@@ -11,11 +11,13 @@ import { localProviderCli } from '../src/agent/provider-cli.js';
 import { codexDynamicTools } from '../src/agent/codex.js';
 import { materializeRemoteSession, seedRemoteAgentHome, syncRemoteAgentHome,
   ensureRemoteCodexSessionTools, remoteAgentHomeRelative } from '../src/agent/remote-process.js';
+import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 
 // Real files, shell commands, and the pinned Codex app-server. Only the model's
 // HTTP Responses endpoint is simulated: no credentials or paid inference.
 function diskWorld(root: string): World {
   fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(path.join(root, 'system-bin'));
   const write = async (file: string, content: string | Buffer) => {
     const dest = path.join(root, file);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -27,7 +29,10 @@ function diskWorld(root: string): World {
     readFileBuffer: async (file: string) => fs.readFileSync(path.join(root, file)),
     writeFile: write, writeFileBuffer: write,
     exec: async (command: string, args: string[]) => {
-      const r = spawnSync(command, args, { cwd: root, encoding: 'utf8' });
+      // This world runs on the test host. Keep sandbox runtime publication
+      // inside the fixture rather than replacing the host's Node/npm symlinks.
+      const localArgs = args.map(arg => arg.replaceAll('/usr/local/bin', path.join(root, 'system-bin')));
+      const r = spawnSync(command, localArgs, { cwd: root, encoding: 'utf8' });
       if (r.error) throw r.error;
       return { code: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
     },
@@ -66,7 +71,7 @@ async function turn(client: CodexAppServerClient, threadId: string, text: string
   expect(await completed).toMatchObject({ status: 'completed' });
 }
 
-it.each(['live source', 'deleted source'])('forks and resumes nested lineage with a %s and stale host snapshots', async (scenario) => {
+it.each(['live source', 'deleted source', 'disconnected login'])('forks and resumes nested lineage with a %s and stale host snapshots', async (scenario) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-lineage-e2e-'));
   const requests: string[] = [];
   const server = createServer(async (req, res) => {
@@ -89,8 +94,8 @@ it.each(['live source', 'deleted source'])('forks and resumes nested lineage wit
   await once(server, 'listening');
   try {
     const port = (server.address() as { port: number }).port;
-    const host = path.join(dir, 'host');
-    fs.mkdirSync(host);
+    const homes = new ConfigHomeManager(path.join(dir, 'homes'));
+    const host = homes.ensure('codex', 'personal');
     fs.writeFileSync(path.join(host, 'config.toml'), `model = "gpt-5.4"\nmodel_provider = "fixture"\n` +
       `[model_providers.fixture]\nname = "Fixture"\nbase_url = "http://127.0.0.1:${port}"\nwire_api = "responses"\n`);
     const source = diskWorld(path.join(dir, 'source'));
@@ -140,6 +145,15 @@ it.each(['live source', 'deleted source'])('forks and resumes nested lineage wit
         expect(rollouts(path.join(destination.handle.root, relative))
           .filter((file) => file.endsWith(`${parent}.jsonl`))).toHaveLength(2);
         fs.rmSync(from.handle.root, { recursive: true, force: true });
+      } else if (generation === 1 && scenario === 'disconnected login') {
+        // The source task has landed and its sandbox is gone. Disconnecting
+        // credentials must not erase the only remaining native fork source.
+        fs.rmSync(from.handle.root, { recursive: true, force: true });
+        const config = fs.readFileSync(path.join(host, 'config.toml'));
+        homes.remove('codex', 'personal');
+        expect(homes.list()).toEqual([]);
+        expect(homes.prepareLogin('codex', 'personal')).toBe(host);
+        fs.writeFileSync(path.join(host, 'config.toml'), config);
       } else {
         expect(await materializeRemoteSession(from, destination, 'codex', parent, host)).toBe(true);
       }

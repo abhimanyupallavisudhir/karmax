@@ -12,6 +12,7 @@ import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrat
 import { detectConversationImport } from '../src/store/conversation-imports.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
+import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -19,10 +20,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   let h: Harness;
   let base: string;
   let token: string;
+  let loginRoot: string;
+  let loginHomes: ConfigHomeManager;
   const auth = () => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
 
   beforeAll(async () => {
-    h = await bootHarness('mock');
+    loginRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-login-homes-'));
+    loginHomes = new ConfigHomeManager(loginRoot);
+    h = await bootHarness('mock', undefined, { configHomes: loginHomes });
     const gw = await h.startGateway();
     base = gw.url;
     const session: any = await (await fetch(`${base}/api/session`)).json();
@@ -31,6 +36,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   }, 60_000);
   afterAll(async () => {
     await h?.stop();
+    if (loginRoot) fs.rmSync(loginRoot, { recursive: true, force: true });
   });
 
   it('serves meta with the detected agent provider', async () => {
@@ -112,6 +118,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     } finally {
       fs.rmSync(nativeHome, { recursive: true, force: true });
     }
+  });
+
+  it('keeps task-native downloads available after deleting and reconnecting the source login', async () => {
+    const project = h.store.createProject('Disconnected source history');
+    const task = h.store.createTask({ projectId: project.id, title: 'Completed source',
+      workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'source', draft: true } });
+    h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+      stage: 'done', status: 'done', messages: [], actions: [] } as any);
+    const session = crypto.randomUUID();
+    const home = loginHomes.ensure('codex', 'retention');
+    fs.mkdirSync(path.join(home, 'sessions'));
+    fs.writeFileSync(path.join(home, 'sessions', `rollout-2026-08-14T00-00-00-${session}.jsonl`),
+      JSON.stringify({ type: 'session_meta', payload: { id: session, timestamp: '2026-08-14T00:00:00Z' } }) + '\n' +
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'Retain this native context.' },
+      ] } }) + '\n');
+    fs.writeFileSync(path.join(home, 'auth.json'), '{"token":"old-token"}');
+    h.store.kvSet(`session:${task.id}:do`, session);
+    h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home, provider: 'codex' }));
+    const deleted = await fetch(`${base}/api/organizations/org_personal/accounts/logins/codex/retention`, {
+      method: 'DELETE', headers: auth(),
+    });
+    expect(deleted.status).toBe(200);
+    expect(loginHomes.list().some(login => login.account === 'retention')).toBe(false);
+    expect(fs.existsSync(path.join(home, 'auth.json'))).toBe(false);
+    // Request the first export AFTER deletion, so an already-frozen export cannot mask data loss.
+    const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
+    expect(sessions.do).toMatchObject({ id: session, provider: 'codex', downloadable: true });
+    const downloaded = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
+    expect(downloaded.status, await downloaded.clone().text()).toBe(200);
+    expect(downloaded.headers.get('x-karmax-conversation-source')).toBe('native');
+    expect(await downloaded.text()).toContain('Retain this native context.');
+    const reconnected = await fetch(`${base}/api/organizations/org_personal/accounts/connect`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'codex', account: 'retention' }),
+    });
+    expect(reconnected.status).toBe(200);
+    expect(loginHomes.list().some(login => login.account === 'retention')).toBe(true);
+    expect(h.store.kvGet(`sessionmeta:${task.id}:do`)).toBe(JSON.stringify({ home, provider: 'codex' }));
+    const after: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
+    expect(after.do).toMatchObject({ id: session, downloadable: true });
   });
 
   it('generates forkable JSONL for a new API-backed conversation with no config home', async () => {
