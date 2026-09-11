@@ -17,7 +17,7 @@ export interface PlatformToolContext {
   /** Optional structured completion summary; provider terminal success is authoritative. */
   signalCompletion(summary?: string): void;
   /** Optionally attach terse, click-to-verify actions/outputs for the Review stage. */
-  createReviewInfo(info: ReviewInfo): void;
+  createReviewInfo(info: ReviewInfo): void | Promise<void>;
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
   createSubTask(t: { title: string; prompt: string }): void;

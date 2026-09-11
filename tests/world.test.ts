@@ -12,6 +12,7 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { ApplicationFailure } from '@temporalio/common';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
+import { forkWorldSource } from '../src/world/fork.js';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -224,6 +225,41 @@ describe('WorktreeProvider (real git)', () => {
       expect(handle.workdir).toBe(handle.repos!.find((candidate) => candidate.role !== 'project-wiki')!.root);
       await worlds.open(handle).then((world) => world.destroy());
     } finally {
+      fs.rmSync(contentDir, { recursive: true, force: true });
+      store.close();
+    }
+  });
+
+  it('preserves the wiki destination when a fork inherits a different task target', async () => {
+    const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-target-'));
+    const store = new Store(':memory:');
+    const project = store.createProject('Fork targets', { repos: [repo], defaultBase: 'main' });
+    const source = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x', target: 'master' } });
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), contentDir });
+    const handles: Awaited<ReturnType<typeof core.createWorld>>[] = [];
+    try {
+      await gitOrThrow(repo, ['branch', 'master']);
+      const original = await core.createWorld({ taskId: source.id, repos: [repo], base: 'main', target: 'master', kind: 'worktree' });
+      handles.push(original);
+      const plan = forkWorldSource(source, original)!;
+      // Published Git state is sufficient for this branch-policy regression.
+      plan.unpublished = false;
+      const task = store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'x', base: plan.base, target: 'master', _forkWorld: plan } });
+      const fork = await core.createWorld({ taskId: task.id, repos: [repo], base: plan.base, target: 'master', kind: 'worktree' });
+      handles.push(fork);
+      expect(fork.repos!.find((r) => r.role === 'project-wiki')).toMatchObject({
+        base: original.branch, target: 'main', targetPinned: true,
+      });
+      expect(fork.repos!.find((r) => r.role !== 'project-wiki')).toMatchObject({
+        base: original.branch, target: 'master',
+      });
+    } finally {
+      for (const handle of handles.reverse()) await worlds.open(handle).then((world) => world.destroy());
       fs.rmSync(contentDir, { recursive: true, force: true });
       store.close();
     }

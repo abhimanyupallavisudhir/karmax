@@ -54,7 +54,7 @@ export interface ScopedToken {
   id: string;
   taskId: string;
   profileId: string;
-  /** Workflow role whose ceiling shaped this agent token. */
+  /** Workflow role running with this token; authorization comes from the task grant. */
   role?: string;
   principal: string; // the granting user/principal id
   projectId?: string;

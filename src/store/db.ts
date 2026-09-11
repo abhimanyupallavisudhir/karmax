@@ -16,6 +16,7 @@ import {
   TaskParams,
   AgentProfile,
   TaskView,
+  ReviewInfo,
   KarmaxEvent,
   Tag,
   SavedView,
@@ -2991,7 +2992,31 @@ export class Store {
     return tasks;
   }
 
+  /** Turn-local review tools must survive cancellation before TurnResult is returned.
+   * Keep only explicitly supplied fields; workflow-owned completion/diffs stay intact. */
+  checkpointReviewInfo(taskId: string, info: ReviewInfo): void {
+    const previous = this.kvGet(`pending-review:${taskId}`);
+    const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+    this.kvSet(`pending-review:${taskId}`, JSON.stringify({ ...(previous ? JSON.parse(previous) : {}), ...supplied }));
+    const view = this.getTask(taskId)?.lastView;
+    if (view) this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?')
+      .run(JSON.stringify(this.withPendingReviewInfo(taskId, view)), taskId);
+  }
+
+  withPendingReviewInfo(taskId: string, view: TaskView): TaskView {
+    const raw = this.kvGet(`pending-review:${taskId}`);
+    return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
+  }
+
   saveView(taskId: string, view: TaskView) {
+    const pending = this.kvGet(`pending-review:${taskId}`);
+    if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
+      JSON.stringify(view.reviewInfo?.[key as keyof ReviewInfo]) === JSON.stringify(value))) {
+      // The workflow has incorporated the checkpoint (normal turn completion or
+      // lifecycle recovery). Future workflow updates own these fields again.
+      this.kvDelete(`pending-review:${taskId}`);
+    }
+    view = this.withPendingReviewInfo(taskId, view);
     // Auto-archive on resolution: the moment a task reaches a terminal, no-further-
     // action status (done or cancelled) it drops out of the default active list
     // without a manual archive step — the same effect the /archive endpoint has, but
@@ -3328,7 +3353,7 @@ export class Store {
         urgencyRank(item.urgency), createdAt, JSON.stringify(subject));
       if (!Number(inserted.changes)) continue;
       const preferences = this.getDeliveryPreferences(userId, organizationId);
-      const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack']
+      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack']
         .filter(Boolean) as string[];
       for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
         (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
@@ -3589,7 +3614,7 @@ export class Store {
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
           item.taskId, item.kind, urgencyRank(item.urgency), item.actionable ? 1 : 0, item.createdAt);
       if (Number(inserted.changes)) {
-        const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
+        const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
         for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
           (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
           .run(newId('delivery'), item.id, channel, item.createdAt, item.createdAt);
@@ -4075,7 +4100,7 @@ export class Store {
     }
     for (const taskId of taskIds) {
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`]) exact.run(key);
+        `permission:grant:${taskId}`, `pending-review:${taskId}`]) exact.run(key);
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
         `view-conversation:${taskId}:`]) prefix.run(value, value);
     }
@@ -4645,7 +4670,7 @@ export class Store {
 
   retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void {
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
-      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (storageLocationId) {

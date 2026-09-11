@@ -421,8 +421,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .inbox-row .urgency-chip { margin-left:8px; }
 .notify-row .urgency-chip { justify-self:start; }
 /* Per-urgency behaviour: one row per level, one column per behaviour. */
-.notify-grid { display:grid; gap:2px; margin:6px 0 12px; }
-.notify-row { display:grid; grid-template-columns:110px repeat(2,minmax(0,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
+.notify-grid { overflow-x:auto; display:grid; gap:2px; margin:6px 0 12px; }
+.notify-row { display:grid; grid-template-columns:90px repeat(4,minmax(70px,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
 .notify-row:last-child { border-bottom:0; }
 .notify-head { color:var(--ink-3); font-size:11px; text-transform:uppercase; letter-spacing:.05em; border-bottom:1px solid var(--line); }
 .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 14px; }
@@ -2532,3 +2532,20 @@ html[data-theme="dark"] .github-signin-btn:active,
   .avatar-defaults { grid-template-columns: 1fr; }
   .avatar-role-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
+
+#bell-badge, .inbox-tabs .pill { background:#c62828; color:#fff; font-weight:800; }
+#bell-badge { min-width:20px; height:20px; font-size:12px; top:-4px; right:-6px; border:2px solid var(--surface); }
+.notify-sound-options { display:flex; flex-wrap:wrap; align-items:end; gap:16px; margin:16px 0; }
+.notify-sound-options label { display:grid; gap:6px; }
+/* Keep arrival alerts prominent while leaving error toasts and skip navigation above them. */
+#notification-alerts { position:fixed; top:64px; right:16px; width:min(380px,calc(100vw - 32px)); z-index:95; display:grid; gap:8px; }
+.notification-alert { display:flex; align-items:center; gap:12px; background:var(--surface); color:var(--ink); border:1px solid var(--line); border-left:4px solid #c62828; padding:12px; border-radius:8px; box-shadow:0 8px 28px #0003; }
+.notification-open { flex:1; min-width:0; display:grid; gap:6px; text-align:left; border:0; background:transparent; color:inherit; cursor:pointer; overflow-wrap:anywhere; }
+
+/* Review documents use the same Markdown typography as conversation messages. */
+.artifact-reader { width: min(900px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; color: var(--ink); }
+.artifact-reader::backdrop { background: rgba(0, 0, 0, .45); }
+.artifact-reader-header { display: flex; align-items: center; gap: 10px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+.artifact-reader-header h2 { flex: 1; min-width: 0; margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.artifact-reader-content { padding: 20px; max-height: calc(100dvh - 150px); overflow: auto; }
+.artifact-reader-content > pre { margin: 0; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }

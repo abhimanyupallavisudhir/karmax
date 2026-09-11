@@ -1,8 +1,8 @@
 /**
  * The capability model + attenuation (SPEC §8.1, §8.2). A flat set of named
- * capabilities granted to principals. An agent's effective capabilities are the
- * intersection of its profile-declared ceiling and the granting principal's
- * capabilities — least privilege, capability attenuation.
+ * capabilities granted to principals. Agent tokens preserve the selected task
+ * authorization, attenuated to the granting principal's authority and scope.
+ * Workflow duty does not introduce a second permission tier.
  *
  * Capabilities support `:`-segmented scoping and `*` wildcards, e.g.
  *   merge-into:/repo:main   merge-into:*   use-credential:openai   *
@@ -34,9 +34,8 @@ export const CAPABILITIES = [
   'credential:read', 'credential:write', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
   'settings:read', 'settings:write', 'safe-mode:write',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
-  // Workflow-internal decisions are ordinary capabilities too. They are kept
-  // in the public catalogue so a profile can be edited without knowing hidden
-  // strings; the concrete role profile still provides the second ceiling.
+  // Workflow decisions are discoverable capabilities too. Authorization selects
+  // them; workflow state determines when the corresponding action is valid.
   'resolve-decision', 'confirm-decision', 'merge-into:*',
 ] as const;
 
@@ -137,7 +136,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['workflow:install', 'Install workflows', 'Self-hosted only: install trusted workflow code into the platform worker.'],
       ['workflow:edit', 'Propose workflow changes', 'Manage version pins; on self-hosted servers, propose external workflow code changes.'],
       ['profile:read', 'View agent profiles', 'Read provider, model, account, and role-profile configuration.'],
-      ['profile:write', 'Edit agent profiles', 'Change role profiles and their capability ceilings.'],
+      ['profile:write', 'Edit agent profiles', 'Change agent runtime profiles; task authorization controls permissions.'],
       ['skill:write', 'Save skills', 'Persist reusable agent knowledge and resolution skills.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
@@ -148,7 +147,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['process:read', 'View processes', 'Inspect processes managed by karmax.'],
       ['process:kill', 'Stop processes', 'Terminate processes managed by karmax.'],
       ['credential:read', 'View credential metadata', 'Discover credential handles, vault items, and non-secret policy.'],
-      ['credential:write', 'Manage credentials', 'Create, replace, delete, and configure credential handles and vault items, and resolve credential access requests.'],
+      ['credential:write', 'Manage credentials', 'Create, replace, delete, configure, and inspect plaintext credentials and vault items; resolve credential access requests.'],
       ['vault:store', 'Store new credentials', 'Write newly created credentials (accounts an agent registered) back into the vault as items.'],
       ['payment:read', 'View payments', 'Inspect payment methods, limits, and transactions.'],
       ['payment:write', 'Manage payments', 'Create payment resources and authorize spending within policy.'],
@@ -164,7 +163,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['authorization:read', 'View authorization', 'Read profiles, grants, defaults, and the audit log.'],
       ['authorization:write', 'Manage authorization', 'Change profiles, grants, and authorization defaults.'],
       ['user:read', 'View user accounts', 'List human accounts and their access grants.'],
-      ['user:write', 'Manage user accounts', 'Create and remove human accounts.'],
+      ['user:write', 'Manage user accounts', 'Create and remove user accounts. Own-account self-service uses verified identity for humans and delegated agents.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
   {

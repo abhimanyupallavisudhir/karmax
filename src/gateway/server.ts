@@ -67,7 +67,7 @@ import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
-import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
+import { actorPrincipal, identityAuditDetail, requireHumanSubject,
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
@@ -569,7 +569,8 @@ const ARTIFACT_MIME: Record<string, string> = {
   '.webm': 'video/webm',
   '.mov': 'video/quicktime',
   '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.markdown': 'text/markdown; charset=utf-8',
   '.log': 'text/plain; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
   '.ipynb': 'application/json; charset=utf-8',
@@ -1714,6 +1715,8 @@ export class Gateway {
       ? `/api/${organizationResource[2]}${organizationResource[3] ?? ''}`
       : p;
 
+    // Authorization is independent of actor type. Personal self-service routes
+    // below require the same verified account subject for browsers and delegates.
     const required = capabilityForRequest(method, p, url);
     if (required) {
       const scope = requestedScope;
@@ -1757,20 +1760,21 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/user/account-deletion-request' && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const privacyContact = (this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).contacts.privacy;
-        const request = { requestedAt: Date.now(), userId: subject.userId, email: session.email };
+        const request = { requestedAt: Date.now(), userId: subject.userId,
+          email: this.deps.identity?.listUsers().find((user) => user.id === subject.userId)?.email ?? session.email };
         store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request));
         if (privacyContact && this.deps.email?.configured()) {
           await this.deps.email.send({ to: privacyContact, subject: `${this.siteName} account deletion request`,
-            text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${session.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
+            text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${request.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
             .catch((error) => console.error('[privacy] deletion-request notification failed:', error instanceof Error ? error.message : error));
         }
         return this.json(res, 202, { ...request, privacyContact: privacyContact ?? null,
           next: 'We will verify ownership and organization/resource transfer needs before irreversible deletion.' });
       }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (method === 'GET') {
           const organization = store.defaultOrganization(subject.userId);
           return this.json(res, 200, { organizationId: organization?.id ?? null });
@@ -1784,7 +1788,7 @@ export class Gateway {
         }
       }
       if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const organizationId = String(url.searchParams.get('organizationId')
           ?? store.defaultOrganization(subject.userId)?.id ?? '');
         if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
@@ -1846,8 +1850,8 @@ export class Gateway {
       }
       if (p === '/api/user/export' && method === 'GET') {
         // Broad task-agent capabilities never imply ownership of a human's
-        // personal archive. Only a verified browser identity has `session.userId`.
-        const subject = requireInteractiveHuman(callerIdentity);
+        // personal archive. Require an authority-verified user subject.
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.identity)
           return this.json(res, 401, { error: 'a signed-in user account is required' });
         const identityData = this.deps.identity.exportUserData(subject.userId);
@@ -1965,13 +1969,14 @@ export class Gateway {
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
-        if (!session.email) return this.json(res, 400, { error: 'a verified account is required' });
+        const subject = requireHumanSubject(callerIdentity);
+        const subjectEmail = this.deps.identity?.listUsers().find((user) => user.id === subject.userId)?.email;
+        if (!subjectEmail) return this.json(res, 400, { error: 'a verified account is required' });
         const b = await this.body(req);
         try {
           const invitationToken = String(b.token ?? '');
           const invited = store.organizationInvitationForToken(invitationToken);
-          const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, session.email);
+          const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, subjectEmail);
           this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
           void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
@@ -2020,17 +2025,16 @@ export class Gateway {
         if (!billing) return this.json(res, 503, { error: 'subscription billing is unavailable' });
         if (action === 'status') {
           if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
-          const interactiveUserId = callerIdentity.actor.kind === 'interactive-human'
-            ? callerIdentity.humanSubject?.userId : undefined;
-          const canManage = Boolean(interactiveUserId
-            && store.organizationMembership(organizationId, interactiveUserId)?.role === 'owner');
+          const billingUserId = callerIdentity.humanSubject?.userId;
+          const canManage = Boolean(billingUserId
+            && this.deps.tokens.check(token, 'payment:write', { organizationId }).ok
+            && store.organizationMembership(organizationId, billingUserId)?.role === 'owner');
           return this.json(res, 200, { ...billing.current(organizationId), canManage });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
-        // Agent-card administration is delegable through payment:write. Paying
-        // for the SaaS itself is not: require live browser presence and the
-        // durable owner membership even after the ordinary capability gate.
-        const billingSubject = requireInteractiveHuman(callerIdentity);
+        // Billing requires payment authority and a verified owner subject,
+        // including securely delegated agents.
+        const billingSubject = requireHumanSubject(callerIdentity);
         if (store.organizationMembership(organizationId, billingSubject.userId)?.role !== 'owner')
           return this.json(res, 403, { error: 'organization owner access is required to administer its subscription' });
         const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
@@ -2048,7 +2052,7 @@ export class Gateway {
                 cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
             store.recordPolicyAcceptance({
               userId: billingSubject.userId,
-              email: session.email,
+              email: this.deps.identity?.listUsers().find((user) => user.id === billingSubject.userId)?.email ?? session.email,
               organizationId,
               context: 'checkout',
               versions,
@@ -2149,7 +2153,6 @@ export class Gateway {
           `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
-        requireInteractiveHuman(callerIdentity);
         const organizationId = organizationMatch[1]!;
         const organization = store.getOrganization(organizationId);
         if (!organization) return this.json(res, 404, { error: 'organization not found' });
@@ -2395,7 +2398,7 @@ export class Gateway {
       }
       const githubManifest = p.match(/^\/api\/organizations\/([^/]+)\/github\/app-manifest$/);
       if (githubManifest && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!this.deps.tokens.check(token, 'settings:write').ok)
           return this.json(res, 403, { error: `Only a ${this.siteName} installation administrator can create the shared GitHub App` });
@@ -2411,7 +2414,7 @@ export class Gateway {
       }
       const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
       if (githubAuthorize && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const b = await this.body(req);
         const reconnectAccountId = b.accountId ? String(b.accountId) : undefined;
@@ -2432,7 +2435,7 @@ export class Gateway {
       }
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
       if (githubInstallUrl && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         const state = store.createGithubInstallState(githubInstallUrl[1]!, subject.userId);
         return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
@@ -2472,10 +2475,9 @@ export class Gateway {
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
           return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
         try {
-          const githubAccountId = callerIdentity.actor.kind === 'task-agent'
-            ? subject.externalIdentities?.githubAccountId : undefined;
-          if (callerIdentity.actor.kind === 'task-agent' && !githubAccountId)
-            return this.json(res, 403, { error: 'the delegated task has no pinned GitHub account' });
+          // Honor an explicit account scope for either actor; otherwise use
+          // the represented user's active account, including after onboarding.
+          const githubAccountId = subject.externalIdentities?.githubAccountId;
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
               private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
@@ -2620,7 +2622,7 @@ export class Gateway {
           ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
             && (policy as any)[key] !== current) || managedProvidersChanged;
           if (ownerOnlyChange) {
-            const subject = requireInteractiveHuman(callerIdentity);
+            const subject = requireHumanSubject(callerIdentity);
             if (store.organizationMembership(organizationId, subject.userId)?.role !== 'owner')
               return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
           }
@@ -2630,7 +2632,7 @@ export class Gateway {
       }
 
       if (p === '/api/inbox' && method === 'GET') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
         const items = store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
@@ -2644,17 +2646,23 @@ export class Gateway {
       }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const b = await this.body(req);
         return this.json(res, 200, store.markInbox(subject.userId, inboxItem[1]!, b.unread !== false) ?? null);
       }
       if (p === '/api/inbox/preferences') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
         if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (b.emailUrgencies !== undefined && (!b.emailUrgencies || typeof b.emailUrgencies !== 'object'
+            || Array.isArray(b.emailUrgencies) || Object.entries(b.emailUrgencies).some(([key, value]) =>
+              !['low', 'normal', 'high', 'critical'].includes(key) || typeof value !== 'boolean')))
+            return this.json(res, 400, { error: 'emailUrgencies must map urgency levels to booleans' });
+          const previous = store.getDeliveryPreferences(subject.userId, requestedScope.organizationId);
           return this.json(res, 200, store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
+            emailUrgencies: b.emailUrgencies ?? previous.emailUrgencies,
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
         }
       }
@@ -2665,21 +2673,30 @@ export class Gateway {
         return this.json(res, 200, (this.deps.identity?.listUsers() ?? []).map((u) => ({ ...u, grants: this.deps.authorization?.grants(`user:${u.id}`) ?? [] })));
       }
       if (p === '/api/users' && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.identity) return this.json(res, 400, { error: 'identity service unavailable' });
         const b = await this.body(req);
+        if (b.profileId) {
+          const profile = this.deps.authorization?.profile(String(b.profileId), b.projectId);
+          if (!profile) return this.json(res, 400, { error: 'unknown authorization profile' });
+          if (!b.projectId && (authRecord.projectId || authRecord.projectIds?.length || authRecord.organizationId))
+            return this.json(res, 403, { error: 'this token cannot delegate global access' });
+          for (const capability of profile.capabilities) {
+            if (!this.deps.tokens.check(token, capability, { projectId: b.projectId,
+              organizationId: b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined }).ok)
+              return this.json(res, 403, { error: `you cannot delegate ${capability}` });
+          }
+        }
         const user = await this.deps.identity.createUser({ name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') });
-        if (b.profileId) this.deps.authorization?.grant(`user:${subject.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
+        if (b.profileId) this.deps.authorization?.grant(actorPrincipal(callerIdentity.actor), { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
         return this.json(res, 200, user);
       }
       const resetOnboarding = p.match(/^\/api\/users\/([^/]+)\/onboarding\/reset$/);
       if ((resetOnboarding || p === '/api/user/onboarding/reset') && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.hosted)
           return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
-        // The self-service route takes its target solely from the browser session.
+        // The self-service route takes its target solely from the verified subject.
         // The operator route retains its user:write capability requirement.
-        const userId = resetOnboarding?.[1] ?? subject.userId;
+        const userId = resetOnboarding?.[1] ?? requireHumanSubject(callerIdentity).userId;
         if (!this.deps.identity?.listUsers().some((user) => user.id === userId))
           return this.json(res, 404, { error: 'user not found' });
         // Only presentation state changes. Live setup facts and user work remain intact.
@@ -2689,10 +2706,9 @@ export class Gateway {
       }
       const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
       if (userMatch && method === 'DELETE') {
-        const subject = requireInteractiveHuman(callerIdentity);
-        if (userMatch[1] === subject.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
+        if (userMatch[1] === callerIdentity.humanSubject?.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
         await this.deps.identity?.removeUser(userMatch[1]!);
-        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(`user:${subject.userId}`, g.principalId, g.scopeKey);
+        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), g.principalId, g.scopeKey);
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/authorization/profiles' && method === 'GET') {
@@ -2894,10 +2910,10 @@ export class Gateway {
           return this.json(res, 200, { availability, avatars: store.listAvatars(projectId).map(view) });
         }
 
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const existing = avatarId ? store.getAvatar(avatarId) : undefined;
         if (avatarId && !existing) return this.json(res, 404, { error: 'avatar not found' });
-        if (existing?.projectId !== projectId) return this.json(res, 404, { error: 'avatar not found' });
+        if (existing && existing.projectId !== projectId) return this.json(res, 404, { error: 'avatar not found' });
         if (method === 'DELETE') {
           if (existing!.ownerUserId !== subject.userId && !canAdmin)
             return this.json(res, 403, { error: 'only the owner or a project administrator can remove this Avatar' });
@@ -3011,8 +3027,25 @@ export class Gateway {
             }
           }
           authorization.capabilities = [...new Set(authorization.capabilities)];
+          // No caller may delegate beyond its grant, including when editing an
+          // Avatar previously authorized by someone else.
+          if (authorization.scope === 'organization'
+            && (authRecord.organizationId && authRecord.organizationId !== organizationId || authRecord.projectId || authRecord.projectIds?.length)
+            || authorization.scope === 'global'
+            && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length))
+            throw new AuthorizationGrantError('this token cannot delegate the selected scope');
+          for (const selectedProject of authorization.projectIds?.length ? authorization.projectIds : [projectId]) {
+            for (const capability of authorization.capabilities) {
+              if (!this.deps.tokens.check(token, capability, { projectId: selectedProject, organizationId }).ok)
+                throw new AuthorizationGrantError(`you cannot delegate ${capability} in project ${selectedProject}`);
+            }
+          }
+
           const githubAccountId = b.githubAccountId === null ? undefined
             : b.githubAccountId ? String(b.githubAccountId) : existing?.githubAccountId;
+          if (githubAccountId && authRecord.externalIdentities?.githubAccountId
+            && githubAccountId !== authRecord.externalIdentities.githubAccountId)
+            throw new AuthorizationGrantError('the selected GitHub account is outside this caller’s account scope');
           if (githubAccountId && this.deps.githubApp?.activeUserAccountId(subject.userId) !== githubAccountId)
             throw new Error('the selected GitHub account is not your active connected account');
 
@@ -3188,8 +3221,6 @@ export class Gateway {
       // write-only; .env example files provide lazy suggestions.
       const projectSecrets = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
       if (projectSecrets && ['GET', 'POST', 'DELETE'].includes(method)) {
-        if (method !== 'GET' && this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents must store generated credentials in the vault and propose them for Review' });
         const project = store.getProject(projectSecrets[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.broker || !this.deps.resources)
@@ -3372,8 +3403,6 @@ export class Gateway {
           revision: resource.currentRevisionId ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined,
         })));
         if (method === 'POST') {
-          if (this.deps.tokens.verify(token)?.kind === 'agent')
-            return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
           const b = await this.body(req, 600 * 1024 * 1024);
           const id = newId('resource');
           const driver = String(b.driver ?? 'volume@1');
@@ -3422,8 +3451,6 @@ export class Gateway {
       }
       const copyGlobsMigration = p.match(/^\/api\/projects\/([^/]+)\/resources\/import-copyglobs$/);
       if (copyGlobsMigration && method === 'POST') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'copyGlobs migration is a human project-settings operation' });
         const project = store.getProject(copyGlobsMigration[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         // `hostLocal`, not `hosted` — the same gate as the scan/import routes above,
@@ -3449,8 +3476,6 @@ export class Gateway {
         if (!resource || resource.projectId !== projectResource[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
           { error: 'this staged resource must be adopted or discarded from its task Review' });
-        if ((method === 'PATCH' || method === 'DELETE') && this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents cannot administer durable project resources directly' });
         if (method === 'GET') return this.json(res, 200, { ...redactResource(resource),
           revisions: store.listResourceRevisions(resource.id).map(redactResourceRevision) });
         if (method === 'PATCH') {
@@ -3489,8 +3514,6 @@ export class Gateway {
       }
       const projectResourceScan = p.match(/^\/api\/projects\/([^/]+)\/resources\/scan$/);
       if (projectResourceScan && method === 'GET') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents can inventory only their own current world' });
         const project = store.getProject(projectResourceScan[1]!);
         if (!project) return this.json(res, 404, { error: 'project not found' });
         // `hosted` and `hostLocal` are orthogonal: a self-host served on a public
@@ -3503,8 +3526,6 @@ export class Gateway {
       }
       const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
       if (resourceUploadCreate && method === 'POST') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceUploadCreate[2]!);
         if (!resource || resource.projectId !== resourceUploadCreate[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
@@ -3523,8 +3544,6 @@ export class Gateway {
       }
       const resourceUpload = p.match(/^\/api\/resource-uploads\/([^/]+)$/);
       if (resourceUpload) {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents cannot modify durable project resource uploads directly' });
         const upload = resourceUploadSession(store, resourceUpload[1]!);
         if (!upload || upload.projectId !== url.searchParams.get('projectId')) return this.json(res, 404, { error: 'resource upload not found' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
@@ -3540,7 +3559,8 @@ export class Gateway {
           const part = Number(url.searchParams.get('part'));
           if (!safeUploadPath(relative) || !Number.isInteger(part) || part < 0) return this.json(res, 400, { error: 'invalid upload path or part' });
           const data = await this.rawBody(req, RESOURCE_UPLOAD_PART_BYTES);
-          if (!data.length) return this.json(res, 400, { error: 'empty upload part' });
+          // A zero-byte first part represents an empty file.
+          if (!data.length && part !== 0) return this.json(res, 400, { error: 'empty upload part' });
           const record = upload.files[relative] ?? { parts: [], bytes: 0 };
           if (part !== record.parts.length) return this.json(res, 409, { error: `expected part ${record.parts.length}` });
           const objectKey = resourceUploadObjectKey(upload, relative, part);
@@ -3582,8 +3602,6 @@ export class Gateway {
       }
       const resourceImport = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/import$/);
       if (resourceImport && method === 'POST') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceImport[2]!);
         if (!resource || resource.projectId !== resourceImport[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
@@ -4802,7 +4820,6 @@ export class Gateway {
           return this.json(res, 200, explanations);
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
-        requireInteractiveHuman(callerIdentity);
         const project = store.getProject(task.projectId);
         if (!project) return this.json(res, 404, { error: 'task project not found' });
         const body = await this.body(req);
@@ -5165,8 +5182,8 @@ export class Gateway {
           modelProvider: _legacyModelProvider,
           allowedAccounts: _legacyAllowedAccounts,
           auth: _legacyAuth,
-          // The role's workflow owns the capability ceiling (roleCeiling); a submitted
-          // one must neither narrow nor escalate what the role's turns are minted with.
+          // Task authorization owns permissions. A runtime profile must neither
+          // narrow nor escalate the grant selected for the task.
           capabilities: _legacyCapabilities,
           ...rest
         } = b;
@@ -5233,7 +5250,7 @@ export class Gateway {
         return this.json(res, 200, { providers: list, active });
       }
       if ((p === '/api/payments/connect' || organizationPayments?.[2] === 'connect') && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const b = await this.body(req);
         const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
         if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
@@ -5430,19 +5447,11 @@ export class Gateway {
           }
           return this.json(res, 200, { ...saved, ...(propagated ? { propagated } : {}) });
         }
-        // Human vault inspection is deliberately separate from the agent
-        // `/api/vault/resolve` path. The item's `reveal` policy answers whether
-        // plaintext may be handed to a task agent; it must not make the vault
-        // opaque to an administrator who is responsible for its contents.
-        // Conversely, a task token carrying broad credential administration
-        // must never use this route as a shortcut around its item grant/policy.
+        // Explicit credential administration permits audited inspection for any
+        // authorized actor. Ordinary task use still follows /api/vault/resolve
+        // and its independent per-item grants and reveal policy.
         const viReveal = p.match(/^\/api\/vault\/items\/([^/]+)\/reveal$/);
         if (viReveal && method === 'POST') {
-          try {
-            requireInteractiveHuman(callerIdentity);
-          } catch {
-            return this.json(res, 403, { error: 'a human vault administrator is required' });
-          }
           const item = vault.get(viReveal[1]!);
           if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
           const b = await this.body(req);
@@ -6104,7 +6113,7 @@ export class Gateway {
 
       const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity))?)?$/);
       if (githubAccountsResource) {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp || !this.deps.broker)
           return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
@@ -6156,9 +6165,9 @@ export class Gateway {
       if (userGitResource || resourcePath.startsWith('/api/git-profiles')) {
       const gitResourcePath = userGitResource ? `/api/git-profiles${userGitResource[1] ?? ''}` : resourcePath;
       const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
-      const interactiveGitSubject = userGitResource ? requireInteractiveHuman(callerIdentity) : undefined;
+      const userGitSubject = userGitResource ? requireHumanSubject(callerIdentity) : undefined;
       const gitScope = userGitResource
-        ? userGitScope(interactiveGitSubject!.userId)
+        ? userGitScope(userGitSubject!.userId)
         : resourceOrganizationId;
       if (gitResourcePath === '/api/git-profiles' && method === 'GET') {
         const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
@@ -6166,8 +6175,8 @@ export class Gateway {
           : this.deps.tokens.check(token, 'credential:write', { organizationId: resourceOrganizationId }).ok;
         return this.json(res, 200, {
           profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null, canManage,
-          ...(userGitResource && interactiveGitSubject && this.deps.githubApp
-            ? { githubApp: this.deps.githubApp.status(interactiveGitSubject.userId) }
+          ...(userGitResource && userGitSubject && this.deps.githubApp
+            ? { githubApp: this.deps.githubApp.status(userGitSubject.userId) }
             : {}),
         });
       }
