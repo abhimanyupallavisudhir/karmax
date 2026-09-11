@@ -76,6 +76,11 @@ ok(permissionRows.includes('@team:operators') && permissionRows.includes('config
 ok(permissionRows.includes('data-preq-act="approve"') && permissionRows.includes('data-preq-act="deny"'),
   'permission request row exposes approve and deny decisions');
 
+const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], projectIds: ['proj_second<script>'],
+  baseAuthorization: { level: 'developer' } }]);
+ok(scopeRows.includes('proj_second&lt;script&gt;') && !scopeRows.includes('<script>'), 'project scopes are visible and escaped');
+ok(scopeRows.includes('Existing permissions for all task roles apply there too'), 'scope approval explains its full effect');
+
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'approvals', 'a task needing approval opens its dedicated tab');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');
 

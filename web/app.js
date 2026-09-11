@@ -13493,8 +13493,9 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.</div>
+      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
     </div>
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
@@ -13504,7 +13505,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
-        <span class="mono">${request.capabilities.map(esc).join(', ')}</span>
+        <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;

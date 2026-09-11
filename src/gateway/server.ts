@@ -4336,6 +4336,7 @@ export class Gateway {
         const b = await this.body(req);
         try {
           return this.json(res, 200, await api.requestPermission(token, {
+            ...(b.projectIds !== undefined ? { projectIds: b.projectIds as string[] } : {}),
             capabilities: Array.isArray(b.capabilities) ? b.capabilities.map(String) : [],
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             reason: String(b.reason ?? ''),

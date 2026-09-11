@@ -229,6 +229,37 @@ describe('gateway request scope for bare-id routes', () => {
     expect(store.getOrganization(acmeId)?.slug).toBe(slug);
   });
 
+  it('accepts a scope-only request through HTTP and exposes the added projects for review', async () => {
+    const second = store.createProject('Phase', {}, acmeId);
+    const task = store.createTask({ projectId: mine, title: 'Cross-project work', workflow: 'software-dev',
+      workflowVersion: '1.9.0', createdBy: { kind: 'user', userId: 'a' },
+      params: { prompt: 'read phase', _authorization: {
+        level: 'developer', scope: 'projects', projectIds: [mine], capabilities: ['task:read'],
+      } } });
+    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do',
+      status: 'active', messages: [], actions: [], state: {}, updatedAt: Date.now() });
+    liveView = store.getTask(task.id)!.lastView;
+    const agent = tokens.mint({ taskId: task.id, profileId: 'do', role: 'do', principal: 'user:a',
+      projectId: mine, organizationId: acmeId, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+    const post = (projectIds: unknown) => fetch(`${base}/api/agent/permission-requests`, { method: 'POST',
+      headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ capabilities: [], projectIds, audience: ['@creator'], reason: 'Read phase work.' }) });
+    expect((await post([theirs])).status).toBe(400);
+    expect((await post('invalid')).status).toBe(400);
+    const response = await post([second.id]);
+    expect(response.status).toBe(200);
+    const requested: any = await response.json();
+    expect(requested).toMatchObject({ status: 'needs_approval', capabilities: [], projectIds: [second.id] });
+    const persisted = new PermissionRequests(store, acmeId).requests({ taskId: task.id });
+    expect(persisted).toEqual([expect.objectContaining({ projectIds: [second.id],
+      baseAuthorization: { level: 'developer', scope: 'projects', projectIds: [mine] } })]);
+    const denial = await fetch(`${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${acmeId}`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ action: 'deny' }),
+    });
+    expect(denial.status).toBe(200);
+    expect((store.getTask(task.id)!.params._authorization as any).projectIds).toEqual([mine]);
+  });
+
   it('serves routed permission requests in Approval Requests and enforces the approver capability', async () => {
     const task = store.createTask({
       projectId: mine,
