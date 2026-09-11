@@ -114,7 +114,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/github/actions/dispatch (body {repository?, workflow, ref, inputs?}; github:actions:write)',
     'POST /api/agent/resource-candidates (calling task inferred from its token)',
     'POST /api/agent/escalate (calling task inferred from its token; body {audience, message, urgency?: low|normal|high|critical})',
-    'POST /api/agent/permission-requests (body {capabilities, audience, reason, urgency?}; exact task elevation routed to people, teams, or Avatars; high urgency by default)',
+    'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience, reason, urgency?}; exact task elevation and additive project scope (capabilities: [] for scope only) routed to people, teams, or Avatars; high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
     'POST /api/permission-requests/:id/resolve?organizationId= (routed user delegate or Avatar: body {action: approve|deny})',

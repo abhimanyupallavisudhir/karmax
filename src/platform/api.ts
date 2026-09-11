@@ -337,6 +337,7 @@ export interface KarmaxApiDeps {
  * so authz lives in exactly one place.
  */
 export class KarmaxApi {
+  private resolvingPermissions = new Set<string>();
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
@@ -3023,12 +3024,12 @@ Act according to your Avatar instructions. When ready, call signal_task for task
   }
 
   /** Ask selected people, teams, or owner-configured Avatars to add exact
-   * capabilities to this task. The deciding principal must independently hold
+   * capabilities and/or project scope to this task. The deciding principal must independently hold
    * every capability it grants. */
   async requestPermission(
     token: string,
-    args: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency },
-  ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; audience?: string[] }> {
+    args: { capabilities: string[]; projectIds?: string[]; audience: string[]; reason: string; urgency?: Urgency },
+  ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; projectIds?: string[]; audience?: string[] }> {
     const caller = this.require(token, 'request_permission');
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
     const task = this.deps.store.getTask(caller.taskId);
@@ -3038,10 +3039,26 @@ Act according to your Avatar instructions. When ready, call signal_task for task
     if (!project?.organizationId) throw new Error('task project has no organization');
 
     const capabilities = [...new Set((args.capabilities ?? []).map(exactCapability))];
-    if (!capabilities.length) throw new Error('choose at least one capability');
+    if (args.projectIds !== undefined && (!Array.isArray(args.projectIds)
+      || args.projectIds.some((id) => typeof id !== 'string' || !id.trim())))
+      throw new ValidationError('projectIds must be an array of nonempty project IDs');
+    const requestedProjects = [...new Set((args.projectIds ?? []).map((id) => String(id).trim()).filter(Boolean))];
+    if (requestedProjects.length > 32) throw new ValidationError('at most 32 projects may be requested');
+    if (!capabilities.length && !requestedProjects.length) throw new Error('choose at least one capability or project');
+    for (const id of requestedProjects) {
+      if (this.deps.store.getProject(id)?.organizationId !== project.organizationId)
+        throw new ValidationError('requested projects must exist in the task organization');
+    }
+    const projectIds = requestedProjects.filter((id) => caller.projectId ? caller.projectId !== id
+      : caller.projectIds?.length ? !caller.projectIds.includes(id) : false);
+    const baseAuthorization = projectIds.length ? previousTaskGrants(task).authorization : undefined;
+    if (projectIds.length && (!baseAuthorization || baseAuthorization.scope !== 'projects'))
+      throw new ValidationError('project expansion requires a task with selected-project authorization');
+    if (projectIds.length && caller.principal.startsWith('avatar:'))
+      throw new ValidationError('update the Avatar authorization before expanding its project access');
     if (capabilities.length > 32) throw new Error('at most 32 capabilities may be requested');
     const missing = capabilities.filter((capability) => !allows(caller.caps, capability));
-    if (!missing.length) return { status: 'granted', capabilities };
+    if (!missing.length && !projectIds.length) return { status: 'granted', capabilities };
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
     if (!audience.length) throw new Error('choose at least one person, team, or Avatar');
@@ -3074,7 +3091,8 @@ Act according to your Avatar instructions. When ready, call signal_task for task
       taskId: task.id,
       projectId: task.projectId,
       role,
-      capabilities: missing,
+      capabilities: projectIds.length ? capabilities : missing,
+      ...(projectIds.length ? { projectIds, baseAuthorization } : {}),
       audience,
       recipients: [...recipients],
       avatarRecipients: [...avatarRecipients],
@@ -3090,6 +3108,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
           requestId: request.id,
           role: request.role,
           capabilities: request.capabilities,
+          projectIds: request.projectIds,
           audience: request.audience,
           recipients: request.recipients,
           avatarRecipients: request.avatarRecipients,
@@ -3110,7 +3129,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
         await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
         await this.startTransitionReplacement(task, view, view.stage, true, {
           audience: request.audience,
-          detail: `Permission requested: ${request.capabilities.join(', ')} — ${request.reason}`,
+          detail: `Permission requested: ${request.capabilities.join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.join(', ')}` : ''} — ${request.reason}`,
         });
       }
       for (const avatarId of avatarRecipients) {
@@ -3123,7 +3142,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
             prompt: `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
 
 Requested capabilities: ${request.capabilities.join(', ')}
-Reason from the requesting agent: ${request.reason}
+${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}Reason from the requesting agent: ${request.reason}
 
 Act according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
             params: {
@@ -3148,6 +3167,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       status: 'needs_approval',
       requestId: request.id,
       capabilities: request.capabilities,
+      ...(request.projectIds?.length ? { projectIds: request.projectIds } : {}),
       audience: request.audience,
     };
   }
@@ -3430,6 +3450,20 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     token: string,
     input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
+    const key = `${input.organizationId}:${input.requestId}`;
+    if (this.resolvingPermissions.has(key)) throw new ValidationError('permission request decision is already in progress');
+    this.resolvingPermissions.add(key);
+    try {
+      return await this.applyPermissionDecision(token, input);
+    } finally {
+      this.resolvingPermissions.delete(key);
+    }
+  }
+
+  private async applyPermissionDecision(
+    token: string,
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
+  ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const service = new PermissionRequests(this.deps.store, input.organizationId);
     const request = service.requests().find((candidate) => candidate.id === input.requestId);
     if (!request) throw new NotFoundError(`no permission request ${input.requestId}`);
@@ -3447,21 +3481,52 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (humanUserId && !request.recipients.includes(humanUserId)
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this permission request was not routed to you');
+    if (request.status !== 'pending') throw new ValidationError(`request ${request.id} is already ${request.status}`);
     if (input.action === 'approve') {
-      for (const capability of request.capabilities) {
-        const checked = this.deps.tokens.check(token, capability, {
-          taskId: request.taskId,
-          projectId: request.projectId,
-          organizationId: input.organizationId,
-        });
-        if (!checked.ok)
-          throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'}`);
+      let expanded: AuthorizationSelection | undefined;
+      if (request.projectIds?.length) {
+        if (!task || !this.deps.authorization) throw new ValidationError('task authorization is unavailable');
+        const current = previousTaskGrants(task).authorization;
+        if (!current || current.scope !== 'projects'
+          || JSON.stringify(current) !== JSON.stringify(request.baseAuthorization))
+          throw new ValidationError('task authorization changed; submit a new project access request');
+        expanded = { ...current, projectIds: [...new Set([...(current.projectIds ?? []), ...request.projectIds])] };
+        this.deps.authorization.requestedCapabilities(task.projectId, expanded);
+        // Scope applies to every role, including earlier approved extensions.
+        // Check durable human grants per project; delegated agents are limited
+        // to their immediate bearer, never their backing human's authority.
+        const existingCaps = [
+          ...((task.params?._authorization as { capabilities?: string[] })?.capabilities ?? []),
+          ...service.extensionCaps(task.id),
+          ...new VaultItems(this.deps.store, this.deps.broker, undefined, input.organizationId).extensionCaps(task.id),
+        ];
+        for (const projectId of expanded.projectIds!) for (const capability of [...existingCaps, ...request.capabilities]) {
+          const held = caller.kind === 'human'
+            ? allows(this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId), capability)
+            : this.deps.tokens.check(token, capability, { projectId, organizationId: input.organizationId }).ok;
+          if (!held) throw new CapabilityError(`you cannot grant ${capability} in project ${projectId}`);
+        }
       }
+      const selectedProjects = task && previousTaskGrants(task).authorization?.projectIds;
+      for (const capability of expanded ? [] : request.capabilities) {
+        for (const projectId of selectedProjects?.length ? selectedProjects : [request.projectId]) {
+          // Later capability requests also apply throughout an expanded scope.
+          const checked = caller.kind === 'human' && this.deps.authorization && selectedProjects && selectedProjects.length > 1
+            ? { ok: allows(this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId), capability), reason: 'permission denied' }
+            : this.deps.tokens.check(token, capability, {
+              taskId: request.taskId, projectId, organizationId: input.organizationId,
+            });
+          if (!checked.ok)
+            throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'} (project ${projectId})`);
+        }
+      }
+      if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
+        { acceptAttenuation: false, preserveCredentialGrants: true });
     }
     const resolved = service.resolve(request.id, { action: input.action, by: caller.principal });
     const message = input.action === 'approve'
-      ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}. Retry the blocked operation now; a newly scoped token will carry the grant.`
-      : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+      ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
     const event = {
       taskId: request.taskId,
@@ -3471,6 +3536,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         requestId: request.id,
         role: request.role,
         capabilities: request.capabilities,
+        projectIds: request.projectIds,
         action: input.action,
         resolvedBy: caller.principal,
         resumed: resume.resumed,

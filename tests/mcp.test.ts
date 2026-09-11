@@ -187,7 +187,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     const result: any = await c.callTool({
       name: 'request_permission',
       arguments: {
-        capabilities: ['settings:read'],
+        capabilities: [],
+        projectIds: ['proj_second'],
         audience: ['@creator', '@team:operators'],
         reason: 'Inspect the outbound email configuration.',
       },
@@ -195,7 +196,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
 
     expect(result.isError).toBeFalsy();
     expect(seen).toEqual([{
-      capabilities: ['settings:read'],
+      capabilities: [],
+      projectIds: ['proj_second'],
       audience: ['@creator', '@team:operators'],
       reason: 'Inspect the outbound email configuration.',
     }]);

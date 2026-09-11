@@ -31,6 +31,18 @@ describe('agent permission approval requests', () => {
     expect(requests.extensionCaps('task_1', 'merge')).toEqual([]);
   });
 
+  it('deduplicates project requests by scope and permits scope-only requests', () => {
+    const service = new PermissionRequests(new Store(':memory:'), 'org_personal');
+    const input = { taskId: 'task', projectId: 'home', role: 'do', capabilities: [],
+      projectIds: ['second'], audience: ['@owners'], recipients: ['owner'],
+      reason: 'Read phase work.', requestedBy: 'task-agent:task:do' };
+    const first = service.request(input);
+    expect(service.request(input).id).toBe(first.id);
+    expect(service.request({ ...input, projectIds: ['third'] }).id).not.toBe(first.id);
+    expect(service.resolve(first.id, { action: 'deny', by: 'user:owner' }).projectIds).toEqual(['second']);
+    expect(service.extensionCaps('task')).toEqual([]);
+  });
+
   it('rejects wildcard and unknown capability requests', () => {
     const requests = new PermissionRequests(new Store(':memory:'), 'org_personal');
     const base = {
