@@ -2575,7 +2575,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 #bell-badge { min-width:20px; height:20px; font-size:12px; top:-4px; right:-6px; border:2px solid var(--surface); }
 .notify-sound-options { display:flex; flex-wrap:wrap; align-items:end; gap:16px; margin:16px 0; }
 .notify-sound-options label { display:grid; gap:6px; }
-#notification-alerts { position:fixed; top:64px; right:16px; width:min(380px,calc(100vw - 32px)); z-index:10000; display:grid; gap:8px; }
+/* Keep arrival alerts prominent while leaving error toasts and skip navigation above them. */
+#notification-alerts { position:fixed; top:64px; right:16px; width:min(380px,calc(100vw - 32px)); z-index:95; display:grid; gap:8px; }
 .notification-alert { display:flex; align-items:center; gap:12px; background:var(--surface); color:var(--ink); border:1px solid var(--line); border-left:4px solid #c62828; padding:12px; border-radius:8px; box-shadow:0 8px 28px #0003; }
 .notification-open { flex:1; min-width:0; display:grid; gap:6px; text-align:left; border:0; background:transparent; color:inherit; cursor:pointer; overflow-wrap:anywhere; }
 
