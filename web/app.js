@@ -4108,7 +4108,8 @@ function renderMain() {
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];
+  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings']
+    .filter((tab) => tab !== 'avatars' || S.avatarAvailability?.effective || S.avatars?.length);
   const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', avatars: 'Avatars', settings: 'Project settings' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
@@ -11722,7 +11723,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-avatars">Avatars</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -11744,8 +11745,6 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-avatars"><div>Avatars<small>Whether autonomous principals may be used in this project</small></div></div>
-    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     ${explanationSettingsCard('project')}
@@ -11759,6 +11758,8 @@ function settingsView(proj) {
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
+    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="card" data-settings-advanced hidden>
       <div class="section-h" data-settings-access="project" hidden>Project name</div>
       <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
@@ -11786,20 +11787,21 @@ async function hydrateAvatarAvailability(scope, id) {
     : `/api/organizations/${encodeURIComponent(id)}/avatar-settings`;
   try {
     const policy = await api(url);
-    if (scope === 'organization') {
-      box.innerHTML = `<label class="choice-row compact"><input type="checkbox" ${policy.enabled ? 'checked' : ''}><span><b>Enable Avatars in this organization</b><small>Projects can disable them individually. Disabling preserves every Avatar and its history.</small></span></label>`;
-      box.querySelector('input').addEventListener('change', async (event) => {
-        try { await api(url, { method: 'PUT', body: JSON.stringify({ enabled: event.target.checked }) }); toast(event.target.checked ? 'Avatars enabled' : 'Avatars disabled'); }
-        catch (error) { event.target.checked = !event.target.checked; toast(error.message, true); }
-      });
-      return;
-    }
-    box.innerHTML = `<label class="form-row"><span>Availability</span><select><option value="inherit" ${policy.project === 'inherit' ? 'selected' : ''}>Inherit organization setting</option><option value="enabled" ${policy.project === 'enabled' ? 'selected' : ''}>Enabled</option><option value="disabled" ${policy.project === 'disabled' ? 'selected' : ''}>Disabled</option></select></label><p class="task-sub">Currently <b>${policy.effective ? 'enabled' : 'disabled'}</b>${policy.organization ? '' : ' because Avatars are disabled for the organization'}. Existing Avatars are retained when disabled.</p>`;
-    box.querySelector('select').addEventListener('change', async (event) => {
-      const previous = policy.project;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ value: event.target.value }) }); await loadAvatars().catch(() => {}); toast('Avatar availability saved'); await hydrateAvatarAvailability(scope, id); }
-      catch (error) { event.target.value = previous; toast(error.message, true); }
-    });
+    const enabled = scope === 'organization' ? policy.enabled : policy.effective;
+    box.innerHTML = `<div class="section-h">Avatars</div><p class="task-sub">Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this default in either direction.' : `Organization default: ${policy.organization ? 'enabled' : 'disabled'}. This project ${policy.project === 'inherit' ? 'inherits the default' : 'overrides the default'}.`} Existing Avatars and their history are retained when disabled.</p>
+      <div class="inline-form"><button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button>${scope === 'project' ? `<button type="button" class="btn sm avatar-availability-inherit" ${policy.project === 'inherit' ? 'disabled' : ''}>Use organization default</button>` : ''}</div>`;
+    const save = async (button, body) => {
+      button.disabled = true;
+      try {
+        await api(url, { method: 'PUT', body: JSON.stringify(body) });
+        await loadAvatars().catch(() => {});
+        renderMain();
+        toast('Avatar availability saved');
+      } catch (error) { button.disabled = false; toast(error.message, true); }
+    };
+    box.querySelector('.avatar-availability-toggle').addEventListener('click', (event) => save(event.currentTarget,
+      scope === 'organization' ? { enabled: !enabled } : { value: enabled ? 'disabled' : 'enabled' }));
+    box.querySelector('.avatar-availability-inherit')?.addEventListener('click', (event) => save(event.currentTarget, { value: 'inherit' }));
   } catch (error) { paneError(box, error, () => hydrateAvatarAvailability(scope, id)); }
 }
 
@@ -15619,7 +15621,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-avatars">Avatars</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
@@ -15638,13 +15640,13 @@ function organizationView() {
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
-    <div class="settings-section-title" id="settings-avatars"><div>Avatars<small>Organization-wide availability</small></div></div>
-    ${AVATAR_RISK_NOTE}
-    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
-
     ${globalSettingsView(true)}
 
-    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div><div id="org-misc-slot"></div>
+    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="settings-section-title" id="settings-experimental"><div>Experimental<small>Optional features for this organization</small></div></div>
+    ${AVATAR_RISK_NOTE}
+    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
+    <div id="org-misc-slot"></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
     <div class="card data-export-card" data-settings-access="organization" hidden>
       <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>

@@ -1340,8 +1340,30 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(await response.json()).toHaveProperty('organizationId');
   });
 
+  it('defaults Avatars off and allows projects to override the organization default', async () => {
+    const project = h.store.createProject('Experimental Avatars');
+    const orgUrl = `${base}/api/organizations/${project.organizationId}/avatar-settings`;
+    const projectUrl = `${base}/api/projects/${project.id}/avatar-settings`;
+    const put = async (url: string, body: object) => {
+      const response = await fetch(url, { method: 'PUT', headers: auth(), body: JSON.stringify(body) });
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await (await fetch(orgUrl, { headers: auth() })).json()).toEqual({ enabled: false });
+    expect(await (await fetch(projectUrl, { headers: auth() })).json())
+      .toEqual({ organization: false, project: 'inherit', effective: false });
+    expect((await fetch(orgUrl, { method: 'PUT', headers: auth(), body: '{}' })).status).toBe(400);
+    expect(await put(projectUrl, { value: 'enabled' })).toMatchObject({ effective: true, organization: false });
+    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: false });
+    await put(orgUrl, { enabled: true });
+    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: true });
+    expect(await put(projectUrl, { value: 'disabled' })).toMatchObject({ effective: false, organization: true });
+    await put(orgUrl, { enabled: false });
+  });
+
   it('allows delegated Avatar administration without widening the agent grant', async () => {
     const project = h.store.createProject('Delegated Avatars');
+    h.store.kvSet(`avatars:project:${project.id}`, 'enabled');
     h.store.setOrganizationMembership(project.organizationId!, 'avatar-owner', 'member');
     const authorization = new AuthorizationService(h.store);
     authorization.grant('system:test', { principalId: 'user:avatar-owner', scopeKey: `project:${project.id}`,

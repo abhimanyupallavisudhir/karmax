@@ -65,10 +65,13 @@ ok(
 // The Activity feed is an internal debugging page. Its direct route remains
 // usable, but users must not discover it through the tab bar, command palette,
 // keyboard help, or a g+a shortcut.
-ok(
-  src.includes("const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];"),
-  'project navigation omits the debugging-only Activity tab',
-);
+for (const effective of [false, true]) {
+  const tabs = require('node:vm').runInNewContext(`${extractConst('tabs')} tabs`, {
+    S: { avatarAvailability: { effective }, avatars: [] },
+  });
+  ok(!tabs.includes('activity'), `project navigation omits Activity with Avatars ${effective ? 'enabled' : 'disabled'}`);
+  ok(tabs.includes('tasks') && tabs.includes('settings'), 'project navigation retains tasks and settings');
+}
 ok(!src.includes("id: 'nav.activity'"), 'Activity has no user-facing navigation command');
 
 // ── parseKeybinding ──
