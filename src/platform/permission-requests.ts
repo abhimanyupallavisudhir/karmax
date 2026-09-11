@@ -1,3 +1,4 @@
+import type { AuthorizationSelection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import { CAPABILITIES, type Capability } from './capabilities.js';
@@ -9,6 +10,9 @@ export interface PermissionRequest {
   projectId: string;
   role: string;
   capabilities: Capability[];
+  /** Additive task scope change; approval also revalidates the existing grant. */
+  projectIds?: string[];
+  baseAuthorization?: AuthorizationSelection;
   audience: string[];
   /** Materialized at request time so later membership changes cannot widen who
    * may decide an already-pending elevation. */
@@ -78,6 +82,8 @@ export class PermissionRequests {
     projectId: string;
     role: string;
     capabilities: Capability[];
+    projectIds?: string[];
+    baseAuthorization?: AuthorizationSelection;
     audience: string[];
     recipients: string[];
     avatarRecipients?: string[];
@@ -85,7 +91,8 @@ export class PermissionRequests {
     requestedBy: string;
   }): PermissionRequest {
     const capabilities = [...new Set(input.capabilities.map(exactCapability))];
-    if (!capabilities.length) throw new Error('choose at least one capability');
+    const projectIds = [...new Set((input.projectIds ?? []).map(String))];
+    if (!capabilities.length && !projectIds.length) throw new Error('choose at least one capability or project');
     if (capabilities.length > 32) throw new Error('at most 32 capabilities may be requested');
     const audience = [...new Set(input.audience.map((value) => String(value).trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
@@ -101,6 +108,8 @@ export class PermissionRequests {
       && request.taskId === input.taskId
       && request.role === input.role
       && fingerprint(request.capabilities) === fingerprint(capabilities)
+      && fingerprint(request.projectIds ?? []) === fingerprint(projectIds)
+      && JSON.stringify(request.baseAuthorization) === JSON.stringify(input.baseAuthorization)
       && fingerprint(request.audience) === fingerprint(audience));
     if (existing) return existing;
 
@@ -111,6 +120,7 @@ export class PermissionRequests {
       projectId: input.projectId,
       role: input.role,
       capabilities,
+      ...(projectIds.length ? { projectIds, baseAuthorization: input.baseAuthorization } : {}),
       audience,
       recipients,
       ...(avatarRecipients.length ? { avatarRecipients } : {}),
@@ -124,7 +134,7 @@ export class PermissionRequests {
       principalId: input.requestedBy,
       action: 'permission.requested',
       scopeKey: `project:${input.projectId}`,
-      detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, audience, recipients, avatarRecipients },
+      detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, projectIds, baseAuthorization: input.baseAuthorization, audience, recipients, avatarRecipients },
     });
     return request;
   }
@@ -151,7 +161,7 @@ export class PermissionRequests {
       principalId: input.by,
       action: 'permission.request.resolved',
       scopeKey: `project:${request.projectId}`,
-      detail: { requestId, taskId: request.taskId, role: request.role, capabilities: request.capabilities, action: input.action },
+      detail: { requestId, taskId: request.taskId, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds, action: input.action },
     });
     return request;
   }

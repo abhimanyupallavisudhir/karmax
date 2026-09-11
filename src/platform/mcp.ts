@@ -452,14 +452,15 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'request_permission',
     {
       description:
-        'Request exact missing Karmax capabilities for this task. The request appears in the task Approval Requests tab ' +
+        'Request exact capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in the task Approval Requests tab ' +
         'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, ' +
         '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Only a selected principal that already holds every requested capability can approve; approval resumes the task ' +
+        'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {
-        capabilities: z.array(z.string().trim().min(1)).min(1).max(32),
+        capabilities: z.array(z.string().trim().min(1)).max(32),
+        projectIds: z.array(z.string().trim().min(1)).max(32).optional(),
         audience: z.array(z.string().trim().min(1)).min(1).max(32),
         reason: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),

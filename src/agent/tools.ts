@@ -642,20 +642,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_permission',
     description:
-      'Request exact missing Karmax capabilities for this task. The request appears in Approval Requests and is routed ' +
+      'Request exact Karmax capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ' +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
-      'holds every requested capability can approve. Do not request wildcards. An approval or denial resumes the task.',
+      'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
     parameters: {
       type: 'object',
       properties: {
         capabilities: {
           type: 'array',
           items: { type: 'string' },
-          minItems: 1,
+          minItems: 0,
           maxItems: 32,
           description: 'Exact capability names to add to this task, for example settings:read.',
         },
+        projectIds: { type: 'array', items: { type: 'string' }, maxItems: 32,
+          description: 'Additional project IDs in this organization. Existing projects are retained. Supply capabilities: [] for scope only.' },
         audience: {
           type: 'array',
           items: { type: 'string' },
@@ -1206,6 +1208,7 @@ export function platformToolHandlers(
     async request_permission(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {
         capabilities: Array.isArray(args?.capabilities) ? args.capabilities.map(String) : [],
+        ...(args?.projectIds !== undefined ? { projectIds: args.projectIds } : {}),
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         reason: String(args?.reason ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),

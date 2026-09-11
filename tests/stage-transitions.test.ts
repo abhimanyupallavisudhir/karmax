@@ -9,12 +9,13 @@ import { MANIFESTS } from '../src/contrib/manifests.js';
 const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
 import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
+import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
 import { sameProposalIdentity } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { RunnerPoolService } from '../src/world/runners.js';
 
-function fixture(refreshCredentialHealth?: () => Promise<void>) {
+function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorization = false) {
   const store = new Store(':memory:');
   store.claimPersonalOrganization('test');
   const project = store.createProject('Transitions', { repos: ['/tmp'], defaultBase: 'main', defaultTarget: 'main' });
@@ -60,7 +61,8 @@ function fixture(refreshCredentialHealth?: () => Promise<void>) {
     },
   } as any;
   const runners = new RunnerPoolService(store);
-  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, runners,
+  const authorization = withAuthorization ? new AuthorizationService(store) : undefined;
+  const api = new KarmaxApi({ store, client, authorization, taskQueue: 'test', tokens, runners,
     refreshCredentialHealth } as any);
   const task = store.createTask({
     projectId: project.id,
@@ -84,7 +86,7 @@ function fixture(refreshCredentialHealth?: () => Promise<void>) {
   };
   store.saveView(task.id, view);
   return {
-    store, project, tokens, token, api, task, view, starts, terminated, signalled, runners, client,
+    store, project, tokens, token, api, task, view, starts, terminated, signalled, runners, client, authorization,
     setLiveView(view?: TaskView) { liveViewOverride = view; },
     setGracefulResult(result?: () => Promise<unknown>) { gracefulResult = result; },
   };
@@ -581,6 +583,139 @@ describe('task stage transitions', () => {
       requestId: second.requestId!,
       action: 'deny',
     })).resolves.toMatchObject({ status: 'denied' });
+  });
+
+  it.each(['human', 'delegated-agent'])('%s approves additive scope and mints usable fresh delegation', async (kind) => {
+    const f = fixture(undefined, true);
+    const second = f.store.createProject('Second');
+    for (const projectId of [f.project.id, second.id]) f.authorization!.grant('system:test', {
+      principalId: 'user:test', scopeKey: projectScope(projectId), profileId: 'maintainer',
+    });
+    const initial = { ...f.authorization!.taskGrant('user:test', f.project.id, {
+      level: 'developer', scope: 'projects', projectIds: [f.project.id],
+    }), principal: 'user:test' };
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial });
+    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${f.task.id}:do`, projectIds: [f.project.id], organizationId: 'org_personal',
+      ceiling: ['task:escalate', 'task:read'], grantorCaps: ['task:escalate', 'task:read'] });
+    expect(f.tokens.check(agent.token, 'task:read', { projectId: second.id }).ok).toBe(false);
+    // task:read is already held; it must still ask because scope is missing.
+    const requested = await f.api.requestPermission(agent.token, {
+      capabilities: ['task:read'], projectIds: [second.id, second.id, f.project.id],
+      audience: ['@owners'], reason: 'Read the phase task in the second project.',
+    });
+    expect(requested).toMatchObject({ status: 'needs_approval', projectIds: [second.id] });
+    expect(f.store.getTask(f.task.id)!.params._authorization).toEqual(initial);
+    expect(f.store.getTask(f.task.id)!.lastView?.status).toBe('waiting');
+    let approver = f.token;
+    if (kind === 'delegated-agent') {
+      const human = f.tokens.mintPrincipal('user:test', ['*'], undefined, undefined, 'org_personal').token;
+      const delegation = f.tokens.delegateHuman(human, { taskId: 'approver-task',
+        projectIds: [f.project.id, second.id], organizationId: 'org_personal' })!;
+      approver = f.tokens.mint({ taskId: 'approver-task', profileId: 'do', principal: 'user:test',
+        projectIds: [f.project.id, second.id], organizationId: 'org_personal',
+        ceiling: ['*'], grantorCaps: ['*'], delegationId: delegation.id }).token;
+    }
+    const approval = f.api.resolvePermissionRequest(approver, {
+      organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
+    });
+    await expect(f.api.resolvePermissionRequest(approver, {
+      organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
+    })).rejects.toThrow(/decision is already in progress/);
+    await expect(approval).resolves.toMatchObject({ status: 'granted', resume: { resumed: true } });
+    const expanded = f.store.getTask(f.task.id)!.params._authorization as any;
+    expect(expanded.projectIds).toEqual([f.project.id, second.id]);
+    expect(expanded.level).toBe('developer');
+    expect(expanded.delegationId).toMatch(/^dlg_/);
+    const fresh = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'user:test',
+      projectIds: expanded.projectIds, organizationId: 'org_personal', delegationId: expanded.delegationId,
+      ceiling: expanded.capabilities, grantorCaps: expanded.capabilities });
+    for (const projectId of [f.project.id, second.id])
+      expect(f.tokens.check(fresh.token, 'task:read', { projectId, organizationId: 'org_personal' }).ok).toBe(true);
+    expect(f.tokens.check(agent.token, 'task:read', { projectId: second.id }).ok).toBe(false);
+    await expect(f.api.resolvePermissionRequest(f.token, {
+      organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
+    })).rejects.toThrow(/already granted/);
+  });
+
+  it('checks target-project authority, rejects foreign projects, and leaves scope unchanged on denial', async () => {
+    const f = fixture(undefined, true);
+    const second = f.store.createProject('Second');
+    f.store.setOrganizationMembership('org_personal', 'limited', 'member');
+    f.authorization!.grant('system:test', {
+      principalId: 'user:limited', scopeKey: projectScope(f.project.id), profileId: 'maintainer',
+    });
+    const initial = { level: 'developer', scope: 'projects', projectIds: [f.project.id],
+      capabilities: ['task:read'], principal: 'user:test' };
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial });
+    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
+      principal: 'task-agent:test', projectId: f.project.id, organizationId: 'org_personal',
+      ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+    await expect(f.api.requestPermission(agent, { capabilities: [], projectIds: ['foreign-or-missing'],
+      audience: ['@owners'], reason: 'Read foreign work.' })).rejects.toThrow(/task organization/);
+    const requested = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
+      audience: ['user:limited'], reason: 'Expand project scope only.' });
+    const limited = f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal').token;
+    await expect(f.api.resolvePermissionRequest(limited, {
+      organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
+    })).rejects.toThrow(/cannot grant.*project/);
+    expect(f.store.getTask(f.task.id)!.params._authorization).toEqual(initial);
+    await expect(f.api.resolvePermissionRequest(limited, {
+      organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
+    })).resolves.toMatchObject({ status: 'denied', resume: { resumed: true } });
+    expect(f.store.getTask(f.task.id)!.params._authorization).toEqual(initial);
+  });
+
+  it('requires authority for earlier permission grants belonging to other roles before expanding scope', async () => {
+    const f = fixture(undefined, true);
+    const second = f.store.createProject('Second');
+    f.store.setOrganizationMembership('org_personal', 'limited', 'member');
+    for (const projectId of [f.project.id, second.id]) f.authorization!.grant('system:test', {
+      principalId: 'user:limited', scopeKey: projectScope(projectId), profileId: 'maintainer',
+    });
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: {
+      level: 'developer', scope: 'projects', projectIds: [f.project.id], capabilities: ['task:read'],
+    } });
+    const service = new PermissionRequests(f.store, 'org_personal');
+    const prior = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'merge',
+      capabilities: ['settings:write'], audience: ['@owners'], recipients: ['test'],
+      reason: 'Configure the platform.', requestedBy: 'task-agent:test' });
+    service.resolve(prior.id, { action: 'approve', by: 'user:test' });
+    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
+      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+    const requested = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
+      audience: ['user:limited'], reason: 'Read phase work.' });
+    const limited = f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal').token;
+    await expect(f.api.resolvePermissionRequest(limited, { organizationId: 'org_personal',
+      requestId: requested.requestId!, action: 'approve' })).rejects.toThrow(/cannot grant settings:write/);
+    expect((f.store.getTask(f.task.id)!.params._authorization as any).projectIds).toEqual([f.project.id]);
+  });
+
+  it('rejects stale scope requests and checks subsequent capability grants across all selected projects', async () => {
+    const f = fixture(undefined, true);
+    const second = f.store.createProject('Second');
+    f.store.setOrganizationMembership('org_personal', 'limited', 'member');
+    f.authorization!.grant('system:test', { principalId: 'user:limited',
+      scopeKey: projectScope(f.project.id), profileId: 'maintainer' });
+    const initial = { level: 'developer', scope: 'projects', projectIds: [f.project.id],
+      capabilities: ['task:read'], principal: 'user:test' };
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial });
+    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
+      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+    const request = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
+      audience: ['user:limited'], reason: 'Read phase work.' });
+    const expanded = { ...initial, projectIds: [f.project.id, second.id] };
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: expanded });
+    const limited = f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal').token;
+    await expect(f.api.resolvePermissionRequest(limited, {
+      organizationId: 'org_personal', requestId: request.requestId!, action: 'approve',
+    })).rejects.toThrow(/authorization changed/);
+    const capabilityRequest = await f.api.requestPermission(agent, { capabilities: ['task:edit'],
+      audience: ['user:limited'], reason: 'Edit phase work.' });
+    await expect(f.api.resolvePermissionRequest(limited, {
+      organizationId: 'org_personal', requestId: capabilityRequest.requestId!, action: 'approve',
+    })).rejects.toThrow(/cannot grant task:edit/);
+    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id)).toEqual([]);
   });
 
   it('parks and resumes the requesting Merge role so the next turn receives the grant', async () => {

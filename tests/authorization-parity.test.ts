@@ -29,6 +29,7 @@ describe('human and agent authorization-level parity', () => {
     const store = new Store(':memory:');
     store.claimPersonalOrganization('me');
     const project = store.createProject('Parity');
+    store.kvSet(`avatars:project:${project.id}`, 'enabled');
     const tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
