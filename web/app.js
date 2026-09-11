@@ -7583,30 +7583,6 @@ function promptSecret(title, hint) {
 }
 
 let reviewActionWs = null;
-// Types a browser renders without running anything: opened straight from a
-// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
-// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
-// page opened bare would execute with the console's session. Everything else
-// is downloaded.
-const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
-const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
-function openSandboxedDocument(blobUrl, title) {
-  const w = window.open('', '_blank', 'noopener=no');
-  if (!w) return false;
-  w.document.title = title;
-  const frame = w.document.createElement('iframe');
-  // No allow-same-origin: the document gets an opaque origin, so its scripts
-  // cannot read this console's storage or cookies or call its API as the user.
-  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
-  frame.src = blobUrl;
-  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
-  w.document.body.style.margin = '0';
-  w.document.body.appendChild(frame);
-  return true;
-}
-function safeHref(href) {
-  return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
-}
 function artifactTextKind(contentType, target) {
   const type = contentType.split(';')[0].trim().toLowerCase();
   if (type === 'text/markdown' || /\.(md|markdown)$/i.test(target)) return 'markdown';
@@ -7646,6 +7622,30 @@ function showArtifactReader(text, kind, name, blob) {
   dialog.querySelector('[data-close]').focus();
 }
 
+// Types a browser renders without running anything: opened straight from a
+// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
+// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
+// page opened bare would execute with the console's session. Everything else
+// is downloaded.
+const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
+const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
+function openSandboxedDocument(blobUrl, title) {
+  const w = window.open('', '_blank', 'noopener=no');
+  if (!w) return false;
+  w.document.title = title;
+  const frame = w.document.createElement('iframe');
+  // No allow-same-origin: the document gets an opaque origin, so its scripts
+  // cannot read this console's storage or cookies or call its API as the user.
+  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
+  frame.src = blobUrl;
+  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
+  w.document.body.style.margin = '0';
+  w.document.body.appendChild(frame);
+  return true;
+}
+function safeHref(href) {
+  return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
+}
 async function openArtifact(url, external, target = '') {
   if (external) { if (safeHref(url) !== '#') window.open(url, '_blank', 'noopener'); return; }
   // Artifact endpoints need the auth header, so fetch as a blob then open it.

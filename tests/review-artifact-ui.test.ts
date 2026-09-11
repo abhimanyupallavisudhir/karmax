@@ -35,13 +35,29 @@ describe('review artifact reader', () => {
     expect(t.fetch).toHaveBeenCalledWith('/artifact', { headers: { authorization: 'Bearer test-token' } });
   });
 
-  it('keeps binary and HTML artifacts on the existing open path', async () => {
-    for (const type of ['application/pdf', 'image/png', 'text/html']) {
+  it('keeps inert binary artifacts on the existing open path', async () => {
+    for (const type of ['application/pdf', 'image/png']) {
       const t = setup(type, 'content', 'report');
       await t.run();
       expect(t.show).not.toHaveBeenCalled();
       expect(t.open).toHaveBeenCalledWith('blob:test', '_blank', 'noopener');
     }
+  });
+
+  it('renders HTML artifacts inside a sandboxed frame, never as a bare same-origin blob', async () => {
+    // A `blob:` URL carries the console's origin; an agent-authored page opened
+    // bare would run with the console session. The frame has no allow-same-origin.
+    const frame: Record<string, unknown> = { style: {}, setAttribute: vi.fn() };
+    const popup = { document: { title: '', createElement: () => frame, body: { style: {}, appendChild: vi.fn() } } };
+    const t = setup('text/html', '<script>alert(1)</script>', 'report.html');
+    t.open.mockReturnValueOnce(popup);
+    await t.run();
+    expect(t.show).not.toHaveBeenCalled();
+    expect(t.open).toHaveBeenCalledWith('', '_blank', 'noopener=no');
+    expect(t.open).not.toHaveBeenCalledWith('blob:test', '_blank', 'noopener');
+    expect(frame.setAttribute).toHaveBeenCalledWith('sandbox', expect.not.stringContaining('allow-same-origin'));
+    expect(frame.src).toBe('blob:test');
+    expect(popup.document.body.appendChild).toHaveBeenCalledWith(frame);
   });
 
   it('opens external URLs without fetching them with credentials', async () => {
