@@ -1371,7 +1371,8 @@ body.landing-active {
   color: #10172a;
   overflow: auto;
 }
-.landing-active #app { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
+/* Public documents use normal page scrolling; the console keeps its fixed viewport. */
+.landing-active #app, #app:has(> .legal-shell) { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
 .landing-page {
   --land-ink: #10172a;
   --land-muted: #647086;
@@ -1405,6 +1406,8 @@ body.landing-active {
   display: flex; align-items: center; justify-content: space-between;
   border-bottom: 1px solid var(--land-line);
 }
+.landing-identity { display: flex; align-items: center; gap: 18px; }
+.landing-tagline { margin: 0; color: var(--land-muted); font-size: 14px; white-space: nowrap; }
 .landing-brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 730; letter-spacing: -.03em; }
 .landing-brand .mark { width: 28px; height: 28px; border-radius: 8px; box-shadow: 0 3px 10px rgba(16, 23, 42, .15); }
 .landing-brand span { font-size: 18px; }
@@ -1567,6 +1570,10 @@ body.landing-active {
 }
 @media (max-width: 680px) {
   .landing-nav { width: min(100% - 32px, 1180px); height: 68px; }
+  .landing-identity { gap: 8px; flex-wrap: wrap; }
+  .landing-tagline { font-size: 12px; }
+  .landing-nav { gap: 12px; }
+  .landing-nav-actions { flex-shrink: 0; }
   .landing-text-link, .landing-sign-in { display: none; }
   .landing-hero { width: min(100% - 32px, 1180px); min-height: 0; padding: 54px 0 70px; gap: 46px; }
   .landing-analogy { font-size: 22px; gap: 10px; }

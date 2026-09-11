@@ -16883,7 +16883,7 @@ function renderLanding() {
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation">
-      <a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a>
+      <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
       <div class="landing-nav-actions">
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
@@ -16994,7 +16994,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
