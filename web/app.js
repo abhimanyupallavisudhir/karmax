@@ -7533,13 +7533,59 @@ function reviewActionBtn(a, i) {
 }
 
 let reviewActionWs = null;
-async function openArtifact(url, external) {
+function artifactTextKind(contentType, target) {
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  if (type === 'text/markdown' || /\.(md|markdown)$/i.test(target)) return 'markdown';
+  if (type === 'text/plain' || type === 'text/csv' || type === 'application/json') return 'text';
+  return null;
+}
+
+function showArtifactReader(text, kind, name, blob) {
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card artifact-reader';
+  dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
+  dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
+    <a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    <div class="artifact-reader-content" tabindex="0"></div>`;
+  const content = dialog.querySelector('.artifact-reader-content');
+  if (kind === 'markdown') {
+    content.classList.add('msg-text', 'md');
+    content.innerHTML = renderMarkdown(text);
+  } else {
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    content.appendChild(pre);
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  const download = dialog.querySelector('[data-download]');
+  download.href = objectUrl;
+  download.download = name;
+  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    URL.revokeObjectURL(objectUrl);
+    dialog.remove();
+    if (previousFocus?.isConnected) previousFocus.focus();
+  }, { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  dialog.querySelector('[data-close]').focus();
+}
+
+async function openArtifact(url, external, target = '') {
   if (external) { window.open(url, '_blank', 'noopener'); return; }
-  // Artifact endpoints need the auth header, so fetch as a blob then open it.
   try {
     const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
     if (!res.ok) { toast('could not open artifact', true); return; }
-    const obj = URL.createObjectURL(await res.blob());
+    const blob = await res.blob();
+    const name = target.replace(/\\/g, '/').split('/').pop()
+      || /filename="([^"]+)"/i.exec(res.headers.get('content-disposition') || '')?.[1] || 'Attachment';
+    const kind = artifactTextKind(res.headers.get('content-type') || '', name);
+    if (kind) {
+      showArtifactReader(await blob.text(), kind, name, blob);
+      return;
+    }
+    const obj = URL.createObjectURL(blob);
     window.open(obj, '_blank', 'noopener');
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
@@ -7577,7 +7623,7 @@ function wireReviewActions(v) {
       btn.disabled = true;
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
-        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'open') { await openArtifact(r.url, r.external, v.reviewInfo?.actions?.[idx]?.target); return; }
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
