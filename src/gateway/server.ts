@@ -4828,8 +4828,31 @@ export class Gateway {
         const conversation = await api.taskConversation(token, taskId, role);
         let message: string | undefined;
         let sourceEvent: ReturnType<typeof store.eventBySeq>;
+        let sourceRequest: { text: string; ts: number } | undefined;
         let userContext: string[] = [];
-        if (sourceKey.startsWith('message:')) {
+        if (sourceKey.startsWith('input-request:')) {
+          const saved = store.eventsOfType(taskId, 'conversation.explanation')
+            .find((event) => event.payload?.role === role && event.payload?.sourceKey === sourceKey && event.payload?.sourceRequest);
+          if (saved) {
+            const source = saved.payload.sourceRequest as { text?: unknown; ts?: unknown };
+            if (typeof source.text === 'string' && typeof source.ts === 'number') {
+              sourceRequest = { text: source.text, ts: source.ts };
+            }
+          } else {
+            const view = await api.getTaskView(token, taskId);
+            const followUp = view?.actions.find((action) => action.name === 'followUp');
+            const detail = view?.waitingFor?.detail?.trim();
+            if (!view || view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !detail
+              || !followUp || (followUp.roles?.length && !followUp.roles.includes(role))
+              || sourceKey !== `input-request:${view.updatedAt}` || body.inputRequest !== detail) {
+              return this.json(res, 409, { error: 'This input request has changed. Refresh the conversation and try again.' });
+            }
+            sourceRequest = { text: detail, ts: view.updatedAt };
+          }
+          message = sourceRequest?.text;
+          userContext = conversation.messages.filter((item) => item.role === 'user'
+            && (!Number(item.ts) || Number(item.ts) <= Number(sourceRequest?.ts))).map((item) => item.text);
+        } else if (sourceKey.startsWith('message:')) {
           const id = sourceKey.slice('message:'.length);
           const index = conversation.messages.findIndex((item) => item.id === id && item.role === 'agent');
           if (index >= 0) {
@@ -4876,6 +4899,7 @@ export class Gateway {
           const event = { taskId, type: 'conversation.explanation', ts: Date.now(), payload: {
             role, sourceKey, text: explanation, provider, model: settings.model,
             ...(sourceEvent ? { sourceEvent } : {}),
+            ...(sourceRequest ? { sourceRequest } : {}),
           } };
           const seq = this.emitTaskEvent(event);
           return this.json(res, 200, { ...event, seq });
