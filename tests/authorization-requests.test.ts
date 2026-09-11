@@ -151,6 +151,7 @@ describe('initial authorization delegation requests', () => {
       authorization: { ...avatarAuthorization, principal: 'user:approver' },
       runtime: { provider: 'mock' }, createdAt: now, updatedAt: now,
     };
+    f.store.kvSet(`avatars:project:${f.project.id}`, 'enabled');
     f.store.upsertAvatar(authorizer);
     const request = await f.api.requestAuthorization(f.tokenFor('requester'), {
       projectId: f.project.id, target: { kind: 'task', taskId: task.id },

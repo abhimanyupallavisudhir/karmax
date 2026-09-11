@@ -2787,17 +2787,18 @@ export class Gateway {
 
       // Avatars are durable autonomous principals owned by one user. Their
       // prompt/runtime/authority are edited together so a caller never observes
-      // a half-updated identity. Organization/project kill switches are separate
+      // a half-updated identity. Organization defaults and project overrides are separate
       // policy and therefore do not rewrite the Avatar itself.
       const organizationAvatarSettings = p.match(/^\/api\/organizations\/([^/]+)\/avatar-settings$/);
       if (organizationAvatarSettings) {
         const organizationId = organizationAvatarSettings[1]!;
         if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
         if (method === 'GET') return this.json(res, 200, {
-          enabled: store.kvGet(`avatars:organization:${organizationId}`) !== 'disabled',
+          enabled: store.kvGet(`avatars:organization:${organizationId}`) === 'enabled',
         });
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (typeof b.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be a boolean' });
           store.kvSet(`avatars:organization:${organizationId}`, b.enabled === false ? 'disabled' : 'enabled');
           store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor), action: 'avatar.organization-policy.changed',
             scopeKey: `organization:${organizationId}`, detail: { enabled: b.enabled !== false } });

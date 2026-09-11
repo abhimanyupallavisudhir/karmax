@@ -22,3 +22,45 @@ test('existing agent controls expose callable Avatars', () => {
   assert.match(app, /Project\/default agent/);
   assert.match(css, /\.af-avatar-note/);
 });
+
+const vm = require('node:vm');
+const hydrateSource = app.slice(app.indexOf('async function hydrateAvatarAvailability('), app.indexOf('\nasync function hydrateProjectSecrets('));
+
+for (const scope of ['organization', 'project']) {
+  test(`${scope} Experimental buttons save explicit enablement and refresh the UI`, async () => {
+    const listeners = {};
+    const box = { innerHTML: '', querySelector: (selector) => ({ addEventListener: (_, fn) => { listeners[selector] = fn; } }) };
+    const writes = [];
+    let renders = 0;
+    const context = vm.createContext({
+      $: () => box,
+      api: async (url, options) => {
+        if (options) { writes.push({ url, body: JSON.parse(options.body) }); return {}; }
+        return scope === 'organization' ? { enabled: false } : { organization: false, project: 'inherit', effective: false };
+      },
+      loadAvatars: async () => {}, renderMain: () => { renders++; }, toast: () => {},
+      paneError: (_, error) => { throw error; },
+    });
+    vm.runInContext(hydrateSource, context);
+    await context.hydrateAvatarAvailability(scope, 'example');
+    assert.match(box.innerHTML, /Enable Avatars/);
+    assert.match(box.innerHTML, /Disabled by default/);
+    await listeners['.avatar-availability-toggle']({ currentTarget: {} });
+    assert.deepEqual(writes[0], { url: `/api/${scope === 'project' ? 'projects' : 'organizations'}/example/avatar-settings`, body: scope === 'project' ? { value: 'enabled' } : { enabled: true } });
+    assert.equal(renders, 1);
+    if (scope === 'project') {
+      await listeners['.avatar-availability-inherit']({ currentTarget: {} });
+      assert.deepEqual(writes[1].body, { value: 'inherit' });
+    }
+  });
+}
+
+test('disabled empty projects hide the Avatar tab and settings expose Experimental sections', () => {
+  const source = app.match(/const tabs = \['tasks', 'queue', 'wiki', 'avatars', 'settings'\][\s\S]*?;/)[0];
+  for (const effective of [false, true]) {
+    const tabs = vm.runInNewContext(`${source}; tabs`, { S: { avatarAvailability: { effective }, avatars: [] } });
+    assert.equal(tabs.includes('avatars'), effective);
+  }
+  assert.match(app, /id="project-experimental"><div>Experimental/);
+  assert.match(app, /id="settings-experimental"><div>Experimental/);
+});

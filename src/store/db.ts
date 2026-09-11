@@ -3989,11 +3989,11 @@ export class Store {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`no project ${projectId}`);
     const organizationId = project.organizationId ?? 'org_personal';
-    const organization = this.kvGet(`avatars:organization:${organizationId}`) !== 'disabled';
+    const organization = this.kvGet(`avatars:organization:${organizationId}`) === 'enabled';
     const raw = this.kvGet(`avatars:project:${projectId}`);
     const projectSetting: AvatarAvailability['project'] = raw === 'enabled' || raw === 'disabled' ? raw : 'inherit';
     return { organization, project: projectSetting,
-      effective: organization && projectSetting !== 'disabled' };
+      effective: projectSetting === 'inherit' ? organization : projectSetting === 'enabled' };
   }
 
   // ── identities are owned by Better Auth; these rows contain only karmax policy ──
