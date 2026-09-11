@@ -55,12 +55,18 @@ for (const scope of ['organization', 'project']) {
   });
 }
 
-test('disabled empty projects hide the Avatar tab and settings expose Experimental sections', () => {
+test('disabled empty projects hide the Avatar tab and settings place Experimental under Advanced', () => {
   const source = app.match(/const tabs = \['tasks', 'queue', 'wiki', 'avatars', 'settings'\][\s\S]*?;/)[0];
   for (const effective of [false, true]) {
     const tabs = vm.runInNewContext(`${source}; tabs`, { S: { avatarAvailability: { effective }, avatars: [] } });
     assert.equal(tabs.includes('avatars'), effective);
   }
-  assert.match(app, /id="project-experimental"><div>Experimental/);
-  assert.match(app, /id="settings-experimental"><div>Experimental/);
+  for (const prefix of ['project', 'settings']) {
+    assert.ok(!app.includes(`href="#${prefix}-experimental"`), 'Experimental has no separate navigation entry');
+    const advanced = app.indexOf(`<div class="settings-section-title" id="${prefix}-advanced"`);
+    const experimental = app.indexOf(`<div class="settings-section-title" id="${prefix}-experimental"`);
+    assert.ok(advanced >= 0 && experimental > advanced, 'Experimental follows Advanced');
+    assert.equal((app.slice(advanced, experimental).match(/settings-section-title/g) || []).length, 1,
+      'Experimental belongs to the Advanced pane');
+  }
 });
