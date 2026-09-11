@@ -1,4 +1,5 @@
 import { canonicalAccountName } from '../domain/account-names.js';
+import { validGitBranch } from '../util/git-ref.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
@@ -3734,6 +3735,7 @@ export class Store {
   createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Tag {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
+    assertTagColor(input.color);
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
     // types the path. `color`/`description` apply to the leaf; `kind` applies to the
@@ -3802,6 +3804,7 @@ export class Store {
   }
 
   updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | 'flag' | null; description?: string | null }): Tag | undefined {
+    assertTagColor(patch.color);
     const cur = this.getTag(id);
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
@@ -4270,12 +4273,23 @@ export class Store {
   }
 
   appendEvent(ev: KarmaxEvent): number {
-    const info = this.db
-      .prepare('INSERT INTO events (taskId, type, ts, payload) VALUES (?, ?, ?, ?)')
-      .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload));
-    const seq = Number(info.lastInsertRowid);
-    this.materializeInbox(seq, ev);
-    return seq;
+    // The event row and its inbox/delivery materialization are one write: a
+    // failure inside `materializeInbox` after the insert would leave an event
+    // whose caller sees an exception, retries, and appends it twice.
+    const nested = this.db.inTransaction();
+    if (!nested) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const info = this.db
+        .prepare('INSERT INTO events (taskId, type, ts, payload) VALUES (?, ?, ?, ?)')
+        .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload));
+      const seq = Number(info.lastInsertRowid);
+      this.materializeInbox(seq, ev);
+      if (!nested) this.db.exec('COMMIT');
+      return seq;
+    } catch (error) {
+      if (!nested) this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   eventsSince(taskId: string, seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
@@ -6133,12 +6147,6 @@ function sha256(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-function validGitBranch(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/.test(value)
-    && !value.includes('..') && !value.includes('@{') && !value.includes('//')
-    && !value.endsWith('/') && !value.endsWith('.') && !value.endsWith('.lock');
-}
-
 export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
@@ -6338,4 +6346,11 @@ function rowToTask(r: any): TaskRecord {
     notes: r.notes ?? undefined,
     lastView: r.lastView ? JSON.parse(r.lastView) : undefined,
   };
+}
+
+/** A tag colour is rendered into an inline `style` custom property; only a
+ *  hex literal is accepted so it can never carry a CSS declaration. */
+function assertTagColor(color: string | null | undefined): void {
+  if (color == null || color === '') return;
+  if (!/^#[0-9a-fA-F]{3,8}$/.test(color)) throw new Error('tag color must be a hex colour like #4a90d9');
 }

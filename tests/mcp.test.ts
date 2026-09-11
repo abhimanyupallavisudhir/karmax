@@ -440,7 +440,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     }).token;
     const res: any = await client.callTool({ name: 'save_skill', arguments: { name: 'greet', content: '# hi' } });
     expect(res.isError).toBeFalsy();
-    expect(fs.existsSync(path.join(contentDir, 'skills', 'greet.md'))).toBe(true);
+    // Saved under the calling tenant's directory, never the installation-wide one.
+    expect(fs.existsSync(path.join(contentDir, 'skills', 'organizations', 'org_personal', 'greet.md'))).toBe(true);
   });
 
   it('denies a tool call when the token lacks the capability', async () => {

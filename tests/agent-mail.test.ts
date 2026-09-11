@@ -10,6 +10,7 @@ import {
   parseMultipart,
   parseUrlEncoded,
   ingestSecret,
+  ingestScope,
   cloudflareWorkerScript,
   type AgentMailStore,
 } from '../src/autonomy/agent-mail.js';
@@ -156,11 +157,25 @@ describe('webhook body parsers + secret + worker script', () => {
     expect(fields.text).toBe('code 456789');
     expect(fields.file).toBeUndefined();
   });
-  it('mints a stable ingest secret in the store (no env var)', () => {
+  it('mints a stable per-organization ingest secret that only reaches that organization', () => {
     const store = memStore();
-    const s = ingestSecret(store);
+    const s = ingestSecret(store, 'org_a');
     expect(s.length).toBeGreaterThan(15);
-    expect(ingestSecret(store)).toBe(s);
+    expect(ingestSecret(store, 'org_a')).toBe(s);
+    expect(ingestSecret(store, 'org_b')).not.toBe(s);
+    expect(ingestScope(store, s)).toEqual({ organizationId: 'org_a' });
+    expect(ingestScope(store, 'nope')).toBeUndefined();
+    expect(ingestScope(store, undefined)).toBeUndefined();
+    // the installation-wide secret earlier releases minted keeps working, for every organization
+    store.kvSet('agent-mail:secret', 'legacy-secret');
+    expect(ingestScope(store, 'legacy-secret')).toEqual({});
+    expect(ingestScope(store, 'env-secret', 'env-secret')).toEqual({});
+    // a message for org_b's address is dropped when delivered with org_a's secret
+    const mail = new AgentMail(store);
+    const b = mail.address('org_b');
+    expect(mail.ingest({ from: 'x@y.z', to: b, text: 'code 123456' }, 'org_a').delivered).toBe(false);
+    expect(mail.ingest({ from: 'x@y.z', to: b, text: 'code 123456' }, 'org_b').delivered).toBe(true);
+    expect(mail.ingest({ from: 'x@y.z', to: b, text: 'code 654321' }).delivered).toBe(true);
   });
   it('the Cloudflare worker script embeds the full webhook URL and relays raw MIME', () => {
     const script = cloudflareWorkerScript('https://kx.example/api/agent-mail/ingest?secret=abc');

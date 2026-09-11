@@ -23,10 +23,26 @@ export class WorkerManager {
   private externals: ExternalWorkflowRef[] = [];
   private refreshing?: Promise<void>;
 
+  /** Why the live worker stopped, if it did (see `watch`). */
+  failure?: unknown;
+
   constructor(
     private conn: TemporalConn,
     private deps: ActivityDeps = {},
+    /** Called once if the live worker's `run()` rejects (connection lost, bundle
+     *  runtime error). Without it the gateway kept serving with no poller and
+     *  every task stalled silently. */
+    private onFailure: (error: unknown) => void = (error) => console.error('[worker] stopped unexpectedly:', error),
   ) {}
+
+  /** `run()` resolves only on shutdown; a rejection means the worker is gone. */
+  private watch(handle: WorkerHandle, run: Promise<void>): Promise<void> {
+    return run.catch((error) => {
+      if (this.handle !== handle) return; // an old worker draining after a refresh
+      this.failure = error;
+      this.onFailure(error);
+    });
+  }
 
   /** Currently-registered external packages (version-qualified). */
   get packages(): ExternalWorkflowRef[] {
@@ -37,7 +53,7 @@ export class WorkerManager {
   async start(externals: ExternalWorkflowRef[] = []): Promise<void> {
     this.externals = externals;
     this.handle = await this.build(externals);
-    this.runPromise = this.handle.run();
+    this.runPromise = this.watch(this.handle, this.handle.run());
   }
 
   private async build(externals: ExternalWorkflowRef[]): Promise<WorkerHandle> {
@@ -54,10 +70,10 @@ export class WorkerManager {
     // Chain onto any in-progress refresh so swaps stay ordered.
     const run = async () => {
       const next = await this.build(externals);
-      const nextRun = next.run();
       const old = this.handle;
-      const oldRun = this.runPromise;
       this.handle = next;
+      const nextRun = this.watch(next, next.run());
+      const oldRun = this.runPromise;
       this.runPromise = nextRun;
       this.externals = externals;
       old?.shutdown(); // graceful drain: stop polling, let in-flight finish

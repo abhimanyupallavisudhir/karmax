@@ -14,10 +14,16 @@ export interface ResolveSkill {
   summary: string;
 }
 
-/** Index the saved resolve skills under `<contentDir>/skills/`. Reads the canonical
- *  `resolve/<slug>.md` subdir and the legacy flattened `resolve-<slug>.md` form. */
-export function listResolveSkills(contentDir: string): ResolveSkill[] {
-  const skillsDir = path.join(contentDir, 'skills');
+/** Where one organization's agent-saved skills live. The installation-wide
+ *  `<contentDir>/skills/` remains the operator's (and the pre-tenancy) store. */
+export function organizationSkillsDir(contentDir: string, organizationId: string): string {
+  return path.join(contentDir, 'skills', 'organizations', organizationId);
+}
+
+/** Index the saved resolve skills: the operator's `<contentDir>/skills/` (canonical
+ *  `resolve/<slug>.md` subdir plus the legacy flattened `resolve-<slug>.md` form) and,
+ *  when an organization is given, that tenant's own directory. */
+export function listResolveSkills(contentDir: string, organizationId?: string): ResolveSkill[] {
   const out: ResolveSkill[] = [];
   const seen = new Set<string>();
   const add = (name: string, file: string) => {
@@ -30,17 +36,21 @@ export function listResolveSkills(contentDir: string): ResolveSkill[] {
     } catch { /* unreadable — index by name alone */ }
     out.push({ name, summary: summary.slice(0, 200) });
   };
-  // Canonical: skills/resolve/<slug>.md
-  try {
-    const dir = path.join(skillsDir, 'resolve');
-    for (const f of fs.readdirSync(dir)) if (f.endsWith('.md')) add(`resolve/${f.replace(/\.md$/, '')}`, path.join(dir, f));
-  } catch { /* none */ }
-  // Legacy flattened: skills/resolve-<slug>.md (before saveSkill kept subdirs)
-  try {
-    for (const f of fs.readdirSync(skillsDir)) {
-      if (f.startsWith('resolve-') && f.endsWith('.md')) add(`resolve/${f.slice('resolve-'.length).replace(/\.md$/, '')}`, path.join(skillsDir, f));
-    }
-  } catch { /* none */ }
+  const roots = [path.join(contentDir, 'skills')];
+  if (organizationId) roots.unshift(organizationSkillsDir(contentDir, organizationId)); // the tenant's own fix wins a name clash
+  for (const skillsDir of roots) {
+    // Canonical: <root>/resolve/<slug>.md
+    try {
+      const dir = path.join(skillsDir, 'resolve');
+      for (const f of fs.readdirSync(dir)) if (f.endsWith('.md')) add(`resolve/${f.replace(/\.md$/, '')}`, path.join(dir, f));
+    } catch { /* none */ }
+    // Legacy flattened: <root>/resolve-<slug>.md (before saveSkill kept subdirs)
+    try {
+      for (const f of fs.readdirSync(skillsDir)) {
+        if (f.startsWith('resolve-') && f.endsWith('.md')) add(`resolve/${f.slice('resolve-'.length).replace(/\.md$/, '')}`, path.join(skillsDir, f));
+      }
+    } catch { /* none */ }
+  }
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 

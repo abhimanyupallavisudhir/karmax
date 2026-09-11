@@ -43,6 +43,8 @@ global.wireProjectDrag = () => {};
 global.newProject = () => {};
 global.draggingProject = null;
 global.editingRailItem = null;
+// The tab list renderRail shares with renderMain (a module constant, not a function).
+eval(src.match(/const PROJECT_SCOPED_TABS = \[[^\]]*\];/)[0].replace('const ', 'global.PROJECT_SCOPED_TABS = ').replace(/^global\.PROJECT_SCOPED_TABS = PROJECT_SCOPED_TABS = /, 'global.PROJECT_SCOPED_TABS = '));
 global.S = {
   projectId: 'p1',
   organizationId: 'o1',
