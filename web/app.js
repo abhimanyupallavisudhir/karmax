@@ -12640,7 +12640,7 @@ const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent
 // `onclick="window.__toast(…)"` threw `TypeError: window.__toast is not a
 // function` on every tap — silently breaking the affordance for exactly the
 // touch users it was added for.
-function policyTip(text) { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">ⓘ</button>`; }
+function policyTip(text, icon = 'ⓘ') { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">${esc(icon)}</button>`; }
 
 function clearTotpQrPreview(control, clearValue = false) {
   if (!control) return;
@@ -12739,6 +12739,13 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task">This task</button>
           <button class="btn sm" data-vreq-act="always">Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${policyTip(`Once: Approves one credential operation, consumed when used, not at the next agent turn.
+
+This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
+
+Always: Does the same as “This task” and sets this credential’s ${request.mode === 'reveal' ? '“agent sees”' : '“blind use”'} policy to “auto” until changed. The other policy stays unchanged. Future tasks still need a grant for this credential; it is not automatically included in every task. Task-specific policy overrides still apply.
+
+Deny: Rejects this request.`, '?')}
         </div>
       </div>`).join('')
     : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
