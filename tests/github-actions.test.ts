@@ -187,7 +187,7 @@ describe('GitHub Actions API', () => {
 
   it('inspects failed jobs, steps, bounded logs, and artifact metadata without leaking signed URLs or auth', async () => {
     const calls: Array<{ url: string; auth?: string }> = [];
-    const signed = 'https://results.example/log.txt?sig=super-secret';
+    const signed = 'https://results.blob.core.windows.net/log.txt?sig=super-secret';
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = String(input);
       calls.push({ url, auth: (init.headers as Record<string, string> | undefined)?.authorization });

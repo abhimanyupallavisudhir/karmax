@@ -42,3 +42,5 @@ CI separately runs a checksum-pinned `actionlint` against every file in
 `concurrency.queue` key and proves the schema gate rejects it. This prevents the
 known invalid-workflow case before merge while the runtime monitor remains the
 backstop for provider-side rejection and configuration drift.
+
+For successful deployment verification and targeted job logs, see [GitHub Actions agent inspection](github-actions-inspection.md).

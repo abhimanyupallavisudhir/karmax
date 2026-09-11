@@ -1,3 +1,4 @@
+import type { GithubActionsInspectOptions } from '../integrations/github-actions.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
@@ -62,7 +63,8 @@ export interface PlatformOps {
   listEvents(taskId: string, since?: number): Promise<unknown>;
   listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
     workflow?: string | number; page?: number; perPage?: number }): Promise<unknown>;
-  inspectGithubActionsRun(a: { repository?: string; runId: number }): Promise<unknown>;
+  listGithubActionsWorkflows(a: { repository?: string; page?: number; perPage?: number }): Promise<unknown>;
+  inspectGithubActionsRun(a: { repository?: string; runId: number } & GithubActionsInspectOptions): Promise<unknown>;
   manageGithubActionsRun(a: { repository?: string; runId: number; action: 'rerun-failed' | 'rerun' | 'cancel' }): Promise<unknown>;
   dispatchGithubActionsWorkflow(a: { repository?: string; workflow: string | number; ref: string;
     inputs?: Record<string, string | number | boolean> }): Promise<unknown>;
@@ -129,6 +131,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     forkAgent: (a) => api.forkTaskAgent(getToken(), a),
     listEvents: (id, since) => api.taskEvents(getToken(), id, since),
     listGithubActionsRuns: (a) => api.listGithubActionsRuns(getToken(), a as any),
+    listGithubActionsWorkflows: (a) => api.listGithubActionsWorkflows(getToken(), a),
     inspectGithubActionsRun: (a) => api.inspectGithubActionsRun(getToken(), a),
     manageGithubActionsRun: (a) => api.manageGithubActionsRun(getToken(), a),
     dispatchGithubActionsWorkflow: (a) => api.dispatchGithubActionsWorkflow(getToken(), a),
@@ -232,7 +235,16 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       if (a.perPage !== undefined) query.set('perPage', String(a.perPage));
       return req(`/api/agent/github/actions/runs?${query}`);
     },
-    inspectGithubActionsRun: (a) => req(`/api/agent/github/actions/runs/${a.runId}${a.repository ? `?repository=${encodeURIComponent(a.repository)}` : ''}`),
+    listGithubActionsWorkflows: (a) => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(a)) if (value !== undefined) query.set(key, String(value));
+      return req(`/api/agent/github/actions/workflows?${query}`);
+    },
+    inspectGithubActionsRun: (a) => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(a)) if (key !== 'runId' && value !== undefined) query.set(key, String(value));
+      return req(`/api/agent/github/actions/runs/${a.runId}?${query}`);
+    },
     manageGithubActionsRun: (a) => req(`/api/agent/github/actions/runs/${a.runId}`, {
       method: 'POST', body: JSON.stringify({ repository: a.repository, action: a.action }),
     }),
@@ -498,9 +510,20 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       page: z.number().int().min(1).max(1000).optional(), perPage: z.number().int().min(1).max(100).optional(),
     },
   }, async (a) => wrap(() => ops.listGithubActionsRuns(a)));
+  server.registerTool('list_github_actions_workflows', {
+    description: 'Discover workflow ids, paths and enabled states for an attached repository. Requires github:actions:read.',
+    inputSchema: { repository: z.string().optional(), page: z.number().int().min(1).max(1000).optional(),
+      perPage: z.number().int().min(1).max(100).optional() },
+  }, async (a) => wrap(() => ops.listGithubActionsWorkflows(a)));
   server.registerTool('inspect_github_actions_run', {
-    description: 'Inspect one GitHub Actions run, its jobs, failed steps, bounded diagnostic log excerpts, and artifact metadata. Signed log URLs and GitHub tokens are never returned.',
-    inputSchema: { repository: z.string().optional(), runId: z.number().int().positive() },
+    description: 'Inspect Actions evidence with read authority. Default failure diagnostics; jobs/artifacts are paginated. log selects any job conclusion by jobId and attempt, returning bounded tail output; annotations selects job check diagnostics; pending-deployments shows current approval waits. Check tailComplete/truncation flags. Run headSha or success/skipped does not prove deployment; correlate explicit target, readiness, completion and rollback evidence. Tokens and signed URLs never returned.',
+    inputSchema: { repository: z.string().optional(), runId: z.number().int().positive(),
+      view: z.enum(['failure', 'jobs', 'log', 'artifacts', 'annotations', 'pending-deployments']).optional(),
+      attempt: z.number().int().positive().optional(), jobId: z.number().int().positive().optional(),
+      page: z.number().int().min(1).max(1000).optional(), perPage: z.number().int().min(1).max(100).optional(),
+      offsetLines: z.number().int().min(0).max(1000000).optional(),
+      tailLines: z.number().int().min(1).max(500).optional(), maxChars: z.number().int().min(256).max(32000).optional(),
+    },
   }, async (a) => wrap(() => ops.inspectGithubActionsRun(a)));
   server.registerTool('manage_github_actions_run', {
     description: 'Rerun failed jobs, rerun an entire run, or cancel a run in a repository attached to this task’s project. Requires separately approved GitHub Actions write authority.',

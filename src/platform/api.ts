@@ -67,7 +67,7 @@ import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, 
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
-import type { GithubActionsStatus } from '../integrations/github-actions.js';
+import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integrations/github-actions.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -3674,7 +3674,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   /** Resolve an Actions request through the calling task's project attachment.
    * Repository names supplied in prompts are never an authority source. */
-  private githubActionsTask(token: string, tool: 'list_github_actions_runs' | 'inspect_github_actions_run'
+  private githubActionsTask(token: string, tool: 'list_github_actions_workflows' | 'list_github_actions_runs' | 'inspect_github_actions_run'
     | 'manage_github_actions_run' | 'dispatch_github_actions_workflow', repositoryRef?: string) {
     const caller = this.require(token, tool);
     if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
@@ -3716,13 +3716,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return result;
   }
 
-  async inspectGithubActionsRun(token: string, input: { repository?: string; runId: number }) {
+  async listGithubActionsWorkflows(token: string, input: { repository?: string; page?: number; perPage?: number }) {
+    const { task, repository, api } = this.githubActionsTask(token, 'list_github_actions_workflows', input.repository);
+    const result = await api.listWorkflows(`${repository.owner}/${repository.name}`, input);
+    this.githubActionsEvent(task.id, 'github.actions.workflows-read', {
+      repositoryId: repository.id, page: result.page, returned: result.workflows.length,
+    });
+    return result;
+  }
+
+  async inspectGithubActionsRun(token: string, input: { repository?: string; runId: number } & GithubActionsInspectOptions) {
     const { task, repository, api } = this.githubActionsTask(token, 'inspect_github_actions_run', input.repository);
-    const result = await api.inspectFailure(`${repository.owner}/${repository.name}`, input.runId);
+    const { repository: _repository, runId, ...options } = input;
+    const result = await api.inspectRun(`${repository.owner}/${repository.name}`, runId, options);
     this.githubActionsEvent(task.id, 'github.actions.run-inspected', {
-      repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`, runId: input.runId,
-      jobs: result.jobs.length, failedJobs: result.failedJobs.length, artifacts: result.artifacts.length,
-      logBytes: result.failedJobs.reduce((total, job) => total + (job.log?.downloadedBytes ?? 0), 0),
+      repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`, runId,
+      view: input.view ?? 'failure', attempt: input.attempt, jobId: input.jobId, page: input.page,
     });
     return result;
   }

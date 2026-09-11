@@ -23,8 +23,9 @@ describe('task-scoped GitHub Actions authority', () => {
     const task = store.createTask({ projectId: project.id, title: 'Repair deploy', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'diagnose it' } });
     const actions = {
+      listWorkflows: vi.fn(async () => ({ page: 1, workflows: [] })),
       listRuns: vi.fn(async () => ({ total: 1, page: 1, perPage: 30, runs: [{ id: 42 }] })),
-      inspectFailure: vi.fn(async () => ({ run: { id: 42 }, jobs: [], failedJobs: [], artifacts: [], notices: [] })),
+      inspectRun: vi.fn(async () => ({ run: { id: 42 }, jobs: [], failedJobs: [], artifacts: [], notices: [] })),
       rerun: vi.fn(async () => ({ accepted: true, action: 'rerun-failed' })),
       cancel: vi.fn(async () => ({ accepted: true, action: 'cancel' })),
       dispatch: vi.fn(async () => ({ accepted: true, workflow: 'deploy.yml', ref: 'main' })),
@@ -60,6 +61,19 @@ describe('task-scoped GitHub Actions authority', () => {
       'github.actions.runs-read', 'github.actions.run-inspected',
       'github.actions.run-operated', 'github.actions.workflow-dispatched',
     ]);
+    for (const view of ['jobs', 'log', 'artifacts', 'annotations', 'pending-deployments'] as const) {
+      await api.inspectGithubActionsRun(read, { runId: 42, view, attempt: 1, jobId: 99, page: 2 });
+      expect(actions.inspectRun).toHaveBeenLastCalledWith('acme/app', 42, { view, attempt: 1, jobId: 99, page: 2 });
+      await expect(api.inspectGithubActionsRun(write, { runId: 42, view })).rejects.toBeInstanceOf(CapabilityError);
+      await expect(api.inspectGithubActionsRun(read, { runId: 42, view, repository: 'acme/outside' })).rejects.toBeInstanceOf(NotFoundError);
+    }
+    await api.listGithubActionsWorkflows(read, { page: 1 });
+    await expect(api.listGithubActionsWorkflows(write, {})).rejects.toBeInstanceOf(CapabilityError);
+    await expect(api.listGithubActionsWorkflows(read, { repository: 'acme/outside' })).rejects.toBeInstanceOf(NotFoundError);
+    const wrongProject = tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: other.id,
+      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] }).token;
+    await expect(api.inspectGithubActionsRun(wrongProject, { runId: 42, view: 'log', jobId: 99 })).rejects.toBeInstanceOf(CapabilityError);
+    expect(JSON.stringify(store.eventsSince(task.id, 0))).not.toMatch(/excerpt|failedJobs|installation-secret/);
     store.close();
   });
 
