@@ -4,6 +4,33 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
 describe('organization and collaboration domain', () => {
+  it('routes email by urgency for task and resource asks, retaining legacy defaults', async () => {
+    const store = new Store(':memory:');
+    const org = store.createOrganization({ name: 'Email', ownerUserId: 'owner' });
+    const project = store.createProject('App', {}, org.id);
+    store.setDeliveryPreferences({ userId: 'owner', organizationId: org.id,
+      browser: true, email: false, slack: false, routine: true, emailUrgencies: { critical: true, high: false } });
+    expect(store.getDeliveryPreferences('owner', org.id).emailUrgencies).toEqual({ critical: true, high: false });
+    for (const urgency of ['critical', 'high'] as const) {
+      const task = store.createTask({ projectId: project.id, title: urgency, workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+      store.appendEvent({ taskId: task.id, type: 'credential.approval-requested', ts: Date.now(),
+        payload: { urgency } });
+    }
+    store.addAuthorizationInbox(org.id, ['owner'], { kind: 'avatar-authorization', avatarId: 'avatar', projectId: project.id, requestId: 'first' });
+    const delivered: string[] = [];
+    const dispatcher = new DeliveryDispatcher(store, { browser: new BrowserDeliveryAdapter(),
+      email: { deliver: async ({ inbox }) => { delivered.push(inbox.urgency); } } });
+    await dispatcher.drain();
+    expect(delivered).toEqual(['critical']);
+    store.setDeliveryPreferences({ userId: 'owner', organizationId: org.id,
+      browser: true, email: true, slack: false, routine: true });
+    store.addAuthorizationInbox(org.id, ['owner'], { kind: 'avatar-authorization', avatarId: 'avatar', projectId: project.id, requestId: 'second' });
+    await dispatcher.drain();
+    expect(delivered).toEqual(['critical', 'high']);
+    store.close();
+  });
+
   it('migrates installation records into a personal organization', () => {
     const store = new Store(':memory:');
     const personal = store.getOrganization('org_personal');

@@ -236,6 +236,7 @@ export interface DeliveryPreferences {
   organizationId: string;
   browser: boolean;
   email: boolean;
+  emailUrgencies?: Partial<Record<Urgency, boolean>>;
   slack: boolean;
   routine: boolean;
 }
