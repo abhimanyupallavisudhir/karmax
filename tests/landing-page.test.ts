@@ -46,7 +46,8 @@ describe('public landing page', () => {
     expect(landing).toContain('As human-in-the-loop');
     expect(landing).toContain('<strong>authorization system</strong>');
     expect(landing).toContain('Leave the permanent');
-    expect(landing).toContain('Everything is a to-do list.');
+    expect(landing.match(/Just do things\./g)).toHaveLength(2);
+    expect(landing).not.toContain('Everything is a to-do list.');
     expect(landing).not.toContain('No new AI subscription');
     expect(landing).not.toContain('The whole idea');
     expect(landing).not.toContain('Human in the loop');
