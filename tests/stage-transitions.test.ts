@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { WorkflowExecutionAlreadyStartedError } from '@temporalio/client';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -22,16 +23,16 @@ function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorizatio
   const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;
   const starts: Array<{ type: string; options: any }> = [];
   const terminated: string[] = [];
-  const signalled: Array<{ id: string; signal: string; args: unknown[] }> = [];
+  const signalled: Array<{ id: string; signal: string; args: unknown[]; runId?: string }> = [];
   const hiddenTurnIds = ['hidden-account-turn'];
   let liveViewOverride: TaskView | undefined;
   let gracefulResult: (() => Promise<unknown>) | undefined;
   const client = {
     workflow: {
-      getHandle(id: string) {
+      getHandle(id: string, runId?: string) {
         const handle: any = {
           async terminate(reason: string) { terminated.push(`${id}:${reason}`); },
-          async signal(signal: string, ...args: unknown[]) { signalled.push({ id, signal, args }); },
+          async signal(signal: string, ...args: unknown[]) { signalled.push({ id, signal, args, runId }); },
           async executeUpdate(_name: string, options: { args: [string] }) {
             return { workflow: options.args[0] };
           },
@@ -85,13 +86,84 @@ function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorizatio
   };
   store.saveView(task.id, view);
   return {
-    store, project, tokens, token, api, task, view, starts, terminated, signalled, runners, authorization,
+    store, project, tokens, token, api, task, view, starts, terminated, signalled, runners, client, authorization,
     setLiveView(view?: TaskView) { liveViewOverride = view; },
     setGracefulResult(result?: () => Promise<unknown>) { gracefulResult = result; },
   };
 }
 
 describe('task stage transitions', () => {
+  it('keeps the winning run reachable when an overlapping resume finishes preparing too late', async () => {
+    const f = fixture();
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' });
+    f.store.saveView(f.task.id, {
+      ...f.view, status: 'waiting', waitingFor: { kind: 'human' },
+      state: { ...f.view.state, humanPauseOrigin: 'do' },
+    });
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const preparing = new Promise<void>((resolve) => { entered = resolve; });
+    const resolveParams = (f.api as any).resolveTaskParams.bind(f.api);
+    let calls = 0;
+    vi.spyOn(f.api as any, 'resolveTaskParams').mockImplementation(async (...args: any[]) => {
+      if (++calls === 1) { entered(); await blocked; }
+      return resolveParams(...args);
+    });
+    let started = false;
+    vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
+      if (started) throw new WorkflowExecutionAlreadyStartedError('already running', f.task.id, 'softwareDev');
+      started = true;
+      return { firstExecutionRunId: 'new-run' };
+    });
+
+    const loser = f.api.signalTask(f.token, f.task.id, 'followUp', 'First resume');
+    const rejected = expect(loser).rejects.toThrow('already running');
+    await preparing;
+    await f.api.signalTask(f.token, f.task.id, 'followUp', 'Second resume');
+    expect(f.store.getTask(f.task.id)?.params._workflowRunId).toBe('new-run');
+    release();
+    await rejected;
+
+    // The losing preparation must not restore old-run before its start fails.
+    expect(f.store.getTask(f.task.id)?.params._workflowRunId).toBe('new-run');
+    await f.api.signalTask(f.token, f.task.id, 'followUp', 'Done');
+    expect(await f.api.resumeAfterCredentialDecision(f.task.id, 'Access granted')).toMatchObject({ resumed: true });
+    expect(f.signalled.slice(-2)).toEqual([
+      expect.objectContaining({ signal: 'followUp', runId: 'new-run' }),
+      expect.objectContaining({ signal: 'followUp', runId: 'new-run' }),
+    ]);
+  });
+
+  it('preserves parameter edits accepted while a replacement start is awaiting acknowledgement', async () => {
+    const f = fixture();
+    vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
+      const current = f.store.getTask(f.task.id)!;
+      f.store.updateTaskParams(f.task.id, {
+        ...current.params, priority: 4, _authorization: { profileId: 'updated-grant' },
+      });
+      return { firstExecutionRunId: 'new-run' };
+    });
+    await f.api.moveTaskStage(f.token, f.task.id, 'human');
+    expect(f.store.getTask(f.task.id)?.params).toMatchObject({
+      priority: 4, _authorization: { profileId: 'updated-grant' }, _workflowRunId: 'new-run',
+    });
+  });
+
+  it('does not roll back a run reference when an authorization update completes late', async () => {
+    const f = fixture();
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' });
+    vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({
+      async executeUpdate() {
+        f.store.patchTaskParams(f.task.id, { _workflowRunId: 'new-run', priority: 4 });
+        return { applied: true };
+      },
+    });
+    const task = await f.api.setTaskAuthorization(f.token, f.task.id, 'maintainer');
+    expect(task.params).toMatchObject({ _workflowRunId: 'new-run', priority: 4,
+      _authorization: { profileId: 'maintainer' } });
+  });
+
   it('rechecks credential health before retrying a credential escalation', async () => {
     const order: string[] = [];
     const f = fixture(async () => { order.push('health'); });

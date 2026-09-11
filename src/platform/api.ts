@@ -1580,8 +1580,10 @@ export class KarmaxApi {
     // Drafts re-resolve at queue time. Stamp that the resulting common branch
     // values already include repository fallback so provisioning must not apply
     // the repository default again over a project/task override.
-    this.deps.store.updateTaskParams(task.id, {
-      ...task.params,
+    // Concurrent lifecycle requests can arrive here with the same old snapshot.
+    // A slower preparation must not overwrite the winner's _workflowRunId even
+    // if its own subsequent Temporal start is rejected as already running.
+    this.deps.store.patchTaskParams(task.id, {
       ...(typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
       ...(typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
@@ -1749,8 +1751,7 @@ export class KarmaxApi {
       );
       const runId = (started as any)?.firstExecutionRunId ?? (started as any)?.runId;
       if (typeof runId === 'string' && runId) {
-        const current = this.deps.store.getTask(taskId)!;
-        this.deps.store.updateTaskParams(taskId, { ...current.params, _workflowRunId: runId });
+        this.deps.store.patchTaskParams(taskId, { _workflowRunId: runId });
       }
     } catch (e) {
       // A start acknowledgement can be lost after Temporal durably accepted the
@@ -1947,8 +1948,7 @@ export class KarmaxApi {
       }
     }
     const { delegationId: _staleDelegationId, ...priorAuthorizationWithoutDelegation } = priorAuthorization ?? {};
-    this.deps.store.updateTaskParams(taskId, {
-      ...task.params,
+    this.deps.store.patchTaskParams(taskId, {
       _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization, profileAttenuated,
         principal: caller.principal, credentialPolicies: policies,
         ...(delegation ? { delegationId: delegation.id } : {}),
@@ -2788,8 +2788,7 @@ export class KarmaxApi {
     this.deps.store.setTaskWorkflowVersion(task.id, version);
     this.deps.store.setTaskExecutionWorkflow(task.id, task.workflow);
     const runId = (started as any)?.firstExecutionRunId ?? (started as any)?.runId;
-    this.deps.store.updateTaskParams(task.id, {
-      ...task.params,
+    this.deps.store.patchTaskParams(task.id, {
       archived: false,
       draft: false,
       ...(typeof runId === 'string' && runId ? { _workflowRunId: runId } : {}),
@@ -4007,8 +4006,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
     const runId = (execution as any)?.firstExecutionRunId ?? (execution as any)?.runId;
     if (typeof runId === 'string' && runId) {
-      const current = this.deps.store.getTask(taskId)!;
-      this.deps.store.updateTaskParams(taskId, { ...current.params, _workflowRunId: runId });
+      this.deps.store.patchTaskParams(taskId, { _workflowRunId: runId });
     }
     // A failed workflow recovery starts a new Temporal history, so replay cannot
     // reconstruct collaborationRequested signals from the old execution. Restore
