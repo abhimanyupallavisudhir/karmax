@@ -5358,7 +5358,7 @@ function repeatableToggleHtml(values) {
   return `
     <div class="form-row repeat-row">
       <label class="repeat-toggle"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
-        <span><b>Repeatable</b> — each run is kept; a trigger (or “Run again”) spawns a fresh run instead of running once.</span>
+        <span><b>Repeatable</b> — each trigger or “Run again” starts a separate run. Runs can overlap; you can start new runs while earlier ones are still running.</span>
       </label>
     </div>`;
 }

@@ -2001,6 +2001,7 @@ export class KarmaxApi {
    * task record linked to the series via `runOf`, with trigger/series metadata
    * stripped so it's a plain one-off execution with its own history. Used on
    * each trigger fire of a repeatable series, and by "Run again".
+   * Runs are independent: starting one never waits for earlier runs to finish.
    */
   async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
     const series = this.deps.store.getTask(seriesId);

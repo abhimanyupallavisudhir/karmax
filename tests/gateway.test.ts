@@ -12,6 +12,7 @@ import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrat
 import { detectConversationImport } from '../src/store/conversation-imports.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
+import type { TaskRecord } from '../src/domain/types.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -32,6 +33,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   afterAll(async () => {
     await h?.stop();
   });
+
+  it('starts concurrent repeatable runs while earlier workflows remain running', async () => {
+    const repo = await h.makeRepo('overlapping-runs');
+    const project = h.store.createProject('Overlapping runs', {
+      repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false,
+    });
+    const response = await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(),
+      body: JSON.stringify({ workflow: 'software-dev', params: { repeatable: true,
+        prompt: '@write overlap.txt :: independent run\n@review keep this run open' } }),
+    });
+    expect(response.ok).toBe(true);
+    const series = await response.json() as TaskRecord;
+    const [first] = h.store.runsOf(series.id);
+    expect(first).toBeDefined();
+    await expect.poll(() => h.store.getTask(first!.id)?.lastView?.stage,
+      { timeout: 20_000 }).toBe('review');
+
+    // Concurrent HTTP requests must each create a distinct execution, even
+    // though the first execution is still waiting for its review decision.
+    const starts = await Promise.all(Array.from({ length: 3 }, async () => {
+      const result = await fetch(`${base}/api/tasks/${series.id}/run-again`, {
+        method: 'POST', headers: auth(), body: '{}',
+      });
+      expect(result.status).toBe(200);
+      return (await result.json() as { startedTaskId: string }).startedTaskId;
+    }));
+    expect(new Set([first!.id, ...starts]).size).toBe(4);
+    const runs = await (await fetch(`${base}/api/tasks/${series.id}/runs`,
+      { headers: auth() })).json() as TaskRecord[];
+    expect(runs).toHaveLength(4);
+    for (const run of runs) {
+      expect(run.params.runOf).toBe(series.id);
+      expect(run.params.repeatable).toBeUndefined();
+      expect((await h.client.workflow.getHandle(run.id).describe()).status.name).toBe('RUNNING');
+    }
+    await expect.poll(() => starts.every((id) => h.store.getTask(id)?.lastView?.stage === 'review'),
+      { timeout: 30_000 }).toBe(true);
+    expect(h.store.getTask(first!.id)?.lastView?.stage).toBe('review');
+  }, 60_000);
 
   it('serves meta with the detected agent provider', async () => {
     const meta: any = await (await fetch(`${base}/api/meta`)).json();
