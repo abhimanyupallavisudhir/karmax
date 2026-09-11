@@ -8180,8 +8180,6 @@ function conversationPane(v, t) {
     : S.taskHistoryError
       ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
       : '';
-  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
-    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -8207,9 +8205,12 @@ function conversationPane(v, t) {
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
-  const request = requestedInput
-    ? `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderAgentMessageBody(requestedInput, v)}</div></div>`
-    : '';
+  if (requestedInput && !entries.some((entry) => entry.type === 'input-request' && entry.request.text === requestedInput)) {
+    entries.push({ type: 'input-request', request: { text: requestedInput, ts: v.updatedAt },
+      sourceKey: `input-request:${v.updatedAt}`, conversationRole: t.role });
+  }
+  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
+    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
@@ -8230,7 +8231,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
+    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
     ${fu}`;
 }
 
@@ -8387,7 +8388,16 @@ function conversationEntries(t) {
     posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts,
       sourceKey: `message:${message.id}`, conversationRole: t.role });
   }
-  const combined = [...messages, ...posted.values(), ...visibleActivities];
+  // Explanations retain their input prompt after the human wait is resolved.
+  const requests = new Map();
+  for (const event of orderedEvents) {
+    const e = event.payload;
+    if (event.type !== 'conversation.explanation' || e?.role !== t.role || !e.sourceRequest) continue;
+    requests.set(e.sourceKey, { type: 'input-request', request: e.sourceRequest,
+      sourceKey: e.sourceKey, conversationRole: t.role, ts: e.sourceRequest.ts,
+      sortTs: e.sourceRequest.ts, order: event.seq ?? event.ts });
+  }
+  const combined = [...messages, ...posted.values(), ...visibleActivities, ...requests.values()];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
   const explanations = new Map();
   for (const event of orderedEvents) {
@@ -8563,6 +8573,9 @@ function explainMessageAffordance(entry, v) {
 
 function renderConversationEntry(entry, v = S.view) {
   const md = markdownEnabled() ? ' md' : '';
+  if (entry.type === 'input-request') {
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v)}</div>${explainMessageAffordance(entry, v)}</div>`;
+  }
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
@@ -8594,7 +8607,7 @@ async function runExplanation(v, role, sourceKey, settings) {
   renderTaskPage();
   try {
     const event = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/explanations`, {
-      method: 'POST', body: JSON.stringify({ role, sourceKey, ...(settings ? { settings } : {}) }),
+      method: 'POST', body: JSON.stringify({ role, sourceKey, ...(sourceKey.startsWith('input-request:') ? { inputRequest: humanWaitDetail(v) } : {}), ...(settings ? { settings } : {}) }),
     });
     if (event && !S.taskEvents.some((item) => item.seq != null && item.seq === event.seq)) S.taskEvents.push(event);
   } catch (error) {

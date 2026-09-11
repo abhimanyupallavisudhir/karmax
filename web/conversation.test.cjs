@@ -243,5 +243,34 @@ for (const status of ['done', 'cancelled', 'waiting']) {
 }
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
 
+// Input prompts use the same model picker, pending/error UI, and durable annotations.
+eval(extractFn('humanWaitDetail'));
+eval(extractFn('conversationInputRequest'));
+S.taskEvents = [];
+const requestView = { taskId: 'task-1', status: 'waiting', updatedAt: 1710000010000,
+  waitingFor: { kind: 'human', detail: 'Choose a deployment target.' },
+  actions: [{ name: 'followUp', enabled: true, roles: ['do'] }] };
+const requestTranscript = { role: 'do', messages: [] };
+const requestKey = `input-request:${requestView.updatedAt}`;
+let requestHtml = conversationPane(requestView, requestTranscript);
+ok(requestHtml.includes(`data-source-key="${requestKey}"`) && requestHtml.includes('Explain this with gemini-3.6-flash'),
+  'input requests offer the existing explanation controls');
+S.explanationPending[requestKey] = true;
+ok(conversationPane(requestView, requestTranscript).includes('disabled>Explaining…'), 'input request shows pending explanation');
+delete S.explanationPending[requestKey];
+S.explanationErrors[requestKey] = { message: 'Try again' };
+ok(conversationPane(requestView, requestTranscript).includes('Try again'), 'input request displays explanation errors');
+delete S.explanationErrors[requestKey];
+S.taskEvents = [{ seq: 30, ts: 1710000011000, type: 'conversation.explanation', payload: {
+  role: 'do', sourceKey: requestKey, sourceRequest: { text: requestView.waitingFor.detail, ts: requestView.updatedAt },
+  text: 'Pick where the update should go.', model: 'google/gemini-3.6-flash',
+} }];
+requestHtml = conversationPane(requestView, requestTranscript);
+ok((requestHtml.match(/class="msg agent input-request"/g) || []).length === 1, 'explained current prompt appears once');
+ok(requestHtml.indexOf('Choose a deployment target.') < requestHtml.indexOf('Pick where the update should go.'), 'explanation follows its input prompt');
+const resolvedHtml = conversationPane({ ...requestView, status: 'active', waitingFor: undefined }, requestTranscript);
+ok(resolvedHtml.includes('Choose a deployment target.') && resolvedHtml.includes('Pick where the update should go.'), 'resolved prompt and explanation survive reload');
+ok(!conversationPane(requestView, { role: 'merge', messages: [] }).includes('input-request'), 'input explanation stays in its own conversation');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
