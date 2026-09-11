@@ -564,7 +564,8 @@ const ARTIFACT_MIME: Record<string, string> = {
   '.webm': 'video/webm',
   '.mov': 'video/quicktime',
   '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.markdown': 'text/markdown; charset=utf-8',
   '.log': 'text/plain; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
   '.ipynb': 'application/json; charset=utf-8',
@@ -2593,7 +2594,13 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (b.emailUrgencies !== undefined && (!b.emailUrgencies || typeof b.emailUrgencies !== 'object'
+            || Array.isArray(b.emailUrgencies) || Object.entries(b.emailUrgencies).some(([key, value]) =>
+              !['low', 'normal', 'high', 'critical'].includes(key) || typeof value !== 'boolean')))
+            return this.json(res, 400, { error: 'emailUrgencies must map urgency levels to booleans' });
+          const previous = store.getDeliveryPreferences(subject.userId, requestedScope.organizationId);
           return this.json(res, 200, store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
+            emailUrgencies: b.emailUrgencies ?? previous.emailUrgencies,
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
         }
       }
@@ -3490,7 +3497,8 @@ export class Gateway {
           const part = Number(url.searchParams.get('part'));
           if (!safeUploadPath(relative) || !Number.isInteger(part) || part < 0) return this.json(res, 400, { error: 'invalid upload path or part' });
           const data = await this.rawBody(req, RESOURCE_UPLOAD_PART_BYTES);
-          if (!data.length) return this.json(res, 400, { error: 'empty upload part' });
+          // A zero-byte first part represents an empty file.
+          if (!data.length && part !== 0) return this.json(res, 400, { error: 'empty upload part' });
           const record = upload.files[relative] ?? { parts: [], bytes: 0 };
           if (part !== record.parts.length) return this.json(res, 409, { error: `expected part ${record.parts.length}` });
           const objectKey = resourceUploadObjectKey(upload, relative, part);

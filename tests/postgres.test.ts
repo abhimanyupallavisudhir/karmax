@@ -16,6 +16,20 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('retains shared snapshot chunks and releases only the last reference', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-chunks-'));
+    const { store } = openStore(path.join(home, 'karmax.db'), url!);
+    try {
+      const chunks = [{ id: 'shared-chunk', bytes: 12 }];
+      store.retainResourceChunks('org_personal', chunks);
+      store.retainResourceChunks('org_personal', chunks);
+      expect(store.releaseResourceChunks('org_personal', ['shared-chunk'])).toEqual([]);
+      expect(store.releaseResourceChunks('org_personal', ['shared-chunk'])).toEqual(['shared-chunk']);
+    } finally {
+      store.close(); fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('transactionally imports application and identity SQLite data and is idempotent', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-'));
     const storeFile = path.join(home, 'karmax.db');

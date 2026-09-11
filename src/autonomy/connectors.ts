@@ -16,6 +16,11 @@ import { hostOf, passEntryMetadata } from './pass-path.js';
 
 const pexec = promisify(execFile);
 
+// Hash ciphertext only: never persist a password hash in plaintext metadata.
+function encryptedRevision(file: string): string {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
 /**
  * External password-store connectors (PLAN-passwords.md §9). The karmax vault
  * is the runtime source of truth; a connector is a **selective mirror**, not a
@@ -60,6 +65,8 @@ export interface ExternalItem {
    *  were last mirrored — decrypting a whole `pass` tree costs seconds per
    *  entry, so re-importing everything must not re-read everything. */
   changedAt?: number;
+  /** Stable fingerprint of the encrypted source; independent of checkout clocks. */
+  revision?: string;
 }
 
 /** An external entry WITH its secrets, ready to write into the vault. */
@@ -483,7 +490,7 @@ export class PassConnector implements CredentialConnector {
         label: slash >= 0 ? entry.slice(slash + 1) : entry,
         folder: slash >= 0 ? entry.slice(0, slash) : '',
         domains: domain ? [domain] : [], ...(username ? { username } : {}),
-        fields: ['password'] as VaultFieldName[], ...this.changedAt(entry) };
+        fields: ['password'] as VaultFieldName[], ...this.sourceState(entry) };
     });
   }
   async pull(externalIds: string[]): Promise<PullResult> {
@@ -496,6 +503,7 @@ export class PassConnector implements CredentialConnector {
     const failures: PullResult['failures'] = [];
     for (const id of externalIds) {
       if (!entries.has(id)) continue;
+      const revision = this.sourceState(id);
       let body: string;
       try {
         body = await this.exec('pass', ['show', id]);
@@ -509,15 +517,15 @@ export class PassConnector implements CredentialConnector {
       const { domain, username } = passEntryMetadata(id);
       out.push({ externalId: id, type: 'login', label: id, domains: domain ? [domain] : [],
         ...(username ? { username } : {}),
-        fields: Object.keys(secrets) as VaultFieldName[], secrets, ...this.changedAt(id) });
+        fields: Object.keys(secrets) as VaultFieldName[], secrets, ...revision });
     }
     return { items: out, failures };
   }
-  /** The entry file's mtime — `pass` keeps one GPG file per entry, so the
-   *  filesystem already records when a credential last changed. */
-  private changedAt(entry: string): { changedAt?: number } {
+  /** Read the encrypted file's identity without invoking GPG. */
+  private sourceState(entry: string): { changedAt?: number; revision?: string } {
     try {
-      return { changedAt: fs.statSync(path.join(this.storeDir, `${entry}.gpg`)).mtimeMs };
+      const file = path.join(this.storeDir, `${entry}.gpg`);
+      return { changedAt: fs.statSync(file).mtimeMs, revision: encryptedRevision(file) };
     } catch {
       return {};
     }
@@ -721,9 +729,10 @@ export class GitPassConnector implements CredentialConnector {
         for (const externalId of externalIds) {
           if (!available.has(externalId)) continue;
           try {
+            const metadata = this.metadata(store, externalId);
             const body = await this.decrypt(gpgHome, connection, this.entryFile(store, externalId));
             const secrets = passSecrets(body);
-            items.push({ ...this.metadata(store, externalId), fields: Object.keys(secrets) as VaultFieldName[], secrets });
+            items.push({ ...metadata, fields: Object.keys(secrets) as VaultFieldName[], secrets });
           } catch (e) {
             failures.push({ externalId, error: gitPassGpgError(e) });
           }
@@ -926,6 +935,7 @@ export class GitPassConnector implements CredentialConnector {
       ...(username ? { username } : {}),
       fields: ['password'],
       changedAt: stat.mtimeMs,
+      revision: encryptedRevision(this.entryFile(store, externalId)),
     };
   }
 
@@ -1341,7 +1351,7 @@ export class Connectors {
     // nothing to compare against, and `list()` is itself a CLI round-trip).
     let wanted = externalIds.filter((id) => isPass || !writtenBack.has(id));
     if (mirrored.size) {
-      const changedAt = new Map((await connector.list()).map((i) => [i.externalId, i.changedAt]));
+      const metadata = new Map((await connector.list()).map((i) => [i.externalId, i]));
       wanted = wanted.filter((id) => {
         // Whole milliseconds on BOTH sides. A source's change marker can be
         // finer-grained than the mirror clock it is compared against — a file
@@ -1350,9 +1360,11 @@ export class Connectors {
         // back as `clock + 0.31…`: strictly greater, hence "changed", hence
         // re-decrypted on every sync from then on. Comparing at the coarser of
         // the two resolutions is what makes the two numbers comparable at all.
-        const at = floorMs(changedAt.get(id));
+        const at = floorMs(metadata.get(id)?.changedAt);
         const item = mirrored.get(id);
         if (isPass && item?.provenance.passNotesVersion !== 1) return true;
+        const revision = metadata.get(id)?.revision;
+        if (revision !== undefined) return !item || item.provenance.sourceRevision !== revision;
         // Items mirrored before `syncedAt` existed fall back to `updatedAt`,
         // so an upgrade does not force one more full-store re-read; they get a
         // real mirror clock the first time they are pulled again.
@@ -1361,7 +1373,7 @@ export class Connectors {
       });
     }
 
-    const { items: pulled, failures } = await connector.pull(wanted);
+    const { items: pulled, failures } = wanted.length ? await connector.pull(wanted) : { items: [], failures: [] };
     // Nothing at all came back: surface why (a locked GPG key, an expired
     // session) rather than reporting a silent zero-item success.
     if (!pulled.length && failures.length) throw new Error(failures[0]!.error);
@@ -1379,7 +1391,7 @@ export class Connectors {
         // clobber a policy the user has since tuned on an existing item.
         ...(existing ? {} : { policy: opts.policy }),
         secrets: ext.secrets,
-        provenance: { source, externalId: ext.externalId, syncedAt, ...(isPass ? { passNotesVersion: 1 } : {}) },
+        provenance: { source, externalId: ext.externalId, syncedAt, sourceRevision: ext.revision, ...(isPass ? { passNotesVersion: 1 } : {}) },
       });
       itemIds.push(saved.id);
     }

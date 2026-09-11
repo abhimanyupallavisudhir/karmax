@@ -7533,13 +7533,59 @@ function reviewActionBtn(a, i) {
 }
 
 let reviewActionWs = null;
-async function openArtifact(url, external) {
+function artifactTextKind(contentType, target) {
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  if (type === 'text/markdown' || /\.(md|markdown)$/i.test(target)) return 'markdown';
+  if (type === 'text/plain' || type === 'text/csv' || type === 'application/json') return 'text';
+  return null;
+}
+
+function showArtifactReader(text, kind, name, blob) {
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card artifact-reader';
+  dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
+  dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
+    <a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    <div class="artifact-reader-content" tabindex="0"></div>`;
+  const content = dialog.querySelector('.artifact-reader-content');
+  if (kind === 'markdown') {
+    content.classList.add('msg-text', 'md');
+    content.innerHTML = renderMarkdown(text);
+  } else {
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    content.appendChild(pre);
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  const download = dialog.querySelector('[data-download]');
+  download.href = objectUrl;
+  download.download = name;
+  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    URL.revokeObjectURL(objectUrl);
+    dialog.remove();
+    if (previousFocus?.isConnected) previousFocus.focus();
+  }, { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  dialog.querySelector('[data-close]').focus();
+}
+
+async function openArtifact(url, external, target = '') {
   if (external) { window.open(url, '_blank', 'noopener'); return; }
-  // Artifact endpoints need the auth header, so fetch as a blob then open it.
   try {
     const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
     if (!res.ok) { toast('could not open artifact', true); return; }
-    const obj = URL.createObjectURL(await res.blob());
+    const blob = await res.blob();
+    const name = target.replace(/\\/g, '/').split('/').pop()
+      || /filename="([^"]+)"/i.exec(res.headers.get('content-disposition') || '')?.[1] || 'Attachment';
+    const kind = artifactTextKind(res.headers.get('content-type') || '', name);
+    if (kind) {
+      showArtifactReader(await blob.text(), kind, name, blob);
+      return;
+    }
+    const obj = URL.createObjectURL(blob);
     window.open(obj, '_blank', 'noopener');
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
@@ -7577,7 +7623,7 @@ function wireReviewActions(v) {
       btn.disabled = true;
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
-        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'open') { await openArtifact(r.url, r.external, v.reviewInfo?.actions?.[idx]?.target); return; }
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
@@ -11757,7 +11803,8 @@ async function hydrateProjectData(proj) {
             : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
             <small class="field-help">Managed storage is provided by ${siteNameMarkup()} for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
-          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
+          <label class="form-row wide"><span>Upload files <small>(optional)</small></span><input id="data-files" type="file" multiple></label>
+          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-folder" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
@@ -11795,8 +11842,8 @@ async function hydrateProjectData(proj) {
     });
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
-      const files = [...$('#data-files').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a path or a browser folder, not both', true);
+      const files = [...$('#data-files').files, ...$('#data-folder').files];
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
@@ -11960,7 +12007,8 @@ async function hydrateProjectResources(proj) {
         <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
         <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
         ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
+        <label class="form-row">Upload files<input id="resource-files" type="file" multiple></label>
+        <label class="form-row">Upload a folder<input id="resource-folder" type="file" multiple webkitdirectory></label>
       </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
     const driverInput = $('#resource-driver');
     const syncDefaults = () => {
@@ -11969,6 +12017,7 @@ async function hydrateProjectResources(proj) {
       $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
       $('#resource-secret').disabled = fileKind;
       $('#resource-files').disabled = !fileKind;
+      $('#resource-folder').disabled = !fileKind;
       if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
     };
     driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
@@ -12006,7 +12055,7 @@ async function hydrateProjectResources(proj) {
         : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
       button.disabled = true; button.textContent = 'Attaching…';
       try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files] : [];
+        const selectedFiles = isFiles ? [...$('#resource-files').files, ...$('#resource-folder').files] : [];
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
           access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
           publish: $('#resource-publish').value, secret: $('#resource-secret').value,
@@ -12041,7 +12090,7 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
   try {
     for (const file of files) {
       const relative = file.webkitRelativePath ? file.webkitRelativePath.split('/').slice(1).join('/') || file.name : file.name;
-      for (let part = 0, offset = 0; offset < file.size; part++, offset += upload.partBytes) {
+      for (let part = 0, offset = 0; offset < file.size || part === 0; part++, offset += upload.partBytes) {
         const chunk = file.slice(offset, Math.min(file.size, offset + upload.partBytes));
         await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relative)}&part=${part}`,
           { method: 'PUT', body: chunk, headers: { 'content-type': 'application/octet-stream' } });
@@ -14528,31 +14577,55 @@ function wireInboxView() {
     try { localStorage.setItem('karmax-inbox-show-read', e.target.checked ? '1' : '0'); } catch {}
     renderMain();
   });
-  $('#inbox-read-all')?.addEventListener('click', async () => {
+  $('#inbox-read-all')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     try {
-      await Promise.all(inboxItems().filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
-      await loadCollaboration(); renderMain(); renderRail();
+      await markVisibleInboxRead();
     } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
   });
 }
 
+async function markVisibleInboxRead() {
+  const organizationId = S.organizationId;
+  const items = inboxItems().filter((item) => item.unread);
+  const results = await Promise.allSettled(items.map(async (item) => {
+    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(organizationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ unread: false }),
+    });
+    if (!saved) throw new Error('Notification could not be marked read.');
+  }));
+  if (S.organizationId === organizationId) {
+    items.forEach((item, index) => {
+      if (results[index].status !== 'fulfilled') return;
+      const current = S.inbox.find((candidate) => candidate.id === item.id);
+      if (current) current.unread = false;
+    });
+    // Invalidate reads started before the mutation; they may contain stale unread flags.
+    S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+    updateBell(); renderMain(); renderRail();
+  }
+  const failed = results.filter((result) => result.status === 'rejected');
+  if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
+}
+
 // ── notification behaviour, per urgency ─────────────────────────────────────
-// The list is where asks live; this is what an ask DOES when it arrives. Both
-// behaviours only make sense where the person actually is, so — like the theme —
-// they are per-browser: a system notification needs this browser's permission,
-// and a sound can only be heard here.
+// Browser alerts are local to this device; email preferences are stored on the server.
 const NOTIFY_BEHAVIOURS = [
   { key: 'notify', label: 'System notification' },
   { key: 'sound', label: 'Sound' },
+  { key: 'visual', label: 'Show in app' },
+  { key: 'email', label: 'Email' },
 ];
 // Sensible defaults: silence is the floor, and each level up interrupts a little
 // more. Nothing below high interrupts at all — an inbox that pings for routine
 // news is one people turn off entirely.
 const NOTIFY_DEFAULTS = {
-  critical: { notify: true, sound: true },
-  high: { notify: true, sound: false },
-  normal: { notify: false, sound: false },
-  low: { notify: false, sound: false },
+  critical: { notify: true, sound: true, visual: true },
+  high: { notify: true, sound: false, visual: false },
+  normal: { notify: false, sound: false, visual: false },
+  low: { notify: false, sound: false, visual: false },
 };
 function notifyPrefs() {
   let stored = {};
@@ -14578,12 +14651,39 @@ function announceInbox(items) {
   for (const item of [...items].sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency))) {
     const behaviour = prefs[item.urgency] || prefs.normal;
     if (behaviour.notify) showSystemNotification(item);
+    if (behaviour.visual) showVisualNotification(item);
     // One sound per batch. `items` is urgency-ordered, so the first level that
     // asks for a sound is the loudest one that arrived — five asks landing
     // together are a single event to the person hearing it.
     if (behaviour.sound && !sounded) { playNotificationSound(item.urgency); sounded = true; }
   }
 }
+function showVisualNotification(item) {
+  let region = document.getElementById('notification-alerts');
+  if (!region) {
+    region = document.createElement('div');
+    region.id = 'notification-alerts';
+    region.setAttribute('aria-live', 'polite');
+    document.body.append(region);
+  }
+  const old = [...region.children].find((node) => node.dataset.id === item.id);
+  old?.remove();
+  const alert = document.createElement('div');
+  alert.className = 'notification-alert';
+  alert.dataset.id = item.id;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(item); };
+  alert.lastElementChild.onclick = () => alert.remove();
+  region.prepend(alert);
+  while (region.children.length > 5) region.lastElementChild.remove();
+}
+function notificationSoundPrefs() {
+  let stored;
+  try { stored = JSON.parse(localStorage.getItem('karmax-notify-sound') || '{}'); } catch {}
+  return { tone: ['bell', 'chime', 'soft'].includes(stored?.tone) ? stored.tone : 'bell',
+    duration: [0.35, 1, 3, 5].includes(stored?.duration) ? stored.duration : 0.35 };
+}
+
 function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
@@ -14611,18 +14711,20 @@ function unlockNotificationAudio() {
 document.addEventListener('pointerdown', unlockNotificationAudio, { passive: true });
 document.addEventListener('keydown', unlockNotificationAudio);
 
-// Synthesized rather than shipped: no asset to fetch, no volume surprise, and a
-// critical ask simply gets a second blip instead of a different sound to learn.
+// Synthesize the selected tone locally, with bounded duration and a gentle envelope.
 function playNotificationSound(urgency = 'normal') {
   const Ctx = typeof window === 'undefined' ? null : (window.AudioContext || window.webkitAudioContext);
   if (!Ctx) return false;
   try {
     const ctx = S.audio || (S.audio = new Ctx());
     ctx.resume?.()?.catch?.(() => {});
-    for (const offset of urgency === 'critical' ? [0, 0.18] : [0]) {
+    const { tone, duration } = notificationSoundPrefs();
+    const offsets = duration === 0.35 ? (urgency === 'critical' ? [0, 0.18] : [0])
+      : Array.from({ length: Math.ceil(duration / 0.4) }, (_, i) => i * 0.4);
+    for (const offset of offsets) {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
-      oscillator.frequency.value = urgency === 'critical' ? 880 : 660;
+      oscillator.frequency.value = tone === 'soft' ? 440 : tone === 'chime' ? (offset ? 1046 : 784) : urgency === 'critical' ? 880 : 660;
       oscillator.connect(gain).connect(ctx.destination);
       const at = ctx.currentTime + offset;
       gain.gain.setValueAtTime(0.0001, at);
@@ -14922,11 +15024,13 @@ function profileView() {
 // asks; it does not configure them.
 function notificationsCard() {
   const prefs = notifyPrefs();
+  const sound = notificationSoundPrefs();
+  const emailReady = S.meta?.deliveryChannels?.includes('email');
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     granted: '<p class="task-sub">This browser may show system notifications.</p>',
-    denied: '<p class="task-sub">This browser is blocking notifications — allow them in its site settings, or the levels above can only play a sound.</p>',
-    unsupported: '<p class="task-sub">This browser cannot show system notifications; sounds still work.</p>',
+    denied: '<p class="task-sub">This browser is blocking system notifications. Allow them in its site settings; in-app alerts and sounds still work.</p>',
+    unsupported: '<p class="task-sub">This browser cannot show system notifications; in-app alerts and sounds still work.</p>',
     default: '<button class="btn sm" id="notify-permission" type="button">Allow system notifications</button>',
   }[permission] ?? '';
   // Loudest first, the same order the inbox itself is in.
@@ -14941,23 +15045,54 @@ function notificationsCard() {
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level}</span>
         ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
-          aria-label="${behaviour.label} for ${level} urgency" ${prefs[level][behaviour.key] ? 'checked' : ''}/></span>`).join('')}
-        <span><button class="btn sm" type="button" data-notify-test="${level}">Test</button></span>
+          aria-label="${behaviour.label} for ${level} urgency" ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
+        <span><button class="btn sm" type="button" data-notify-test="${level}" title="Test browser alerts">Test</button></span>
       </div>`).join('')}
     </div>
+    <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
+      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : duration + ' seconds'}</option>`).join('')}</select></label>
+      <button class="btn sm" id="notify-preview">Preview sound</button></div>
+    <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
     ${permissionNote}
-    <p class="task-sub">These choices apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
+    <p class="task-sub">System notifications, in-app alerts, and sounds apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
 function wireNotificationsCard() {
+  const organizationId = S.organizationId;
+  api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`).then((prefs) => {
+    if (S.organizationId !== organizationId) return;
+    S.deliveryPreferences = prefs;
+    document.querySelectorAll('[data-notify$=":email"]').forEach((box) => {
+      box.checked = prefs.emailUrgencies?.[box.dataset.notify.split(':')[0]] ?? prefs.email;
+      box.disabled = !S.meta?.deliveryChannels?.includes('email');
+    });
+  }).catch((error) => toast(error.message, true));
+  for (const id of ['notify-tone', 'notify-duration']) $('#' + id)?.addEventListener('change', () => {
+    try { localStorage.setItem('karmax-notify-sound', JSON.stringify({ tone: $('#notify-tone').value, duration: Number($('#notify-duration').value) })); } catch {}
+  });
+  $('#notify-preview')?.addEventListener('click', () => playNotificationSound('critical'));
+
   // The inbox links here by anchor. A SPA render is not a document load, so the
   // browser never honours the fragment on its own — arriving at the profile and
   // being left at the top would make that link a lie.
   if (location.hash === '#notifications')
     requestAnimationFrame(() => $('#notifications')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
-  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', () => {
+  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', async () => {
     const [level, behaviour] = box.dataset.notify.split(':');
+    if (behaviour === 'email') {
+      const boxes = [...document.querySelectorAll('[data-notify$=":email"]')];
+      boxes.forEach((input) => input.disabled = true);
+      try {
+        const prefs = S.deliveryPreferences;
+        const emailUrgencies = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, prefs.emailUrgencies?.[key] ?? prefs.email]));
+        emailUrgencies[level] = box.checked;
+        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, emailUrgencies }) });
+        if (S.organizationId === organizationId) S.deliveryPreferences = saved;
+      } catch (error) { box.checked = !box.checked; toast(error.message, true); }
+      finally { boxes.forEach((input) => input.disabled = false); }
+      return;
+    }
     setNotifyPref(level, behaviour, box.checked);
     // Turning a level on is the natural moment to ask for the permission it needs.
     if (box.checked && behaviour === 'notify' && typeof Notification !== 'undefined' && Notification.permission === 'default')
@@ -14966,12 +15101,13 @@ function wireNotificationsCard() {
   $('#main').querySelectorAll('[data-notify-test]').forEach((button) => button.addEventListener('click', () => {
     const level = button.dataset.notifyTest;
     const behaviour = notifyPrefs()[level];
+    if (behaviour.visual) showVisualNotification({ id: `test-${level}`, urgency: level, kind: 'escalated', task: { title: `Test ${level} notification` } });
     if (behaviour.sound) playNotificationSound(level);
     const shown = behaviour.notify && showSystemNotification({ id: `test-${level}`, urgency: level,
       kind: 'escalated', task: { title: `Test ${level} notification` } });
     toast(behaviour.notify && !shown
       ? 'Allow notifications in this browser to see the popup.'
-      : behaviour.notify || behaviour.sound ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
+      : behaviour.notify || behaviour.sound || behaviour.visual ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
     behaviour.notify && !shown);
   }));
   $('#notify-permission')?.addEventListener('click', async () => {

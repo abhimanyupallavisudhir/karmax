@@ -3352,7 +3352,7 @@ export class Store {
         urgencyRank(item.urgency), createdAt, JSON.stringify(subject));
       if (!Number(inserted.changes)) continue;
       const preferences = this.getDeliveryPreferences(userId, organizationId);
-      const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack']
+      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack']
         .filter(Boolean) as string[];
       for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
         (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
@@ -3613,7 +3613,7 @@ export class Store {
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
           item.taskId, item.kind, urgencyRank(item.urgency), item.actionable ? 1 : 0, item.createdAt);
       if (Number(inserted.changes)) {
-        const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
+        const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
         for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
           (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
           .run(newId('delivery'), item.id, channel, item.createdAt, item.createdAt);
@@ -4656,7 +4656,7 @@ export class Store {
 
   retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void {
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
-      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (storageLocationId) {

@@ -83,6 +83,8 @@ export interface VaultItem {
     /** Import format marker: older pass entries need one complete notes refresh. */
     passNotesVersion?: number;
     syncedAt?: number;
+    /** Source fingerprint recorded with the last successful import. */
+    sourceRevision?: string;
   };
   updatedAt: number;
 }
@@ -255,7 +257,7 @@ export class VaultItems {
     envVar?: string;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
-    provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; syncedAt?: number };
+    provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? this.get(args.id) : undefined;
@@ -298,8 +300,8 @@ export class VaultItems {
       },
       // Preserve origin identity; only import format and mirror clock change on sync.
       provenance: prior
-        ? { ...prior.provenance, ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
-        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
+        ? { ...prior.provenance, ...(args.provenance?.syncedAt !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
+        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.sourceRevision !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
       updatedAt: Date.now(),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));

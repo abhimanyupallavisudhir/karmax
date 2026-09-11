@@ -56,9 +56,15 @@ describe('Git-backed unix pass connector', () => {
     expect(await connector.describe()).toMatchObject({ available: true, canPush: true });
     expect((await connector.list()).map((item) => item.externalId)).toEqual(['sites/example.com']);
     const first = (await connector.pull(['sites/example.com'])).items[0]!;
+    expect(first.revision).toMatch(/^[a-f0-9]{64}$/);
+    // A fresh checkout has new mtimes but identical encrypted source content.
+    const fresh = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
+      path.join(fixture.root, 'fresh-state'), { allowLocalRepository: true });
+    expect((await fresh.list())[0]!.revision).toBe(first.revision);
     expect(first.secrets).toEqual({ password: 'old-password', note: 'username: alice\nkeep this note\notpauth://totp/example?secret=OLDSEED\n', totp: 'otpauth://totp/example?secret=OLDSEED' });
 
     await connector.updateSecret('sites/example.com', 'password', 'rotated-password');
+    expect((await connector.list())[0]!.revision).not.toBe(first.revision);
     await connector.push({ externalId: '', type: 'login', label: 'Created account', username: 'new-user',
       domains: ['created.example'], folder: '', fields: ['password'], secrets: { password: 'generated-password', note: 'username: new-user\n  retain this too  ' } });
 
