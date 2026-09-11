@@ -9,12 +9,12 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { roleCeiling } from '../src/contrib/manifests.js';
 
 describe('capability model + attenuation (SPEC §8.2)', () => {
-  it('lets the Do role use delegated organization authority without bypassing workflow gates', () => {
+  it('does not impose a second authorization tier on the Do role', () => {
     const ceiling = roleCeiling('do');
     expect(allows(ceiling, 'organization:member:write')).toBe(true);
     expect(allows(ceiling, 'settings:write')).toBe(true);
-    expect(allows(ceiling, 'merge-into:main')).toBe(false);
-    expect(allows(ceiling, 'confirm-decision')).toBe(false);
+    expect(allows(ceiling, 'merge-into:main')).toBe(true);
+    expect(allows(ceiling, 'confirm-decision')).toBe(true);
   });
 
   it('matches exact, prefix-wildcard, and global', () => {

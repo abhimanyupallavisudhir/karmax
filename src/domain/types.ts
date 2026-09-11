@@ -1590,9 +1590,8 @@ export interface AgentProfile {
   role: AgentRole;
   /** Prompt template path under the content store, or inline text. */
   promptTemplate?: string;
-  /** @deprecated The declaring workflow owns the role's capability ceiling
-   *  (SPEC §8.2), resolved per turn by `roleCeiling(role)`; persisted values are
-   *  ignored. A per-profile copy only ever drifted from the manifest. */
+  /** @deprecated Task authorization owns capability selection. Declared agent
+   *  roles preserve that grant; persisted profile capability copies are ignored. */
   capabilities?: string[];
   maxTurns?: number;
   /** @deprecated Credentials policy is authoritative; persisted values are ignored. */

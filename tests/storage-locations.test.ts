@@ -1,3 +1,10 @@
+import { findFreePortFrom } from '../src/util/ports.js';
+import { Gateway } from '../src/gateway/server.js';
+import { KarmaxApi } from '../src/platform/api.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
+import { KarmaxBus } from '../src/contrib/bus.js';
+import { ContributionRegistry } from '../src/contrib/registry.js';
+import { Overlays } from '../src/store/overlays.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -73,8 +80,10 @@ describe('organization storage locations', () => {
   it('keeps customer S3 secrets vaulted and pins revisions to the tested location', async () => {
     const f = fixture(1024);
     const objects = new Map<string, Buffer>();
+    const httpFetch = globalThis.fetch;
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const key = String(input);
+      if (!key.startsWith('https://objects.example/')) return httpFetch(input, init);
       if (init?.method === 'PUT') { objects.set(key, Buffer.from(init.body as Uint8Array)); return new Response('', { status: 200 }); }
       if (init?.method === 'DELETE') { objects.delete(key); return new Response(null, { status: 204 }); }
       const value = objects.get(key); return value ? new Response(value, { status: 200 }) : new Response('missing', { status: 404 });
@@ -92,11 +101,34 @@ describe('organization storage locations', () => {
       kind: 's3', status: 'ready', isDefault: true, credentialConfigured: true,
     });
 
-    const attachment = f.store.createResourceAttachment({ organizationId: f.project.organizationId!,
-      projectId: f.project.id, name: 'Dataset', driver: 'object-tree@1', target: { kind: 'path', path: 'data' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: [], storageLocationId: ready.id,
-      publish: 'discard' });
-    const revision = await f.resources.importFiles(attachment.id, [{ path: 'rows.bin', data: Buffer.from('rows') }]);
+    // Reproduce #201 through the authenticated HTTP route: an agent from one
+    // project attaches a data item in another, using an explicit S3 location.
+    const origin = f.store.createProject('Agent origin');
+    const task = f.store.createTask({ projectId: origin.id, title: 'Configure data', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'configure data' } });
+    const tokens = new TokenAuthority();
+    const caps = ['project:settings:write'];
+    const agent = tokens.mint({ taskId: task.id, profileId: 'maintainer', principal: `task:${task.id}`,
+      organizationId: f.project.organizationId, ceiling: caps, grantorCaps: caps });
+    const client = { workflow: { getHandle: () => ({}) } } as any;
+    const worlds = new WorldRegistry();
+    const api = new KarmaxApi({ store: f.store, tokens, client, worlds, taskQueue: 'test', resources: f.resources });
+    const gateway = new Gateway({ api, store: f.store, tokens, client, worlds, taskQueue: 'test',
+      resources: f.resources, broker: f.broker, bus: new KarmaxBus(), contributions: new ContributionRegistry(),
+      overlays: new Overlays(), staticDir: 'web', agentInfo: { provider: 'mock', reason: 'S3 agent authorization test' } });
+    const server = await gateway.listen(await findFreePortFrom(49_800));
+    let revision: any;
+    try {
+      const response = await httpFetch(`${server.url}/api/projects/${f.project.id}/resources`, {
+        method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Dataset', driver: 'object-tree@1', target: { kind: 'path', path: 'data' },
+          storageLocationId: ready.id, files: [{ path: 'rows.bin', data: 'rows', encoding: 'utf8' }] }),
+      });
+      expect(response.status).toBe(200);
+      const attachment = await response.json() as any;
+      expect(attachment.storageLocationId).toBe(ready.id);
+      revision = f.store.getResourceRevision(attachment.revision.id);
+    } finally { await server.close(); }
     expect(revision.storageLocationId).toBe(ready.id);
     expect([...objects.keys()].some((key) => key.includes('/tenant-data/krmax/acme/resources/'))).toBe(true);
     expect(f.locations.list(f.project.organizationId!).find((candidate) => candidate.id === ready.id)?.usage.retainedBytes).toBe(4);
