@@ -66,6 +66,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',
+    'GET|POST /api/organizations/:organizationId/roles (POST body {name, description, capabilities}; organization-owned roles may contain only catalog capabilities held by the caller)',
     'GET|POST /api/organizations/:organizationId/members', 'DELETE /api/organizations/:organizationId/members/:userId',
     'GET|POST /api/organizations/:organizationId/invitations',
     'POST /api/invitations/accept (body {token}; verified user subject and account email required)',

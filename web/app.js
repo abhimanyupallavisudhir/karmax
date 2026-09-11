@@ -1387,11 +1387,12 @@ function normalizeComboOption(option) {
 
 function authorizationLevels() {
   return [
-    { id: 'viewer', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', name: 'Project maintainer', scope: 'selectable' },
-    { id: 'administrator', name: 'Administrator', scope: 'organization' },
-    { id: 'god', name: 'God', scope: 'global' },
+    { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
+    { id: 'developer', description: 'Create and manage tasks, work with agents, publish branches, and save skills in the selected scope.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Developer access plus project settings, queues, teams, repositories, and GitHub Actions in the selected scope.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'administrator', description: 'Manage this organization, including projects, members, credentials, and payments.', name: 'Administrator', scope: 'organization' },
+    { id: 'god', description: 'Unrestricted access across every organization and the installation, including global settings and authorization.', name: 'God', scope: 'global' },
+    ...(typeof S !== 'undefined' && S.authorizationCatalogOrganization === S.organizationId ? (S.authorizationCatalog?.profiles || []).filter((role) => role.scopeKey === `organization:${S.organizationId}`).map((role) => ({ ...role, scope: 'selectable' })) : []),
   ];
 }
 
@@ -1405,8 +1406,8 @@ function authorizationScopeSuggestions(projects, query) {
 }
 
 function normalizedAuthorization(value, fallbackProjectId) {
-  const level = authorizationLevels().some((candidate) => candidate.id === value?.level) ? value.level : 'developer';
-  const levelDef = authorizationLevels().find((candidate) => candidate.id === level);
+  const level = (authorizationLevels().some((candidate) => candidate.id === value?.level) || /^role_/.test(value?.level || '')) ? value.level : 'developer';
+  const levelDef = authorizationLevels().find((candidate) => candidate.id === level) || { scope: 'selectable' };
   if (levelDef.scope === 'organization') return { level, scope: 'organization' };
   if (levelDef.scope === 'global') return { level, scope: 'global' };
   if (value?.scope === 'organization') return { level, scope: 'organization' };
@@ -1422,12 +1423,13 @@ function authorizationScopePlaceholder(chips) {
 
 function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
   const selected = normalizedAuthorization(value, fallbackProjectId);
-  const level = authorizationLevels().find((candidate) => candidate.id === selected.level);
+  const level = authorizationLevels().find((candidate) => candidate.id === selected.level) || { id: selected.level, name: 'Unavailable role', scope: 'selectable', description: 'Role details could not be loaded. Reload to view its capabilities.' };
   const names = new Map((projects || []).map((project) => [project.id, project.name]));
   const chips = selected.scope === 'organization' ? ['@organization'] : (selected.projectIds || []);
   return `<div class="authz-editor" id="${esc(id)}" data-authorization="${esc(JSON.stringify(selected))}">
-    <select class="authz-level-select" aria-label="Authorization level">${authorizationLevels().map((candidate) =>
-      `<option value="${candidate.id}" ${candidate.id === selected.level ? 'selected' : ''}>${candidate.name}</option>`).join('')}</select>
+    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
+      `<option value="${esc(candidate.id)}" ${candidate.id === selected.level ? 'selected' : ''}>${esc(candidate.name)}</option>`).join('')}</select>
+    <p class="authz-description task-sub" id="${esc(id)}-description" aria-live="polite">${esc(level.description || "Custom capabilities in the selected scope.")}</p>
     <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
       <div class="authz-scope-field">
         <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('')}</span>
@@ -1544,11 +1546,17 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const chips = root.querySelector('.authz-scope-chips');
   const field = root.querySelector('.authz-scope-field');
   let value = normalizedAuthorization(JSON.parse(root.dataset.authorization || '{}'));
+  const availableLevels = authorizationLevels();
+  if (!availableLevels.some((level) => level.id === value.level)) availableLevels.push({ id: value.level, name: 'Unavailable role', scope: 'selectable', description: 'Role details could not be loaded. Reload to view its capabilities.' });
+  levelSelect.innerHTML = availableLevels.map((level) =>
+    `<option value="${esc(level.id)}" ${level.id === value.level ? 'selected' : ''}>${esc(level.name)}</option>`).join('');
   let active = -1;
   const projectById = new Map((projects || []).map((project) => [project.id, project]));
-  const levelOf = () => authorizationLevels().find((candidate) => candidate.id === value.level);
+  const levelOf = () => availableLevels.find((candidate) => candidate.id === value.level) || { scope: 'selectable' };
   const emit = () => { root._authorizationValue = value; root.dataset.authorization = JSON.stringify(value); onChange?.(value); };
   const drawChips = () => {
+    const description = root.querySelector('.authz-description');
+    if (description) description.textContent = levelOf().description || 'Custom capabilities in the selected scope.';
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
     chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
     input.placeholder = authorizationScopePlaceholder(selected);
@@ -1578,7 +1586,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
     input.value = ''; drawChips(); emit(); show();
   };
   levelSelect.addEventListener('change', () => {
-    const level = authorizationLevels().find((candidate) => candidate.id === levelSelect.value);
+    const level = availableLevels.find((candidate) => candidate.id === levelSelect.value);
     value = level.scope === 'selectable'
       ? normalizedAuthorization({ ...value, level: level.id })
       : { level: level.id, scope: level.scope };
@@ -2907,13 +2915,16 @@ async function loadCollaboration() {
   const organizationId = S.organizationId;
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const [members, teams, users] = await Promise.all([
+  const [members, teams, users, catalog] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
+    api(`/api/organizations/${organizationId}/roles`).catch(() => null),
     loadInbox().catch(() => {}),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
+  S.authorizationCatalog = catalog;
+  S.authorizationCatalogOrganization = organizationId;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
@@ -15651,6 +15662,7 @@ function organizationView() {
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card" id="organization-roles">Loading roles…</div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
@@ -15716,6 +15728,69 @@ function appendPendingInvitation(invitation, projects) {
   box.insertAdjacentHTML('beforeend', pendingInvitationRow(invitation, projects));
 }
 
+function roleAllows(patterns, capability) {
+  return patterns.some((pattern) => pattern === '*' || pattern === capability
+    || (pattern.endsWith(':*') && capability.startsWith(pattern.slice(0, -1))));
+}
+
+function roleCapabilityTree(groups, capabilities, selectable = false) {
+  return groups.map((group) => {
+    const included = group.capabilities.filter((cap) => roleAllows(capabilities, cap.id));
+    if (!included.length) return '';
+    return `<details class="role-capability-group"><summary>${esc(group.label)} <span class="chip">${included.length}</span></summary>
+      <p class="task-sub">${esc(group.description)}</p><ul>${included.map((cap) => `<li>
+        ${selectable ? `<label><input type="checkbox" name="capability" value="${esc(cap.id)}"><b>${esc(cap.label)}</b></label>` : `<b>${esc(cap.label)}</b>`}
+        <code>${esc(cap.id)}</code><p class="task-sub">${esc(cap.description)}</p></li>`).join('')}</ul></details>`;
+  }).join('');
+}
+
+function renderOrganizationRoles() {
+  const root = $('#organization-roles');
+  if (!root) return;
+  const catalog = S.authorizationCatalog;
+  if (!catalog) { root.textContent = 'Could not load roles. Reload this page to try again.'; return; }
+  const levels = authorizationLevels();
+  root.innerHTML = `<div class="section-h">Roles &amp; capabilities</div>
+    <p class="task-sub">Expand a role, then a category to inspect its exact capabilities. Access is limited by the selected projects or organization and by the person granting it. Task actions also depend on workflow state.</p>
+    ${catalog.profiles.slice().sort((a, b) => levels.findIndex((level) => level.id === a.id) - levels.findIndex((level) => level.id === b.id)).map((role) => `<details class="authorization-role">
+      <summary><b>${esc(role.name)}</b><span class="chip">${role.builtin ? 'Built-in' : 'Custom'}</span></summary>
+      <p class="task-sub">${esc(role.description)}</p>
+      ${roleCapabilityTree(catalog.capabilityGroups, role.capabilities)}
+      <details class="role-capability-group"><summary>Exact grant patterns</summary><p class="task-sub">A wildcard (*) grants every matching capability, including future additions. Scope limits still apply; for example, project scope excludes Review-gate approval.</p><ul>${role.capabilities.map((cap) => `<li><code>${esc(cap)}</code></li>`).join('')}</ul></details>
+    </details>`).join('')}
+    ${catalog.canCreate ? `<details class="authorization-role"><summary><b>Create role</b></summary>
+      <form id="create-authorization-role">
+        <label class="form-row">Role name<input name="name" required maxlength="80" placeholder="Release coordinator"></label>
+        <label class="form-row">Description<input name="description" required maxlength="240" placeholder="What this role can do"></label>
+        <p class="task-sub">Choose specific capabilities. Only permissions you can grant within this organization are available. New roles are available for people and tasks; existing grants stay unchanged.</p>
+        ${roleCapabilityTree(catalog.capabilityGroups, catalog.creatableCapabilities, true)}
+        <p class="task-sub" id="role-selection-count" aria-live="polite">0 capabilities selected</p>
+        <p class="task-sub" id="role-create-error" role="alert"></p>
+        <button class="btn primary" type="submit">Create role</button>
+      </form></details>` : ''}
+  `;
+  const form = root.querySelector('form');
+  form?.addEventListener('change', () => {
+    root.querySelector('#role-selection-count').textContent = `${form.querySelectorAll('[name=capability]:checked').length} capabilities selected`;
+  });
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const capabilities = data.getAll('capability');
+    const error = root.querySelector('#role-create-error');
+    if (!capabilities.length) { error.textContent = 'Select at least one capability.'; return; }
+    const button = form.querySelector('[type=submit]');
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${S.organizationId}/roles`, { method: 'POST',
+        body: JSON.stringify({ name: data.get('name'), description: data.get('description'), capabilities }) });
+      await loadCollaboration();
+      await hydrateOrganizationView();
+      toast('Role created');
+    } catch (e) { error.textContent = e.message; button.disabled = false; }
+  });
+}
+
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -15733,6 +15808,7 @@ async function hydrateOrganizationView() {
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  renderOrganizationRoles();
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
