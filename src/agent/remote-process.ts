@@ -13,6 +13,7 @@ import { publishRemoteCodexHistory } from './codex-history-remote.js';
 import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
+import { exposeRemoteNodeCommand } from './remote-node.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -862,6 +863,10 @@ async function ensureRemoteNode(world: World): Promise<string> {
     `${quote(node)} -e ${quote(acceptable)}`,
   ].join(' && ')], { timeoutMs: 5 * 60_000 });
   if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
+  // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
+  // at the standard sandbox location, including on resumed worlds.
+  const expose = await world.exec('bash', ['-lc', exposeRemoteNodeCommand(bin)]);
+  if (expose.code !== 0) throw new Error(`could not make managed Node/npm the sandbox default (requires writable /usr/local/bin or passwordless sudo): ${expose.stderr || expose.stdout}`);
   return bin;
 }
 

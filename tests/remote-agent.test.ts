@@ -77,6 +77,18 @@ describe('remote subscription agents', () => {
     const second = await seedRemoteAgentHome(world, 'codex', localHome);
     expect(first.runtimeBin).toBe('/workspace/.karmax-injection/agent/tools/node-22.16.0/bin');
     expect(second.runtimeBin).toBe(first.runtimeBin);
+    expect(world.commands.filter((command) => command.includes('ln -sfnT') && command.includes('/usr/local/bin/node'))).toHaveLength(2);
+  });
+
+  it('reports when a sandbox cannot expose the managed toolchain', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
+    const world = fakeWorld();
+    const exec = world.exec.bind(world);
+    world.exec = async (command, args = [], options) => args.some((arg) => arg.includes('ln -sfnT'))
+      ? { code: 1, stdout: '', stderr: 'sudo: a password is required' }
+      : exec(command, args, options);
+    await expect(seedRemoteAgentHome(world, 'claude', localHome)).rejects.toThrow(
+      'could not make managed Node/npm the sandbox default');
   });
 
   it('delivers remote stderr before close, including when diagnostics cannot be read', async () => {
