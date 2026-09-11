@@ -244,6 +244,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   propose_project_resource: 'task:review:write', adopt_project_resource: 'task:review:execute',
   discard_project_resource: 'task:review:execute',
   list_events: 'task:event:read', diagnostics: 'diagnostic:read', list_processes: 'process:read', kill_process: 'process:kill',
+  list_github_actions_workflows: 'github:actions:read',
   list_github_actions_runs: 'github:actions:read', inspect_github_actions_run: 'github:actions:read',
   manage_github_actions_run: 'github:actions:write', dispatch_github_actions_workflow: 'github:actions:write',
   execute_review_action: 'task:review:execute', stop_review_action: 'task:review:execute',

@@ -711,11 +711,23 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'list_github_actions_workflows',
+    description: 'Discover workflow ids, paths and enabled states in an attached repository. Paginated; requires github:actions:read.',
+    parameters: { type: 'object', properties: {
+      repository: { type: 'string' }, page: { type: 'number' }, per_page: { type: 'number' },
+    } },
+  },
+  {
     name: 'inspect_github_actions_run',
-    description: 'Inspect one Actions run, including failed jobs/steps, bounded log excerpts, and artifact metadata. GitHub credentials and signed log URLs never enter the task world.',
+    description: 'Inspect Actions evidence with github:actions:read. Default failure view preserves diagnostics. Use jobs for paginated steps/attempts, log with job_id for any conclusion and bounded tail output, artifacts for metadata, annotations with job_id for check diagnostics, or pending-deployments for current approval waits. Pin attempt for historical jobs/logs. headSha and success/skipped status do not prove deployed code; verify explicit target, readiness, completion and rollback evidence. Credentials and signed URLs stay host-side.',
     parameters: { type: 'object', properties: {
       repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
       run_id: { type: 'number' },
+      view: { type: 'string', enum: ['failure', 'jobs', 'log', 'artifacts', 'annotations', 'pending-deployments'] },
+      attempt: { type: 'number' }, job_id: { type: 'number' }, page: { type: 'number' }, per_page: { type: 'number' },
+      offset_lines: { type: 'number', description: 'Page backwards from the end using nextOffsetLines, within retainedLines.' },
+      tail_lines: { type: 'number', description: 'Log tail lines, default 100, maximum 500.' },
+      max_chars: { type: 'number', description: 'Log output characters, default 16000, maximum 32000. Check tailComplete and truncation flags.' },
     }, required: ['run_id'] },
   },
   {
@@ -1234,9 +1246,19 @@ export function platformToolHandlers(
       }
       return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs?${query}`));
     },
+    async list_github_actions_workflows(args) {
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['page', args?.page], ['perPage', args?.per_page]])
+        if (value !== undefined) query.set(String(key), String(value));
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/workflows?${query}`));
+    },
     async inspect_github_actions_run(args) {
-      const repository = args?.repository ? `?repository=${encodeURIComponent(String(args.repository))}` : '';
-      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}${repository}`));
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['view', args?.view], ['attempt', args?.attempt],
+        ['jobId', args?.job_id], ['page', args?.page], ['perPage', args?.per_page],
+        ['offsetLines', args?.offset_lines], ['tailLines', args?.tail_lines], ['maxChars', args?.max_chars]])
+        if (value !== undefined) query.set(String(key), String(value));
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}?${query}`));
     },
     async manage_github_actions_run(args) {
       return JSON.stringify(await platformRequest('POST', `/api/agent/github/actions/runs/${Number(args?.run_id)}`, {

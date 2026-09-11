@@ -91,6 +91,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   it('forwards brokered GitHub Actions reads and separately-declared mutations', async () => {
     const seen: unknown[] = [];
     const stub = {
+      listGithubActionsWorkflows: async (args: unknown) => { seen.push(['workflows', args]); return { workflows: [] }; },
       listGithubActionsRuns: async (args: unknown) => { seen.push(['list', args]); return { runs: [] }; },
       inspectGithubActionsRun: async (args: unknown) => { seen.push(['inspect', args]); return { failedJobs: [] }; },
       manageGithubActionsRun: async (args: unknown) => { seen.push(['manage', args]); return { accepted: true }; },
@@ -100,8 +101,9 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     const [clientT, serverT] = InMemoryTransport.createLinkedPair(); await server.connect(serverT);
     const c = new Client({ name: 'github-actions-test', version: '1.0.0' }); await c.connect(clientT);
     for (const [name, args] of [
+      ['list_github_actions_workflows', { repository: 'acme/app', page: 2 }],
       ['list_github_actions_runs', { repository: 'acme/app', branch: 'main', status: 'failure', perPage: 10 }],
-      ['inspect_github_actions_run', { repository: 'acme/app', runId: 42 }],
+      ['inspect_github_actions_run', { repository: 'acme/app', runId: 42, view: 'log', attempt: 1, jobId: 99, tailLines: 20, offsetLines: 3, maxChars: 1000 }],
       ['manage_github_actions_run', { repository: 'acme/app', runId: 42, action: 'rerun-failed' }],
       ['dispatch_github_actions_workflow', { repository: 'acme/app', workflow: 'deploy.yml', ref: 'main', inputs: { dry_run: false } }],
     ] as const) {
@@ -109,8 +111,9 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       expect(result.isError, result.content?.[0]?.text).toBeFalsy();
     }
     expect(seen).toEqual([
+      ['workflows', { repository: 'acme/app', page: 2 }],
       ['list', { repository: 'acme/app', branch: 'main', status: 'failure', perPage: 10 }],
-      ['inspect', { repository: 'acme/app', runId: 42 }],
+      ['inspect', { repository: 'acme/app', runId: 42, view: 'log', attempt: 1, jobId: 99, tailLines: 20, offsetLines: 3, maxChars: 1000 }],
       ['manage', { repository: 'acme/app', runId: 42, action: 'rerun-failed' }],
       ['dispatch', { repository: 'acme/app', workflow: 'deploy.yml', ref: 'main', inputs: { dry_run: false } }],
     ]);

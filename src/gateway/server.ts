@@ -4265,6 +4265,14 @@ export class Gateway {
         try { return this.json(res, 200, await api.publishTaskBranch(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      if (p === '/api/agent/github/actions/workflows' && method === 'GET') {
+        try { return this.json(res, 200, await api.listGithubActionsWorkflows(token, {
+          repository: url.searchParams.get('repository') ?? undefined,
+          page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
+          perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
+        })); } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
+      }
       if (p === '/api/agent/github/actions/runs' && method === 'GET') {
         try {
           return this.json(res, 200, await api.listGithubActionsRuns(token, {
@@ -4283,6 +4291,14 @@ export class Gateway {
       if (githubActionsRun && method === 'GET') {
         try { return this.json(res, 200, await api.inspectGithubActionsRun(token, {
           repository: url.searchParams.get('repository') ?? undefined, runId: Number(githubActionsRun[1]),
+          view: (url.searchParams.get('view') ?? undefined) as any,
+          attempt: url.searchParams.has('attempt') ? Number(url.searchParams.get('attempt')) : undefined,
+          jobId: url.searchParams.has('jobId') ? Number(url.searchParams.get('jobId')) : undefined,
+          page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
+          perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
+          offsetLines: url.searchParams.has('offsetLines') ? Number(url.searchParams.get('offsetLines')) : undefined,
+          tailLines: url.searchParams.has('tailLines') ? Number(url.searchParams.get('tailLines')) : undefined,
+          maxChars: url.searchParams.has('maxChars') ? Number(url.searchParams.get('maxChars')) : undefined,
         })); }
         catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
           { error: error instanceof Error ? error.message : String(error) }); }
