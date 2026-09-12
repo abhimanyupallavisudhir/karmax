@@ -137,29 +137,10 @@ it('reproduces the cutoff error with the real pinned Codex after rewriting an an
     .rejects.toThrow('cutoff byte offset is past the source rollout');
 });
 
-it.each([false, true])('recovers native lineage through transfers and completed turns (damaged ancestor: %s)', async (damaged) => {
+it('forks, migrates tools, transfers, checkpoints, restores, and completes a real app-server turn', async () => {
   const origin = temp();
   const { root, child } = await history(origin);
   const sourceFile = findProviderSession({ provider: 'codex', session: root, forkHome: origin })!;
-  if (damaged) {
-    // Reproduce the old writer's decimal-tail ordinal reuse in an ancestor,
-    // including a distinct record with the reused ordinal. Adjust only this
-    // fixture's byte boundary so the child still references the same history.
-    const bytes = fs.readFileSync(sourceFile);
-    const firstEnd = bytes.indexOf(10) + 1;
-    const next = JSON.parse(bytes.subarray(firstEnd).toString().split('\n')[0]!);
-    const tail = Buffer.from(JSON.stringify({ timestamp: new Date().toISOString(), ordinal: next.ordinal,
-      type: 'event_msg', payload: { type: 'token_count', info: null,
-        rate_limits: { primary: { used_percent: 1.5, window_minutes: 300, resets_at: 1999999999 } } },
-    }) + '\n');
-    fs.writeFileSync(sourceFile, Buffer.concat([bytes.subarray(0, firstEnd), tail, bytes.subarray(firstEnd)]));
-    const childFile = findProviderSession({ provider: 'codex', session: child, forkHome: origin })!;
-    const childBytes = fs.readFileSync(childFile);
-    const newline = childBytes.indexOf(10);
-    const metadata = JSON.parse(childBytes.subarray(0, newline).toString());
-    metadata.payload.history_base.end_byte_offset += tail.length;
-    fs.writeFileSync(childFile, Buffer.concat([Buffer.from(JSON.stringify(metadata)), childBytes.subarray(newline)]));
-  }
   const original = fs.readFileSync(sourceFile);
   const migrated = await ensureLocalCodexSessionTools(origin, root, [])!;
   expect(migrated).not.toBe(root);

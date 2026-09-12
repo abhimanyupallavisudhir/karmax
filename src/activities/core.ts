@@ -1017,9 +1017,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
             const source = store.currentWorld(forkSource.taskId) as WorldHandle | undefined;
             if (!source) throw new Error('source world is unavailable; choose another starting branch to fork only the conversation');
-            const state = await worlds.status(source);
-            if (state !== 'ready' && source.checkpointId)
-              forkCheckpoint = store.getWorldCheckpoint(source.checkpointId);
+            // The source may finish while this fork waits for setup. Its world
+            // is deliberately destroyed then; provider status can still say ready
+            // (cached or after a worker restart). Never reopen that world or acquire
+            // a new source lease: use its durable snapshot, preserving the fork's
+            // original branch/files rather than silently switching to the target.
+            const sourceStatus = store.getTask(forkSource.taskId)?.lastView?.status;
+            const finished = (sourceStatus && ['done', 'cancelled', 'failed'].includes(sourceStatus))
+              || store.worldState(source.id) === 'released';
+            if (finished) {
+              forkCheckpoint = store.latestWorldCheckpoint(source.id);
+              if (!forkCheckpoint || forkCheckpoint.generation !== (source.generation ?? 1))
+                throw new Error('source world has finished without a checkpoint for its current generation; choose another starting branch to fork only the conversation');
+            } else {
+              const state = await worlds.status(source);
+              if (state !== 'ready' && source.checkpointId)
+                forkCheckpoint = store.getWorldCheckpoint(source.checkpointId);
+            }
             if (!forkCheckpoint) {
               const sourceWorld = await openWorld(source, source.id);
               if (isRemote(source.kind)) {
