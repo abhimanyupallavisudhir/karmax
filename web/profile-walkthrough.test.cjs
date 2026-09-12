@@ -113,3 +113,83 @@ test('late status responses cannot replace another organization or signed-in use
     assert.equal(ctx.S.onboarding, undefined);
   }
 });
+
+const finishedOnboarding = { organizationId: 'org1', visible: false, complete: true,
+  display: 'expanded', completedRequired: 4, totalRequired: 4 };
+function unfinishedOnboarding(ctx, display = 'expanded') {
+  ctx.S.onboarding = { ...finishedOnboarding, visible: true, complete: false, completedRequired: 3, display };
+}
+
+test('finishing expanded or minimized onboarding shows a closeable completion notice', async () => {
+  for (const display of ['expanded', 'minimized']) {
+    const { ctx, host } = onboardingContext();
+    unfinishedOnboarding(ctx, display);
+    let close;
+    ctx.$ = selector => selector === '#hosted-onboarding' ? host
+      : selector === '#onboarding-complete-close' ? { addEventListener: (_event, fn) => { close = fn; } } : null;
+    ctx.api = async () => finishedOnboarding;
+    await vm.runInContext('refreshOnboarding()', ctx);
+    assert.equal(host.hidden, false);
+    assert.match(host.innerHTML, /Setup complete/);
+    assert.match(host.innerHTML, /Close completed walkthrough/);
+    assert.equal(ctx.S.onboardingTimer, null);
+    // Background refreshes must not erase the notice or reopen it after dismissal.
+    await vm.runInContext('refreshOnboarding()', ctx);
+    assert.equal(host.hidden, false);
+    close();
+    assert.equal(host.hidden, true);
+    await vm.runInContext('refreshOnboarding()', ctx);
+    assert.equal(host.hidden, true);
+  }
+});
+
+test('already completed setup stays hidden on a fresh page or login', async () => {
+  const { ctx, host } = onboardingContext();
+  ctx.api = async () => finishedOnboarding;
+  await vm.runInContext('refreshOnboarding()', ctx);
+  assert.equal(host.hidden, true);
+  assert.equal(ctx.S.onboardingCompletion, undefined);
+});
+
+function beginNavigation(ctx) {
+  // Execute the actual router entry, before route-specific rendering starts.
+  const start = source.indexOf('async function applyRoute()');
+  const end = source.indexOf('  const routePath', start);
+  vm.runInContext(source.slice(start, end) + '\n}\napplyRoute();', ctx);
+}
+
+test('navigation removes completion feedback and returning does not restore it', async () => {
+  const { ctx, host } = onboardingContext();
+  unfinishedOnboarding(ctx);
+  ctx.api = async () => finishedOnboarding;
+  await vm.runInContext('refreshOnboarding()', ctx);
+  assert.equal(host.hidden, false);
+  beginNavigation(ctx);
+  assert.equal(host.hidden, true);
+  await vm.runInContext('refreshOnboarding()', ctx);
+  beginNavigation(ctx);
+  vm.runInContext('renderOnboarding()', ctx);
+  assert.equal(host.hidden, true);
+});
+
+test('a completion response from the previous page cannot display a notice after navigation', async () => {
+  const { ctx, host } = onboardingContext();
+  unfinishedOnboarding(ctx);
+  let resolve;
+  ctx.api = () => new Promise(done => { resolve = done; });
+  const pending = vm.runInContext('refreshOnboarding()', ctx);
+  beginNavigation(ctx);
+  resolve(finishedOnboarding);
+  await pending;
+  assert.equal(host.hidden, true);
+});
+
+test('finishing a replay through Done also shows completion feedback', async () => {
+  const { ctx, host } = onboardingContext();
+  unfinishedOnboarding(ctx);
+  ctx.S.onboarding.replay = true;
+  ctx.api = async () => finishedOnboarding;
+  await vm.runInContext("setOnboardingDisplay('expanded', true)", ctx);
+  assert.equal(host.hidden, false);
+  assert.match(host.innerHTML, /Setup complete/);
+});

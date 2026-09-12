@@ -483,6 +483,7 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
 }
 
 async function applyRoute() {
+  if (S.onboardingCompletion) dismissOnboardingCompletion();
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
@@ -3497,16 +3498,18 @@ function brandMark() {
 async function refreshOnboarding() {
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   const userId = S.user?.id;
+  const pageEpoch = S.routeEpoch;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
+    S.onboardingCompletion = null;
     renderOnboarding();
     return;
   }
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    S.onboarding = status;
+    acceptOnboardingStatus(status, pageEpoch);
   } catch {
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
     // Keep the last known guide and retry even when the first request failed.
@@ -3517,17 +3520,36 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
+// Completion feedback belongs only to the page that observed the transition.
+// It is deliberately absent from both the saved preference and browser storage.
+function acceptOnboardingStatus(status, pageEpoch) {
+  const previous = S.onboarding;
+  if (status.complete && previous?.visible && !previous.complete
+    && previous.organizationId === status.organizationId && pageEpoch === S.routeEpoch) {
+    S.onboardingCompletion = { organizationId: status.organizationId, userId: S.user?.id };
+  } else if (!status.complete) {
+    S.onboardingCompletion = null;
+  }
+  S.onboarding = status;
+}
+
+function dismissOnboardingCompletion() {
+  S.onboardingCompletion = null;
+  renderOnboarding();
+}
+
 async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   const organizationId = S.organizationId;
   const userId = S.user?.id;
+  const pageEpoch = S.routeEpoch;
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    S.onboarding = status;
+    acceptOnboardingStatus(status, pageEpoch);
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
@@ -3553,6 +3575,20 @@ function renderOnboarding() {
   const host = $('#hosted-onboarding');
   if (!host) return;
   const state = S.onboarding;
+  const completion = S.onboardingCompletion;
+  if (state?.complete && completion?.organizationId === S.organizationId
+    && completion.userId === S.user?.id && S.meta?.hosted) {
+    clearTimeout(S.onboardingTimer);
+    S.onboardingTimer = null;
+    host.hidden = false;
+    host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
+      <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
+      <span><b>Setup complete</b><small>All required steps are finished.</small></span>
+      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">×</button>
+    </div>`;
+    $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
+    return;
+  }
   if (!state?.visible || state.organizationId !== S.organizationId) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
