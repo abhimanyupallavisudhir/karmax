@@ -65,8 +65,9 @@ export class ReviewActionRunner {
     private resources?: import('../world/resources.js').ProjectResourceService) {
     this.commandPoll = setInterval(() => {
       for (const rec of this.procs.values()) {
+        if (!rec.running) continue;
         this.store.heartbeatExecution(rec.procId);
-        if (this.store.execution(rec.procId)?.state === 'stop-requested' && rec.running) void rec.process.kill('SIGTERM');
+        if (this.store.execution(rec.procId)?.state === 'stop-requested') void rec.process.kill('SIGTERM');
       }
     }, 1_000);
     this.commandPoll.unref();
@@ -152,6 +153,10 @@ export class ReviewActionRunner {
       this.releaseLease(rec, opts.world.kind);
       this.revokePreviews(rec);
       for (const l of rec.listeners) l('', true, rec.exitCode);
+      // The durable execution record (and its frames) now answers status/attach;
+      // keeping the in-memory buffer would grow the map by MAX_OUTPUT per run.
+      rec.listeners.clear();
+      this.procs.delete(procId);
     });
     this.procs.set(procId, rec);
     return rec;

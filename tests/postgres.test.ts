@@ -16,6 +16,34 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('patches task fields without replacing unrelated metadata or merging revoked grants', () => {
+    const store = new Store(url!);
+    try {
+      const project = store.createProject('Parameter patches');
+      const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'work', _workflowRunId: 'live-run',
+          _authorization: { capabilities: ['old'], delegationId: 'revoked' } } });
+      store.patchTaskParams(task.id, { base: 'main', _authorization: { capabilities: ['new'] },
+        nullable: null, ignored: undefined });
+      expect(store.getTask(task.id)?.params).toEqual({ prompt: 'work', _workflowRunId: 'live-run',
+        base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
+    } finally { store.close(); }
+  });
+
+  it('retains shared snapshot chunks and releases only the last reference', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-chunks-'));
+    const { store } = openStore(path.join(home, 'karmax.db'), url!);
+    try {
+      const chunks = [{ id: 'shared-chunk', bytes: 12 }];
+      store.retainResourceChunks('org_personal', chunks);
+      store.retainResourceChunks('org_personal', chunks);
+      expect(store.releaseResourceChunks('org_personal', ['shared-chunk'])).toEqual([]);
+      expect(store.releaseResourceChunks('org_personal', ['shared-chunk'])).toEqual(['shared-chunk']);
+    } finally {
+      store.close(); fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('transactionally imports application and identity SQLite data and is idempotent', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-'));
     const storeFile = path.join(home, 'karmax.db');

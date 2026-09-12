@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
-  reconcileRemoteCodexSessionCopies, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
+  reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
@@ -67,6 +67,54 @@ describe('remote subscription agents', () => {
     expect(world.commands.some((command) => command.includes('find') && command.includes('chmod 600'))).toBe(true);
     await seedRemoteAgentHome(world, 'codex', localHome, 'host-task');
     expect(world.files.get(`${remoteHome}/sessions/forked/host-task.jsonl`)?.toString()).toBe('host-only conversation');
+  });
+
+  it('keeps a managed runtime even when task-installed system Node reports a modern version', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
+    const world = fakeWorld();
+    // All commands, including an ambient version probe, report success.
+    const first = await seedRemoteAgentHome(world, 'codex', localHome);
+    const second = await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(first.runtimeBin).toBe('/workspace/.karmax-injection/agent/tools/node-22.16.0/bin');
+    expect(second.runtimeBin).toBe(first.runtimeBin);
+    expect(world.commands.filter((command) => command.includes('ln -sfnT') && command.includes('/usr/local/bin/node'))).toHaveLength(2);
+  });
+
+  it('reports when a sandbox cannot expose the managed toolchain', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
+    const world = fakeWorld();
+    const exec = world.exec.bind(world);
+    world.exec = async (command, args = [], options) => args.some((arg) => arg.includes('ln -sfnT'))
+      ? { code: 1, stdout: '', stderr: 'sudo: a password is required' }
+      : exec(command, args, options);
+    await expect(seedRemoteAgentHome(world, 'claude', localHome)).rejects.toThrow(
+      'could not make managed Node/npm the sandbox default');
+  });
+
+  it('delivers remote stderr before close, including when diagnostics cannot be read', async () => {
+    for (const readable of [true, false]) {
+      let exit!: (code: number | null) => void;
+      const world = fakeWorld();
+      world.openPty = async () => ({
+        onData: () => () => {}, onExit: (listener) => { exit = listener; return () => {}; },
+        write: async () => {}, resize: async () => {}, close: async () => {},
+      });
+      world.exec = async () => {
+        if (!readable) throw new Error('sandbox unavailable');
+        return { code: 0, stdout: 'npm ENOENT: missing node/lib', stderr: '' };
+      };
+      const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {}, undefined, '/home/agent-stderr.log');
+      let diagnostic = '';
+      child.stderr.on('data', (chunk) => { diagnostic += chunk; });
+      const closed = new Promise<void>((resolve) => child.once('close', (code) => {
+        expect(code).toBe(254);
+        expect(diagnostic).toBe(readable ? 'npm ENOENT: missing node/lib' : '');
+        resolve();
+      }));
+      await Promise.resolve();
+      exit(254);
+      await closed;
+    }
   });
 
   it('keeps Claude refresh authority on the control plane across parallel worlds', async () => {
@@ -213,7 +261,7 @@ describe('remote subscription agents', () => {
     // launcher sets vm.overcommit_memory=1 first so Chrome's V8 renderer can run
     // in the memory-constrained sandbox (findings/e2b-headless-chrome-overcommit).
     expect(seeded.browserMcp?.['chrome-devtools']).toMatchObject({
-      command: 'node',
+      command: `${seeded.runtimeBin}/node`,
       args: ['/workspace/.karmax-injection/agent/chrome-cdp-launcher.mjs'],
       env: {
         PLAYWRIGHT_BROWSERS_PATH: '/opt/karmax/browsers',
@@ -540,7 +588,7 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
         for (const file of args.slice(2)) files.delete(file.replace('/workspace/', ''));
         return { stdout: '', stderr: '', code: 0 };
       }
-      if (command === 'node' && args[0] === '-e' && args[1]?.includes('.karmax-history-publish.sqlite')) {
+      if (path.posix.basename(command) === 'node' && args[0] === '-e' && args[1]?.includes('.karmax-history-publish.sqlite')) {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-publish-'));
         try {
           for (const [file, content] of files) {
@@ -560,9 +608,9 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
           return { stdout: result.stdout, stderr: result.stderr, code: result.status ?? 1 };
         } finally { fs.rmSync(root, { recursive: true, force: true }); }
       }
-      if (command === 'node' && args[0] === '-e' && args[1]?.includes('process.versions.node'))
+      if (path.posix.basename(command) === 'node' && args[0] === '-e' && args[1]?.includes('process.versions.node'))
         return { stdout: '', stderr: '', code: 0 };
-      if (browserReady && command === 'node' && args[0] === '-e' && args[1]?.includes('executablePath'))
+      if (browserReady && path.posix.basename(command) === 'node' && args[0] === '-e' && args[1]?.includes('executablePath'))
         return { stdout: '/opt/karmax/browsers/chromium', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     },

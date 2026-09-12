@@ -1,3 +1,4 @@
+import type { GithubActionsInspectOptions } from '../integrations/github-actions.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
@@ -57,12 +58,13 @@ export interface PlatformOps {
   findTask(projectId: string, num: number): Promise<unknown>;
   listAgents(taskId: string): Promise<unknown>;
   getConversation(taskId: string, role?: string): Promise<unknown>;
-  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string;
+  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; base?: string; authorizationProfile?: string;
     reauthorize?: boolean; target?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
   listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
     workflow?: string | number; page?: number; perPage?: number }): Promise<unknown>;
-  inspectGithubActionsRun(a: { repository?: string; runId: number }): Promise<unknown>;
+  listGithubActionsWorkflows(a: { repository?: string; page?: number; perPage?: number }): Promise<unknown>;
+  inspectGithubActionsRun(a: { repository?: string; runId: number } & GithubActionsInspectOptions): Promise<unknown>;
   manageGithubActionsRun(a: { repository?: string; runId: number; action: 'rerun-failed' | 'rerun' | 'cancel' }): Promise<unknown>;
   dispatchGithubActionsWorkflow(a: { repository?: string; workflow: string | number; ref: string;
     inputs?: Record<string, string | number | boolean> }): Promise<unknown>;
@@ -129,6 +131,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     forkAgent: (a) => api.forkTaskAgent(getToken(), a),
     listEvents: (id, since) => api.taskEvents(getToken(), id, since),
     listGithubActionsRuns: (a) => api.listGithubActionsRuns(getToken(), a as any),
+    listGithubActionsWorkflows: (a) => api.listGithubActionsWorkflows(getToken(), a),
     inspectGithubActionsRun: (a) => api.inspectGithubActionsRun(getToken(), a),
     manageGithubActionsRun: (a) => api.manageGithubActionsRun(getToken(), a),
     dispatchGithubActionsWorkflow: (a) => api.dispatchGithubActionsWorkflow(getToken(), a),
@@ -232,7 +235,16 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       if (a.perPage !== undefined) query.set('perPage', String(a.perPage));
       return req(`/api/agent/github/actions/runs?${query}`);
     },
-    inspectGithubActionsRun: (a) => req(`/api/agent/github/actions/runs/${a.runId}${a.repository ? `?repository=${encodeURIComponent(a.repository)}` : ''}`),
+    listGithubActionsWorkflows: (a) => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(a)) if (value !== undefined) query.set(key, String(value));
+      return req(`/api/agent/github/actions/workflows?${query}`);
+    },
+    inspectGithubActionsRun: (a) => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(a)) if (key !== 'runId' && value !== undefined) query.set(key, String(value));
+      return req(`/api/agent/github/actions/runs/${a.runId}?${query}`);
+    },
     manageGithubActionsRun: (a) => req(`/api/agent/github/actions/runs/${a.runId}`, {
       method: 'POST', body: JSON.stringify({ repository: a.repository, action: a.action }),
     }),
@@ -415,10 +427,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'fork_agent',
     {
-      description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. The source remains untouched. Use message_agent for later back-and-forth with the fork. reauthorize=true starts the fork with the grants the source task ended with (its authorization level/scope and approved vault credentials) instead of the project default; the grant is checked against your own authority like any new task.',
+      description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. Defaults to the source task branch and unpublished checkpoint, or its merge target after landing. Set base to another branch for normal project initialization. The source remains untouched. Use message_agent for later back-and-forth with the fork. reauthorize=true starts the fork with the grants the source task ended with (its authorization level/scope and approved vault credentials) instead of the project default; the grant is checked against your own authority like any new task.',
       inputSchema: {
         taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(),
-        target: z.string().optional(), authorizationProfile: z.string().optional(), reauthorize: z.boolean().optional(),
+        base: z.string().optional(), target: z.string().optional(), authorizationProfile: z.string().optional(), reauthorize: z.boolean().optional(),
         provider: z.enum(['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock']).optional(),
         model: z.string().optional(), effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
       },
@@ -452,14 +464,15 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'request_permission',
     {
       description:
-        'Request exact missing Karmax capabilities for this task. The request appears in the task Approval Requests tab ' +
+        'Request exact capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in the task Approval Requests tab ' +
         'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, ' +
         '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Only a selected principal that already holds every requested capability can approve; approval resumes the task ' +
+        'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {
-        capabilities: z.array(z.string().trim().min(1)).min(1).max(32),
+        capabilities: z.array(z.string().trim().min(1)).max(32),
+        projectIds: z.array(z.string().trim().min(1)).max(32).optional(),
         audience: z.array(z.string().trim().min(1)).min(1).max(32),
         reason: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
@@ -497,9 +510,20 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       page: z.number().int().min(1).max(1000).optional(), perPage: z.number().int().min(1).max(100).optional(),
     },
   }, async (a) => wrap(() => ops.listGithubActionsRuns(a)));
+  server.registerTool('list_github_actions_workflows', {
+    description: 'Discover workflow ids, paths and enabled states for an attached repository. Requires github:actions:read.',
+    inputSchema: { repository: z.string().optional(), page: z.number().int().min(1).max(1000).optional(),
+      perPage: z.number().int().min(1).max(100).optional() },
+  }, async (a) => wrap(() => ops.listGithubActionsWorkflows(a)));
   server.registerTool('inspect_github_actions_run', {
-    description: 'Inspect one GitHub Actions run, its jobs, failed steps, bounded diagnostic log excerpts, and artifact metadata. Signed log URLs and GitHub tokens are never returned.',
-    inputSchema: { repository: z.string().optional(), runId: z.number().int().positive() },
+    description: 'Inspect Actions evidence with read authority. Default failure diagnostics; jobs/artifacts are paginated. log selects any job conclusion by jobId and attempt, returning bounded tail output; annotations selects job check diagnostics; pending-deployments shows current approval waits. Check tailComplete/truncation flags. Run headSha or success/skipped does not prove deployment; correlate explicit target, readiness, completion and rollback evidence. Tokens and signed URLs never returned.',
+    inputSchema: { repository: z.string().optional(), runId: z.number().int().positive(),
+      view: z.enum(['failure', 'jobs', 'log', 'artifacts', 'annotations', 'pending-deployments']).optional(),
+      attempt: z.number().int().positive().optional(), jobId: z.number().int().positive().optional(),
+      page: z.number().int().min(1).max(1000).optional(), perPage: z.number().int().min(1).max(100).optional(),
+      offsetLines: z.number().int().min(0).max(1000000).optional(),
+      tailLines: z.number().int().min(1).max(500).optional(), maxChars: z.number().int().min(256).max(32000).optional(),
+    },
   }, async (a) => wrap(() => ops.inspectGithubActionsRun(a)));
   server.registerTool('manage_github_actions_run', {
     description: 'Rerun failed jobs, rerun an entire run, or cancel a run in a repository attached to this task’s project. Requires separately approved GitHub Actions write authority.',
@@ -522,7 +546,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
   server.registerTool('propose_project_resource', {
-    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored.',
+    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
     inputSchema: {
       path: z.string().optional(), vaultItemId: z.string().optional(), field: z.string().optional(), name: z.string(),
       driver: z.enum(['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1']).optional(),
@@ -577,7 +601,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'get_credential',
     {
       description:
-        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),

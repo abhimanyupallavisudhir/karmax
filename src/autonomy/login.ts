@@ -104,7 +104,7 @@ export class LoginManager {
 
   /** Start (or report) a login for an account. Returns the device URL to open. */
   async connect(provider: Provider, account: string, opts: LoginOptions = {}, organizationId = 'org_personal'): Promise<LoginResult> {
-    const configHome = this.homes.ensure(provider, account, organizationId);
+    const configHome = this.homes.prepareLogin(provider, account, organizationId);
     if (provider === 'opencode' && opts.modelProvider) {
       this.homes.setModelProvider(configHome, opts.modelProvider);
     }

@@ -59,7 +59,8 @@ export class AttachmentStore {
   constructor(opts: AttachmentStoreOpts = {}) {
     this.dir = paths(opts.home).attachments;
     this.maxBytes = opts.maxBytes ?? MAX_IMAGE_BYTES;
-    fs.mkdirSync(this.dir, { recursive: true });
+    // Uploads are whatever a user pasted into a prompt; keep them private on a shared host.
+    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
   }
 
   /**
@@ -80,7 +81,7 @@ export class AttachmentStore {
 
     const id = crypto.createHash('sha256').update(buf).digest('hex');
     const file = this.pathFor(id, sniffed);
-    if (!fs.existsSync(file)) fs.writeFileSync(file, buf); // content-addressed ⇒ idempotent
+    if (!fs.existsSync(file)) fs.writeFileSync(file, buf, { mode: 0o600 }); // content-addressed ⇒ idempotent
     return { id, mediaType: sniffed, bytes: buf.length };
   }
 
@@ -103,7 +104,7 @@ export class AttachmentStore {
     const safeName = sanitizeAttachmentName(name);
     const id = crypto.createHash('sha256').update(buf).digest('hex');
     const file = path.join(this.dir, `${id}.file`);
-    if (!fs.existsSync(file)) fs.writeFileSync(file, buf);
+    if (!fs.existsSync(file)) fs.writeFileSync(file, buf, { mode: 0o600 });
     return { id, name: safeName, mediaType: normalizeMediaType(declaredType), bytes: buf.length };
   }
 

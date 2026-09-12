@@ -76,7 +76,7 @@ const S = {
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'; null → auto)
   taskFile: null, // URL-owned agent citation handoff ({ path, line? }); null on the ordinary task page
   taskFileLoad: null, // { key, status, result|error } for the current handoff page
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
@@ -149,12 +149,16 @@ function rememberInteractionOrigin(event) {
   // Keep the original control as the event target (pointer-events:none can send
   // a repeat click through to a clickable row underneath). Swallow repeats at
   // capture time while the first request is visibly pending.
+  // Only activation keys count; ordinary typing must never be swallowed, and a
+  // paste/drop into a text field is an upload, not an action on that field —
+  // marking it pending would disable the field the user is typing in.
+  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+  if ((event.type === 'paste' || event.type === 'drop') && /^(?:INPUT|TEXTAREA)$/.test(control.tagName || '')) return;
   if (control.classList?.contains('action-pending')) {
     event.preventDefault?.();
     event.stopImmediatePropagation?.();
     return;
   }
-  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
   const epoch = ++interactionOriginEpoch;
   interactionOrigin = control;
   queueMicrotask(() => {
@@ -479,6 +483,7 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
 }
 
 async function applyRoute() {
+  if (S.onboardingCompletion) dismissOnboardingCompletion();
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
@@ -1042,6 +1047,34 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
+function forkBranchDefaults(task) {
+  const view = task?.lastView || task;
+  const base = view?.status === 'done' ? view.targetBranch || task?.params?.target : view?.branch;
+  return base ? { base } : {};
+}
+
+function prefillForkBranch(box, task) {
+  if (!['do', 'unified'].includes(box.dataset.agent)) return;
+  const root = box.closest('#tf-body');
+  const input = root?.querySelector('[data-field="base"]');
+  const base = forkBranchDefaults(task).base;
+  if (!input || !base || (task.projectId && task.projectId !== S.projectId)) return;
+  input.value = base;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  showForkWorldHelp(root);
+}
+
+function showForkWorldHelp(root) {
+  const input = root?.querySelector('[data-field="base"]');
+  if (!input) return;
+  if (!root.querySelector('.fork-world-help')) {
+    const help = document.createElement('p');
+    help.className = 'task-sub fork-world-help';
+    help.textContent = 'Changing the starting branch excludes the original task’s unpublished files and resources.';
+    input.closest('.form-row')?.append(help);
+  }
+}
+
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
 // The task reference is a real permalink to the source (Ctrl/⌘-click opens it
@@ -1331,9 +1364,11 @@ function collectForm(root, fields) {
     else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
     else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
     else val = el.value === '' ? undefined : el.value;
+    const forkBase = f.name === 'base' && root.querySelector('.agent-field[data-agent="do"] .af-resume-enabled:checked, .agent-field[data-agent="unified"] .af-resume-enabled:checked');
+    if (forkBase && val === undefined) val = inh;
     if (val === undefined) continue;
     // store only when changed from the inherited default (required fields always)
-    if (f.required || !sameJson(val, inh)) out[f.name] = val;
+    if (forkBase || f.required || !sameJson(val, inh)) out[f.name] = val;
   }
   return out;
 }
@@ -1353,11 +1388,12 @@ function normalizeComboOption(option) {
 
 function authorizationLevels() {
   return [
-    { id: 'viewer', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', name: 'Project maintainer', scope: 'selectable' },
-    { id: 'administrator', name: 'Administrator', scope: 'organization' },
-    { id: 'god', name: 'God', scope: 'global' },
+    { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
+    { id: 'developer', description: 'Create and manage tasks, work with agents, publish branches, and save skills in the selected scope.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Developer access plus project settings, queues, teams, repositories, and GitHub Actions in the selected scope.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'administrator', description: 'Manage this organization, including projects, members, credentials, and payments.', name: 'Administrator', scope: 'organization' },
+    { id: 'god', description: 'Unrestricted access across every organization and the installation, including global settings and authorization.', name: 'God', scope: 'global' },
+    ...(typeof S !== 'undefined' && S.authorizationCatalogOrganization === S.organizationId ? (S.authorizationCatalog?.profiles || []).filter((role) => role.scopeKey === `organization:${S.organizationId}`).map((role) => ({ ...role, scope: 'selectable' })) : []),
   ];
 }
 
@@ -1371,8 +1407,8 @@ function authorizationScopeSuggestions(projects, query) {
 }
 
 function normalizedAuthorization(value, fallbackProjectId) {
-  const level = authorizationLevels().some((candidate) => candidate.id === value?.level) ? value.level : 'developer';
-  const levelDef = authorizationLevels().find((candidate) => candidate.id === level);
+  const level = (authorizationLevels().some((candidate) => candidate.id === value?.level) || /^role_/.test(value?.level || '')) ? value.level : 'developer';
+  const levelDef = authorizationLevels().find((candidate) => candidate.id === level) || { scope: 'selectable' };
   if (levelDef.scope === 'organization') return { level, scope: 'organization' };
   if (levelDef.scope === 'global') return { level, scope: 'global' };
   if (value?.scope === 'organization') return { level, scope: 'organization' };
@@ -1388,12 +1424,13 @@ function authorizationScopePlaceholder(chips) {
 
 function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
   const selected = normalizedAuthorization(value, fallbackProjectId);
-  const level = authorizationLevels().find((candidate) => candidate.id === selected.level);
+  const level = authorizationLevels().find((candidate) => candidate.id === selected.level) || { id: selected.level, name: 'Unavailable role', scope: 'selectable', description: 'Role details could not be loaded. Reload to view its capabilities.' };
   const names = new Map((projects || []).map((project) => [project.id, project.name]));
   const chips = selected.scope === 'organization' ? ['@organization'] : (selected.projectIds || []);
   return `<div class="authz-editor" id="${esc(id)}" data-authorization="${esc(JSON.stringify(selected))}">
-    <select class="authz-level-select" aria-label="Authorization level">${authorizationLevels().map((candidate) =>
-      `<option value="${candidate.id}" ${candidate.id === selected.level ? 'selected' : ''}>${candidate.name}</option>`).join('')}</select>
+    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
+      `<option value="${esc(candidate.id)}" ${candidate.id === selected.level ? 'selected' : ''}>${esc(candidate.name)}</option>`).join('')}</select>
+    <p class="authz-description task-sub" id="${esc(id)}-description" aria-live="polite">${esc(level.description || "Custom capabilities in the selected scope.")}</p>
     <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
       <div class="authz-scope-field">
         <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('')}</span>
@@ -1510,11 +1547,17 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const chips = root.querySelector('.authz-scope-chips');
   const field = root.querySelector('.authz-scope-field');
   let value = normalizedAuthorization(JSON.parse(root.dataset.authorization || '{}'));
+  const availableLevels = authorizationLevels();
+  if (!availableLevels.some((level) => level.id === value.level)) availableLevels.push({ id: value.level, name: 'Unavailable role', scope: 'selectable', description: 'Role details could not be loaded. Reload to view its capabilities.' });
+  levelSelect.innerHTML = availableLevels.map((level) =>
+    `<option value="${esc(level.id)}" ${level.id === value.level ? 'selected' : ''}>${esc(level.name)}</option>`).join('');
   let active = -1;
   const projectById = new Map((projects || []).map((project) => [project.id, project]));
-  const levelOf = () => authorizationLevels().find((candidate) => candidate.id === value.level);
+  const levelOf = () => availableLevels.find((candidate) => candidate.id === value.level) || { scope: 'selectable' };
   const emit = () => { root._authorizationValue = value; root.dataset.authorization = JSON.stringify(value); onChange?.(value); };
   const drawChips = () => {
+    const description = root.querySelector('.authz-description');
+    if (description) description.textContent = levelOf().description || 'Custom capabilities in the selected scope.';
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
     chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
     input.placeholder = authorizationScopePlaceholder(selected);
@@ -1544,7 +1587,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
     input.value = ''; drawChips(); emit(); show();
   };
   levelSelect.addEventListener('change', () => {
-    const level = authorizationLevels().find((candidate) => candidate.id === levelSelect.value);
+    const level = availableLevels.find((candidate) => candidate.id === levelSelect.value);
     value = level.scope === 'selectable'
       ? normalizedAuthorization({ ...value, level: level.id })
       : { level: level.id, scope: level.scope };
@@ -1751,6 +1794,7 @@ function wireAgentBox(box) {
     chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    if (rf && task) prefillForkBranch(box, task);
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -2872,13 +2916,16 @@ async function loadCollaboration() {
   const organizationId = S.organizationId;
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const [members, teams, users] = await Promise.all([
+  const [members, teams, users, catalog] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
+    api(`/api/organizations/${organizationId}/roles`).catch(() => null),
     loadInbox().catch(() => {}),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
+  S.authorizationCatalog = catalog;
+  S.authorizationCatalogOrganization = organizationId;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
@@ -3186,10 +3233,11 @@ function normalizeQuery(q) { return stringifyQuery(parseQueryClient(q || '')); }
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
+// Membership/metadata changes the compact row projection cannot express. A
+// `view.updated` for a task the list has never seen (created elsewhere, or by an
+// agent) is handled separately in connectWs.
 const LIST_RELOAD_EVENTS = new Set([
-  'task.created',
-  'task.deleted',
-  'task.tags-changed',
+  'subtask.created',
   'task.responsibility-changed',
   'credential.approval-requested',
   'credential.approval-resolved',
@@ -3255,6 +3303,10 @@ function patchTaskListFromEvent(ev) {
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
 }
 
+/** Tabs that belong to the selected project (the rail highlights it, the main
+ *  pane shows its tab bar). One list so the two never drift apart again. */
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
@@ -3282,16 +3334,16 @@ function connectWs() {
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
-        if (S.taskTab === 'checkin') scheduleTaskPageRender();
-        else renderTaskEvents();
+        scheduleTaskPageRender();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
-      } else if (ev.type === 'session.started') {
-        refreshTask(); // the session id was just published mid-turn → show the live fork command
-      } else renderTaskEvents();
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated') {
+        // Mid-turn metadata changes must not clear output or patch lifecycle state.
+        refreshTask();
+      } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
@@ -3302,17 +3354,21 @@ function connectWs() {
       if (S.tab === 'tasks' && !S.selected) scheduleSearch();
       if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
       renderRail();
-    } else if (LIST_RELOAD_EVENTS.has(ev.type)) {
+    } else if (LIST_RELOAD_EVENTS.has(ev.type)
+      || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
+        && (!ev.payload?.projectId || ev.payload.projectId === S.projectId))) {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
     if (S.organizationId && inboxEventChanges(ev)) scheduleInboxReload();
+    if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
   // queue, activity feed) is driven only by this socket. A silent drop left the
   // page showing stale state as if it were truth, and events missed during the
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
+    wsRetryMs = 1500;
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped) {
@@ -3322,10 +3378,17 @@ function connectWs() {
     }
     wsHadDropped = false;
   };
-  ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
+  ws.onclose = () => {
+    wsHadDropped = true; setWsOnline(false);
+    // Back off while the gateway is down (a restart, an expired session) instead
+    // of hammering it from every open tab at a fixed 1.5 s.
+    setTimeout(connectWs, wsRetryMs);
+    wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
+  };
 }
 
 let wsHadDropped = false;
+let wsRetryMs = 1500; // reconnect delay; doubles per failed attempt up to 30 s, reset on open
 function setWsOnline(online) {
   S.wsOnline = online;
   document.getElementById('ws-offline')?.classList.toggle('hidden', online);
@@ -3433,30 +3496,60 @@ function brandMark() {
 }
 
 async function refreshOnboarding() {
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
+  const userId = S.user?.id;
+  const pageEpoch = S.routeEpoch;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
+    S.onboardingCompletion = null;
     renderOnboarding();
     return;
   }
-  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
-    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
-    S.onboarding = status;
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    acceptOnboardingStatus(status, pageEpoch);
   } catch {
-    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
-    S.onboarding = null;
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    // Keep the last known guide and retry even when the first request failed.
+    renderOnboarding();
+    pollOnboarding();
+    return;
   }
+  renderOnboarding();
+}
+
+// Completion feedback belongs only to the page that observed the transition.
+// It is deliberately absent from both the saved preference and browser storage.
+function acceptOnboardingStatus(status, pageEpoch) {
+  const previous = S.onboarding;
+  if (status.complete && previous?.visible && !previous.complete
+    && previous.organizationId === status.organizationId && pageEpoch === S.routeEpoch) {
+    S.onboardingCompletion = { organizationId: status.organizationId, userId: S.user?.id };
+  } else if (!status.complete) {
+    S.onboardingCompletion = null;
+  }
+  S.onboarding = status;
+}
+
+function dismissOnboardingCompletion() {
+  S.onboardingCompletion = null;
   renderOnboarding();
 }
 
 async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
+  const organizationId = S.organizationId;
+  const userId = S.user?.id;
+  const pageEpoch = S.routeEpoch;
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
-    S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
+    const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    acceptOnboardingStatus(status, pageEpoch);
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
@@ -3474,7 +3567,7 @@ function pollOnboarding() {
   clearTimeout(S.onboardingTimer);
   S.onboardingTimer = setTimeout(() => {
     if (document.hidden) return pollOnboarding();
-    refreshOnboarding();
+    return refreshOnboarding();
   }, 4_000);
 }
 
@@ -3482,11 +3575,29 @@ function renderOnboarding() {
   const host = $('#hosted-onboarding');
   if (!host) return;
   const state = S.onboarding;
+  const completion = S.onboardingCompletion;
+  if (state?.complete && completion?.organizationId === S.organizationId
+    && completion.userId === S.user?.id && S.meta?.hosted) {
+    clearTimeout(S.onboardingTimer);
+    S.onboardingTimer = null;
+    host.hidden = false;
+    host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
+      <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
+      <span><b>Setup complete</b><small>All required steps are finished.</small></span>
+      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">×</button>
+    </div>`;
+    $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
+    return;
+  }
   if (!state?.visible || state.organizationId !== S.organizationId) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
     host.hidden = true;
     host.innerHTML = '';
+    // The shell can repaint after a failed initial load. Keep recovery alive
+    // until this organization's status is known, even without a visible card.
+    if (S.meta?.hosted && S.user && S.organizationId
+      && (!state || state.organizationId !== S.organizationId)) pollOnboarding();
     return;
   }
   host.hidden = false;
@@ -3502,7 +3613,7 @@ function renderOnboarding() {
   const settings = globalRoute('organization');
   const optional = state.steps.optional || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
-    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get ${siteNameMarkup()} ready</h2></div>
+    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Set up ${siteNameMarkup()}</h2></div>
       <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
@@ -3513,7 +3624,7 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot">${state.replay ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
@@ -3801,7 +3912,7 @@ function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
   if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
+  const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
   // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
@@ -4008,6 +4119,12 @@ function flushBgRender() {
 // WS-driven repaints into one per animation frame: the last state wins and the
 // browser paints once, at a frame boundary.
 let taskPageRenderQueued = false;
+function summarize(p) {
+  if (!p) return '';
+  if (p.text) return p.text.slice(0, 160);
+  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
+}
+
 function scheduleTaskPageRender() {
   if (taskPageRenderQueued) return;
   taskPageRenderQueued = true;
@@ -4038,9 +4155,10 @@ function renderMain() {
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];
+  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings']
+    .filter((tab) => tab !== 'avatars' || S.avatarAvailability?.effective || S.avatars?.length);
   const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', avatars: 'Avatars', settings: 'Project settings' };
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(S.tab);
+  const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
@@ -4807,11 +4925,15 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     clearTimeout(deb);
     deb = setTimeout(run, typing ? 180 : 0); // keystrokes coalesce; clicks apply at once
   };
+  let runEpoch = 0;
   async function run() {
+    const epoch = ++runEpoch;
+    let next;
     try {
-      const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
-      result = r;
-    } catch { result = { tasks: [] }; }
+      next = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
+    } catch { next = { tasks: [] }; }
+    if (epoch !== runEpoch) return; // a newer query (a click after a slow keystroke) already owns the list
+    result = next;
     hi = 0;
     paintList();
   }
@@ -5792,6 +5914,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     wireWikiMention(contextTa, projectId);
   }
   paintFormChips();
+  if ((values['agent:do'] || values['agent:unified'])?.resumeFrom?.taskId) showForkWorldHelp($('#tf-body'));
   // Focus the consuming field (prompt/command) with the caret at the end, so
   // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
   // (the consuming field) is resolved once at the top of this function.
@@ -6360,6 +6483,16 @@ function taskAttempts(v) {
   </section>`;
 }
 
+// Follow the rendered links so keyboard navigation uses the same pinned routes
+// and tab selection as clicking an attempt card.
+function cycleAttempt(delta) {
+  if (!S.selected || !S.view) return;
+  const links = [...document.querySelectorAll('[data-attempt-select]')];
+  const index = links.findIndex((link) => link.dataset.attemptSelect === S.selected);
+  if (links.length < 2 || index < 0) return;
+  links[(index + delta + links.length) % links.length].click();
+}
+
 function wireAttempts(v) {
   document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
     if (S.addingAttempt) return;
@@ -6626,7 +6759,10 @@ function closeTask() {
   const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
   const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('dashboard'));
   S.returnRoute = null;
-  return go(back, { replace: true });
+  // A push, not a replace: Back after closing reopens the task that was just
+  // closed, and Back from the task page returns to the list — the history a
+  // user expects. Replacing left two identical list entries, so Back did nothing.
+  return go(back);
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
@@ -6642,6 +6778,7 @@ function closeTaskDom() {
   S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
+  if (reviewActionWs) { try { reviewActionWs.close(); } catch {} reviewActionWs = null; } // …and stops streaming a review action into the next page
 }
 
 // A task's organizational metadata (priority + tags). Both are purely for
@@ -6983,8 +7120,6 @@ function renderTaskPage() {
     wireParams(v);
     wireTaskAuthorization(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
-  } else if (tab === 'advanced') {
-    renderTaskEvents();
   }
   wireCopyButtons();
   // Restore the pre-render scroll offsets + focus so the box the user was working
@@ -7121,7 +7256,6 @@ function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
   if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
-  if (tab === 'advanced') return advancedTab(v);
   return overviewTab(v);
 }
 
@@ -7476,15 +7610,119 @@ function reviewActionBtn(a, i) {
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
+/** Ask for a secret in a masked field. `window.prompt` shows the value in clear
+ *  and keeps it in the browser's prompt history; every other secret input in the
+ *  console is `type="password"`, so this one is too. Resolves null on cancel. */
+function promptSecret(title, hint) {
+  return new Promise((resolve) => {
+    const host = document.createElement('div'); $('#modal-root').appendChild(host);
+    host.innerHTML = `<div class="palette-scrim secret-prompt-scrim"><form class="palette picker" style="max-width:480px">
+      <div class="fp-head">${esc(title)} <span class="q-spacer"></span><button type="button" class="icon-btn secret-prompt-close">✕</button></div>
+      ${hint ? `<p class="task-sub">${esc(hint)}</p>` : ''}
+      <input type="password" class="secret-prompt-value" autocomplete="off" spellcheck="false" placeholder="New value" style="width:100%">
+      <div class="inline-form" style="margin-top:10px;justify-content:flex-end"><button type="submit" class="btn sm primary">Save</button></div>
+    </form></div>`;
+    const done = (value) => { host.remove(); resolve(value); };
+    host.querySelector('.secret-prompt-close').addEventListener('click', () => done(null));
+    host.querySelector('.secret-prompt-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) done(null); });
+    host.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); done(host.querySelector('.secret-prompt-value').value || null); });
+    host.querySelector('.secret-prompt-value').focus();
+  });
+}
+
 let reviewActionWs = null;
-async function openArtifact(url, external) {
-  if (external) { window.open(url, '_blank', 'noopener'); return; }
+function artifactTextKind(contentType, target) {
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  if (type === 'text/markdown' || /\.(md|markdown)$/i.test(target)) return 'markdown';
+  if (type === 'text/plain' || type === 'text/csv' || type === 'application/json') return 'text';
+  return null;
+}
+
+function showArtifactReader(text, kind, name, blob) {
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card artifact-reader';
+  dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
+  dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
+    <a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    <div class="artifact-reader-content" tabindex="0"></div>`;
+  const content = dialog.querySelector('.artifact-reader-content');
+  if (kind === 'markdown') {
+    content.classList.add('msg-text', 'md');
+    content.innerHTML = renderMarkdown(text);
+  } else {
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    content.appendChild(pre);
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  const download = dialog.querySelector('[data-download]');
+  download.href = objectUrl;
+  download.download = name;
+  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  // Consume Escape before the shell dispatcher can also close the task behind us.
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    dialog.close();
+  });
+  dialog.addEventListener('close', () => {
+    URL.revokeObjectURL(objectUrl);
+    dialog.remove();
+    if (previousFocus?.isConnected) previousFocus.focus();
+  }, { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  dialog.querySelector('[data-close]').focus();
+}
+
+// Types a browser renders without running anything: opened straight from a
+// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
+// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
+// page opened bare would execute with the console's session. Everything else
+// is downloaded.
+const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
+const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
+function openSandboxedDocument(blobUrl, title) {
+  const w = window.open('', '_blank', 'noopener=no');
+  if (!w) return false;
+  w.document.title = title;
+  const frame = w.document.createElement('iframe');
+  // No allow-same-origin: the document gets an opaque origin, so its scripts
+  // cannot read this console's storage or cookies or call its API as the user.
+  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
+  frame.src = blobUrl;
+  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
+  w.document.body.style.margin = '0';
+  w.document.body.appendChild(frame);
+  return true;
+}
+function safeHref(href) {
+  return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
+}
+async function openArtifact(url, external, target = '') {
+  if (external) { if (safeHref(url) !== '#') window.open(url, '_blank', 'noopener'); return; }
   // Artifact endpoints need the auth header, so fetch as a blob then open it.
   try {
     const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
     if (!res.ok) { toast('could not open artifact', true); return; }
-    const obj = URL.createObjectURL(await res.blob());
-    window.open(obj, '_blank', 'noopener');
+    const blob = await res.blob();
+    const name = target.replace(/\\/g, '/').split('/').pop()
+      || /filename="([^"]+)"/i.exec(res.headers.get('content-disposition') || '')?.[1] || 'Attachment';
+    // Readable text (markdown, plain text, CSV, JSON) opens in the in-page reader.
+    const kind = artifactTextKind(res.headers.get('content-type') || '', name);
+    if (kind) {
+      showArtifactReader(await blob.text(), kind, name, blob);
+      return;
+    }
+    const obj = URL.createObjectURL(blob);
+    if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
+    else if (!(ACTIVE_ARTIFACT.test(blob.type) && openSandboxedDocument(obj, name))) {
+      const a = document.createElement('a');
+      a.href = obj; a.download = name; a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); a.remove();
+    }
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
 }
@@ -7521,7 +7759,7 @@ function wireReviewActions(v) {
       btn.disabled = true;
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
-        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'open') { await openArtifact(r.url, r.external, v.reviewInfo?.actions?.[idx]?.target); return; }
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
@@ -7545,10 +7783,11 @@ function wireReviewActions(v) {
         ws.onclose = () => setStopBtn(false);
         setStopBtn(true, r.procId, v.taskId);
         // A server keeps running — open its pages once it's had a moment to boot.
-        if (r.server && Array.isArray(r.openUrls)) {
-          setTimeout(() => r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
-        } else if (Array.isArray(r.openUrls) && r.openUrls.length) {
-          r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
+        const openable = (Array.isArray(r.openUrls) ? r.openUrls : []).filter((u) => /^https?:/i.test(String(u)));
+        if (r.server && openable.length) {
+          setTimeout(() => openable.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+        } else if (openable.length) {
+          openable.forEach((u) => window.open(u, '_blank', 'noopener'));
         }
       } catch (e) { toast(e.message, true); }
       finally { if (btn.isConnected) btn.disabled = false; }
@@ -7996,8 +8235,6 @@ function conversationPane(v, t) {
     : S.taskHistoryError
       ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
       : '';
-  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
-    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -8023,9 +8260,12 @@ function conversationPane(v, t) {
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
-  const request = requestedInput
-    ? `<div class="msg system"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderMessageBody(requestedInput)}</div></div>`
-    : '';
+  if (requestedInput && !entries.some((entry) => entry.type === 'input-request' && entry.request.text === requestedInput)) {
+    entries.push({ type: 'input-request', request: { text: requestedInput, ts: v.updatedAt },
+      sourceKey: `input-request:${v.updatedAt}`, conversationRole: t.role });
+  }
+  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
+    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
@@ -8046,7 +8286,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
+    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
     ${fu}`;
 }
 
@@ -8203,7 +8443,26 @@ function conversationEntries(t) {
     posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts,
       sourceKey: `message:${message.id}`, conversationRole: t.role });
   }
-  const combined = [...messages, ...posted.values(), ...visibleActivities];
+  // Explanations retain their input prompt after the human wait is resolved.
+  // sourceRequest.ts can be a workflow revision (e.g. 17), not wall time.
+  // Recover the wait's timestamp where available, otherwise anchor to the first
+  // explanation. Never sort a revision as 1970 or move a request on re-explain.
+  const requests = new Map();
+  for (const event of orderedEvents) {
+    const e = event.payload;
+    if (event.type !== 'conversation.explanation' || e?.role !== t.role || !e.sourceRequest) continue;
+    if (requests.has(e.sourceKey)) continue;
+    const wait = orderedEvents.filter((candidate) => candidate.type === 'view.updated'
+      && candidate.payload?.waitingFor === 'human'
+      && candidate.payload?.waitingDetail?.trim() === e.sourceRequest.text
+      && Number(candidate.ts) <= Number(event.ts)).at(-1);
+    const ts = Number(e.sourceRequest.ts) > 100000000000
+      ? Number(e.sourceRequest.ts) : (wait?.ts ?? event.ts);
+    requests.set(e.sourceKey, { type: 'input-request', request: e.sourceRequest,
+      sourceKey: e.sourceKey, conversationRole: t.role, ts,
+      sortTs: ts, order: wait?.seq ?? event.seq ?? event.ts });
+  }
+  const combined = [...messages, ...posted.values(), ...visibleActivities, ...requests.values()];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
   const explanations = new Map();
   for (const event of orderedEvents) {
@@ -8277,7 +8536,7 @@ function renderConversationText(text, role, v = S.view) {
     const fileUrl = worldFileHref(href, v);
     html += fileUrl
       ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">${esc(match[1])}</a>`
-      : `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+      : `<a href="${esc(safeHref(href))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
   return html + esc(source.slice(at));
@@ -8379,6 +8638,9 @@ function explainMessageAffordance(entry, v) {
 
 function renderConversationEntry(entry, v = S.view) {
   const md = markdownEnabled() ? ' md' : '';
+  if (entry.type === 'input-request') {
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v)}</div>${explainMessageAffordance(entry, v)}</div>`;
+  }
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
@@ -8410,7 +8672,7 @@ async function runExplanation(v, role, sourceKey, settings) {
   renderTaskPage();
   try {
     const event = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/explanations`, {
-      method: 'POST', body: JSON.stringify({ role, sourceKey, ...(settings ? { settings } : {}) }),
+      method: 'POST', body: JSON.stringify({ role, sourceKey, ...(sourceKey.startsWith('input-request:') ? { inputRequest: humanWaitDetail(v) } : {}), ...(settings ? { settings } : {}) }),
     });
     if (event && !S.taskEvents.some((item) => item.seq != null && item.seq === event.seq)) S.taskEvents.push(event);
   } catch (error) {
@@ -8514,6 +8776,7 @@ function wireCheckinSidebar(v) {
   );
   $('#fork-task-agent')?.addEventListener('click', (event) => {
     openTaskForm('software-dev', undefined, undefined, {
+      ...forkBranchDefaults(v),
       'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
     });
   });
@@ -8877,19 +9140,6 @@ async function wireTaskAuthorization(v) {
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
-function advancedTab(v) {
-  return `
-    <div class="section-h">Live events</div>
-    <div class="events" id="tp-events"></div>
-    <div class="section-h">Structured state (the view-model floor)</div>
-    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn,
-      // `localPath` goes through localWorldPath() like every other host-path
-      // affordance. The gateway only strips `worldPath` for REMOTE handles, so a
-      // hosted deployment backed by worktree worlds (explicitly supported) was
-      // printing the karmax host's filesystem layout into a remote browser here —
-      // the one place a raw worldPath escaped the hostLocal() gate.
-      world: { available: v.worldAvailable, provider: v.worldProvider, localPath: localWorldPath(v) || undefined }, pr: v.pr }, null, 2))}</pre>`;
-}
 
 function renderDiff(d) {
   return esc(d)
@@ -8959,8 +9209,8 @@ function conversationTextKey(value) {
 // A normal Do turn uses its final reply as waitingFor.detail so responders and
 // the Overview tab retain the full request. That reply is already the last
 // agent message in the conversation, however, so appending the detail again as
-// an italic "Input requested" row only repeats the same content. Preserve the
-// row when a targeted hold carries a genuinely separate question.
+// an "Input requested" message only repeats the same content. Preserve the
+// message when a targeted hold carries a genuinely separate question.
 function conversationInputRequest(v, entries) {
   const detail = humanWaitDetail(v);
   if (!detail) return '';
@@ -9610,7 +9860,7 @@ function taskActions(v) {
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
     // actionToast's standard-verb match and produced "Confirm1 — done" instead
     // of "Confirmed" on the most-used control in the app.
-    html += `<button class="btn ${cls}" data-act="${a.name}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
+    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -9766,20 +10016,6 @@ function updateLiveBubble() {
   if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
-function renderTaskEvents() {
-  const box = document.getElementById('tp-events');
-  if (!box) return;
-  box.innerHTML = S.taskEvents
-    .slice(-120)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span>${esc(summarize(e.payload))}</span></div>`)
-    .join('');
-  box.scrollTop = box.scrollHeight;
-}
-function summarize(p) {
-  if (!p) return '';
-  if (p.text) return p.text.slice(0, 160);
-  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
-}
 
 // ── queue ────────────────────────────────────────────────────────────────────
 // Fetch the coordinator's authoritative queue order for every domain currently in
@@ -10710,7 +10946,6 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
   );
 }
 
-const quickDefaultsHeader = () => '';
 
 // ── Avatars ──────────────────────────────────────────────────────────────
 function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
@@ -11552,7 +11787,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-avatars">Avatars</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -11574,8 +11809,6 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-avatars"><div>Avatars<small>Whether autonomous principals may be used in this project</small></div></div>
-    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     ${explanationSettingsCard('project')}
@@ -11589,6 +11822,8 @@ function settingsView(proj) {
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
+    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="card" data-settings-advanced hidden>
       <div class="section-h" data-settings-access="project" hidden>Project name</div>
       <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
@@ -11616,20 +11851,21 @@ async function hydrateAvatarAvailability(scope, id) {
     : `/api/organizations/${encodeURIComponent(id)}/avatar-settings`;
   try {
     const policy = await api(url);
-    if (scope === 'organization') {
-      box.innerHTML = `<label class="choice-row compact"><input type="checkbox" ${policy.enabled ? 'checked' : ''}><span><b>Enable Avatars in this organization</b><small>Projects can disable them individually. Disabling preserves every Avatar and its history.</small></span></label>`;
-      box.querySelector('input').addEventListener('change', async (event) => {
-        try { await api(url, { method: 'PUT', body: JSON.stringify({ enabled: event.target.checked }) }); toast(event.target.checked ? 'Avatars enabled' : 'Avatars disabled'); }
-        catch (error) { event.target.checked = !event.target.checked; toast(error.message, true); }
-      });
-      return;
-    }
-    box.innerHTML = `<label class="form-row"><span>Availability</span><select><option value="inherit" ${policy.project === 'inherit' ? 'selected' : ''}>Inherit organization setting</option><option value="enabled" ${policy.project === 'enabled' ? 'selected' : ''}>Enabled</option><option value="disabled" ${policy.project === 'disabled' ? 'selected' : ''}>Disabled</option></select></label><p class="task-sub">Currently <b>${policy.effective ? 'enabled' : 'disabled'}</b>${policy.organization ? '' : ' because Avatars are disabled for the organization'}. Existing Avatars are retained when disabled.</p>`;
-    box.querySelector('select').addEventListener('change', async (event) => {
-      const previous = policy.project;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ value: event.target.value }) }); await loadAvatars().catch(() => {}); toast('Avatar availability saved'); await hydrateAvatarAvailability(scope, id); }
-      catch (error) { event.target.value = previous; toast(error.message, true); }
-    });
+    const enabled = scope === 'organization' ? policy.enabled : policy.effective;
+    box.innerHTML = `<div class="section-h">Avatars</div><p class="task-sub">Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this default in either direction.' : `Organization default: ${policy.organization ? 'enabled' : 'disabled'}. This project ${policy.project === 'inherit' ? 'inherits the default' : 'overrides the default'}.`} Existing Avatars and their history are retained when disabled.</p>
+      <div class="inline-form"><button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button>${scope === 'project' ? `<button type="button" class="btn sm avatar-availability-inherit" ${policy.project === 'inherit' ? 'disabled' : ''}>Use organization default</button>` : ''}</div>`;
+    const save = async (button, body) => {
+      button.disabled = true;
+      try {
+        await api(url, { method: 'PUT', body: JSON.stringify(body) });
+        await loadAvatars().catch(() => {});
+        renderMain();
+        toast('Avatar availability saved');
+      } catch (error) { button.disabled = false; toast(error.message, true); }
+    };
+    box.querySelector('.avatar-availability-toggle').addEventListener('click', (event) => save(event.currentTarget,
+      scope === 'organization' ? { enabled: !enabled } : { value: enabled ? 'disabled' : 'enabled' }));
+    box.querySelector('.avatar-availability-inherit')?.addEventListener('click', (event) => save(event.currentTarget, { value: 'inherit' }));
   } catch (error) { paneError(box, error, () => hydrateAvatarAvailability(scope, id)); }
 }
 
@@ -11700,7 +11936,8 @@ async function hydrateProjectData(proj) {
             : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
             <small class="field-help">Managed storage is provided by ${siteNameMarkup()} for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
-          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
+          <label class="form-row wide"><span>Upload files <small>(optional)</small></span><input id="data-files" type="file" multiple></label>
+          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-folder" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
@@ -11738,8 +11975,8 @@ async function hydrateProjectData(proj) {
     });
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
-      const files = [...$('#data-files').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a path or a browser folder, not both', true);
+      const files = [...$('#data-files').files, ...$('#data-folder').files];
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
@@ -11903,7 +12140,8 @@ async function hydrateProjectResources(proj) {
         <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
         <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
         ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
+        <label class="form-row">Upload files<input id="resource-files" type="file" multiple></label>
+        <label class="form-row">Upload a folder<input id="resource-folder" type="file" multiple webkitdirectory></label>
       </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
     const driverInput = $('#resource-driver');
     const syncDefaults = () => {
@@ -11912,6 +12150,7 @@ async function hydrateProjectResources(proj) {
       $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
       $('#resource-secret').disabled = fileKind;
       $('#resource-files').disabled = !fileKind;
+      $('#resource-folder').disabled = !fileKind;
       if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
     };
     driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
@@ -11949,7 +12188,7 @@ async function hydrateProjectResources(proj) {
         : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
       button.disabled = true; button.textContent = 'Attaching…';
       try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files] : [];
+        const selectedFiles = isFiles ? [...$('#resource-files').files, ...$('#resource-folder').files] : [];
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
           access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
           publish: $('#resource-publish').value, secret: $('#resource-secret').value,
@@ -11984,7 +12223,7 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
   try {
     for (const file of files) {
       const relative = file.webkitRelativePath ? file.webkitRelativePath.split('/').slice(1).join('/') || file.name : file.name;
-      for (let part = 0, offset = 0; offset < file.size; part++, offset += upload.partBytes) {
+      for (let part = 0, offset = 0; offset < file.size || part === 0; part++, offset += upload.partBytes) {
         const chunk = file.slice(offset, Math.min(file.size, offset + upload.partBytes));
         await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relative)}&part=${part}`,
           { method: 'PUT', body: chunk, headers: { 'content-type': 'application/octet-stream' } });
@@ -11996,11 +12235,6 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
     await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}`, { method: 'DELETE' }).catch(() => {});
     throw error;
   }
-}
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer); let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  return btoa(binary);
 }
 function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   const host = document.createElement('div');
@@ -12355,7 +12589,6 @@ function globalSettingsView(embedded = false) {
     ${settingsForms('global')}
     ${explanationSettingsCard('global')}
     ${profilesCard('global')}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full task form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     ${passwordsCard()}
@@ -12442,8 +12675,8 @@ function renderPhoneAccess(status) {
     : status.state === 'conflict'
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
-    ? `<div class="phone-access-address"><span>Access your ${siteNameMarkup()} at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your ${siteNameMarkup()} at</span><b>Tailscale not set up</b></div>`;
+    ? `<div class="phone-access-address"><span>Open your ${siteNameMarkup()} workspace at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Open your ${siteNameMarkup()} workspace at</span><b>Tailscale not set up</b></div>`;
   const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private ${siteNameMarkup()} address shown here in your phone’s browser.</li>`;
   const recovery = ready
@@ -12463,7 +12696,7 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? `Why this ${siteName()} is not being served` : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? 'Why this workspace address is unavailable' : 'Set up instructions';
   const setupIntro = status.state === 'conflict'
     ? `<p>Tailscale is already configured on this computer; its address currently belongs to another local service or ${siteNameMarkup()} instance.</p>`
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
@@ -12636,7 +12869,7 @@ async function hydratePhoneAccess() {
     revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
-        <span>Access your ${siteNameMarkup()} at</span>
+        <span>Open your ${siteNameMarkup()} workspace at</span>
         <b>${disconnected ? `Could not reach ${siteNameMarkup()}` : 'Could not check Phone Access'}</b>
       </div>
       <div class="phone-setup-body">
@@ -13200,7 +13433,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
 const VAULT_SECRET_LABELS = {
-  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)']],
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
   'ssh-key': [['privateKey', 'private key (PEM)']],
   env: [['env', '.env contents (KEY=VALUE per line)']],
@@ -13218,7 +13451,7 @@ const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent
 // `onclick="window.__toast(…)"` threw `TypeError: window.__toast is not a
 // function` on every tap — silently breaking the affordance for exactly the
 // touch users it was added for.
-function policyTip(text) { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">ⓘ</button>`; }
+function policyTip(text, icon = 'ⓘ') { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">${esc(icon)}</button>`; }
 
 function clearTotpQrPreview(control, clearValue = false) {
   if (!control) return;
@@ -13317,6 +13550,13 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task">This task</button>
           <button class="btn sm" data-vreq-act="always">Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${policyTip(`Once: Approves one credential operation, consumed when used, not at the next agent turn.
+
+This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
+
+Always: Does the same as “This task” and sets this credential’s ${request.mode === 'reveal' ? '“agent sees”' : '“blind use”'} policy to “auto” until changed. The other policy stays unchanged. Future tasks still need a grant for this credential; it is not automatically included in every task. Task-specific policy overrides still apply.
+
+Deny: Rejects this request.`, '?')}
         </div>
       </div>`).join('')
     : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
@@ -13339,8 +13579,9 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.</div>
+      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
     </div>
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
@@ -13350,7 +13591,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
-        <span class="mono">${request.capabilities.map(esc).join(', ')}</span>
+        <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
@@ -13666,7 +13907,7 @@ async function wireVaultCards(organizationId) {
           : item.provenance?.source?.startsWith('connector:')
             ? 'The connected source store is updated too if write-back is on.'
             : 'Metadata and notes are untouched.';
-        const value = prompt(`New ${field} for "${item.label}" (${sourceNote}):`);
+        const value = await promptSecret(`New ${field} for "${item.label}"`, sourceNote);
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
@@ -13943,17 +14184,20 @@ async function wireVaultCards(organizationId) {
   });
   const renderRequests = async () => {
     const rbox = $('#vault-requests-card .vault-requests-list');
-    if (!rbox) return;
+    if (!rbox) { if (refreshVaultRequests === renderRequests) refreshVaultRequests = null; return; }
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
     rbox.innerHTML = credentialRequestRows(requests, items);
     wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
+  refreshVaultRequests = renderRequests; // live: a new/resolved approval repaints this list (connectWs)
   await renderItems();
   await renderConnectors();
   await renderRequests();
 }
+// The organization settings' pending-approvals list, while that page is open.
+let refreshVaultRequests = null;
 
 // ── organization AgentMail inbox ──────────────────────────────────────────────
 function agentMailCard() {
@@ -14471,31 +14715,55 @@ function wireInboxView() {
     try { localStorage.setItem('karmax-inbox-show-read', e.target.checked ? '1' : '0'); } catch {}
     renderMain();
   });
-  $('#inbox-read-all')?.addEventListener('click', async () => {
+  $('#inbox-read-all')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     try {
-      await Promise.all(inboxItems().filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
-      await loadCollaboration(); renderMain(); renderRail();
+      await markVisibleInboxRead();
     } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
   });
 }
 
+async function markVisibleInboxRead() {
+  const organizationId = S.organizationId;
+  const items = inboxItems().filter((item) => item.unread);
+  const results = await Promise.allSettled(items.map(async (item) => {
+    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(organizationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ unread: false }),
+    });
+    if (!saved) throw new Error('Notification could not be marked read.');
+  }));
+  if (S.organizationId === organizationId) {
+    items.forEach((item, index) => {
+      if (results[index].status !== 'fulfilled') return;
+      const current = S.inbox.find((candidate) => candidate.id === item.id);
+      if (current) current.unread = false;
+    });
+    // Invalidate reads started before the mutation; they may contain stale unread flags.
+    S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+    updateBell(); renderMain(); renderRail();
+  }
+  const failed = results.filter((result) => result.status === 'rejected');
+  if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
+}
+
 // ── notification behaviour, per urgency ─────────────────────────────────────
-// The list is where asks live; this is what an ask DOES when it arrives. Both
-// behaviours only make sense where the person actually is, so — like the theme —
-// they are per-browser: a system notification needs this browser's permission,
-// and a sound can only be heard here.
+// Browser alerts are local to this device; email preferences are stored on the server.
 const NOTIFY_BEHAVIOURS = [
   { key: 'notify', label: 'System notification' },
   { key: 'sound', label: 'Sound' },
+  { key: 'visual', label: 'Show in app' },
+  { key: 'email', label: 'Email' },
 ];
 // Sensible defaults: silence is the floor, and each level up interrupts a little
 // more. Nothing below high interrupts at all — an inbox that pings for routine
 // news is one people turn off entirely.
 const NOTIFY_DEFAULTS = {
-  critical: { notify: true, sound: true },
-  high: { notify: true, sound: false },
-  normal: { notify: false, sound: false },
-  low: { notify: false, sound: false },
+  critical: { notify: true, sound: true, visual: true },
+  high: { notify: true, sound: false, visual: false },
+  normal: { notify: false, sound: false, visual: false },
+  low: { notify: false, sound: false, visual: false },
 };
 function notifyPrefs() {
   let stored = {};
@@ -14521,12 +14789,39 @@ function announceInbox(items) {
   for (const item of [...items].sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency))) {
     const behaviour = prefs[item.urgency] || prefs.normal;
     if (behaviour.notify) showSystemNotification(item);
+    if (behaviour.visual) showVisualNotification(item);
     // One sound per batch. `items` is urgency-ordered, so the first level that
     // asks for a sound is the loudest one that arrived — five asks landing
     // together are a single event to the person hearing it.
     if (behaviour.sound && !sounded) { playNotificationSound(item.urgency); sounded = true; }
   }
 }
+function showVisualNotification(item) {
+  let region = document.getElementById('notification-alerts');
+  if (!region) {
+    region = document.createElement('div');
+    region.id = 'notification-alerts';
+    region.setAttribute('aria-live', 'polite');
+    document.body.append(region);
+  }
+  const old = [...region.children].find((node) => node.dataset.id === item.id);
+  old?.remove();
+  const alert = document.createElement('div');
+  alert.className = 'notification-alert';
+  alert.dataset.id = item.id;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(item); };
+  alert.lastElementChild.onclick = () => alert.remove();
+  region.prepend(alert);
+  while (region.children.length > 5) region.lastElementChild.remove();
+}
+function notificationSoundPrefs() {
+  let stored;
+  try { stored = JSON.parse(localStorage.getItem('karmax-notify-sound') || '{}'); } catch {}
+  return { tone: ['bell', 'chime', 'soft'].includes(stored?.tone) ? stored.tone : 'bell',
+    duration: [0.35, 1, 3, 5].includes(stored?.duration) ? stored.duration : 0.35 };
+}
+
 function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
@@ -14554,18 +14849,20 @@ function unlockNotificationAudio() {
 document.addEventListener('pointerdown', unlockNotificationAudio, { passive: true });
 document.addEventListener('keydown', unlockNotificationAudio);
 
-// Synthesized rather than shipped: no asset to fetch, no volume surprise, and a
-// critical ask simply gets a second blip instead of a different sound to learn.
+// Synthesize the selected tone locally, with bounded duration and a gentle envelope.
 function playNotificationSound(urgency = 'normal') {
   const Ctx = typeof window === 'undefined' ? null : (window.AudioContext || window.webkitAudioContext);
   if (!Ctx) return false;
   try {
     const ctx = S.audio || (S.audio = new Ctx());
     ctx.resume?.()?.catch?.(() => {});
-    for (const offset of urgency === 'critical' ? [0, 0.18] : [0]) {
+    const { tone, duration } = notificationSoundPrefs();
+    const offsets = duration === 0.35 ? (urgency === 'critical' ? [0, 0.18] : [0])
+      : Array.from({ length: Math.ceil(duration / 0.4) }, (_, i) => i * 0.4);
+    for (const offset of offsets) {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
-      oscillator.frequency.value = urgency === 'critical' ? 880 : 660;
+      oscillator.frequency.value = tone === 'soft' ? 440 : tone === 'chime' ? (offset ? 1046 : 784) : urgency === 'critical' ? 880 : 660;
       oscillator.connect(gain).connect(ctx.destination);
       const at = ctx.currentTime + offset;
       gain.gain.setValueAtTime(0.0001, at);
@@ -14702,10 +14999,10 @@ async function hydrateProfileGithub() {
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileWalkthroughCard(userId) {
-  if (!S.installationAccess || !S.meta?.hosted || !userId) return '';
+  if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
   return `<div class="card"><div class="section-h">Walkthrough</div>
-    <p class="task-sub">Show this user's setup walkthrough again in each organization. Existing work and connections are preserved.</p>
-    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Reset walkthrough</button></div>`;
+    <p class="task-sub">Restart the setup walkthrough in each organization. Existing work and connections are preserved.</p>
+    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Restart walkthrough</button></div>`;
 }
 
 function profileView() {
@@ -14865,11 +15162,13 @@ function profileView() {
 // asks; it does not configure them.
 function notificationsCard() {
   const prefs = notifyPrefs();
+  const sound = notificationSoundPrefs();
+  const emailReady = S.meta?.deliveryChannels?.includes('email');
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     granted: '<p class="task-sub">This browser may show system notifications.</p>',
-    denied: '<p class="task-sub">This browser is blocking notifications — allow them in its site settings, or the levels above can only play a sound.</p>',
-    unsupported: '<p class="task-sub">This browser cannot show system notifications; sounds still work.</p>',
+    denied: '<p class="task-sub">This browser is blocking system notifications. Allow them in its site settings; in-app alerts and sounds still work.</p>',
+    unsupported: '<p class="task-sub">This browser cannot show system notifications; in-app alerts and sounds still work.</p>',
     default: '<button class="btn sm" id="notify-permission" type="button">Allow system notifications</button>',
   }[permission] ?? '';
   // Loudest first, the same order the inbox itself is in.
@@ -14884,23 +15183,54 @@ function notificationsCard() {
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level}</span>
         ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
-          aria-label="${behaviour.label} for ${level} urgency" ${prefs[level][behaviour.key] ? 'checked' : ''}/></span>`).join('')}
-        <span><button class="btn sm" type="button" data-notify-test="${level}">Test</button></span>
+          aria-label="${behaviour.label} for ${level} urgency" ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
+        <span><button class="btn sm" type="button" data-notify-test="${level}" title="Test browser alerts">Test</button></span>
       </div>`).join('')}
     </div>
+    <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
+      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : duration + ' seconds'}</option>`).join('')}</select></label>
+      <button class="btn sm" id="notify-preview">Preview sound</button></div>
+    <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
     ${permissionNote}
-    <p class="task-sub">These choices apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
+    <p class="task-sub">System notifications, in-app alerts, and sounds apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
 function wireNotificationsCard() {
+  const organizationId = S.organizationId;
+  api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`).then((prefs) => {
+    if (S.organizationId !== organizationId) return;
+    S.deliveryPreferences = prefs;
+    document.querySelectorAll('[data-notify$=":email"]').forEach((box) => {
+      box.checked = prefs.emailUrgencies?.[box.dataset.notify.split(':')[0]] ?? prefs.email;
+      box.disabled = !S.meta?.deliveryChannels?.includes('email');
+    });
+  }).catch((error) => toast(error.message, true));
+  for (const id of ['notify-tone', 'notify-duration']) $('#' + id)?.addEventListener('change', () => {
+    try { localStorage.setItem('karmax-notify-sound', JSON.stringify({ tone: $('#notify-tone').value, duration: Number($('#notify-duration').value) })); } catch {}
+  });
+  $('#notify-preview')?.addEventListener('click', () => playNotificationSound('critical'));
+
   // The inbox links here by anchor. A SPA render is not a document load, so the
   // browser never honours the fragment on its own — arriving at the profile and
   // being left at the top would make that link a lie.
   if (location.hash === '#notifications')
     requestAnimationFrame(() => $('#notifications')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
-  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', () => {
+  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', async () => {
     const [level, behaviour] = box.dataset.notify.split(':');
+    if (behaviour === 'email') {
+      const boxes = [...document.querySelectorAll('[data-notify$=":email"]')];
+      boxes.forEach((input) => input.disabled = true);
+      try {
+        const prefs = S.deliveryPreferences;
+        const emailUrgencies = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, prefs.emailUrgencies?.[key] ?? prefs.email]));
+        emailUrgencies[level] = box.checked;
+        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, emailUrgencies }) });
+        if (S.organizationId === organizationId) S.deliveryPreferences = saved;
+      } catch (error) { box.checked = !box.checked; toast(error.message, true); }
+      finally { boxes.forEach((input) => input.disabled = false); }
+      return;
+    }
     setNotifyPref(level, behaviour, box.checked);
     // Turning a level on is the natural moment to ask for the permission it needs.
     if (box.checked && behaviour === 'notify' && typeof Notification !== 'undefined' && Notification.permission === 'default')
@@ -14909,12 +15239,13 @@ function wireNotificationsCard() {
   $('#main').querySelectorAll('[data-notify-test]').forEach((button) => button.addEventListener('click', () => {
     const level = button.dataset.notifyTest;
     const behaviour = notifyPrefs()[level];
+    if (behaviour.visual) showVisualNotification({ id: `test-${level}`, urgency: level, kind: 'escalated', task: { title: `Test ${level} notification` } });
     if (behaviour.sound) playNotificationSound(level);
     const shown = behaviour.notify && showSystemNotification({ id: `test-${level}`, urgency: level,
       kind: 'escalated', task: { title: `Test ${level} notification` } });
     toast(behaviour.notify && !shown
       ? 'Allow notifications in this browser to see the popup.'
-      : behaviour.notify || behaviour.sound ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
+      : behaviour.notify || behaviour.sound || behaviour.visual ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
     behaviour.notify && !shown);
   }));
   $('#notify-permission')?.addEventListener('click', async () => {
@@ -14928,8 +15259,11 @@ function wireProfileView() {
   reset?.addEventListener('click', async () => {
     reset.disabled = true;
     try {
-      await api(`/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
-      toast('Walkthrough reset. The user will see it when they next open their workspace.');
+      const ownProfile = reset.dataset.userId === S.user?.id;
+      await api(ownProfile ? '/api/user/onboarding/reset'
+        : `/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
+      if (ownProfile) await refreshOnboarding();
+      toast(ownProfile ? 'Walkthrough restarted.' : 'Walkthrough restarted. The user will see it when they next open their workspace.');
     } catch (error) { toast(error.message, true); }
     finally { reset.disabled = false; }
   });
@@ -15359,7 +15693,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-avatars">Avatars</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
@@ -15371,6 +15705,7 @@ function organizationView() {
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card" id="organization-roles">Loading roles…</div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
@@ -15378,13 +15713,13 @@ function organizationView() {
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
-    <div class="settings-section-title" id="settings-avatars"><div>Avatars<small>Organization-wide availability</small></div></div>
-    ${AVATAR_RISK_NOTE}
-    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
-
     ${globalSettingsView(true)}
 
-    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div><div id="org-misc-slot"></div>
+    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="settings-section-title" id="settings-experimental"><div>Experimental<small>Optional features for this organization</small></div></div>
+    ${AVATAR_RISK_NOTE}
+    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
+    <div id="org-misc-slot"></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
     <div class="card data-export-card" data-settings-access="organization" hidden>
       <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
@@ -15436,6 +15771,69 @@ function appendPendingInvitation(invitation, projects) {
   box.insertAdjacentHTML('beforeend', pendingInvitationRow(invitation, projects));
 }
 
+function roleAllows(patterns, capability) {
+  return patterns.some((pattern) => pattern === '*' || pattern === capability
+    || (pattern.endsWith(':*') && capability.startsWith(pattern.slice(0, -1))));
+}
+
+function roleCapabilityTree(groups, capabilities, selectable = false) {
+  return groups.map((group) => {
+    const included = group.capabilities.filter((cap) => roleAllows(capabilities, cap.id));
+    if (!included.length) return '';
+    return `<details class="role-capability-group"><summary>${esc(group.label)} <span class="chip">${included.length}</span></summary>
+      <p class="task-sub">${esc(group.description)}</p><ul>${included.map((cap) => `<li>
+        ${selectable ? `<label><input type="checkbox" name="capability" value="${esc(cap.id)}"><b>${esc(cap.label)}</b></label>` : `<b>${esc(cap.label)}</b>`}
+        <code>${esc(cap.id)}</code><p class="task-sub">${esc(cap.description)}</p></li>`).join('')}</ul></details>`;
+  }).join('');
+}
+
+function renderOrganizationRoles() {
+  const root = $('#organization-roles');
+  if (!root) return;
+  const catalog = S.authorizationCatalog;
+  if (!catalog) { root.textContent = 'Could not load roles. Reload this page to try again.'; return; }
+  const levels = authorizationLevels();
+  root.innerHTML = `<div class="section-h">Roles &amp; capabilities</div>
+    <p class="task-sub">Expand a role, then a category to inspect its exact capabilities. Access is limited by the selected projects or organization and by the person granting it. Task actions also depend on workflow state.</p>
+    ${catalog.profiles.slice().sort((a, b) => levels.findIndex((level) => level.id === a.id) - levels.findIndex((level) => level.id === b.id)).map((role) => `<details class="authorization-role">
+      <summary><b>${esc(role.name)}</b><span class="chip">${role.builtin ? 'Built-in' : 'Custom'}</span></summary>
+      <p class="task-sub">${esc(role.description)}</p>
+      ${roleCapabilityTree(catalog.capabilityGroups, role.capabilities)}
+      <details class="role-capability-group"><summary>Exact grant patterns</summary><p class="task-sub">A wildcard (*) grants every matching capability, including future additions. Scope limits still apply; for example, project scope excludes Review-gate approval.</p><ul>${role.capabilities.map((cap) => `<li><code>${esc(cap)}</code></li>`).join('')}</ul></details>
+    </details>`).join('')}
+    ${catalog.canCreate ? `<details class="authorization-role"><summary><b>Create role</b></summary>
+      <form id="create-authorization-role">
+        <label class="form-row">Role name<input name="name" required maxlength="80" placeholder="Release coordinator"></label>
+        <label class="form-row">Description<input name="description" required maxlength="240" placeholder="What this role can do"></label>
+        <p class="task-sub">Choose specific capabilities. Only permissions you can grant within this organization are available. New roles are available for people and tasks; existing grants stay unchanged.</p>
+        ${roleCapabilityTree(catalog.capabilityGroups, catalog.creatableCapabilities, true)}
+        <p class="task-sub" id="role-selection-count" aria-live="polite">0 capabilities selected</p>
+        <p class="task-sub" id="role-create-error" role="alert"></p>
+        <button class="btn primary" type="submit">Create role</button>
+      </form></details>` : ''}
+  `;
+  const form = root.querySelector('form');
+  form?.addEventListener('change', () => {
+    root.querySelector('#role-selection-count').textContent = `${form.querySelectorAll('[name=capability]:checked').length} capabilities selected`;
+  });
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const capabilities = data.getAll('capability');
+    const error = root.querySelector('#role-create-error');
+    if (!capabilities.length) { error.textContent = 'Select at least one capability.'; return; }
+    const button = form.querySelector('[type=submit]');
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${S.organizationId}/roles`, { method: 'POST',
+        body: JSON.stringify({ name: data.get('name'), description: data.get('description'), capabilities }) });
+      await loadCollaboration();
+      await hydrateOrganizationView();
+      toast('Role created');
+    } catch (e) { error.textContent = e.message; button.disabled = false; }
+  });
+}
+
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -15453,6 +15851,7 @@ async function hydrateOrganizationView() {
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  renderOrganizationRoles();
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
@@ -15951,6 +16350,10 @@ function allCommands() {
   // page's tabs. Documented in the help panel's static "On a task page" section
   // (help: false here) so they're discoverable before a page is open.
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
+  const attemptsAvailable = !!(S.selected && S.view && document.querySelectorAll('[data-attempt-select]').length > 1);
+  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: 'a j', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
+  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: 'a k', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
+  add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
   add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
@@ -16075,7 +16478,8 @@ function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId)
 // A data-id row navigates through its .row-link `<a>` overlay (the delegated
 // link router only fires for anchors), so click that; draft rows carry their
 // own click handler on the div, so fall back to the row itself.
-function openCursorRow() { const r = cursorRow(); if (r) (r.querySelector('a.row-link') || r).click(); }
+function openListRow(row) { if (row) (row.querySelector('a.row-link') || row).click(); }
+function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
@@ -16177,7 +16581,11 @@ function bindKeys() {
     if (focusedAction === 'native') return;
     if (focusedAction === 'click') {
       e.preventDefault();
-      t.closest('[role="button"], [tabindex="0"]').click();
+      const control = t.closest('[role="button"], [tabindex="0"]');
+      // List rows navigate through their link overlay, not a container click.
+      // Use the focused control so buttons/chips inside a row keep their action.
+      if (control.matches('#main .task-row, #main .queue-item')) openListRow(control);
+      else control.click();
       return;
     }
     if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
@@ -16407,6 +16815,8 @@ function openHelp() {
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
       ${row('[ / ]', 'Previous / next tab')}
+      ${row('a j / a k', 'Next / previous attempt')}
+      ${row('a n', 'New attempt (open editable draft)')}
       ${row('{ / }', 'Previous / next Check-in pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
@@ -16602,7 +17012,7 @@ function renderLanding() {
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation">
-      <a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a>
+      <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
       <div class="landing-nav-actions">
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
@@ -16713,7 +17123,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);

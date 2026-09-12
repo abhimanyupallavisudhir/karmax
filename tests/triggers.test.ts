@@ -273,6 +273,11 @@ describe('TriggerScheduler (dispatcher)', () => {
   let fired: [string, string][];
   let clock: FakeClock;
   let projectId: string;
+  /** A task in the same project that emits the events under test: every real
+   *  event carries the id of the task it happened to, and that task's
+   *  organization is the tenant the event belongs to. */
+  let sourceId: string | undefined;
+  const sourceTask = () => (sourceId ??= store.createTask({ projectId, title: 'source', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 's' } }).id);
 
   beforeEach(() => {
     store = new Store(':memory:');
@@ -280,6 +285,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     fired = [];
     clock = new FakeClock();
     projectId = store.createProject('P').id;
+    sourceId = undefined;
   });
 
   const armedTask = (triggers: TaskTrigger[]): TaskRecord => {
@@ -380,9 +386,25 @@ describe('TriggerScheduler (dispatcher)', () => {
     const t = armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]);
     const s = makeScheduler();
     s.start();
-    bus.emit({ type: 'github.pr-merged', taskId: 'x', ts: 0, payload: { branch: 'dev' } } as KarmaxEvent);
+    bus.emit({ type: 'github.pr-merged', taskId: sourceTask(), ts: 0, payload: { branch: 'dev' } } as KarmaxEvent);
     expect(fired).toHaveLength(0);
-    bus.emit({ type: 'github.pr-merged', taskId: 'x', ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    bus.emit({ type: 'github.pr-merged', taskId: sourceTask(), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    expect(fired).toEqual([[t.id, 'self']]);
+  });
+
+  it('never fires on an event from another organization', () => {
+    const t = armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]);
+    const other = store.createOrganization({ name: 'Other' });
+    const otherProject = store.createProject('Q', {}, other.id);
+    const foreign = store.createTask({ projectId: otherProject.id, title: 'f', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'f' } });
+    const s = makeScheduler();
+    s.start();
+    bus.emit({ type: 'github.pr-merged', taskId: foreign.id, ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    expect(fired).toHaveLength(0);
+    // An event whose task no longer exists has no tenant and reaches nobody.
+    bus.emit({ type: 'github.pr-merged', taskId: 'task_gone', ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    expect(fired).toHaveLength(0);
+    bus.emit({ type: 'github.pr-merged', taskId: sourceTask(), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
     expect(fired).toEqual([[t.id, 'self']]);
   });
 
@@ -395,7 +417,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     const first = makeScheduler();
     first.start();
 
-    bus.emit({ type: 'release.approved', taskId: 'release', ts: 0, payload: {} } as KarmaxEvent);
+    bus.emit({ type: 'release.approved', taskId: sourceTask(), ts: 0, payload: {} } as KarmaxEvent);
     expect(fired).toHaveLength(0);
     expect(store.getTask(t.id)!.params.triggerPending).toBe(true);
 
@@ -798,7 +820,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
     const s = makeScheduler();
     s.start();
-    bus.emit({ type: 'x.y', taskId: 'z', ts: 0, payload: { a: 1 } } as KarmaxEvent);
+    bus.emit({ type: 'x.y', taskId: sourceTask(), ts: 0, payload: { a: 1 } } as KarmaxEvent);
     expect(fired).toEqual([[series.id, 'clone']]); // both triggers matched; one run
     s.stop();
   });

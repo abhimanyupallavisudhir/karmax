@@ -15,6 +15,7 @@ import {
   GitPassConnector,
   attachedRepositoryCredential,
   parsePassFiles,
+  passSecrets,
   type Exec,
 } from '../src/autonomy/connectors.js';
 
@@ -225,9 +226,8 @@ describe('pass connector', () => {
     const [pulled] = (await c.pull(['github.com'])).items;
     expect(pulled!.secrets.password).toBe('hunter2');
     expect(pulled!.secrets.totp).toContain('otpauth://');
-    // the notes/username lines are NOT stored as any secret field
-    expect(JSON.stringify(pulled!.secrets)).not.toContain('random note');
-    expect(JSON.stringify(pulled!.secrets)).not.toContain('username');
+    expect(pulled!.secrets.note).toBe('username: alice\nsome random note\notpauth://totp/x?secret=SEED\nmore notes');
+    expect(pulled!.username).toBeUndefined();
   });
   it('surfaces a clear unlock hint when GPG is locked', async () => {
     const exec: Exec = async (cmd) => {
@@ -578,6 +578,49 @@ describe('Connectors sync into the vault (§9)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('checks ciphertext across timestamp resets, restarts and a 500-entry re-import', async () => {
+    const { shown, write, connector, dir } = passStore();
+    const ids = Array.from({ length: 500 }, (_, i) => `sites/${i}.com`);
+    for (const id of ids) write(id, `password-${id}`);
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    await connectors.sync('pass', ids);
+    // A checkout/restore touches every file. Changed content can also carry
+    // an older timestamp, so neither direction of clock comparison is safe.
+    for (const id of ids) fs.utimesSync(path.join(dir, `${id}.gpg`), 2e9, 2e9);
+    write(ids[0]!, 'updated-a', 1000);
+    write(ids[1]!, 'updated-b', 1000);
+    const added = ['sites/new-a.com', 'sites/new-b.com'];
+    for (const id of added) write(id, 'new-password', 1000);
+    shown.length = 0;
+    const restarted = new Connectors(store, items, broker);
+    restarted.register(connector);
+    const result = await restarted.sync('pass', [...ids, ...added]);
+    expect(result).toMatchObject({ count: 4, skipped: 498 });
+    expect(shown).toEqual([ids[0], ids[1], ...added]);
+    connector.pull = async () => { throw new Error('unchanged import must not open the secret store'); };
+    shown.length = 0;
+    expect(await restarted.sync('pass', [...ids, ...added])).toMatchObject({ count: 0, skipped: 502 });
+    expect(shown).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refreshes legacy pass mirrors once to establish a source fingerprint', async () => {
+    const { shown, write, connector, dir } = passStore();
+    write('sites/a.com', 'pw-a', 1000);
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    const old = items.save({ type: 'login', label: 'Legacy', secrets: { password: 'old' },
+      provenance: { source: 'connector:pass', externalId: 'sites/a.com', passNotesVersion: 1, syncedAt: Date.now() } });
+    expect(await connectors.sync('pass', ['sites/a.com'])).toMatchObject({ count: 1, skipped: 0 });
+    expect(items.get(old.id)!.provenance.sourceRevision).toMatch(/^[a-f0-9]{64}$/);
+    expect(await connectors.sync('pass', ['sites/a.com'])).toMatchObject({ count: 0, skipped: 1 });
+    expect(shown).toEqual(['sites/a.com']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('a policy edit on a mirrored item does not make it look up to date', async () => {
     const { shown, write, connector } = passStore();
     write('sites/a.com', 'pw-a');
@@ -593,7 +636,7 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(items.resolveField(items.get(itemIds[0]!)!, 'password', { mode: 'reveal' })).toBe('pw-a2');
   });
 
-  it('items mirrored before the mirror clock existed are not re-read either', async () => {
+  it('backfills notes for imports older than the mirror clock once', async () => {
     const { shown, write, connector } = passStore();
     write('sites/a.com', 'pw-a', Date.now() - 60_000);
     const { items, store, broker } = makeVault();
@@ -604,8 +647,11 @@ describe('Connectors sync into the vault (§9)', () => {
       provenance: { source: 'connector:pass', externalId: 'sites/a.com' } });
 
     const result = await connectors.sync('pass', ['sites/a.com']);
+    expect(shown).toEqual(['sites/a.com']);
+    expect(result.skipped).toBe(0);
+    shown.length = 0;
+    await connectors.sync('pass', ['sites/a.com']);
     expect(shown).toEqual([]);
-    expect(result.skipped).toBe(1);
   });
 
   it('one undecryptable entry no longer discards the whole import (V)', async () => {
@@ -668,10 +714,11 @@ describe('Connectors sync into the vault (§9)', () => {
 
   it('updateSecret for Bitwarden edits one field of the fetched item', async () => {
     const edits: any[] = [];
-    const exec: Exec = async (cmd, args) => {
+    const exec: Exec = async (cmd, args, opts) => {
       const key = [cmd, ...args].join(' ');
       if (key.startsWith('bw get item bw1')) return JSON.stringify({ id: 'bw1', type: 1, name: 'GH', notes: 'keep me', login: { username: 'octo', password: 'old' } });
-      if (key.startsWith('bw edit item bw1')) { edits.push(JSON.parse(Buffer.from(args[3]!, 'base64').toString())); return '{}'; }
+      // The edited item (with the new secret) arrives on stdin, never in argv.
+      if (key === 'bw edit item bw1') { edits.push(JSON.parse(Buffer.from(opts!.input!, 'base64').toString())); return '{}'; }
       throw new Error(`unexpected: ${key}`);
     };
     const c = new BitwardenConnector(() => 'sess', exec);
@@ -689,8 +736,8 @@ describe('Connectors sync into the vault (§9)', () => {
       if (key.startsWith('bw status')) return JSON.stringify({ status: 'unlocked' });
       if (key.startsWith('bw list items')) return JSON.stringify([{ id: 'bw1', type: 1, name: 'GH', login: { password: 'old', uris: [{ uri: 'https://gh.com' }] } }]);
       if (key.startsWith('bw get item bw1')) return JSON.stringify({ id: 'bw1', type: 1, name: 'GH', login: { password: 'old' } });
-      if (key.startsWith('bw edit item bw1')) { updates.push(JSON.parse(Buffer.from(args[3]!, 'base64').toString())); return '{}'; }
-      throw new Error(`unexpected: ${key}${opts ? '' : ''}`);
+      if (key === 'bw edit item bw1') { updates.push(JSON.parse(Buffer.from(opts!.input!, 'base64').toString())); return '{}'; }
+      throw new Error(`unexpected: ${key}`);
     };
     const connectors = new Connectors(store, items, broker);
     connectors.register(new BitwardenConnector(() => 'sess', exec));
@@ -869,5 +916,60 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(await connectors.propagate(imported.id, ['password'])).toBeUndefined();
     await expect(connectors.writeBack('alpha', imported.id)).rejects.toThrow(/one-way file import/i);
     expect(updated).toEqual([]);
+  });
+});
+
+describe('pass notes preservation and migration', () => {
+  it('writes notes back verbatim while keeping the password', async () => {
+    const writes: string[] = [];
+    const connector = new PassConnector(async (cmd, args, opts) => {
+      if (args[0] === 'show') return 'pw\nold notes\n';
+      writes.push(opts!.input!);
+      return '';
+    });
+    const note = 'Username: administrator\r\n  extra  ';
+    await connector.updateSecret('vps', 'note', note);
+    await connector.push({ externalId: '', type: 'login', label: 'VPS', domains: [],
+      fields: ['password', 'note'], secrets: { password: 'pw', note } });
+    expect(writes).toEqual(['pw\n' + note, 'pw\n' + note]);
+  });
+
+  it('keeps arbitrary trailing content and CRLF verbatim without parsing Username', () => {
+    expect(passSecrets('pw\r\nUsername: administrator\r\n\r\n  recovery text  \r\n'))
+      .toEqual({ password: 'pw', note: 'Username: administrator\r\n\r\n  recovery text  \r\n' });
+    expect(passSecrets('pw')).toEqual({ password: 'pw', note: '' });
+  });
+
+  it.each([false, true])('backfills unchanged entries once, including written-back=%s', async (writtenBack) => {
+    const { items, store, broker } = makeVault();
+    const item = items.save({ type: 'login', label: 'VPS', secrets: { password: 'pw' },
+      policy: { reveal: 'never' }, provenance: writtenBack
+        ? { source: 'task:signup', taskId: 'signup' }
+        : { source: 'connector:pass-git', externalId: 'vps', syncedAt: Date.now() } });
+    if (writtenBack) items.setExternalId(item.id, 'pass-git', 'vps');
+    let note = 'Username: administrator\n';
+    let changedAt = 1;
+    const pulls: string[][] = [];
+    const connectors = new Connectors(store, items, broker);
+    connectors.register({ name: 'pass-git',
+      describe: async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: false, detail: '' }),
+      list: async () => [{ externalId: 'vps', type: 'login', label: 'VPS', fields: ['password'], changedAt }],
+      pull: async (ids) => {
+        pulls.push(ids);
+        return { items: ids.map((externalId) => ({ externalId, type: 'login' as const, label: 'VPS',
+          fields: ['password' as const, 'note' as const], secrets: { password: 'pw', note } })), failures: [] };
+      },
+    });
+    await connectors.sync('pass-git', ['vps']);
+    expect(items.list()).toHaveLength(1);
+    expect(items.readSecret(items.get(item.id)!, 'note')).toBe(note);
+    expect(items.get(item.id)!.policy.reveal).toBe('never');
+    expect(items.get(item.id)!.provenance.source).toBe(item.provenance.source);
+    await connectors.sync('pass-git', ['vps']);
+    expect(pulls).toEqual([['vps']]);
+    note = '';
+    changedAt = Date.now() + 10000;
+    await connectors.sync('pass-git', ['vps']);
+    expect(items.readSecret(items.get(item.id)!, 'note')).toBe('');
   });
 });

@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['credentialRequestTaskLink', 'credentialRequestRows', 'permissionRequestRows', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['policyTip', 'credentialRequestTaskLink', 'credentialRequestRows', 'permissionRequestRows', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -75,6 +75,11 @@ ok(permissionRows.includes('@team:operators') && permissionRows.includes('config
   'permission request row explains its audience and reason');
 ok(permissionRows.includes('data-preq-act="approve"') && permissionRows.includes('data-preq-act="deny"'),
   'permission request row exposes approve and deny decisions');
+
+const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], projectIds: ['proj_second<script>'],
+  baseAuthorization: { level: 'developer' } }]);
+ok(scopeRows.includes('proj_second&lt;script&gt;') && !scopeRows.includes('<script>'), 'project scopes are visible and escaped');
+ok(scopeRows.includes('Existing permissions for all task roles apply there too'), 'scope approval explains its full effect');
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'approvals', 'a task needing approval opens its dedicated tab');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');

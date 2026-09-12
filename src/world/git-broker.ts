@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { validGitBranch } from '../util/git-ref.js';
 import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
@@ -47,9 +48,9 @@ export async function brokerEnrollRepository(
   auth: GitBrokerAuth,
 ): Promise<WorldRepo> {
   if (!/^(?:ssh:\/\/|git@)/.test(spec.source)) throw new Error('dynamic repository enrollment requires an SSH remote');
-  if (!safeBranch(spec.branch)) throw new Error(`invalid task branch "${spec.branch}"`);
-  if (!safeBranch(spec.base)) throw new Error(`invalid repository base branch "${spec.base}"`);
-  if (spec.target && !safeBranch(spec.target)) throw new Error(`invalid repository target branch "${spec.target}"`);
+  if (!validGitBranch(spec.branch)) throw new Error(`invalid task branch "${spec.branch}"`);
+  if (!validGitBranch(spec.base)) throw new Error(`invalid repository base branch "${spec.base}"`);
+  if (spec.target && !validGitBranch(spec.target)) throw new Error(`invalid repository target branch "${spec.target}"`);
 
   const enrolled = worldRepos(world.handle).find((repo) =>
     canonicalRepositoryIdentity(worldRepoSource(repo)) === canonicalRepositoryIdentity(spec.source));
@@ -277,7 +278,7 @@ async function localAuthority(repo: WorldRepo, worldRepoIsLocal = false): Promis
 /** A local worktree and its source checkout share one ref database. Publication
  * is therefore a consistency check, not a push or bundle round-trip. */
 async function verifySharedWorktreeBranch(world: World, repo: WorldRepo, localRepo: string): Promise<void> {
-  if (!safeBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
+  if (!validGitBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
   const ref = `refs/heads/${repo.branch}`;
   const worldTip = await world.exec('git', ['rev-parse', '--verify', ref], { cwd: repo.root });
   if (worldTip.code !== 0) throw new Error(`world task branch "${repo.branch}" is unavailable: ${worldTip.stderr || worldTip.stdout}`);
@@ -437,7 +438,7 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
   const repos = worldRepos(world.handle);
   const updated: Array<{ repo: string; branch: string; sha: string }> = [];
   for (const repo of repos) {
-    if (!safeBranch(repo.branch)) throw new Error(`repo "${repo.name}" has an invalid task branch`);
+    if (!validGitBranch(repo.branch)) throw new Error(`repo "${repo.name}" has an invalid task branch`);
     const dirty = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
     if (dirty.code !== 0) throw new Error(`could not inspect repo "${repo.name}": ${dirty.stderr || dirty.stdout}`);
     if (dirty.stdout.trim()) throw new Error(`repo "${repo.name}" has uncommitted cloud changes; commit or discard them before refreshing`);
@@ -512,7 +513,7 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
   for (const repo of worldRepos(world.handle)) {
     try {
       const branch = requestedBranch ?? repo.target ?? repo.base;
-      if (!safeBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
+      if (!validGitBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
       const ref = `refs/remotes/origin/${branch}`;
       const sha = await brokerFetchRef(world, repo, branch, ref, auth, targetAuthority === 'origin');
       refreshed.push({ repo: repo.name, branch, ref, sha });
@@ -527,7 +528,7 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
 
 async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: string, destinationRef: string,
   auth: GitBrokerAuth, preferOrigin = false): Promise<string> {
-  if (!safeBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
+  if (!validGitBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-import-'));
   const bundleName = `.karmax-import-${cryptoSafeName(destinationRepo.name)}.bundle`;
   const bundleRelative = worldRepos(world.handle).length > 1 ? `${destinationRepo.name}/${bundleName}` : bundleName;
@@ -597,10 +598,12 @@ export async function brokerFinalizeMerge(
 ): Promise<MergeResult> {
   const repos = worldRepos(world.handle);
   if (!repos.length) return { merged: false, landedFiles: [], note: 'cloud scratch world has no remote repository' };
+  if (!validGitBranch(target)) throw new Error(`invalid target branch "${target}"`);
   const landedFiles: string[] = [];
   let sha: string | undefined;
   for (const repo of repos) {
     const repoTarget = worldRepoTarget(repo, target);
+    if (!validGitBranch(repoTarget)) throw new Error(`invalid target branch "${repoTarget}" for ${repo.root}`);
     const dirty = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
     if (dirty.code !== 0) return { merged: false, landedFiles, note: `repo "${repo.name}": could not inspect worktree: ${dirty.stderr || dirty.stdout}` };
     if (dirty.stdout.trim()) {
@@ -697,7 +700,7 @@ export async function brokerPushBranches(
  * verification servers may legitimately sit on another revision while a
  * committed snapshot is published. */
 async function readBranchBundle(world: World, repo: WorldRepo): Promise<Buffer> {
-  if (!safeBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
+  if (!validGitBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
   const transferName = `.karmax-transfer-${cryptoSafeName(repo.name)}.bundle`;
   const transferRel = worldRepos(world.handle).length > 1 ? `${repo.name}/${transferName}` : transferName;
   try {
@@ -803,8 +806,4 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function safeBranch(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/.test(value)
-    && !value.includes('..') && !value.includes('@{') && !value.endsWith('/')
-    && !value.endsWith('.lock') && !value.includes('//');
-}
+

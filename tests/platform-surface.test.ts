@@ -45,7 +45,7 @@ describe('the two agent-facing platform surfaces share one definition', () => {
     }
     // The live escalation this closes: Better Auth sign-up is forwarded ahead of
     // the capability gate, so it needed no `user:write` at all.
-    expect(platformRequestPathError('/api/auth/sign-up/email')).toMatch(/Account creation and sign-in are human operations/);
+    expect(platformRequestPathError('/api/auth/sign-up/email')).toMatch(/authenticated authorization\/user administration routes with user:write/);
     // Query strings and sub-paths do not evade the list.
     expect(platformRequestPathError('/api/signup?x=1')).toBeDefined();
     expect(platformRequestPathError('/api/github/webhook/extra')).toBeDefined();

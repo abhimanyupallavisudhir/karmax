@@ -1,4 +1,5 @@
 import { canonicalAccountName } from '../domain/account-names.js';
+import { validGitBranch } from '../util/git-ref.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
@@ -15,6 +16,7 @@ import {
   TaskParams,
   AgentProfile,
   TaskView,
+  ReviewInfo,
   KarmaxEvent,
   Tag,
   SavedView,
@@ -2990,7 +2992,31 @@ export class Store {
     return tasks;
   }
 
+  /** Turn-local review tools must survive cancellation before TurnResult is returned.
+   * Keep only explicitly supplied fields; workflow-owned completion/diffs stay intact. */
+  checkpointReviewInfo(taskId: string, info: ReviewInfo): void {
+    const previous = this.kvGet(`pending-review:${taskId}`);
+    const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+    this.kvSet(`pending-review:${taskId}`, JSON.stringify({ ...(previous ? JSON.parse(previous) : {}), ...supplied }));
+    const view = this.getTask(taskId)?.lastView;
+    if (view) this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?')
+      .run(JSON.stringify(this.withPendingReviewInfo(taskId, view)), taskId);
+  }
+
+  withPendingReviewInfo(taskId: string, view: TaskView): TaskView {
+    const raw = this.kvGet(`pending-review:${taskId}`);
+    return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
+  }
+
   saveView(taskId: string, view: TaskView) {
+    const pending = this.kvGet(`pending-review:${taskId}`);
+    if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
+      JSON.stringify(view.reviewInfo?.[key as keyof ReviewInfo]) === JSON.stringify(value))) {
+      // The workflow has incorporated the checkpoint (normal turn completion or
+      // lifecycle recovery). Future workflow updates own these fields again.
+      this.kvDelete(`pending-review:${taskId}`);
+    }
+    view = this.withPendingReviewInfo(taskId, view);
     // Auto-archive on resolution: the moment a task reaches a terminal, no-further-
     // action status (done or cancelled) it drops out of the default active list
     // without a manual archive step — the same effect the /archive endpoint has, but
@@ -3028,6 +3054,20 @@ export class Store {
 
   updateTaskParams(taskId: string, params: TaskParams) {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
+  }
+
+  /** Atomically replace only the supplied top-level fields. Use after awaits:
+   * a whole-record write can restore a superseded execution or authorization. */
+  patchTaskParams(taskId: string, patch: Record<string, unknown>) {
+    const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
+    if (!entries.length) return;
+    if (this.db.dialect === 'postgres') {
+      this.db.prepare('UPDATE tasks SET params = (params::jsonb || ?::jsonb)::text WHERE id = ?')
+        .run(JSON.stringify(Object.fromEntries(entries)), taskId);
+    } else {
+      this.db.prepare(`UPDATE tasks SET params = json_set(params, ${entries.map(() => '?, json(?)').join(', ')}) WHERE id = ?`)
+        .run(...entries.flatMap(([key, value]) => [`$.${JSON.stringify(key)}`, JSON.stringify(value)]), taskId);
+    }
   }
 
   /** Archive/unarchive the logical task, regardless of which attempt initiated it.
@@ -3151,6 +3191,7 @@ export class Store {
       this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId);
       this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId);
       this.db.prepare('DELETE FROM world_instances WHERE worldId = ?').run(taskId);
+      this.deleteProjectKv([], [taskId]);
       this.deletePermissionRequestKv(
         prior ? this.getProject(prior.projectId)?.organizationId : undefined,
         [taskId],
@@ -3326,7 +3367,7 @@ export class Store {
         urgencyRank(item.urgency), createdAt, JSON.stringify(subject));
       if (!Number(inserted.changes)) continue;
       const preferences = this.getDeliveryPreferences(userId, organizationId);
-      const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack']
+      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack']
         .filter(Boolean) as string[];
       for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
         (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
@@ -3587,7 +3628,7 @@ export class Store {
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
           item.taskId, item.kind, urgencyRank(item.urgency), item.actionable ? 1 : 0, item.createdAt);
       if (Number(inserted.changes)) {
-        const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
+        const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
         for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
           (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
           .run(newId('delivery'), item.id, channel, item.createdAt, item.createdAt);
@@ -3708,6 +3749,7 @@ export class Store {
   createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Tag {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
+    assertTagColor(input.color);
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
     // types the path. `color`/`description` apply to the leaf; `kind` applies to the
@@ -3776,6 +3818,7 @@ export class Store {
   }
 
   updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | 'flag' | null; description?: string | null }): Tag | undefined {
+    assertTagColor(patch.color);
     const cur = this.getTag(id);
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
@@ -3963,11 +4006,11 @@ export class Store {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`no project ${projectId}`);
     const organizationId = project.organizationId ?? 'org_personal';
-    const organization = this.kvGet(`avatars:organization:${organizationId}`) !== 'disabled';
+    const organization = this.kvGet(`avatars:organization:${organizationId}`) === 'enabled';
     const raw = this.kvGet(`avatars:project:${projectId}`);
     const projectSetting: AvatarAvailability['project'] = raw === 'enabled' || raw === 'disabled' ? raw : 'inherit';
     return { organization, project: projectSetting,
-      effective: organization && projectSetting !== 'disabled' };
+      effective: projectSetting === 'inherit' ? organization : projectSetting === 'enabled' };
   }
 
   // ── identities are owned by Better Auth; these rows contain only karmax policy ──
@@ -4071,8 +4114,9 @@ export class Store {
     }
     for (const taskId of taskIds) {
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`]) exact.run(key);
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`]) prefix.run(value, value);
+        `permission:grant:${taskId}`, `pending-review:${taskId}`]) exact.run(key);
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
+        `view-conversation:${taskId}:`]) prefix.run(value, value);
     }
   }
 
@@ -4243,12 +4287,23 @@ export class Store {
   }
 
   appendEvent(ev: KarmaxEvent): number {
-    const info = this.db
-      .prepare('INSERT INTO events (taskId, type, ts, payload) VALUES (?, ?, ?, ?)')
-      .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload));
-    const seq = Number(info.lastInsertRowid);
-    this.materializeInbox(seq, ev);
-    return seq;
+    // The event row and its inbox/delivery materialization are one write: a
+    // failure inside `materializeInbox` after the insert would leave an event
+    // whose caller sees an exception, retries, and appends it twice.
+    const nested = this.db.inTransaction();
+    if (!nested) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const info = this.db
+        .prepare('INSERT INTO events (taskId, type, ts, payload) VALUES (?, ?, ?, ?)')
+        .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload));
+      const seq = Number(info.lastInsertRowid);
+      this.materializeInbox(seq, ev);
+      if (!nested) this.db.exec('COMMIT');
+      return seq;
+    } catch (error) {
+      if (!nested) this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   eventsSince(taskId: string, seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
@@ -4629,7 +4684,7 @@ export class Store {
 
   retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void {
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
-      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (storageLocationId) {
@@ -6106,12 +6161,6 @@ function sha256(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-function validGitBranch(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/.test(value)
-    && !value.includes('..') && !value.includes('@{') && !value.includes('//')
-    && !value.endsWith('/') && !value.endsWith('.') && !value.endsWith('.lock');
-}
-
 export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
@@ -6311,4 +6360,11 @@ function rowToTask(r: any): TaskRecord {
     notes: r.notes ?? undefined,
     lastView: r.lastView ? JSON.parse(r.lastView) : undefined,
   };
+}
+
+/** A tag colour is rendered into an inline `style` custom property; only a
+ *  hex literal is accepted so it can never carry a CSS declaration. */
+function assertTagColor(color: string | null | undefined): void {
+  if (color == null || color === '') return;
+  if (!/^#[0-9a-fA-F]{3,8}$/.test(color)) throw new Error('tag color must be a hex colour like #4a90d9');
 }

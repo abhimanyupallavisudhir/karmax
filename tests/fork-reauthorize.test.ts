@@ -44,6 +44,42 @@ function fixture() {
 }
 
 describe('fork_agent reauthorize', () => {
+  it('defaults to unpublished source work, permits a different base, and uses the landing target after completion', async () => {
+    const f = fixture();
+    const token = f.tokenFor('owner');
+    f.store.saveView(f.source.id, { taskId: f.source.id, status: 'cancelled',
+      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any);
+    const fork = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'continue' });
+    expect(fork.params.base).toBe('karmax/source');
+    expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'karmax/source', unpublished: true });
+    const changed = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'fresh', base: 'main', target: 'release' });
+    expect(changed.params.base).toBe('main');
+    expect(changed.params.target).toBe('release');
+    f.store.saveView(f.source.id, { taskId: f.source.id, status: 'done',
+      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any);
+    const landed = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'follow up' });
+    expect(landed.params.base).toBe('release');
+    expect(landed.params._forkWorld).toMatchObject({ unpublished: false });
+    f.store.close();
+  });
+
+  it('ignores injected world provenance and honors an explicit default branch from the form', async () => {
+    const f = fixture();
+    f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
+      branch: 'karmax/source', targetBranch: 'main', messages: [], state: {} } as any);
+    const fork = await f.api.createTask(f.tokenFor('owner'), { projectId: f.project.id, draft: true,
+      params: { prompt: 'fresh', base: 'main', 'agent:do': { resumeFrom: { taskId: f.source.id } },
+        _forkWorld: { taskId: 'another-project', base: 'main' } } });
+    expect(fork.params.base).toBe('main');
+    expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'karmax/source' });
+    const edited = await f.api.updateArmedParams(f.tokenFor('owner'), fork.id, { base: 'release' }, { keepArmed: false });
+    expect(edited.params._forkWorld).toEqual(fork.params._forkWorld);
+    const cleared = await f.api.updateArmedParams(f.tokenFor('owner'), fork.id,
+      { prompt: 'ordinary task', base: 'main' }, { replace: true, keepArmed: false });
+    expect(cleared.params._forkWorld).toBeUndefined();
+    f.store.close();
+  });
+
   it('reads the grants a task ended with in task-creation shape', () => {
     const f = fixture();
     expect(previousTaskGrants(f.store.getTask(f.source.id)!)).toEqual({

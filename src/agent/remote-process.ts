@@ -11,8 +11,9 @@ import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, prepareCodexH
 import { atomicPrivateWrite, publishLocalCodexHistory } from './codex-history-files.js';
 import { publishRemoteCodexHistory } from './codex-history-remote.js';
 import { codexHistoryBase, codexSessionFiles } from './fork.js';
-import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
+import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
+import { exposeRemoteNodeCommand } from './remote-node.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -131,7 +132,12 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
     // intentionally never refresh authority and must never overwrite the one
     // canonical credential shared by every task using this login.
     if (isControlPlaneAuth(provider, relative)) continue;
-    const destination = path.join(localHome, ...relative.split('/'));
+    // The listing came from a shell inside the sandbox, which the agent controls:
+    // a `..` segment would write anywhere the control plane's user can.
+    const segments = relative.split('/');
+    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) continue;
+    const destination = path.join(localHome, ...segments);
+    if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
     const data = await world.readFileBuffer(remoteFile);
     if (recovery) { atomicPrivateWrite(destination, data); continue; }
     if (provider === 'codex' && session) {
@@ -160,6 +166,10 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
 
 function isControlPlaneAuth(provider: Provider, relative: string): boolean {
   const normalized = relative.split(path.sep).join('/');
+  // The captured setup token is injected into every later turn of this login
+  // (`CLAUDE_CODE_OAUTH_TOKEN`); a sandbox that could replace it would make
+  // those turns authenticate as whoever it chose.
+  if (normalized === KARMAX_TOKEN_FILE) return true;
   return provider === 'codex'
     ? normalized === 'auth.json'
     : provider === 'claude'
@@ -358,7 +368,7 @@ export function spawnRemoteAgentProcess(opts: {
     "printf '\\036KARMAX_AGENT_%s\\036\\n' READY",
     `exec ${commandLine} 2>${quote(stderr)}`,
   ].join('; ');
-  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal);
+  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal, stderr);
 }
 
 export class RemoteSpawnedProcess extends EventEmitter {
@@ -375,8 +385,10 @@ export class RemoteSpawnedProcess extends EventEmitter {
   private preamble = '';
   private protocolReady = false;
   private finished = false;
+  private finishing = false;
 
-  constructor(world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal) {
+  constructor(private world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal,
+    private stderrFile?: string) {
     super();
     this.protocolGate = new Promise<void>((resolve) => { this.openProtocolGate = resolve; });
     this.ready = world.openPty({ command, cwd, env, cols: 200, rows: 40 }).then((pty) => {
@@ -435,11 +447,20 @@ export class RemoteSpawnedProcess extends EventEmitter {
     return true;
   }
 
-  private finish(code: number | null): void {
-    if (this.finished) return;
-    this.finished = true;
+  private async finish(code: number | null): Promise<void> {
+    if (this.finishing) return;
+    this.finishing = true;
     this.exitCode = code;
     this.openProtocolGate();
+    // The protocol owns PTY stdout; native stderr is redirected to a file.
+    // Recover a bounded tail before close so startup failures retain their cause.
+    if (this.stderrFile) {
+      try {
+        const result = await this.world.exec('tail', ['-c', '8192', this.stderrFile], { timeoutMs: 5000 });
+        if (result.code === 0 && result.stdout) this.stderr.write(result.stdout);
+      } catch { /* diagnostics must not replace the process failure */ }
+    }
+    this.finished = true;
     this.stdout.end();
     this.stderr.end();
     this.emit('exit', code, null);
@@ -823,11 +844,13 @@ async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBi
 /** Bring stock provider images up to the minimum runtime required by the pinned
  * Codex/Claude and browser MCP packages. The runtime is installed from npm into
  * the world injection surface, so users do not need to rebuild their selected
- * E2B template merely because its system Node is stale. Baked Karmax images skip
- * this entirely. */
-async function ensureRemoteNode(world: World): Promise<string | undefined> {
+ * E2B template merely because its system Node is stale. Reuse the paired runtime
+ * on later turns even if task commands replace system Node/npm. */
+async function ensureRemoteNode(world: World): Promise<string> {
   const acceptable = "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>22||(a===22&&b>=12)?0:1)";
-  if ((await world.exec('node', ['-e', acceptable], { timeoutMs: 30_000 })).code === 0) return undefined;
+  // Task commands can replace system Node with an npx-cache symlink. Its
+  // version still passes while npm's inferred prefix is unusable (task 201).
+  // Keep the paired, pinned runtime stable across every turn.
   const root = path.posix.join(world.handle.root, `${REMOTE_ROOT}/tools/node-${REMOTE_NODE_VERSION}`);
   const bin = path.posix.join(root, 'bin');
   const node = path.posix.join(bin, 'node');
@@ -840,6 +863,10 @@ async function ensureRemoteNode(world: World): Promise<string | undefined> {
     `${quote(node)} -e ${quote(acceptable)}`,
   ].join(' && ')], { timeoutMs: 5 * 60_000 });
   if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
+  // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
+  // at the standard sandbox location, including on resumed worlds.
+  const expose = await world.exec('bash', ['-lc', exposeRemoteNodeCommand(bin)]);
+  if (expose.code !== 0) throw new Error(`could not make managed Node/npm the sandbox default (requires writable /usr/local/bin or passwordless sudo): ${expose.stderr || expose.stdout}`);
   return bin;
 }
 

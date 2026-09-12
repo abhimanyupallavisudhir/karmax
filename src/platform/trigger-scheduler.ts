@@ -121,6 +121,11 @@ export class TriggerScheduler {
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
   }
 
+  private organizationOfTask(taskId: string, task = this.deps.store.getTask(taskId)): string | undefined {
+    const projectId = task?.projectId;
+    return projectId ? this.deps.store.getProject(projectId)?.organizationId ?? 'org_personal' : undefined;
+  }
+
   /**
    * Validate a task's trigger graph against the live store.
    *
@@ -211,9 +216,15 @@ export class TriggerScheduler {
   // ─── Event routing ─────────────────────────────────────────────────────────
 
   private onEvent(ev: KarmaxEvent): void {
+    // Events are tenant data: an armed task only ever sees events from tasks in
+    // its own organization. Without this, `{kind:'event', where:{repo:…}}` in one
+    // organization fired on (and probed the payloads of) another's tasks.
+    const sourceOrganization = this.organizationOfTask(ev.taskId);
+    if (!sourceOrganization) return;
     // Copy: firing mutates the map (one-shot disarm).
     for (const entry of [...this.armed.values()]) {
       if (entry.fired) continue;
+      if (this.organizationOfTask(entry.task.id, entry.task) !== sourceOrganization) continue;
       // `event` triggers are activators. They become runnable only once every
       // dependency prerequisite is also satisfied.
       // `firedNow` is load-bearing for a REPEATABLE series: `entry.fired` is only
@@ -432,7 +443,11 @@ export class TriggerScheduler {
       last = next;
       cursor = next;
     }
-    if (last === undefined) return mark;
+    // Nothing fell inside the window: subsequent scheduling measures from the
+    // window's edge, not the raw mark. Returning a mark older than the window
+    // made `armCron` compute a next occurrence in the past and fire once per
+    // historical occurrence, back to back — the replay the window exists to stop.
+    if (last === undefined) return Math.max(mark, now - MAX_CATCHUP_WINDOW_MS);
     this.log(`cron catch-up for ${entry.task.id}: occurrence at ${new Date(last).toISOString()} was missed`);
     this.recordCronFire(entry, last);
     this.markActivationPending(entry);

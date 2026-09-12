@@ -279,7 +279,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'get_credential',
     description:
-      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {
@@ -304,7 +304,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
         secrets: {
           type: 'object',
-          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI); api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
+          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI), note; api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
         },
       },
       required: ['type', 'label'],
@@ -313,7 +313,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'propose_project_resource',
     description:
-      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service).',
+      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
     parameters: {
       type: 'object',
       properties: {
@@ -573,12 +573,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'fork_agent',
-    description: 'Branch an attached agent into an independent new task/session, optionally with a different provider/model. The source remains untouched. reauthorize=true starts the fork with the grants the source task ended with (authorization level/scope and approved vault credentials), checked against your own authority.',
+    description: 'Branch an attached agent into an independent new task/session, optionally with a different provider/model. Defaults to the source task branch and unpublished checkpoint, or its merge target after landing. Set base to another branch for normal project initialization. The source remains untouched. reauthorize=true starts the fork with the grants the source task ended with (authorization level/scope and approved vault credentials), checked against your own authority.',
     parameters: {
       type: 'object',
       properties: {
         task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' },
-        target: { type: 'string' }, authorization_profile: { type: 'string' }, reauthorize: { type: 'boolean' },
+        base: { type: 'string', description: 'Starting branch; defaults to the source task branch, or its merge target after landing. Changing it excludes unpublished source state.' }, target: { type: 'string' }, authorization_profile: { type: 'string' }, reauthorize: { type: 'boolean' },
         provider: { type: 'string', enum: ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'] },
         model: { type: 'string' }, effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
       },
@@ -642,20 +642,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_permission',
     description:
-      'Request exact missing Karmax capabilities for this task. The request appears in Approval Requests and is routed ' +
+      'Request exact Karmax capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ' +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
-      'holds every requested capability can approve. Do not request wildcards. An approval or denial resumes the task.',
+      'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
     parameters: {
       type: 'object',
       properties: {
         capabilities: {
           type: 'array',
           items: { type: 'string' },
-          minItems: 1,
+          minItems: 0,
           maxItems: 32,
           description: 'Exact capability names to add to this task, for example settings:read.',
         },
+        projectIds: { type: 'array', items: { type: 'string' }, maxItems: 32,
+          description: 'Additional project IDs in this organization. Existing projects are retained. Supply capabilities: [] for scope only.' },
         audience: {
           type: 'array',
           items: { type: 'string' },
@@ -709,11 +711,23 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'list_github_actions_workflows',
+    description: 'Discover workflow ids, paths and enabled states in an attached repository. Paginated; requires github:actions:read.',
+    parameters: { type: 'object', properties: {
+      repository: { type: 'string' }, page: { type: 'number' }, per_page: { type: 'number' },
+    } },
+  },
+  {
     name: 'inspect_github_actions_run',
-    description: 'Inspect one Actions run, including failed jobs/steps, bounded log excerpts, and artifact metadata. GitHub credentials and signed log URLs never enter the task world.',
+    description: 'Inspect Actions evidence with github:actions:read. Default failure view preserves diagnostics. Use jobs for paginated steps/attempts, log with job_id for any conclusion and bounded tail output, artifacts for metadata, annotations with job_id for check diagnostics, or pending-deployments for current approval waits. Pin attempt for historical jobs/logs. headSha and success/skipped status do not prove deployed code; verify explicit target, readiness, completion and rollback evidence. Credentials and signed URLs stay host-side.',
     parameters: { type: 'object', properties: {
       repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
       run_id: { type: 'number' },
+      view: { type: 'string', enum: ['failure', 'jobs', 'log', 'artifacts', 'annotations', 'pending-deployments'] },
+      attempt: { type: 'number' }, job_id: { type: 'number' }, page: { type: 'number' }, per_page: { type: 'number' },
+      offset_lines: { type: 'number', description: 'Page backwards from the end using nextOffsetLines, within retainedLines.' },
+      tail_lines: { type: 'number', description: 'Log tail lines, default 100, maximum 500.' },
+      max_chars: { type: 'number', description: 'Log output characters, default 16000, maximum 32000. Check tailComplete and truncation flags.' },
     }, required: ['run_id'] },
   },
   {
@@ -868,7 +882,7 @@ export function platformToolHandlers(
           return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
         }
       }
-      ctx.createReviewInfo({
+      await ctx.createReviewInfo({
         caption: args?.caption,
         actions: Array.isArray(args?.actions) ? args.actions : undefined,
         summary: args?.summary,
@@ -972,7 +986,7 @@ export function platformToolHandlers(
       });
       // Mirror request_spend: a parked request surfaces at the Review gate.
       if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {
-        ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+        await ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       }
       return JSON.stringify(r);
     },
@@ -1007,7 +1021,7 @@ export function platformToolHandlers(
           : args.target_service ? { kind: 'service', name: String(args.target_service) }
             : { kind: 'environment', name: String(args.target_environment) },
       });
-      ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       return JSON.stringify(result);
     },
     async check_agent_mail(args) {
@@ -1174,7 +1188,7 @@ export function platformToolHandlers(
     async fork_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       return JSON.stringify(await platformRequest('POST', `/api/tasks/${taskId}/fork-agent`, {
-        role: args?.role ?? 'do', title: args?.title, message: args?.message, target: args?.target,
+        role: args?.role ?? 'do', title: args?.title, message: args?.message, base: args?.base, target: args?.target,
         authorizationProfile: args?.authorization_profile, reauthorize: args?.reauthorize === true,
         provider: args?.provider, model: args?.model, effort: args?.effort,
       }));
@@ -1206,6 +1220,7 @@ export function platformToolHandlers(
     async request_permission(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {
         capabilities: Array.isArray(args?.capabilities) ? args.capabilities.map(String) : [],
+        ...(args?.projectIds !== undefined ? { projectIds: args.projectIds } : {}),
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         reason: String(args?.reason ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
@@ -1231,9 +1246,19 @@ export function platformToolHandlers(
       }
       return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs?${query}`));
     },
+    async list_github_actions_workflows(args) {
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['page', args?.page], ['perPage', args?.per_page]])
+        if (value !== undefined) query.set(String(key), String(value));
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/workflows?${query}`));
+    },
     async inspect_github_actions_run(args) {
-      const repository = args?.repository ? `?repository=${encodeURIComponent(String(args.repository))}` : '';
-      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}${repository}`));
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['view', args?.view], ['attempt', args?.attempt],
+        ['jobId', args?.job_id], ['page', args?.page], ['perPage', args?.per_page],
+        ['offsetLines', args?.offset_lines], ['tailLines', args?.tail_lines], ['maxChars', args?.max_chars]])
+        if (value !== undefined) query.set(String(key), String(value));
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}?${query}`));
     },
     async manage_github_actions_run(args) {
       return JSON.stringify(await platformRequest('POST', `/api/agent/github/actions/runs/${Number(args?.run_id)}`, {

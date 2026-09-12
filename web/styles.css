@@ -3,6 +3,22 @@
    for the board details (ids, stages, branches, SHAs). One confident accent
    (electric indigo). The signature is the stage pipeline. */
 
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/inter/InterVariable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/inter/InterVariable-Italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
 :root {
   color-scheme: light dark; /* defeat Chrome force-dark by declaring both */
   --paper: #f6f7f9;
@@ -25,7 +41,7 @@
   --shadow: 0 1px 2px rgba(20, 24, 34, 0.06), 0 8px 24px rgba(20, 24, 34, 0.06);
   --r: 9px;
   --r-sm: 6px;
-  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Inter, "Helvetica Neue", sans-serif;
+  --font-ui: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
 }
 
@@ -177,13 +193,6 @@ a { color: var(--accent); text-decoration: none; }
 .global-search-trigger:hover { border-color: var(--line-strong); color: var(--ink-2); background: var(--surface); }
 .global-search-trigger .global-search-label { flex: 1; }
 .global-search-trigger .kbd { margin-left: auto; background: var(--surface); }
-.topbar .agent-chip {
-  display: flex; align-items: center; gap: 7px;
-  font-size: 12px; color: var(--ink-2);
-  padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
-  background: var(--surface-2);
-}
-.topbar .agent-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--merged); }
 .icon-btn {
   width: 34px; height: 34px; border-radius: 8px; border: 1px solid transparent;
   background: transparent; color: var(--ink-2); cursor: pointer;
@@ -349,7 +358,6 @@ p.task-sub { display: block; line-height: 1.55; }
 p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
-.principal-chip { display:inline-flex; align-items:center; border-radius:999px; padding:2px 7px; background:var(--accent-weak); color:var(--accent); font-weight:600; }
 .task-right { display: flex; align-items: center; gap: 12px; }
 
 /* ── real-link rows ─────────────────────────────────────────────
@@ -399,9 +407,6 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .pipeline .ponr.passed { background: var(--merged); }
 .pipeline .ponr.current { background: var(--accent); }
 
-.responsibility-editor { width:100%; display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; padding-top:10px; border-top:1px solid var(--line); margin-top:10px; }
-.responsibility-editor > label:not(.switch) { display:flex; flex-direction:column; gap:4px; color:var(--ink-3); font-size:11px; }
-.responsibility-editor .switch, .responsibility-editor .pal-sub { align-self:end; margin:0; }
 .inbox-toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; color:var(--ink-2); }
 .inbox-controls { display:flex; align-items:center; gap:14px; }
 .inbox-controls .switch { gap:7px; font-size:13px; }
@@ -432,8 +437,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .inbox-row .urgency-chip { margin-left:8px; }
 .notify-row .urgency-chip { justify-self:start; }
 /* Per-urgency behaviour: one row per level, one column per behaviour. */
-.notify-grid { display:grid; gap:2px; margin:6px 0 12px; }
-.notify-row { display:grid; grid-template-columns:110px repeat(2,minmax(0,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
+.notify-grid { overflow-x:auto; display:grid; gap:2px; margin:6px 0 12px; }
+.notify-row { display:grid; grid-template-columns:90px repeat(4,minmax(70px,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
 .notify-row:last-child { border-bottom:0; }
 .notify-head { color:var(--ink-3); font-size:11px; text-transform:uppercase; letter-spacing:.05em; border-bottom:1px solid var(--line); }
 .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 14px; }
@@ -913,6 +918,9 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .msg-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
 .msg-meta-gap { flex: 1; }
 .msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; font-family: var(--font-mono); }
+.msg.input-request { background: var(--accent-weak); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); border-inline-start: 3px solid var(--accent); }
+.msg.input-request .msg-meta { margin-bottom: 7px; }
+.msg.input-request .role { color: var(--accent); font-weight: 600; opacity: 1; }
 .msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
 /* A little copy control per message — faint until the bubble is hovered. */
@@ -1085,9 +1093,11 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--ink);
   box-shadow: 0 8px 28px rgba(16, 24, 40, .16); cursor: pointer; text-align: left;
 }
-.onboarding-minimized:hover { border-color: var(--accent); transform: translateY(-1px); }
+.onboarding-minimized:not(.onboarding-complete):hover { border-color: var(--accent); transform: translateY(-1px); }
 .onboarding-minimized-mark { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent-weak); color: var(--accent); font-weight: 800; }
-.onboarding-minimized > span:last-child { display: grid; gap: 1px; }
+.onboarding-minimized > span:last-of-type { display: grid; gap: 1px; }
+.onboarding-complete { cursor: default; }
+.onboarding-complete .icon-btn { margin-left: auto; flex-shrink: 0; }
 .onboarding-minimized b { font-size: 12px; }
 .onboarding-minimized small { color: var(--ink-3); font-size: 10px; }
 @media (max-width: 760px) {
@@ -1154,7 +1164,6 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .policy-acceptance input { margin-top:3px; flex:none; }
 .policy-acceptance a, .price-policy a { color:var(--accent); text-decoration:underline; text-underline-offset:2px; }
 .policy-acceptance .mono { font-size:10px; color:var(--ink-3); }
-.billing-price { font-size:20px; font-weight:700; margin:6px 0; }
 
 /* profile page */
 .profile-page { max-width: 620px; }
@@ -1364,7 +1373,8 @@ body.landing-active {
   color: #10172a;
   overflow: auto;
 }
-.landing-active #app { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
+/* Public documents use normal page scrolling; the console keeps its fixed viewport. */
+.landing-active #app, #app:has(> .legal-shell) { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
 .landing-page {
   --land-ink: #10172a;
   --land-muted: #647086;
@@ -1398,6 +1408,8 @@ body.landing-active {
   display: flex; align-items: center; justify-content: space-between;
   border-bottom: 1px solid var(--land-line);
 }
+.landing-identity { display: flex; align-items: center; gap: 18px; }
+.landing-tagline { margin: 0; color: var(--land-muted); font-size: 14px; white-space: nowrap; }
 .landing-brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 730; letter-spacing: -.03em; }
 .landing-brand .mark { width: 28px; height: 28px; border-radius: 8px; box-shadow: 0 3px 10px rgba(16, 23, 42, .15); }
 .landing-brand span { font-size: 18px; }
@@ -1560,6 +1572,10 @@ body.landing-active {
 }
 @media (max-width: 680px) {
   .landing-nav { width: min(100% - 32px, 1180px); height: 68px; }
+  .landing-identity { gap: 8px; flex-wrap: wrap; }
+  .landing-tagline { font-size: 12px; }
+  .landing-nav { gap: 12px; }
+  .landing-nav-actions { flex-shrink: 0; }
   .landing-text-link, .landing-sign-in { display: none; }
   .landing-hero { width: min(100% - 32px, 1180px); min-height: 0; padding: 54px 0 70px; gap: 46px; }
   .landing-analogy { font-size: 22px; gap: 10px; }
@@ -1654,21 +1670,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   html:not([data-theme="light"]) .github-signin-btn:active { background: #b1bac4; border-color: #b1bac4; }
 }
 
-/* Authorization profiles: the finite capability surface is a discoverable
-   checklist. Dynamic resource scopes remain tucked under one expert control. */
-.authz-checklist { display: grid; gap: 6px; margin: 10px 0; }
-.authz-all, .authz-cap-item { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
-.authz-all { padding: 10px; margin: 10px 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2, var(--surface)); }
-.authz-all span, .authz-cap-item span, .authz-cap-group summary span { display: grid; gap: 2px; min-width: 0; }
-.authz-all small, .authz-cap-item small, .authz-cap-group summary small { color: var(--ink-3); font-weight: 400; }
-.authz-cap-group { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.authz-cap-group > summary { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; cursor: pointer; list-style: none; }
-.authz-cap-group > summary::-webkit-details-marker { display: none; }
-.authz-cap-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1px; border-top: 1px solid var(--line); background: var(--line); }
-.authz-cap-item { padding: 9px 10px; background: var(--surface); }
-.authz-cap-item code { width: fit-content; font-size: 10px; color: var(--ink-2); }
-.authz-cap-item input, .authz-all input, .authz-cap-group summary input { margin-top: 2px; flex: none; }
-.authz-scoped { margin: 8px 0 12px; }
 
 /* One authorization control everywhere: the level on its own line, then a single
    field where the scopes live — chosen scopes sit as chips beside the cursor, so
@@ -1941,18 +1942,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .branch-pair .form-row { min-width: 0; }
 @media (max-width: 700px) { .branch-pair, .branch-pair.cols-3 { grid-template-columns: 1fr; } }
 
-/* ── Schedule builder + 5-field cron grid (task form) ─────────────────────── */
-.sched-builder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
-.sched-extra { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; }
-.sched-extra input[type="time"], .sched-extra input[type="number"] {
-  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 3px 6px; background: var(--surface); color: var(--ink);
-}
-.dow-row { display: inline-flex; gap: 3px; }
-.dow-chip {
-  width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line);
-  background: transparent; color: var(--ink-2); cursor: pointer; font-size: 12px; padding: 0;
-}
-.dow-chip.on { background: var(--accent); color: #fff; border-color: transparent; }
+/* ── 5-field cron grid (task form) ─────────────────────── */
 /* Cron field values are a few characters — compact cells, and minmax(0,1fr) +
    width:100% so the inputs' intrinsic size can't overflow a narrow container. */
 .cron-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; max-width: 440px; }
@@ -2567,3 +2557,32 @@ html[data-theme="dark"] .github-signin-btn:active,
   .avatar-defaults { grid-template-columns: 1fr; }
   .avatar-role-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
+
+#bell-badge, .inbox-tabs .pill { background:#c62828; color:#fff; font-weight:800; }
+#bell-badge { min-width:20px; height:20px; font-size:12px; top:-4px; right:-6px; border:2px solid var(--surface); }
+.notify-sound-options { display:flex; flex-wrap:wrap; align-items:end; gap:16px; margin:16px 0; }
+.notify-sound-options label { display:grid; gap:6px; }
+/* Keep arrival alerts prominent while leaving error toasts and skip navigation above them. */
+#notification-alerts { position:fixed; top:64px; right:16px; width:min(380px,calc(100vw - 32px)); z-index:95; display:grid; gap:8px; }
+.notification-alert { display:flex; align-items:center; gap:12px; background:var(--surface); color:var(--ink); border:1px solid var(--line); border-left:4px solid #c62828; padding:12px; border-radius:8px; box-shadow:0 8px 28px #0003; }
+.notification-open { flex:1; min-width:0; display:grid; gap:6px; text-align:left; border:0; background:transparent; color:inherit; cursor:pointer; overflow-wrap:anywhere; }
+
+/* Review documents use the same Markdown typography as conversation messages. */
+.artifact-reader { width: min(900px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; color: var(--ink); }
+.artifact-reader::backdrop { background: rgba(0, 0, 0, .45); }
+.artifact-reader-header { display: flex; align-items: center; gap: 10px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+.artifact-reader-header h2 { flex: 1; min-width: 0; margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.artifact-reader-content { padding: 20px; max-height: calc(100dvh - 150px); overflow: auto; }
+.artifact-reader-content > pre { margin: 0; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.authz-editor .authz-description { margin: 0; line-height: 1.45; }
+.authorization-role { border-top: 1px solid var(--line); padding: 12px 0; }
+.authorization-role > summary { display: list-item; cursor: pointer; }
+.authorization-role > summary .chip { margin-left: 8px; }
+.role-capability-group { margin: 8px 0 8px 12px; padding: 6px 0; }
+.role-capability-group > summary { cursor: pointer; }
+.role-capability-group ul { list-style: none; margin: 8px 0; padding-left: 16px; border-left: 1px solid var(--line); }
+.role-capability-group li { padding: 6px 0; overflow-wrap: anywhere; }
+.role-capability-group code { display: block; color: var(--ink-3); font-size: 11px; }
+.role-capability-group label { display: flex; align-items: center; gap: 8px; }
+.role-capability-group p { margin: 3px 0; }

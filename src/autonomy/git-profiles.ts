@@ -41,6 +41,13 @@ function userIdOfScope(scope: string): string | undefined {
 }
 
 /** The vault handle for one of a profile's secrets. */
+/** A profile name is a single path segment: alphanumeric plus `. _ -`, and never
+ *  `.`/`..` (which `path.join` would resolve out of the profiles directory). */
+export function assertProfileName(name: string): void {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || name === '.' || name === '..' || /^\.+$/.test(name))
+    throw new Error('profile name must be alphanumeric with . _ - only');
+}
+
 export function gitHandle(profile: string, kind: 'ssh' | 'signing' | 'token', organizationId = 'org_personal'): string {
   const userId = userIdOfScope(organizationId);
   if (userId) return `git:user:${userId}:${profile}:${kind}`;
@@ -145,7 +152,7 @@ export class GitProfiles {
     githubToken?: string; github?: { id: string; login: string; name?: string };
     customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean }): GitProfile {
     const name = args.name.trim();
-    if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error('profile name must be alphanumeric with . _ - only');
+    assertProfileName(name);
     if (!args.userName?.trim() || !args.userEmail?.trim()) throw new Error('userName and userEmail are required');
     const secrets: Array<['ssh' | 'signing' | 'token', string | undefined, keyof GitProfile]> = [
       ['ssh', args.sshKey, 'sshKey'],
@@ -445,10 +452,16 @@ export class GitProfiles {
     });
   }
 
+  /** Per-profile directory for materialized key files. The name is validated
+   *  again here because `delete()` and the materializers take it straight from
+   *  the request: `..` once resolved to the state directory itself, and the
+   *  recursive `rmSync` after a save would have deleted every database. */
   private keyDir(profile: string): string {
+    assertProfileName(profile);
+    const root = path.join(this.home, 'git-profiles');
     return this.organizationId === 'org_personal'
-      ? path.join(this.home, 'git-profiles', profile)
-      : path.join(this.home, 'git-profiles', this.organizationId, profile);
+      ? path.join(root, profile)
+      : path.join(root, this.organizationId, profile);
   }
 
   private profilesKey(): string {

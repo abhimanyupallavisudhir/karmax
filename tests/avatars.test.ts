@@ -31,21 +31,29 @@ describe('Avatars', () => {
     store.upsertAvatar(avatar);
   });
 
-  it('persists owner-controlled identities and applies both kill switches', () => {
-    expect(store.getAvatar(avatar.id)).toMatchObject({ name: 'Atlas', ownerUserId: 'owner' });
-    expect(avatarCallableBy(store, avatar, 'caller')).toBe(true);
-    expect(avatarEnabled(store, avatar)).toBe(true);
+  it.each([undefined, 'enabled', 'disabled'] as const)('resolves all project overrides with organization %s', (organization) => {
+    if (organization) store.kvSet(`avatars:organization:${avatar.organizationId}`, organization);
+    for (const project of ['inherit', 'enabled', 'disabled'] as const) {
+      store.kvSet(`avatars:project:${projectId}`, project);
+      const effective = project === 'inherit' ? organization === 'enabled' : project === 'enabled';
+      expect(store.avatarAvailability(projectId)).toEqual({ organization: organization === 'enabled', project, effective });
+      expect(avatarEnabled(store, avatar)).toBe(effective);
+      const task = { projectId, agents: { do: { avatarId: avatar.id, provider: 'mock' as const } } };
+      if (effective) expect(avatarForRole(store, task, 'do')).toMatchObject({ id: avatar.id });
+      else expect(() => avatarForRole(store, task, 'do')).toThrow('disabled');
+      expect(store.getAvatar(avatar.id)).toMatchObject({ name: 'Atlas', enabled: true });
+    }
+  });
 
-    store.kvSet(`avatars:project:${projectId}`, 'disabled');
-    expect(store.avatarAvailability(projectId)).toMatchObject({ project: 'disabled', effective: false });
+  it('defaults off without changing stored identities', () => {
+    expect(store.avatarAvailability(projectId)).toEqual({ organization: false, project: 'inherit', effective: false });
     expect(avatarEnabled(store, avatar)).toBe(false);
-
-    store.kvSet(`avatars:project:${projectId}`, 'enabled');
-    store.kvSet(`avatars:organization:${avatar.organizationId}`, 'disabled');
-    expect(store.avatarAvailability(projectId)).toMatchObject({ organization: false, effective: false });
+    expect(avatarCallableBy(store, avatar, 'caller')).toBe(true);
+    expect(store.getAvatar(avatar.id)).toMatchObject({ enabled: true });
   });
 
   it('uses an Avatar prompt and runtime for a selected workflow role', () => {
+    store.kvSet(`avatars:project:${projectId}`, 'enabled');
     const selected = avatarForRole(store, { projectId, agents: {
       do: { avatarId: avatar.id, provider: 'claude' },
     } }, 'do');
