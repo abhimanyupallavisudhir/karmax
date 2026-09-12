@@ -7,6 +7,8 @@ import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
+const DISCONNECTED_HOME = '.karmax-disconnected';
+
 /**
  * Config homes (SPEC §7.3). karmax mints one config home per
  * (organization × account × profile)
@@ -31,10 +33,50 @@ export class ConfigHomeManager {
     return dir;
   }
 
-  /** Delete a login's config home (removes its credentials + settings). */
+  /** Only an explicit login attempt reactivates a disconnected home. Status
+   * polling also calls ensure(), and must not make a removed account reappear. */
+  prepareLogin(provider: Provider, account: string, organizationId = 'org_personal'): string {
+    const dir = this.ensure(provider, account, organizationId);
+    fs.rmSync(path.join(dir, DISCONNECTED_HOME), { force: true });
+    return dir;
+  }
+
+  /** Disconnect credentials, not the task histories sharing this home. Tasks keep
+   * absolute sessionmeta.home references, so retained history must stay in place.
+   * Account discovery hides this history-only home until an explicit reconnect. */
   remove(provider: Provider, account: string, organizationId = 'org_personal'): void {
     const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (!fs.existsSync(dir)) return;
+    if (!fs.lstatSync(dir).isDirectory()) {
+      fs.rmSync(dir, { force: true });
+      return;
+    }
+    const history = provider === 'codex'
+      ? ['sessions', 'archived_sessions', '.karmax-history-recovery', '.karmax-history-backups']
+      : provider === 'claude' ? ['projects']
+      : provider === 'opencode' ? ['data/opencode'] : [];
+    if (!history.length) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+    // Mark before pruning so an interrupted disconnect cannot re-admit a login.
+    // An account home is provider-writable; never follow a pre-existing marker symlink.
+    fs.rmSync(path.join(dir, DISCONNECTED_HOME), { force: true });
+    fs.writeFileSync(path.join(dir, DISCONNECTED_HOME), '', { mode: 0o600 });
+    const prune = (relative: string) => {
+      for (const entry of fs.readdirSync(path.join(dir, relative), { withFileTypes: true })) {
+        const name = relative ? `${relative}/${entry.name}` : entry.name;
+        if (name === DISCONNECTED_HOME) continue;
+        // OpenCode stores its credential alongside the native database/storage.
+        const credential = name === 'data/opencode/auth.json';
+        const retained = !credential && history.some(prefix => name === prefix || name.startsWith(`${prefix}/`));
+        const ancestor = history.some(prefix => prefix.startsWith(`${name}/`));
+        if (entry.isDirectory() && (retained || ancestor)) prune(name);
+        else if (!retained || entry.isSymbolicLink())
+          fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+      }
+    };
+    prune('');
   }
 
   /** Rename a login (move its config home so credentials carry over). */
@@ -52,6 +94,7 @@ export class ConfigHomeManager {
     if (!fs.existsSync(root)) return [];
     return fs.readdirSync(root, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && entry.name === 'organizations'))
+      .filter((entry) => !fs.existsSync(path.join(root, entry.name, DISCONNECTED_HOME)))
       .map(({ name }) => {
       const [provider, ...rest] = name.split('-');
       const dir = path.join(root, name);
@@ -295,6 +338,7 @@ function readJson(file: string): any {
 /** Is a config home logged in? Checks the provider's own credential file and the
  *  karmax token file we write when a `setup-token` flow prints a token. */
 export function isLoggedIn(provider: string, home: string): boolean {
+  if (fs.existsSync(path.join(home, DISCONNECTED_HOME))) return false;
   if (isAcpProvider(provider) && hasAcpHomeLogin(provider, home)) return true;
   if (provider === 'claude') {
     return hasClaudeNativeCredential(home) || !!capturedToken(home);
@@ -333,6 +377,7 @@ export function capturedToken(home: string): string | undefined {
  *  A setup-token-only home (just `karmax-oauth.json`) is NOT fully authed, so
  *  `connect` re-runs login to upgrade it to a full, usage-pollable credential (#6). */
 export function isFullyAuthed(provider: string, home: string): boolean {
+  if (fs.existsSync(path.join(home, DISCONNECTED_HOME))) return false;
   if (isAcpProvider(provider)) return hasAcpHomeLogin(provider, home);
   if (provider === 'claude') return hasClaudeNativeCredential(home);
   const native = provider === 'codex'
