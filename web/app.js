@@ -7624,6 +7624,13 @@ function showArtifactReader(text, kind, name, blob) {
   download.href = objectUrl;
   download.download = name;
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  // Consume Escape before the shell dispatcher can also close the task behind us.
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    dialog.close();
+  });
   dialog.addEventListener('close', () => {
     URL.revokeObjectURL(objectUrl);
     dialog.remove();

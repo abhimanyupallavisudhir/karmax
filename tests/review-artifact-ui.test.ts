@@ -20,6 +20,44 @@ describe('review artifact reader', () => {
     return { context, show, open, fetch, run: () => context.openArtifact('/artifact', false, target) };
   }
 
+  it('consumes reader Escape before the shell can close the selected task', () => {
+    const listeners: Record<string, (event: any) => void> = {};
+    const control = { classList: { add: vi.fn() }, addEventListener: vi.fn(), focus: vi.fn() };
+    const dialog = {
+      setAttribute: vi.fn(), querySelector: () => control,
+      addEventListener: (name: string, handler: (event: any) => void) => { listeners[name] = handler; },
+      showModal: vi.fn(), close: vi.fn(),
+    };
+    const closeTask = vi.fn();
+    let shellKeydown: (event: any) => void;
+    const context = vm.createContext({
+      document: { activeElement: null, createElement: () => dialog,
+        body: { appendChild: vi.fn() },
+        addEventListener: (_name: string, handler: (event: any) => void) => { shellKeydown = handler; } },
+      URL: { createObjectURL: () => 'blob:test' }, esc: (s: string) => s,
+      renderMarkdown: () => '', closeTask, S: { selected: 'task-1' },
+      $: () => ({ childElementCount: 0 }), resetChord: vi.fn(), inRail: () => false,
+      focusedEnterAction: () => null,
+    });
+    vm.runInContext(source + '\n' + app.slice(app.indexOf('function closeTopOverlay()'),
+      app.indexOf('// -- the dispatcher')) + '\n' + app.slice(app.indexOf('function bindKeys()'),
+      app.indexOf('// -- global search:')), context);
+    context.showArtifactReader('report', 'markdown', 'report.md', {});
+    context.bindKeys();
+    const event = { key: 'Escape', defaultPrevented: false, stopPropagation: vi.fn(),
+      preventDefault() { this.defaultPrevented = true; } };
+    listeners.keydown!(event);
+    // Even if another listener forwards this event, the shell must leave the task open.
+    shellKeydown!(event);
+    expect(dialog.close).toHaveBeenCalledOnce();
+    expect(event.stopPropagation).toHaveBeenCalledOnce();
+    expect(event.defaultPrevented).toBe(true);
+    expect(closeTask).not.toHaveBeenCalled();
+    // The next Escape, after the reader is gone, still closes the task normally.
+    shellKeydown!({ key: 'Escape', defaultPrevented: false });
+    expect(closeTask).toHaveBeenCalledOnce();
+  });
+
   it.each([
     ['text/markdown; charset=utf-8', 'report.md', 'markdown'],
     ['text/plain', 'REPORT.MD', 'markdown'],
