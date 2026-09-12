@@ -1258,16 +1258,39 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: task.title,
         prompt: `${log}\n@write history.md :: preserved proposal\n@review Ready`, base: 'main', target: 'main',
-        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 1,
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 60_000,
       }],
     });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
     githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
     await handle.signal('confirm');
     const publications = () => h.store.eventsSince(task.id, 0).filter((e) => e.type === 'view.updated').length;
-    await expect.poll(publications, { timeout: 60_000 }).toBeGreaterThan(30);
+    // Drive full polling cycles explicitly. A 1ms timer can start another
+    // non-heartbeating activity during shutdown; losing its completion then
+    // leaves replay waiting for the five-minute activity timeout. This test
+    // measures history size and replay, so restart at a durable timer boundary.
+    const waitForPoll = async (previous: number) => {
+      await expect.poll(async () => {
+        const description = await h.client.workflowService.describeWorkflowExecution({
+          namespace: h.client.options.namespace, execution: { workflowId: task.id },
+        });
+        const current = h.store.getTask(task.id)?.lastView;
+        return publications() > previous && current?.stage === 'merge'
+          && current.waitingFor?.kind === 'github'
+          && !description.pendingActivities?.length && !description.pendingWorkflowTask;
+      }, { timeout: 30_000 }).toBe(true);
+    };
+    const advancePublications = async (minimum: number) => {
+      while (publications() <= minimum) {
+        const previous = publications();
+        await handle.signal('providerChanged');
+        await waitForPoll(previous);
+      }
+    };
+    await waitForPoll(0);
+    await advancePublications(30);
     await h.restartWorker();
-    await expect.poll(publications, { timeout: 120_000 }).toBeGreaterThan(100);
+    await advancePublications(100);
     const live = await view(handle);
     expect(live.stage).toBe('merge');
     expect(live.messages.map((m: any) => m.text).join('\n')).toContain(log);
