@@ -17,7 +17,7 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import type { WorldHandle } from '../src/world/types.js';
 
 describe('fork world initialization', () => {
-  it('restores exact unlanded commits, dirty files and private resources independently; changing base uses normal state', async () => {
+  it.each(['parked', 'done', 'cancelled', 'failed'] as const)('restores exact commits, dirty files and private resources from a %s source; changing base uses normal state', async (state) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-world-'));
     const store = new Store(':memory:');
     const worlds = new WorldRegistry();
@@ -45,6 +45,7 @@ describe('fork world initialization', () => {
     source.handle = store.registerWorld(source.handle, project.id) as WorldHandle;
     const created: WorldHandle[] = [];
     try {
+      const olderCheckpoint = await checkpoints.checkpoint(source.handle, { scrubSecrets: false });
       await source.writeFile('committed.txt', 'unlanded commit');
       await source.exec('git', ['add', 'committed.txt']);
       await source.exec('git', ['commit', '-qm', 'unlanded']);
@@ -57,10 +58,25 @@ describe('fork world initialization', () => {
       await source.exec('git', ['add', 'later.txt']);
       await source.exec('git', ['commit', '-qm', 'later work']);
       const plan = forkWorldSource(sourceTask, source.handle)!;
+      // The fork was requested before the source finished. Its sandbox can be
+      // destroyed before setup runs, and a fresh provider can still report ready.
+      const finished = state !== 'parked';
+      if (finished) {
+        store.saveView(sourceTask.id, { status: state } as any);
+        await source.destroy();
+        store.setWorldState(source.handle, 'released');
+        // A stale durable handle must not make us restore an older snapshot.
+        store.attachWorldCheckpoint(source.handle, olderCheckpoint.id);
+      }
       const capture = vi.spyOn(checkpoints, 'checkpoint');
+      const open = worlds.open.bind(worlds);
+      const opened = vi.spyOn(worlds, 'open').mockImplementation((handle) => {
+        if (finished && handle.id === sourceTask.id) throw new Error('Sandbox is probably not running anymore');
+        return open(handle);
+      });
       const status = worlds.status.bind(worlds);
       vi.spyOn(worlds, 'status').mockImplementation((handle) => handle.id === sourceTask.id
-        ? Promise.resolve('parked') : status(handle));
+        ? Promise.resolve(finished ? 'ready' : 'parked') : status(handle));
       const core = makeCoreActivities({ store, worlds, adapters: new Map(), resources, checkpoints,
         profiles: new ProfileResolver(store, 'mock'), contentDir: path.join(dir, 'content') });
       const create = async (base: string, reuse: boolean) => {
@@ -83,7 +99,8 @@ describe('fork world initialization', () => {
       await expect(fork.readFile(`${prefix}later.txt`)).rejects.toThrow();
       expect(await fork.readFile('data/value.txt')).toBe('unpublished resource');
       await fork.writeFile('data/value.txt', 'fork changed');
-      expect(await source.readFile('data/value.txt')).toBe('unpublished resource');
+      if (!finished) expect(await source.readFile('data/value.txt')).toBe('unpublished resource');
+      if (finished) expect(opened.mock.calls.some(([handle]) => handle.id === sourceTask.id)).toBe(false);
       expect(store.currentWorld(sourceTask.id)?.generation).toBe(source.handle.generation);
       expect(capture).not.toHaveBeenCalled();
 
@@ -95,10 +112,38 @@ describe('fork world initialization', () => {
       expect(capture).not.toHaveBeenCalled();
     } finally {
       for (const handle of created) await (await worlds.open(handle)).destroy();
-      await source.destroy();
+      if (state === 'parked') await source.destroy();
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it.each(['missing', 'older-generation'] as const)('refuses a finished source with a %s checkpoint instead of opening it or dropping files', async (scenario) => {
+    const store = new Store(':memory:');
+    const worlds = new WorldRegistry();
+    const project = store.createProject('Fork');
+    const source = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'source' } });
+    const handle = store.registerWorld({ id: source.id, kind: 'worktree', root: '/unavailable',
+      branch: 'karmax/source', base: 'main', target: 'main' }, project.id) as WorldHandle;
+    const plan = forkWorldSource(source, handle)!;
+    store.saveView(source.id, { status: 'done' } as any);
+    const task = store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'fork', _forkWorld: plan } });
+    if (scenario === 'older-generation') vi.spyOn(store, 'latestWorldCheckpoint').mockReturnValue({
+      id: 'old', worldId: source.id, projectId: project.id, generation: 0,
+    } as any);
+    const opened = vi.spyOn(worlds, 'open');
+    // Failure must happen before any checkpoint I/O or destination provisioning.
+    const checkpoints = { checkpoint: vi.fn(), applyFork: vi.fn() } as unknown as WorldCheckpointService;
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(), checkpoints,
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      await expect(core.createWorld({ taskId: task.id, projectId: project.id, base: plan.base,
+        target: 'main', kind: 'worktree' })).rejects.toThrow('without a checkpoint for its current generation');
+      expect(opened).not.toHaveBeenCalled();
+      expect(store.currentWorld(task.id)).toBeUndefined();
+    } finally { store.close(); }
   });
 
   it('copies repositoryless output files without copying injected secrets', async () => {
