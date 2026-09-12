@@ -1093,9 +1093,11 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--ink);
   box-shadow: 0 8px 28px rgba(16, 24, 40, .16); cursor: pointer; text-align: left;
 }
-.onboarding-minimized:hover { border-color: var(--accent); transform: translateY(-1px); }
+.onboarding-minimized:not(.onboarding-complete):hover { border-color: var(--accent); transform: translateY(-1px); }
 .onboarding-minimized-mark { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent-weak); color: var(--accent); font-weight: 800; }
-.onboarding-minimized > span:last-child { display: grid; gap: 1px; }
+.onboarding-minimized > span:last-of-type { display: grid; gap: 1px; }
+.onboarding-complete { cursor: default; }
+.onboarding-complete .icon-btn { margin-left: auto; flex-shrink: 0; }
 .onboarding-minimized b { font-size: 12px; }
 .onboarding-minimized small { color: var(--ink-3); font-size: 10px; }
 @media (max-width: 760px) {
