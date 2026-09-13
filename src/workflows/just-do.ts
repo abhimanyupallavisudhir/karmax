@@ -82,6 +82,11 @@ export async function justDoV1_5(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true, true, true, true, true, true);
 }
 
+/** Publish finalization progress before saving the approved work. */
+export async function justDoV1_6(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
@@ -98,6 +103,7 @@ async function justDoImpl(
   // on replay would park where history says it proceeded. Pinned to justDo@1.4.0.
   clearsConfirmOnGate = false,
   resourceCandidateReview = false,
+  publishesFinalization = false,
 ): Promise<{ stage: Stage }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const coordinator = boundedCoordinatorRetries ? boundedCoord : coord;
@@ -107,6 +113,7 @@ async function justDoImpl(
   const msgs: Message[] = input.prompt || input.images?.length || input.files?.length
     ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
     : [];
+  let finalizing = false;
   let confirmed = false;
   let cancelled = false;
   let resourceResolutionEpoch = 0;
@@ -128,6 +135,7 @@ async function justDoImpl(
   const confirmLayers = confirmLayersOf(input.confirm);
 
   function actions(): DeclaredAction[] {
+    if (finalizing) return [];
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Done', enabled: true };
@@ -138,7 +146,7 @@ async function justDoImpl(
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { worldReady: !!world }, branch: world?.branch, base,
+      actions: actions(), state: { worldReady: !!world, ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
@@ -360,9 +368,16 @@ async function justDoImpl(
   // No merge machinery: the world IS the deliverable. Commit the work to the
   // task branch so it persists, and keep the worktree for inspection.
   if (!cancelled && world) {
+    if (publishesFinalization) {
+      finalizing = true;
+      status = 'active';
+      waitingFor = undefined;
+      await publish();
+    }
     await core.commitWork(world as any, `karmax: ${input.title}`);
     if (remoteWorldProvider(world.provider ?? world.kind)) await core.publishTaskBranch(world as any);
   }
+  finalizing = false;
   stage = cancelled ? 'cancelled' : 'done';
   status = cancelled ? 'cancelled' : 'done';
   await publish();

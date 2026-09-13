@@ -72,6 +72,7 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.justDo, '1.3.0'),
   qualifiedType(WF.justDo, '1.4.0'),
   qualifiedType(WF.justDo, '1.5.0'),
+  qualifiedType(WF.justDo, '1.6.0'),
   qualifiedType(WF.scriptExec, '1.0.0'),
   qualifiedType(WF.goal, '1.0.0'),
   qualifiedType(WF.goal, '1.1.0'),
