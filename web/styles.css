@@ -1871,12 +1871,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-source { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
 .af-resume-source:hover { text-decoration-style: solid; }
 /* the fork's "Re-authorize previous grants?" — its own line under the chip */
-.af-resume-reauth {
+.af-resume-reauth, .af-resume-dependency {
   flex-basis: 100%; display: flex; align-items: center; gap: 6px; width: max-content; max-width: 100%;
   margin-top: 2px; color: var(--ink-3); font-size: 12px; cursor: pointer;
 }
-.af-resume-reauth[hidden] { display: none !important; }
-.af-resume-reauth input { width: auto; margin: 0; }
+.af-resume-reauth[hidden], .af-resume-dependency[hidden] { display: none !important; }
+.af-resume-reauth input, .af-resume-dependency input { width: auto; margin: 0; }
 .af-resume-reauth-summary { opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .af-resume-clear:hover { color: var(--danger); }
