@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
-import { TriggerScheduler } from '../src/platform/trigger-scheduler.js';
+import { TriggerScheduler, createTriggerFire } from '../src/platform/trigger-scheduler.js';
 import type { TaskRecord, TaskTrigger, KarmaxEvent } from '../src/domain/types.js';
 import {
   parseCron,
@@ -240,6 +240,34 @@ describe('trigger helpers', () => {
 
 // ─── Dispatcher: TriggerScheduler ────────────────────────────────────────────
 
+it('authorizes trigger starts after days of uptime and releases each operation token', async () => {
+  let now = Date.now();
+  const date = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const tokens = new TokenAuthority();
+  const issued: string[] = [];
+  const fire = createTriggerFire({
+    fireTriggeredTask: async (token, taskId) => {
+      issued.push(token);
+      const check = tokens.check(token, 'create_task');
+      expect(check.ok).toBe(true);
+      expect(check.record?.principal).toBe('system:triggers');
+      expect(check.record!.expiresAt - now).toBe(10 * 60_000);
+      if (taskId === 'failed') throw new Error('engine unavailable');
+      return { startedTaskId: taskId };
+    },
+  }, tokens);
+  try {
+    await fire('first', 'self');
+    now += 3 * 24 * 60 * 60_000;
+    await fire('later', 'clone');
+    await expect(fire('failed', 'self')).rejects.toThrow('engine unavailable');
+    expect(new Set(issued).size).toBe(3);
+    for (const token of issued) expect(tokens.verify(token)).toBeUndefined();
+  } finally {
+    date.mockRestore();
+  }
+});
+
 class FakeClock {
   time = 0;
   private seq = 0;
@@ -310,6 +338,121 @@ describe('TriggerScheduler (dispatcher)', () => {
 
   const emitDone = (taskId: string, status = 'done') =>
     bus.emit({ type: 'view.updated', taskId, ts: 0, payload: { status } } as KarmaxEvent);
+
+  it.each(['dependency', 'event', 'schedule', 'cron'] as const)('backs off failed %s starts while other tasks remain responsive', async (kind) => {
+    const dep = sourceTask();
+    store.saveView(dep, { status: 'done' } as any);
+    const triggers: TaskTrigger[] = kind === 'dependency' ? [{ kind: 'dependency', tasks: [dep] }]
+      : kind === 'event' ? [{ kind: 'event', type: 'release' }]
+      : kind === 'cron' ? [{ kind: 'schedule', cron: '* * * * *' }]
+      : [{ kind: 'schedule', at: 0 }];
+    const task = armedTask(triggers);
+    const other = armedTask([{ kind: 'event', type: 'other' }]);
+    const attempts: number[] = [];
+    const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
+      fire: async (id, mode) => {
+        if (id === task.id) {
+          attempts.push(clock.time);
+          // Finite failures make the old immediate-rearm bug fail an assertion
+          // instead of hanging the entire test process's event loop.
+          if (attempts.length <= 2) throw new Error('invalid or expired token');
+        }
+        fired.push([id, mode]);
+      },
+    });
+    scheduler.start();
+    if (kind === 'event') bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
+    clock.advance(kind === 'cron' ? 60_000 : 0);
+    const due = clock.time;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(attempts).toEqual([due]);
+    if (kind !== 'dependency') expect(store.getTask(task.id)!.params.triggerPending).toBe(true);
+    bus.emit({ type: 'other', taskId: dep, ts: 0, payload: {} });
+    expect(fired).toContainEqual([other.id, 'self']);
+    // Matching events cannot bypass the retry cooldown.
+    bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
+    clock.advance(999);
+    expect(attempts).toHaveLength(1);
+    clock.advance(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(attempts).toEqual([due, due + 1000]);
+    clock.advance(1999);
+    expect(attempts).toHaveLength(2);
+    clock.advance(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(attempts).toEqual([due, due + 1000, due + 3000]);
+    expect(fired).toContainEqual([task.id, kind === 'cron' ? 'clone' : 'self']);
+    expect(store.getTask(task.id)!.params.triggerPending).toBeUndefined();
+    scheduler.stop();
+  });
+
+  it.each(['stop', 'disarm', 'edit'] as const)('does not resurrect a failed start after %s', async (action) => {
+    const task = armedTask([{ kind: 'schedule', at: 0 }]);
+    let reject!: (error: Error) => void;
+    let attempts = 0;
+    const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
+      fire: () => { attempts++; return new Promise((_, fail) => { reject = fail; }); },
+    });
+    scheduler.start();
+    clock.advance(0);
+    if (action === 'stop') scheduler.stop();
+    else if (action === 'disarm') scheduler.disarm(task.id);
+    else {
+      store.updateTaskParams(task.id, { ...task.params, triggers: [{ kind: 'event', type: 'edited' }], triggerPending: false });
+      scheduler.arm(store.getTask(task.id)!);
+    }
+    reject(new Error('engine unavailable'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    clock.advance(60_000);
+    expect(attempts).toBe(1);
+    expect(scheduler.size).toBe(action === 'edit' ? 1 : 0);
+    scheduler.stop();
+  });
+
+  it('cancels scheduled retries on disarm', async () => {
+    const task = armedTask([{ kind: 'schedule', at: 0 }]);
+    let attempts = 0;
+    const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
+      fire: async () => { if (++attempts < 3) throw new Error('engine unavailable'); },
+    });
+    scheduler.start();
+    clock.advance(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    scheduler.disarm(task.id);
+    clock.advance(60_000);
+    expect(attempts).toBe(1);
+    scheduler.stop();
+  });
+
+  it('caps persistent failures at one retry per minute and rechecks dependencies', async () => {
+    const dep = sourceTask();
+    store.saveView(dep, { status: 'done' } as any);
+    armedTask([{ kind: 'dependency', tasks: [dep] }]);
+    const attempts: number[] = [];
+    const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
+      fire: async () => {
+        attempts.push(clock.time);
+        if (attempts.length < 20) throw new Error('engine unavailable');
+      },
+    });
+    scheduler.start();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const delays = [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000];
+    let expected = 0;
+    for (const delay of delays) {
+      clock.advance(delay);
+      expected += delay;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(attempts.at(-1)).toBe(expected);
+    }
+    expect(attempts).toHaveLength(delays.length + 1);
+    // A dependency can cease to be satisfied while a start is in flight, when
+    // one-shot event routing is suppressed. Retry must read the live state.
+    store.saveView(dep, { status: 'running' } as any);
+    clock.advance(60_000);
+    expect(attempts).toHaveLength(delays.length + 1);
+    scheduler.stop();
+  });
 
   it('re-arms stored armed tasks on start()', () => {
     armedTask([{ kind: 'event', type: 'x.y' }]);

@@ -511,12 +511,11 @@ async function main() {
   // dependency prerequisites are met and a schedule/event activates it. Runs
   // in-process off the same bus as the self-heal loop; the store is the durable
   // source of truth, so it re-arms every armed task on boot.
-  const { TriggerScheduler } = await import('./platform/trigger-scheduler.js');
-  const triggerToken = tokens.mintPrincipal('system:triggers', ['*']).token;
+  const { TriggerScheduler, createTriggerFire } = await import('./platform/trigger-scheduler.js');
   const triggerScheduler = new TriggerScheduler({
     store,
     bus,
-    fire: (taskId, mode) => api.fireTriggeredTask(triggerToken, taskId, mode),
+    fire: createTriggerFire(api, tokens),
     log: (m) => console.log('  • ' + m),
   });
   api.setTriggerArmer(triggerScheduler);
