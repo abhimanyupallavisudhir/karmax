@@ -1092,6 +1092,8 @@ function resumeChosenInner(rf, task) {
   const grants = t ? previousGrantsSummary(t) : '';
   return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
     ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+    : ''}${t && (t.lastView?.status || t.status) !== 'done'
+    ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
     : ''}`;
 }
 
@@ -1751,6 +1753,7 @@ function wireAgentBox(box) {
     // page); elsewhere the chip stays a plain label.
     const option = chosen?.querySelector('.af-resume-reauth');
     if (option) option.hidden = !box.closest('[data-reauthorize-host]');
+    box.closest('[data-dependency-host]')?._syncForkDependencies();
   };
   // "Re-authorize previous grants?" belongs to the agent box but acts on the
   // hosting form's Authorization / Vault credentials controls, so the box only
@@ -5477,8 +5480,33 @@ function wireDepPicker(values, selfId) {
       onPick: (t) => { known.set(t.id, t); paint([...selectedDepIds(), t.id], true); },
     }),
   );
+  // Both fork entry points use this form. The checkbox is another view of the
+  // ordinary dependency selection, so drafts and manual picker edits stay in sync.
+  const root = box.closest('#tf-body');
+  if (root) {
+    root.dataset.dependencyHost = '';
+    root._syncForkDependencies = () => {
+      const ids = selectedDepIds();
+      root.querySelectorAll('.af-resume-add-dependency').forEach((input) => {
+        input.closest('.af-resume-dependency').hidden = input.dataset.taskId === selfId;
+        input.checked = ids.includes(input.dataset.taskId);
+      });
+    };
+    root.addEventListener('change', (event) => {
+      const input = event.target.closest?.('.af-resume-add-dependency');
+      if (input && input.dataset.taskId !== selfId) {
+        const id = input.dataset.taskId;
+        const source = input.closest('.af-resume-chosen')?._sourceTask;
+        if (source) known.set(id, source);
+        const ids = selectedDepIds().filter((dep) => dep !== id);
+        paint(input.checked ? [...ids, id] : ids, true);
+      }
+      root._syncForkDependencies();
+    });
+  }
   const existing = (Array.isArray(values.triggers) ? values.triggers : []).find((t) => t.kind === 'dependency');
   paint(existing?.tasks || []);
+  root?._syncForkDependencies();
 }
 
 function vaultItemSearchText(item) {
