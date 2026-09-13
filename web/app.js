@@ -816,6 +816,14 @@ const WORKFLOWS = [
 ];
 const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
+// Hidden workflows remain editable on existing tasks without becoming choices
+// for new tasks. Include the current value so the select cannot imply a switch.
+function taskFormWorkflows(currentWorkflow, existingTask) {
+  return existingTask && !WORKFLOWS.some((w) => w.id === currentWorkflow)
+    ? [...WORKFLOWS, { id: currentWorkflow, label: workflowLabel(currentWorkflow) }]
+    : WORKFLOWS;
+}
+
 const NODES = [
   { key: 'setup', label: 'Setup' },
   { key: 'do', label: 'Working' },
@@ -5765,7 +5773,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
-          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
+          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
       <div class="tf-scroll">
@@ -9876,6 +9884,7 @@ function taskActionLabel(v, action) {
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
+  if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
@@ -9909,6 +9918,7 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
+  if (signal === 'confirm' && String(label).toLowerCase() === 'done') return 'Confirmation sent';
   const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
   const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
@@ -9939,19 +9949,25 @@ function wireActions(v) {
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
-      if (!confirmTaskAction(act, v)) return;
+      if (btn.disabled || !confirmTaskAction(act, v)) return;
+      const feedback = beginActionFeedback(btn);
+      let succeeded = false;
       const cancelling = act === 'cancel';
       const label = btn.innerHTML;
-      if (cancelling) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+      btn.disabled = true;
+      btn.textContent = cancelling ? 'Cancelling…' : 'Sending…';
       try {
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
         toast(actionToast(act, btn.dataset.label));
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) {
-        if (cancelling) { btn.disabled = false; btn.innerHTML = label; }
         toast(e.message, true);
+      } finally {
+        if (!cancelling || !succeeded) { btn.disabled = false; btn.innerHTML = label; }
+        finishActionFeedback(feedback, succeeded);
       }
     }),
   );

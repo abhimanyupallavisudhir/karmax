@@ -64,6 +64,7 @@ export { justDoV1_2 as 'justDo@1.2.0' } from './just-do.js';
 export { justDoV1_3 as 'justDo@1.3.0' } from './just-do.js';
 export { justDoV1_4 as 'justDo@1.4.0' } from './just-do.js';
 export { justDoV1_5 as 'justDo@1.5.0' } from './just-do.js';
+export { justDoV1_6 as 'justDo@1.6.0' } from './just-do.js';
 export { scriptExec as 'scriptExec@1.0.0' } from './script-exec.js';
 export { goalV1 as 'goal@1.0.0' } from './goal.js';
 export { goal as 'goal@1.1.0' } from './goal.js';

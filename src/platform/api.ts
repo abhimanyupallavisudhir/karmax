@@ -5266,7 +5266,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   workflowSchemas(organizationId = 'org_personal'): { name: string; description: string; params: unknown; stages: unknown }[] {
     const taskSchemas = this.deps.workflows
       ? this.deps.workflows.schemas(organizationId)
-      : MANIFESTS.filter((m) => m.kind !== 'coordinator' && m.selectable !== false).map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+      : MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
     const settingsOnly = MANIFESTS
       .filter((m) => m.kind === 'coordinator' && m.params.length)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
