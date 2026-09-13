@@ -3491,6 +3491,34 @@ export class Gateway {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       }
+      const resourceVerification = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/revisions\/([^/]+)\/verify$/);
+      if (resourceVerification && method === 'GET') {
+        // The common request gate requires project:settings:read in the URL's project scope.
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const [, projectId, resourceId, revisionId] = resourceVerification;
+        const resource = store.getResourceAttachment(resourceId!);
+        const revision = store.getResourceRevision(revisionId!);
+        const project = store.getProject(projectId!);
+        // Use canonical ownership here, regardless of optional scope query parameters.
+        if (project && !this.deps.tokens.check(token, 'project:settings:read',
+          { projectId: project.id, organizationId: project.organizationId }).ok)
+          return this.json(res, 403, { error: 'forbidden' });
+        if (!project || !resource || resource.projectId !== project.id
+          || resource.organizationId !== project.organizationId || !revision || revision.attachmentId !== resource.id)
+          return this.json(res, 404, { error: 'resource revision not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'this staged resource must be adopted or discarded from its task Review' });
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const limit = Number(url.searchParams.get('limit') ?? 100);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+          return this.json(res, 400, { error: 'offset must be a nonnegative integer; limit must be 1–1000' });
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          return this.json(res, 200, await this.deps.resources.verifyRevision(projectId!, resourceId!, revisionId!, offset, limit));
+        } catch {
+          return this.json(res, 422, { error: 'resource revision verification is unsupported or unavailable' });
+        }
+      }
       const projectResource = p.match(/^\/api\/projects\/([^/]+)\/resources\/(?!scan$)([^/]+)$/);
       if (projectResource) {
         const resource = store.getResourceAttachment(projectResource[2]!);

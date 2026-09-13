@@ -78,6 +78,11 @@ describe('project resources', () => {
       { DATABASE_URL: 'postgres://private-per-world-endpoint' });
     world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
     expect(await world.readFile('resources/model/model.bin')).toBe('base-model');
+    const leasesBeforeVerification = store.listResourceLeases(world.handle.id);
+    expect(leasesBeforeVerification.length).toBeGreaterThan(0);
+    expect((await resources.verifyRevision(project.id, volume.id, initial.id)).status).toBe('complete');
+    expect(store.listResourceLeases(world.handle.id)).toEqual(leasesBeforeVerification);
+
     expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
     const wrapped = resources.withEnvironment(world);
     expect((await wrapped.exec('bash', ['-lc', 'printf %s "$TRAINING_TOKEN"'])).stdout).toBe('secret-token');

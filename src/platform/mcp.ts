@@ -545,6 +545,12 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world. Returns refreshed refs plus per-repository skipped/errors diagnostics for any partial failure.',
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
+  server.registerTool('verify_resource_revision', {
+    description: 'Read and decrypt an exact historical project resource snapshot on the server. Requires project:settings:read for projectId. Returns validated root digest/totals and bounded per-file SHA256/byte evidence; no keys, object refs or plaintext. Reads at most 1000 files and 256 MiB per page (default 100 files). Follow nextOffset on the same revision; status complete means the entire tree was byte-verified in this call, partial covers only returned files, failed means unreadable/corrupt storage or invalid offset. A byte-limit with no progress requires another verification facility for that oversized file. Does not change the resource head or leases.',
+    inputSchema: { projectId: z.string(), resourceId: z.string(), revisionId: z.string(),
+      offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(1000).optional() },
+  }, async (a) => wrap(() => ops.platformRequest('GET',
+    `/api/projects/${encodeURIComponent(a.projectId)}/resources/${encodeURIComponent(a.resourceId)}/revisions/${encodeURIComponent(a.revisionId)}/verify?offset=${a.offset ?? 0}&limit=${a.limit ?? 100}`)));
   server.registerTool('propose_project_resource', {
     description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
     inputSchema: {

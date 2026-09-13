@@ -49,7 +49,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action', 'cancel_agent_action',
         'escalate_to_human', 'request_permission',
-        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
+        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'verify_resource_revision', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
         'list_github_actions_runs', 'inspect_github_actions_run', 'manage_github_actions_run', 'dispatch_github_actions_workflow',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
@@ -72,6 +72,21 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       model: { type: 'string' },
       effort: { enum: expect.arrayContaining(['low', 'high', 'xhigh']) },
     });
+  });
+
+  it('routes exact historical verification through the authorized API', async () => {
+    const seen: unknown[] = [];
+    const server = createPlatformMcpServer({ platformRequest: async (...args: unknown[]) => {
+      seen.push(args); return { status: 'partial', nextOffset: 2 };
+    } } as any);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair(); await server.connect(serverT);
+    const c = new Client({ name: 'verification-test', version: '1' }); await c.connect(clientT);
+    const result: any = await c.callTool({ name: 'verify_resource_revision', arguments: {
+      projectId: 'project', resourceId: 'resource', revisionId: 'old', offset: 1, limit: 1,
+    } });
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([['GET', '/api/projects/project/resources/resource/revisions/old/verify?offset=1&limit=1']]);
+    await c.close(); await server.close();
   });
 
   it('forwards a task resource proposal without adopting it', async () => {
