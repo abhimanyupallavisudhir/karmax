@@ -241,5 +241,53 @@ enabled.checked = false;
 listeners.get('enabled:change')();
 ok(formGrants.ids.length === 0 && editorCalls.at(-1).level === 'developer', 'turning the fork off withdraws re-authorized grants too');
 
+// The fork checkbox shares the normal dependency state and serialized triggers.
+for (const status of ['running', 'waiting', 'failed', 'cancelled']) {
+  ok(resumeChosenInner({ taskId: source.id, role: 'do' }, { ...source, lastView: { status } }).includes('Also add as dependency?'), `${status} source offers a dependency`);
+}
+ok(!resumeChosenInner({ taskId: source.id }, { ...source, lastView: { status: 'done' } }).includes('Also add as dependency?'), 'done source needs no dependency');
+ok(!resumeChosenInner({ taskId: 'unknown' }).includes('Also add as dependency?'), 'unknown source does not guess its completion state');
+eval(extractFn('selectedDepIds'));
+eval(extractFn('dependencyChipHtml'));
+eval(extractFn('wireDepPicker'));
+eval(extractFn('collectTriggers'));
+global.numberedTaskTitle = (task) => task.title;
+let depIds = [], depChange, depPickerClick;
+const depLabel = { hidden: true };
+const depInput = {
+  dataset: { taskId: source.id }, checked: false,
+  closest: (selector) => selector === '.af-resume-dependency' ? depLabel : selector === '.af-resume-add-dependency' ? depInput : { _sourceTask: source },
+};
+const depRoot = {
+  dataset: {}, querySelectorAll: () => [depInput],
+  addEventListener: (_type, callback) => { depChange = callback; },
+};
+const depBox = {
+  set innerHTML(html) { depIds = [...html.matchAll(/data-depid="([^"]+)"/g)].map((match) => match[1]); },
+  querySelectorAll: () => [], closest: () => depRoot,
+  dispatchEvent: () => depChange({ target: { closest: () => null } }),
+};
+global.document = { querySelectorAll: () => depIds.map((id) => ({ dataset: { depid: id } })) };
+global.$ = (selector) => selector === '#dep-chips' ? depBox : selector === '#dep-add' ? { addEventListener: (_type, callback) => { depPickerClick = callback; } } : null;
+global.readCronCells = () => ['*', '*', '*', '*', '*'];
+wireDepPicker({ triggers: [{ kind: 'dependency', tasks: ['manual'] }] });
+ok(!depLabel.hidden && !depInput.checked, 'unfinished fork option is visible and opt-in');
+depInput.checked = true;
+depChange({ target: depInput });
+ok(depIds.join() === `manual,${source.id}`, 'checking preserves existing dependencies and adds source');
+ok(collectTriggers([])[0].tasks.includes(source.id), 'source is serialized in the normal task dependency trigger');
+depChange({ target: depInput });
+ok(depIds.length === 2, 'checking never duplicates the dependency');
+depInput.checked = false;
+depChange({ target: depInput });
+ok(depIds.join() === 'manual', 'unchecking removes only the source dependency');
+depPickerClick();
+picker.onPick(source);
+ok(depInput.checked, 'manual picker additions update the fork checkbox');
+wireDepPicker({ triggers: [{ kind: 'dependency', tasks: [source.id] }] });
+ok(depInput.checked, 'reopening a saved draft restores the checked state');
+wireDepPicker({}, source.id);
+ok(depLabel.hidden, 'a task cannot select itself as a dependency');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
