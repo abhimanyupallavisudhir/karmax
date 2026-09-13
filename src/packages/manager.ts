@@ -251,15 +251,15 @@ export class WorkflowManager {
   }
 
   /**
-   * Task-form parameter schemas for every selectable workflow — built-in and
-   * installed (§10.4/§21d) — so an installed workflow is pickable in the New Task
-   * form, not just via the API. Coordinators are excluded (not user-startable).
+   * Task-form schemas include hidden workflows: existing drafts still need their
+   * fields to display and save correctly. Creation-picker visibility is separate.
+   * Coordinators are excluded (not user-startable).
    */
   schemas(organizationId = 'org_personal'): { name: string; description: string; params: unknown; stages: unknown }[] {
     const store = this.storeFor(organizationId);
     return [...new Set(store.list().map((p) => p.name))]
       .map((name) => store.resolve(name)!)
-      .filter((m) => m.kind !== 'coordinator' && m.selectable !== false)
+      .filter((m) => m.kind !== 'coordinator')
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
   }
 

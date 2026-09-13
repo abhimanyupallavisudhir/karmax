@@ -816,6 +816,14 @@ const WORKFLOWS = [
 ];
 const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
+// Hidden workflows remain editable on existing tasks without becoming choices
+// for new tasks. Include the current value so the select cannot imply a switch.
+function taskFormWorkflows(currentWorkflow, existingTask) {
+  return existingTask && !WORKFLOWS.some((w) => w.id === currentWorkflow)
+    ? [...WORKFLOWS, { id: currentWorkflow, label: workflowLabel(currentWorkflow) }]
+    : WORKFLOWS;
+}
+
 const NODES = [
   { key: 'setup', label: 'Setup' },
   { key: 'do', label: 'Working' },
@@ -5737,7 +5745,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
-          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
+          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
       <div class="tf-scroll">
