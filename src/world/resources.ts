@@ -31,6 +31,21 @@ interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: st
 interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number }
 interface SnapshotRef { objectKey: string; sha256: string; storageLocationId?: string }
 export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number }
+export interface SnapshotVerification {
+  status: 'complete' | 'partial' | 'failed';
+  manifestVerified: boolean;
+  rootDigest?: string;
+  totalFiles?: number;
+  totalBytes?: number;
+  offset: number;
+  nextOffset?: number;
+  verifiedFiles: number;
+  verifiedBytes: number;
+  files: Array<{ path: string; bytes: number; sha256: string }>;
+  issue?: 'unreadable-or-corrupt' | 'byte-limit' | 'invalid-offset';
+}
+const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
+
 export interface CopyGlobsMigrationResult {
   environmentSecrets: string[];
   fileSecrets: string[];
@@ -55,6 +70,7 @@ export interface SnapshotEngine {
   }>;
   restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>): Promise<void>;
   manifest(revision: ResourceRevision): Promise<SnapshotManifest>;
+  verify?(revision: ResourceRevision, offset: number, limit: number): Promise<SnapshotVerification>;
   delete?(revision: ResourceRevision): Promise<void>;
 }
 
@@ -126,32 +142,94 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
 
   async restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>): Promise<void> {
     const manifest = await this.manifest(revision);
-    const attachment = this.attachmentFor(revision);
-    const key = this.key(attachment.organizationId);
-    const objects = this.objectsForRevision(revision);
     for (const file of manifest.files) {
-      const digest = crypto.createHash('sha256');
       let offset = 0;
-      for (const chunkId of file.chunks) {
-        const encrypted = await objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
-        const data = openDeterministic(key, chunkId, encrypted);
-        digest.update(data);
+      for await (const data of this.readFile(revision, file)) {
         await write(file.path, data, offset);
         offset += data.length;
       }
-      if (offset !== file.bytes || digest.digest('hex') !== file.sha256)
-        throw new Error(`resource snapshot integrity mismatch: ${file.path}`);
     }
+  }
+
+  /** One shared streaming integrity check for restore and verification. */
+  private async *readFile(revision: ResourceRevision, file: SnapshotFile): AsyncIterable<Buffer> {
+    const attachment = this.attachmentFor(revision);
+    const key = this.key(attachment.organizationId, false);
+    const objects = this.objectsForRevision(revision);
+    const digest = crypto.createHash('sha256');
+    let bytes = 0;
+    for (const chunkId of file.chunks) {
+      const encrypted = await objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
+      const data = openDeterministic(key, chunkId, encrypted);
+      if (data.length !== Math.min(CHUNK_BYTES, file.bytes - bytes))
+        throw new Error('resource chunk size mismatch');
+      digest.update(data);
+      bytes += data.length;
+      yield data;
+    }
+    if (bytes !== file.bytes || digest.digest('hex') !== file.sha256)
+      throw new Error('resource snapshot integrity mismatch');
+  }
+
+  async verify(revision: ResourceRevision, offset: number, limit: number): Promise<SnapshotVerification> {
+    const result: SnapshotVerification = { status: 'failed', manifestVerified: false, offset,
+      verifiedFiles: 0, verifiedBytes: 0, files: [] };
+    try {
+      const manifest = await this.manifest(revision);
+      Object.assign(result, { manifestVerified: true, rootDigest: manifest.rootDigest,
+        totalFiles: manifest.files.length, totalBytes: manifest.bytes });
+      if (offset > manifest.files.length) return { ...result, issue: 'invalid-offset' };
+      for (const file of manifest.files.slice(offset, offset + limit)) {
+        if (result.verifiedBytes + file.bytes > VERIFY_MAX_BYTES) {
+          result.issue = 'byte-limit';
+          break;
+        }
+        // Do not retain plaintext. Exhaustion also checks empty files and the final hash.
+        for await (const _data of this.readFile(revision, file)) { /* checked by engine */ }
+        result.files.push({ path: file.path, bytes: file.bytes, sha256: file.sha256 });
+        result.verifiedFiles++;
+        result.verifiedBytes += file.bytes;
+      }
+      const end = offset + result.verifiedFiles;
+      result.status = offset === 0 && end === manifest.files.length ? 'complete' : 'partial';
+      if (end < manifest.files.length) result.nextOffset = end;
+    } catch {
+      // Object-store exceptions may contain signed URLs, paths or provider response bodies.
+      result.status = 'failed';
+      result.issue = 'unreadable-or-corrupt';
+    }
+    return result;
   }
 
   async manifest(revision: ResourceRevision): Promise<SnapshotManifest> {
     const attachment = this.attachmentFor(revision);
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
+    if (typeof ref.objectKey !== 'string'
+      || !ref.objectKey.startsWith(`resources/${attachment.organizationId}/manifests/${attachment.id}/`)
+      || ref.objectKey.includes('..') || (ref.storageLocationId && ref.storageLocationId !== revision.storageLocationId))
+      throw new Error('resource reference does not match revision');
     const encrypted = await this.objectsForRevision(revision, ref).get(ref.objectKey);
     if (sha256(encrypted) !== ref.sha256) throw new Error('resource manifest integrity mismatch');
-    const manifest = JSON.parse(openRandom(this.key(attachment.organizationId), encrypted).toString('utf8')) as SnapshotManifest;
+    const manifest = JSON.parse(openRandom(this.key(attachment.organizationId, false), encrypted).toString('utf8')) as SnapshotManifest;
     if (manifest.version !== 1 || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
       throw new Error('resource manifest does not match its revision');
+    if (!Array.isArray(manifest.files) || manifest.files.length !== (revision.files ?? manifest.files.length)
+      || manifest.bytes !== revision.bytes || !Number.isSafeInteger(manifest.bytes) || manifest.bytes < 0)
+      throw new Error('invalid resource manifest totals');
+    const paths = new Set<string>();
+    let bytes = 0;
+    for (const file of manifest.files) {
+      if (typeof file.path !== 'string' || file.path.length > 4096 || safePath(file.path) !== file.path
+        || paths.has(file.path) || !Number.isSafeInteger(file.bytes) || file.bytes < 0
+        || !/^[a-f0-9]{64}$/.test(file.sha256) || !Array.isArray(file.chunks)
+        || file.chunks.length !== Math.max(1, Math.ceil(file.bytes / CHUNK_BYTES))
+        || file.chunks.some((id) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)))
+        throw new Error('invalid resource manifest file');
+      paths.add(file.path);
+      bytes += file.bytes;
+    }
+    if (bytes !== manifest.bytes || sha256(Buffer.from(JSON.stringify(manifest.files))) !== manifest.rootDigest)
+      throw new Error('resource manifest tree integrity mismatch');
     return manifest;
   }
 
@@ -181,11 +259,14 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
 
   private objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef): ObjectStore {
     const locationId = ref?.storageLocationId ?? revision.storageLocationId;
+    if (locationId && this.storageLocations)
+      this.storageLocations.requireForOrganization(this.attachmentFor(revision).organizationId, locationId);
     return locationId && this.storageLocations ? this.storageLocations.objectStore(locationId) : this.objects;
   }
 
-  private key(organizationId: string): Buffer {
+  private key(organizationId: string, create = true): Buffer {
     const handle = `${RESOURCE_KEY_PREFIX}${organizationId}`;
+    if (!create && !this.broker.hasHandle(handle)) throw new Error('resource key unavailable');
     if (!this.broker.hasHandle(handle)) this.broker.registerHandle(handle, crypto.randomBytes(32).toString('base64'));
     return Buffer.from(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
   }
@@ -205,6 +286,27 @@ export class ProjectResourceService {
       retain: (organizationId, chunks, storageLocationId) => store.retainResourceChunks(organizationId, chunks, storageLocationId),
       release: (organizationId, chunks) => store.releaseResourceChunks(organizationId, chunks),
     });
+  }
+
+  /** Caller must authorize project:settings:read for this exact project before calling. */
+  async verifyRevision(projectId: string, attachmentId: string, revisionId: string, offset = 0, limit = 100) {
+    const project = this.store.getProject(projectId);
+    const attachment = this.store.getResourceAttachment(attachmentId);
+    const revision = this.store.getResourceRevision(revisionId);
+    if (!project || !attachment || attachment.projectId !== project.id
+      || attachment.organizationId !== project.organizationId || !revision || revision.attachmentId !== attachment.id)
+      throw new Error('resource revision not found');
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+      throw new Error('offset must be a nonnegative integer; limit must be 1–1000');
+    if (!isSnapshotDriver(attachment.driver) || revision.engine !== this.engine.id || !this.engine.verify)
+      throw new Error('resource revision verification is unsupported');
+    if (revision.storageLocationId && this.storageLocations) {
+      try { this.storageLocations.requireForOrganization(attachment.organizationId, revision.storageLocationId); }
+      catch { throw new Error('resource revision storage is unavailable'); }
+    }
+    return { projectId, resourceId: attachment.id, revisionId: revision.id,
+      storageLocationId: revision.storageLocationId ?? null,
+      ...await this.engine.verify(revision, offset, limit) };
   }
 
   storageLocationFor(organizationId: string, requested?: string): string | undefined {

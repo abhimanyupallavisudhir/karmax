@@ -311,6 +311,16 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'verify_resource_revision',
+    description: 'Verify an exact historical project resource revision by decrypting and hashing its bytes server-side. Requires project:settings:read in that project. Returns actual revision, storage location, validated tree digest/totals and per-file SHA256/size evidence without keys or internal refs. Default 100 files, maximum 1000 files / 256 MiB per page. Follow response nextOffset as offset on the same revision. Complete means whole-tree byte verification; partial covers only returned files; failed reports unreadable/corrupt storage or invalid offset. A byte-limit without offset progress cannot verify that oversized file. Does not mutate heads or leases.',
+    parameters: {
+      type: 'object', properties: {
+        project_id: { type: 'string' }, resource_id: { type: 'string' }, revision_id: { type: 'string' },
+        offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 },
+      }, required: ['project_id', 'resource_id', 'revision_id'],
+    },
+  },
+  {
     name: 'propose_project_resource',
     description:
       'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
@@ -1006,6 +1016,14 @@ export function platformToolHandlers(
         id: args?.id, type: args?.type, label: args?.label, domains: args?.domains,
         username: args?.username, envVar: args?.env_var, secrets: args?.secrets,
       }));
+    },
+    async verify_resource_revision(args) {
+      const projectId = encodeURIComponent(String(args?.project_id ?? ''));
+      const resourceId = encodeURIComponent(String(args?.resource_id ?? ''));
+      const revisionId = encodeURIComponent(String(args?.revision_id ?? ''));
+      const query = new URLSearchParams({ offset: String(args?.offset ?? 0), limit: String(args?.limit ?? 100) });
+      return JSON.stringify(await platformRequest('GET',
+        `/api/projects/${projectId}/resources/${resourceId}/revisions/${revisionId}/verify?${query}`));
     },
     async propose_project_resource(args) {
       const sources = Number(Boolean(args?.path)) + Number(Boolean(args?.vault_item_id));

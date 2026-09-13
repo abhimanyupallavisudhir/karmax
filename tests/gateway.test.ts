@@ -1,3 +1,4 @@
+import { platformToolHandlers } from '../src/agent/tools.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import crypto from 'node:crypto';
@@ -1349,6 +1350,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}`, {
       method: 'DELETE', headers: resourceAuth(),
     })).status).toBe(200);
+  });
+
+  it('authorizes historical byte verification in the exact project scope', async () => {
+    const project = h.store.createProject('Verify history');
+    const other = h.store.createProject('Other history');
+    const resource = h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'History', driver: 'volume@1', target: { kind: 'path', path: 'history' },
+      access: 'write', isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+    const revision = await h.resources.importFiles(resource.id, [{ path: 'empty', data: Buffer.alloc(0) }]);
+    const head = await h.resources.importFiles(resource.id, [{ path: 'later', data: Buffer.from('later') }]);
+    const headers = (caps: string[], projectId = project.id, organizationId = project.organizationId) => ({
+      authorization: `Bearer ${h.tokens.mint({ taskId: 'historical-reader', profileId: 'do',
+        principal: 'task:historical-reader', projectId, organizationId, ceiling: caps, grantorCaps: caps }).token}`,
+    });
+    const route = `/api/projects/${project.id}/resources/${resource.id}/revisions/${revision.id}/verify`;
+    for (const denied of [headers([]), headers(['project:settings:read'], other.id),
+      headers(['project:settings:read'], project.id, 'org_foreign')]) {
+      expect((await fetch(`${base}${route}`, { headers: denied })).status).toBe(403);
+    }
+    expect((await fetch(`${base}${route}?organizationId=org_foreign`, {
+      headers: headers(['project:settings:read'], project.id, 'org_foreign'),
+    })).status).toBe(403);
+    const allowed = headers(['project:settings:read']);
+    const response = await fetch(`${base}${route}`, { headers: allowed });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const evidence: any = await response.json();
+    expect(evidence).toMatchObject({ revisionId: revision.id, status: 'complete', verifiedFiles: 1, verifiedBytes: 0 });
+    expect(JSON.stringify(evidence)).not.toMatch(/sealedRef|objectKey|credential|chunks/);
+    const handlers = platformToolHandlers({} as any, { platformRequest: async (method: string, requestPath: string) => {
+      const response = await fetch(`${base}${requestPath}`, { method, headers: allowed });
+      expect(response.status).toBe(200); return response.json();
+    } } as any);
+    expect(JSON.parse(await handlers.verify_resource_revision!({ project_id: project.id,
+      resource_id: resource.id, revision_id: revision.id }))).toEqual(evidence);
+
+    expect((await fetch(`${base}${route}?limit=1001`, { headers: allowed })).status).toBe(400);
+    expect((await fetch(`${base}${route.replace(revision.id, 'unknown')}`, { headers: allowed })).status).toBe(404);
+    expect((await fetch(`${base}${route.replace(resource.id, 'unknown')}`, { headers: allowed })).status).toBe(404);
+    expect(h.store.getResourceAttachment(resource.id)?.currentRevisionId).toBe(head.id);
   });
 
   it('keeps direct resource administration scoped and unavailable to proposal-only agents', async () => {

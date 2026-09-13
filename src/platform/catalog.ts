@@ -42,6 +42,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/projects/:projectId/reorder (body {before?: projectId} — sidebar order)',
     'GET|POST /api/projects/:projectId/workflow-pins',
     'GET|POST /api/projects/:projectId/resources', 'GET|PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
+    'GET /api/projects/:projectId/resources/:resourceId/revisions/:revisionId/verify?offset=0&limit=100 (project:settings:read; explicit server-side decryption and byte verification, 1–1000 files / 256 MiB per page; complete verifies whole tree, partial only returned files, failed means unreadable/corrupt; follow nextOffset on exact revision; no-progress byte-limit cannot verify oversized file; null storageLocationId is legacy managed storage; never mutates head/leases or returns internal refs)',
     'POST /api/projects/:projectId/resources/:resourceId/import',
     'GET /api/projects/:projectId/resources/scan',
     'POST /api/projects/:projectId/resources/import-copyglobs',

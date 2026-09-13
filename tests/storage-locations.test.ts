@@ -133,5 +133,23 @@ describe('organization storage locations', () => {
     expect([...objects.keys()].some((key) => key.includes('/tenant-data/krmax/acme/resources/'))).toBe(true);
     expect(f.locations.list(f.project.organizationId!).find((candidate) => candidate.id === ready.id)?.usage.retainedBytes).toBe(4);
     expect(() => f.locations.delete(f.project.organizationId!, ready.id)).toThrow(/still used/i);
+    // Verification uses immutable revision placement even after the head moves to managed storage.
+    const managed = f.locations.ensureManaged(f.project.organizationId!);
+    f.store.updateResourceAttachment(revision.attachmentId, { storageLocationId: managed.id });
+    const head = await f.resources.importFiles(revision.attachmentId, [{ path: 'new', data: Buffer.from('new') }]);
+    const evidence = await f.resources.verifyRevision(f.project.id, revision.attachmentId, revision.id);
+    expect(evidence).toMatchObject({ status: 'complete', storageLocationId: ready.id, verifiedBytes: 4 });
+    expect(JSON.stringify(evidence)).not.toMatch(/AKIA_TEST|super-secret|objects.example|sealedRef|credential/);
+    expect(f.store.getResourceAttachment(revision.attachmentId)?.currentRevisionId).toBe(head.id);
+
+    // Even an internally inconsistent revision cannot route reads to another tenant's location.
+    const foreign = f.store.createOrganization({ name: 'Foreign storage' });
+    const foreignLocation = f.locations.ensureManaged(foreign.id);
+    const ref = JSON.parse(revision.sealedRef);
+    const invalid = f.store.saveResourceRevision({ ...revision, id: undefined,
+      storageLocationId: foreignLocation.id, sealedRef: JSON.stringify({ ...ref, storageLocationId: foreignLocation.id }) });
+    await expect(f.resources.verifyRevision(f.project.id, revision.attachmentId, invalid.id))
+      .rejects.toThrow('resource revision storage is unavailable');
+
   });
 });
