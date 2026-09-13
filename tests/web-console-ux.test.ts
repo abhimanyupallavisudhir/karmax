@@ -203,7 +203,7 @@ describe('manual PR opening', () => {
     expect(app).toContain('Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.');
     expect(app).toContain('Commit all preserved changes, open the PR, and confirm it if you are authorized?');
     expect(app).toContain('Return this pull request to Review and confirm it if you are authorized? ${siteName()} will first verify that the current proposal is clean and committed.');
-    expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act, v)) return;');
+    expect(handlerAfter('function wireActions(v)')).toContain('if (btn.disabled || !confirmTaskAction(act, v)) return;');
     expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name, S.view)) return;');
   });
 });
