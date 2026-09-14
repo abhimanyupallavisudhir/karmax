@@ -7152,10 +7152,10 @@ function renderTaskPage() {
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  wireResourceReview(v); // Resource decisions must be reachable from every task tab.
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
-    wireResourceReview(v);
   } else if (tab === 'checkin') {
     wireCheckinSidebar(v);
     wireFollowups(v);
@@ -7300,10 +7300,13 @@ function cycleTaskTab(delta) {
 }
 
 function taskTabBody(v, tab) {
-  if (tab === 'checkin') return checkinTab(v);
-  if (tab === 'approvals') return approvalRequestsTab(v);
-  if (tab === 'parameters') return parametersTab(v);
-  return overviewTab(v);
+  const body = tab === 'checkin' ? checkinTab(v)
+    : tab === 'approvals' ? approvalRequestsTab(v)
+    : tab === 'parameters' ? parametersTab(v)
+    : overviewTab(v);
+  // The selected tab persists across stage changes. Keep the resource gate
+  // alongside every tab so reaching Review never requires navigating away.
+  return `${v.stage === 'review' ? '<div id="review-resources" class="hidden"></div>' : ''}${body}`;
 }
 
 function approvalRequestsTab(v) {
@@ -7846,20 +7849,29 @@ const resourceReviewCache = new Map();
 async function wireResourceReview(v, force = false) {
   const wrap = document.getElementById('review-resources');
   if (!wrap || v.stage !== 'review') return;
+  const isCurrent = beginAsyncElementRender(wrap);
   try {
     const cached = resourceReviewCache.get(v.taskId);
     let items;
-    if (!force && cached && Date.now() - cached.at < 15_000) items = cached.items;
+    // Reuse data only within the same task view. A refreshed gate must not
+    // inherit an empty result (or resolved actions) from the previous view.
+    if (!force && cached?.view === v && Date.now() - cached.at < 15_000) items = cached.items;
     else {
       const [loaded, inventory] = await Promise.all([
         api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources`),
         api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/inventory`).catch(() => ({ entries: [], truncated: false })),
       ]);
+      if (!isCurrent()) return;
       items = loaded;
-      resourceReviewCache.set(v.taskId, { at: Date.now(), items, inventory });
+      resourceReviewCache.set(v.taskId, { at: Date.now(), view: v, items, inventory });
     }
     const inventory = resourceReviewCache.get(v.taskId)?.inventory ?? { entries: [], truncated: false };
-    if (!document.body.contains(wrap) || (!items.length && !inventory.entries?.length)) return;
+    if (!isCurrent()) return;
+    if (!items.length && !inventory.entries?.length) {
+      wrap.classList.add('hidden');
+      wrap.innerHTML = '';
+      return;
+    }
     wrap.classList.remove('hidden');
     wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
       const resource = item.resource;
@@ -7936,7 +7948,7 @@ async function wireResourceReview(v, force = false) {
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
   } catch (error) {
-    if (!document.body.contains(wrap)) return;
+    if (!isCurrent()) return;
     wrap.classList.remove('hidden');
     // Raw server text here told the user nothing they could act on; a retry is
     // the only useful next step, so offer that (details stay in the tooltip).
@@ -8163,7 +8175,6 @@ function overviewTab(v) {
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
-         <div id="review-resources" class="hidden"></div>
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
