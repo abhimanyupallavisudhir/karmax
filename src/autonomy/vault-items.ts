@@ -86,6 +86,8 @@ export interface VaultItem {
     /** Source fingerprint recorded with the last successful import. */
     sourceRevision?: string;
   };
+  /** Successful field accesses; absent on items created before usage tracking. */
+  useCount?: number;
   updatedAt: number;
 }
 
@@ -307,6 +309,7 @@ export class VaultItems {
       provenance: prior
         ? { ...prior.provenance, ...(args.provenance?.syncedAt !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
         : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.sourceRevision !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
+      useCount: prior?.useCount ?? 0,
       updatedAt: Date.now(),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
@@ -498,6 +501,14 @@ export class VaultItems {
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',
       detail: { itemId: item.id, label: item.label, field, ...(ctx.taskId ? { taskId: ctx.taskId } : {}) },
     });
+    // Read fresh metadata: callers may reuse an item across several fields.
+    // Usage must not move updatedAt, which connector sync uses for edits.
+    const items = this.list();
+    const current = items.find((candidate) => candidate.id === item.id);
+    if (current) {
+      current.useCount = (current.useCount ?? 0) + 1;
+      this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items));
+    }
     return secret;
   }
 

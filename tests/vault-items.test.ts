@@ -81,6 +81,38 @@ describe('vault items: CRUD + write-only secrets', () => {
   });
 });
 
+describe('vault usage frequency', () => {
+  it('persists successful accesses without treating usage as an edit', () => {
+    const { items, store, broker, dir } = makeService();
+    const item = items.save({ type: 'login', label: 'Login', secrets: { password: 'secret' } });
+    items.resolveField(item, 'password', { mode: 'use' });
+    items.resolveField(item, 'password', { mode: 'reveal' });
+    // Reusing the original object must not lose increments.
+    expect(items.get(item.id)).toMatchObject({ useCount: 2, updatedAt: item.updatedAt });
+    expect(items.save({ id: item.id, type: 'login', label: 'Renamed' }).useCount).toBe(2);
+    const reopened = new VaultItems(store, broker, path.join(dir, 'state'));
+    expect(reopened.get(item.id)?.useCount).toBe(2);
+    expect(new VaultItems(store, broker, path.join(dir, 'state'), 'other').list()).toEqual([]);
+  });
+
+  it('counts legacy items from zero and excludes reads of metadata, internal reads, and failed accesses', () => {
+    const { items, store, broker } = makeService();
+    const item = items.save({ type: 'login', label: 'Legacy', secrets: { password: 'secret' } });
+    delete item.useCount;
+    store.kvSet('vault:items:org_personal', JSON.stringify([item]));
+    items.list();
+    items.get(item.id);
+    items.readSecret(item, 'password');
+    expect(() => items.resolveField(item, 'totp', { mode: 'use' })).toThrow();
+    expect(items.get(item.id)?.useCount).toBeUndefined();
+    items.resolveField(item, 'password', { mode: 'use' });
+    expect(items.get(item.id)?.useCount).toBe(1);
+    broker.deleteHandle(itemHandle(item.id, 'password'));
+    expect(() => items.resolveField(item, 'password', { mode: 'use' })).toThrow();
+    expect(items.get(item.id)?.useCount).toBe(1);
+  });
+});
+
 describe('organization isolation (tenant boundary)', () => {
   it('items and requests are scoped per organization', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-org-'));

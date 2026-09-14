@@ -5517,6 +5517,15 @@ function wireDepPicker(values, selfId) {
   root?._syncForkDependencies();
 }
 
+// Keep the source array intact: it is shared with other credential controls.
+function sortVaultItems(items, selectedIds = new Set()) {
+  return [...items].sort((a, b) =>
+    Number(selectedIds.has(b.id)) - Number(selectedIds.has(a.id))
+    || (b.useCount || 0) - (a.useCount || 0)
+    || a.label.localeCompare(b.label)
+    || a.id.localeCompare(b.id));
+}
+
 function vaultItemSearchText(item) {
   return [
     item.label, item.type, item.username, item.envVar,
@@ -5528,6 +5537,8 @@ function vaultItemSearchText(item) {
 // password-manager import panel, while allowing sparse policy overrides for this
 // task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
 function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
+  // Sort on open; keep rows steady while the user changes checkboxes.
+  items = sortVaultItems(items, selectedIds);
   const localPolicies = JSON.parse(JSON.stringify(policyOverrides || {}));
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -13589,7 +13600,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
         </div>
         <div class="approval-request-actions">
-          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
+          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${sortVaultItems(items).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
           <button class="btn sm" data-vreq-act="once">Once</button>
           <button class="btn sm" data-vreq-act="task">This task</button>
           <button class="btn sm" data-vreq-act="always">Always</button>
@@ -13865,7 +13876,7 @@ async function wireVaultCards(organizationId) {
     };
     const paint = () => {
       list.innerHTML = vaultItems.length
-        ? vaultItems.map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
+        ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
           <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
