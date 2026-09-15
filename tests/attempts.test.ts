@@ -180,6 +180,18 @@ describe('multiple task attempts', () => {
     f.store.close();
   });
 
+  it.each(['cancelled', 'failed'] as const)('keeps the task list on a surviving alternative when its first admitted attempt is %s', (status) => {
+    const f = choiceFixture();
+    f.store.claimAttempt(f.first.id);
+    f.store.saveView(f.first.id, { ...f.mergeView(f.first.id), stage: status === 'failed' ? 'merge' : 'cancelled', status });
+    expect(f.store.attemptGroup(f.first.id)).toMatchObject({
+      committedAttemptId: f.first.id, principalAttemptId: f.second.id, otherAttempts: 'keep',
+    });
+    expect(f.store.listTasks(f.project.id).map((task) => task.id)).toEqual([f.second.id]);
+    expect(f.store.claimAttempt(f.second.id)).toEqual({ accepted: true, cancel: [] });
+    f.store.close();
+  });
+
   it('applies cancellation to drafts but leaves finished attempts alone', async () => {
     const f = choiceFixture();
     f.store.updateTaskParams(f.second.id, { prompt: 'b', draft: true });

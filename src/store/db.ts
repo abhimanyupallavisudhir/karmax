@@ -2909,7 +2909,12 @@ export class Store {
   /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
   electPrincipal(intentId: string) {
     const g = this.attemptGroup(intentId);
-    if (!g || g.committedAttemptId) return;
+    if (!g || (g.committedAttemptId && g.otherAttempts !== 'keep')) return;
+    // Kept alternatives may outlive the first admitted attempt. Preserve a
+    // healthy principal, but do not strand the logical task on a failed/cancelled
+    // attempt while another remains eligible. The admission policy stays fixed.
+    const principal = g.attempts.find((a) => a.id === g.principalAttemptId);
+    if (g.committedAttemptId && principal && !['cancelled', 'failed'].includes(principal.lastView?.status ?? '')) return;
     const eligible = g.attempts.find((a) => a.lastView?.status !== 'cancelled' && a.lastView?.status !== 'failed');
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }
