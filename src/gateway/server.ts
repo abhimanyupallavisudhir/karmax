@@ -1,3 +1,4 @@
+import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -127,6 +128,9 @@ export interface GatewayDeps {
  * apply the conservative fallback, and tests assert the catalog stays complete. */
 export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
+  if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
@@ -1198,6 +1202,13 @@ export class Gateway {
         { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
+    if (p.startsWith('/share/conversations/')) {
+      const share = req.method === 'GET' ? publicShare(this.deps.store, p.slice('/share/conversations/'.length)) : undefined;
+      res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      return void res.end(publicConversationHtml(share));
+    }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);
     if (p === '/app.webmanifest' && req.method === 'GET') return this.webManifest(res);
@@ -1754,6 +1765,48 @@ export class Gateway {
     }
 
     try {
+      const sharingSettings = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/conversation-sharing$/);
+      if (sharingSettings) {
+        const [, scope, id] = sharingSettings;
+        const organization = scope === 'organizations';
+        if (!(organization ? store.getOrganization(id!) : store.getProject(id!))) return this.json(res, 404, { error: 'scope not found' });
+        const key = `conversation-sharing:${organization ? 'organization' : 'project'}:${id}`;
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (organization ? typeof body.enabled !== 'boolean' : !['inherit', 'disabled'].includes(body.value))
+            return this.json(res, 400, { error: 'invalid sharing setting' });
+          store.kvSet(key, organization ? (body.enabled ? 'enabled' : 'disabled') : body.value);
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { ...(organization ? { enabled: store.kvGet(key) === 'enabled' } : sharingPolicy(store, id!)),
+          canManage: this.deps.tokens.check(token, organization ? 'organization:edit' : 'project:settings:write', requestedScope).ok });
+      }
+      const conversationShare = p.match(/^\/api\/tasks\/([^/]+)\/conversation-share$/);
+      if (conversationShare) {
+        const taskId = conversationShare[1]!;
+        const task = store.getTask(taskId);
+        if (!task) return this.json(res, 404, { error: 'task not found' });
+        // Bind mutations and link discovery to the record itself, even when a
+        // caller supplies a conflicting projectId query parameter.
+        const actualScope = { taskId, projectId: task.projectId, organizationId: store.getProject(task.projectId)?.organizationId };
+        if (!this.deps.tokens.check(token, 'task:conversation:share', actualScope).ok)
+          return this.json(res, 403, { error: 'conversation sharing is not allowed in this project' });
+        const role = url.searchParams.get('role') ?? 'do';
+        const policy = sharingPolicy(store, task.projectId);
+        if (method === 'DELETE') {
+          revokeShare(store, taskId, role);
+          return this.json(res, 200, { revoked: true });
+        }
+        let share = currentShare(store, taskId, role);
+        if (method === 'POST') {
+          if (!policy.effective) return this.json(res, 403, { error: 'Public conversation sharing is disabled by organization or project settings' });
+          const view = await api.getTaskView(token, taskId);
+          const transcript = view?.transcripts?.find(t => t.role === role);
+          const messages = transcript?.messages ?? (role === 'do' ? view?.messages : undefined);
+          if (!messages?.length) return this.json(res, 404, { error: 'conversation not found' });
+          share = createShare(store, taskId, role, messages);
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { enabled: policy.effective, url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
+      }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
         if (bearer) this.sessions.delete(bearer);
