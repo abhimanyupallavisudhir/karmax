@@ -326,7 +326,7 @@ function currentOrg() {
 function syncOrganizationSwitcher() {
   const switcher = $('#org-switcher');
   const organization = currentOrg();
-  if (switcher && organization && switcher.value !== organization.id) switcher.value = organization.id;
+  if (switcher && organization) switcher._sync?.();
 }
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
@@ -1381,6 +1381,131 @@ function collectForm(root, fields) {
     if (forkBase || f.required || !sameJson(val, inh)) out[f.name] = val;
   }
   return out;
+}
+
+// Organization selection keeps the displayed name separate from its stable ID.
+// Typing filters choices; only choosing an existing option commits a change.
+function organizationComboHtml(id, selectedId, label) {
+  const organization = organizationById(selectedId);
+  return `<div class="combo organization-combo" id="${esc(id)}">
+    <input value="${esc(organization?.name || '')}" aria-label="${esc(label)}" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${esc(id)}-options" autocomplete="off" placeholder="Search organizations…">
+    <button type="button" class="combo-caret" aria-label="Show ${esc(label.toLowerCase())} options" tabindex="-1">▾</button>
+    <div class="combo-menu" id="${esc(id)}-options" role="listbox" aria-label="${esc(label)}" hidden></div>
+  </div>`;
+}
+
+function wireOrganizationCombo(root, selectedId, onSelect, discover = false) {
+  if (!root) return;
+  const input = root.querySelector('input');
+  const menu = root.querySelector('.combo-menu');
+  const caret = root.querySelector('.combo-caret');
+  let options = S.organizations.map((o) => ({ ...o, accessible: true }));
+  let matches = [];
+  let active = -1;
+  let query = '';
+  let busy = false;
+  const sync = () => { input.value = organizationById(selectedId())?.name || ''; };
+  const dismissOnScroll = (event) => { if (!menu.contains(event.target)) hide(); };
+  const hide = () => {
+    document.removeEventListener('scroll', dismissOnScroll, true);
+    window.removeEventListener('resize', hide);
+    menu.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+    active = -1;
+    sync();
+  };
+  root._sync = hide;
+  const paint = () => {
+    [...menu.querySelectorAll('[role="option"]')].forEach((option, index) => {
+      option.classList.toggle('active', index === active);
+      if (index === active) {
+        input.setAttribute('aria-activedescendant', option.id);
+        option.scrollIntoView({ block: 'nearest' });
+      }
+    });
+    if (active < 0) input.removeAttribute('aria-activedescendant');
+  };
+  const draw = () => {
+    matches = options.filter((o) => o.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
+    if (discover && (!query || 'new organization'.includes(query.toLowerCase())))
+      matches.push({ id: '__new', name: '＋ New organization', accessible: true });
+    active = -1;
+    menu.innerHTML = matches.length ? matches.map((o, index) => `<div class="combo-opt" role="option" id="${root.id}-option-${index}" data-index="${index}" aria-selected="${o.id === selectedId()}" aria-disabled="${!o.accessible}">
+      <div class="combo-opt-head"><span>${esc(o.name)}</span></div>
+      ${o.accessible ? '' : '<div class="combo-opt-description">Membership required — ask an organization administrator for access</div>'}
+    </div>`).join('') : '<div class="combo-empty" role="status">No matching organizations</div>';
+    paint();
+    const rect = root.getBoundingClientRect();
+    const width = Math.min(Math.max(rect.width, 320), window.innerWidth - 16);
+    menu.style.width = `${width}px`;
+    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
+    const below = window.innerHeight - rect.bottom - 8;
+    const above = rect.top - 8;
+    const upwards = below < Math.min(220, menu.scrollHeight) && above > below;
+    menu.style.maxHeight = `${Math.max(0, Math.min(220, upwards ? above : below))}px`;
+    menu.style.top = `${upwards ? rect.top - menu.getBoundingClientRect().height - 3 : rect.bottom + 3}px`;
+  };
+  const show = () => {
+    if (busy) return;
+    menu.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    document.addEventListener('scroll', dismissOnScroll, true);
+    window.addEventListener('resize', hide);
+    draw();
+  };
+  const choose = async (index) => {
+    const option = matches[index];
+    if (!option?.accessible || busy) return;
+    hide();
+    busy = true;
+    input.readOnly = caret.disabled = true;
+    root.setAttribute('aria-busy', 'true');
+    try { await onSelect(option.id); }
+    catch (error) { toast(error.message, true); }
+    finally { busy = false; input.readOnly = caret.disabled = false; root.removeAttribute('aria-busy'); sync(); }
+  };
+  input.addEventListener('focus', async () => {
+    query = '';
+    show();
+    input.select();
+    if (discover) {
+      try {
+        const directory = await api('/api/organization-directory');
+        if (!root.isConnected) return;
+        options = directory;
+        if (!menu.hidden) draw();
+      } catch (error) { toast(error.message, true); }
+    }
+  });
+  input.addEventListener('input', () => { query = input.value; show(); });
+  input.addEventListener('blur', hide);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { event.preventDefault(); hide(); }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) { query = ''; show(); }
+      if (!matches.length) return;
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      active = active < 0 ? (step === 1 ? 0 : matches.length - 1) : (active + step + matches.length) % matches.length;
+      paint();
+    }
+    if (event.key === 'Enter' && !menu.hidden) {
+      event.preventDefault();
+      if (active >= 0) void choose(active);
+      else if (matches.length === 1) void choose(0);
+    }
+  });
+  caret.addEventListener('mousedown', (event) => event.preventDefault());
+  caret.addEventListener('click', () => {
+    if (!menu.hidden) hide();
+    else { query = ''; input.focus(); show(); }
+  });
+  menu.addEventListener('mousedown', (event) => event.preventDefault());
+  menu.addEventListener('click', (event) => {
+    const option = event.target.closest('[data-index]');
+    if (option) void choose(Number(option.dataset.index));
+  });
 }
 
 // A lightweight combobox: a real dropdown that opens on focus and on the caret,
@@ -3659,10 +3784,7 @@ function renderShell() {
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
       <div class="brand">${brandMark()} ${siteNameMarkup()}</div>
-      <select class="org-switcher" id="org-switcher" title="Organization">
-        ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
-        <option value="__new">＋ New organization</option>
-      </select>
+      ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
       <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
@@ -3703,11 +3825,14 @@ function renderShell() {
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
-  $('#org-switcher')?.addEventListener('change', (e) => {
-    if (e.target.value === '__new') return createOrganization();
-    const route = organizationLandingRoute(e.target.value);
-    return route ? go(route) : syncOrganizationSwitcher();
-  });
+  wireOrganizationCombo($('#org-switcher'), () => currentOrg()?.id, async (id) => {
+    if (id === '__new') return createOrganization();
+    // Recheck membership before entering an organization discovered on focus.
+    await loadOrganizations();
+    const route = organizationLandingRoute(id);
+    if (route) await go(route);
+    else toast('Organization access is no longer available', true);
+  }, true);
   renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
@@ -15118,19 +15243,8 @@ function profileView() {
   const email = u?.email || '';
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
   const orgs = S.organizations || [];
-  // Every organization the user belongs to (owns or was added to), each linking
-  // to its dashboard. Role comes from the membership loaded alongside the org.
   const orgList = orgs.length
-    ? orgs.map((o) => `<div class="profile-org">
-        <a class="profile-org-link" data-spa href="${globalRoute('dashboard', o)}">
-          <span class="profile-org-mark">◇</span>
-          <span class="profile-org-name">${esc(o.name)}</span>
-          ${o.kind === 'personal' ? '<span class="chip">personal</span>' : ''}
-        </a>
-        ${o.id === S.defaultOrganizationId
-          ? '<span class="chip success">Default</span>'
-          : `<button class="btn sm" type="button" data-default-organization="${esc(o.id)}">Set as default</button>`}
-      </div>`).join('')
+    ? organizationComboHtml('default-organization', S.defaultOrganizationId, 'Default organization')
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
@@ -15222,8 +15336,8 @@ function profileView() {
       ${profileGithubFields()}
     </div>
     <div class="card">
-      <div class="section-h">Organizations</div>
-      <div class="profile-orgs">${orgList}</div>
+      <div class="section-h">Default organization</div>
+      <p class="task-sub">Select your default organization. It opens when you sign in.</p><div class="profile-orgs">${orgList}</div>
     </div>
     ${notificationsCard()}
     <div class="card">
@@ -15368,17 +15482,13 @@ function wireProfileView() {
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   hydrateProfileGithub();
-  document.querySelectorAll('[data-default-organization]').forEach((button) => button.addEventListener('click', async () => {
-    button.disabled = true;
-    try {
-      const preference = await api('/api/user/default-organization', {
-        method: 'PUT', body: JSON.stringify({ organizationId: button.dataset.defaultOrganization }),
-      });
-      S.defaultOrganizationId = preference.organizationId;
-      renderMain();
-      toast('Default organization updated');
-    } catch (error) { toast(error.message, true); button.disabled = false; }
-  }));
+  wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
+    const preference = await api('/api/user/default-organization', {
+      method: 'PUT', body: JSON.stringify({ organizationId }),
+    });
+    S.defaultOrganizationId = preference.organizationId;
+    toast('Default organization updated');
+  });
   const setProfileEditor = (kind) => {
     document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
       panel.hidden = panel.id !== `profile-${kind}-panel`;
@@ -15803,6 +15913,11 @@ function organizationView() {
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card"><label class="form-row">Organization name visibility
+      <select id="organization-name-visibility" disabled>
+        <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Only people added to this organization</option>
+        <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>All users</option>
+      </select></label><p class="task-sub">Controls whether your organization’s name appears in organization search. Access to projects and settings still requires authorization. The operator can always find every organization.</p></div>
     <div class="card" id="organization-roles">Loading roles…</div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
@@ -15949,6 +16064,24 @@ async function hydrateOrganizationView() {
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  const visibility = $('#organization-name-visibility');
+  if (visibility) {
+    visibility.disabled = !S.authorizationCatalog?.canCreate;
+    visibility.onchange = async () => {
+      visibility.disabled = true;
+      try {
+        const updated = await api(`/api/organizations/${organizationId}`, {
+          method: 'PATCH', body: JSON.stringify({ nameVisibility: visibility.value }),
+        });
+        const organization = organizationById(organizationId);
+        if (organization) organization.nameVisibility = updated.nameVisibility;
+        toast('Organization name visibility updated');
+      } catch (error) {
+        visibility.value = organizationById(organizationId)?.nameVisibility || 'members';
+        toast(error.message, true);
+      } finally { visibility.disabled = !S.authorizationCatalog?.canCreate; }
+    };
+  }
   renderOrganizationRoles();
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
@@ -16228,7 +16361,7 @@ async function hydrateOrganizationView() {
 
 async function createOrganization() {
   const name = prompt('Organization name');
-  if (!name) { if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; return; }
+  if (!name) { syncOrganizationSwitcher(); return; }
   try {
     const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
     await loadOrganizations();
@@ -16238,7 +16371,7 @@ async function createOrganization() {
     await refreshOnboarding();
     renderShell();
     await go(globalRoute('organization'));
-  } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }
+  } catch (error) { toast(error.message, true); syncOrganizationSwitcher(); }
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────

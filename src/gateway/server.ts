@@ -150,6 +150,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/user\/(?:git-profiles|github-accounts)(?:\/|$)/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
+  if (p === '/api/organization-directory' && read) return 'none';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -1776,13 +1777,14 @@ export class Gateway {
       }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
+        const operator = allows(authRecord.caps, 'authorization:read');
         if (method === 'GET') {
-          const organization = store.defaultOrganization(subject.userId);
+          const organization = store.defaultOrganization(subject.userId, operator);
           return this.json(res, 200, { organizationId: organization?.id ?? null });
         }
         const b = await this.body(req);
         try {
-          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''));
+          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''), operator);
           return this.json(res, 200, { organizationId: organization.id });
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -1791,7 +1793,7 @@ export class Gateway {
       if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
         const organizationId = String(url.searchParams.get('organizationId')
-          ?? store.defaultOrganization(subject.userId)?.id ?? '');
+          ?? store.defaultOrganization(subject.userId, allows(authRecord.caps, 'authorization:read'))?.id ?? '');
         if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
           return this.json(res, 404, { error: 'organization not found' });
         const key = hostedOnboardingKey(subject.userId, organizationId);
@@ -1943,6 +1945,11 @@ export class Gateway {
       // Organization is the hosted tenant boundary. Collection discovery is
       // filtered by membership; every nested request was minted an
       // organization-scoped token above, so identifiers cannot cross tenants.
+      if (p === '/api/organization-directory' && method === 'GET') {
+        const subject = requireHumanSubject(callerIdentity);
+        return this.json(res, 200, store.organizationDirectory(subject.userId,
+          allows(authRecord.caps, 'authorization:read')));
+      }
       if (p === '/api/organizations' && method === 'GET') {
         const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
         if (canAuditAll) return this.json(res, 200, store.listOrganizations());
@@ -2138,9 +2145,18 @@ export class Gateway {
       }
       if (organizationMatch && method === 'PATCH') {
         const b = await this.body(req);
-        if (typeof b.name !== 'string') return this.json(res, 400, { error: 'organization name is required' });
-        try { return this.json(res, 200, store.renameOrganization(organizationMatch[1]!, b.name)); }
-        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        if (b.nameVisibility !== undefined && b.nameVisibility !== 'members' && b.nameVisibility !== 'public')
+          return this.json(res, 400, { error: 'nameVisibility must be members or public' });
+        if (b.name !== undefined && typeof b.name !== 'string')
+          return this.json(res, 400, { error: 'organization name must be a string' });
+        if (b.name === undefined && b.nameVisibility === undefined)
+          return this.json(res, 400, { error: 'organization name or nameVisibility is required' });
+        try {
+          const id = organizationMatch[1]!;
+          if (b.name !== undefined) store.renameOrganization(id, b.name);
+          if (b.nameVisibility !== undefined) store.setOrganizationNameVisibility(id, b.nameVisibility);
+          return this.json(res, 200, store.getOrganization(id));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
       if (organizationExecution) {

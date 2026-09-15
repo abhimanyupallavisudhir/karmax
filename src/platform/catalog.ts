@@ -12,7 +12,7 @@ export const PLATFORM_API_CATALOG = {
   identityRequirements: {
     capability: 'Default. No user identity is implied by a capability grant. Self-service account operations require the same verified subject for humans and delegated agents; neither needs user-administration authority for its own account.',
     humanSubject: [
-      'POST /api/organizations',
+      'POST /api/organizations', 'GET /api/organization-directory',
       'POST /api/organizations/:organizationId/repositories/create',
       'GET /api/projects/:projectId/github-merge-eligibility',
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
@@ -56,13 +56,14 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/projects/:projectId/members/user|team|organization/:principalId',
   ],
   organizations: [
+    'GET /api/organization-directory (verified user subject; names only, public or member organizations; operator sees all; does not grant resource access)',
     'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
     'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display preference)',
     'POST /api/user/onboarding/reset (restart the signed-in user’s hosted walkthrough in each organization)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     'GET|PUT /api/settings/installation (global operator-only installation identity; PUT body {siteName})',
     'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
-    'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
+    'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name?, nameVisibility?: members|public}; DELETE body {confirmSlug})',
     'GET /api/organizations/:organizationId/entitlements (current hosted plan, limits, and live usage; private installs are unlimited)',
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
