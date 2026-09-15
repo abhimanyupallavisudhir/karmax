@@ -138,6 +138,31 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it.each(['keep', 'cancel'] as const)('%s other attempts at first Merge admission', async (choice) => {
+    const repo = await h.makeRepo(`attempts-${choice}`);
+    const project = h.store.createProject(`Attempts ${choice}`, { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const first = h.store.createTask({ projectId: project.id, title: 'First', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write first.txt :: first' } });
+    const second = h.store.createTask({ projectId: project.id, title: 'Second', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write second.txt :: second' }, intentId: first.intentId });
+    const handles = await Promise.all([first, second].map((task) => h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ ...input({ taskId: task.id, projectId: project.id, repo, prompt: task.params.prompt }), intentId: first.intentId }],
+    })));
+    for (const handle of handles) await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    h.store.kvSet(`attempt-choice:${first.id}`, choice);
+    await handles[0]!.signal('confirm');
+    expect((await handles[0]!.result() as any).stage).toBe('done');
+    if (choice === 'keep') {
+      expect((await view(handles[1])).stage).toBe('review');
+      await handles[1]!.signal('confirm');
+      expect((await handles[1]!.result() as any).stage).toBe('done');
+      expect((await git(repo, ['show', 'main:second.txt'])).stdout).toContain('second');
+    } else {
+      expect((await handles[1]!.result() as any).stage).toBe('cancelled');
+      expect((await git(repo, ['show', 'main:second.txt'])).code).not.toBe(0);
+    }
+    expect((await git(repo, ['show', 'main:first.txt'])).stdout).toContain('first');
+  });
+
   it.each(['1.15.0', '1.20.0'])('v%s runs repository-less work through Do and Review without Git or Merge', async (version) => {
     const taskId = newId('task');
     const handle = await h.client.workflow.start(`softwareDev@${version}`, {
