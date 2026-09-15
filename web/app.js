@@ -16406,8 +16406,8 @@ function allCommands() {
   // (help: false here) so they're discoverable before a page is open.
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
   const attemptsAvailable = !!(S.selected && S.view && document.querySelectorAll('[data-attempt-select]').length > 1);
-  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: 'a j', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
-  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: 'a k', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
+  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: 'a ]', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
+  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: 'a [', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
   add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
@@ -16870,7 +16870,7 @@ function openHelp() {
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
       ${row('[ / ]', 'Previous / next tab')}
-      ${row('a j / a k', 'Next / previous attempt')}
+      ${row('a [ / a ]', 'Previous / next attempt')}
       ${row('a n', 'New attempt (open editable draft)')}
       ${row('{ / }', 'Previous / next Check-in pane')}
       ${row('u', 'Back to the list')}
