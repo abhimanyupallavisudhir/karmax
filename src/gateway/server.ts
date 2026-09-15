@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { ServiceConnections, ConnectionError } from '../integrations/service-connections.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -78,6 +79,7 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
 export interface GatewayDeps {
+  serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
   bus: KarmaxBus;
@@ -127,6 +129,8 @@ export interface GatewayDeps {
  * apply the conservative fallback, and tests assert the catalog stays complete. */
 export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
+  if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
+  if (p.startsWith('/api/connections')) return p.endsWith('/execute') ? 'connection:use' : 'credential:read';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
@@ -671,6 +675,28 @@ export class Gateway {
     return !!durable && durable.taskId === taskId && durable.kind === 'review-action';
   }
 
+  private connectionTimer?: ReturnType<typeof setInterval>;
+  private connectionSweep?: Promise<void>;
+  private connections(): ServiceConnections | undefined {
+    if (!this.deps.serviceConnections && this.deps.broker)
+      this.deps.serviceConnections = new ServiceConnections(this.deps.store, this.deps.broker);
+    return this.deps.serviceConnections;
+  }
+  private sweepConnections(): void {
+    if (this.connectionSweep || !this.connections()) return;
+    this.connectionSweep = this.connections()!.reconcile(async (c) => {
+      const task = this.deps.store.getTask(c.taskId!);
+      if (!task || ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')) return true;
+      const message = c.status === 'active'
+        ? `${c.label} is connected. Use list_connections, search_connection_tools, and execute_connection_tool with connection ${c.id}. The account is authorized for this task; continue the requested work.`
+        : `${c.label} connection is ${c.status}. Continue without it or explain the remaining connection step.`;
+      const result = await this.deps.api.resumeAfterCredentialDecision(c.taskId!, message, c.role ?? 'do');
+      if (result.resumed) this.emitTaskEvent({ taskId: c.taskId!, type: 'connection.resolved', ts: Date.now(),
+        payload: { requestId: c.id, connectionId: c.id, status: c.status } });
+      return result.resumed;
+    }).finally(() => { this.connectionSweep = undefined; });
+  }
+
   private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
     const task = this.deps.store.getTask(taskId);
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
@@ -698,7 +724,7 @@ export class Gateway {
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
     if (!view) return view;
     const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length
-      + this.pendingAuthorizationRequests(taskId).length;
+      + this.pendingAuthorizationRequests(taskId).length + (this.connections()?.pending(taskId).length ?? 0);
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -998,6 +1024,9 @@ export class Gateway {
     const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
     // Webhooks give GitHub-backed stores low latency; this durable-state scan is
     // the recovery rail for missed deliveries, restarts, and non-GitHub remotes.
+    this.sweepConnections();
+    this.connectionTimer = setInterval(() => this.sweepConnections(), 5000);
+    this.connectionTimer.unref();
     this.enqueueGitPassBackstop();
     this.gitPassAutoSyncTimer = setInterval(() => this.enqueueGitPassBackstop(), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
     this.gitPassAutoSyncTimer.unref();
@@ -1007,6 +1036,7 @@ export class Gateway {
       port,
       close: () =>
         new Promise<void>((resolve) => {
+          if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
           if (this.gitPassAutoSyncTimer) clearInterval(this.gitPassAutoSyncTimer);
@@ -5440,6 +5470,97 @@ export class Gateway {
             .then(() => true, () => false);
         }
         return this.json(res, 200, { ...result, resumed });
+      }
+
+      // Application connections. Derive tenant/task identity from the verified
+      // token; body ids can only narrow the caller's existing authority.
+      if (p === '/api/connections' || p.startsWith('/api/connections/')) {
+        const service = this.connections();
+        if (!service) return this.json(res, 503, { error: 'Connection storage is unavailable' });
+        const org = authRecord.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const callerTaskId = authRecord.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+        const taskId = callerTaskId ?? url.searchParams.get('taskId') ?? undefined;
+        const task = taskId ? store.getTask(taskId) : undefined;
+        if (taskId && (!task || store.getProject(task.projectId)?.organizationId !== org ||
+          !this.deps.tokens.check(token, 'task:read', { projectId: task.projectId, organizationId: org }).ok))
+          return this.json(res, 403, { error: 'Task access denied' });
+        const ownerId = callerIdentity.humanSubject?.userId;
+        const requireOwner = () => requireHumanSubject(callerIdentity).userId;
+        const projectId = task?.projectId;
+        const b = ['POST', 'PUT'].includes(method) ? await this.body(req) : {};
+        try {
+          if (p === '/api/connections/config') {
+            if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: service.configured(), canConfigure: this.deps.tokens.check(token, 'settings:write').ok });
+          }
+          if (p === '/api/connections/catalog' && method === 'GET')
+            return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
+          if (p === '/api/connections' && method === 'GET') {
+            if (!taskId && !ownerId) requireOwner();
+            return this.json(res, 200, service.list(org, { ownerId, taskId, projectId }));
+          }
+          if (p === '/api/connections/request' && method === 'POST') {
+            if (!callerTaskId || !task) return this.json(res, 400, { error: 'A task-agent token is required' });
+            const toolkit = String(b.toolkit ?? '');
+            const available = service.list(org, { taskId, projectId }).find(c => c.toolkit === toolkit && c.status === 'active');
+            if (available) return this.json(res, 200, { status: 'connected', connection: available });
+            const c = service.request(org, toolkit, task.id, authRecord.role ?? 'do', String(b.why ?? ''));
+            if (c.status === 'requested') this.emitTaskEvent({ taskId: task.id, type: 'connection.requested', ts: Date.now(),
+              payload: { requestId: c.id, connectionId: c.id, toolkit: c.toolkit, why: c.why } });
+            return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
+              connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
+          }
+          if (p === '/api/connections/connect' && method === 'POST') {
+            const userId = requireOwner();
+            if (callerTaskId) return this.json(res, 403, { error: 'Connect accounts from the Connections or task page' });
+            if (b.id) {
+              const c = service.get(org, String(b.id));
+              if (c.taskId) {
+                const t = store.getTask(c.taskId);
+                if (!t || !this.deps.tokens.check(token, 'task:edit', { projectId: t.projectId, organizationId: org }).ok)
+                  return this.json(res, 403, { error: 'Task access denied' });
+              }
+            }
+            return this.json(res, 200, await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label }));
+          }
+          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|tools|execute)$/);
+          if (match) {
+            const id = match[1]!; const action = match[2]!;
+            const c = service.get(org, id);
+            if (action === 'tools' || action === 'execute') {
+              if (!callerTaskId || !projectId) return this.json(res, 403, { error: 'A task-agent token is required' });
+              if (action === 'tools' && method === 'GET') return this.json(res, 200,
+                await service.tools(org, id, callerTaskId, projectId, url.searchParams.get('search') ?? ''));
+              if (action === 'execute' && method === 'POST') {
+                if (!b.arguments || typeof b.arguments !== 'object' || Array.isArray(b.arguments))
+                  return this.json(res, 400, { error: 'arguments must be an object' });
+                return this.json(res, 200, await service.execute(org, id, callerTaskId, projectId, String(b.tool ?? ''), b.arguments));
+              }
+            } else {
+              const userId = requireOwner();
+              if (callerTaskId || (c.ownerId !== userId && !(action === 'disconnect' && !c.ownerId && c.taskId && this.deps.tokens.check(token, 'task:edit', { projectId: store.getTask(c.taskId)?.projectId, organizationId: org }).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
+              if (action === 'refresh' && method === 'POST') {
+                const result = await service.refresh(org, id); this.sweepConnections();
+                return this.json(res, 200, service.view(result));
+              }
+              if (action === 'access' && method === 'PUT') {
+                if (!Array.isArray(b.projectIds) || b.projectIds.some((id: unknown) => typeof id !== 'string'))
+                  return this.json(res, 400, { error: 'projectIds must be an array of project IDs' });
+                for (const projectId of b.projectIds) if (!this.deps.tokens.check(token, 'project:settings:write', { projectId, organizationId: org }).ok)
+                  return this.json(res, 403, { error: 'Project settings access required to share an account' });
+                return this.json(res, 200, await service.share(org, id, userId, b.projectIds));
+              }
+              if (action === 'disconnect' && method === 'POST') {
+                const result = await service.disconnect(org, id, userId); this.sweepConnections();
+                return this.json(res, 200, result);
+              }
+            }
+          }
+          return this.json(res, 404, { error: 'Unknown connection operation' });
+        } catch (e) {
+          if (e instanceof ConnectionError) return this.json(res, e.status, { error: e.message });
+          throw e;
+        }
       }
 
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──

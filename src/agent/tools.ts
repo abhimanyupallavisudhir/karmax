@@ -235,6 +235,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'list_connections', description: 'List app accounts explicitly shared with this task or project. Prefer these to requesting passwords; tokens stay server-side.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'request_connection', description: 'Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in this task and it resumes automatically after authorization. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    parameters: { type: 'object', properties: { toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['toolkit', 'why'] },
+  },
+  {
+    name: 'search_connection_tools', description: 'Search tools and input schemas for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
+    parameters: { type: 'object', properties: { connection_id: { type: 'string' }, search: { type: 'string' } }, required: ['connection_id', 'search'] },
+  },
+  {
+    name: 'execute_connection_tool', description: 'Execute one app tool on the exact connected account within the user’s task instructions. Search its schema first. Writes take effect immediately; connecting an account does not authorize unrelated actions. Before retrying a failed write, check whether it succeeded.',
+    parameters: { type: 'object', properties: { connection_id: { type: 'string' }, tool: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['connection_id', 'tool', 'arguments'] },
+  },
+  {
     name: 'list_credentials',
     description:
       'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
@@ -986,6 +1002,10 @@ export function platformToolHandlers(
         },
       }));
     },
+    async list_connections() { return JSON.stringify(await platformRequest('GET', '/api/connections')); },
+    async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { toolkit: args?.toolkit, why: args?.why })); },
+    async search_connection_tools(args) { return JSON.stringify(await platformRequest('GET', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/tools?search=${encodeURIComponent(String(args?.search ?? ''))}`)); },
+    async execute_connection_tool(args) { return JSON.stringify(await platformRequest('POST', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/execute`, { tool: args?.tool, arguments: args?.arguments })); },
     async list_credentials() {
       return JSON.stringify(await platformRequest('GET', '/api/vault/available'));
     },

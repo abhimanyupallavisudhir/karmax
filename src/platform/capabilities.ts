@@ -31,7 +31,7 @@ export const CAPABILITIES = [
   'queue:read', 'queue:write', 'workflow:read', 'workflow:install', 'workflow:edit',
   'profile:read', 'profile:write', 'skill:write',
   'diagnostic:read', 'process:read', 'process:kill',
-  'credential:read', 'credential:write', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
+  'credential:read', 'credential:write', 'connection:use', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
   'settings:read', 'settings:write', 'safe-mode:write',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
   // Workflow decisions are discoverable capabilities too. Authorization selects
@@ -48,7 +48,7 @@ export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
   'queue:read', 'workflow:read', 'profile:read',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read',
   'github:actions:read',
-  'credential:read', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
+  'credential:read', 'connection:use', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
 ];
 
 export interface CapabilityDefinition {
@@ -147,6 +147,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['process:read', 'View processes', 'Inspect processes managed by karmax.'],
       ['process:kill', 'Stop processes', 'Terminate processes managed by karmax.'],
       ['credential:read', 'View credential metadata', 'Discover credential handles, vault items, and non-secret policy.'],
+      ['connection:use', 'Use connected apps', 'Execute app tools using accounts explicitly shared with the task or project.'],
       ['credential:write', 'Manage credentials', 'Create, replace, delete, configure, and inspect plaintext credentials and vault items; resolve credential access requests.'],
       ['vault:store', 'Store new credentials', 'Write newly created credentials (accounts an agent registered) back into the vault as items.'],
       ['payment:read', 'View payments', 'Inspect payment methods, limits, and transactions.'],
@@ -250,6 +251,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   execute_review_action: 'task:review:execute', stop_review_action: 'task:review:execute',
   list_credentials: 'credential:read', manage_credentials: 'credential:write',
   get_credential: 'credential:read', fill_credential: 'credential:read',
+  list_connections: 'credential:read', request_connection: 'credential:read', search_connection_tools: 'credential:read', execute_connection_tool: 'connection:use',
   request_credential: 'credential:read', store_credential: 'vault:store',
   check_agent_mail: 'credential:read', enroll_passkey: 'credential:read',
   use_passkey: 'credential:read', save_passkey: 'vault:store',

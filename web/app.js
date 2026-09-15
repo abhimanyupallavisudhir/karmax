@@ -2962,7 +2962,7 @@ function inboxEventChanges(ev) {
   return ev.type === 'view.updated' || ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
-      'credential.approval-requested', 'credential.approval-resolved',
+      'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
       'permission.approval-requested', 'permission.approval-resolved',
       'authorization.approval-requested', 'authorization.approval-resolved'].includes(ev.type);
 }
@@ -3250,7 +3250,7 @@ let refreshTimer = null;
 const LIST_RELOAD_EVENTS = new Set([
   'subtask.created',
   'task.responsibility-changed',
-  'credential.approval-requested',
+  'credential.approval-requested', 'connection.requested',
   'credential.approval-resolved',
   'permission.approval-requested',
   'permission.approval-resolved',
@@ -6690,6 +6690,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.paramDefaults = {};
   S.attemptGroup = null;
   S.approvalRequests = [];
+  S.connections = [];
   S.permissionRequests = [];
   S.authorizationRequests = [];
   S.approvalItems = [];
@@ -6715,6 +6716,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
+      api(`/api/connections?${approvalQuery}`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
@@ -6725,7 +6727,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents, connections] = await details;
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
@@ -6735,6 +6737,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.permissionRequests = permissionRequests;
     S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
+    S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
     toast(e.message, true);
@@ -6767,7 +6770,7 @@ async function refreshTask() {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems] = await Promise.all([
+    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
@@ -6776,6 +6779,7 @@ async function refreshTask() {
       api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
       api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
+      api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -6792,6 +6796,7 @@ async function refreshTask() {
     S.permissionRequests = permissionRequests;
     S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
+    S.connections = connections;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -7308,19 +7313,20 @@ function taskTabBody(v, tab) {
 
 function approvalRequestsTab(v) {
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
-    .filter((request) => request.status === 'pending').length;
+    .filter((request) => request.status === 'pending').length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status)).length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
-        <p class="task-sub">Credential, permission, and initial authorization decisions raised by this task.</p></div>
+        <p class="task-sub">App connections, credential access, and permission decisions raised by this task.</p></div>
       ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
     </div>
     <div class="approval-list">
+      ${connectionRows(S.connections || [], true)}
       ${permissionRequestRows(S.permissionRequests)}
       ${authorizationRequestRows(S.authorizationRequests || [])}
       ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
         historyLimit: 20,
-        showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length,
+        showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length && !(S.connections || []).length,
       })}
     </div>
   </div>`;
@@ -7329,6 +7335,7 @@ function approvalRequestsTab(v) {
 function wireTaskApprovalRequests(v) {
   const rec = taskRecord(v.taskId);
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  wireConnectionActions(document.getElementById('task-approval-requests'), organizationId, refreshTask);
   wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
     await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
   });
@@ -12646,6 +12653,9 @@ function globalSettingsView(embedded = false) {
     ${profilesCard('global')}
     ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
+    <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
+      <p class="task-sub">Connect your accounts once. Choose which projects may use them. Service credentials are managed by Composio.</p>
+      <div id="service-connections">Loading connections…</div></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
     ${agentMailCard()}
@@ -13761,6 +13771,96 @@ async function importFromConnector(sync, externalIds, onProgress, batchSize = 25
   return totals;
 }
 
+function connectionRows(connections, inTask = false) {
+  const userId = typeof S.user === 'string' ? S.user : S.user?.id;
+  return connections.map(c => {
+    const own = c.ownerId === userId;
+    const canConnect = !c.ownerId || own;
+    const status = { requested: 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
+    const projects = S.projects.filter(p => p.organizationId === c.organizationId);
+    return `<div class="approval-request" data-connection="${esc(c.id)}">
+      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
+        ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
+        <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
+        ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
+          ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
+          <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
+        <span data-connection-result role="status"></span>
+      </div><div class="approval-request-actions">
+        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm primary" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : 'Connect'}${inTask ? ' for this task' : ''}</button>` : ''}
+        ${own && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+      </div></div>`;
+  }).join('');
+}
+
+function wireConnectionActions(root, organizationId, refresh) {
+  if (!root) return;
+  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  root.querySelectorAll('[data-connection-action]').forEach(button => button.addEventListener('click', async () => {
+    const row = button.closest('[data-connection]'); const id = row.dataset.connection;
+    const action = button.dataset.connectionAction;
+    const popup = action === 'connect' ? window.open('about:blank', '_blank') : null;
+    if (popup) popup.opener = null;
+    button.disabled = true;
+    try {
+      if (action === 'connect') {
+        const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id }) });
+        if (result.url) {
+          if (popup) popup.location.href = result.url;
+          row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
+          button.hidden = true;
+        } else await refresh();
+      } else {
+        const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
+        await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });
+        await refresh();
+      }
+    } catch (e) { popup?.close(); toast(e.message, true); }
+    finally { button.disabled = false; }
+  }));
+}
+
+async function hydrateConnections(organizationId) {
+  const root = document.getElementById('service-connections'); if (!root) return;
+  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  try {
+    const [config, connections] = await Promise.all([api(`/api/connections/config${oq}`), api(`/api/connections${oq}`)]);
+    if (!root.isConnected) return;
+    root.innerHTML = `${!config.configured ? `<p class="task-sub">An installation administrator needs to configure Composio before accounts can be connected.</p>
+      ${config.canConfigure ? '<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="Composio project API key" autocomplete="off" required aria-label="Composio project API key"><button class="btn sm primary">Set up connections</button></form>' : ''}` : `
+      <form data-connection-search class="inline-form"><input name="search" placeholder="Search apps, e.g. Gmail or Slack" aria-label="Search apps"><button class="btn sm">Search apps</button></form>
+      <div data-connection-catalog></div>`}
+      <div data-connection-list>${connectionRows(connections)}${!connections.length ? '<p class="task-sub">No accounts connected yet.</p>' : ''}</div>`;
+    const refresh = () => hydrateConnections(organizationId);
+    wireConnectionActions(root, organizationId, refresh);
+    root.querySelector('[data-composio-config]')?.addEventListener('submit', async e => {
+      e.preventDefault(); const form = e.currentTarget; const key = form.elements.apiKey.value; form.elements.apiKey.value = '';
+      try { await api(`/api/connections/config${oq}`, { method: 'PUT', body: JSON.stringify({ apiKey: key }) }); await refresh(); }
+      catch (error) { toast(error.message, true); }
+    });
+    root.querySelector('[data-connection-search]')?.addEventListener('submit', async e => {
+      e.preventDefault(); const form = e.currentTarget; const box = root.querySelector('[data-connection-catalog]');
+      box.textContent = 'Searching apps…';
+      try {
+        const apps = await api(`/api/connections/catalog${oq}&search=${encodeURIComponent(form.elements.search.value)}`);
+        box.innerHTML = apps.length ? apps.map(a => `<button type="button" class="btn sm" data-app="${esc(a.slug)}">Connect ${esc(a.name)}</button>`).join(' ') : '<p>No matching apps.</p>';
+        box.querySelectorAll('[data-app]').forEach(button => button.addEventListener('click', async () => {
+          const popup = window.open('about:blank', '_blank'); if (popup) popup.opener = null;
+          button.disabled = true;
+          try {
+            const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ toolkit: button.dataset.app }) });
+            if (popup && result.url) popup.location.href = result.url;
+            box.innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">After signing in, check the account’s status below.</p>`;
+            const list = root.querySelector('[data-connection-list]');
+            list.innerHTML = connectionRows(await api(`/api/connections${oq}`)); wireConnectionActions(list, organizationId, refresh);
+          } catch (error) { popup?.close(); button.disabled = false; toast(error.message, true); }
+        }));
+      } catch (error) { box.textContent = error.message; }
+    });
+  } catch (error) { if (root.isConnected) root.textContent = error.message; }
+}
+
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
@@ -14556,6 +14656,7 @@ function wireGlobalSettings(organizationId) {
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
   wireVaultCards(organizationId);
+  hydrateConnections(organizationId || S.organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
   $('#wf-install')?.addEventListener('click', async () => {
@@ -15748,7 +15849,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-connections">Connected apps</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>

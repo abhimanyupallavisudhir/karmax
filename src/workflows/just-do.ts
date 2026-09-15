@@ -6,6 +6,7 @@ import {
   condition,
   isCancellation,
   workflowInfo,
+  patched,
 } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
@@ -295,6 +296,16 @@ async function justDoImpl(
       continue;
     }
     if (msgs.length > seen) continue;
+    if (patched('service-connections-wait-v1')) {
+      while (await core.pendingServiceConnections(taskId) && !cancelled && msgs.length === seen) {
+        status = 'waiting';
+        waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
+        await publish();
+        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+      }
+      if (cancelled) break;
+      if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
+    }
     stage = 'review';
     status = 'waiting';
     // `confirmed` is a GATE token, not a latch — clear it on entry to Review, before

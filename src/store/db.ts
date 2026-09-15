@@ -3517,9 +3517,9 @@ export class Store {
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
   private hasPendingApprovals(taskId: string): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM events e
-      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
+      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
+          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'connection.resolved')
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
       LIMIT 1`).get(taskId));
   }
@@ -3548,7 +3548,7 @@ export class Store {
     const finished = ['done', 'failed', 'cancelled'].includes(status);
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
-    if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved'
+    if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
       || ev.type === 'authorization.approval-resolved') {
       if (!this.hasPendingApprovals(task.id)) this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]);
       return;
@@ -3573,7 +3573,7 @@ export class Store {
       kind = 'mentioned';
       const mentioned = ev.payload.principal as PrincipalRef | undefined;
       if (mentioned) users = this.expandPrincipal(mentioned, task.projectId);
-    } else if (ev.type === 'credential.approval-requested') {
+    } else if (ev.type === 'credential.approval-requested' || ev.type === 'connection.requested') {
       kind = 'approval-requested'; actionable = true;
       users = this.humanAudience(task.id, ['@creator']);
       // The creator is the natural first audience, while organization owners
@@ -3653,9 +3653,9 @@ export class Store {
     if (this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get()) {
       dropped += this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
-        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
+        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
+            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'connection.resolved')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []);
     }
     return dropped;
