@@ -40,6 +40,8 @@ export interface ConfirmationPolicy {
 }
 
 export interface Organization {
+  /** Name discovery only; never grants access to organization resources. */
+  nameVisibility: 'members' | 'public';
   id: string;
   name: string;
   slug: string;

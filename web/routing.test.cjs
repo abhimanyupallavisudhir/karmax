@@ -100,7 +100,7 @@ eq(globalRoute('organization', organizationById('org_globex')), '/globex/setting
 eq(organizationLandingRoute('org_globex'), '/globex/mobile-app', 'switching organizations navigates into the selected organization');
 S.organizationId = 'org_globex';
 eq(profileRoute(), '/profile', 'profile route is stable when a different organization is selected');
-const organizationSwitcher = { value: 'org_acme' };
+const organizationSwitcher = { value: 'org_acme', _sync() { this.value = currentOrg().id; } };
 global.$ = (selector) => selector === '#org-switcher' ? organizationSwitcher : null;
 syncOrganizationSwitcher();
 eq(organizationSwitcher.value, 'org_globex', 'the persistent top-left picker follows the active organization');

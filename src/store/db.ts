@@ -837,6 +837,8 @@ export class Store {
     const organizationCols = this.db.prepare('PRAGMA table_info(organizations)').all() as { name: string }[];
     if (!organizationCols.some((c) => c.name === 'plan'))
       this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'");
+    if (!organizationCols.some((c) => c.name === 'nameVisibility'))
+      this.db.exec("ALTER TABLE organizations ADD COLUMN nameVisibility TEXT NOT NULL DEFAULT 'members'");
     const policyAcceptanceCols = this.db.prepare('PRAGMA table_info(policy_acceptances)').all() as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT');
@@ -1462,7 +1464,7 @@ export class Store {
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
       id: newId('org'), name, slug,
-      kind: input.kind ?? 'team', plan: 'free', createdAt: Date.now(),
+      kind: input.kind ?? 'team', plan: 'free', nameVisibility: 'members', createdAt: Date.now(),
     };
     this.db.prepare('INSERT INTO organizations (id, name, slug, kind, plan, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
       .run(organization.id, organization.name, organization.slug, organization.kind, organization.plan, organization.createdAt);
@@ -1530,6 +1532,21 @@ export class Store {
     return (rows as any[]).map(rowToOrganization);
   }
 
+  setOrganizationNameVisibility(id: string, visibility: Organization['nameVisibility']): Organization {
+    if (visibility !== 'members' && visibility !== 'public') throw new Error('nameVisibility must be members or public');
+    if (!this.getOrganization(id)) throw new Error('organization not found');
+    this.db.prepare('UPDATE organizations SET nameVisibility=? WHERE id=?').run(visibility, id);
+    return this.getOrganization(id)!;
+  }
+
+  /** Discovery deliberately returns names only, never tenant settings. */
+  organizationDirectory(userId: string, operator = false): Array<{ id: string; name: string; accessible: boolean }> {
+    const memberships = new Set(this.listOrganizations(userId).map((organization) => organization.id));
+    return this.listOrganizations()
+      .filter((organization) => operator || memberships.has(organization.id) || organization.nameVisibility === 'public')
+      .map((organization) => ({ id: organization.id, name: organization.name, accessible: operator || memberships.has(organization.id) }));
+  }
+
   /** The unclaimed migration placeholder is not a real namespace reservation. */
   organizationNameReservations(): Organization[] {
     return this.listOrganizations().filter((organization) => organization.id !== 'org_personal'
@@ -1539,22 +1556,22 @@ export class Store {
   /** The workspace a person's neutral `/` route opens. Existing users predate
    * this preference, so initialize them lazily to the personal workspace they
    * own; joining or creating another organization must never change it. */
-  defaultOrganization(userId: string): Organization | undefined {
+  defaultOrganization(userId: string, operator = false): Organization | undefined {
     const row = this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?').get(userId) as any;
-    const organizations = this.listOrganizations(userId);
+    const organizations = this.listOrganizations(operator ? undefined : userId);
     const stored = organizations.find((organization) => organization.id === row?.defaultOrganizationId);
     if (stored) return stored;
     const fallback = organizations.find((organization) => organization.kind === 'personal'
       && this.organizationMembership(organization.id, userId)?.role === 'owner')
       ?? organizations.find((organization) => organization.kind === 'personal')
       ?? organizations[0];
-    if (fallback) this.setDefaultOrganization(userId, fallback.id);
+    if (fallback) this.setDefaultOrganization(userId, fallback.id, operator);
     return fallback;
   }
 
-  setDefaultOrganization(userId: string, organizationId: string): Organization {
+  setDefaultOrganization(userId: string, organizationId: string, operator = false): Organization {
     const organization = this.getOrganization(organizationId);
-    if (!organization || !this.organizationMembership(organizationId, userId))
+    if (!organization || (!operator && !this.organizationMembership(organizationId, userId)))
       throw new Error('default organization must be one of your organizations');
     this.db.prepare(`INSERT INTO user_preferences (userId, defaultOrganizationId) VALUES (?, ?)
       ON CONFLICT(userId) DO UPDATE SET defaultOrganizationId=excluded.defaultOrganizationId`)
@@ -1783,7 +1800,10 @@ export class Store {
       format: 'karmax-user-export',
       version: 1,
       exportedAt: new Date().toISOString(),
-      preferences: { defaultOrganizationId: this.defaultOrganization(userId)?.id ?? null },
+      // Export the stored preference without revalidating it under a member-only
+      // scope: an operator may have selected an organization they do not belong to.
+      preferences: { defaultOrganizationId: (this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?')
+        .get(userId) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? this.defaultOrganization(userId)?.id ?? null },
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles'],
@@ -6194,7 +6214,7 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 }
 
 function rowToOrganization(r: any): Organization {
-  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind,
+  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
     plan: isHostedPlanId(r.plan) ? r.plan : 'free', createdAt: r.createdAt };
 }
 
