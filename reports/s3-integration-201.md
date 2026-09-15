@@ -40,7 +40,7 @@ Tasks A `task_mu11nakza5bbf04199` and B `task_mu11nb5h9ff6833f64` forked the sam
 - B succeeded: `revision_mu11r6dc5af24f6966`; SHA256 `851ca2879d9bed3d9714eaf320a5d7a03fdd5ef1440c5fd79486e7b8a02c5ee9` (writer-B plus LF).
 - A rejected: resource baseline changed before publish. Its captured revision `revision_mu11r7une57dc0b85a` remains historical, never head; SHA256 `c8bf0e3943cbe35bcf9978b6f43bd4499934b44cf42501d6e442c856dfea7460` (writer-A plus LF).
 - Authorized server-side S3 verification returned complete, manifestVerified=true, one file/nine bytes and exact SHA256 for each revision.
-- A's pending changes discarded. Probe disabled. Head remains B. Both workflows await final Review approval because parent lacks review:approve; test assertions passed.
+- A's pending changes discarded. Probe disabled. Head remains B. After the explicit review:approve grant on 2026-09-15, both workflows were confirmed and independently verified done. Test assertions passed; final settings GET confirmed the main S3 head unchanged and both isolated probes disabled.
 
 These are project/resource binding checks, not an exhaustive cross-tenant penetration test. Invalid credentials test connection failure; no production outage or deliberate stored-object corruption was introduced.
 
