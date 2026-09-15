@@ -2287,11 +2287,24 @@ function renderFlag(key, dflt) {
 const markdownEnabled = () => renderFlag('karmax-md-render', true);
 const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
 
+// Memory-only overrides are scoped to the task and agent conversation. Unset
+// conversations continue to follow Appearance; reloading drops all overrides.
+function conversationMathEnabled(v, role = 'do') {
+  return S.conversationMath?.[JSON.stringify([v.taskId, role])] ?? mathjaxEnabled();
+}
+
+function toggleConversationMath(v, role) {
+  const enabled = conversationMathEnabled(v, role);
+  S.conversationMath ||= {};
+  S.conversationMath[JSON.stringify([v.taskId, role])] = !enabled;
+  renderTaskPage();
+}
+
 // A message body: Markdown when enabled, otherwise the previous plain-escaped
 // text (the .msg-text pre-wrap handles its newlines). The caller adds the `md`
 // class so the two whitespace models don't collide.
-function renderMessageBody(text) {
-  return markdownEnabled() ? renderMarkdown(text, { math: mathjaxEnabled() }) : esc(text);
+function renderMessageBody(text, math = mathjaxEnabled()) {
+  return markdownEnabled() ? renderMarkdown(text, { math }) : esc(text);
 }
 
 // A little copy control for a message bubble — copies the raw source text (the
@@ -2651,11 +2664,13 @@ function ensureMathJax() {
   return mathjaxLoad;
 }
 function typesetMath(root) {
-  if (!mathjaxEnabled()) return;
   const scope = root || document.getElementById('ck-thread');
-  if (!scope || !scope.querySelector('.md-math')) return;
+  const enabled = () => scope?.id === 'ck-thread'
+    ? conversationMathEnabled({ taskId: scope.dataset.taskId }, scope.dataset.role) && markdownEnabled()
+    : mathjaxEnabled() && markdownEnabled();
+  if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
-    if (!window.MathJax || !window.MathJax.typesetPromise) return;
+    if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
     try { window.MathJax.typesetClear?.([scope]); } catch {}
     window.MathJax.typesetPromise([scope]).catch(() => {});
   });
@@ -8376,7 +8391,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
     ${fu}`;
 }
 
@@ -8700,8 +8715,8 @@ function annotateWorldFileLinks(html, v = S.view) {
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
 // else the plain path that renders only the file-citation link subset.
-function renderAgentMessageBody(text, v = S.view) {
-  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text), v) : renderConversationText(text, 'agent', v);
+function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
+  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
 }
 
 function explanationModelLabel(model = S.explanationSettings?.model) {
@@ -8722,28 +8737,30 @@ function explainMessageAffordance(entry, v) {
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
+    <button type="button" class="conversation-math" aria-label="Typeset math in this conversation" aria-pressed="${conversationMathEnabled(v, entry.conversationRole || 'do')}" title="${markdownEnabled() ? 'Toggle math typesetting for this conversation' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
     ${error}
   </div>`;
 }
 
 function renderConversationEntry(entry, v = S.view) {
+  const math = conversationMathEnabled(v, entry.conversationRole || 'do');
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'input-request') {
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
     return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
-    return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text)}</div></div>`;
+    return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text, math)}</div></div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -8810,6 +8827,13 @@ function wireExplainMessages(v) {
   $('#main').querySelectorAll('.explain-tools').forEach((tools) => {
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
+    tools.querySelector('.conversation-math')?.addEventListener('click', () => {
+      toggleConversationMath(v, role);
+      // The repaint replaces this button; keep keyboard focus on its successor.
+      const replacement = [...$('#main').querySelectorAll('.explain-tools')]
+        .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
+      replacement?.querySelector('.conversation-math')?.focus({ preventScroll: true });
+    });
     tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(v, role, sourceKey));
     tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(v, role, sourceKey));
   });

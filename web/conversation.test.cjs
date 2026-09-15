@@ -21,6 +21,8 @@ global.renderMessageImages = () => '';
 // Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
 // these assertions stay about the timeline, not the message body renderer.
 global.markdownEnabled = () => false;
+global.mathjaxEnabled = () => true;
+eval(extractFn('conversationMathEnabled'));
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
 global.hostLocal = () => true;
@@ -271,6 +273,16 @@ ok(requestHtml.indexOf('Choose a deployment target.') < requestHtml.indexOf('Pic
 const resolvedHtml = conversationPane({ ...requestView, status: 'active', waitingFor: undefined }, requestTranscript);
 ok(resolvedHtml.includes('Choose a deployment target.') && resolvedHtml.includes('Pick where the update should go.'), 'resolved prompt and explanation survive reload');
 ok(!conversationPane(requestView, { role: 'merge', messages: [] }).includes('input-request'), 'input explanation stays in its own conversation');
+
+// The control is present beside Explain and reflects the entire conversation.
+global.markdownEnabled = () => true;
+const mathEntry = { sourceKey: 'message:math', conversationRole: 'merge' };
+ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="true"'), 'math toggle inherits enabled profile');
+S.conversationMath = { [JSON.stringify([S.view.taskId, 'merge'])]: false };
+ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="false"'), 'math toggle reflects conversation override');
+ok(explainMessageAffordance({ ...mathEntry, conversationRole: 'do' }, S.view).includes('aria-pressed="true"'), 'other agent toggle remains enabled');
+global.markdownEnabled = () => false;
+ok(explainMessageAffordance(mathEntry, S.view).includes('disabled><span class="tex-mark"'), 'math toggle explains Markdown prerequisite and is disabled without it');
 
 // Task 219 stored updatedAt=17: a workflow revision must not send an explained
 // request to the start of the thread. Include surrounding history (the original
