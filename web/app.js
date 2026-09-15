@@ -58,6 +58,7 @@ const S = {
   projects: [],
   organizations: [],
   organizationId: null,
+  projectSearch: '',
   defaultOrganizationId: null,
   organizationMembers: [],
   teams: [],
@@ -2412,11 +2413,24 @@ function renderFlag(key, dflt) {
 const markdownEnabled = () => renderFlag('karmax-md-render', true);
 const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
 
+// Memory-only overrides are scoped to the task and agent conversation. Unset
+// conversations continue to follow Appearance; reloading drops all overrides.
+function conversationMathEnabled(v, role = 'do') {
+  return S.conversationMath?.[JSON.stringify([v.taskId, role])] ?? mathjaxEnabled();
+}
+
+function toggleConversationMath(v, role) {
+  const enabled = conversationMathEnabled(v, role);
+  S.conversationMath ||= {};
+  S.conversationMath[JSON.stringify([v.taskId, role])] = !enabled;
+  renderTaskPage();
+}
+
 // A message body: Markdown when enabled, otherwise the previous plain-escaped
 // text (the .msg-text pre-wrap handles its newlines). The caller adds the `md`
 // class so the two whitespace models don't collide.
-function renderMessageBody(text) {
-  return markdownEnabled() ? renderMarkdown(text, { math: mathjaxEnabled() }) : esc(text);
+function renderMessageBody(text, math = mathjaxEnabled()) {
+  return markdownEnabled() ? renderMarkdown(text, { math }) : esc(text);
 }
 
 // A little copy control for a message bubble — copies the raw source text (the
@@ -2776,11 +2790,13 @@ function ensureMathJax() {
   return mathjaxLoad;
 }
 function typesetMath(root) {
-  if (!mathjaxEnabled()) return;
   const scope = root || document.getElementById('ck-thread');
-  if (!scope || !scope.querySelector('.md-math')) return;
+  const enabled = () => scope?.id === 'ck-thread'
+    ? conversationMathEnabled({ taskId: scope.dataset.taskId }, scope.dataset.role) && markdownEnabled()
+    : mathjaxEnabled() && markdownEnabled();
+  if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
-    if (!window.MathJax || !window.MathJax.typesetPromise) return;
+    if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
     try { window.MathJax.typesetClear?.([scope]); } catch {}
     window.MathJax.typesetPromise([scope]).catch(() => {});
   });
@@ -3787,11 +3803,11 @@ function renderShell() {
       ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
+      <button class="global-search-trigger" id="topbar-search" title="${esc(commandHint('Search tasks and projects across your workspace', 'nav.globalSearch'))}" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
       <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
-      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
       <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
@@ -4010,7 +4026,9 @@ function editRailFolder(button) {
 // flat list the drag logic can walk. A collapsed folder still shows the open
 // project, so navigating into a tucked-away project never blanks the selection.
 function railProjectRows(projectScoped) {
-  const projects = S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId);
+  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
+  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+    && projectPath(p).toLocaleLowerCase().includes(query));
   const root = { path: '', children: [] };
   const nodes = new Map([['', root]]);
   const dir = (path) => {
@@ -4029,7 +4047,7 @@ function railProjectRows(projectScoped) {
   // CSS), so it never reads like the bold active project. Each row's tooltip
   // names its kind for the first-time reader. Folders carry their own "+" so a
   // project can be created in place.
-  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
+  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="${!query}" title="${query ? 'Project' : 'Drag to reorder'}">
           <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
@@ -4037,11 +4055,11 @@ function railProjectRows(projectScoped) {
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
-    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    if (query || !folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
-  return walk(root, 0);
+  return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
 function renderRail() {
@@ -4060,19 +4078,38 @@ function renderRail() {
       : active.classList.contains('folder-toggle') && active.dataset.folder != null ? `.folder-toggle[data-folder="${CSS.escape(active.dataset.folder)}"]`
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
-  rail.innerHTML = `
-    <div class="label rail-heading"><span>Projects</span><button class="rail-add" id="new-project" type="button" title="New project" aria-label="New project">${ICON.plus}</button></div>
+  // Keep the input node alive during typing, composition, and live refreshes.
+  const searching = active?.id === 'project-search';
+  if (searching) {
+    rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
+    $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
+  } else rail.innerHTML = `
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
-    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0" title="${esc(commandHint('Dashboard', 'nav.dashboard'))}">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
     ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
-  $('#new-project')?.addEventListener('click', () => newProject());
+  if (!searching) {
+    $('#new-project')?.addEventListener('click', () => newProject());
+    const search = $('#project-search');
+    search?.addEventListener('input', () => { S.projectSearch = search.value; renderRail(); });
+    search?.addEventListener('keydown', (event) => {
+      if (event.isComposing) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        resetChord();
+        focusRail();
+      }
+    });
+  }
   // Folder headers are native buttons, so click, Enter, and Space all share the
   // same fold behavior during pointer use and the rail's keyboard walk.
   for (const head of rail.querySelectorAll('.folder-toggle')) {
@@ -4102,7 +4139,7 @@ function wireProjectDrag(rail) {
   // above a header means "above that folder", i.e. in the folder's parent.
   const anchors = () => [...rail.querySelectorAll('.proj[draggable="true"], .proj.folder')];
   const rows = projects();
-  if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
+  if ((S.projectSearch || '').trim() || rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
   const end = $('#rail-projects-end');
   for (const row of rows) {
     row.addEventListener('dragstart', (e) => {
@@ -8498,10 +8535,11 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
+      <button class="btn sm" id="share-task-conversation" data-role="${esc(t.role)}">Share</button>
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
     ${fu}`;
 }
 
@@ -8825,8 +8863,8 @@ function annotateWorldFileLinks(html, v = S.view) {
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
 // else the plain path that renders only the file-citation link subset.
-function renderAgentMessageBody(text, v = S.view) {
-  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text), v) : renderConversationText(text, 'agent', v);
+function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
+  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
 }
 
 function explanationModelLabel(model = S.explanationSettings?.model) {
@@ -8847,28 +8885,30 @@ function explainMessageAffordance(entry, v) {
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
+    <button type="button" class="conversation-math" aria-label="Typeset math in this conversation" aria-pressed="${conversationMathEnabled(v, entry.conversationRole || 'do')}" title="${markdownEnabled() ? 'Toggle math typesetting for this conversation' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
     ${error}
   </div>`;
 }
 
 function renderConversationEntry(entry, v = S.view) {
+  const math = conversationMathEnabled(v, entry.conversationRole || 'do');
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'input-request') {
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
     return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
-    return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text)}</div></div>`;
+    return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text, math)}</div></div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -8935,6 +8975,13 @@ function wireExplainMessages(v) {
   $('#main').querySelectorAll('.explain-tools').forEach((tools) => {
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
+    tools.querySelector('.conversation-math')?.addEventListener('click', () => {
+      toggleConversationMath(v, role);
+      // The repaint replaces this button; keep keyboard focus on its successor.
+      const replacement = [...$('#main').querySelectorAll('.explain-tools')]
+        .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
+      replacement?.querySelector('.conversation-math')?.focus({ preventScroll: true });
+    });
     tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(v, role, sourceKey));
     tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(v, role, sourceKey));
   });
@@ -8982,6 +9029,46 @@ function terminalPane(v) {
     </div>`;
 }
 
+async function openConversationShare(v, role) {
+  const endpoint = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation-share?role=${encodeURIComponent(role)}`;
+  try {
+    let state = await api(endpoint);
+    let preview = !state.url && state.enabled ? await api(`/api/tasks/${encodeURIComponent(v.taskId)}/conversation?role=${encodeURIComponent(role)}`) : null;
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'modal-card artifact-reader';
+    dialog.setAttribute('aria-labelledby', 'conversation-share-title');
+    const draw = () => {
+      dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="conversation-share-title">Share conversation</h2><button class="btn sm" data-close>Close</button></header>
+        <div class="artifact-reader-content"><p>Anyone with this link can read the user and agent message text, including any sensitive information in it. Attachments, system messages, and tool activity are excluded. Later messages will not be added.</p>
+        ${!state.enabled ? '<p>Public sharing is disabled in organization or project settings. Existing links are unavailable until sharing is enabled again.</p>' : ''}
+        ${state.url ? `<label class="form-row"><span>Public snapshot link</span><input data-link readonly value="${esc(new URL(state.url, location.origin).href)}"></label><p class="task-sub">Created ${esc(new Date(state.createdAt).toLocaleString())}. Revoke this link before creating a new snapshot.</p><div class="inline-form"><button class="btn sm" data-copy>Copy link</button><a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open snapshot</a><button class="btn sm" data-revoke>Revoke link</button></div>` : `<details><summary>Preview message text</summary>${(preview?.messages || []).filter(m => m.role === 'user' || m.role === 'agent').map(m => `<article><b>${m.role === 'user' ? 'User' : 'Agent'}</b><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</pre></article>`).join('')}</details><button class="btn primary" data-create ${state.enabled ? '' : 'disabled'}>Create public link</button>`}</div>`;
+      dialog.querySelector('[data-close]').onclick = () => dialog.close();
+      dialog.querySelector('[data-copy]')?.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(new URL(state.url, location.origin).href); toast('Link copied'); }
+        catch { dialog.querySelector('[data-link]').select(); toast('Select and copy the link above'); }
+      });
+      const mutate = async (button, method) => {
+        button.disabled = true;
+        try {
+          await api(endpoint, { method });
+          state = await api(endpoint);
+          if (!state.url && state.enabled) preview = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/conversation?role=${encodeURIComponent(role)}`);
+          draw();
+        }
+        catch (error) { button.disabled = false; toast(error.message, true); }
+      };
+      dialog.querySelector('[data-create]')?.addEventListener('click', e => mutate(e.currentTarget, 'POST'));
+      dialog.querySelector('[data-revoke]')?.addEventListener('click', e => mutate(e.currentTarget, 'DELETE'));
+    };
+    draw();
+    dialog.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dialog.close(); } });
+    dialog.addEventListener('close', () => { dialog.remove(); if (previousFocus?.isConnected) previousFocus.focus(); }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  } catch (error) { toast(error.message, true); }
+}
+
 function wireCheckinSidebar(v) {
   $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
@@ -8989,6 +9076,7 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
   $('#fork-task-agent')?.addEventListener('click', (event) => {
     openTaskForm('software-dev', undefined, undefined, {
       ...forkBranchDefaults(v),
@@ -12034,6 +12122,7 @@ function settingsView(proj) {
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     ${explanationSettingsCard('project')}
     ${profilesCard('project')}
     ${quickSettingsForms('project', proj.id)}
@@ -12064,6 +12153,29 @@ function cloudEnvironmentCard(proj) {
 function paneError(box, error, retry) {
   box.innerHTML = `<div class="inline-form"><span class="task-sub" style="color:var(--warn)" title="${esc(error?.message || '')}">Couldn’t load this section.</span><button type="button" class="btn sm">Retry</button></div>`;
   box.querySelector('button').addEventListener('click', retry);
+}
+
+async function hydrateConversationSharing(scope, id) {
+  const box = $(`#${scope}-conversation-sharing`);
+  if (!box) return;
+  const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
+  try {
+    const policy = await api(url);
+    box.innerHTML = `<div class="section-h">Public conversation links</div><p class="task-sub">Allow developers to create public snapshots of agent conversations. Anyone with a link can read its message text. Disabling sharing makes existing links unavailable until re-enabled.</p>
+      <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
+        ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
+      </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    box.querySelector('[data-save]').onclick = async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const value = box.querySelector('select').value;
+        await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
+        toast('Public sharing policy saved');
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
 
 async function hydrateAvatarAvailability(scope, id) {
@@ -12592,6 +12704,7 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
+  hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);
   hydrateProjectData(proj);
@@ -15919,6 +16032,7 @@ function organizationView() {
         <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>All users</option>
       </select></label><p class="task-sub">Controls whether your organization’s name appears in organization search. Access to projects and settings still requires authorization. The operator can always find every organization.</p></div>
     <div class="card" id="organization-roles">Loading roles…</div>
+    <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
@@ -16056,6 +16170,7 @@ async function hydrateOrganizationView() {
     && !!$('#org-members');
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
+  hydrateConversationSharing('organization', organizationId);
   hydrateAvatarAvailability('organization', organizationId);
   hydrateOrganizationSubscription(organizationId);
   await loadCollaboration().catch(() => {});
@@ -16509,6 +16624,12 @@ function fmtKeys(binding) {
     .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
     .join(' ');
 }
+function commandHint(label, id, next) {
+  const declared = (S.contributions?.commands || []).find((command) => command.id === id);
+  const binding = declared ? declared.keybinding : HOST_COMMANDS.find((command) => command.id === id)?.key;
+  const keys = [binding && fmtKeys(binding), next].filter(Boolean).join(' → ');
+  return keys ? `${label} (${keys})` : label;
+}
 // Subsequence fuzzy match: score (higher = better), or -1 for no match.
 function fuzzyScore(q, s) {
   if (!q) return 0;
@@ -16553,12 +16674,14 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', run: h.run });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', available: !(['nav.newTask', 'nav.search'].includes(h.id) && inRail()), run: h.run });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
+  add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
+  add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
   const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
   add({ id: 'list.quickAdd', title: 'Add quick task', keybinding: 'meta+Enter', group: 'List', palette: false, available: !!$('#add-task'), run: () => $('#add-task')?.click() });
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
@@ -16731,7 +16854,7 @@ function railRows() { return [...document.querySelectorAll('#rail .rail-add, #ra
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();
-  (rows.find((r) => r.dataset.id === S.projectId) || rows[0])?.focus();
+  (rows.find((r) => r.dataset.project === S.projectId) || rows[0])?.focus();
 }
 function moveRail(delta) {
   const rows = railRows();
@@ -16795,12 +16918,13 @@ function bindKeys() {
     const t = e.target;
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
-    if (e.defaultPrevented) return;
+    if (e.defaultPrevented || e.isComposing) return;
     // The check-in terminal is a focusable <pre> that behaves like a text field:
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
     const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (typing) {
+      resetChord();
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
