@@ -281,13 +281,13 @@ const press = (key, typing = false) => attemptKeydown({
   target: { matches: () => typing },
 });
 const chord = (key) => { press('a'); press(key); };
-chord('j');
-ok(S.selected === 'two' && taskMoves === 0, 'a j selects the next attempt without switching tasks');
-chord('k');
-ok(S.selected === 'one', 'a k selects the previous attempt');
-chord('k');
+chord(']');
+ok(S.selected === 'two' && taskMoves === 0, 'a ] selects the next attempt without switching tasks');
+chord('[');
+ok(S.selected === 'one', 'a [ selects the previous attempt');
+chord('[');
 ok(S.selected === 'three', 'previous attempt wraps to the last');
-chord('j');
+chord(']');
 ok(S.selected === 'one', 'next attempt wraps to the first');
 chord('n');
 ok(newAttempts === 1, 'a n invokes the existing draft creation control');
