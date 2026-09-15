@@ -1,3 +1,5 @@
+import { McpConnections } from '../mcp/connections/store.js';
+import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
 import type { PublishedView, ViewConversation } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
@@ -2070,6 +2072,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
+      let mcpCleanup: (() => Promise<void>) | undefined;
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
@@ -2173,6 +2176,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Recreate their stable world paths immediately before every turn so a
         // restored cloud sandbox or a repeatedly-forked session can still read them.
         const turnMessages = await materializeFileAttachments(world, messages);
+        if (profile.mcpConnections !== undefined && !deps.broker) throw new Error('MCP connections require the credential vault');
+        const chosenMcp = profile.mcpConnections === undefined ? [] : await prepareConnections(
+          new McpConnections(store, deps.broker!, organizationId), world, profile.mcpConnections, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; });
+        store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } });
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2213,7 +2220,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
-          ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
+          agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
         } },
         {
           adapters: deps.adapters,
@@ -2420,6 +2427,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (usageAdmissionId && !usageAdmissionFinished) store.finishUsageAdmission(usageAdmissionId, false);
         await releaseSlot();
         releaseConfirm();
+        await mcpCleanup?.();
         publishLegacyAgentState(undefined);
       }
       if (token) deps.tokens?.revoke(token);

@@ -1,3 +1,4 @@
+import { apiMcpTools } from '../mcp/connections/client.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -82,8 +83,10 @@ export class ClaudeAdapter implements AgentAdapter {
     // lost its reasoning effort here (the old fallback, claude-sonnet-4-5, is real
     // but not effort-capable, so `claudeMessagesEffort` returned undefined for it).
     const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
-    const handlers = platformToolHandlers(input.world, ctx);
-    const tools = MESSAGES_API_TOOLS;
+    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
+    try {
+    const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
+    const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
 
     const messages: any[] = [];
     const userMsgs = input.messages.filter((m) => m.role !== 'system');
@@ -227,6 +230,7 @@ export class ClaudeAdapter implements AgentAdapter {
       delivered: deliveredIndex,
       usage,
     };
+    } finally { await mcp.close(); }
   }
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
@@ -333,7 +337,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     }
     const remoteHome = remote
-      ? await seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session)
+      ? await seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none')
       : undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and
@@ -349,8 +353,11 @@ export class ClaudeAdapter implements AgentAdapter {
       // Claude wire protocol already supports SDK MCP servers across custom spawn.
       tools: buildSdkTools(tool, zod, handlers, remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS),
     });
-    const configuredMcp = configHomeMcpServers(input.resolvedAuth?.configHome);
-    if (remoteHome?.browserMcp) {
+    const configuredMcp = input.profile.mcpConnections === undefined ? configHomeMcpServers(input.resolvedAuth?.configHome) : {};
+    if (input.profile.mcpConnections !== undefined) {
+      delete configuredMcp['chrome-devtools']; delete configuredMcp.playwright;
+    }
+    if (input.profile.mcpConnections === undefined && remoteHome?.browserMcp) {
       delete configuredMcp['chrome-devtools'];
       delete configuredMcp.playwright;
       Object.assign(configuredMcp, remoteHome.browserMcp);
@@ -619,6 +626,11 @@ export class ClaudeAdapter implements AgentAdapter {
     let publishedSession = false;
     try {
       for await (const message of iterator) {
+        if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {
+          const inventory = (message as any).mcp_servers ?? [];
+          const missing = (input.agentMcp ?? []).filter((s) => !inventory.some((c: any) => c.name === s.name && c.status === 'connected'));
+          if (missing.length) throw new Error(`MCP connections could not start: ${missing.map((s) => s.name).join(', ')}. Check Agent tools settings.`);
+        }
         if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
         // Publish the session id the moment it's known — the SDK's init message carries
         // it — so the drawer shows a live "fork this agent" command mid-turn (#3).

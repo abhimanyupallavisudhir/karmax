@@ -1,0 +1,10 @@
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+const server = new Server({ name: 'connection-fixture', version: '1' }, { capabilities: { tools: {}, resources: {} } });
+let count = 0;
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{ name: 'echo', description: 'Echo with session count', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }] }));
+server.setRequestHandler(CallToolRequestSchema, async (r) => ({ content: [{ type: 'text', text: JSON.stringify({ count: ++count, text: r.params.arguments?.text, secret: process.env.FIXTURE_SECRET, platform: process.env.KARMAX_TOKEN ?? null, argument: process.argv[2] }) }] }));
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [{ uri: 'fixture://example', name: 'Example' }] }));
+server.setRequestHandler(ReadResourceRequestSchema, async () => ({ contents: [{ uri: 'fixture://example', text: 'resource content' }] }));
+await server.connect(new StdioServerTransport());

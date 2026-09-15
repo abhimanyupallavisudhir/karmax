@@ -1,3 +1,6 @@
+import { platformMcpSpec } from '../autonomy/config-homes.js';
+import { codexMcpFlags } from '../mcp/connections/runtime.js';
+import { apiMcpTools } from '../mcp/connections/client.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -218,9 +221,11 @@ export class CodexAdapter implements AgentAdapter {
     if (!apiKey) throw new Error('CodexAdapter: OPENAI_API_KEY not set');
     const baseUrl = process.env.KARMAX_OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
     const model = input.profile.model ?? 'gpt-5.5';
-    const handlers = platformToolHandlers(input.world, ctx);
+    const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
+    try {
+    const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
     // Responses API function tools are flat ({type:'function', name, ...}).
-    const tools = RESPONSES_API_TOOLS;
+    const tools = [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
 
     // On a fresh session, replay the full conversation so a login switch (which
     // drops the server-bound previous_response_id) doesn't lose context; when
@@ -382,6 +387,7 @@ export class CodexAdapter implements AgentAdapter {
       delivered: deliveredIndex,
       usage,
     };
+    } finally { await mcp.close(); }
   }
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
@@ -394,7 +400,7 @@ export class CodexAdapter implements AgentAdapter {
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const remote = isRemoteAgentWorld(input.world);
     const remoteHome = remote
-      ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session)
+      ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none')
       : undefined;
     const dynamicTools = codexDynamicTools(remote);
     // Resume/fork cannot override dynamicTools. Migrate into a new rollout
@@ -416,8 +422,8 @@ export class CodexAdapter implements AgentAdapter {
 
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const child: any = remote
-      ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server'], cwd, env, signal: ctx.signal })
-      : spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server', ...codexMcpFlags([...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined)], cwd, env, signal: ctx.signal })
+      : spawn(cmd, ['app-server', ...codexMcpFlags([...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined)], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx);
@@ -708,12 +714,13 @@ export class CodexAdapter implements AgentAdapter {
         // explicit MCP-name correlation above, but do not get the stronger
         // generic-error correlation without positive account proof.
       }
-      if (remote && Object.keys(remoteHome?.browserMcp ?? {}).length) {
+      const requiredMcp = input.profile.mcpConnections !== undefined ? (input.agentMcp ?? []).map((s) => s.name) : remote ? Object.keys(remoteHome?.browserMcp ?? {}) : [];
+      if (requiredMcp.length) {
         // Dynamic Karmax tools use this control channel and therefore need no
         // sandbox startup probe. Browser MCPs really do launch remotely: ask
         // app-server for its authoritative inventory and fail before the model
         // turn when an explicitly provisioned browser did not load.
-        const required = Object.keys(remoteHome?.browserMcp ?? {});
+        const required = requiredMcp;
         let servers: any[] = [];
         let missing = required;
         const deadline = Date.now() + 30_000;
@@ -726,7 +733,7 @@ export class CodexAdapter implements AgentAdapter {
             const server = servers.find((candidate) => candidate?.name === name);
             if (!server) return true;
             const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
-            return tools.length === 0;
+            return name === 'chrome-devtools' || name === 'playwright' ? tools.length === 0 : false;
           });
           if (!missing.length || Date.now() >= deadline) break;
           await new Promise((resolve) => setTimeout(resolve, 250));
@@ -905,7 +912,7 @@ export class CodexAdapter implements AgentAdapter {
     // answer), and karmax's world (worktree/container) IS the sandbox boundary
     // (SPEC §7.3) — the same stance as the Claude adapter's bypassPermissions — so
     // we bypass Codex's own approvals+sandbox rather than depend on its landlock.
-    const flags = ['--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-o', lastFile];
+    const flags = [...codexMcpFlags([...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined), '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-o', lastFile];
     if (model) flags.push('-m', model);
     if (effort) flags.push('-c', `model_reasoning_effort=${effort}`);
     // Turn-local controls (`confirm_decision`, `resolve_decision`, `create_review_info`,
