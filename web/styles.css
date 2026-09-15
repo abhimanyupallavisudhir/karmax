@@ -2591,3 +2591,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .input-request .resource-review-card { flex-direction: column; }
 .input-request .resource-review-card > div { width: 100%; min-width: 0; }
 .input-request .resource-review-card .inline-form { flex-wrap: wrap; }
+
+/* Compact project filter; keep it visible while the project list changes. */
+.rail .rail-search { width: calc(100% - 12px); min-height: 30px; margin: 4px 6px 8px; padding: 5px 8px; font-size: 12px; flex-shrink: 0; }
+.rail-search-empty { padding: 8px 10px; color: var(--ink-3); font-size: 12px; }

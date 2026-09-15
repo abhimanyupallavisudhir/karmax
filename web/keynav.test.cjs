@@ -135,7 +135,7 @@ ok(focusedEnterAction(ev('Enter'), focused('role')) === 'click', 'Enter clicks a
 ok(focusedEnterAction(ev('Enter', { ctrlKey: true }), focused('chip')) === null, 'Ctrl+Enter remains available to global commands when a control is focused');
 ok(focusedEnterAction(ev('Enter', { metaKey: true }), focused('button')) === null, 'Cmd+Enter remains available to global commands when a native button is focused');
 ok(focusedEnterAction(ev('x'), focused('chip')) === null, 'non-Enter keys do not activate the focused control');
-ok(src.includes('if (e.defaultPrevented) return;'), 'component-level Enter handlers are not activated a second time by the document dispatcher');
+ok(src.includes('if (e.defaultPrevented || e.isComposing) return;'), 'component-level Enter handlers are not activated a second time by the document dispatcher');
 ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (dispatchKey(e)) return;', src.indexOf('function bindKeys()')), 'focused Enter activation is resolved before global key dispatch');
 ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (overlayOpen)', src.indexOf('function bindKeys()')), 'focused custom controls also activate inside overlays');
 ok(src.includes("id: 'list.quickAdd'") && src.includes("keybinding: 'meta+Enter'") && src.includes("run: () => $('#add-task')?.click()"), 'Ctrl/Cmd+Enter clicks quick-add from anywhere on the task list');

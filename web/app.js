@@ -58,6 +58,7 @@ const S = {
   projects: [],
   organizations: [],
   organizationId: null,
+  projectSearch: '',
   defaultOrganizationId: null,
   organizationMembers: [],
   teams: [],
@@ -3665,11 +3666,11 @@ function renderShell() {
       </select>
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
+      <button class="global-search-trigger" id="topbar-search" title="${esc(commandHint('Search tasks and projects across your workspace', 'nav.globalSearch'))}" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
       <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
-      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
       <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
@@ -3885,7 +3886,9 @@ function editRailFolder(button) {
 // flat list the drag logic can walk. A collapsed folder still shows the open
 // project, so navigating into a tucked-away project never blanks the selection.
 function railProjectRows(projectScoped) {
-  const projects = S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId);
+  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
+  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+    && projectPath(p).toLocaleLowerCase().includes(query));
   const root = { path: '', children: [] };
   const nodes = new Map([['', root]]);
   const dir = (path) => {
@@ -3904,7 +3907,7 @@ function railProjectRows(projectScoped) {
   // CSS), so it never reads like the bold active project. Each row's tooltip
   // names its kind for the first-time reader. Folders carry their own "+" so a
   // project can be created in place.
-  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
+  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="${!query}" title="${query ? 'Project' : 'Drag to reorder'}">
           <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
@@ -3912,11 +3915,11 @@ function railProjectRows(projectScoped) {
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
-    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    if (query || !folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
-  return walk(root, 0);
+  return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
 function renderRail() {
@@ -3935,19 +3938,38 @@ function renderRail() {
       : active.classList.contains('folder-toggle') && active.dataset.folder != null ? `.folder-toggle[data-folder="${CSS.escape(active.dataset.folder)}"]`
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
-  rail.innerHTML = `
-    <div class="label rail-heading"><span>Projects</span><button class="rail-add" id="new-project" type="button" title="New project" aria-label="New project">${ICON.plus}</button></div>
+  // Keep the input node alive during typing, composition, and live refreshes.
+  const searching = active?.id === 'project-search';
+  if (searching) {
+    rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
+    $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
+  } else rail.innerHTML = `
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
-    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0" title="${esc(commandHint('Dashboard', 'nav.dashboard'))}">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
     ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
-  $('#new-project')?.addEventListener('click', () => newProject());
+  if (!searching) {
+    $('#new-project')?.addEventListener('click', () => newProject());
+    const search = $('#project-search');
+    search?.addEventListener('input', () => { S.projectSearch = search.value; renderRail(); });
+    search?.addEventListener('keydown', (event) => {
+      if (event.isComposing) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        resetChord();
+        focusRail();
+      }
+    });
+  }
   // Folder headers are native buttons, so click, Enter, and Space all share the
   // same fold behavior during pointer use and the rail's keyboard walk.
   for (const head of rail.querySelectorAll('.folder-toggle')) {
@@ -3977,7 +3999,7 @@ function wireProjectDrag(rail) {
   // above a header means "above that folder", i.e. in the folder's parent.
   const anchors = () => [...rail.querySelectorAll('.proj[draggable="true"], .proj.folder')];
   const rows = projects();
-  if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
+  if ((S.projectSearch || '').trim() || rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
   const end = $('#rail-projects-end');
   for (const row of rows) {
     row.addEventListener('dragstart', (e) => {
@@ -16376,6 +16398,12 @@ function fmtKeys(binding) {
     .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
     .join(' ');
 }
+function commandHint(label, id, next) {
+  const declared = (S.contributions?.commands || []).find((command) => command.id === id);
+  const binding = declared ? declared.keybinding : HOST_COMMANDS.find((command) => command.id === id)?.key;
+  const keys = [binding && fmtKeys(binding), next].filter(Boolean).join(' → ');
+  return keys ? `${label} (${keys})` : label;
+}
 // Subsequence fuzzy match: score (higher = better), or -1 for no match.
 function fuzzyScore(q, s) {
   if (!q) return 0;
@@ -16420,12 +16448,14 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', run: h.run });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', available: !(['nav.newTask', 'nav.search'].includes(h.id) && inRail()), run: h.run });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
+  add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
+  add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
   const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
   add({ id: 'list.quickAdd', title: 'Add quick task', keybinding: 'meta+Enter', group: 'List', palette: false, available: !!$('#add-task'), run: () => $('#add-task')?.click() });
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
@@ -16598,7 +16628,7 @@ function railRows() { return [...document.querySelectorAll('#rail .rail-add, #ra
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();
-  (rows.find((r) => r.dataset.id === S.projectId) || rows[0])?.focus();
+  (rows.find((r) => r.dataset.project === S.projectId) || rows[0])?.focus();
 }
 function moveRail(delta) {
   const rows = railRows();
@@ -16662,12 +16692,13 @@ function bindKeys() {
     const t = e.target;
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
-    if (e.defaultPrevented) return;
+    if (e.defaultPrevented || e.isComposing) return;
     // The check-in terminal is a focusable <pre> that behaves like a text field:
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
     const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (typing) {
+      resetChord();
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
