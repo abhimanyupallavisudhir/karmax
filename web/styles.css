@@ -2586,3 +2586,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 .role-capability-group code { display: block; color: var(--ink-3); font-size: 11px; }
 .role-capability-group label { display: flex; align-items: center; gap: 8px; }
 .role-capability-group p { margin: 3px 0; }
+
+/* Resource decisions belong to the active input request in the conversation. */
+.input-request .resource-review-card { flex-direction: column; }
+.input-request .resource-review-card > div { width: 100%; min-width: 0; }
+.input-request .resource-review-card .inline-form { flex-wrap: wrap; }

@@ -7152,10 +7152,11 @@ function renderTaskPage() {
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  wireResourceReview(v); // Overview and the current conversation input request.
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
-    wireResourceReview(v);
+    wireResourceInventory(v);
   } else if (tab === 'checkin') {
     wireCheckinSidebar(v);
     wireFollowups(v);
@@ -7843,23 +7844,63 @@ function wireReviewActions(v) {
 }
 
 const resourceReviewCache = new Map();
+const resourceInventoryCache = new Map();
+function resourceReviewPlaceholder() {
+  return '<div id="review-resources"><div class="task-sub" role="status">Loading resource changes…</div></div>';
+}
+
+// Opening a task paints twice (compact view, then history). Share pending reads
+// across those paints; only the current DOM subscriber may render the result.
+function loadResourceReview(v, force = false, inventory = false) {
+  const cache = inventory ? resourceInventoryCache : resourceReviewCache;
+  const cached = cache.get(v.taskId);
+  if (!force && cached?.view === v && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  const entry = { view: v, pending: true, at: Date.now() };
+  entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : ''}`)
+    .then((result) => {
+      entry.pending = false;
+      entry.at = Date.now();
+      return result;
+    }, (error) => {
+      if (cache.get(v.taskId) === entry) cache.delete(v.taskId);
+      throw error;
+    });
+  cache.set(v.taskId, entry);
+  return entry.promise;
+}
+
+// The ignored-file scan can take seconds in a cloud world. It must never hold
+// up the independently available candidate decisions, even on the first open.
+async function wireResourceInventory(v, force = false) {
+  const wrap = document.getElementById('review-resource-inventory');
+  if (!wrap || v.stage !== 'review') return;
+  const isCurrent = beginAsyncElementRender(wrap);
+  try {
+    const inventory = await loadResourceReview(v, force, true);
+    if (!isCurrent()) return;
+    wrap.innerHTML = inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
+      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; ${siteNameMarkup()} did not upload their contents.</div>
+      <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : '';
+  } catch (error) {
+    if (!isCurrent()) return;
+    wrap.innerHTML = `<div class="task-sub" title="${esc(error.message)}">Couldn’t inspect ignored output. <button class="btn sm" data-inventory-retry>Retry</button></div>`;
+    wrap.querySelector('[data-inventory-retry]')?.addEventListener('click', () => wireResourceInventory(v, true));
+  }
+}
 async function wireResourceReview(v, force = false) {
   const wrap = document.getElementById('review-resources');
   if (!wrap || v.stage !== 'review') return;
+  const isCurrent = beginAsyncElementRender(wrap);
   try {
-    const cached = resourceReviewCache.get(v.taskId);
-    let items;
-    if (!force && cached && Date.now() - cached.at < 15_000) items = cached.items;
-    else {
-      const [loaded, inventory] = await Promise.all([
-        api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources`),
-        api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/inventory`).catch(() => ({ entries: [], truncated: false })),
-      ]);
-      items = loaded;
-      resourceReviewCache.set(v.taskId, { at: Date.now(), items, inventory });
+    const items = await loadResourceReview(v, force);
+    if (!isCurrent()) return;
+    if (!items.length) {
+      wrap.classList.add('hidden');
+      wrap.innerHTML = '';
+      return;
     }
-    const inventory = resourceReviewCache.get(v.taskId)?.inventory ?? { entries: [], truncated: false };
-    if (!document.body.contains(wrap) || (!items.length && !inventory.entries?.length)) return;
+    const thread = wrap.closest?.('.ck-thread');
+    const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
     wrap.classList.remove('hidden');
     wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
       const resource = item.resource;
@@ -7874,7 +7915,7 @@ async function wireResourceReview(v, force = false) {
           : candidate.state === 'discarding'
             ? `<div class="inline-form"><span class="chip">Discard interrupted</span><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Retry discard</button></div>`
           : `<span class="chip">${candidate.state === 'adopted' ? 'Adopted into project' : candidate.state === 'discarding' ? 'Discarding staged bytes…' : 'Discarded'}</span>`;
-        return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
+        return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
           <div class="task-sub">${esc(size)} · ${esc(source || '')} → ${esc(target || '')} · ${esc(resource.access || 'read')} access</div>
           <div class="task-sub">Bound to world generation ${esc(String(candidate.worldGeneration))}; staged bytes are encrypted and retained until Adopt/Discard. Estimated retained cost: $0.00 under the current deployment storage policy (usage is recorded).</div></div>${state}</div>`;
       }
@@ -7890,11 +7931,10 @@ async function wireResourceReview(v, force = false) {
       const action = resource.publish === 'review' && changed
         ? `<div class="inline-form"><button class="btn sm primary resource-promote" data-resource-id="${esc(resource.id)}">Promote as new baseline</button><button class="btn sm resource-discard" data-resource-id="${esc(resource.id)}">Discard fork</button></div>`
         : `<span class="chip">${resource.publish === 'discard' ? 'Task fork will be discarded' : 'Unchanged'}</span>`;
-      return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
+      return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
         <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
-    }).join('')}${inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
-      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; ${siteNameMarkup()} did not upload their contents.</div>
-      <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : ''}`;
+    }).join('')}`;
+    if (atBottom) thread.scrollTop = thread.scrollHeight;
     wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
       button.disabled = true; button.textContent = 'Adopting…';
@@ -7936,7 +7976,7 @@ async function wireResourceReview(v, force = false) {
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
   } catch (error) {
-    if (!document.body.contains(wrap)) return;
+    if (!isCurrent()) return;
     wrap.classList.remove('hidden');
     // Raw server text here told the user nothing they could act on; a retry is
     // the only useful next step, so offer that (details stay in the tooltip).
@@ -8163,7 +8203,7 @@ function overviewTab(v) {
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
-         <div id="review-resources" class="hidden"></div>
+         ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
@@ -8311,7 +8351,10 @@ function conversationPane(v, t) {
     entries.push({ type: 'input-request', request: { text: requestedInput, ts: v.updatedAt },
       sourceKey: `input-request:${v.updatedAt}`, conversationRole: t.role });
   }
-  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
+  const resourceRequestIndex = v.stage === 'review' && requestedInput
+    ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
+  const msgs = historyStatus + (entries.map((entry, index) => renderConversationEntry(
+    index === resourceRequestIndex ? { ...entry, resourceReview: true } : entry, v)).join('')
     || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
@@ -8686,7 +8729,7 @@ function explainMessageAffordance(entry, v) {
 function renderConversationEntry(entry, v = S.view) {
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'input-request') {
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
