@@ -3960,7 +3960,10 @@ function renderRail() {
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
     <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <label class="rail-search-box">
+      <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
     <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
