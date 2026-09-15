@@ -8373,6 +8373,7 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
+      <button class="btn sm" id="share-task-conversation" data-role="${esc(t.role)}">Share</button>
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
@@ -8857,6 +8858,46 @@ function terminalPane(v) {
     </div>`;
 }
 
+async function openConversationShare(v, role) {
+  const endpoint = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation-share?role=${encodeURIComponent(role)}`;
+  try {
+    let state = await api(endpoint);
+    let preview = !state.url && state.enabled ? await api(`/api/tasks/${encodeURIComponent(v.taskId)}/conversation?role=${encodeURIComponent(role)}`) : null;
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'modal-card artifact-reader';
+    dialog.setAttribute('aria-labelledby', 'conversation-share-title');
+    const draw = () => {
+      dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="conversation-share-title">Share conversation</h2><button class="btn sm" data-close>Close</button></header>
+        <div class="artifact-reader-content"><p>Anyone with this link can read the user and agent message text, including any sensitive information in it. Attachments, system messages, and tool activity are excluded. Later messages will not be added.</p>
+        ${!state.enabled ? '<p>Public sharing is disabled in organization or project settings. Existing links are unavailable until sharing is enabled again.</p>' : ''}
+        ${state.url ? `<label class="form-row"><span>Public snapshot link</span><input data-link readonly value="${esc(new URL(state.url, location.origin).href)}"></label><p class="task-sub">Created ${esc(new Date(state.createdAt).toLocaleString())}. Revoke this link before creating a new snapshot.</p><div class="inline-form"><button class="btn sm" data-copy>Copy link</button><a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open snapshot</a><button class="btn sm" data-revoke>Revoke link</button></div>` : `<details><summary>Preview message text</summary>${(preview?.messages || []).filter(m => m.role === 'user' || m.role === 'agent').map(m => `<article><b>${m.role === 'user' ? 'User' : 'Agent'}</b><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</pre></article>`).join('')}</details><button class="btn primary" data-create ${state.enabled ? '' : 'disabled'}>Create public link</button>`}</div>`;
+      dialog.querySelector('[data-close]').onclick = () => dialog.close();
+      dialog.querySelector('[data-copy]')?.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(new URL(state.url, location.origin).href); toast('Link copied'); }
+        catch { dialog.querySelector('[data-link]').select(); toast('Select and copy the link above'); }
+      });
+      const mutate = async (button, method) => {
+        button.disabled = true;
+        try {
+          await api(endpoint, { method });
+          state = await api(endpoint);
+          if (!state.url && state.enabled) preview = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/conversation?role=${encodeURIComponent(role)}`);
+          draw();
+        }
+        catch (error) { button.disabled = false; toast(error.message, true); }
+      };
+      dialog.querySelector('[data-create]')?.addEventListener('click', e => mutate(e.currentTarget, 'POST'));
+      dialog.querySelector('[data-revoke]')?.addEventListener('click', e => mutate(e.currentTarget, 'DELETE'));
+    };
+    draw();
+    dialog.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dialog.close(); } });
+    dialog.addEventListener('close', () => { dialog.remove(); if (previousFocus?.isConnected) previousFocus.focus(); }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  } catch (error) { toast(error.message, true); }
+}
+
 function wireCheckinSidebar(v) {
   $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
@@ -8864,6 +8905,7 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
   $('#fork-task-agent')?.addEventListener('click', (event) => {
     openTaskForm('software-dev', undefined, undefined, {
       ...forkBranchDefaults(v),
@@ -11909,6 +11951,7 @@ function settingsView(proj) {
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     ${explanationSettingsCard('project')}
     ${profilesCard('project')}
     ${quickSettingsForms('project', proj.id)}
@@ -11939,6 +11982,29 @@ function cloudEnvironmentCard(proj) {
 function paneError(box, error, retry) {
   box.innerHTML = `<div class="inline-form"><span class="task-sub" style="color:var(--warn)" title="${esc(error?.message || '')}">Couldn’t load this section.</span><button type="button" class="btn sm">Retry</button></div>`;
   box.querySelector('button').addEventListener('click', retry);
+}
+
+async function hydrateConversationSharing(scope, id) {
+  const box = $(`#${scope}-conversation-sharing`);
+  if (!box) return;
+  const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
+  try {
+    const policy = await api(url);
+    box.innerHTML = `<div class="section-h">Public conversation links</div><p class="task-sub">Allow developers to create public snapshots of agent conversations. Anyone with a link can read its message text. Disabling sharing makes existing links unavailable until re-enabled.</p>
+      <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
+        ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
+      </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    box.querySelector('[data-save]').onclick = async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const value = box.querySelector('select').value;
+        await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
+        toast('Public sharing policy saved');
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
 
 async function hydrateAvatarAvailability(scope, id) {
@@ -12467,6 +12533,7 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
+  hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);
   hydrateProjectData(proj);
@@ -15804,6 +15871,7 @@ function organizationView() {
       <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
     <div class="card" id="organization-roles">Loading roles…</div>
+    <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
@@ -15941,6 +16009,7 @@ async function hydrateOrganizationView() {
     && !!$('#org-members');
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
+  hydrateConversationSharing('organization', organizationId);
   hydrateAvatarAvailability('organization', organizationId);
   hydrateOrganizationSubscription(organizationId);
   await loadCollaboration().catch(() => {});

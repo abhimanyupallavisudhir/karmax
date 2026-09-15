@@ -1915,6 +1915,7 @@ export class Store {
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`authorization:requests:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`avatars:organization:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`conversation-sharing:organization:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-usage-policy:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
         `credpolicy:organization:${organizationId}`,
@@ -4109,10 +4110,15 @@ export class Store {
       exact.run(`authz:default:project:${projectId}`);
       exact.run(`credpolicy:project:${projectId}`);
       exact.run(`avatars:project:${projectId}`);
+      exact.run(`conversation-sharing:project:${projectId}`);
       const workflowPrefix = `wfpin:${projectId}:`;
       prefix.run(workflowPrefix, workflowPrefix);
     }
     for (const taskId of taskIds) {
+      const sharePrefix = `conversation-share-index:${taskId}:`;
+      const shares = this.db.prepare('SELECT v FROM kv WHERE substr(k, 1, length(?))=?').all(sharePrefix, sharePrefix) as Array<{ v: string }>;
+      for (const share of shares) exact.run(`conversation-share:${share.v}`);
+      prefix.run(sharePrefix, sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`]) exact.run(key);
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,

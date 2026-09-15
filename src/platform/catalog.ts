@@ -129,6 +129,9 @@ export const PLATFORM_API_CATALOG = {
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
+    'GET|POST|DELETE /api/tasks/:taskId/conversation-share?role=',
+    'GET|PUT /api/projects/:projectId/conversation-sharing',
+    'GET|PUT /api/organizations/:organizationId/conversation-sharing',
     'GET /api/tasks/:taskId/conversation.jsonl?role= (native provider history download)',
     'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
     'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload)',
