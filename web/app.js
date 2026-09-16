@@ -14214,9 +14214,9 @@ async function hydrateConnections(organizationId) {
             list.innerHTML = connectionRows(await api(`/api/connections${oq}`)); wireConnectionActions(list, organizationId, refresh);
           } catch (error) { popup?.close(); button.disabled = false; toast(error.message, true); }
         }));
-      } catch (error) { box.textContent = error.message; }
+      } catch (error) { paneError(box, error, () => form.requestSubmit()); }
     });
-  } catch (error) { if (root.isConnected) root.textContent = error.message; }
+  } catch (error) { if (root.isConnected) paneError(root, error, () => hydrateConnections(organizationId)); }
 }
 
 function passwordsCard() {
