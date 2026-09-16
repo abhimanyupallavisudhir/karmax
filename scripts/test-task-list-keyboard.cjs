@@ -91,7 +91,7 @@ const tasks = [1, 2].map((n) => ({
     if (p === "/app.js")
       body =
         fs.readFileSync(process.env.APP_SOURCE || file, "utf8") +
-        "\nwindow.keyboardTest = { S, renderMain };";
+        "\nwindow.keyboardTest = { S, renderMain, renderRail };";
     await route.fulfill({
       body,
       contentType: file.endsWith(".js")
@@ -118,6 +118,61 @@ const tasks = [1, 2].map((n) => ({
     );
   }
   try {
+    await reset();
+    await page.evaluate(() => {
+      const { S, renderRail } = window.keyboardTest;
+      S.projects.push(
+        { id: 'p2', name: 'Needle', folder: 'Hidden/Nested', organizationId: 'o1', config: {} },
+        { id: 'p3', name: 'Other', folder: 'Hidden', organizationId: 'o1', config: {} },
+        { id: 'p4', name: 'Needle', organizationId: 'other-org', config: {} },
+      );
+      renderRail();
+    });
+    await page.locator('.folder-toggle[data-folder="Hidden"]').click();
+    await page.locator('#new-project').blur();
+    await page.keyboard.press('g');
+    await page.keyboard.press('Shift+P');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.project), 'p1');
+    assert.equal(await page.locator('#new-project').getAttribute('title'), 'New project (g P → n)');
+    await page.keyboard.press('/');
+    const search = page.locator('#project-search');
+    assert.equal(await search.evaluate(el => el === document.activeElement), true);
+    await page.keyboard.type('n/jkg?');
+    assert.equal(await search.inputValue(), 'n/jkg?');
+    assert.equal(await page.locator('#new-project-title').count(), 0);
+    assert.equal(await page.locator('.rail-search-empty').innerText(), 'No matching projects');
+    assert.equal(page.url(), listUrl);
+    await search.fill(' nEeDlE ');
+    assert.deepEqual(await page.locator('#rail .project-link').evaluateAll(els => els.map(el => el.dataset.project)), ['p2']);
+    assert.equal(await page.locator('#rail .project-row').getAttribute('draggable'), 'false');
+    await search.evaluate(el => el.setSelectionRange(2, 5));
+    await page.evaluate(() => {
+      window.savedSearch = document.querySelector('#project-search');
+      window.keyboardTest.renderRail();
+    });
+    assert.deepEqual(await search.evaluate(el => [el.selectionStart, el.selectionEnd]), [2, 5]);
+    await search.dispatchEvent('keydown', { key: 'Escape', isComposing: true });
+    assert.equal(await search.evaluate(el => el === document.activeElement), true);
+    assert.equal(await search.evaluate(el => el === window.savedSearch && el === document.activeElement), true);
+    await page.keyboard.press('Escape');
+    assert.equal(await search.inputValue(), ' nEeDlE ');
+    assert.equal(await page.evaluate(() => document.activeElement.closest('#rail') !== null && document.activeElement.id !== 'project-search'), true);
+    await page.keyboard.press('n');
+    await page.waitForSelector('#new-project-title');
+    await page.keyboard.press('Escape');
+    await page.locator('#new-project').focus();
+    await page.keyboard.press('/');
+    await search.fill('hidden');
+    assert.equal(await page.locator('#rail .project-link').count(), 2);
+    await search.fill('');
+    assert.equal(await page.locator('.folder-toggle[data-folder="Hidden"]').getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('#rail .project-link').count(), 1);
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('/');
+    await page.waitForFunction(() => document.activeElement.id === 'task-search');
+    console.log('PASS project search, folder filtering, live refresh, scoped shortcuts, typing and Escape');
+
     for (const keys of [
       ["ArrowDown"],
       ["j"],
