@@ -2638,7 +2638,31 @@ html[data-theme="dark"] .github-signin-btn:active,
 .organization-combo .combo-menu { position: fixed; right: auto; min-width: 0; }
 .organization-combo .combo-opt[aria-disabled="true"] { cursor: default; color: var(--ink-3); }
 #org-switcher { width: 230px; flex-shrink: 1; }
-#org-switcher input { font-weight: 600; text-overflow: ellipsis; }
+/* The persistent picker belongs to the topbar, not a browser-default form. */
+#org-switcher > input {
+  min-width: 0; height: 34px; padding: 0 30px 0 11px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface-2); color: var(--ink);
+  font-size: 13px; font-weight: 600; text-overflow: ellipsis;
+}
+#org-switcher:hover > input { border-color: var(--line-strong); background: var(--surface); }
+#org-switcher > input:focus {
+  outline: 2px solid var(--accent-weak); outline-offset: 2px;
+  border-color: var(--accent); background: var(--surface);
+}
+#org-switcher > input::placeholder { color: var(--ink-3); font-weight: 400; }
+#org-switcher:focus-within > .combo-caret { color: var(--accent); }
+#org-switcher .combo-menu { padding: 5px; border-color: var(--line); border-radius: var(--r); box-shadow: var(--shadow); }
+#org-switcher .combo-opt { padding: 9px 10px; }
+#org-switcher .combo-opt-head { align-items: center; }
+#org-switcher .combo-opt-head span { overflow-wrap: anywhere; }
+#org-switcher .combo-opt[aria-selected="true"] { color: var(--accent); }
+#org-switcher .combo-opt[aria-selected="true"] .combo-opt-head::after {
+  content: ''; flex: none; width: 6px; height: 10px; margin: 0 3px;
+  border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg);
+}
+#org-switcher .combo-opt[aria-disabled="false"]:hover { background: var(--accent-weak); }
+#org-switcher[aria-busy="true"] { opacity: .65; }
 @media (max-width: 850px) { #org-switcher { width: 140px; } }
 @media (max-width: 600px) { #org-switcher { width: 105px; } }
 
