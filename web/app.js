@@ -6695,11 +6695,11 @@ function taskAttempts(v) {
     const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
     const principal = a.id === g.principalAttemptId;
     const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
-    const crownTitle = g.committedAttemptId ? 'The merge winner is the principal attempt' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
+    const crownTitle = g.committedAttemptId ? 'Principal selection is locked after Merge admission' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
     return `<div class="attempt-item"><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
     </a></div>`;
   }).join('') : '';
   return `<section class="attempts" aria-label="Task attempts">
@@ -7352,6 +7352,7 @@ function renderTaskPage() {
     wireReviewActions(v);
     wireResourceInventory(v);
   } else if (tab === 'checkin') {
+    wireReviewActions(v);
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
@@ -8508,6 +8509,19 @@ function checkinTab(v) {
   </div>`;
 }
 
+// Task-level review affordances belong at the end of whichever agent is open.
+// Keep previews in Overview and command output hidden until explicitly run.
+function conversationReviewInfo(v) {
+  const info = v.reviewInfo;
+  const caption = info?.caption || info?.summary;
+  if (!caption && !info?.actions?.length && !info?.links?.length && !info?.html) return '';
+  return `<div class="msg agent review-info">
+    <div class="review-info-line"><span class="role">Review info</span>${caption ? `<span class="review-info-caption">${esc(caption)}</span>` : ''}</div>
+    ${info.actions?.length ? `<div class="review-actions" id="review-actions">${info.actions.map((action, index) => reviewActionBtn(action, index)).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
+    ${info.links?.length || info.html ? `<div class="review-actions">${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}${info.html ? '<button class="btn sm" data-tasktab="overview">View preview ↗</button>' : ''}</div>` : ''}
+  </div>`;
+}
+
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
@@ -8571,7 +8585,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
 }
 
@@ -10236,6 +10250,46 @@ function confirmTaskAction(action, v = S.view) {
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
+// The choice travels with confirmation; saving the project default is authorized
+// separately on the server. Dismissing this dialog never confirms the proposal.
+async function otherAttemptsConfirmation(action, taskId) {
+  if (action !== 'confirm' && action !== 'openPr') return {};
+  const group = await api(`/api/tasks/${taskId}/attempts`);
+  if (!group?.otherAttemptsChoiceAvailable || group.committedAttemptId || !group.attempts.some((a) => a.id !== taskId
+    && !['done', 'cancelled', 'failed'].includes(a.lastView?.status))) return {};
+  if (group.otherAttemptsDefault !== 'ask') return { otherAttempts: group.otherAttemptsDefault };
+  return new Promise((resolve) => {
+    const root = $('#overlay-root');
+    root.innerHTML = `<div class="palette-scrim" id="attempt-choice-scrim"><div class="palette" role="dialog" aria-modal="true" aria-labelledby="attempt-choice-title" style="width:min(480px,92vw);padding:24px">
+      <h2 id="attempt-choice-title">Keep or cancel other attempts?</h2>
+      <p>Keep lets the other attempts continue and integrate their proposals. Cancel stops the alternatives when this attempt enters Merge.</p>
+      ${group.canSaveOtherAttemptsDefault ? '<label class="form-row"><span><input id="save-attempt-choice" type="checkbox"> Save this choice for future tasks in this project</span></label>' : ''}
+      <div class="actions"><button class="btn" data-attempt-choice="back">Back</button><button class="btn danger" data-attempt-choice="cancel">Cancel other attempts</button><button class="btn primary" data-attempt-choice="keep">Keep other attempts</button></div>
+    </div></div>`;
+    const previousFocus = document.activeElement;
+    const close = (choice) => {
+      const save = !!$('#save-attempt-choice')?.checked;
+      document.removeEventListener('keydown', keydown, true);
+      root.innerHTML = '';
+      previousFocus?.focus();
+      resolve(choice === 'back' ? null : { otherAttempts: choice, saveOtherAttemptsDefault: save });
+    };
+    const keydown = (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close('back'); }
+      if (event.key === 'Tab') {
+        const items = [...root.querySelectorAll('button, input')];
+        const index = items.indexOf(document.activeElement);
+        if (event.shiftKey && index <= 0) { event.preventDefault(); items.at(-1).focus(); }
+        else if (!event.shiftKey && index === items.length - 1) { event.preventDefault(); items[0].focus(); }
+      }
+    };
+    document.addEventListener('keydown', keydown, true);
+    root.querySelectorAll('[data-attempt-choice]').forEach((button) => button.addEventListener('click', () => close(button.dataset.attemptChoice)));
+    $('#attempt-choice-scrim').addEventListener('click', (event) => { if (event.target.id === 'attempt-choice-scrim') close('back'); });
+    root.querySelector('[data-attempt-choice="keep"]').focus();
+  });
+}
+
 function reflectAcceptedTaskAction(taskId, action) {
   if (action !== 'cancel') return;
   markTaskCancelling(taskId);
@@ -10256,7 +10310,9 @@ function wireActions(v) {
       btn.disabled = true;
       btn.textContent = cancelling ? 'Cancelling…' : 'Sending…';
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        const choice = await otherAttemptsConfirmation(act, v.taskId);
+        if (choice === null) return;
+        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act, ...choice }) });
         succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
         toast(actionToast(act, btn.dataset.label));
@@ -11106,7 +11162,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the task agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -16789,7 +16845,9 @@ async function runDeclaredAction(a) {
   if (!confirmTaskAction(a.name, S.view)) return;
   const taskId = S.selected;
   try {
-    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    const choice = await otherAttemptsConfirmation(a.name, taskId);
+    if (choice === null) return;
+    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name, ...choice }) });
     reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, taskActionLabel(S.view, a)));
     setTimeout(refreshTask, 250);

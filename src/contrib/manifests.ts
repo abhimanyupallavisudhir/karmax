@@ -82,6 +82,11 @@ const remoteField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
+const otherAttemptsField = (): FieldSpec => ({
+  name: 'otherAttempts', type: 'select', label: 'Other task attempts',
+  help: 'ask — the human or agent reviewer chooses Keep or Cancel; without a reviewer, keep. Keep allows other proposals to continue and merge. The first attempt entering Merge fixes the choice for its group.',
+  options: ['ask', 'keep', 'cancel'], default: 'ask', scopes: ['project'], bind: 'project',
+});
 const landingAuthorityField = (): FieldSpec => ({
   name: 'landingAuthority',
   type: 'select',
@@ -450,6 +455,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       copyGlobsField(),
       remoteField(),
       landingAuthorityField(),
+      otherAttemptsField(),
       ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
       responderField(),
       confirmerField(),

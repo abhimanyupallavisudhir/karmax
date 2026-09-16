@@ -214,6 +214,8 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 
 // Forking addresses the conversation being viewed, including completed agents
 // and sessions without a native CLI/config home.
+eval(extractFn('reviewActionBtn'));
+eval(extractFn('conversationReviewInfo'));
 eval(extractFn('conversationPane'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
@@ -244,6 +246,28 @@ for (const status of ['done', 'cancelled', 'waiting']) {
   }
 }
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
+
+// Review info is task-wide, compact, and follows the conversation in every role.
+for (const info of [undefined, {}, { completion: 'finished' }]) {
+  ok(conversationReviewInfo({ reviewInfo: info }) === '', 'empty review info reserves no space');
+}
+const reviewView = { ...forkView, reviewInfo: {
+  caption: 'Check <layout>',
+  actions: [{ kind: 'open', label: 'Report', target: 'report.md' }, { kind: 'run', label: 'Preview', command: 'npm start' }],
+  links: [{ label: 'Unsafe link', url: 'javascript:alert(1)' }],
+  html: '<iframe>large preview</iframe>',
+} };
+for (const role of ['do', 'merge', 'confirm', 'resolve']) {
+  const html = conversationPane(reviewView, { role, messages: [{ id: 'final', role: 'agent', text: 'Final response', ts: 1 }] });
+  ok(html.indexOf('Review info') > html.indexOf('Final response'), `${role} review info follows the conversation`);
+  ok(html.includes('Check &lt;layout&gt;'), 'review caption is escaped');
+  ok(html.includes('data-idx="1" data-kind="run"'), 'review actions preserve API indices');
+  ok(html.includes('class="raw hidden" id="review-action-out"'), 'command output takes no space until run');
+  ok(html.includes('href="#"'), 'unsafe legacy link is neutralized');
+  ok(html.includes('data-tasktab="overview"') && !html.includes('<iframe>'), 'large preview is linked in Overview');
+  ok((html.match(/id="review-actions"/g) || []).length === 1, 'review actions have a single wiring target');
+}
+
 
 // Input prompts use the same model picker, pending/error UI, and durable annotations.
 eval(extractFn('humanWaitDetail'));
