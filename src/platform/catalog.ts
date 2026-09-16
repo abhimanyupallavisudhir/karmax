@@ -122,10 +122,10 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience, reason, urgency?}; exact task elevation and additive project scope (capabilities: [] for scope only) routed to people, teams, or Avatars; high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
-    'POST /api/permission-requests/:id/resolve?organizationId= (routed user delegate or Avatar: body {action: approve|deny})',
+    'POST /api/permission-requests/:id/resolve?organizationId= (routed user delegate or Avatar: body {action: approve|deny|dismiss}; dismiss only silences the request)',
     'POST /api/authorization/escalation-targets (delegated grantor chooser; body {projectId, authorization})',
     'GET|POST /api/authorization-requests (GET by taskId or avatarId; POST routes an over-authorization request)',
-    'POST /api/authorization-requests/:id/resolve?organizationId= (routed user delegate or authorizer Avatar: body {action: approve|deny})',
+    'POST /api/authorization-requests/:id/resolve?organizationId= (routed user delegate or authorizer Avatar: body {action: approve|deny|dismiss}; dismiss only silences the request)',
     'POST /api/agent/collaboration/request',
   ],
   conversations: [

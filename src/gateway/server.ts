@@ -689,7 +689,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new PermissionRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private pendingAuthorizationRequests(taskId: string) {
@@ -697,7 +697,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new AuthorizationRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
@@ -4535,8 +4535,8 @@ export class Gateway {
         const b = await this.body(req);
         const organizationId = String(url.searchParams.get('organizationId') ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (b.action !== 'approve' && b.action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (b.action !== 'approve' && b.action !== 'deny' && b.action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolveAuthorizationRequest(token, {
             organizationId, requestId: authorizationResolution[1]!, action: b.action,
@@ -4571,8 +4571,8 @@ export class Gateway {
         const b = await this.body(req);
         const action = String(b.action ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (action !== 'approve' && action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (action !== 'approve' && action !== 'deny' && action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolvePermissionRequest(token, {
             organizationId,

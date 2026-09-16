@@ -3104,8 +3104,8 @@ function inboxEventChanges(ev) {
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
       'credential.approval-requested', 'credential.approval-resolved',
-      'permission.approval-requested', 'permission.approval-resolved',
-      'authorization.approval-requested', 'authorization.approval-resolved'].includes(ev.type);
+      'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
+      'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
 let inboxRefreshTimer;
 function scheduleInboxReload() {
@@ -3395,8 +3395,10 @@ const LIST_RELOAD_EVENTS = new Set([
   'credential.approval-resolved',
   'permission.approval-requested',
   'permission.approval-resolved',
+  'permission.approval-dismissed',
   'authorization.approval-requested',
   'authorization.approval-resolved',
+  'authorization.approval-dismissed',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -3492,7 +3494,7 @@ function connectWs() {
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
-      } else if (ev.type === 'session.started' || ev.type === 'review.updated') {
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask();
       } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -7474,7 +7476,7 @@ function taskTabBody(v, tab) {
 
 function approvalRequestsTab(v) {
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
-    .filter((request) => request.status === 'pending').length;
+    .filter((request) => request.status === 'pending' && !request.dismissed).length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
@@ -13911,10 +13913,10 @@ Deny: Rejects this request.`, '?')}
 function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
-  const pendingHtml = pending.map((request) => `<div class="approval-request" data-preq="${esc(request.id)}">
+  const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        <span class="chip approval-needed">approval needed</span>
+        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
@@ -13925,6 +13927,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
+      ${!request.dismissed ? '<button class="btn sm" data-preq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
     </div>
   </div>`).join('');
   const history = recent.length
@@ -13942,10 +13945,10 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
-    return `<div class="approval-request" data-areq="${esc(request.id)}">
+    return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
-        <span class="chip approval-needed">approval needed</span>
+        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -13955,6 +13958,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
+      ${canResolve && !request.dismissed ? '<button class="btn sm" data-areq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
     </div>
   </div>`;
   }).join('');
@@ -13974,7 +13978,7 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
         });
-        toast(button.dataset.areqAct === 'deny' ? 'Authorization denied'
+        toast(button.dataset.areqAct === 'dismiss' ? 'Request dismissed' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -13991,10 +13995,10 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
           method: 'POST',
           body: JSON.stringify({ action: button.dataset.preqAct }),
         });
-        const decision = button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
-        toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+        const decision = button.dataset.preqAct === 'dismiss' ? 'Request dismissed' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
-        !result.resume?.resumed && !!result.resume?.reason);
+        button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
         await onResolved?.(result);
       } catch (error) {
         button.disabled = false;

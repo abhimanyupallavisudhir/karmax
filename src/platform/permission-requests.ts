@@ -23,6 +23,7 @@ export interface PermissionRequest {
   reason: string;
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied';
+  dismissed?: { by: string; at: number };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
   /** Human-facing metadata projected by the gateway, never persisted. */
@@ -139,12 +140,12 @@ export class PermissionRequests {
     return request;
   }
 
-  resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string }): PermissionRequest {
+  resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean }): PermissionRequest {
     const all = this.requests();
     const request = all.find((candidate) => candidate.id === requestId);
     if (!request) throw new Error(`no permission request ${requestId}`);
     if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
-    if (input.action === 'approve') {
+    if (input.action === 'approve' && !input.alreadyAuthorized) {
       let grants: Record<string, Capability[]> = {};
       try {
         const raw = this.store.kvGet(extensionsKey(request.taskId));
@@ -163,6 +164,18 @@ export class PermissionRequests {
       scopeKey: `project:${request.projectId}`,
       detail: { requestId, taskId: request.taskId, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds, action: input.action },
     });
+    return request;
+  }
+
+  dismiss(id: string, by: string): PermissionRequest {
+    const all = this.requests();
+    const request = all.find((candidate) => candidate.id === id);
+    if (!request) throw new Error(`no permission request ${id}`);
+    if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    request.dismissed ??= { by, at: Date.now() };
+    this.save(all);
+    this.store.appendAudit({ principalId: by, action: 'permission.request.dismissed',
+      scopeKey: `project:${request.projectId}`, detail: { requestId: id } });
     return request;
   }
 

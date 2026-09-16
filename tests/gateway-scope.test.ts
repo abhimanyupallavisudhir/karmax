@@ -322,6 +322,19 @@ describe('gateway request scope for bare-id routes', () => {
       }),
     ]);
 
+    const viewUrl = `${base}/api/tasks/${task.id}`;
+    const headers = { authorization: `Bearer ${approver}`, 'content-type': 'application/json' };
+    expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1 });
+    const dismissed = await fetch(
+      `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${store.getProject(mine)!.organizationId}`,
+      { method: 'POST', headers, body: JSON.stringify({ action: 'dismiss' }) },
+    );
+    expect(dismissed.status).toBe(200);
+    expect(await dismissed.json()).toMatchObject({ status: 'pending', dismissed: { by: 'user:a' } });
+    expect(await (await fetch(viewUrl, { headers })).json()).not.toHaveProperty('approvalRequests');
+    expect(new PermissionRequests(store, store.getProject(mine)!.organizationId!).requests({ taskId: task.id }))
+      .toEqual([expect.objectContaining({ status: 'pending', dismissed: expect.any(Object) })]);
+
     const resolved = await fetch(
       `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${store.getProject(mine)!.organizationId}`,
       {
