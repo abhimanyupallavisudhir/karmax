@@ -142,6 +142,9 @@ const tasks = [1, 2].map((n) => ({
     assert.equal(await page.locator('#new-project-title').count(), 0);
     assert.equal(await page.locator('.rail-search-empty').innerText(), 'No matching projects');
     assert.equal(page.url(), listUrl);
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await search.evaluate(el => el === document.activeElement), true);
     await search.fill(' nEeDlE ');
     assert.deepEqual(await page.locator('#rail .project-link').evaluateAll(els => els.map(el => el.dataset.project)), ['p2']);
     assert.equal(await page.locator('#rail .project-row').getAttribute('draggable'), 'false');
@@ -164,6 +167,22 @@ const tasks = [1, 2].map((n) => ({
     await page.keyboard.press('/');
     await search.fill('hidden');
     assert.equal(await page.locator('#rail .project-link').count(), 2);
+    await search.dispatchEvent('keydown', { key: 'ArrowDown', isComposing: true });
+    assert.equal(await search.evaluate(el => el === document.activeElement), true);
+    await page.keyboard.press('Shift+ArrowDown');
+    assert.equal(await search.evaluate(el => el === document.activeElement), true);
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.project), 'p2');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.project), 'p3');
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.project), 'p2');
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await search.evaluate(el => el === document.activeElement), true);
+    assert.equal(await search.inputValue(), 'hidden');
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.project), 'p3');
+    await page.keyboard.press('/');
     await search.fill('');
     assert.equal(await page.locator('.folder-toggle[data-folder="Hidden"]').getAttribute('aria-expanded'), 'false');
     assert.equal(await page.locator('#rail .project-link').count(), 1);
@@ -171,7 +190,12 @@ const tasks = [1, 2].map((n) => ({
     await page.keyboard.press('Escape');
     await page.keyboard.press('/');
     await page.waitForFunction(() => document.activeElement.id === 'task-search');
-    console.log('PASS project search, folder filtering, live refresh, scoped shortcuts, typing and Escape');
+    await page.locator('#project-search').fill('Project');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.project), 'p1');
+    await page.keyboard.press('Enter');
+    await page.waitForURL('http://keyboard.test/test/project');
+    console.log('PASS project search, arrow navigation, folder filtering, live refresh, scoped shortcuts, typing and Escape');
 
     for (const keys of [
       ["ArrowDown"],

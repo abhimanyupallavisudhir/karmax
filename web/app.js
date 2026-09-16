@@ -4105,6 +4105,15 @@ function renderRail() {
     search?.addEventListener('input', () => { S.projectSearch = search.value; renderRail(); });
     search?.addEventListener('keydown', (event) => {
       if (event.isComposing) return;
+      if (['ArrowDown', 'ArrowUp'].includes(event.key)
+          && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+        event.preventDefault();
+        resetChord();
+        const results = [...rail.querySelectorAll('.project-link')];
+        const result = event.key === 'ArrowDown' ? results[0] : results.at(-1);
+        result?.focus();
+        result?.scrollIntoView({ block: 'nearest' });
+      }
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
@@ -16853,7 +16862,11 @@ function openAdjacentTask(delta) {
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
-function railRows() { return [...document.querySelectorAll('#rail .rail-add, #rail .project-link, #rail .folder-toggle, #rail .nav-item')]; }
+function railRows() {
+  // Search results are projects; skip their folder headings during a filtered walk.
+  const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
+  return [...document.querySelectorAll('#rail .rail-add, #project-search, #rail .project-link, #rail .nav-item' + folders)];
+}
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();
