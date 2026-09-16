@@ -5521,7 +5521,7 @@ export class Gateway {
                   return this.json(res, 403, { error: 'Task access denied' });
               }
             }
-            return this.json(res, 200, await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label }));
+            return this.json(res, 200, await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label, restart: b.restart === true }));
           }
           const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|tools|execute)$/);
           if (match) {

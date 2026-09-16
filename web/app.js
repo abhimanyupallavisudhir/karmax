@@ -13788,6 +13788,7 @@ function connectionRows(connections, inTask = false) {
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
         ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm primary" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : 'Connect'}${inTask ? ' for this task' : ''}</button>` : ''}
+        ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${own && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
         ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
       </div></div>`;
@@ -13800,17 +13801,17 @@ function wireConnectionActions(root, organizationId, refresh) {
   root.querySelectorAll('[data-connection-action]').forEach(button => button.addEventListener('click', async () => {
     const row = button.closest('[data-connection]'); const id = row.dataset.connection;
     const action = button.dataset.connectionAction;
-    const popup = action === 'connect' ? window.open('about:blank', '_blank') : null;
+    const popup = ['connect', 'restart'].includes(action) ? window.open('about:blank', '_blank') : null;
     if (popup) popup.opener = null;
     button.disabled = true;
     try {
-      if (action === 'connect') {
-        const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id }) });
+      if (action === 'connect' || action === 'restart') {
+        const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });
         if (result.url) {
           if (popup) popup.location.href = result.url;
           row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
           button.hidden = true;
-        } else await refresh();
+        } else { popup?.close(); await refresh(); }
       } else {
         const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
         await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });

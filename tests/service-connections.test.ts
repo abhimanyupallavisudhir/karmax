@@ -41,6 +41,25 @@ describe('service connections', () => {
     const view = JSON.stringify(service.list(org, { taskId: 'task_a', projectId: project }));
     for (const value of ['project-key-private', 'session-private', 'ca_exact', '/link/secret']) expect(view).not.toContain(value);
   });
+  it('replaces an invalid sign-in link immediately on explicit restart', async () => {
+    const c = service.request(org, 'gmail', 'task_a', 'do', 'Read mail');
+    await service.connect(org, 'alice', { id: c.id });
+    vi.mocked(backend.authorize).mockResolvedValueOnce({ id: 'ca_fresh', url: 'https://connect.composio.dev/link/fresh' });
+    const fresh = await service.connect(org, 'alice', { id: c.id, restart: true });
+    expect(fresh.url).toBe('https://connect.composio.dev/link/fresh');
+    expect(backend.disconnect).toHaveBeenCalledWith('ca_exact');
+    expect(service.get(org, c.id).accountId).toBe('ca_fresh');
+  });
+  it('preserves a completed sign-in when restart races with provider consent', async () => {
+    const c = service.request(org, 'gmail', 'task_a', 'do', 'Read mail');
+    await service.connect(org, 'alice', { id: c.id });
+    vi.mocked(backend.active).mockResolvedValue(true);
+    const result = await service.connect(org, 'alice', { id: c.id, restart: true });
+    expect(result.connection.status).toBe('active');
+    expect(result.url).toBeUndefined();
+    expect(backend.disconnect).not.toHaveBeenCalled();
+    expect(backend.authorize).toHaveBeenCalledTimes(1);
+  });
   it('isolates people, organizations and projects; requires explicit sharing', async () => {
     const id = await connected();
     expect(service.list(org, { ownerId: 'bob' })).toEqual([]);

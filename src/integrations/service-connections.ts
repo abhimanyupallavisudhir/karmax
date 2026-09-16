@@ -149,14 +149,20 @@ export class ServiceConnections {
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() });
   }
   private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
-  async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string }) {
+  async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean }) {
     return this.locked(input.id ?? `${org}:${ownerId}:${input.toolkit}`, async () => {
       let c = input.id ? this.get(org, input.id) : undefined;
       if (c?.ownerId && c.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
       if (c?.status === 'active') return { connection: this.view(c) };
       const toolkit = c?.toolkit ?? input.toolkit ?? '';
       this.slug(toolkit);
-      if (c?.status === 'connecting' && Date.now() - c.updatedAt < TTL && this.broker.hasHandle(PREFIX + c.id))
+      if (input.restart && c?.status === 'connecting' && c.accountId && await this.remote(() => this.backend().active(c!.accountId!, toolkit))) {
+        c.sessionId = await this.remote(() => this.backend().session(this.user(c!), toolkit, c!.accountId!));
+        c.status = 'active'; c.notifiedAt = undefined;
+        this.broker.deleteHandle(PREFIX + c.id); this.save(c);
+        return { connection: this.view(c) };
+      }
+      if (!input.restart && c?.status === 'connecting' && Date.now() - c.updatedAt < TTL && this.broker.hasHandle(PREFIX + c.id))
         return { connection: this.view(c), url: this.broker.resolve(PREFIX + c.id, { caps: [`use-credential:${PREFIX + c.id}`] }) };
       c ??= { id: newId('conn'), organizationId: org, toolkit, label: (input.label || toolkit).slice(0, 120),
         projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() };
