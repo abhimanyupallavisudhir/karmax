@@ -43,7 +43,7 @@ async function main() {
     api: (_path, options) => { requests.push(JSON.parse(options.body)); return new Promise((resolve) => { complete = resolve; }); },
     toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
   });
-  vm.runInContext(['collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readAgentSpec'].map(fn).join('\n'), context);
+  vm.runInContext(['collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec'].map(fn).join('\n'), context);
   const render = (value) => {
     const root = new Element(), button = new Element(), field = new Element(), bar = new Element();
     field.value = value;
