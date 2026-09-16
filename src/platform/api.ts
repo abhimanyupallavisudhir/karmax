@@ -1712,7 +1712,7 @@ export class KarmaxApi {
       throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     this.assertStoredGrantQueueable(token, caller, task);
     const group = this.deps.store.attemptGroup(taskId);
-    if (group?.committedAttemptId && group.committedAttemptId !== taskId) {
+    if (group?.committedAttemptId && group.otherAttempts !== 'keep' && group.committedAttemptId !== taskId) {
       throw new Error('another attempt has entered Merge; this task is committed and no other attempt can be queued');
     }
     // Queuing a task that carries triggers ARMS it (activates its triggers) rather
@@ -2376,6 +2376,11 @@ export class KarmaxApi {
     return this.deps.store.getTask(attempt.id)!;
   }
 
+  private attemptsReachMerge(task: TaskRecord): boolean {
+    return !!this.resolveStart(task.workflow, task.workflowVersion,
+      this.deps.store.getProject(task.projectId)?.organizationId)?.manifest.stages?.some((stage) => stage.key === 'merge');
+  }
+
   attemptGroup(token: string, taskId: string) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'get_task', { projectId: task?.projectId, taskId });
@@ -2383,6 +2388,9 @@ export class KarmaxApi {
     if (!group) return group;
     return {
       ...group,
+      otherAttemptsChoiceAvailable: !!task && this.attemptsReachMerge(task),
+      otherAttemptsDefault: this.deps.store.otherAttemptsDefault(taskId),
+      canSaveOtherAttemptsDefault: this.deps.tokens.check(token, 'project:settings:write', { projectId: task?.projectId }).ok,
       attempts: group.attempts.map((attempt) => attempt.params.draft
         ? { ...attempt, lastView: this.getDraftView(token, attempt.id, group) }
         : attempt.lastView
@@ -2916,6 +2924,7 @@ export class KarmaxApi {
         const opened = await this.deps.worlds.open(world).catch(() => undefined);
         await opened?.destroy().catch(() => undefined);
       }
+      this.deps.store.kvDelete(`attempt-choice:${taskId}`);
       const draftParams = { ...task.params };
       delete (draftParams as any)._workflowRunId;
       this.deps.store.updateTaskParams(taskId, {
@@ -4102,10 +4111,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[]): Promise<Message | undefined> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
+    if (attemptChoice?.otherAttempts !== undefined && !['keep', 'cancel'].includes(attemptChoice.otherAttempts))
+      throw new ValidationError('otherAttempts must be keep or cancel');
+    if (attemptChoice?.saveOtherAttemptsDefault) {
+      this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId });
+      if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
+    }
     const heldView = scopedTask?.lastView;
     if (signal === SIG.retry && scopedTask && heldView?.stage === 'escalated'
       && heldView.status === 'blocked') {
@@ -4135,6 +4150,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
+    const attemptGroup = scopedTask && this.deps.store.attemptGroup(taskId);
+    const confirmsProposal = signal === SIG.confirm || (signal === SIG.openPr && !!caller.humanSubject);
+    const needsAttemptChoice = confirmsProposal && scopedTask && this.attemptsReachMerge(scopedTask) && attemptGroup && !attemptGroup.committedAttemptId
+      && attemptGroup.attempts.some((a) => a.id !== taskId && !['done', 'cancelled', 'failed'].includes(a.lastView?.status ?? ''));
+    if (needsAttemptChoice && this.deps.store.otherAttemptsDefault(taskId) === 'ask' && !attemptChoice?.otherAttempts)
+      throw new ValidationError('Choose whether to keep or cancel the other attempts when confirming this proposal.');
     if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       // Master's authorization parity: the human is the verified subject, not the
@@ -4160,6 +4181,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
         payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } });
       if (!vote.satisfied) return;
+    }
+    const chosenOtherAttempts = attemptChoice?.otherAttempts ?? (needsAttemptChoice ? this.deps.store.otherAttemptsDefault(taskId) : undefined);
+    if (confirmsProposal && scopedTask && (chosenOtherAttempts === 'keep' || chosenOtherAttempts === 'cancel')) {
+      this.deps.store.kvSet(`attempt-choice:${taskId}`, chosenOtherAttempts);
+      if (attemptChoice?.saveOtherAttemptsDefault) {
+        const defaults = this.deps.store.getSettings(scopedTask.projectId, '__common__') ?? {};
+        this.deps.store.setSettings(scopedTask.projectId, '__common__', { ...defaults, otherAttempts: chosenOtherAttempts });
+      }
     }
     // Setup is the one stage where the projected view has no WorldHandle yet.
     // A plain signal used to wait behind the five-minute createWorld activity,

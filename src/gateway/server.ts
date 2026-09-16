@@ -4275,7 +4275,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files);
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault });
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);

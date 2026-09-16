@@ -499,6 +499,7 @@ describe('Store', () => {
     const p = store.createProject('Acme');
     const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });
     const second = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'second' }, intentId: first.intentId });
+    store.kvSet(`attempt-choice:${second.id}`, 'cancel');
     expect(store.claimAttempt(second.id)).toEqual({ accepted: true, cancel: [first.id] });
     expect(store.claimAttempt(first.id)).toEqual({ accepted: false, cancel: [first.id] });
     const group = store.attemptGroup(first.id)!;

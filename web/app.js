@@ -6696,7 +6696,7 @@ function taskAttempts(v) {
     return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
     </a>`;
   }).join('') : '';
   return `<section class="attempts" aria-label="Task attempts">
@@ -10232,6 +10232,46 @@ function confirmTaskAction(action, v = S.view) {
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
+// The choice travels with confirmation; saving the project default is authorized
+// separately on the server. Dismissing this dialog never confirms the proposal.
+async function otherAttemptsConfirmation(action, taskId) {
+  if (action !== 'confirm' && action !== 'openPr') return {};
+  const group = await api(`/api/tasks/${taskId}/attempts`);
+  if (!group?.otherAttemptsChoiceAvailable || group.committedAttemptId || !group.attempts.some((a) => a.id !== taskId
+    && !['done', 'cancelled', 'failed'].includes(a.lastView?.status))) return {};
+  if (group.otherAttemptsDefault !== 'ask') return { otherAttempts: group.otherAttemptsDefault };
+  return new Promise((resolve) => {
+    const root = $('#overlay-root');
+    root.innerHTML = `<div class="palette-scrim" id="attempt-choice-scrim"><div class="palette" role="dialog" aria-modal="true" aria-labelledby="attempt-choice-title" style="width:min(480px,92vw);padding:24px">
+      <h2 id="attempt-choice-title">Keep or cancel other attempts?</h2>
+      <p>Keep lets the other attempts continue and integrate their proposals. Cancel stops the alternatives when this attempt enters Merge.</p>
+      ${group.canSaveOtherAttemptsDefault ? '<label class="form-row"><span><input id="save-attempt-choice" type="checkbox"> Save this choice for future tasks in this project</span></label>' : ''}
+      <div class="actions"><button class="btn" data-attempt-choice="back">Back</button><button class="btn danger" data-attempt-choice="cancel">Cancel other attempts</button><button class="btn primary" data-attempt-choice="keep">Keep other attempts</button></div>
+    </div></div>`;
+    const previousFocus = document.activeElement;
+    const close = (choice) => {
+      const save = !!$('#save-attempt-choice')?.checked;
+      document.removeEventListener('keydown', keydown, true);
+      root.innerHTML = '';
+      previousFocus?.focus();
+      resolve(choice === 'back' ? null : { otherAttempts: choice, saveOtherAttemptsDefault: save });
+    };
+    const keydown = (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close('back'); }
+      if (event.key === 'Tab') {
+        const items = [...root.querySelectorAll('button, input')];
+        const index = items.indexOf(document.activeElement);
+        if (event.shiftKey && index <= 0) { event.preventDefault(); items.at(-1).focus(); }
+        else if (!event.shiftKey && index === items.length - 1) { event.preventDefault(); items[0].focus(); }
+      }
+    };
+    document.addEventListener('keydown', keydown, true);
+    root.querySelectorAll('[data-attempt-choice]').forEach((button) => button.addEventListener('click', () => close(button.dataset.attemptChoice)));
+    $('#attempt-choice-scrim').addEventListener('click', (event) => { if (event.target.id === 'attempt-choice-scrim') close('back'); });
+    root.querySelector('[data-attempt-choice="keep"]').focus();
+  });
+}
+
 function reflectAcceptedTaskAction(taskId, action) {
   if (action !== 'cancel') return;
   markTaskCancelling(taskId);
@@ -10252,7 +10292,9 @@ function wireActions(v) {
       btn.disabled = true;
       btn.textContent = cancelling ? 'Cancelling…' : 'Sending…';
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        const choice = await otherAttemptsConfirmation(act, v.taskId);
+        if (choice === null) return;
+        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act, ...choice }) });
         succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
         toast(actionToast(act, btn.dataset.label));
@@ -11102,7 +11144,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the task agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -16785,7 +16827,9 @@ async function runDeclaredAction(a) {
   if (!confirmTaskAction(a.name, S.view)) return;
   const taskId = S.selected;
   try {
-    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    const choice = await otherAttemptsConfirmation(a.name, taskId);
+    if (choice === null) return;
+    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name, ...choice }) });
     reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, taskActionLabel(S.view, a)));
     setTimeout(refreshTask, 250);
