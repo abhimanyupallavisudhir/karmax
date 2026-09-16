@@ -1,3 +1,7 @@
+import { probeConnection } from '../mcp/connections/probe.js';
+import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
+import { registrySearch } from '../mcp/connections/registry.js';
+import { beginOAuth, finishOAuth } from '../mcp/connections/oauth.js';
 import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
 import { ServiceConnections, ConnectionError } from '../integrations/service-connections.js';
@@ -240,6 +244,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/defaults/')) return 'task:read';
+  if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
+    return read ? 'profile:read' : url?.searchParams.get('projectId') ? 'project:settings:write' : 'organization:edit';
+  }
   if (p.startsWith('/api/profiles')) {
     const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
@@ -5291,6 +5298,49 @@ export class Gateway {
 
       // Agent-role defaults resolve project → organization → bundled/legacy.
       // Unscoped access is reserved for the operator-owned fallback records.
+      if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
+        const organizationId = requestedScope.organizationId;
+        const projectId = requestedScope.projectId;
+        if (!organizationId || !store.getOrganization(organizationId)) return this.json(res, 400, { error: 'Choose an organization or project' });
+        if (projectId && store.getProject(projectId)?.organizationId !== organizationId) return this.json(res, 404, { error: 'Project not found in this organization' });
+        if (!this.deps.broker) return this.json(res, 503, { error: 'Credential vault unavailable' });
+        const connections = new McpConnections(store, this.deps.broker, organizationId);
+        const actor = actorPrincipal(callerIdentity.actor);
+        try {
+          if (p === '/api/mcp/registry' && method === 'GET')
+            return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? ''));
+          if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, connections.list(projectId).map((c) => ({ ...c,
+            connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!connections.secret(c).tokens?.access_token) })));
+          if (p === '/api/mcp' && method === 'POST') {
+            const saved = connections.save(await this.body(req), projectId);
+            store.appendAudit({ principalId: actor, action: 'mcp.connection.saved', scopeKey: auditScope, detail: { id: saved.id, revision: saved.revision } });
+            return this.json(res, 200, saved);
+          }
+          const match = p.match(/^\/api\/mcp\/(mcp_[a-f0-9]{24})(?:\/(authorize|callback|test))?$/);
+          if (match) {
+            const c = connections.get(match[1]!, projectId);
+            if (c.projectId !== projectId) return this.json(res, 403, { error: 'Manage this connection in its owning settings' });
+            if (!match[2] && method === 'DELETE') {
+              connections.remove(c.id, projectId);
+              store.appendAudit({ principalId: actor, action: 'mcp.connection.deleted', scopeKey: auditScope, detail: { id: c.id } });
+              return this.json(res, 200, { ok: true });
+            }
+            if (match[2] === 'test' && method === 'POST') return this.json(res, 200, await probeConnection(connections, c));
+            if (match[2] === 'authorize' && method === 'POST') {
+              const origin = process.env.KARMAX_PUBLIC_URL ?? (hostLocal() ? url.origin : undefined);
+              if (!origin) throw new Error('Configure the public Tavya URL before connecting OAuth');
+              return this.json(res, 200, await beginOAuth(connections, c, actor, new URL('/mcp-callback', origin).href));
+            }
+            if (match[2] === 'callback' && method === 'POST') {
+              const b = await this.body(req);
+              await finishOAuth(connections, c, actor, b.state, b.code);
+              store.appendAudit({ principalId: actor, action: 'mcp.connection.authorized', scopeKey: auditScope, detail: { id: c.id } });
+              return this.json(res, 200, { ok: true });
+            }
+          }
+          return this.json(res, 404, { error: 'MCP route not found' });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : 'Connection failed' }); }
+      }
       if (p === '/api/profiles' && method === 'GET') {
         // Annotate each profile with the workflow(s) that declare its role, so the
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
@@ -5334,7 +5384,7 @@ export class Gateway {
         if (!organizationId) return this.json(res, 404, { error: 'organization not found' });
         const organizations = globals.map((global) => {
           const own = store.getProfile(organizationProfileId(organizationId, global.role));
-          return withRole({ ...(own ?? global), id: organizationProfileId(organizationId, global.role), role: global.role,
+          return withRole({ ...(own ?? global), ...(own?.mcpConnections === undefined && global.mcpConnections !== undefined ? { mcpConnections: global.mcpConnections } : {}), id: organizationProfileId(organizationId, global.role), role: global.role,
             scope: own ? 'organization' : 'inherited', inherited: global });
         });
         if (!pid) return this.json(res, 200, organizations);
@@ -5357,6 +5407,7 @@ export class Gateway {
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        try { validateMcpSelection(b.mcpConnections); } catch (e) { return this.json(res, 400, { error: (e as Error).message }); }
         if (b.provider !== undefined && !isAgentProvider(b.provider)) {
           return this.json(res, 400, { error: `unknown agent provider "${String(b.provider)}"` });
         }
@@ -6767,7 +6818,7 @@ export class Gateway {
           : undefined;
         const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
         const enrich = (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
-          const out = this.enrichAgentDefaults(m, vals, projectId);
+          const out = this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined);
           if (branches) {
             if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
             if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
@@ -7206,18 +7257,19 @@ export class Gateway {
     })).map((credential) => credential.key);
   }
 
-  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
+  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string, organizationId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
       if ((f.type !== 'agent' && f.type !== 'confirmer' && f.type !== 'responder') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
-      const prof = roleDefaultProfile(this.deps.store, f.role, projectId);
+      const prof = roleDefaultProfile(this.deps.store, f.role, projectId, organizationId);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
+      const mcpConnections = spec.mcpConnections ?? prof?.mcpConnections;
+      const agent = { ...(mcpConnections !== undefined ? { mcpConnections } : {}), provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
       // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
       // normalize). Each agent layer gets the role-default agent knobs filled in,
       // same as a bare agent field; `agentDefault` rides along so the form can
@@ -7230,7 +7282,7 @@ export class Gateway {
               const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
               const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
               const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
-              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+              return { ...l, ...(l.mcpConnections === undefined && prof?.mcpConnections !== undefined ? { mcpConnections: prof.mcpConnections } : {}), provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
             }),
             agentDefault: agent,
           }
