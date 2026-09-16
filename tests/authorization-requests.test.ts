@@ -38,6 +38,23 @@ function fixture() {
 }
 
 describe('initial authorization delegation requests', () => {
+  it('dismisses without changing authorization and permits a later denial', async () => {
+    const f = fixture();
+    const task = f.store.createTask({ projectId: f.project.id, title: 'Pending', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { draft: true, prompt: 'work' } });
+    const service = new AuthorizationRequests(f.store, 'org_personal');
+    const request = service.request({ projectId: f.project.id, target: { kind: 'task', taskId: task.id },
+      authorization: f.requested, capabilities: [], missingCapabilities: [], audience: ['user:approver'],
+      recipients: ['approver'], reason: 'More access', requestedBy: 'user:requester' });
+    await expect(f.api.resolveAuthorizationRequest(f.tokenFor('limited'), { organizationId: 'org_personal',
+      requestId: request.id, action: 'dismiss' })).rejects.toThrow(/not routed/);
+    await expect(f.api.resolveAuthorizationRequest(f.tokenFor('approver'), { organizationId: 'org_personal',
+      requestId: request.id, action: 'dismiss' })).resolves.toMatchObject({ status: 'pending', dismissed: { by: 'user:approver' } });
+    expect(f.store.getTask(task.id)?.params).toEqual({ draft: true, prompt: 'work' });
+    await expect(f.api.resolveAuthorizationRequest(f.tokenFor('approver'), { organizationId: 'org_personal',
+      requestId: request.id, action: 'deny' })).resolves.toMatchObject({ status: 'denied' });
+  });
+
   it.each(['human', 'delegated-agent'])('%s routes and resolves authorization with the complete granted package', async (kind) => {
     const f = fixture();
     const tokenFor = (userId: string) => {

@@ -2622,3 +2622,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 #org-switcher input { font-weight: 600; text-overflow: ellipsis; }
 @media (max-width: 850px) { #org-switcher { width: 140px; } }
 @media (max-width: 600px) { #org-switcher { width: 105px; } }
+
+.approval-request-dismissed { opacity: .55; }
+.approval-request-dismissed:focus-within, .approval-request-dismissed:hover { opacity: .8; }

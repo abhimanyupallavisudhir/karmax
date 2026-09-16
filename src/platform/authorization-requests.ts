@@ -24,6 +24,7 @@ export interface AuthorizationRequest {
   reason: string;
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied';
+  dismissed?: { by: string; at: number };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
 }
@@ -89,6 +90,18 @@ export class AuthorizationRequests {
       scopeKey: `project:${request.projectId}`,
       detail: { requestId: request.id, target: request.target, authorization: request.authorization, action },
     });
+    return request;
+  }
+
+  dismiss(id: string, by: string): AuthorizationRequest {
+    const all = this.requests();
+    const request = all.find((candidate) => candidate.id === id);
+    if (!request) throw new Error(`no authorization request ${id}`);
+    if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    request.dismissed ??= { by, at: Date.now() };
+    this.save(all);
+    this.store.appendAudit({ principalId: by, action: 'authorization.request.dismissed',
+      scopeKey: `project:${request.projectId}`, detail: { requestId: id } });
     return request;
   }
 

@@ -1958,6 +1958,14 @@ export class KarmaxApi {
     });
     const updated = this.deps.store.getTask(taskId)!;
     this.persistTaskCredentialPolicies(updated);
+    const requests = new PermissionRequests(this.deps.store, organizationId);
+    for (const request of requests.requests({ taskId, status: 'pending' })) {
+      // A manual decision may itself be updating the task's scope.
+      if (this.resolvingPermissions.has(`${organizationId}:${request.id}`)) continue;
+      if (requests.requests().find((candidate) => candidate.id === request.id)?.status !== 'pending') continue;
+      if (this.permissionRequestSatisfied(this.deps.store.getTask(taskId)!, request))
+        await this.finishPermissionDecision(requests, request, 'approve', caller.principal, true);
+    }
     return updated;
   }
 
@@ -3363,7 +3371,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   async resolveAuthorizationRequest(
     token: string,
-    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
   ): Promise<AuthorizationRequest & { queued?: boolean }> {
     const service = new AuthorizationRequests(this.deps.store, input.organizationId);
     const request = service.requests().find((candidate) => candidate.id === input.requestId);
@@ -3375,6 +3383,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (humanUserId && !request.recipients.includes(humanUserId)
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this authorization request was not routed to you');
+    if (input.action === 'dismiss') {
+      const dismissed = service.dismiss(request.id, caller.principal);
+      this.deps.store.removeAuthorizationInbox(request.id);
+      const event = { taskId: request.target.kind === 'task' ? request.target.taskId : `avatar:${request.target.avatarId}`,
+        type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+      return dismissed;
+    }
     let queued = false;
     if (input.action === 'approve') {
       const grantorCaps = this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId);
@@ -3447,7 +3464,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   async resolvePermissionRequest(
     token: string,
-    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const key = `${input.organizationId}:${input.requestId}`;
     if (this.resolvingPermissions.has(key)) throw new ValidationError('permission request decision is already in progress');
@@ -3461,7 +3478,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   private async applyPermissionDecision(
     token: string,
-    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const service = new PermissionRequests(this.deps.store, input.organizationId);
     const request = service.requests().find((candidate) => candidate.id === input.requestId);
@@ -3481,7 +3498,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this permission request was not routed to you');
     if (request.status !== 'pending') throw new ValidationError(`request ${request.id} is already ${request.status}`);
-    if (input.action === 'approve') {
+    if (input.action === 'dismiss') {
+      const dismissed = service.dismiss(request.id, caller.principal);
+      const event = { taskId: request.taskId, type: 'permission.approval-dismissed',
+        ts: Date.now(), payload: { requestId: request.id } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+      return { ...dismissed, resume: { resumed: false, reason: 'Dismissed without notifying the agent' } };
+    }
+    if (input.action === 'approve' && !(task && this.permissionRequestSatisfied(task, request))) {
       let expanded: AuthorizationSelection | undefined;
       if (request.projectIds?.length) {
         if (!task || !this.deps.authorization) throw new ValidationError('task authorization is unavailable');
@@ -3522,8 +3547,40 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (expanded) await this.setTaskAuthorization(token, request.taskId, expanded, undefined, undefined,
         { acceptAttenuation: false, preserveCredentialGrants: true });
     }
-    const resolved = service.resolve(request.id, { action: input.action, by: caller.principal });
-    const message = input.action === 'approve'
+    return this.finishPermissionDecision(service, request, input.action, caller.principal,
+      input.action === 'approve' && !!task && this.permissionRequestSatisfied(task, request));
+  }
+
+  /** Only reconcile from the persisted grant, never from the requested level. */
+  private permissionRequestSatisfied(task: TaskRecord, request: PermissionRequest): boolean {
+    const authorization = task.params?._authorization as { capabilities?: Capability[] } | undefined;
+    if (!authorization?.capabilities) return false;
+    const service = new PermissionRequests(this.deps.store,
+      this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal');
+    const caps = [...authorization.capabilities, ...service.extensionCaps(task.id, request.role)];
+    if (!request.capabilities.every((cap) => allows(caps, cap))) return false;
+    if (!request.projectIds?.length) return true;
+    const current = previousTaskGrants(task).authorization;
+    if (!current || !this.deps.authorization || !request.baseAuthorization) return false;
+    const projects = [...new Set([...(request.baseAuthorization.projectIds ?? [task.projectId]), ...request.projectIds])];
+    if (current.scope === 'projects' && !projects.every((id) => current.projectIds?.includes(id))) return false;
+    // Scope-only asks promise the original authorization across the added projects.
+    try {
+      const required = this.deps.authorization.requestedCapabilities(task.projectId,
+        { ...request.baseAuthorization, scope: 'projects', projectIds: projects });
+      return required.every((cap) => allows(authorization.capabilities!, cap));
+    } catch {
+      // An obsolete profile or deleted project must not block an unrelated edit.
+      return false;
+    }
+  }
+
+  private async finishPermissionDecision(
+    service: PermissionRequests, request: PermissionRequest, action: 'approve' | 'deny',
+    principal: string, alreadyAuthorized = false,
+  ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
+    const resolved = service.resolve(request.id, { action, by: principal, alreadyAuthorized });
+    const message = action === 'approve'
       ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
       : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
@@ -3536,8 +3593,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         role: request.role,
         capabilities: request.capabilities,
         projectIds: request.projectIds,
-        action: input.action,
-        resolvedBy: caller.principal,
+        action,
+        resolvedBy: principal,
         resumed: resume.resumed,
       },
     };
