@@ -6148,6 +6148,7 @@ function uniqueSlug(value: string, used: (candidate: string) => boolean): string
  *  creation. Keep this in sync with `web/app.js` (`parseRoute` / `ORG_VIEWS`) and
  *  the gateway's `/api` + `/ws` prefixes. */
 const RESERVED_ROUTE_SLUGS = new Set([
+  'mcp-callback',
   // gateway-owned top-level prefixes
   'api', 'ws',
   // top-level routes / legacy org paths (an org slug is the first URL segment)

@@ -1043,6 +1043,7 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, model, effort || '')}
     </div>
+    ${mcpPickerHtml(spec?.mcpConnections, inh.mcpConnections)}
     <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
@@ -1182,6 +1183,8 @@ function readAgentSpec(box) {
   const effort = avatar?.runtime?.effort || box.querySelector('.af-effort').value;
   if (model) spec.model = model;
   if (effort) spec.effort = effort;
+  const mcpConnections = readMcpPicker(box);
+  if (mcpConnections !== undefined) spec.mcpConnections = mcpConnections;
   const resumeFrom = readResume(box);
   if (resumeFrom) spec.resumeFrom = resumeFrom;
   return spec;
@@ -1844,6 +1847,7 @@ function wireCombo(combo, getOptions, onChange) {
 
 // Wire one agent box's controls: provider→model combobox + one fork source.
 function wireAgentBox(box) {
+  wireMcpPicker(box.querySelector('.mcp-picker'), box.closest?.('[data-mcp-scope]')?.dataset.mcpScope);
   const combo = box.querySelector('.af-model-combo');
   const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
   if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
@@ -2913,7 +2917,7 @@ async function boot() {
   // A social sign-in that Better Auth rejected comes back here with `?error=`
   // (see wireSocialBtn's errorCallbackURL). Same shape as `verified` above:
   // read it, clear it from the URL, and let the card say what happened.
-  S.signInError = socialSignInError(new URLSearchParams(location.search));
+  S.signInError = location.pathname === '/mcp-callback' ? null : socialSignInError(new URLSearchParams(location.search));
   if (S.signInError) {
     const clean = new URL(location.href);
     clean.searchParams.delete('error');
@@ -2935,7 +2939,7 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login') return renderLogin();
+    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login' || location.pathname === '/mcp-callback') return renderLogin();
     if (location.pathname === '/signup') return renderSignup();
     return renderLanding();
   }
@@ -2945,6 +2949,7 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  if (location.pathname === '/mcp-callback') return finishMcpCallback();
   const route = parseRoute(location.pathname);
   if (route.name === 'invite') {
     const invitationToken = new URLSearchParams(location.search).get('token');
@@ -11293,6 +11298,7 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
     const fields = wf === '__common__' ? commonSettingsFields(scope)
       : settingsFields(wf, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
+    sec.dataset.mcpScope = mcpScope(projectId || null, organizationId);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -11325,6 +11331,7 @@ async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
     sec.querySelector('.quick-defaults-body').hidden = !enabled;
     sec.querySelector('.quick-defaults-enabled').addEventListener('change', (event) => { sec.querySelector('.quick-defaults-body').hidden = !event.target.checked; });
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
+    sec.dataset.mcpScope = mcpScope(projectId || null, organizationId);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -12186,7 +12193,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-tools">Tools</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -12206,6 +12213,7 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-tools"><div>MCP connections</div></div><div class="card"><p>Connect services from the Official MCP Registry or add your own server. Choose connections in each Agent’s Tools field.</p><button type="button" class="btn primary" id="project-mcp-manage">Manage connections</button></div>
     <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
@@ -13019,6 +13027,7 @@ function globalSettingsView(embedded = false) {
     ${vaultRequestsCard()}
     ${agentMailCard()}
     ${paymentsCard('global')}
+    <div class="settings-section-title" id="settings-tools"><div>MCP connections</div></div><div class="card"><p>Connections shared with this organization’s projects. Choose connections in each Agent’s Tools field.</p><button type="button" class="btn primary" id="organization-mcp-manage">Manage connections</button></div>
     <div class="settings-section-title" id="settings-agents"><div>Codex/Claude</div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
@@ -13033,11 +13042,6 @@ function globalSettingsView(embedded = false) {
             <option value="xai|xAI Grok OAuth (SuperGrok Subscription)">SuperGrok / Grok or X Premium (local browser)</option>
           </select>
           <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
-          <select id="login-browser" title="Browser MCP baseline for this profile">
-            <option value="none">no browser MCP</option>
-            <option value="chrome-devtools">+ chrome-devtools MCP</option>
-            <option value="playwright">+ playwright MCP</option>
-          </select>
           <button class="btn primary" id="login-connect">Connect</button>
         </div>
         <div id="login-result" style="font-size:12px;margin-top:6px"></div>
@@ -14804,6 +14808,7 @@ function profileRow(p, scope) {
       ${effortSelectHtml('pf-effort', provider, model, effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
+    ${mcpPickerHtml(inherited ? undefined : p.mcpConnections, p.inherited?.mcpConnections)}
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save agent</button>
       ${p.scope === ownScope ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -14816,6 +14821,8 @@ function profileRow(p, scope) {
 // Standing Confirm/Responder profiles are not shown: those agents are configured
 // directly in their Review route / Responder controls.
 async function hydrateProfiles(scope, projectId, organizationId) {
+  const manage = document.getElementById(projectId ? 'project-mcp-manage' : 'organization-mcp-manage');
+  if (manage) manage.onclick = () => openMcpManager(mcpScope(projectId || null, organizationId));
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
   const renderIsCurrent = beginAsyncElementRender(list);
@@ -14828,6 +14835,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
     : profiles.map((p) => profileRow(p, scope)).join('');
   list.querySelectorAll('[data-profile]').forEach((card) => {
+    wireMcpPicker(card.querySelector('.mcp-picker'), query);
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
     if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
@@ -14842,6 +14850,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       provider: card.querySelector('.pf-provider').value,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
+      mcpConnections: readMcpPicker(card),
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
     };
     const targets = [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
@@ -14888,6 +14897,7 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
   if (!renderIsCurrent()) return;
   box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
     <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  box.dataset.mcpScope = mcpScope(projectId || null, organizationId);
   wireAgentFields(box);
   wireFieldResets(box, [field]);
   const saveButton = box.querySelector('[data-save-review-route]');
@@ -14964,7 +14974,7 @@ function wireGlobalSettings(organizationId) {
   $('#login-connect')?.addEventListener('click', async () => {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
-    const browserMcp = $('#login-browser').value;
+    const browserMcp = 'none';
     const [modelProvider, authMethod] = provider === 'opencode'
       ? $('#login-opencode-target').value.split('|', 2)
       : [];
@@ -16104,7 +16114,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-tools">Tools</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
@@ -17856,3 +17866,212 @@ function renderSetup() {
 }
 
 boot().catch((e) => { console.error(e); document.getElementById('app').innerHTML = `<div class="empty"><div class="big">Failed to load</div>${esc(e.message)}</div>`; });
+
+// MCP choices belong to the agent, independent of the model login.
+function mcpScope(projectId = S.projectId, organizationId = S.organizationId) {
+  return projectId ? `?projectId=${encodeURIComponent(projectId)}` : `?organizationId=${encodeURIComponent(organizationId)}`;
+}
+function mcpPickerHtml(value, inherited) {
+  return `<div class="mcp-picker" data-value='${esc(JSON.stringify(value ?? null))}' data-inherited='${esc(JSON.stringify(inherited ?? null))}'>
+    <div class="mcp-picker-heading"><b>Tools</b><button type="button" class="btn sm mcp-manage">Manage connections</button></div>
+    <details class="mcp-choices"><summary>Loading tools…</summary><input class="mcp-filter" type="search" aria-label="Search tool connections" placeholder="Search connections…"><div class="mcp-options" role="group" aria-label="Tool connections"></div></details>
+    <label class="mcp-inherit"><input type="checkbox" ${value === undefined ? 'checked' : ''}> Use inherited tools</label><div class="mcp-picker-status" role="status"></div>
+  </div>`;
+}
+function readMcpPicker(root) {
+  const picker = root.querySelector('.mcp-picker');
+  if (!picker || picker.querySelector('.mcp-inherit input').checked) return undefined;
+  return JSON.parse(picker.dataset.value || '[]') || [];
+}
+async function wireMcpPicker(picker, query = mcpScope()) {
+  if (!picker) return;
+  picker.dataset.scope = query;
+  const inherited = JSON.parse(picker.dataset.inherited || 'null');
+  const own = JSON.parse(picker.dataset.value || 'null');
+  let selected = new Set(own ?? inherited ?? []);
+  let connections = [];
+  const defaults = [{ id: 'browser:chrome-devtools', label: 'Chrome DevTools', enabled: true }, { id: 'browser:playwright', label: 'Playwright', enabled: true }];
+  function paint() {
+    const all = [...defaults, ...connections];
+    for (const id of selected) if (!all.some((c) => c.id === id)) all.push({ id, label: 'Unavailable connection', enabled: false });
+    const filter = picker.querySelector('.mcp-filter').value.toLowerCase();
+    picker.querySelector('.mcp-options').innerHTML = all.filter((c) => c.label.toLowerCase().includes(filter)).map((c) =>
+      `<label class="mcp-option"><input type="checkbox" value="${esc(c.id)}" ${selected.has(c.id) ? 'checked' : ''} ${!c.enabled && !selected.has(c.id) ? 'disabled' : ''}><span>${esc(c.label)}${!c.enabled ? ' · unavailable' : c.connected === false ? ' · needs connection' : ''}</span></label>`).join('');
+    const names = [...selected].map((id) => all.find((c) => c.id === id)?.label || id);
+    const inherit = picker.querySelector('.mcp-inherit input').checked;
+    picker.querySelector('summary').textContent = names.length ? `${names.join(', ')}${inherit ? ' · inherited' : ''}` : inherit && inherited === null ? 'Inherited · account browser if configured' : 'Karmax tools only';
+    picker.dataset.value = JSON.stringify([...selected]);
+  }
+  picker.querySelector('.mcp-filter').oninput = paint;
+  picker.querySelector('.mcp-options').onchange = (event) => {
+    const input = event.target;
+    if (input.checked) {
+      if (input.value.startsWith('browser:')) for (const id of [...selected]) if (id.startsWith('browser:')) selected.delete(id);
+      selected.add(input.value);
+    } else selected.delete(input.value);
+    picker.querySelector('.mcp-inherit input').checked = false;
+    paint(); picker.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  picker.querySelector('.mcp-inherit input').onchange = (event) => {
+    if (event.target.checked) selected = new Set(inherited ?? []);
+    paint();
+  };
+  picker.querySelector('.mcp-manage').onclick = () => openMcpManager(query, async () => {
+    connections = await api(`/api/mcp${query}`); paint();
+    for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
+  });
+  try { connections = await api(`/api/mcp${query}`); paint(); }
+  catch (e) { paint(); picker.querySelector('.mcp-picker-status').textContent = e.message; }
+}
+async function openMcpManager(query, changed = async () => {
+  await Promise.all([...document.querySelectorAll('.mcp-picker')].filter((p) => p.dataset.scope === query).map((p) => wireMcpPicker(p, query)));
+}) {
+  const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog'; dialog.setAttribute('aria-label', 'MCP connections');
+  dialog.innerHTML = `<div class="mcp-dialog-header"><div><h2>MCP connections</h2><p>Connect tools once, then choose them for any agent.</p></div><button type="button" class="btn sm mcp-close" aria-label="Close connections">✕</button></div>
+    <div class="mcp-manager-list">Loading connections…</div><button type="button" class="btn primary mcp-add">Add connection</button><div class="mcp-editor" hidden></div><p class="mcp-message" role="status"></p>`;
+  document.body.append(dialog); dialog.showModal();
+  dialog.querySelector('.mcp-close').onclick = () => dialog.close();
+  dialog.addEventListener('close', () => dialog.remove());
+  const message = (s) => { dialog.querySelector('.mcp-message').textContent = s; };
+  async function load() {
+    const connections = await api(`/api/mcp${query}`);
+    const pid = new URLSearchParams(query).get('projectId') || undefined;
+    dialog.querySelector('.mcp-manager-list').innerHTML = connections.length ? connections.map((c) => `<div class="mcp-connection-row"><div><b>${esc(c.label)}</b><small>${esc(c.registry ? `${c.registry.name} · ${c.registry.version}` : c.transport.type === 'stdio' ? 'Custom process' : new URL(c.transport.url).hostname)} · ${c.enabled ? c.connected ? 'Ready to use' : 'Needs authentication' : 'Disabled'}${c.projectId !== pid ? ' · organization connection' : ''}</small></div><div>${c.projectId === pid ? `${c.transport.type !== 'stdio' ? `<button type="button" class="btn sm" data-mcp-test="${c.id}">Test</button>` : ''}${c.auth === 'oauth' ? `<button type="button" class="btn sm" data-mcp-connect="${c.id}">Connect</button>` : ''}<button type="button" class="btn sm" data-mcp-edit="${c.id}">Edit</button><button type="button" class="btn sm" data-mcp-delete="${c.id}">Remove</button>` : ''}</div></div>`).join('') : '<p>No connections yet. Add one from the Official MCP Registry or use your own server.</p>';
+    dialog.querySelectorAll('[data-mcp-edit]').forEach((b) => { b.onclick = () => editor(connections.find((c) => c.id === b.dataset.mcpEdit)); });
+    dialog.querySelectorAll('[data-mcp-delete]').forEach((b) => { b.onclick = async () => {
+      if (b.dataset.confirm !== 'yes') { b.dataset.confirm = 'yes'; b.textContent = 'Confirm removal'; return; }
+      try { await api(`/api/mcp/${b.dataset.mcpDelete}${query}`, { method: 'DELETE' }); await load(); await changed(); } catch (e) { message(e.message); }
+    }; });
+    dialog.querySelectorAll('[data-mcp-test]').forEach((b) => { b.onclick = async () => {
+      b.disabled = true; message('Testing connection…');
+      try { const result = await api(`/api/mcp/${b.dataset.mcpTest}/test${query}`, { method: 'POST', body: '{}' }); message(`Connection works · ${result.tools}${result.moreTools ? '+' : ''} tools${result.resources ? ' · resources' : ''}${result.prompts ? ' · prompts' : ''}`); }
+      catch (e) { message(e.message); } finally { b.disabled = false; }
+    }; });
+    dialog.querySelectorAll('[data-mcp-connect]').forEach((b) => { b.onclick = () => authorize(b.dataset.mcpConnect); });
+  }
+  async function authorize(id, existingWindow) {
+    const popup = existingWindow || window.open('about:blank', '_blank');
+    if (!popup) { message('Allow pop-ups, then click Connect to sign in. Your form is preserved.'); return; }
+    try {
+      const result = await api(`/api/mcp/${id}/authorize${query}`, { method: 'POST', body: '{}' });
+      const authUrl = new URL(result.authorizationUrl), state = authUrl.searchParams.get('state');
+      popup.sessionStorage.setItem(`mcp-oauth:${state}`, JSON.stringify({ id, query, popup: true, back: location.pathname + location.search + location.hash }));
+      // The authorization site must never gain a reference to the task form.
+      popup.opener = null;
+      const channel = new BroadcastChannel(`mcp-oauth:${state}`);
+      const timeout = setTimeout(() => channel.close(), 600000);
+      channel.onmessage = async (event) => {
+        if (event.data !== 'connected') return;
+        clearTimeout(timeout); channel.close();
+        if (dialog.isConnected) { message('Connected. Your agent can now use these tools.'); await load(); await changed(); }
+      };
+      popup.location.replace(authUrl.href);
+      message('Complete sign-in in the new tab. This form will stay here.');
+    } catch (e) { popup.close(); message(e.message); }
+  }
+  function editor(existing) {
+    const box = dialog.querySelector('.mcp-editor'); box.hidden = false;
+    box.innerHTML = `<h3>${existing ? 'Edit connection' : 'Add connection'}</h3>${existing ? '' : `<div class="mcp-registry-search"><label>Official MCP Registry<input type="search" class="mcp-registry-query" placeholder="Search servers, e.g. GitHub" /></label><button type="button" class="btn sm mcp-search">Search</button></div><div class="mcp-registry-results" aria-live="polite"></div><p class="task-sub">Registry listings identify publishers; they are not a security certification. Or enter a custom server below.</p>`}
+      <form class="mcp-connection-form"><label>Connection name<input class="mcp-label" required maxlength="120" placeholder="GitHub — work" value="${esc(existing?.label || '')}"></label>
+      <label>Connection type<select class="mcp-type"><option value="http">Remote HTTPS</option><option value="sse">Remote HTTPS (SSE)</option><option value="stdio">Process in task environment</option></select></label>
+      <label class="mcp-url-row">Server URL<input class="mcp-url" type="url" placeholder="https://example.com/mcp"></label>
+      <div class="mcp-process" hidden><label>Command<input class="mcp-command" placeholder="npx"></label><label>Arguments (JSON array)<textarea class="mcp-args" rows="3" spellcheck="false">[]</textarea></label><label>Public environment values (JSON object)<textarea class="mcp-env" rows="2" spellcheck="false">{}</textarea></label><p class="task-sub">Runs with access to this task’s files. Use pinned package versions. The task environment must provide the command.</p></div>
+      <label>Authentication<select class="mcp-auth"><option value="none">No authentication</option><option value="oauth">Sign in with OAuth</option><option value="secrets">API key / secret values</option></select></label>
+      <div class="mcp-secrets" hidden><p class="task-sub">HTTP header names for remote servers; environment variable names for processes. Saved values are kept in the vault.</p><div class="mcp-secret-fields"></div><button type="button" class="btn sm mcp-secret-add">Add secret</button>${existing?.secretNames?.length ? '<p>Leave existing values blank to keep them.</p>' : ''}</div>
+      <div class="mcp-registry-fields"></div><label class="mcp-enabled"><input type="checkbox" ${existing?.enabled !== false ? 'checked' : ''}> Enabled</label>
+      <div class="mcp-form-actions"><button class="btn primary" type="submit">Save connection</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button></div></form>`;
+    const form = box.querySelector('form'); let registry = existing?.registry; let fields = []; let secretDirty = false;
+    const type = form.querySelector('.mcp-type'); const auth = form.querySelector('.mcp-auth');
+    function sync() {
+      const process = type.value === 'stdio';
+      form.querySelector('.mcp-url-row').hidden = process; form.querySelector('.mcp-url').required = !process;
+      form.querySelector('.mcp-process').hidden = !process; form.querySelector('.mcp-command').required = process;
+      auth.querySelector('[value="oauth"]').disabled = process;
+      if (process && auth.value === 'oauth') auth.value = 'secrets';
+      form.querySelector('.mcp-secrets').hidden = auth.value !== 'secrets';
+    }
+    function addSecret(name = '', value = '') {
+      const row = document.createElement('div'); row.className = 'mcp-secret-row';
+      row.innerHTML = `<input class="mcp-secret-name" aria-label="Secret name" placeholder="${type.value === 'stdio' ? 'API_KEY' : 'Authorization'}" value="${esc(name)}"><input class="mcp-secret-value" type="password" autocomplete="new-password" aria-label="Secret value" placeholder="${existing ? 'Saved value unchanged' : 'Secret value'}" value="${esc(value)}"><button class="btn sm" type="button" aria-label="Remove secret">✕</button>`;
+      row.querySelector('button').onclick = () => { row.remove(); secretDirty = true; };
+      row.oninput = () => { secretDirty = true; };
+      form.querySelector('.mcp-secret-fields').append(row);
+    }
+    function fill(transport) {
+      type.value = transport?.type || 'http'; form.querySelector('.mcp-url').value = transport?.url || '';
+      form.querySelector('.mcp-command').value = transport?.command || '';
+      form.querySelector('.mcp-args').value = JSON.stringify(transport?.args || [], null, 2);
+      form.querySelector('.mcp-env').value = JSON.stringify(transport?.env || {}, null, 2); sync();
+    }
+    auth.value = existing?.auth || 'none'; fill(existing?.transport);
+    for (const name of existing?.secretNames || []) addSecret(name);
+    type.onchange = sync; auth.onchange = sync;
+    form.querySelector('.mcp-secret-add').onclick = () => addSecret();
+    form.querySelector('.mcp-editor-cancel').onclick = () => { box.hidden = true; };
+    let searchGeneration = 0;
+    async function search(cursor = '') {
+      const generation = ++searchGeneration; const results = box.querySelector('.mcp-registry-results'); results.textContent = 'Searching Official MCP Registry…';
+      try {
+        const result = await api(`/api/mcp/registry${query}&search=${encodeURIComponent(box.querySelector('.mcp-registry-query').value)}&cursor=${encodeURIComponent(cursor)}`);
+        if (generation !== searchGeneration || !box.isConnected) return;
+        results.innerHTML = result.servers.length ? result.servers.map((s, i) => `<div class="mcp-registry-result"><b>${esc(s.title)}</b><small>${esc(s.name)} · ${esc(s.version)}</small><p>${esc(s.description)}</p>${s.options.length ? s.options.map((o, j) => `<button type="button" class="btn sm" data-registry-option="${i}:${j}">Use ${esc(o.label)}</button>`).join(' ') : '<small>This server needs custom configuration. Enter its server details below.</small>'}</div>`).join('') : '<p>No matching servers. Try another name or enter a custom server.</p>';
+        results.querySelectorAll('[data-registry-option]').forEach((b) => { b.onclick = () => {
+          const [i, j] = b.dataset.registryOption.split(':').map(Number); const s = result.servers[i], option = s.options[j];
+          registry = { name: s.name, version: s.version }; fields = option.fields;
+          form.querySelector('.mcp-label').value = s.title; fill(option.transport);
+          form.querySelector('.mcp-registry-fields').innerHTML = fields.map((f, n) => `<label>${esc(f.name || f.description || `Argument ${n + 1}`)}${f.isRequired ? ' *' : ''}<input data-registry-field="${n}" type="${f.isSecret ? 'password' : 'text'}" ${f.isRequired && f.value === undefined ? 'required' : ''} value="${esc(f.value ?? f.default ?? '')}" placeholder="${esc(f.description || '')}"></label>`).join('');
+          results.textContent = `Selected ${s.name} · ${s.version}`;
+          form.querySelector('.mcp-label').focus();
+        }; });
+        if (result.nextCursor) { const next = document.createElement('button'); next.type = 'button'; next.className = 'btn sm'; next.textContent = 'More servers'; next.onclick = () => search(result.nextCursor); results.append(next); }
+      } catch (e) { if (generation === searchGeneration) results.textContent = e.message; }
+    }
+    box.querySelector('.mcp-search')?.addEventListener('click', () => search());
+    box.querySelector('.mcp-registry-query')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); search(); } });
+    form.onsubmit = async (event) => {
+      event.preventDefault(); const oauthWindow = auth.value === 'oauth' ? window.open('about:blank', '_blank') : null; const save = form.querySelector('[type="submit"]'); save.disabled = true; message('Saving connection…');
+      try {
+        const transport = type.value === 'stdio' ? { type: 'stdio', command: form.querySelector('.mcp-command').value.trim(), args: JSON.parse(form.querySelector('.mcp-args').value), env: JSON.parse(form.querySelector('.mcp-env').value) } : { type: type.value, url: form.querySelector('.mcp-url').value.trim() };
+        const secrets = {}; const secretRows = [...form.querySelectorAll('.mcp-secret-row')];
+        for (const row of secretRows) { const name = row.querySelector('.mcp-secret-name').value.trim(), value = row.querySelector('.mcp-secret-value').value; if (name && value) secrets[name] = value; }
+        for (const [n, f] of fields.entries()) {
+          const value = form.querySelector(`[data-registry-field="${n}"]`).value;
+          if (!value) continue;
+          if (f.target === 'argument') {
+            if (f.type === 'named' && f.name) transport.args.push(f.name);
+            if (f.isSecret) { const name = `MCP_ARGUMENT_${n}`; secrets[name] = value; transport.args.push(`{{${name}}}`); }
+            else transport.args.push(value);
+          } else if (f.isSecret || transport.type !== 'stdio') secrets[f.name] = value;
+          else transport.env[f.name] = value;
+        }
+        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input').checked, registry,
+          ...(Object.keys(secrets).length || secretDirty ? { secrets, mergeSecrets: !!existing, retainSecretNames: secretRows.map((row) => row.querySelector('.mcp-secret-name').value.trim()) } : {}) }) });
+        box.hidden = true; message('Connection saved. Choose it in Agent → Tools.'); await load(); await changed();
+        if (saved.auth === 'oauth') await authorize(saved.id, oauthWindow); else oauthWindow?.close();
+      } catch (e) { oauthWindow?.close(); message(e.message); }
+      finally { save.disabled = false; }
+    };
+  }
+  dialog.querySelector('.mcp-add').onclick = () => editor();
+  try { await load(); } catch (e) { message(e.message); }
+}
+async function finishMcpCallback() {
+  const params = new URLSearchParams(location.search), state = params.get('state') || '';
+  const key = `mcp-oauth:${state}`; let pending;
+  try { pending = JSON.parse(sessionStorage.getItem(key) || 'null'); } catch {}
+  history.replaceState({}, '', '/mcp-callback');
+  document.querySelector('#app').innerHTML = '<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to Tavya</a></main>';
+  const status = document.querySelector('.mcp-callback p');
+  try {
+    if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
+    if (params.get('error')) throw new Error('Authorization was declined. You can try again in connection settings.');
+    await api(`/api/mcp/${pending.id}/callback${pending.query}`, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
+    sessionStorage.removeItem(key);
+    if (pending.popup) {
+      const channel = new BroadcastChannel(`mcp-oauth:${state}`); channel.postMessage('connected'); channel.close();
+      document.querySelector('.mcp-callback h1').textContent = 'Connected'; status.textContent = 'You can close this tab and return to your task.';
+      window.close(); return;
+    }
+    location.replace(pending.back.startsWith('/') && !pending.back.startsWith('//') ? pending.back : '/');
+  } catch (e) { status.textContent = e.message; }
+}

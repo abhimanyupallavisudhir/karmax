@@ -48,7 +48,7 @@ export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMa
   for (const f of manifest.params) {
     let v: unknown = f.default;
     // Fold from lowest precedence up: each non-empty higher layer wins.
-    for (let i = layers.length - 1; i >= 0; i--) v = pick(layers[i]?.[f.name], v);
+    for (let i = layers.length - 1; i >= 0; i--) v = (f.type === 'agent' ? pickAgent : pick)(layers[i]?.[f.name], v);
     if (v !== undefined) out[f.name] = v;
   }
   resolveAgentGroup(manifest, layers, out);
@@ -75,8 +75,8 @@ function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undef
     for (let i = layers.length - 1; i >= 0; i--) {
       const layer = layers[i];
       if (!layer) continue;
-      const legacyMerge = manifest.name === 'merge-only' ? pick(layer['agent:merge'], resolved) : resolved;
-      resolved = pick(layer['agent:do'], pick(layer['agent:unified'], legacyMerge));
+      const legacyMerge = manifest.name === 'merge-only' ? pickAgent(layer['agent:merge'], resolved) : resolved;
+      resolved = pickAgent(layer['agent:do'], pickAgent(layer['agent:unified'], legacyMerge));
     }
     if (resolved !== undefined) {
       out['agent:do'] = resolved;
@@ -97,10 +97,10 @@ function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undef
       (layer.separateAgents === undefined && AGENT_GROUP_ROLES.some((role) => layer[`agent:${role}`] !== undefined));
     topSeparate = separate;
     if (separate) {
-      for (const role of AGENT_GROUP_ROLES) resolved[role] = pick(layer[`agent:${role}`], resolved[role]);
+      for (const role of AGENT_GROUP_ROLES) resolved[role] = pickAgent(layer[`agent:${role}`], resolved[role]);
       continue;
     }
-    const unified = pick(layer['agent:unified'], pick(layer['agent:do'], resolved.do));
+    const unified = pickAgent(layer['agent:unified'], pickAgent(layer['agent:do'], resolved.do));
     if (unified !== undefined) {
       resolved.do = unified;
       resolved.merge = withoutResume(unified);
@@ -118,6 +118,17 @@ function withoutResume(value: unknown): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const { resumeFrom: _resumeFrom, ...rest } = value as Record<string, unknown>;
   return rest;
+}
+
+/** Tool selection inherits independently when a higher layer changes model. */
+function pickAgent(a: unknown, fallback: unknown): unknown {
+  const chosen = pick(a, fallback);
+  if (chosen === a && a && typeof a === 'object' && !Array.isArray(a)
+    && fallback && typeof fallback === 'object' && !Array.isArray(fallback)
+    && (a as AgentSpec).mcpConnections === undefined
+    && (fallback as AgentSpec).mcpConnections !== undefined)
+    return { ...a, mcpConnections: (fallback as AgentSpec).mcpConnections };
+  return chosen;
 }
 
 function pick<T>(a: T, fallback: T): T {
@@ -178,6 +189,7 @@ export function assembleTaskInput(
                   ...(l.provider ? { provider: l.provider } : {}),
                   ...(l.model ? { model: l.model } : {}),
                   ...(l.effort ? { effort: l.effort } : {}),
+                  ...(l.mcpConnections !== undefined ? { mcpConnections: l.mcpConnections } : {}),
                   ...(l.resumeFrom ? { resumeFrom: l.resumeFrom } : {}),
                   ...(l.prompt?.trim() ? { prompt: l.prompt } : {}),
                 }
@@ -196,6 +208,7 @@ export function assembleTaskInput(
                 ...(route.provider ? { provider: route.provider } : {}),
                 ...(route.model ? { model: route.model } : {}),
                 ...(route.effort ? { effort: route.effort } : {}),
+                ...(route.mcpConnections !== undefined ? { mcpConnections: route.mcpConnections } : {}),
                 ...(route.resumeFrom ? { resumeFrom: route.resumeFrom } : {}),
                 ...(route.prompt?.trim() ? { prompt: route.prompt } : {}),
               }

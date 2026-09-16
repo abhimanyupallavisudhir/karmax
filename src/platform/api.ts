@@ -1427,6 +1427,7 @@ export class KarmaxApi {
         ...(model ? { model } : {}),
         ...(effort ? { effort: effort as AgentSpec['effort'] } : {}),
         ...(resumeFrom ? { resumeFrom } : {}),
+        ...(profile?.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
       };
     }
     resolved['agent:do'] = spec;
@@ -1455,6 +1456,7 @@ export class KarmaxApi {
         provider: profile.provider,
         ...(profile.model ? { model: profile.model } : {}),
         ...(profile.effort ? { effort: profile.effort } : {}),
+        ...(profile.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
         ...(selected?.resumeFrom ? { resumeFrom: selected.resumeFrom } : {}),
         ...(selected?.avatarId ? { avatarId: selected.avatarId } : {}),
         ...(selected?.avatarPurpose ? { avatarPurpose: selected.avatarPurpose } : {}),

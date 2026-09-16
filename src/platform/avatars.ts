@@ -97,6 +97,7 @@ export function applyAvatarProfile(base: AgentProfile, spec: AgentSpec | undefin
     ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
     ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
     ...(spec?.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}),
+    ...(spec?.mcpConnections !== undefined ? { mcpConnections: spec.mcpConnections } : {}),
     avatarId: avatar.id,
     ...(spec?.avatarPurpose ? { avatarPurpose: spec.avatarPurpose } : {}),
   };
