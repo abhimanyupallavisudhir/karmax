@@ -40,6 +40,8 @@ export interface ConfirmationPolicy {
 }
 
 export interface Organization {
+  /** Name discovery only; never grants access to organization resources. */
+  nameVisibility: 'members' | 'public';
   id: string;
   name: string;
   slug: string;
@@ -1456,6 +1458,7 @@ export interface ResponderConfig extends Partial<AgentSpec> {
  *  `revise` sends the task back to Do (with an optional comment), `reject` cancels. */
 export type ConfirmAction = 'confirm' | 'revise' | 'reject';
 export interface ConfirmDecision {
+  otherAttempts?: 'keep' | 'cancel';
   action: ConfirmAction;
   text?: string;
 }

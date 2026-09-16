@@ -45,7 +45,7 @@ export interface PlatformOps {
   listTags(projectId: string): Promise<{ path: string; kind?: string; description?: string }[]>;
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
-  signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
+  signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
@@ -115,7 +115,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     listTags: async (pid) => compactTags(await api.listTags(getToken(), pid)),
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
-    signalTask: async (id, sig, text, role) => void (await api.signalTask(getToken(), id, sig as any, text, role)),
+    signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
@@ -207,7 +207,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     listTags: async (pid) => compactTags((await req(`/api/projects/${pid}/tags`)) as any[]),
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
-    signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
+    signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
@@ -741,11 +741,13 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       inputSchema: {
         taskId: z.string(),
         signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']),
+        otherAttempts: z.enum(['keep', 'cancel']).optional(),
+        saveOtherAttemptsDefault: z.boolean().optional().describe('Save as project default; requires project:settings:write.'),
         text: z.string().optional(),
         role: z.enum(AGENT_ROLE_NAMES).optional(),
       },
     },
-    async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role); return 'signalled'; }),
+    async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role, a.otherAttempts, a.saveOtherAttemptsDefault); return 'signalled'; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {

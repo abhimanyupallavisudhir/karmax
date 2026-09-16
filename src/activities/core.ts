@@ -1967,12 +1967,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : forkOrigin.unpublished
             ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
             : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
+      const attemptGroup = store.attemptGroup(args.taskId);
+      const attemptContext = attemptGroup && attemptGroup.attempts.length > 1
+        ? `\n\nThis task has ${attemptGroup.attempts.length} attempts. Other attempts: ${attemptGroup.otherAttempts ?? store.otherAttemptsDefault(args.taskId)}. `
+          + (args.role === 'confirm' && !attemptGroup.committedAttemptId
+            ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
+            : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
+        : '';
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
         world: args.worldHandle,
-        globalInstructions: globalInstructions + forkContext,
+        globalInstructions: globalInstructions + forkContext + attemptContext,
         projectInstructions,
         bindings,
       });
@@ -2405,11 +2412,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
+        if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
+          store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts);
+        }
         if (confirmTranscript) {
           if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
           if (result.confirmDecision) {
             const d = result.confirmDecision;
-            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
           }
           store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript));
         }
@@ -4552,9 +4562,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // next publication may reference the same immutable snapshot.
       if (view.state?.humanPauseOrigin && view.status === 'active' && !view.waitingFor) return;
       store.saveView(taskId, view);
-      // Entering Merge is the logical commitment boundary. The SQLite compare-and-
-      // set is the winner lease: exactly one attempt may get past this awaited
-      // activity and approach the global merge queue.
+      // First Merge admission freezes whether sibling proposals remain eligible.
+      // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {
         const claim = store.claimAttempt(taskId);
         for (const siblingId of claim.cancel) {
@@ -4565,6 +4574,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           await deps.client?.workflow.getHandle(siblingId).signal('cancel').catch(() => undefined);
         }
+        if (!claim.accepted) throw ApplicationFailure.nonRetryable('Another attempt cancelled this proposal at Merge admission', 'attempt-superseded');
       }
       record(taskId, 'view.updated', {
         stage: view.stage,

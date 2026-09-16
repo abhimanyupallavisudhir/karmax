@@ -21,6 +21,8 @@ global.renderMessageImages = () => '';
 // Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
 // these assertions stay about the timeline, not the message body renderer.
 global.markdownEnabled = () => false;
+global.mathjaxEnabled = () => true;
+eval(extractFn('conversationMathEnabled'));
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
 global.hostLocal = () => true;
@@ -212,6 +214,8 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 
 // Forking addresses the conversation being viewed, including completed agents
 // and sessions without a native CLI/config home.
+eval(extractFn('reviewActionBtn'));
+eval(extractFn('conversationReviewInfo'));
 eval(extractFn('conversationPane'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
@@ -243,6 +247,28 @@ for (const status of ['done', 'cancelled', 'waiting']) {
 }
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
 
+// Review info is task-wide, compact, and follows the conversation in every role.
+for (const info of [undefined, {}, { completion: 'finished' }]) {
+  ok(conversationReviewInfo({ reviewInfo: info }) === '', 'empty review info reserves no space');
+}
+const reviewView = { ...forkView, reviewInfo: {
+  caption: 'Check <layout>',
+  actions: [{ kind: 'open', label: 'Report', target: 'report.md' }, { kind: 'run', label: 'Preview', command: 'npm start' }],
+  links: [{ label: 'Unsafe link', url: 'javascript:alert(1)' }],
+  html: '<iframe>large preview</iframe>',
+} };
+for (const role of ['do', 'merge', 'confirm', 'resolve']) {
+  const html = conversationPane(reviewView, { role, messages: [{ id: 'final', role: 'agent', text: 'Final response', ts: 1 }] });
+  ok(html.indexOf('Review info') > html.indexOf('Final response'), `${role} review info follows the conversation`);
+  ok(html.includes('Check &lt;layout&gt;'), 'review caption is escaped');
+  ok(html.includes('data-idx="1" data-kind="run"'), 'review actions preserve API indices');
+  ok(html.includes('class="raw hidden" id="review-action-out"'), 'command output takes no space until run');
+  ok(html.includes('href="#"'), 'unsafe legacy link is neutralized');
+  ok(html.includes('data-tasktab="overview"') && !html.includes('<iframe>'), 'large preview is linked in Overview');
+  ok((html.match(/id="review-actions"/g) || []).length === 1, 'review actions have a single wiring target');
+}
+
+
 // Input prompts use the same model picker, pending/error UI, and durable annotations.
 eval(extractFn('humanWaitDetail'));
 eval(extractFn('conversationInputRequest'));
@@ -271,6 +297,16 @@ ok(requestHtml.indexOf('Choose a deployment target.') < requestHtml.indexOf('Pic
 const resolvedHtml = conversationPane({ ...requestView, status: 'active', waitingFor: undefined }, requestTranscript);
 ok(resolvedHtml.includes('Choose a deployment target.') && resolvedHtml.includes('Pick where the update should go.'), 'resolved prompt and explanation survive reload');
 ok(!conversationPane(requestView, { role: 'merge', messages: [] }).includes('input-request'), 'input explanation stays in its own conversation');
+
+// The control is present beside Explain and reflects the entire conversation.
+global.markdownEnabled = () => true;
+const mathEntry = { sourceKey: 'message:math', conversationRole: 'merge' };
+ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="true"'), 'math toggle inherits enabled profile');
+S.conversationMath = { [JSON.stringify([S.view.taskId, 'merge'])]: false };
+ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="false"'), 'math toggle reflects conversation override');
+ok(explainMessageAffordance({ ...mathEntry, conversationRole: 'do' }, S.view).includes('aria-pressed="true"'), 'other agent toggle remains enabled');
+global.markdownEnabled = () => false;
+ok(explainMessageAffordance(mathEntry, S.view).includes('disabled><span class="tex-mark"'), 'math toggle explains Markdown prerequisite and is disabled without it');
 
 // Task 219 stored updatedAt=17: a workflow revision must not send an explained
 // request to the start of the thread. Include surrounding history (the original

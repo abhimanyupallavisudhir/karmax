@@ -175,7 +175,6 @@ a { color: var(--accent); text-decoration: none; }
   border-color: var(--accent); color: var(--ink);
   box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600;
 }
-.org-switcher { max-width: 230px; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 28px 6px 9px; font-weight: 600; }
 .topbar .search {
   flex: 1; max-width: 420px;
   display: flex; align-items: center; gap: 8px;
@@ -230,6 +229,29 @@ a { color: var(--accent); text-decoration: none; }
   background: transparent; color: var(--ink-3); cursor: pointer; transition: color .12s, background .12s;
 }
 .rail .rail-add:hover, .rail .rail-add:focus-visible { background: var(--surface-2); color: var(--accent); outline: none; }
+/* Project search shares the rail's row geometry and quiet surface treatment. */
+.rail-search-box {
+  display: flex; align-items: center; gap: 7px; flex-shrink: 0;
+  margin: 4px 0 8px; padding: 0 9px; min-height: 32px;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface-2); color: var(--ink-3); cursor: text;
+  transition: border-color .12s, background .12s;
+}
+.rail-search-box:hover { border-color: var(--line-strong); }
+.rail-search-box:focus-within {
+  border-color: var(--accent); background: var(--surface);
+  outline: 2px solid var(--accent-weak);
+}
+.rail-search-icon { width: 16px; height: 16px; flex: none; }
+.rail-search-box:focus-within .rail-search-icon { color: var(--accent); }
+.rail .rail-search {
+  appearance: none; flex: 1; width: 100%; min-width: 0; margin: 0; padding: 6px 0;
+  border: 0; border-radius: 0; outline: none; background: transparent;
+  color: var(--ink); font: 12px/18px var(--font-ui);
+}
+.rail .rail-search::placeholder { color: var(--ink-2); opacity: 1; }
+.rail-search-empty { padding: 8px 10px; color: var(--ink-3); font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { .rail-search-box { transition: none; } }
 .rail .proj {
   display: flex; align-items: center; gap: 7px;
   padding: 7px 10px 7px calc(10px + 14px * var(--depth, 0));
@@ -533,7 +555,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .team-rename-form[hidden] { display:none; }
 .inline-form { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
 .inline-form input, .inline-form select { min-width:0; flex:1; padding:7px 9px; border:1px solid var(--line); background:var(--surface-2); border-radius:7px; }
-@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .org-switcher { max-width:140px; } .settings-disclosure > summary span { display:none; } .settings-layout { grid-template-columns:1fr; gap:14px; } .settings-nav { position:sticky; top:0; z-index:4; flex-direction:row; overflow-x:auto; padding:8px 0; border:0; border-bottom:1px solid var(--line); background:var(--paper); } .settings-nav > span { display:none; } .settings-nav a { white-space:nowrap; } .settings-nav a::before { display:none; } .project-kind-guide { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .settings-disclosure > summary span { display:none; } .settings-layout { grid-template-columns:1fr; gap:14px; } .settings-nav { position:sticky; top:0; z-index:4; flex-direction:row; overflow-x:auto; padding:8px 0; border:0; border-bottom:1px solid var(--line); background:var(--paper); } .settings-nav > span { display:none; } .settings-nav a { white-space:nowrap; } .settings-nav a::before { display:none; } .project-kind-guide { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media (max-width: 560px) { .project-form-grid { grid-template-columns:1fr; } .project-form-grid .form-row.wide { grid-column:auto; } .project-kind-guide { grid-template-columns:1fr 1fr; } .new-repository-identity { grid-template-columns:1fr; } .new-repository-slash { display:none; } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -921,6 +943,12 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .msg.input-request { background: var(--accent-weak); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); border-inline-start: 3px solid var(--accent); }
 .msg.input-request .msg-meta { margin-bottom: 7px; }
 .msg.input-request .role { color: var(--accent); font-weight: 600; opacity: 1; }
+.msg.review-info { padding: 7px 10px; font-size: 12px; }
+.review-info-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 9px; }
+.review-info-line .role { flex-shrink: 0; }
+.review-info-caption { white-space: pre-wrap; }
+.review-info .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
+.review-info #review-action-out { max-height: 180px; overflow: auto; margin: 5px 0 0; }
 .msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
 /* A little copy control per message — faint until the bubble is hovered. */
@@ -936,6 +964,13 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .explain-run:disabled, .explain-more:disabled { cursor: wait; opacity: .65; }
 .explain-more { display: inline-flex; align-items: center; font-style: normal; }
 .explain-more svg { width: 16px; height: 16px; }
+.conversation-math { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; min-height: 24px; margin-left: 4px; padding: 2px 5px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.conversation-math:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.conversation-math[aria-pressed="true"] { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 25%, transparent); }
+.conversation-math:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.conversation-math:disabled { opacity: .45; cursor: default; }
+.tex-mark { font: 15px/1 Georgia, 'Times New Roman', serif; letter-spacing: -.08em; padding-right: .08em; }
+.tex-mark > span { display: inline-block; position: relative; top: .2em; font-size: .8em; margin-left: -.08em; margin-right: -.03em; }
 .explain-error { flex-basis: 100%; color: var(--danger); font: normal 11px/1.45 var(--font-ui); padding: 5px 3px 0; }
 .explain-error a { color: inherit; text-decoration: underline; }
 .explanation-form { width: min(580px, calc(100vw - 28px)); }
@@ -1222,18 +1257,6 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .verify-dismiss:hover { color: var(--ink-1); }
 .profile-orgs { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
-.profile-org {
-  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
-  border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
-  color: var(--ink-1);
-}
-.profile-org:hover { border-color: var(--accent); background: var(--accent-weak); }
-.profile-org-link {
-  display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;
-  color: inherit; text-decoration: none;
-}
-.profile-org-mark { color: var(--ink-3); }
-.profile-org-name { font-weight: 600; flex: 1; }
 .github-mark { width: 16px; height: 16px; flex: none; }
 .github-account-list { display: grid; gap: 8px; margin-bottom: 10px; }
 .github-account-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
@@ -1749,7 +1772,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   .topbar .brand { font-size:0; gap:0; }
   .topbar #topbar-help, .topbar #topbar-palette { display:none; }
   .topbar-user { max-width:84px; padding:0 9px; }
-  .org-switcher { max-width:105px; }
   .body { grid-template-columns: 1fr; }
   .rail {
     display:flex; position:fixed; z-index:80; left:0; top:52px; bottom:0;
@@ -2606,3 +2628,19 @@ html[data-theme="dark"] .github-signin-btn:active,
 .mcp-manager-list { margin-bottom:16px; }.mcp-editor { margin-top:20px; border-top:1px solid var(--line); }.mcp-connection-form>label,.mcp-process label,.mcp-registry-fields label { display:block; margin:12px 0; }.mcp-connection-form label>input,.mcp-connection-form label>select,.mcp-connection-form label>textarea { margin-top:5px; }
 .mcp-secret-row { margin:8px 0; }.mcp-secret-row input { min-width:0; }.mcp-registry-result { border-bottom:1px solid var(--line); padding:12px 0; }.mcp-registry-result button { max-width:100%; overflow-wrap:anywhere; white-space:normal; }.mcp-registry-search { display:flex; align-items:flex-end; gap:8px; }.mcp-registry-search label { flex:1; }.mcp-message { min-height:20px; }.mcp-callback { max-width:520px; margin:15vh auto; padding:24px; }
 @media(max-width:540px) { .mcp-dialog { padding:16px; }.mcp-connection-row { align-items:flex-start; flex-direction:column; }.mcp-secret-row { flex-wrap:wrap; }.mcp-secret-row input { flex:1; min-width:120px; } }
+/* Resource decisions belong to the active input request in the conversation. */
+.input-request .resource-review-card { flex-direction: column; }
+.input-request .resource-review-card > div { width: 100%; min-width: 0; }
+.input-request .resource-review-card .inline-form { flex-wrap: wrap; }
+
+/* Names stay readable while long organization directories scroll independently. */
+.organization-combo { min-width: 0; max-width: 440px; }
+.organization-combo .combo-menu { position: fixed; right: auto; min-width: 0; }
+.organization-combo .combo-opt[aria-disabled="true"] { cursor: default; color: var(--ink-3); }
+#org-switcher { width: 230px; flex-shrink: 1; }
+#org-switcher input { font-weight: 600; text-overflow: ellipsis; }
+@media (max-width: 850px) { #org-switcher { width: 140px; } }
+@media (max-width: 600px) { #org-switcher { width: 105px; } }
+
+.approval-request-dismissed { opacity: .55; }
+.approval-request-dismissed:focus-within, .approval-request-dismissed:hover { opacity: .8; }

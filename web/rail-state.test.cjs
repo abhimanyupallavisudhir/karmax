@@ -41,6 +41,7 @@ global.esc = (value) => String(value);
 global.ICON = { edit: '<svg></svg>', chevron: '<svg class="i-chevron"></svg>', project: '<svg class="i-project"></svg>', plus: '<svg class="i-plus"></svg>' };
 global.wireProjectDrag = () => {};
 global.newProject = () => {};
+global.commandHint = (label) => label;
 global.draggingProject = null;
 global.editingRailItem = null;
 // The tab list renderRail shares with renderMain (a module constant, not a function).

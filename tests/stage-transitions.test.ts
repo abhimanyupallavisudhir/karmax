@@ -494,6 +494,79 @@ describe('task stage transitions', () => {
     })).rejects.toThrow(/only escalate its own task/i);
   });
 
+  it('dismisses a permission ask without signaling and still allows a later decision', async () => {
+    const f = fixture();
+    const service = new PermissionRequests(f.store, 'org_personal');
+    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+      capabilities: ['settings:read'], audience: ['@owners'], recipients: ['test'],
+      reason: 'Inspect settings', requestedBy: 'agent' });
+    f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
+      payload: { requestId: request.id, recipients: ['test'] } });
+    expect(f.store.listInbox('test', 'org_personal')).toHaveLength(1);
+    const outsider = f.tokens.mintPrincipal('user:outsider', ['*'], f.project.id).token;
+    await expect(f.api.resolvePermissionRequest(outsider, { organizationId: 'org_personal',
+      requestId: request.id, action: 'dismiss' })).rejects.toThrow(/not routed/);
+    const result = await f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal',
+      requestId: request.id, action: 'dismiss' });
+    expect(result).toMatchObject({ status: 'pending', dismissed: { by: 'user:test' } });
+    expect(f.signalled).toEqual([]);
+    expect(f.starts).toEqual([]);
+    expect(service.extensionCaps(f.task.id)).toEqual([]);
+    expect(f.store.listInbox('test', 'org_personal')).toEqual([]);
+    expect(service.requests({ taskId: f.task.id })).toHaveLength(1);
+    await expect(f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal',
+      requestId: request.id, action: 'approve' })).resolves.toMatchObject({ status: 'granted' });
+  });
+
+  it('automatically resolves covered permission requests after authorization changes', async () => {
+    const f = fixture();
+    const service = new PermissionRequests(f.store, 'org_personal');
+    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+      capabilities: ['settings:read'], audience: ['@owners'], recipients: ['test'],
+      reason: 'Inspect settings', requestedBy: 'agent' });
+    await f.api.setTaskAuthorization(f.token, f.task.id, 'developer');
+    expect(service.requests()[0]).toMatchObject({ id: request.id, status: 'granted' });
+    expect(service.extensionCaps(f.task.id)).toEqual([]);
+    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, args: [expect.any(Object), 'do'] });
+    const signals = f.signalled.length;
+    await f.api.setTaskAuthorization(f.token, f.task.id, 'developer');
+    expect(f.signalled).toHaveLength(signals);
+  });
+
+  it('leaves requests pending until both scope and capabilities are covered', async () => {
+    const f = fixture(undefined, true);
+    const other = f.store.createProject('Additional project');
+    for (const projectId of [f.project.id, other.id]) f.authorization!.grant('system:test', {
+      principalId: 'user:test', scopeKey: projectScope(projectId), profileId: 'maintainer',
+    });
+    const base = { level: 'developer', scope: 'projects' as const, projectIds: [f.project.id] };
+    const service = new PermissionRequests(f.store, 'org_personal');
+    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+      capabilities: ['github:actions:write'], projectIds: [other.id], baseAuthorization: base,
+      audience: ['@owners'], recipients: ['test'], reason: 'Configure project', requestedBy: 'agent' });
+    await f.api.setTaskAuthorization(f.token, f.task.id, base);
+    expect(service.requests()[0]!.status).toBe('pending');
+    await f.api.setTaskAuthorization(f.token, f.task.id, { ...base, projectIds: [f.project.id, other.id] });
+    expect(service.requests()[0]!.status).toBe('pending');
+    expect(f.signalled).toEqual([]);
+    await f.api.setTaskAuthorization(f.token, f.task.id, { ...base, level: 'maintainer', projectIds: [f.project.id, other.id] });
+    expect(service.requests()[0]).toMatchObject({ id: request.id, status: 'granted' });
+  });
+
+  it('recognizes an already-satisfied project request despite a changed selection', async () => {
+    const f = fixture(undefined, true);
+    const other = f.store.createProject('Additional project');
+    const base = { level: 'developer', scope: 'projects' as const, projectIds: [f.project.id] };
+    const service = new PermissionRequests(f.store, 'org_personal');
+    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+      capabilities: [], projectIds: [other.id], baseAuthorization: base,
+      audience: ['@owners'], recipients: ['test'], reason: 'Read additional project', requestedBy: 'agent' });
+    f.store.patchTaskParams(f.task.id, { _authorization: { ...base,
+      projectIds: [f.project.id, other.id], capabilities: ['*'] } });
+    await expect(f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal',
+      requestId: request.id, action: 'approve' })).resolves.toMatchObject({ status: 'granted' });
+  });
+
   it('routes an exact permission elevation to selected humans and only a capable recipient may approve', async () => {
     const f = fixture();
     f.store.setOrganizationMembership('org_personal', 'outsider', 'member');

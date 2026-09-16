@@ -2,6 +2,7 @@ import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
 import { beginOAuth, finishOAuth } from '../mcp/connections/oauth.js';
+import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -131,6 +132,9 @@ export interface GatewayDeps {
  * apply the conservative fallback, and tests assert the catalog stays complete. */
 export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
+  if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
@@ -154,6 +158,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/user\/(?:git-profiles|github-accounts)(?:\/|$)/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
+  if (p === '/api/organization-directory' && read) return 'none';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -691,7 +696,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new PermissionRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private pendingAuthorizationRequests(taskId: string) {
@@ -699,7 +704,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new AuthorizationRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
@@ -1204,6 +1209,13 @@ export class Gateway {
       res.writeHead(this.deps.store.previewHostnameAllowed(domain) ? 204 : 403,
         { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
+    }
+    if (p.startsWith('/share/conversations/')) {
+      const share = req.method === 'GET' ? publicShare(this.deps.store, p.slice('/share/conversations/'.length)) : undefined;
+      res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      return void res.end(publicConversationHtml(share));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);
@@ -1761,6 +1773,48 @@ export class Gateway {
     }
 
     try {
+      const sharingSettings = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/conversation-sharing$/);
+      if (sharingSettings) {
+        const [, scope, id] = sharingSettings;
+        const organization = scope === 'organizations';
+        if (!(organization ? store.getOrganization(id!) : store.getProject(id!))) return this.json(res, 404, { error: 'scope not found' });
+        const key = `conversation-sharing:${organization ? 'organization' : 'project'}:${id}`;
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (organization ? typeof body.enabled !== 'boolean' : !['inherit', 'disabled'].includes(body.value))
+            return this.json(res, 400, { error: 'invalid sharing setting' });
+          store.kvSet(key, organization ? (body.enabled ? 'enabled' : 'disabled') : body.value);
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { ...(organization ? { enabled: store.kvGet(key) === 'enabled' } : sharingPolicy(store, id!)),
+          canManage: this.deps.tokens.check(token, organization ? 'organization:edit' : 'project:settings:write', requestedScope).ok });
+      }
+      const conversationShare = p.match(/^\/api\/tasks\/([^/]+)\/conversation-share$/);
+      if (conversationShare) {
+        const taskId = conversationShare[1]!;
+        const task = store.getTask(taskId);
+        if (!task) return this.json(res, 404, { error: 'task not found' });
+        // Bind mutations and link discovery to the record itself, even when a
+        // caller supplies a conflicting projectId query parameter.
+        const actualScope = { taskId, projectId: task.projectId, organizationId: store.getProject(task.projectId)?.organizationId };
+        if (!this.deps.tokens.check(token, 'task:conversation:share', actualScope).ok)
+          return this.json(res, 403, { error: 'conversation sharing is not allowed in this project' });
+        const role = url.searchParams.get('role') ?? 'do';
+        const policy = sharingPolicy(store, task.projectId);
+        if (method === 'DELETE') {
+          revokeShare(store, taskId, role);
+          return this.json(res, 200, { revoked: true });
+        }
+        let share = currentShare(store, taskId, role);
+        if (method === 'POST') {
+          if (!policy.effective) return this.json(res, 403, { error: 'Public conversation sharing is disabled by organization or project settings' });
+          const view = await api.getTaskView(token, taskId);
+          const transcript = view?.transcripts?.find(t => t.role === role);
+          const messages = transcript?.messages ?? (role === 'do' ? view?.messages : undefined);
+          if (!messages?.length) return this.json(res, 404, { error: 'conversation not found' });
+          share = createShare(store, taskId, role, messages);
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { enabled: policy.effective, url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
+      }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
         if (bearer) this.sessions.delete(bearer);
@@ -1783,13 +1837,14 @@ export class Gateway {
       }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
+        const operator = allows(authRecord.caps, 'authorization:read');
         if (method === 'GET') {
-          const organization = store.defaultOrganization(subject.userId);
+          const organization = store.defaultOrganization(subject.userId, operator);
           return this.json(res, 200, { organizationId: organization?.id ?? null });
         }
         const b = await this.body(req);
         try {
-          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''));
+          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''), operator);
           return this.json(res, 200, { organizationId: organization.id });
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -1798,7 +1853,7 @@ export class Gateway {
       if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
         const organizationId = String(url.searchParams.get('organizationId')
-          ?? store.defaultOrganization(subject.userId)?.id ?? '');
+          ?? store.defaultOrganization(subject.userId, allows(authRecord.caps, 'authorization:read'))?.id ?? '');
         if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
           return this.json(res, 404, { error: 'organization not found' });
         const key = hostedOnboardingKey(subject.userId, organizationId);
@@ -1950,6 +2005,11 @@ export class Gateway {
       // Organization is the hosted tenant boundary. Collection discovery is
       // filtered by membership; every nested request was minted an
       // organization-scoped token above, so identifiers cannot cross tenants.
+      if (p === '/api/organization-directory' && method === 'GET') {
+        const subject = requireHumanSubject(callerIdentity);
+        return this.json(res, 200, store.organizationDirectory(subject.userId,
+          allows(authRecord.caps, 'authorization:read')));
+      }
       if (p === '/api/organizations' && method === 'GET') {
         const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
         if (canAuditAll) return this.json(res, 200, store.listOrganizations());
@@ -2145,9 +2205,18 @@ export class Gateway {
       }
       if (organizationMatch && method === 'PATCH') {
         const b = await this.body(req);
-        if (typeof b.name !== 'string') return this.json(res, 400, { error: 'organization name is required' });
-        try { return this.json(res, 200, store.renameOrganization(organizationMatch[1]!, b.name)); }
-        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        if (b.nameVisibility !== undefined && b.nameVisibility !== 'members' && b.nameVisibility !== 'public')
+          return this.json(res, 400, { error: 'nameVisibility must be members or public' });
+        if (b.name !== undefined && typeof b.name !== 'string')
+          return this.json(res, 400, { error: 'organization name must be a string' });
+        if (b.name === undefined && b.nameVisibility === undefined)
+          return this.json(res, 400, { error: 'organization name or nameVisibility is required' });
+        try {
+          const id = organizationMatch[1]!;
+          if (b.name !== undefined) store.renameOrganization(id, b.name);
+          if (b.nameVisibility !== undefined) store.setOrganizationNameVisibility(id, b.nameVisibility);
+          return this.json(res, 200, store.getOrganization(id));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
       if (organizationExecution) {
@@ -3194,10 +3263,18 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const projects = store.projectFolderProjects(projectFolder[1]!, b.folder);
-          const forbidden = projects.find((project) => !this.deps.tokens.check(token, 'project:edit', {
-            projectId: project.id,
-            organizationId: project.organizationId,
-          }).ok);
+          // Browser tokens are minted for the request's anchor project. Resolve
+          // the signed-in user's grants independently for each sibling instead
+          // of treating that token's scope as the user's full authority. Bearers
+          // (including delegated agents) must remain within their minted scope.
+          const forbidden = projects.find((project) => {
+            if (session.userId && this.deps.authorization)
+              return !allows(this.deps.authorization.capabilities(`user:${session.userId}`, project.id, project.organizationId), 'project:edit');
+            return !this.deps.tokens.check(token, 'project:edit', {
+              projectId: project.id,
+              organizationId: project.organizationId,
+            }).ok;
+          });
           if (forbidden)
             return this.json(res, 403, { error: 'Renaming this folder requires edit access to every project it contains.' });
           return this.json(res, 200, store.renameProjectFolder(projectFolder[1]!, b.folder, b.name));
@@ -4205,7 +4282,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files);
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault });
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
@@ -4473,8 +4550,8 @@ export class Gateway {
         const b = await this.body(req);
         const organizationId = String(url.searchParams.get('organizationId') ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (b.action !== 'approve' && b.action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (b.action !== 'approve' && b.action !== 'deny' && b.action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolveAuthorizationRequest(token, {
             organizationId, requestId: authorizationResolution[1]!, action: b.action,
@@ -4509,8 +4586,8 @@ export class Gateway {
         const b = await this.body(req);
         const action = String(b.action ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (action !== 'approve' && action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (action !== 'approve' && action !== 'deny' && action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolvePermissionRequest(token, {
             organizationId,
