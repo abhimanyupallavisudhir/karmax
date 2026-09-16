@@ -4059,10 +4059,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
     if (attemptChoice?.otherAttempts !== undefined && !['keep', 'cancel'].includes(attemptChoice.otherAttempts))
-      throw new Error('otherAttempts must be keep or cancel');
+      throw new ValidationError('otherAttempts must be keep or cancel');
     if (attemptChoice?.saveOtherAttemptsDefault) {
       this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId });
-      if (!attemptChoice.otherAttempts) throw new Error('choose keep or cancel before saving a default');
+      if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
     }
     const heldView = scopedTask?.lastView;
     if (signal === SIG.retry && scopedTask && heldView?.stage === 'escalated'
@@ -4098,7 +4098,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const needsAttemptChoice = confirmsProposal && scopedTask && this.attemptsReachMerge(scopedTask) && attemptGroup && !attemptGroup.committedAttemptId
       && attemptGroup.attempts.some((a) => a.id !== taskId && !['done', 'cancelled', 'failed'].includes(a.lastView?.status ?? ''));
     if (needsAttemptChoice && this.deps.store.otherAttemptsDefault(taskId) === 'ask' && !attemptChoice?.otherAttempts)
-      throw new Error('Choose whether to keep or cancel the other attempts when confirming this proposal.');
+      throw new ValidationError('Choose whether to keep or cancel the other attempts when confirming this proposal.');
     if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       // Master's authorization parity: the human is the verified subject, not the
