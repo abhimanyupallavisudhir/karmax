@@ -20,7 +20,7 @@ Current root digest: `64068f615e77b324db9b0d2c757ddab0ce2c87043cea3a4cad858c0ead
 
 Read-only probe: UID 1000, file 0444, directory 0555; overwrite and create returned EACCES, normal promotion rejected. Independent settings GET confirmed unchanged revision/binding. Isolated attachment `resource_mu09rj1054b8b6ed3a` disabled with snapshot retained.
 
-Caveat: ancillary legacy just-do helper `task_mu09s2il51a56b4d96` failed during workflow finalization after its read-only tests passed. It is not reported as a completed task. This is separate from the three completed software-dev phases.
+Caveat: ancillary legacy just-do helper `task_mu09s2il51a56b4d96` failed during workflow finalization after its read-only tests passed. It is not reported as a completed task. This is separate from the three completed software-dev phases. Follow-up #266 (`task_mu4p1f5p4c1be32380`) was created and started on 2026-09-16 to investigate and fix resource-only just-do finalization.
 
 ## Additional live checks (2026-09-14, #201)
 
@@ -53,3 +53,9 @@ The file picker was folder-only (webkitdirectory), explaining greyed-out individ
 Earlier onboarding fixes on this task branch also cover failed S3 probe cleanup/API discovery, Git pass asynchronous credential lifetime, AgentMail replay deduplication, remote payment helper ES-module execution, and browser-session persistence. Their focused tests were run during implementation. Upload browser/gateway checks, 18 storage/resource tests, real PostgreSQL regression and TypeScript checking passed for the S3 fixes.
 
 Human-required onboarding and release gaps were recorded as side tasks throughout. The retained AWS bucket and main project data remain available for inspection.
+
+## Follow-up status (2026-09-16)
+
+Tasks #218, #219, #232 and #242 are done. The five earlier fix commits on this PR (S3 probe cleanup/API discovery, pass Git credential lifetime, AgentMail deduplication, remote card helper execution and browser persistence) are not yet integrated into current master. They should not be described as independently completed follow-up tasks. The scoped Review-approval automation proposal remains draft; eight earlier onboarding proposal IDs now return null, so their completion cannot be verified. These automation suggestions are not prerequisites for using the tested S3 connection.
+
+Revalidation on 2026-09-16: all 59 tests in the seven focused suites passed (storage-locations, git-pass-connector, agent-mail, mail-pull, card-fill, chrome-cdp-launcher and remote-agent). These results verify this task branch, not deployment of its remaining commits.
