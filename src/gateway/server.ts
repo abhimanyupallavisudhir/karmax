@@ -689,7 +689,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new PermissionRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private pendingAuthorizationRequests(taskId: string) {
@@ -697,7 +697,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new AuthorizationRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
@@ -3256,10 +3256,18 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const projects = store.projectFolderProjects(projectFolder[1]!, b.folder);
-          const forbidden = projects.find((project) => !this.deps.tokens.check(token, 'project:edit', {
-            projectId: project.id,
-            organizationId: project.organizationId,
-          }).ok);
+          // Browser tokens are minted for the request's anchor project. Resolve
+          // the signed-in user's grants independently for each sibling instead
+          // of treating that token's scope as the user's full authority. Bearers
+          // (including delegated agents) must remain within their minted scope.
+          const forbidden = projects.find((project) => {
+            if (session.userId && this.deps.authorization)
+              return !allows(this.deps.authorization.capabilities(`user:${session.userId}`, project.id, project.organizationId), 'project:edit');
+            return !this.deps.tokens.check(token, 'project:edit', {
+              projectId: project.id,
+              organizationId: project.organizationId,
+            }).ok;
+          });
           if (forbidden)
             return this.json(res, 403, { error: 'Renaming this folder requires edit access to every project it contains.' });
           return this.json(res, 200, store.renameProjectFolder(projectFolder[1]!, b.folder, b.name));
@@ -4535,8 +4543,8 @@ export class Gateway {
         const b = await this.body(req);
         const organizationId = String(url.searchParams.get('organizationId') ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (b.action !== 'approve' && b.action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (b.action !== 'approve' && b.action !== 'deny' && b.action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolveAuthorizationRequest(token, {
             organizationId, requestId: authorizationResolution[1]!, action: b.action,
@@ -4571,8 +4579,8 @@ export class Gateway {
         const b = await this.body(req);
         const action = String(b.action ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (action !== 'approve' && action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (action !== 'approve' && action !== 'deny' && action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolvePermissionRequest(token, {
             organizationId,
