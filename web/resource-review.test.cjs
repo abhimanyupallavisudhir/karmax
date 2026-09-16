@@ -41,7 +41,7 @@ function setup(api) {
     approvalRequestsTab: () => 'approvals', parametersTab: () => 'parameters',
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
-  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'overviewTab', 'conversationPane', 'renderConversationEntry']) {
+  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'overviewTab', 'safeHref', 'reviewActionBtn', 'conversationReviewInfo', 'conversationPane', 'renderConversationEntry']) {
     vm.runInContext(extract(name), context);
   }
   context.checkinTab = (v) => context.conversationPane(v, { role: 'do' });

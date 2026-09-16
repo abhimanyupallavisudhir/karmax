@@ -7334,6 +7334,7 @@ function renderTaskPage() {
     wireReviewActions(v);
     wireResourceInventory(v);
   } else if (tab === 'checkin') {
+    wireReviewActions(v);
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
@@ -8490,6 +8491,19 @@ function checkinTab(v) {
   </div>`;
 }
 
+// Task-level review affordances belong at the end of whichever agent is open.
+// Keep previews in Overview and command output hidden until explicitly run.
+function conversationReviewInfo(v) {
+  const info = v.reviewInfo;
+  const caption = info?.caption || info?.summary;
+  if (!caption && !info?.actions?.length && !info?.links?.length && !info?.html) return '';
+  return `<div class="msg agent review-info">
+    <div class="review-info-line"><span class="role">Review info</span>${caption ? `<span class="review-info-caption">${esc(caption)}</span>` : ''}</div>
+    ${info.actions?.length ? `<div class="review-actions" id="review-actions">${info.actions.map((action, index) => reviewActionBtn(action, index)).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
+    ${info.links?.length || info.html ? `<div class="review-actions">${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}${info.html ? '<button class="btn sm" data-tasktab="overview">View preview ↗</button>' : ''}</div>` : ''}
+  </div>`;
+}
+
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
@@ -8553,7 +8567,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
 }
 
