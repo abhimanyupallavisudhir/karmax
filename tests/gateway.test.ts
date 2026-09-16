@@ -40,6 +40,21 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     if (loginRoot) fs.rmSync(loginRoot, { recursive: true, force: true });
   });
 
+  it('changes the principal attempt through HTTP and preserves the Merge winner', async () => {
+    const project = h.store.createProject('Principal selection');
+    const first = h.store.createTask({ projectId: project.id, title: 'Attempts', workflow: 'script-exec', workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const second = h.store.createTask({ projectId: project.id, title: 'Attempts', workflow: 'script-exec', workflowVersion: '1.0.0', params: { prompt: 'test', draft: true }, intentId: first.intentId });
+    const select = (id: string) => fetch(`${base}/api/tasks/${id}/principal`, { method: 'POST', headers: auth(), body: '{}' });
+    const response = await select(second.id);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ principalAttemptId: second.id });
+    expect(h.store.listTasks(project.id)[0]!.id).toBe(second.id);
+    h.store.claimAttempt(first.id);
+    expect((await select(second.id)).status).toBe(400);
+    expect(h.store.attemptGroup(first.id)!.principalAttemptId).toBe(first.id);
+    expect((await select('missing-attempt')).status).toBe(404);
+  });
+
   it('serves meta with the detected agent provider', async () => {
     const meta: any = await (await fetch(`${base}/api/meta`)).json();
     expect(meta.version).toBeTruthy();

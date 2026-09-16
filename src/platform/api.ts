@@ -2378,6 +2378,14 @@ export class KarmaxApi {
     return this.deps.store.getTask(attempt.id)!;
   }
 
+  setPrincipalAttempt(token: string, taskId: string) {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    this.deps.store.setPrincipalAttempt(taskId);
+    return this.deps.store.attemptGroup(taskId);
+  }
+
   private attemptsReachMerge(task: TaskRecord): boolean {
     return !!this.resolveStart(task.workflow, task.workflowVersion,
       this.deps.store.getProject(task.projectId)?.organizationId)?.manifest.stages?.some((stage) => stage.key === 'merge');

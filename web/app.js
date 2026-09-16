@@ -6698,11 +6698,14 @@ function taskAttempts(v) {
     const draft = !!a.params?.draft;
     const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
     const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
-    return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+    const principal = a.id === g.principalAttemptId;
+    const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
+    const crownTitle = g.committedAttemptId ? 'Principal selection is locked after Merge admission' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
+    return `<div class="attempt-item"><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
       ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
-    </a>`;
+    </a></div>`;
   }).join('') : '';
   return `<section class="attempts" aria-label="Task attempts">
     <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
@@ -6722,6 +6725,21 @@ function cycleAttempt(delta) {
 }
 
 function wireAttempts(v) {
+  document.querySelectorAll('[data-attempt-principal]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (button.disabled || button.getAttribute('aria-pressed') === 'true') return;
+      button.disabled = true;
+      try {
+        await api(`/api/tasks/${button.dataset.attemptPrincipal}/principal`, { method: 'POST', body: '{}' });
+        await refreshTasks();
+        if (S.selected === v.taskId) {
+          S.viewingAttempt = v.taskId;
+          await refreshTask();
+        }
+      } catch (e) { toast(e.message, true); }
+      finally { button.disabled = false; }
+    });
+  });
   document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
     if (S.addingAttempt) return;
     S.addingAttempt = true;

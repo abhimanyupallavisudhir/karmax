@@ -2927,15 +2927,26 @@ export class Store {
     this.saveView(taskId, view);
   }
 
+  /** Select the list representative without changing the Merge commitment. */
+  setPrincipalAttempt(taskId: string) {
+    const task = this.getTask(taskId);
+    if (!task?.intentId) throw new Error('attempt not found');
+    const changed = this.db.prepare(`UPDATE task_intents SET principalAttemptId=?
+      WHERE id=? AND committedAttemptId IS NULL
+      AND EXISTS (SELECT 1 FROM tasks WHERE id=?
+        AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('cancelled', 'failed'))`)
+      .run(taskId, task.intentId, taskId);
+    if (!Number(changed.changes)) throw new Error('Only eligible attempts can be selected before Merge commitment');
+  }
+
   /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
   electPrincipal(intentId: string) {
     const g = this.attemptGroup(intentId);
     if (!g || (g.committedAttemptId && g.otherAttempts !== 'keep')) return;
-    // Kept alternatives may outlive the first admitted attempt. Preserve a
-    // healthy principal, but do not strand the logical task on a failed/cancelled
-    // attempt while another remains eligible. The admission policy stays fixed.
+    // Preserve manual selection while healthy. Kept alternatives may also take
+    // over from a failed/cancelled principal after admission, without changing policy.
     const principal = g.attempts.find((a) => a.id === g.principalAttemptId);
-    if (g.committedAttemptId && principal && !['cancelled', 'failed'].includes(principal.lastView?.status ?? '')) return;
+    if (principal && !['cancelled', 'failed'].includes(principal.lastView?.status ?? '')) return;
     const eligible = g.attempts.find((a) => a.lastView?.status !== 'cancelled' && a.lastView?.status !== 'failed');
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }

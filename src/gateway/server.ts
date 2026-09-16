@@ -4155,6 +4155,12 @@ export class Gateway {
         store.deleteTask(viewMatch[1]!);
         return this.json(res, 200, { ok: true });
       }
+      const principalMatch = p.match(/^\/api\/tasks\/([^/]+)\/principal$/);
+      if (principalMatch && method === 'POST') {
+        try {
+          return this.json(res, 200, api.setPrincipalAttempt(token, principalMatch[1]!));
+        } catch (e) { return this.badRequest(res, e); }
+      }
       const attemptsMatch = p.match(/^\/api\/tasks\/([^/]+)\/attempts$/);
       if (attemptsMatch && method === 'GET') {
         const group = api.attemptGroup(token, attemptsMatch[1]!);
