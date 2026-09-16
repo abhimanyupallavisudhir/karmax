@@ -67,9 +67,9 @@
   <rect width="512" height="512" rx="112" fill="#181220"/>
   <g transform="translate(256 256) scale(1.12) translate(-256 -256)">
   <rect width="512" height="512" fill="url(#face)" mask="url(#weave)"/>
-  <path fill="#FFD43B" stroke="#181220" stroke-width="14" stroke-linejoin="round" d="M136.739 171.501L178.466 201.779L276.765 117.593L308.609 135.359L178.466 240.707L115.156 191.795Z
+  <path fill="#FFD43B" stroke="#120D19" stroke-width="14" stroke-linejoin="miter" stroke-miterlimit="3" d="M136.739 171.501L178.466 201.779L276.765 117.593L308.609 135.359L178.466 240.707L115.156 191.795Z
       M136.739 237.516L178.466 271.293L301.603 176.160L335.207 196.486L178.466 310.221L115.156 256.000Z"/>
-  <path fill="#FFD43B" stroke="#FFD43B" stroke-width="6" stroke-linejoin="round" d="M136.739 171.501L178.466 201.779L276.765 117.593L308.609 135.359L178.466 240.707L115.156 191.795Z
+  <path fill="#FFD43B" stroke="#FFD43B" stroke-width="6" stroke-linejoin="miter" stroke-miterlimit="3" d="M136.739 171.501L178.466 201.779L276.765 117.593L308.609 135.359L178.466 240.707L115.156 191.795Z
       M136.739 237.516L178.466 271.293L301.603 176.160L335.207 196.486L178.466 310.221L115.156 256.000Z"/>
 </g>
 </svg>
