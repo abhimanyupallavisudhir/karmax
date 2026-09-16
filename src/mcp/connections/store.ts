@@ -1,0 +1,115 @@
+import crypto from 'node:crypto';
+import type { Store } from '../../store/db.js';
+import type { CredentialBroker } from '../../autonomy/broker.js';
+import { publicUrl } from './http.js';
+
+export type McpTransport = { type: 'http' | 'sse'; url: string }
+  | { type: 'stdio'; command: string; args: string[]; env?: Record<string, string> };
+export interface McpConnection {
+  id: string; label: string; organizationId: string; projectId?: string;
+  transport: McpTransport; enabled: boolean; revision: string;
+  secretNames: string[]; auth: 'none' | 'secrets' | 'oauth';
+  registry?: { name: string; version: string }; createdAt: number;
+}
+export const BUILTIN_MCPS = ['browser:chrome-devtools', 'browser:playwright'] as const;
+export function validateMcpSelection(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 24 || value.some((v) => typeof v !== 'string'
+    || (!BUILTIN_MCPS.includes(v as any) && !/^mcp_[a-f0-9]{24}$/.test(v)))) throw new Error('Tools must be a list of MCP connection IDs');
+  if (new Set(value).size !== value.length) throw new Error('Tools contains duplicate connections');
+  if (BUILTIN_MCPS.every((id) => value.includes(id))) throw new Error('Choose one browser connection');
+  return value;
+}
+function bounded(value: unknown, max: number, label: string): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > max || value.includes('\0')) throw new Error(`Invalid ${label}`);
+  return value;
+}
+export function validateTransport(input: any): McpTransport {
+  if (input?.type === 'http' || input?.type === 'sse') return { type: input.type, url: publicUrl(bounded(input.url, 2048, 'server URL')).href };
+  if (input?.type !== 'stdio') throw new Error('Choose HTTP, SSE or a local process');
+  const command = bounded(input.command, 256, 'command');
+  if (!Array.isArray(input.args) || input.args.length > 80 || input.args.some((v: any) => typeof v !== 'string' || v.length > 4096 || v.includes('\0'))) throw new Error('Arguments must be a list of strings');
+  const env = validateSecrets(input.env ?? {}, true);
+  return { type: 'stdio', command, args: input.args, ...(Object.keys(env).length ? { env } : {}) };
+}
+export function validateSecrets(input: unknown, environment = false): Record<string, string> {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length > 40) throw new Error('Expected a map of names to values');
+  const out: Record<string, string> = Object.create(null);
+  for (const [key, value] of Object.entries(input)) {
+    if (!(environment ? /^[A-Za-z_][A-Za-z0-9_]{0,79}$/ : /^[A-Za-z][A-Za-z0-9_-]{0,79}$/).test(key)
+      || /^(karmax_|node_options$|ld_|dyld_|http_proxy$|https_proxy$|all_proxy$)/i.test(key)
+      || (!environment && /^(host|cookie|connection|content-length|transfer-encoding)$/i.test(key))) throw new Error(`Reserved or invalid credential name: ${key}`);
+    if (typeof value !== 'string' || value.length > 16384 || /[\r\n\0]/.test(value)) throw new Error(`Invalid value for ${key}`);
+    out[key] = value;
+  }
+  return out;
+}
+export class McpConnections {
+  constructor(private store: Store, private broker: CredentialBroker, readonly organizationId: string) {}
+  private key() { return `mcp-connections:${this.organizationId}`; }
+  private all(): McpConnection[] { return this.store.getSettings(this.key(), 'mcp')?.connections as McpConnection[] ?? []; }
+  list(projectId?: string): McpConnection[] { return this.all().filter((c) => !c.projectId || c.projectId === projectId); }
+  get(id: string, projectId?: string): McpConnection {
+    const c = this.list(projectId).find((v) => v.id === id);
+    if (!c) throw new Error('MCP connection not found in this scope');
+    return c;
+  }
+  private handle(id: string) { return `mcp:${this.organizationId}:${id}`; }
+  save(input: any, projectId?: string): McpConnection {
+    if (projectId && this.store.getProject(projectId)?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
+    const prior = input.id ? this.get(input.id, projectId) : undefined;
+    if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
+    if (!prior && this.all().length >= 200) throw new Error('Connection limit reached (200 per organization)');
+    const transport = validateTransport(input.transport);
+    const auth = input.auth ?? 'none';
+    if (!['none', 'secrets', 'oauth'].includes(auth) || (auth === 'oauth' && transport.type === 'stdio')) throw new Error('Invalid authentication method');
+    const connection: McpConnection = {
+      id: prior?.id ?? `mcp_${crypto.randomBytes(12).toString('hex')}`,
+      organizationId: this.organizationId, ...(projectId ? { projectId } : {}),
+      label: bounded(input.label, 120, 'connection name'), transport, enabled: input.enabled !== false,
+      auth, secretNames: prior?.secretNames ?? [], revision: crypto.randomUUID(), createdAt: prior?.createdAt ?? Date.now(),
+      ...(input.registry ? { registry: { name: bounded(input.registry.name, 256, 'registry name'), version: bounded(input.registry.version, 128, 'registry version') } } : {}),
+    };
+    const changed = prior && (JSON.stringify(prior.transport) !== JSON.stringify(transport) || prior.auth !== auth);
+    let secrets: Record<string, string> | undefined;
+    if (input.secrets !== undefined && auth === 'secrets') {
+      secrets = validateSecrets(input.secrets, transport.type === 'stdio');
+      if (input.mergeSecrets && prior && !changed && prior.auth === 'secrets') {
+        const old = this.secret(prior);
+        const keep = Array.isArray(input.retainSecretNames) ? input.retainSecretNames : Object.keys(old);
+        secrets = validateSecrets({ ...Object.fromEntries(Object.entries(old).filter(([key]) => keep.includes(key))), ...secrets }, transport.type === 'stdio');
+      }
+    }
+    if (changed || auth === 'none') { this.broker.deleteHandle(this.handle(connection.id)); connection.secretNames = []; }
+    if (secrets) {
+      this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets));
+      connection.secretNames = Object.keys(secrets);
+    }
+    const connections = this.all().filter((c) => c.id !== connection.id);
+    if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization)');
+    this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] });
+    return connection;
+  }
+  remove(id: string, projectId?: string) {
+    const c = this.get(id, projectId);
+    if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
+    this.store.setSettings(this.key(), 'mcp', { connections: this.all().filter((v) => v.id !== id) });
+    this.broker.deleteHandle(this.handle(id));
+  }
+  secret(c: McpConnection, taskId?: string): any {
+    const handle = this.handle(c.id);
+    if (!this.broker.hasHandle(handle)) return {};
+    return JSON.parse(this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
+  }
+  setSecret(c: McpConnection, value: unknown) {
+    if (this.get(c.id, c.projectId).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
+    this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)); }
+  selected(ids: string[], projectId: string): McpConnection[] {
+    validateMcpSelection(ids);
+    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any)).map((id) => {
+      const c = this.get(id, projectId);
+      if (!c.enabled) throw new Error(`MCP connection “${c.label}” is disabled. Update the Agent tools selection.`);
+      return c;
+    });
+  }
+}

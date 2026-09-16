@@ -2609,6 +2609,25 @@ html[data-theme="dark"] .github-signin-btn:active,
 .role-capability-group label { display: flex; align-items: center; gap: 8px; }
 .role-capability-group p { margin: 3px 0; }
 
+/* Tool connections follow the agent's existing form rhythm. */
+.mcp-picker { margin: 12px 0; }
+.mcp-picker-heading,.mcp-dialog-header,.mcp-connection-row,.mcp-secret-row,.mcp-form-actions { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.mcp-picker-heading { margin-bottom:6px; }
+.mcp-choices { border:1px solid var(--line); border-radius:8px; padding:9px 12px; background:var(--surface-2); }
+.mcp-choices summary { cursor:pointer; overflow-wrap:anywhere; }
+.mcp-filter { width:100%; margin:10px 0 6px; }
+.mcp-options { max-height:230px; overflow:auto; }
+.mcp-option { display:flex; align-items:center; gap:9px; padding:8px 2px; cursor:pointer; }
+.mcp-option input,.mcp-inherit input,.mcp-enabled input { width:auto; }
+.mcp-inherit { display:flex; gap:8px; align-items:center; margin-top:7px; color:var(--ink-3); font-size:12px; }
+.mcp-dialog { width:min(680px,calc(100vw - 24px)); max-height:88vh; padding:24px; border:1px solid var(--line); border-radius:14px; background:var(--surface); color:var(--ink); overflow:auto; }
+.mcp-dialog::backdrop { background:rgba(0,0,0,.45); }
+.mcp-dialog h2 { margin:0; }.mcp-dialog p { color:var(--ink-3); }.mcp-dialog-header { align-items:flex-start; }
+.mcp-dialog input:not([type=checkbox]),.mcp-dialog select,.mcp-dialog textarea { width:100%; }
+.mcp-connection-row { padding:14px 0; border-bottom:1px solid var(--line); }.mcp-connection-row small,.mcp-registry-result small { display:block; color:var(--ink-3); overflow-wrap:anywhere; margin:4px 0; }
+.mcp-manager-list { margin-bottom:16px; }.mcp-editor { margin-top:20px; border-top:1px solid var(--line); }.mcp-connection-form>label,.mcp-process label,.mcp-registry-fields label { display:block; margin:12px 0; }.mcp-connection-form label>input,.mcp-connection-form label>select,.mcp-connection-form label>textarea { margin-top:5px; }
+.mcp-secret-row { margin:8px 0; }.mcp-secret-row input { min-width:0; }.mcp-registry-result { border-bottom:1px solid var(--line); padding:12px 0; }.mcp-registry-result button { max-width:100%; overflow-wrap:anywhere; white-space:normal; }.mcp-registry-search { display:flex; align-items:flex-end; gap:8px; }.mcp-registry-search label { flex:1; }.mcp-message { min-height:20px; }.mcp-callback { max-width:520px; margin:15vh auto; padding:24px; }
+@media(max-width:540px) { .mcp-dialog { padding:16px; }.mcp-connection-row { align-items:flex-start; flex-direction:column; }.mcp-secret-row { flex-wrap:wrap; }.mcp-secret-row input { flex:1; min-width:120px; } }
 /* Resource decisions belong to the active input request in the conversation. */
 .input-request .resource-review-card { flex-direction: column; }
 .input-request .resource-review-card > div { width: 100%; min-width: 0; }

@@ -1365,6 +1365,8 @@ export interface FieldSpec {
 
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
+  /** Omitted inherits tools; [] explicitly selects no optional connections. */
+  mcpConnections?: string[];
   provider: Provider;
   /** Select a durable Avatar. Provider/model remain snapshotted for replay and
    * display, but current turns resolve the owner-controlled prompt + authority
@@ -1583,6 +1585,7 @@ export interface AuthSource {
 }
 
 export interface AgentProfile {
+  mcpConnections?: string[];
   id: string;
   name: string;
   provider: Provider;

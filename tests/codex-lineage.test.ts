@@ -24,9 +24,12 @@ afterEach(async () => {
 
 // Real files and processes behind the same World methods used by cloud transfers.
 function diskWorld(root: string): World {
+  fs.mkdirSync(path.join(root, 'system-bin'), { recursive: true });
   return {
     handle: { root, kind: 'worktree' },
     async exec(command: string, args: string[]) {
+      // Model sandbox runtime publication inside this fixture, never the host.
+      args = args.map(arg => arg.replaceAll('/usr/local/bin', path.join(root, 'system-bin')));
       try { return { code: 0, stdout: execFileSync(command === 'node' ? process.execPath : command, args,
         { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), stderr: '' }; }
       catch (e: any) { return { code: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }

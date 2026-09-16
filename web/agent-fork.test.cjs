@@ -18,6 +18,7 @@ function extractFn(name) {
 
 global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
+global.wireMcpPicker = () => {};
 global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -37,6 +38,7 @@ eval(extractFn('wireResumeReauthorization'));
 eval(extractFn('agentRoleLabel'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
+eval(extractFn('mcpPickerHtml'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('prefillForkBranch'));
@@ -68,7 +70,7 @@ ok(forkBranchInput.value === 'karmax/source' && branchChanges === 1, 'picking a 
 const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
-ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
+ok(!closed.includes('<details class="af-resume') && closed.includes('af-resume-enabled'), 'fork choice uses its explicit toggle');
 ok(closed.includes('provider conversation ID or public ChatGPT/Claude share link'), 'a local console advertises provider ids and public share links');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 

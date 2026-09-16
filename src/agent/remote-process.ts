@@ -48,7 +48,7 @@ export interface RemoteAgentHome {
  * projection and withholds rotating refresh tokens, so parallel task worlds
  * cannot fork and revoke one shared login's token family. */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
-  session?: string): Promise<RemoteAgentHome> {
+  session?: string, browserOverride?: 'none'): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
@@ -87,7 +87,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   if (provider === 'codex' && session)
     await reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session);
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
-  const browser = configuredBrowser(localHome, provider);
+  const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
   const browserMcp = browser ? await ensureRemoteBrowser(world, browser, runtimeBin) : undefined;
   if (provider === 'codex') await seedRemoteCodexConfig(world, localHome, home, browserMcp);
   const permissions = await world.exec('bash', ['-lc',
@@ -734,7 +734,7 @@ function configuredBrowser(home: string, provider: Provider): BrowserKind | unde
  * compatibility path for stock/custom environments. The launch smoke test is
  * the actual guarantee: a world is never handed to an agent with a configured
  * browser MCP that cannot start its browser. */
-async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
+export async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
   const relative = `${REMOTE_ROOT}/tools/browser-${PLAYWRIGHT_VERSION}`;
   const absolute = path.posix.join(world.handle.root, relative);
   const bin = path.posix.join(absolute, 'node_modules/.bin');
@@ -846,7 +846,7 @@ async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBi
  * the world injection surface, so users do not need to rebuild their selected
  * E2B template merely because its system Node is stale. Reuse the paired runtime
  * on later turns even if task commands replace system Node/npm. */
-async function ensureRemoteNode(world: World): Promise<string> {
+export async function ensureRemoteNode(world: World): Promise<string> {
   const acceptable = "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>22||(a===22&&b>=12)?0:1)";
   // Task commands can replace system Node with an npx-cache symlink. Its
   // version still passes while npm's inferred prefix is unusable (task 201).
