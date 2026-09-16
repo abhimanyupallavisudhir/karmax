@@ -2623,7 +2623,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .attempt-item { position: relative; flex: 0 0 auto; }
 .attempt-item .attempt-card { padding-right: 38px; }
 .attempt-crown { position: absolute; top: 5px; right: 5px; display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--ink-2); cursor: pointer; }
-.attempt-crown svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; }
+.attempt-crown svg { fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
 .attempt-crown.principal { color: var(--accent); }
 .attempt-crown.principal svg { fill: currentColor; }
 .attempt-crown:hover:not(:disabled) { background: var(--accent-weak); color: var(--accent); }
