@@ -2902,10 +2902,24 @@ export class Store {
     this.saveView(taskId, view);
   }
 
+  /** Select the list representative without changing the Merge commitment. */
+  setPrincipalAttempt(taskId: string) {
+    const task = this.getTask(taskId);
+    if (!task?.intentId) throw new Error('attempt not found');
+    const changed = this.db.prepare(`UPDATE task_intents SET principalAttemptId=?
+      WHERE id=? AND committedAttemptId IS NULL
+      AND EXISTS (SELECT 1 FROM tasks WHERE id=?
+        AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('cancelled', 'failed'))`)
+      .run(taskId, task.intentId, taskId);
+    if (!Number(changed.changes)) throw new Error('Only eligible attempts can be selected before Merge commitment');
+  }
+
   /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
   electPrincipal(intentId: string) {
     const g = this.attemptGroup(intentId);
     if (!g || g.committedAttemptId) return;
+    const current = g.attempts.find((a) => a.id === g.principalAttemptId);
+    if (current && current.lastView?.status !== 'cancelled' && current.lastView?.status !== 'failed') return;
     const eligible = g.attempts.find((a) => a.lastView?.status !== 'cancelled' && a.lastView?.status !== 'failed');
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }

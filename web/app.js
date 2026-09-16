@@ -6693,11 +6693,14 @@ function taskAttempts(v) {
     const draft = !!a.params?.draft;
     const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
     const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
-    return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+    const principal = a.id === g.principalAttemptId;
+    const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
+    const crownTitle = g.committedAttemptId ? 'The merge winner is the principal attempt' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
+    return `<div class="attempt-item"><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 6l4.5 4L12 3l4.5 7L21 6l-2 13H5Z"/></svg></button><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
       ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
-    </a>`;
+    </a></div>`;
   }).join('') : '';
   return `<section class="attempts" aria-label="Task attempts">
     <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
@@ -6717,6 +6720,21 @@ function cycleAttempt(delta) {
 }
 
 function wireAttempts(v) {
+  document.querySelectorAll('[data-attempt-principal]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (button.disabled || button.getAttribute('aria-pressed') === 'true') return;
+      button.disabled = true;
+      try {
+        await api(`/api/tasks/${button.dataset.attemptPrincipal}/principal`, { method: 'POST', body: '{}' });
+        await refreshTasks();
+        if (S.selected === v.taskId) {
+          S.viewingAttempt = v.taskId;
+          await refreshTask();
+        }
+      } catch (e) { toast(e.message, true); }
+      finally { button.disabled = false; }
+    });
+  });
   document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
     if (S.addingAttempt) return;
     S.addingAttempt = true;
