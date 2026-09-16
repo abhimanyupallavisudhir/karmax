@@ -3256,10 +3256,18 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const projects = store.projectFolderProjects(projectFolder[1]!, b.folder);
-          const forbidden = projects.find((project) => !this.deps.tokens.check(token, 'project:edit', {
-            projectId: project.id,
-            organizationId: project.organizationId,
-          }).ok);
+          // Browser tokens are minted for the request's anchor project. Resolve
+          // the signed-in user's grants independently for each sibling instead
+          // of treating that token's scope as the user's full authority. Bearers
+          // (including delegated agents) must remain within their minted scope.
+          const forbidden = projects.find((project) => {
+            if (session.userId && this.deps.authorization)
+              return !allows(this.deps.authorization.capabilities(`user:${session.userId}`, project.id, project.organizationId), 'project:edit');
+            return !this.deps.tokens.check(token, 'project:edit', {
+              projectId: project.id,
+              organizationId: project.organizationId,
+            }).ok;
+          });
           if (forbidden)
             return this.json(res, 403, { error: 'Renaming this folder requires edit access to every project it contains.' });
           return this.json(res, 200, store.renameProjectFolder(projectFolder[1]!, b.folder, b.name));
