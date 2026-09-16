@@ -496,6 +496,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         task_id: { type: 'string' },
         signal: { type: 'string', enum: ['confirm', 'cancel', 'retry', 'followUp'] },
+        otherAttempts: { type: 'string', enum: ['keep', 'cancel'] },
+        saveOtherAttemptsDefault: { type: 'boolean', description: 'Save the choice for this project; requires project:settings:write.' },
         text: { type: 'string' },
         role: { type: 'string', enum: [...AGENT_ROLE_NAMES] },
       },
@@ -828,6 +830,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['confirm', 'revise', 'reject'] },
+        otherAttempts: { type: 'string', enum: ['keep', 'cancel'], description: 'On confirmation, keep sibling attempts running and eligible to merge, or cancel them. The first attempt entering Merge fixes this choice for the group.' },
         text: { type: 'string', description: 'For revise: the feedback the Do agent should act on. For reject: why the work is being cancelled.' },
       },
       required: ['action'],
@@ -1133,7 +1136,7 @@ export function platformToolHandlers(
     },
     async signal_task(args) {
       await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/signal`,
-        { signal: args?.signal, text: args?.text, role: args?.role });
+        { signal: args?.signal, text: args?.text, role: args?.role, otherAttempts: args?.otherAttempts, saveOtherAttemptsDefault: args?.saveOtherAttemptsDefault });
       return 'signalled';
     },
     async reorder_queue(args) {
@@ -1341,7 +1344,8 @@ export function platformToolHandlers(
     async confirm_decision(args) {
       const action = String(args?.action ?? '');
       if (!['confirm', 'revise', 'reject'].includes(action)) return 'invalid confirm decision — use action: confirm | revise | reject';
-      ctx.confirmDecision({ action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
+      if (args?.otherAttempts !== undefined && !['keep', 'cancel'].includes(args.otherAttempts)) return 'otherAttempts must be keep or cancel';
+      ctx.confirmDecision({ otherAttempts: args?.otherAttempts, action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
       return `confirm decision recorded: ${action}`;
     },
   };

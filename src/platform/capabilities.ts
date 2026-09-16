@@ -17,7 +17,7 @@ export type Capability = string;
  */
 export const CAPABILITIES = [
   'task:read', 'task:create', 'task:edit', 'task:signal', 'task:escalate', 'task:delete',
-  'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+  'task:conversation:read', 'task:conversation:share', 'task:conversation:fork', 'task:conversation:message',
   'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute', 'review:approve',
   'task:assign', 'task:subscribe',
   'project:read', 'project:create', 'project:edit', 'project:delete',
@@ -108,6 +108,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     id: 'collaboration', label: 'Conversations and review', description: 'Inspect and coordinate agents, and operate review actions.',
     capabilities: [
       ['task:conversation:read', 'Read agent conversations', 'Discover attached agents and read their conversation history.'],
+      ['task:conversation:share', 'Share conversations publicly', 'Create and revoke public conversation snapshots when organization and project policy allows.'],
       ['task:conversation:fork', 'Fork agent conversations', 'Create a new task from an existing agent conversation.'],
       ['task:conversation:message', 'Message forked agents', 'Continue a forked conversation with additional messages.'],
       ['task:review:write', 'Write review information', 'Publish structured review summaries and evidence.'],

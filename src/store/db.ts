@@ -837,6 +837,8 @@ export class Store {
     const organizationCols = this.db.prepare('PRAGMA table_info(organizations)').all() as { name: string }[];
     if (!organizationCols.some((c) => c.name === 'plan'))
       this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'");
+    if (!organizationCols.some((c) => c.name === 'nameVisibility'))
+      this.db.exec("ALTER TABLE organizations ADD COLUMN nameVisibility TEXT NOT NULL DEFAULT 'members'");
     const policyAcceptanceCols = this.db.prepare('PRAGMA table_info(policy_acceptances)').all() as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT');
@@ -1462,7 +1464,7 @@ export class Store {
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
       id: newId('org'), name, slug,
-      kind: input.kind ?? 'team', plan: 'free', createdAt: Date.now(),
+      kind: input.kind ?? 'team', plan: 'free', nameVisibility: 'members', createdAt: Date.now(),
     };
     this.db.prepare('INSERT INTO organizations (id, name, slug, kind, plan, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
       .run(organization.id, organization.name, organization.slug, organization.kind, organization.plan, organization.createdAt);
@@ -1530,6 +1532,21 @@ export class Store {
     return (rows as any[]).map(rowToOrganization);
   }
 
+  setOrganizationNameVisibility(id: string, visibility: Organization['nameVisibility']): Organization {
+    if (visibility !== 'members' && visibility !== 'public') throw new Error('nameVisibility must be members or public');
+    if (!this.getOrganization(id)) throw new Error('organization not found');
+    this.db.prepare('UPDATE organizations SET nameVisibility=? WHERE id=?').run(visibility, id);
+    return this.getOrganization(id)!;
+  }
+
+  /** Discovery deliberately returns names only, never tenant settings. */
+  organizationDirectory(userId: string, operator = false): Array<{ id: string; name: string; accessible: boolean }> {
+    const memberships = new Set(this.listOrganizations(userId).map((organization) => organization.id));
+    return this.listOrganizations()
+      .filter((organization) => operator || memberships.has(organization.id) || organization.nameVisibility === 'public')
+      .map((organization) => ({ id: organization.id, name: organization.name, accessible: operator || memberships.has(organization.id) }));
+  }
+
   /** The unclaimed migration placeholder is not a real namespace reservation. */
   organizationNameReservations(): Organization[] {
     return this.listOrganizations().filter((organization) => organization.id !== 'org_personal'
@@ -1539,22 +1556,22 @@ export class Store {
   /** The workspace a person's neutral `/` route opens. Existing users predate
    * this preference, so initialize them lazily to the personal workspace they
    * own; joining or creating another organization must never change it. */
-  defaultOrganization(userId: string): Organization | undefined {
+  defaultOrganization(userId: string, operator = false): Organization | undefined {
     const row = this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?').get(userId) as any;
-    const organizations = this.listOrganizations(userId);
+    const organizations = this.listOrganizations(operator ? undefined : userId);
     const stored = organizations.find((organization) => organization.id === row?.defaultOrganizationId);
     if (stored) return stored;
     const fallback = organizations.find((organization) => organization.kind === 'personal'
       && this.organizationMembership(organization.id, userId)?.role === 'owner')
       ?? organizations.find((organization) => organization.kind === 'personal')
       ?? organizations[0];
-    if (fallback) this.setDefaultOrganization(userId, fallback.id);
+    if (fallback) this.setDefaultOrganization(userId, fallback.id, operator);
     return fallback;
   }
 
-  setDefaultOrganization(userId: string, organizationId: string): Organization {
+  setDefaultOrganization(userId: string, organizationId: string, operator = false): Organization {
     const organization = this.getOrganization(organizationId);
-    if (!organization || !this.organizationMembership(organizationId, userId))
+    if (!organization || (!operator && !this.organizationMembership(organizationId, userId)))
       throw new Error('default organization must be one of your organizations');
     this.db.prepare(`INSERT INTO user_preferences (userId, defaultOrganizationId) VALUES (?, ?)
       ON CONFLICT(userId) DO UPDATE SET defaultOrganizationId=excluded.defaultOrganizationId`)
@@ -1783,7 +1800,10 @@ export class Store {
       format: 'karmax-user-export',
       version: 1,
       exportedAt: new Date().toISOString(),
-      preferences: { defaultOrganizationId: this.defaultOrganization(userId)?.id ?? null },
+      // Export the stored preference without revalidating it under a member-only
+      // scope: an operator may have selected an organization they do not belong to.
+      preferences: { defaultOrganizationId: (this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?')
+        .get(userId) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? this.defaultOrganization(userId)?.id ?? null },
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles'],
@@ -1915,6 +1935,7 @@ export class Store {
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`authorization:requests:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`avatars:organization:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`conversation-sharing:organization:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-usage-policy:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
         `credpolicy:organization:${organizationId}`,
@@ -2817,12 +2838,13 @@ export class Store {
     return projectId ? this.attachTags(projectId, tasks) : tasks;
   }
 
-  attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; attempts: TaskRecord[] } | undefined {
+  attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; otherAttempts?: 'keep' | 'cancel'; attempts: TaskRecord[] } | undefined {
     const t = this.getTask(taskOrIntentId);
     const intentId = t?.intentId ?? taskOrIntentId;
     const r = this.db.prepare('SELECT * FROM task_intents WHERE id = ?').get(intentId) as any;
     if (!r) return undefined;
     return { intentId, principalAttemptId: r.principalAttemptId, committedAttemptId: r.committedAttemptId ?? undefined,
+      otherAttempts: r.committedAttemptId ? (this.kvGet(`attempt-policy:${intentId}`) === 'keep' ? 'keep' : 'cancel') : undefined,
       confirmer: r.confirmer == null ? undefined : JSON.parse(r.confirmer), attempts: this.attemptsOf(intentId) };
   }
 
@@ -2859,15 +2881,39 @@ export class Store {
     return this.attachTags(projectId, rows.map(rowToTask));
   }
 
-  /** Atomically reserve the logical task at Merge entry. Returns siblings to cancel. */
+  /** Project default is read at Review time, including for already-running tasks. */
+  otherAttemptsDefault(taskId: string): 'ask' | 'keep' | 'cancel' {
+    const task = this.getTask(taskId);
+    const value = task && this.getSettings(task.projectId, '__common__')?.otherAttempts;
+    return value === 'keep' || value === 'cancel' ? value : 'ask';
+  }
+
+  /** Freeze the group's disposition at first Merge admission. Old reservations
+   * without an explicit policy retain their exclusive, cancel-siblings meaning. */
   claimAttempt(taskId: string): { accepted: boolean; cancel: string[] } {
     const t = this.getTask(taskId);
     if (!t?.intentId) return { accepted: true, cancel: [] };
-    const info = this.db.prepare('UPDATE task_intents SET committedAttemptId=?, principalAttemptId=? WHERE id=? AND committedAttemptId IS NULL')
-      .run(taskId, taskId, t.intentId);
-    const group = this.attemptGroup(t.intentId)!;
-    if (!Number(info.changes) && group.committedAttemptId !== taskId) return { accepted: false, cancel: [taskId] };
-    return { accepted: true, cancel: group.attempts.filter((a) => a.id !== taskId && a.lastView?.status !== 'cancelled').map((a) => a.id) };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      let group = this.attemptGroup(t.intentId)!;
+      if (!group.committedAttemptId) {
+        const choice = this.kvGet(`attempt-choice:${taskId}`) ?? this.otherAttemptsDefault(taskId);
+        const policy = choice === 'cancel' ? 'cancel' : 'keep';
+        this.kvSet(`attempt-policy:${t.intentId}`, policy);
+        this.db.prepare('UPDATE task_intents SET committedAttemptId=?, principalAttemptId=? WHERE id=?')
+          .run(taskId, taskId, t.intentId);
+        group = this.attemptGroup(t.intentId)!;
+      }
+      const accepted = group.otherAttempts === 'keep' || group.committedAttemptId === taskId;
+      const cancel = group.otherAttempts === 'keep' ? [] : accepted
+        ? group.attempts.filter((a) => a.id !== taskId && !['cancelled', 'done', 'failed'].includes(a.lastView?.status ?? '')).map((a) => a.id)
+        : [taskId];
+      this.db.exec('COMMIT');
+      return { accepted, cancel };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   markDraftSuperseded(taskId: string, winnerId: string) {
@@ -2884,7 +2930,12 @@ export class Store {
   /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
   electPrincipal(intentId: string) {
     const g = this.attemptGroup(intentId);
-    if (!g || g.committedAttemptId) return;
+    if (!g || (g.committedAttemptId && g.otherAttempts !== 'keep')) return;
+    // Kept alternatives may outlive the first admitted attempt. Preserve a
+    // healthy principal, but do not strand the logical task on a failed/cancelled
+    // attempt while another remains eligible. The admission policy stays fixed.
+    const principal = g.attempts.find((a) => a.id === g.principalAttemptId);
+    if (g.committedAttemptId && principal && !['cancelled', 'failed'].includes(principal.lastView?.status ?? '')) return;
     const eligible = g.attempts.find((a) => a.lastView?.status !== 'cancelled' && a.lastView?.status !== 'failed');
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }
@@ -3515,13 +3566,14 @@ export class Store {
   }
 
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
-  private hasPendingApprovals(taskId: string): boolean {
+  private hasPendingApprovals(taskId: string, includeDismissed = false): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM events e
       WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'connection.resolved')
+          AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
+          AND (?=0 OR r.type NOT IN ('permission.approval-dismissed', 'authorization.approval-dismissed'))
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
-      LIMIT 1`).get(taskId));
+      LIMIT 1`).get(taskId, includeDismissed ? 1 : 0));
   }
 
   /**
@@ -3549,7 +3601,8 @@ export class Store {
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
-      || ev.type === 'authorization.approval-resolved') {
+      || ev.type === 'authorization.approval-resolved' || ev.type === 'permission.approval-dismissed'
+      || ev.type === 'authorization.approval-dismissed') {
       if (!this.hasPendingApprovals(task.id)) this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]);
       return;
     }
@@ -3593,7 +3646,9 @@ export class Store {
       // The one lifecycle state that is an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
-      if (this.hasPendingApprovals(task.id)) return;
+      // A dismissed approval is still the reason for this hold; a lifecycle tick
+      // must not turn it into a fresh escalation notification.
+      if (this.hasPendingApprovals(task.id, true)) return;
       kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
       actionable = true;
       users = this.reviewAudience(task);
@@ -3655,7 +3710,7 @@ export class Store {
         SELECT e.taskId FROM events e
         WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'connection.resolved')
+            AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []);
     }
     return dropped;
@@ -4109,10 +4164,15 @@ export class Store {
       exact.run(`authz:default:project:${projectId}`);
       exact.run(`credpolicy:project:${projectId}`);
       exact.run(`avatars:project:${projectId}`);
+      exact.run(`conversation-sharing:project:${projectId}`);
       const workflowPrefix = `wfpin:${projectId}:`;
       prefix.run(workflowPrefix, workflowPrefix);
     }
     for (const taskId of taskIds) {
+      const sharePrefix = `conversation-share-index:${taskId}:`;
+      const shares = this.db.prepare('SELECT v FROM kv WHERE substr(k, 1, length(?))=?').all(sharePrefix, sharePrefix) as Array<{ v: string }>;
+      for (const share of shares) exact.run(`conversation-share:${share.v}`);
+      prefix.run(sharePrefix, sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`]) exact.run(key);
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
@@ -4384,6 +4444,8 @@ export class Store {
   }
 
   setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+    if (values.otherAttempts !== undefined && !['ask', 'keep', 'cancel'].includes(values.otherAttempts as string))
+      throw new Error('otherAttempts must be ask, keep, or cancel');
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && values.remote === 'none')
       throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
     this.db
@@ -6188,7 +6250,7 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 }
 
 function rowToOrganization(r: any): Organization {
-  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind,
+  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
     plan: isHostedPlanId(r.plan) ? r.plan : 'free', createdAt: r.createdAt };
 }
 
