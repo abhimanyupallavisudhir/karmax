@@ -1456,6 +1456,7 @@ export interface ResponderConfig extends Partial<AgentSpec> {
  *  `revise` sends the task back to Do (with an optional comment), `reject` cancels. */
 export type ConfirmAction = 'confirm' | 'revise' | 'reject';
 export interface ConfirmDecision {
+  otherAttempts?: 'keep' | 'cancel';
   action: ConfirmAction;
   text?: string;
 }

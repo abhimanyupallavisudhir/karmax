@@ -2838,12 +2838,13 @@ export class Store {
     return projectId ? this.attachTags(projectId, tasks) : tasks;
   }
 
-  attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; attempts: TaskRecord[] } | undefined {
+  attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; otherAttempts?: 'keep' | 'cancel'; attempts: TaskRecord[] } | undefined {
     const t = this.getTask(taskOrIntentId);
     const intentId = t?.intentId ?? taskOrIntentId;
     const r = this.db.prepare('SELECT * FROM task_intents WHERE id = ?').get(intentId) as any;
     if (!r) return undefined;
     return { intentId, principalAttemptId: r.principalAttemptId, committedAttemptId: r.committedAttemptId ?? undefined,
+      otherAttempts: r.committedAttemptId ? (this.kvGet(`attempt-policy:${intentId}`) === 'keep' ? 'keep' : 'cancel') : undefined,
       confirmer: r.confirmer == null ? undefined : JSON.parse(r.confirmer), attempts: this.attemptsOf(intentId) };
   }
 
@@ -2880,15 +2881,39 @@ export class Store {
     return this.attachTags(projectId, rows.map(rowToTask));
   }
 
-  /** Atomically reserve the logical task at Merge entry. Returns siblings to cancel. */
+  /** Project default is read at Review time, including for already-running tasks. */
+  otherAttemptsDefault(taskId: string): 'ask' | 'keep' | 'cancel' {
+    const task = this.getTask(taskId);
+    const value = task && this.getSettings(task.projectId, '__common__')?.otherAttempts;
+    return value === 'keep' || value === 'cancel' ? value : 'ask';
+  }
+
+  /** Freeze the group's disposition at first Merge admission. Old reservations
+   * without an explicit policy retain their exclusive, cancel-siblings meaning. */
   claimAttempt(taskId: string): { accepted: boolean; cancel: string[] } {
     const t = this.getTask(taskId);
     if (!t?.intentId) return { accepted: true, cancel: [] };
-    const info = this.db.prepare('UPDATE task_intents SET committedAttemptId=?, principalAttemptId=? WHERE id=? AND committedAttemptId IS NULL')
-      .run(taskId, taskId, t.intentId);
-    const group = this.attemptGroup(t.intentId)!;
-    if (!Number(info.changes) && group.committedAttemptId !== taskId) return { accepted: false, cancel: [taskId] };
-    return { accepted: true, cancel: group.attempts.filter((a) => a.id !== taskId && a.lastView?.status !== 'cancelled').map((a) => a.id) };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      let group = this.attemptGroup(t.intentId)!;
+      if (!group.committedAttemptId) {
+        const choice = this.kvGet(`attempt-choice:${taskId}`) ?? this.otherAttemptsDefault(taskId);
+        const policy = choice === 'cancel' ? 'cancel' : 'keep';
+        this.kvSet(`attempt-policy:${t.intentId}`, policy);
+        this.db.prepare('UPDATE task_intents SET committedAttemptId=?, principalAttemptId=? WHERE id=?')
+          .run(taskId, taskId, t.intentId);
+        group = this.attemptGroup(t.intentId)!;
+      }
+      const accepted = group.otherAttempts === 'keep' || group.committedAttemptId === taskId;
+      const cancel = group.otherAttempts === 'keep' ? [] : accepted
+        ? group.attempts.filter((a) => a.id !== taskId && !['cancelled', 'done', 'failed'].includes(a.lastView?.status ?? '')).map((a) => a.id)
+        : [taskId];
+      this.db.exec('COMMIT');
+      return { accepted, cancel };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   markDraftSuperseded(taskId: string, winnerId: string) {
@@ -2905,7 +2930,12 @@ export class Store {
   /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
   electPrincipal(intentId: string) {
     const g = this.attemptGroup(intentId);
-    if (!g || g.committedAttemptId) return;
+    if (!g || (g.committedAttemptId && g.otherAttempts !== 'keep')) return;
+    // Kept alternatives may outlive the first admitted attempt. Preserve a
+    // healthy principal, but do not strand the logical task on a failed/cancelled
+    // attempt while another remains eligible. The admission policy stays fixed.
+    const principal = g.attempts.find((a) => a.id === g.principalAttemptId);
+    if (g.committedAttemptId && principal && !['cancelled', 'failed'].includes(principal.lastView?.status ?? '')) return;
     const eligible = g.attempts.find((a) => a.lastView?.status !== 'cancelled' && a.lastView?.status !== 'failed');
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }
@@ -3536,13 +3566,14 @@ export class Store {
   }
 
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
-  private hasPendingApprovals(taskId: string): boolean {
+  private hasPendingApprovals(taskId: string, includeDismissed = false): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM events e
       WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
+          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
+          AND (?=0 OR r.type NOT IN ('permission.approval-dismissed', 'authorization.approval-dismissed'))
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
-      LIMIT 1`).get(taskId));
+      LIMIT 1`).get(taskId, includeDismissed ? 1 : 0));
   }
 
   /**
@@ -3570,7 +3601,8 @@ export class Store {
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved'
-      || ev.type === 'authorization.approval-resolved') {
+      || ev.type === 'authorization.approval-resolved' || ev.type === 'permission.approval-dismissed'
+      || ev.type === 'authorization.approval-dismissed') {
       if (!this.hasPendingApprovals(task.id)) this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]);
       return;
     }
@@ -3614,7 +3646,9 @@ export class Store {
       // The one lifecycle state that is an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
-      if (this.hasPendingApprovals(task.id)) return;
+      // A dismissed approval is still the reason for this hold; a lifecycle tick
+      // must not turn it into a fresh escalation notification.
+      if (this.hasPendingApprovals(task.id, true)) return;
       kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
       actionable = true;
       users = this.reviewAudience(task);
@@ -3676,7 +3710,7 @@ export class Store {
         SELECT e.taskId FROM events e
         WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
+            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []);
     }
     return dropped;
@@ -4410,6 +4444,8 @@ export class Store {
   }
 
   setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+    if (values.otherAttempts !== undefined && !['ask', 'keep', 'cancel'].includes(values.otherAttempts as string))
+      throw new Error('otherAttempts must be ask, keep, or cancel');
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && values.remote === 'none')
       throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
     this.db

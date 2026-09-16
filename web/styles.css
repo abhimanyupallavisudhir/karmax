@@ -943,6 +943,12 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .msg.input-request { background: var(--accent-weak); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); border-inline-start: 3px solid var(--accent); }
 .msg.input-request .msg-meta { margin-bottom: 7px; }
 .msg.input-request .role { color: var(--accent); font-weight: 600; opacity: 1; }
+.msg.review-info { padding: 7px 10px; font-size: 12px; }
+.review-info-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 9px; }
+.review-info-line .role { flex-shrink: 0; }
+.review-info-caption { white-space: pre-wrap; }
+.review-info .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
+.review-info #review-action-out { max-height: 180px; overflow: auto; margin: 5px 0 0; }
 .msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
 /* A little copy control per message — faint until the bubble is hovered. */
@@ -2616,3 +2622,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 #org-switcher input { font-weight: 600; text-overflow: ellipsis; }
 @media (max-width: 850px) { #org-switcher { width: 140px; } }
 @media (max-width: 600px) { #org-switcher { width: 105px; } }
+
+.approval-request-dismissed { opacity: .55; }
+.approval-request-dismissed:focus-within, .approval-request-dismissed:hover { opacity: .8; }

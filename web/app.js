@@ -3104,8 +3104,8 @@ function inboxEventChanges(ev) {
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
       'credential.approval-requested', 'credential.approval-resolved',
-      'permission.approval-requested', 'permission.approval-resolved',
-      'authorization.approval-requested', 'authorization.approval-resolved'].includes(ev.type);
+      'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
+      'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
 let inboxRefreshTimer;
 function scheduleInboxReload() {
@@ -3395,8 +3395,10 @@ const LIST_RELOAD_EVENTS = new Set([
   'credential.approval-resolved',
   'permission.approval-requested',
   'permission.approval-resolved',
+  'permission.approval-dismissed',
   'authorization.approval-requested',
   'authorization.approval-resolved',
+  'authorization.approval-dismissed',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -3492,7 +3494,7 @@ function connectWs() {
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
-      } else if (ev.type === 'session.started' || ev.type === 'review.updated') {
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask();
       } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -4105,6 +4107,15 @@ function renderRail() {
     search?.addEventListener('input', () => { S.projectSearch = search.value; renderRail(); });
     search?.addEventListener('keydown', (event) => {
       if (event.isComposing) return;
+      if (['ArrowDown', 'ArrowUp'].includes(event.key)
+          && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+        event.preventDefault();
+        resetChord();
+        const results = [...rail.querySelectorAll('.project-link')];
+        const result = event.key === 'ArrowDown' ? results[0] : results.at(-1);
+        result?.focus();
+        result?.scrollIntoView({ block: 'nearest' });
+      }
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
@@ -6685,7 +6696,7 @@ function taskAttempts(v) {
     return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
     </a>`;
   }).join('') : '';
   return `<section class="attempts" aria-label="Task attempts">
@@ -7323,6 +7334,7 @@ function renderTaskPage() {
     wireReviewActions(v);
     wireResourceInventory(v);
   } else if (tab === 'checkin') {
+    wireReviewActions(v);
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
@@ -7474,7 +7486,7 @@ function taskTabBody(v, tab) {
 
 function approvalRequestsTab(v) {
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
-    .filter((request) => request.status === 'pending').length;
+    .filter((request) => request.status === 'pending' && !request.dismissed).length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
@@ -8479,6 +8491,19 @@ function checkinTab(v) {
   </div>`;
 }
 
+// Task-level review affordances belong at the end of whichever agent is open.
+// Keep previews in Overview and command output hidden until explicitly run.
+function conversationReviewInfo(v) {
+  const info = v.reviewInfo;
+  const caption = info?.caption || info?.summary;
+  if (!caption && !info?.actions?.length && !info?.links?.length && !info?.html) return '';
+  return `<div class="msg agent review-info">
+    <div class="review-info-line"><span class="role">Review info</span>${caption ? `<span class="review-info-caption">${esc(caption)}</span>` : ''}</div>
+    ${info.actions?.length ? `<div class="review-actions" id="review-actions">${info.actions.map((action, index) => reviewActionBtn(action, index)).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
+    ${info.links?.length || info.html ? `<div class="review-actions">${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}${info.html ? '<button class="btn sm" data-tasktab="overview">View preview ↗</button>' : ''}</div>` : ''}
+  </div>`;
+}
+
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
@@ -8542,7 +8567,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
 }
 
@@ -10207,6 +10232,46 @@ function confirmTaskAction(action, v = S.view) {
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
+// The choice travels with confirmation; saving the project default is authorized
+// separately on the server. Dismissing this dialog never confirms the proposal.
+async function otherAttemptsConfirmation(action, taskId) {
+  if (action !== 'confirm' && action !== 'openPr') return {};
+  const group = await api(`/api/tasks/${taskId}/attempts`);
+  if (!group?.otherAttemptsChoiceAvailable || group.committedAttemptId || !group.attempts.some((a) => a.id !== taskId
+    && !['done', 'cancelled', 'failed'].includes(a.lastView?.status))) return {};
+  if (group.otherAttemptsDefault !== 'ask') return { otherAttempts: group.otherAttemptsDefault };
+  return new Promise((resolve) => {
+    const root = $('#overlay-root');
+    root.innerHTML = `<div class="palette-scrim" id="attempt-choice-scrim"><div class="palette" role="dialog" aria-modal="true" aria-labelledby="attempt-choice-title" style="width:min(480px,92vw);padding:24px">
+      <h2 id="attempt-choice-title">Keep or cancel other attempts?</h2>
+      <p>Keep lets the other attempts continue and integrate their proposals. Cancel stops the alternatives when this attempt enters Merge.</p>
+      ${group.canSaveOtherAttemptsDefault ? '<label class="form-row"><span><input id="save-attempt-choice" type="checkbox"> Save this choice for future tasks in this project</span></label>' : ''}
+      <div class="actions"><button class="btn" data-attempt-choice="back">Back</button><button class="btn danger" data-attempt-choice="cancel">Cancel other attempts</button><button class="btn primary" data-attempt-choice="keep">Keep other attempts</button></div>
+    </div></div>`;
+    const previousFocus = document.activeElement;
+    const close = (choice) => {
+      const save = !!$('#save-attempt-choice')?.checked;
+      document.removeEventListener('keydown', keydown, true);
+      root.innerHTML = '';
+      previousFocus?.focus();
+      resolve(choice === 'back' ? null : { otherAttempts: choice, saveOtherAttemptsDefault: save });
+    };
+    const keydown = (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close('back'); }
+      if (event.key === 'Tab') {
+        const items = [...root.querySelectorAll('button, input')];
+        const index = items.indexOf(document.activeElement);
+        if (event.shiftKey && index <= 0) { event.preventDefault(); items.at(-1).focus(); }
+        else if (!event.shiftKey && index === items.length - 1) { event.preventDefault(); items[0].focus(); }
+      }
+    };
+    document.addEventListener('keydown', keydown, true);
+    root.querySelectorAll('[data-attempt-choice]').forEach((button) => button.addEventListener('click', () => close(button.dataset.attemptChoice)));
+    $('#attempt-choice-scrim').addEventListener('click', (event) => { if (event.target.id === 'attempt-choice-scrim') close('back'); });
+    root.querySelector('[data-attempt-choice="keep"]').focus();
+  });
+}
+
 function reflectAcceptedTaskAction(taskId, action) {
   if (action !== 'cancel') return;
   markTaskCancelling(taskId);
@@ -10227,7 +10292,9 @@ function wireActions(v) {
       btn.disabled = true;
       btn.textContent = cancelling ? 'Cancelling…' : 'Sending…';
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        const choice = await otherAttemptsConfirmation(act, v.taskId);
+        if (choice === null) return;
+        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act, ...choice }) });
         succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
         toast(actionToast(act, btn.dataset.label));
@@ -11077,7 +11144,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the task agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -13911,10 +13978,10 @@ Deny: Rejects this request.`, '?')}
 function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
-  const pendingHtml = pending.map((request) => `<div class="approval-request" data-preq="${esc(request.id)}">
+  const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        <span class="chip approval-needed">approval needed</span>
+        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
@@ -13925,6 +13992,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
+      ${!request.dismissed ? '<button class="btn sm" data-preq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
     </div>
   </div>`).join('');
   const history = recent.length
@@ -13942,10 +14010,10 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
-    return `<div class="approval-request" data-areq="${esc(request.id)}">
+    return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
-        <span class="chip approval-needed">approval needed</span>
+        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -13955,6 +14023,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
+      ${canResolve && !request.dismissed ? '<button class="btn sm" data-areq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
     </div>
   </div>`;
   }).join('');
@@ -13974,7 +14043,7 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
         });
-        toast(button.dataset.areqAct === 'deny' ? 'Authorization denied'
+        toast(button.dataset.areqAct === 'dismiss' ? 'Request dismissed' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -13991,10 +14060,10 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
           method: 'POST',
           body: JSON.stringify({ action: button.dataset.preqAct }),
         });
-        const decision = button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
-        toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+        const decision = button.dataset.preqAct === 'dismiss' ? 'Request dismissed' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
-        !result.resume?.resumed && !!result.resume?.reason);
+        button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
         await onResolved?.(result);
       } catch (error) {
         button.disabled = false;
@@ -16758,7 +16827,9 @@ async function runDeclaredAction(a) {
   if (!confirmTaskAction(a.name, S.view)) return;
   const taskId = S.selected;
   try {
-    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    const choice = await otherAttemptsConfirmation(a.name, taskId);
+    if (choice === null) return;
+    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name, ...choice }) });
     reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, taskActionLabel(S.view, a)));
     setTimeout(refreshTask, 250);
@@ -16853,7 +16924,11 @@ function openAdjacentTask(delta) {
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
-function railRows() { return [...document.querySelectorAll('#rail .rail-add, #rail .project-link, #rail .folder-toggle, #rail .nav-item')]; }
+function railRows() {
+  // Search results are projects; skip their folder headings during a filtered walk.
+  const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
+  return [...document.querySelectorAll('#rail .rail-add, #project-search, #rail .project-link, #rail .nav-item' + folders)];
+}
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();

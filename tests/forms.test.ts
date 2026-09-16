@@ -238,8 +238,19 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect((await get(`/api/tasks/${task.id}/attempts`)).attempts.every((attempt: any) => attempt.params.archived === true)).toBe(true);
     // un-archive so we can finish it, then archive the finished task
     await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: false }) });
-    await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm' });
+    // A sibling now requires the explicit Keep/Cancel choice. Check the HTTP
+    // boundary instead of silently ignoring an error and timing out at Done.
+    const missingChoice = await fetch(`${base}/api/tasks/${task.id}/signal`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ signal: 'confirm' }),
+    });
+    expect(missingChoice.status).toBe(400);
+    expect((await J(missingChoice)).error).toMatch(/keep or cancel/i);
+    expect((await get(`/api/tasks/${task.id}`)).stage).toBe('review');
+    const confirmed = await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm', otherAttempts: 'cancel' });
+    expect(confirmed).toMatchObject({ ok: true });
     await poll(task.id, 'done');
+    expect((await get(`/api/tasks/${task.id}/attempts`)).attempts
+      .find((attempt: any) => attempt.id === draftAttempt.id)?.lastView?.status).toBe('cancelled');
     const ok = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
     expect(ok.status).toBe(200);
 
