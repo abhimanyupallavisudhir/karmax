@@ -50,6 +50,20 @@ function fixture() {
 const humanWait = (stage: string) => ({ stage, status: 'waiting', waitingFor: { kind: 'human', audience: ['user:reviewer'] } });
 
 describe('inbox', () => {
+  it('keeps dismissed approvals silent across waiting lifecycle ticks', () => {
+    const f = fixture();
+    f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
+      payload: { requestId: 'request', recipients: ['reviewer'] } });
+    expect(f.inbox()).toHaveLength(1);
+    f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-dismissed', ts: Date.now(),
+      payload: { requestId: 'request' } });
+    expect(f.inbox()).toEqual([]);
+    f.view({ status: 'waiting', waitingFor: { kind: 'human' } });
+    expect(f.inbox()).toEqual([]);
+    f.store.pruneStaleInbox();
+    expect(f.inbox()).toEqual([]);
+  });
+
   it('keeps one row per ask instead of one per lifecycle event', () => {
     const f = fixture();
     f.view(humanWait('review'));

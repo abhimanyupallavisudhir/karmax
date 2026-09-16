@@ -3536,13 +3536,14 @@ export class Store {
   }
 
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
-  private hasPendingApprovals(taskId: string): boolean {
+  private hasPendingApprovals(taskId: string, includeDismissed = false): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM events e
       WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
+          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
+          AND (?=0 OR r.type NOT IN ('permission.approval-dismissed', 'authorization.approval-dismissed'))
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
-      LIMIT 1`).get(taskId));
+      LIMIT 1`).get(taskId, includeDismissed ? 1 : 0));
   }
 
   /**
@@ -3570,7 +3571,8 @@ export class Store {
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved'
-      || ev.type === 'authorization.approval-resolved') {
+      || ev.type === 'authorization.approval-resolved' || ev.type === 'permission.approval-dismissed'
+      || ev.type === 'authorization.approval-dismissed') {
       if (!this.hasPendingApprovals(task.id)) this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]);
       return;
     }
@@ -3614,7 +3616,9 @@ export class Store {
       // The one lifecycle state that is an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
-      if (this.hasPendingApprovals(task.id)) return;
+      // A dismissed approval is still the reason for this hold; a lifecycle tick
+      // must not turn it into a fresh escalation notification.
+      if (this.hasPendingApprovals(task.id, true)) return;
       kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
       actionable = true;
       users = this.reviewAudience(task);
@@ -3676,7 +3680,7 @@ export class Store {
         SELECT e.taskId FROM events e
         WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
+            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []);
     }
     return dropped;
