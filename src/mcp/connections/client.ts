@@ -18,26 +18,29 @@ export async function connectWorldMcp(world: World, server: AgentMcpServer, sign
   const child = isRemoteAgentWorld(world)
     ? new RemoteSpawnedProcess(world, `stty raw -echo; printf '\\036KARMAX_AGENT_READY\\036'; exec ${[server.command, ...(server.args ?? [])].map(quote).join(' ')} 2>/dev/null`, world.handle.root, server.env ?? {}, signal)
     : spawn(server.command, server.args ?? [], { cwd: world.handle.root, env, stdio: ['pipe', 'pipe', 'ignore'] });
-  let buffered = ''; const decoder = new StringDecoder('utf8');
+  let buffered = ''; let bufferedBytes = 0; const decoder = new StringDecoder('utf8');
   const transport: Transport = {
     async start() {
       child.on('error', (e) => transport.onerror?.(e));
-      child.on('exit', () => transport.onclose?.());
+      child.on('close', () => transport.onclose?.());
+      child.stdin?.on('error', (error) => { child.kill(); transport.onerror?.(error); });
+      child.stdout?.on('error', (error) => { child.kill(); transport.onerror?.(error); });
       child.stdout!.on('data', (chunk: Buffer) => {
-        buffered += decoder.write(chunk);
+        const decoded = decoder.write(chunk); buffered += decoded; bufferedBytes += Buffer.byteLength(decoded);
         try {
           let end: number;
           while ((end = buffered.indexOf('\n')) >= 0) {
-            if (end > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
-            const line = buffered.slice(0, end); buffered = buffered.slice(end + 1);
+            const line = buffered.slice(0, end); const bytes = Buffer.byteLength(line);
+            if (bytes > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
+            buffered = buffered.slice(end + 1); bufferedBytes -= bytes + 1;
             if (line.trim()) transport.onmessage?.(JSONRPCMessageSchema.parse(JSON.parse(line)));
           }
-          if (buffered.length > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
+          if (bufferedBytes > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
         } catch { child.kill(); transport.onerror?.(new Error('Invalid or oversized MCP response')); }
 
       });
     },
-    async send(message) { const data = serializeMessage(message); if (data.length > 2 * 1024 * 1024) throw new Error('MCP request exceeds 2 MiB'); child.stdin!.write(data); },
+    async send(message) { const data = serializeMessage(message); if (Buffer.byteLength(data) > 2 * 1024 * 1024) throw new Error('MCP request exceeds 2 MiB'); child.stdin!.write(data); },
     async close() { signal?.removeEventListener('abort', abort); child.kill(); },
   };
   const abort = () => { void transport.close(); };
@@ -80,11 +83,12 @@ export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], 
       do {
         if (++pages > 10) throw new Error('MCP tool catalog has too many pages');
         const page = await client.listTools(cursor ? { cursor } : undefined);
-        catalogBytes += JSON.stringify(page).length;
+        catalogBytes += Buffer.byteLength(JSON.stringify(page));
         if (catalogBytes > 1024 * 1024) throw new Error('Selected MCP tool descriptions exceed 1 MiB; select fewer connections');
         for (const tool of page.tools) {
           if (tools.length >= 200) throw new Error('Selected MCP connections expose more than 200 tools; select fewer connections');
           const name = `mcp_${crypto.createHash('sha256').update(server.name + '\0' + tool.name).digest('hex').slice(0, 24)}`;
+          if (handlers[name]) throw new Error('MCP server returned duplicate tool names');
           tools.push({ name, description: `${server.name}: ${tool.name}\n${tool.description ?? ''}`.slice(0, 8000), parameters: tool.inputSchema });
           handlers[name] = (args) => client.callTool({ name: tool.name, arguments: args }, undefined, { timeout: 60_000 });
         }

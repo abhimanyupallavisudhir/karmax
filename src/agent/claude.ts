@@ -204,7 +204,7 @@ export class ClaudeAdapter implements AgentAdapter {
         ctx.emitActivity(claudeToolActivity(use, 'started'));
         const result = handler ? await handler(use.input ?? {}) : `unknown tool ${use.name}`;
         ctx.emitActivity(claudeToolActivity(use, 'completed', result));
-        toolResults.push({ type: 'tool_result', tool_use_id: use.id, content: result });
+        toolResults.push({ type: 'tool_result', tool_use_id: use.id, content: typeof result === 'string' ? result : JSON.stringify(result) });
         if (use.name === 'signal_completion') completed = true;
       }
       messages.push({ role: 'user', content: toolResults });

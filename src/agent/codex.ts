@@ -1,5 +1,5 @@
 import { platformMcpSpec } from '../autonomy/config-homes.js';
-import { codexMcpFlags } from '../mcp/connections/runtime.js';
+import { selectedCodexMcpFlags } from '../mcp/connections/codex-selection.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -364,7 +364,7 @@ export class CodexAdapter implements AgentAdapter {
           title: String(call.name ?? 'Tool call'),
           ...(doneDetail ? { detail: doneDetail } : {}),
         });
-        toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: result });
+        toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: typeof result === 'string' ? result : JSON.stringify(result) });
         if (call.name === 'signal_completion') completed = true;
       }
       nextInput = toolOutputs;
@@ -420,10 +420,12 @@ export class CodexAdapter implements AgentAdapter {
     const custody = remote ? undefined : createCustodyEnv(env);
     if (custody) env = custody.env;
 
+    const mcpFlags = await selectedCodexMcpFlags(input.world, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal);
+
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const child: any = remote
-      ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server', ...codexMcpFlags([...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined)], cwd, env, signal: ctx.signal })
-      : spawn(cmd, ['app-server', ...codexMcpFlags([...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined)], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
+      : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx);
@@ -912,7 +914,7 @@ export class CodexAdapter implements AgentAdapter {
     // answer), and karmax's world (worktree/container) IS the sandbox boundary
     // (SPEC §7.3) — the same stance as the Claude adapter's bypassPermissions — so
     // we bypass Codex's own approvals+sandbox rather than depend on its landlock.
-    const flags = [...codexMcpFlags([...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined), '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-o', lastFile];
+    const flags = [...await selectedCodexMcpFlags(input.world, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal), '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-o', lastFile];
     if (model) flags.push('-m', model);
     if (effort) flags.push('-c', `model_reasoning_effort=${effort}`);
     // Turn-local controls (`confirm_decision`, `resolve_decision`, `create_review_info`,

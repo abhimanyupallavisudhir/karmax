@@ -46,4 +46,25 @@ describe('MCP HTTP authorization boundary', () => {
     expect((await request('POST', `/api/mcp?projectId=${project}`, token(['project:settings:write']), { ...c, label: 'Hijacked' })).status).toBe(400);
     expect((await request('DELETE', `/api/mcp/${c.id}?projectId=${project}`, token(['project:settings:write']))).status).toBe(403);
   });
+  it.each(['test', 'authorize', 'callback'])('requires administration authority for %s, before making outbound requests', async (operation) => {
+    const created = await request('POST', `/api/mcp?projectId=${project}`, token(['project:settings:write']), { label: 'Restricted', transport: { type: 'http', url: 'https://example.com/mcp' } });
+    const c = await created.json() as any;
+    expect((await request('POST', `/api/mcp/${c.id}/${operation}?projectId=${project}`, token(['profile:read']), { state: 'bad', code: 'bad' })).status).toBe(403);
+  });
+  it('round-trips editing and disabling, rejects invalid updates, and deletes connections', async () => {
+    const route = `/api/mcp?projectId=${project}`, admin = token(['project:settings:write']);
+    const created = await request('POST', route, admin, { label: 'Lifecycle', transport: { type: 'http', url: 'https://example.com/lifecycle' }, auth: 'secrets', secrets: { Authorization: 'Bearer original' } });
+    const c = await created.json() as any;
+    expect((await request('POST', route, admin, { ...c, transport: { type: 'http', url: 'https://127.0.0.1' } })).status).toBe(400);
+    const edited = await request('POST', route, admin, { ...c, label: 'Disabled', enabled: false });
+    expect(edited.status).toBe(200);
+    const list = await (await request('GET', route, token(['profile:read']))).json() as any[];
+    expect(list.find((v) => v.id === c.id)).toMatchObject({ label: 'Disabled', enabled: false, connected: true });
+    expect(JSON.stringify(list)).not.toContain('Bearer original');
+    expect((await request('POST', `/api/mcp/${c.id}/test?projectId=${project}`, admin, {})).status).toBe(400);
+    expect((await request('DELETE', `/api/mcp/${c.id}?projectId=${project}`, admin)).status).toBe(200);
+    const after = await (await request('GET', route, token(['profile:read']))).json() as any[];
+    expect(after.some((v) => v.id === c.id)).toBe(false);
+  });
+
 });

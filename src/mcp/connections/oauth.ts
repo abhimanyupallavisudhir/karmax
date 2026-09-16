@@ -48,8 +48,8 @@ export async function finishOAuth(service: McpConnections, c: McpConnection, act
     const data = service.secret(c);
     const pending = data.pending;
     if (!pending || pending.actor !== actor || pending.revision !== c.revision || pending.expires < Date.now()
-      || typeof state !== 'string' || state.length !== 64 || !crypto.timingSafeEqual(Buffer.from(state), Buffer.from(pending.state))) throw new Error('Authorization expired or belongs to another session. Connect again.');
-    if (!code || code.length > 4096) throw new Error('Invalid authorization code');
+      || typeof state !== 'string' || !/^[a-f0-9]{64}$/.test(state) || !crypto.timingSafeEqual(Buffer.from(state), Buffer.from(pending.state))) throw new Error('Authorization expired or belongs to another session. Connect again.');
+    if (typeof code !== 'string' || !code || code.length > 4096) throw new Error('Invalid authorization code');
     // Consume before exchanging. Preserve verifier only inside this invocation.
     service.setSecret(c, { ...data, pending: undefined });
     const p = provider(service, c, data, data.redirect, () => { throw new Error('Authorization must be restarted'); });

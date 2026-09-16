@@ -81,3 +81,60 @@ npm run reset                            # also wipes karmax's Temporal + local 
 
 When stopping the app, prefer **Ctrl-C** (runs graceful shutdown, which kills the
 Temporal child) over `fuser -k <port>` / `kill -9` (leaves the child orphaned).
+
+## Agent MCP connections
+
+Run these sequentially, including separately from typechecking. The ordinary
+suite covers scoped CRUD and authorization, selection inheritance, registry
+validation, OAuth state/refresh races, SSRF/DNS pinning, HTTP and SSE protocol
+exchanges, hostile subprocesses, cancellation, lease revocation, cleanup, and
+Claude/Codex API tool loops. The API-loop tests use local model-protocol fixtures;
+they do not spend model tokens. `mcp-workflow.test.ts` additionally runs a real
+Temporal task through Review and checks secret exclusion from workflow history.
+
+```bash
+TEMPORAL_CLI=/path/to/temporal KARMAX_SKIP_LIVE=1 npx vitest run tests/mcp*.test.ts
+npm run typecheck
+```
+
+Additional checks deliberately require explicit infrastructure:
+
+```bash
+# New isolated tab in a test Chrome exposing CDP; real settings UI and gateway.
+KARMAX_MCP_BROWSER_CDP=http://127.0.0.1:9222 npx vitest run tests/mcp-browser.test.ts
+# Installed native Codex; isolated configuration, no login or model calls.
+KARMAX_MCP_CODEX_BINARY=/path/to/codex npx vitest run tests/mcp-native-codex.test.ts
+# Live Official Registry import followed by Microsoft Learn tool invocation.
+KARMAX_MCP_LIVE_NETWORK=1 npx vitest run tests/mcp-deployment.test.ts
+# Creates and destroys a real task environment (cloud providers incur charges).
+KARMAX_MCP_LIVE_WORLD=container npx vitest run tests/mcp-deployment.test.ts
+KARMAX_MCP_LIVE_WORLD=e2b npx vitest run tests/mcp-deployment.test.ts
+KARMAX_MCP_LIVE_WORLD=daytona npx vitest run tests/mcp-deployment.test.ts
+```
+
+Cloud checks require their respective `E2B_API_KEY` or `DAYTONA_API_KEY`.
+An explicitly requested deployment fails if its infrastructure is missing;
+unrequested deployments are skipped. A skipped check is not verification.
+OAuth fixtures do not establish compatibility with every real identity provider,
+and native tool discovery does not establish successful live model tool use.
+These checks reduce risk; they do not certify arbitrary third-party servers or
+prove the absence of vulnerabilities.
+
+### Verification recorded 2026-09-16
+
+- MCP checks: **123 passed**, including a real browser, native Codex startup,
+  live Registry → Microsoft Learn tool call, and a real Temporal task. The one
+  deployment smoke test was skipped: Docker/E2B/Daytona were unavailable.
+- Repository regression: the initial single-worker run reached 1,536 passing
+  tests before an unexpected worker exit. The remaining files and affected
+  tests were run in sequential batches of 20, with targeted reruns afterward.
+  The batches recorded 964 passes; final targeted verification recorded 25
+  passes. These counts overlap and must not be added as unique coverage.
+- Every observed assertion failure was resolved and passed on rerun: missing
+  local native dependencies, an existing lineage fixture that modified host
+  Node symlinks, and omitted MCP routes in the API discovery catalog.
+- No live cloud sandbox, real-account OAuth consent, or paid model invocation
+  was verified. OAuth and model API interaction tests use protocol fixtures.
+
+The broad run was not one uninterrupted green suite. Use the commands above to
+reproduce the relevant checks; preserve per-run results and explicit skips.

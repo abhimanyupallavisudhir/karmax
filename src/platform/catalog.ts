@@ -29,6 +29,14 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/authorization-requests',
     ],
   },
+  mcpConnections: [
+    'GET|POST /api/mcp?projectId= (or organizationId; POST creates/updates {id?, label, transport, auth, enabled?, secrets?}; secrets are write-only)',
+    'GET /api/mcp/registry?projectId=&search=&cursor= (Official MCP Registry discovery; listings are untrusted metadata)',
+    'DELETE /api/mcp/:id?projectId= (or organizationId; owning scope required)',
+    'POST /api/mcp/:id/test?projectId= (or organizationId; probes remote HTTPS, never executes custom processes on the host)',
+    'POST /api/mcp/:id/authorize?projectId= (or organizationId; starts actor-bound OAuth)',
+    'POST /api/mcp/:id/callback?projectId= (or organizationId; body {state, code}; finishes the initiating actor’s OAuth session)',
+  ],
   resources: ['GET /api/resource-drivers'],
   resourceAuthorization: 'Direct project resource and secret administration uses project:settings:write, including storageLocationId and uploads. Agents with this capability may act directly in any project covered by their token. Narrow task agents use propose_project_resource; adoption/discard requires task:review:execute.',
   projects: [

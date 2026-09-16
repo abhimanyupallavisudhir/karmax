@@ -37,7 +37,7 @@ async function bounded<T>(run: () => Promise<T>): Promise<T> {
   inflight++;
   try {
     const value = await run();
-    if (JSON.stringify(value).length > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
+    if (Buffer.byteLength(JSON.stringify(value)) > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
     return value;
   } finally { inflight--; }
 }

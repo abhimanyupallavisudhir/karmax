@@ -18,8 +18,8 @@ export async function registrySearch(search = '', cursor = ''): Promise<any> {
   if (!response.ok) throw new Error('Official MCP Registry is unavailable. Try again or add a custom server.');
   const raw = await response.json() as any;
   if (!Array.isArray(raw.servers)) throw new Error('Unexpected registry response');
-  const value = { servers: raw.servers.slice(0, 20).filter((entry: any) => entry._meta?.['io.modelcontextprotocol.registry/official']?.status === 'active')
-    .map((entry: any) => registryEntry(entry.server)), nextCursor: typeof raw.metadata?.nextCursor === 'string' ? raw.metadata.nextCursor.slice(0, 1024) : undefined };
+  const value = { servers: raw.servers.slice(0, 20).filter((entry: any) => entry?._meta?.['io.modelcontextprotocol.registry/official']?.status === 'active')
+    .map((entry: any) => registryEntry(entry.server)).filter((entry: any) => entry.name && entry.version), nextCursor: typeof raw.metadata?.nextCursor === 'string' ? raw.metadata.nextCursor.slice(0, 1024) : undefined };
   if (cache.size >= 100) cache.delete(cache.keys().next().value!);
   cache.set(key, { value, expires: Date.now() + 300_000 });
   return value;
@@ -28,12 +28,14 @@ export async function registrySearch(search = '', cursor = ''): Promise<any> {
 /** Registry descriptions are display-only, never prompts. Return declarative
  * candidates; importing always passes through the same custom-server validator. */
 export function registryEntry(server: any) {
+  server = server && typeof server === 'object' && !Array.isArray(server) ? server : {};
+  const records = (value: unknown, limit: number): any[] => Array.isArray(value) ? value.slice(0, limit).filter((v) => v && typeof v === 'object' && !Array.isArray(v)) : [];
   const options: { label: string; transport: McpTransport; fields: any[] }[] = [];
-  for (const remote of (server.remotes ?? []).slice(0, 10)) {
+  for (const remote of records(server.remotes, 10)) {
     if (!['streamable-http', 'sse'].includes(remote.type) || typeof remote.url !== 'string' || /[{}]/.test(remote.url)) continue;
-    try { options.push({ label: remote.url, transport: validateTransport({ type: remote.type === 'sse' ? 'sse' : 'http', url: remote.url }), fields: remote.headers ?? [] }); } catch {}
+    try { options.push({ label: remote.url, transport: validateTransport({ type: remote.type === 'sse' ? 'sse' : 'http', url: remote.url }), fields: records(remote.headers, 40) }); } catch {}
   }
-  for (const pkg of (server.packages ?? []).slice(0, 10)) {
+  for (const pkg of records(server.packages, 10)) {
     // Registry metadata must never choose a package manager's alternate registry
     // or smuggle switches into the package identifier/version.
     if (pkg.transport?.type !== 'stdio' || typeof pkg.version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/.test(pkg.version) || pkg.version === 'latest') continue;
@@ -48,8 +50,8 @@ export function registryEntry(server: any) {
     // Runtime arguments customize the package manager itself: do not import
     // these implicitly. A user can explicitly configure a custom command.
     if (pkg.runtimeArguments?.length) continue;
-    const fields = [...(pkg.environmentVariables ?? []).map((f: any) => ({ ...f, target: 'env' })),
-      ...(pkg.packageArguments ?? []).map((f: any) => ({ ...f, target: 'argument' }))];
+    const fields = [...records(pkg.environmentVariables, 40).map((f: any) => ({ ...f, target: 'env' })),
+      ...records(pkg.packageArguments, 80).map((f: any) => ({ ...f, target: 'argument' }))];
     options.push({ label: `${pkg.identifier} ${pkg.version}`, transport: { type: 'stdio', command, args }, fields });
   }
   return { name: String(server.name ?? '').slice(0, 256), version: String(server.version ?? '').slice(0, 128),
