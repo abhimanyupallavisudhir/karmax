@@ -66,7 +66,7 @@ const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
   'project:resource:shared-write',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:read', 'vault:store', 'use-credential:*', 'skill:write',
+  'credential:read', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write',
   'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
@@ -79,7 +79,7 @@ export const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'project:resource:shared-write',
   // Loading code into the shared worker is installation authority, never tenant authority.
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
+  'credential:*', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'github:actions:*',
 ];
