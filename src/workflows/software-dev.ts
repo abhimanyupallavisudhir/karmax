@@ -2635,7 +2635,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // stale head and exact-candidate verification repeats forever.
   let recoveredLandingNeedsDo = false;
   proposalCycle: for (;;) {
-  // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
+  // ── Do ⇄ Needs input ⇒ PR ⇄ Review ──
   if (!restoredReviewApproved
     && (recoveredLandingNeedsDo || (recoveryStage !== 'pr' && recoveryStage !== 'merge'))) {
   recoveredLandingNeedsDo = false;
@@ -2725,6 +2725,17 @@ Inspect the complete current diff and specifically compare its delta from the re
       stage = 'do';
       status = 'active';
       continue;
+    }
+
+    if (patched('service-connections-wait-v1')) {
+      while (await core.pendingServiceConnections(taskId) && !cancelled && msgs.length === seen) {
+        status = 'waiting';
+        waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
+        await publish();
+        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+      }
+      if (cancelled) return await abort();
+      if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
     }
 
     // A collaboration may settle after the provider's final live-message poll

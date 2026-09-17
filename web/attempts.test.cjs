@@ -54,6 +54,9 @@ const ok = (condition, message) => {
 
 const html = taskAttempts({ taskId: 'attempt-2' });
 ok((html.match(/data-attempt-select=/g) || []).length === 2, 'every attempt is a selectable row');
+ok((html.match(/data-attempt-principal=/g) || []).length === 2, 'every attempt has a crown');
+ok((html.match(/aria-pressed="true"/g) || []).length === 1, 'only the principal crown is pressed');
+ok(!/<a[^>]*>[\s\S]*?<button/.test(html.split('</a>')[0]), 'crown is outside the navigation link');
 ok(html.includes('data-attempt-select="attempt-1"'), 'principal can be selected again');
 ok(html.includes('data-attempt-select="attempt-2"'), 'draft can be selected');
 ok(html.includes('attempt-card selected') && html.includes('aria-current="true"'), 'current attempt is visibly and semantically selected');
@@ -92,7 +95,7 @@ const button = {
   disabled: false,
   addEventListener(event, handler) { this[event] = handler; },
 };
-global.document = { getElementById: () => button };
+global.document = { getElementById: () => button, querySelectorAll: () => [] };
 const navigated = [];
 global.spaNavigate = async (href) => { navigated.push(href); S.selected = 'new-draft'; };
 global.refreshTasks = async () => {};
@@ -100,6 +103,25 @@ global.openTaskForm = async () => {};
 global.toast = () => {};
 eval(extractFn('wireAttempts'));
 (async () => {
+  const crown = {
+    disabled: false, dataset: { attemptPrincipal: 'attempt-2' },
+    getAttribute: () => 'false',
+    addEventListener(event, handler) { this[event] = handler; },
+  };
+  document.querySelectorAll = () => [crown];
+  const crownCalls = [];
+  global.api = async (url, options) => { crownCalls.push([url, options.method]); };
+  let refreshed = 0;
+  global.refreshTask = async () => { refreshed++; };
+  S.selected = 'attempt-1';
+  wireAttempts({ taskId: 'attempt-1' });
+  await crown.click();
+  ok(crownCalls[0]?.[0] === '/api/tasks/attempt-2/principal' && crownCalls[0]?.[1] === 'POST', 'crown selects its own attempt');
+  ok(S.viewingAttempt === 'attempt-1' && refreshed === 1, 'changing principal preserves the viewed attempt and refreshes');
+  global.api = async () => { throw new Error('Rejected'); };
+  await crown.click();
+  ok(!crown.disabled, 'rejected crown selection can be retried');
+  document.querySelectorAll = () => [];
   let resolve;
   let calls = 0;
   global.api = () => { calls++; return new Promise((done) => { resolve = done; }); };

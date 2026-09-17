@@ -7,6 +7,34 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 
 describe('multiple task attempts', () => {
+  it('selects and preserves a principal until it fails or a winner commits', async () => {
+    const store = new Store(':memory:');
+    store.claimPersonalOrganization('test');
+    const project = store.createProject('Acme');
+    const tokens = new TokenAuthority();
+    const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;
+    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'test', tokens });
+    const first = store.createTask({ projectId: project.id, title: 'X', workflow: 'script-exec', workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const second = await api.addAttempt(token, first.id);
+    const readOnly = tokens.mintPrincipal('user:reader', ['task:read'], project.id).token;
+    expect(() => api.setPrincipalAttempt(readOnly, second.id)).toThrow();
+    api.setPrincipalAttempt(token, second.id);
+    expect(store.listTasks(project.id)[0]!.id).toBe(second.id);
+    expect(store.getTaskByNum(project.id, first.num!)!.id).toBe(second.id);
+    const third = await api.addAttempt(token, first.id);
+    const failed = (id: string) => ({ taskId: id, title: 'X', workflow: 'script-exec', stage: 'do' as const,
+      status: 'failed' as const, messages: [], actions: [], state: {}, updatedAt: 1 });
+    store.saveView(third.id, failed(third.id));
+    expect(store.attemptGroup(first.id)!.principalAttemptId).toBe(second.id);
+    expect(() => api.setPrincipalAttempt(token, third.id)).toThrow();
+    store.saveView(second.id, failed(second.id));
+    expect(store.attemptGroup(first.id)!.principalAttemptId).toBe(first.id);
+    store.claimAttempt(first.id);
+    expect(() => api.setPrincipalAttempt(token, first.id)).toThrow(/commitment/);
+    expect(store.attemptGroup(first.id)!.committedAttemptId).toBe(first.id);
+    store.close();
+  });
+
   it('creates and queues every up-front attempt', async () => {
     const store = new Store(':memory:');
     store.claimPersonalOrganization('test');

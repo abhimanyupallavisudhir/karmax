@@ -64,6 +64,26 @@ describe('inbox', () => {
     expect(f.inbox()).toEqual([]);
   });
 
+  it('keeps a connection ask visible while another approval is dismissed', () => {
+    const f = fixture();
+    try {
+      f.store.appendEvent({ taskId: f.task.id, type: 'connection.requested', ts: Date.now(),
+        payload: { requestId: 'connection' } });
+      f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
+        payload: { requestId: 'permission', recipients: ['owner'] } });
+      f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-dismissed', ts: Date.now(),
+        payload: { requestId: 'permission' } });
+      f.store.pruneStaleInbox();
+      expect(f.inbox('owner')).toEqual([expect.objectContaining({ kind: 'approval-requested', actionable: true })]);
+      f.store.appendEvent({ taskId: f.task.id, type: 'connection.resolved', ts: Date.now(),
+        payload: { requestId: 'connection' } });
+      expect(f.inbox('owner')).toEqual([]);
+      f.view({ status: 'waiting', waitingFor: { kind: 'human' } });
+      f.store.pruneStaleInbox();
+      expect(f.inbox('owner')).toEqual([]);
+    } finally { f.store.close(); }
+  });
+
   it('keeps one row per ask instead of one per lifecycle event', () => {
     const f = fixture();
     f.view(humanWait('review'));

@@ -2861,6 +2861,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     },
 
+    async pendingServiceConnections(taskId: string): Promise<number> {
+      return store.kvEntries('service-connection:').filter(row => {
+        const c = JSON.parse(row.value);
+        return c.taskId === taskId && (['requested', 'connecting'].includes(c.status) || !c.notifiedAt);
+      }).length;
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return store.listResourceCandidates(taskId).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;

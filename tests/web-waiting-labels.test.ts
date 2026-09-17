@@ -66,13 +66,13 @@ describe('waiting labels in task summaries', () => {
       status: 'waiting',
       state: { humanPauseOrigin: 'do' },
       waitingFor: { kind: 'human', detail: 'The agent finished its turn.' },
-    })).toBe('Waiting for input');
+    })).toBe('Needs input');
     expect(stageLabel({
       stage: 'review',
       status: 'waiting',
       state: {},
       waitingFor: { kind: 'human', detail: 'Review this proposal.' },
-    })).toBe('Waiting for input');
+    })).toBe('Needs input');
     expect(stageLabel({
       stage: 'merge',
       status: 'waiting',
@@ -124,7 +124,7 @@ describe('waiting labels in task summaries', () => {
     expect(waitingText({
       kind: 'human',
       detail: 'A long internal explanation of the decision needed',
-    })).toBe('Waiting for input');
+    })).toBe('Needs input');
     expect(waitingText({
       kind: 'human',
       summary: '  GitHub Actions billing\n action required  ',

@@ -576,6 +576,21 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   // /api/vault surface so the pull model is first-class, not buried behind
   // platform_request. Available on the gateway-backed bridge; the in-process
   // apiOps embedding reports the same platform_request limitation.
+  server.registerTool('list_connections', {
+    description: 'List app accounts explicitly shared with this task or project. Prefer these connections to requesting passwords. Tokens stay server-side.', inputSchema: {},
+  }, async () => wrap(() => ops.platformRequest('GET', '/api/connections')));
+  server.registerTool('request_connection', {
+    description: 'Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in the task; it resumes automatically after authorization. Continue independent work, but do not finish the task while the connection is pending. Reuse connected accounts from list_connections.',
+    inputSchema: { toolkit: z.string(), why: z.string() },
+  }, async a => wrap(() => ops.platformRequest('POST', '/api/connections/request', a)));
+  server.registerTool('search_connection_tools', {
+    description: 'Search the tools and input schemas available for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
+    inputSchema: { connectionId: z.string(), search: z.string() },
+  }, async a => wrap(() => ops.platformRequest('GET', `/api/connections/${encodeURIComponent(a.connectionId)}/tools?search=${encodeURIComponent(a.search)}`)));
+  server.registerTool('execute_connection_tool', {
+    description: 'Execute one app tool on the exact connected account, within the user’s task instructions. Search its schema first. Read/write actions take effect immediately; authorization to connect an account does not authorize unrelated actions. Do not blindly retry a failed write: check whether it succeeded first.',
+    inputSchema: { connectionId: z.string(), tool: z.string(), arguments: z.record(z.string(), z.unknown()) },
+  }, async a => wrap(() => ops.platformRequest('POST', `/api/connections/${encodeURIComponent(a.connectionId)}/execute`, { tool: a.tool, arguments: a.arguments })));
   server.registerTool(
     'list_credentials',
     {
