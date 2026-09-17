@@ -3632,6 +3632,12 @@ const BRAND_ICON_CHOICES = [
   { id: 'check-knot-tilted', label: 'Tilted knot' },
   { id: 'check-knot-purple', label: 'Purple knot' },
   { id: 'check-knot-purple-arrow', label: 'Purple arrow' },
+  { id: 'gold-check', label: 'Gold checks' },
+  { id: 'gold-arrow', label: 'Gold arrow' },
+  { id: 'bold-gold-check', label: 'Bold gold checks' },
+  { id: 'bold-gold-arrow', label: 'Bold gold arrow' },
+  { id: 'royal-gold-check', label: 'Rich gold checks' },
+  { id: 'royal-gold-arrow', label: 'Rich gold arrow' },
   { id: 'clover', label: 'Clover' },
 ];
 

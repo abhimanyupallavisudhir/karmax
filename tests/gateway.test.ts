@@ -417,6 +417,27 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
   });
 
+  it('selects every gold logo and serves its preview, favicon and installed app assets', async () => {
+    for (const icon of ['gold-check', 'gold-arrow', 'bold-gold-check', 'bold-gold-arrow', 'royal-gold-check', 'royal-gold-arrow']) {
+      const saved = await fetch(`${base}/api/settings/global/appearance`, {
+        method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon } }),
+      });
+      expect(saved.status, icon).toBe(200);
+      expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toEqual({ icon });
+      for (const file of ['icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png']) {
+        const expected = fs.readFileSync(path.join(webDir, 'brand', icon, file));
+        for (const url of [`/brand/${icon}/${file}`, `/brand/${file}`]) {
+          const response = await fetch(`${base}${url}`);
+          expect(response.status, url).toBe(200);
+          expect(Buffer.from(await response.arrayBuffer())).toEqual(expected);
+        }
+      }
+    }
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'diamond' } }),
+    });
+  });
+
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
     const schemas = (await (await fetch(`${base}/api/schema`, { headers: auth() })).json()) as any[];
     const softwareDev = schemas.find((s) => s.name === 'software-dev');
