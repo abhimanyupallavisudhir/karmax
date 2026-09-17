@@ -60,16 +60,20 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
     const sha256 = hash(data);
     const id = `review-${hash(`${taskId}\0${target}\0${sha256}`)}`;
     if (!store.getPromotedArtifact(id)) {
-      const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
+      // Retries share the logical artifact identity, but never the upload key:
+      // cleanup of one failed attempt must not erase another attempt's object.
+      const uploadId = `artifact:${crypto.randomUUID()}`;
+      const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}/${uploadId.slice(9)}`;
       const name = path.posix.basename(normalized);
       const mediaType = ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
       const managed = store.listStorageLocations(project.organizationId).find((location) => location.kind === 'managed');
-      if (managed) store.reserveStorageUpload(`artifact:${id}`, project.organizationId, managed.id,
+      if (managed) store.reserveStorageUpload(uploadId, project.organizationId, managed.id,
         data.length, Date.now() + 60 * 60_000);
       try {
         await objects.put(objectKey, data, mediaType);
         store.db.exec('BEGIN IMMEDIATE');
         try {
+          if (!store.getTask(taskId)) throw new Error('review artifact task was deleted during upload');
           if (!store.getPromotedArtifact(id)) {
             store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
               taskId, objectKey, sha256, bytes: data.length, mediaType, name, createdAt: Date.now() });
@@ -80,10 +84,11 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
           }
           store.db.exec('COMMIT');
         } catch (error) { store.db.exec('ROLLBACK'); throw error; }
-      } catch (error) {
-        if (!store.getPromotedArtifact(id)) await objects.delete(objectKey).catch(() => {});
-        throw error;
-      } finally { if (managed) store.releaseStorageUpload(`artifact:${id}`); }
+      } finally {
+        if (store.getPromotedArtifact(id)?.objectKey !== objectKey)
+          await objects.delete(objectKey).catch(() => {});
+        if (managed) store.releaseStorageUpload(uploadId);
+      }
     }
     index[hash(target)] = id;
   }

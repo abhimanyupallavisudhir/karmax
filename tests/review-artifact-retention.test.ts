@@ -24,7 +24,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 async function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-retention-'));
   cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }));
-  const store = new Store(':memory:');
+  const store = new Store(path.join(root, 'state.sqlite'));
   cleanup.push(() => store.close());
   const objects = new LocalObjectStore(path.join(root, 'objects'));
   const project = store.createProject('Review retention');
@@ -55,7 +55,7 @@ async function fixture() {
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
   });
-  return { store, objects, task, project, worlds, world, core, info, view, request };
+  return { root, store, objects, task, project, worlds, world, core, info, view, request };
 }
 
 describe('durable Review attachments', () => {
@@ -110,6 +110,108 @@ describe('durable Review attachments', () => {
     expect(await f.world.readFile('report.md')).toBe('# Saved report');
   });
 
+  it('does not let cleanup from a failed upload delete a concurrent successful retry', async () => {
+    const f = await fixture();
+    let deleteStarted!: () => void;
+    const deleting = new Promise<void>((resolve) => { deleteStarted = resolve; });
+    let releaseDelete!: () => void;
+    const release = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    const originalDelete = f.objects.delete.bind(f.objects);
+    vi.spyOn(f.objects, 'put').mockRejectedValueOnce(new Error('first upload failed'));
+    vi.spyOn(f.objects, 'delete').mockImplementationOnce(async (key) => {
+      deleteStarted();
+      await release;
+      await originalDelete(key);
+    });
+    const save = () => preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
+    const first = save().catch((error) => error);
+    await deleting;
+    try { await save(); } finally { releaseDelete(); }
+    expect((await first).message).toBe('first upload failed');
+    const response = await f.request(`/api/tasks/${f.task.id}/artifact?path=report.md`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('# Saved report');
+  });
+
+  it('keeps both attachments when the agent calls the tool concurrently', async () => {
+    const f = await fixture();
+    await f.world.writeFile('second.md', 'second');
+    const second = { actions: [{ kind: 'open' as const, label: 'Second', target: 'second.md' }] };
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn(input: any, ctx: any) {
+      const handlers = platformToolHandlers(input.world, ctx);
+      await Promise.all([handlers.create_review_info!(f.info), handlers.create_review_info!(second)]);
+      expect(f.store.getTask(f.task.id)?.lastView?.reviewInfo?.actions)
+        .toEqual([...f.info.actions, ...second.actions]);
+      throw new Error('escalated');
+    } }]]) as any;
+    const core = makeCoreActivities({ store: f.store, worlds: f.worlds, objects: f.objects,
+      adapters, profiles: new ProfileResolver(f.store, 'mock') });
+    await expect(core.runAgentTurn({ taskId: f.task.id, role: 'do', agentTurnId: `${f.task.id}#0`,
+      agentSlotGranted: true, worldHandle: f.world.handle, messages: [], task: {
+        taskId: f.task.id, projectId: f.project.id, title: 'Report', prompt: 'report', project: {},
+        workflow: 'just-do', agents: { do: { provider: 'mock' } },
+      } } as any)).rejects.toThrow('escalated');
+  });
+
+  it('deduplicates overlapping successful uploads and deletes only the unused object', async () => {
+    const f = await fixture();
+    const put = f.objects.put.bind(f.objects);
+    const keys: string[] = [];
+    let release!: () => void;
+    const bothStarted = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(f.objects, 'put').mockImplementation(async (key, data) => {
+      keys.push(key);
+      if (keys.length === 2) release();
+      await bothStarted;
+      await put(key, data);
+    });
+    const save = () => preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
+    await Promise.all([save(), save()]);
+    const records = f.store.listPromotedArtifacts(f.task.id);
+    expect(records).toHaveLength(1);
+    expect(new Set(keys).size).toBe(2);
+    expect((await f.objects.get(records[0]!.objectKey)).toString()).toBe('# Saved report');
+    await expect(f.objects.get(keys.find((key) => key !== records[0]!.objectKey)!)).rejects.toThrow();
+    expect(f.store.db.prepare("SELECT * FROM usage_events WHERE taskId=? AND kind='resource.storage'")
+      .all(f.task.id)).toHaveLength(1);
+  });
+
+  it('does not resurrect an artifact when the task is deleted during its upload', async () => {
+    const f = await fixture();
+    const put = f.objects.put.bind(f.objects);
+    let uploaded!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { uploaded = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let uploadedKey = '';
+    vi.spyOn(f.objects, 'put').mockImplementation(async (key, data) => {
+      uploadedKey = key;
+      await put(key, data);
+      uploaded();
+      await released;
+    });
+    const saving = preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
+    const rejected = expect(saving).rejects.toThrow('deleted during upload');
+    await started;
+    f.store.deleteTask(f.task.id);
+    release();
+    await rejected;
+    expect(f.store.listPromotedArtifacts(f.task.id)).toHaveLength(0);
+    expect(f.store.kvGet(`review-artifacts:${f.task.id}`)).toBeUndefined();
+    await expect(f.objects.get(uploadedKey)).rejects.toThrow();
+  });
+
+  it('loads saved links and bytes from fresh database and object-store instances', async () => {
+    const f = await fixture();
+    await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
+    await f.world.destroy();
+    const reopened = new Store(path.join(f.root, 'state.sqlite'));
+    cleanup.push(() => reopened.close());
+    const objects = new LocalObjectStore(path.join(f.root, 'objects'));
+    const saved = savedReviewArtifact(reopened, f.task.id, 'report.md')!;
+    expect((await objects.get(saved.objectKey)).toString()).toBe('# Saved report');
+  });
+
   it('deduplicates retries and preserves the reviewed bytes when the workspace later changes', async () => {
     const f = await fixture();
     const save = () => preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
@@ -146,6 +248,13 @@ describe('durable Review attachments', () => {
     expect(read).not.toHaveBeenCalled();
     await expect(f.core.destroyWorld(f.world.handle)).rejects.toThrow('100 MiB');
     expect(fs.existsSync(f.world.handle.root)).toBe(true);
+  });
+
+  it('accepts a file exactly at the 100 MiB boundary', async () => {
+    const f = await fixture();
+    fs.truncateSync(path.join(f.world.handle.root, 'report.md'), MAX_REVIEW_ARTIFACT_BYTES);
+    await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
+    expect(savedReviewArtifact(f.store, f.task.id, 'report.md')?.bytes).toBe(MAX_REVIEW_ARTIFACT_BYTES);
   });
 
   it('enforces managed quotas and releases upload reservations on failure', async () => {
