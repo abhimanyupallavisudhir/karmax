@@ -48,7 +48,7 @@ const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', l
 // prompt) while forbidding zero/multiple steps: a question must have an owner.
 const responderField = (): FieldSpec => ({
   name: 'responder', type: 'responder', label: 'Responder',
-  help: 'Who answers when the working agent pauses at Waiting for input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
+  help: 'Who answers when the working agent pauses at Needs input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
   scopes: ALL, bind: 'responder', role: 'responder',
   default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
   // A task can ask for ordinary input more than once, so there is no first-use

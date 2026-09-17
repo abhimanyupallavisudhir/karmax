@@ -56,7 +56,7 @@ function extractConst(name) {
     collaboration: 'Waiting for collaborator',
     confirm: 'Waiting for review',
     responder: 'Waiting for responder',
-    human: 'Waiting for input',
+    human: 'Needs input',
   };
   for (const kind of Object.keys(concise)) {
     const view = { waitingFor: { kind }, agentTurn: undefined, status: 'active', stage: 'do', roles: ['do'] };
@@ -64,12 +64,12 @@ function extractConst(name) {
     assert.strictEqual(label, concise[kind]);
     assert.ok(!/[a-z][A-Z]/.test(label),
       `check-in pane leaked a camelCase enum: ${label}`);
-    assert.ok(/^(Waiting|Starting)/.test(label), `unexpected presence label for ${kind}: ${label}`);
+    assert.ok(/^(Waiting|Starting|Needs)/.test(label), `unexpected presence label for ${kind}: ${label}`);
   }
   // Detailed workflow diagnostics do not spill into compact status labels.
   const detailed = ctx.conversationPresence(
     { waitingFor: { kind: 'human', detail: 'your approval' }, status: 'active', roles: ['do'] }, { role: 'do' });
-  assert.strictEqual(detailed.label, 'Waiting for input');
+  assert.strictEqual(detailed.label, 'Needs input');
   console.log('ok  waiting labels are human-readable in the check-in pane');
 }
 
