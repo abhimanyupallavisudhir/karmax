@@ -128,7 +128,7 @@ describe('just-do durable finalization', () => {
     expect(JSON.stringify(await handle.fetchHistory())).toContain('configured repositories are missing');
   });
 
-  it.each(['1.0.0', '1.6.0'])('keeps the legacy %s activity sequence replayable', async (version) => {
+  it.each(['1.0.0', '1.5.0', '1.6.0'])('keeps the legacy %s activity sequence replayable', async (version) => {
     const { handle } = await start([], version);
     await handle.signal('confirm');
     await expect(handle.result()).rejects.toThrow();
