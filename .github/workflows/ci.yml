@@ -43,6 +43,7 @@ jobs:
       KARMAX_SKIP_LIVE: '1'
       KARMAX_SKIP_DOCKER: '1'
       KARMAX_TEST_PASS_INTEROP: '1'
+      KARMAX_TEST_PASS_BROWSER: '1'
       TEMPORAL_CLI_VERSION: '1.7.2'
       KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
       ACTIONLINT_VERSION: '1.7.12'
@@ -83,6 +84,9 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      - name: Install browser for password-store end-to-end test
+        run: npx playwright install --with-deps chromium
 
       - name: Install password-store interoperability tools
         run: |
