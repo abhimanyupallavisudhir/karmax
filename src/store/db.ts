@@ -4185,7 +4185,7 @@ export class Store {
       for (const share of shares) exact.run(`conversation-share:${share.v}`);
       prefix.run(sharePrefix, sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`, `pending-review:${taskId}`]) exact.run(key);
+        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`]) exact.run(key);
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
         `view-conversation:${taskId}:`]) prefix.run(value, value);
     }

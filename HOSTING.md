@@ -228,6 +228,20 @@ Projects → Data storage**. The bucket configuration is safe metadata; access k
 the encrypted credential broker. A connection must pass a write/read/delete
 probe before it can become the organization default.
 
+Review `open` actions for local files automatically save their current bytes in
+the deployment object store before the attachment is acknowledged. They retain
+the 100 MiB per-file limit and count toward the organization's managed-storage
+quota. The original authenticated task links continue working after workspace
+cleanup, including for uncommitted screenshots and reports. Reattaching a file
+captures its new contents; editing the workspace alone does not change an
+already saved attachment. External URLs and `run` actions still depend on their
+original destination or a running world.
+
+Before destroying a workspace, Karmax saves any older Review attachments that
+have no durable copy; a failed upload prevents cleanup. Tasks whose workspaces
+were already removed before this feature require recovery from another copy
+of the files (for example, their landed Git commit).
+
 Storage placement is pinned on every immutable resource revision. Changing the
 default affects only new revisions; old revisions continue restoring from their
 original bucket. Chunk names include the customer-location identity, preserving

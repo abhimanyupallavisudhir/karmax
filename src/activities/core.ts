@@ -1,4 +1,5 @@
 import { McpConnections } from '../mcp/connections/store.js';
+import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
 import type { PublishedView, ViewConversation } from '../domain/view-publication.js';
@@ -2243,8 +2244,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             lastEmit = t;
             record(args.taskId, 'agent.output', { text: t });
           },
-          onReviewInfo: (info) => {
+          onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
+            if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);
             store.checkpointReviewInfo(args.taskId, info);
             record(args.taskId, 'review.updated', {});
           },
@@ -2479,6 +2481,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (result.skills?.length) {
         for (const s of result.skills) record(args.taskId, 'skill.saved', { name: s.name });
       }
+      // Adapters can also return review info directly without invoking the tool.
+      if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, result.reviewInfo, true);
       record(args.taskId, 'turn.result', {
         completed: result.completed,
         providerCompleted: result.providerCompleted,
@@ -2799,6 +2803,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async destroyWorld(handle: WorldHandle): Promise<void> {
       const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
       const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
+      // Backfill reviews authored before durable attachment publication. A failed
+      // upload must propagate before teardown's best-effort catch/finally: this
+      // world may contain the only remaining copy of an uncommitted attachment.
+      if (deps.objects && unsavedReviewArtifacts(store, handle.id, store.getTask(handle.id)?.lastView?.reviewInfo)) {
+        const world = await worlds.open(current);
+        await preserveReviewArtifacts(store, deps.objects, world, handle.id,
+          store.getTask(handle.id)?.lastView?.reviewInfo, true);
+      }
       try {
         if (store.getTask(handle.id)?.lastView?.status === 'cancelled')
           await deps.resources?.discardTaskCandidates(handle.id, 'system:task-cancel');

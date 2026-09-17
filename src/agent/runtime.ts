@@ -9,7 +9,7 @@ export interface RunTurnDeps {
   /** Stream incremental output to the task's live event log. */
   onEmit?: (text: string) => void;
   /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
-  onReviewInfo?: (info: ReviewInfo) => void | Promise<void>;
+  onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
@@ -103,8 +103,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // every other field is last-write-wins.
       const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
       const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
-      reviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
-      await deps.onReviewInfo?.(reviewInfo);
+      const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
+      await deps.onReviewInfo?.(nextReviewInfo, info);
+      reviewInfo = nextReviewInfo;
     },
     createSubTask(t) {
       subTasks.push(t);

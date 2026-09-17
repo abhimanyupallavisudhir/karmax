@@ -1,3 +1,5 @@
+import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
+import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
@@ -518,31 +520,6 @@ const PREVIEW_REQUEST_HEADERS = new Set([
   'accept', 'accept-language', 'content-type', 'if-match', 'if-modified-since',
   'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
 ]);
-const MIME: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.woff2': 'font/woff2',
-  '.json': 'application/json; charset=utf-8',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-  '.cjs': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.ts': 'text/plain; charset=utf-8',
-  '.tsx': 'text/plain; charset=utf-8',
-  '.jsx': 'text/javascript; charset=utf-8',
-  '.py': 'text/plain; charset=utf-8',
-  '.rs': 'text/plain; charset=utf-8',
-  '.go': 'text/plain; charset=utf-8',
-  '.java': 'text/plain; charset=utf-8',
-  '.rb': 'text/plain; charset=utf-8',
-  '.sh': 'text/plain; charset=utf-8',
-  '.yml': 'text/plain; charset=utf-8',
-  '.yaml': 'text/plain; charset=utf-8',
-  '.toml': 'text/plain; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.ico': 'image/x-icon',
-};
 
 export function staticAssetHeaders(file: string): Record<string, string> {
   return {
@@ -572,26 +549,6 @@ export function staticAssetRevision(file: string): string | undefined {
     return undefined;
   }
 }
-
-/** Content types for review "open" artifacts (a superset of the static MIME map). */
-const ARTIFACT_MIME: Record<string, string> = {
-  ...MIME,
-  '.pdf': 'application/pdf',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.mp4': 'video/mp4',
-  '.webm': 'video/webm',
-  '.mov': 'video/quicktime',
-  '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/markdown; charset=utf-8',
-  '.markdown': 'text/markdown; charset=utf-8',
-  '.log': 'text/plain; charset=utf-8',
-  '.csv': 'text/csv; charset=utf-8',
-  '.ipynb': 'application/json; charset=utf-8',
-};
 
 interface Session {
   user: string;
@@ -4789,7 +4746,7 @@ export class Gateway {
           access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
           const world = access?.world ?? await this.deps.worlds.open(handle);
           const data = await world.readFileBuffer(worldWorkingRelativePath(handle, relPath));
-          if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
+          if (data.length > MAX_REVIEW_ARTIFACT_BYTES) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
           const id = newId('artifact');
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
           // The type is derived from the name, never taken from the request: a
@@ -7443,6 +7400,20 @@ export class Gateway {
    * inline text view instead of a download, for a useful source view. */
   private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
     const task = this.deps.store.getTask(taskId);
+    const saved = !sourceFile && task ? savedReviewArtifact(this.deps.store, taskId, relPath) : undefined;
+    if (saved) {
+      if (!this.deps.objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
+      try {
+        const data = await this.deps.objects.get(saved.objectKey);
+        if (crypto.createHash('sha256').update(data).digest('hex') !== saved.sha256)
+          return this.json(res, 502, { error: 'artifact integrity check failed' });
+        res.writeHead(200, { ...untrustedContentHeaders(saved.mediaType, saved.name),
+          'content-length': String(data.length), 'cache-control': 'private, no-store' });
+        return void res.end(data);
+      } catch {
+        return this.json(res, 503, { error: 'saved artifact is unavailable' });
+      }
+    }
     const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
