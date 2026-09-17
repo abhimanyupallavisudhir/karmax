@@ -1,3 +1,4 @@
+import { decayVaultUsage, type VaultUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -88,6 +89,9 @@ export interface VaultItem {
   };
   /** Successful field accesses; absent on items created before usage tracking. */
   useCount?: number;
+  frecencyScore?: number;
+  frecencyUpdatedAt?: number;
+  lastUsedAt?: number;
   updatedAt: number;
 }
 
@@ -118,6 +122,7 @@ export interface CredentialAccessRequest {
 }
 
 export interface VaultItemStore {
+  vaultUsageHistory?(itemIds: string[], now: number): Record<string, VaultUsage>;
   kvGet(k: string): string | undefined;
   kvSet(k: string, v: string): void;
   appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): number;
@@ -219,11 +224,26 @@ export class VaultItems {
   list(): VaultItem[] {
     const raw = this.store.kvGet(kvItems(this.organizationId));
     if (!raw) return [];
+    let items: VaultItem[];
     try {
-      return JSON.parse(raw) as VaultItem[];
+      items = JSON.parse(raw) as VaultItem[];
     } catch {
       return [];
     }
+    const legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
+    if (legacy.length) {
+      const now = Date.now();
+      const history = this.store.vaultUsageHistory?.(legacy.map((item) => item.id), now) ?? {};
+      for (const item of legacy) {
+        // Prefer dated audit evidence. Without it, preserve the old count as
+        // the initial score, but do not invent a last-use timestamp.
+        Object.assign(item, history[item.id] ?? {
+          useCount: item.useCount ?? 0, frecencyScore: item.useCount ?? 0, frecencyUpdatedAt: now,
+        });
+      }
+      this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items));
+    }
+    return items;
   }
 
   get(id: string): VaultItem | undefined {
@@ -310,6 +330,9 @@ export class VaultItems {
         ? { ...prior.provenance, ...(args.provenance?.syncedAt !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
         : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.sourceRevision !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
       useCount: prior?.useCount ?? 0,
+      frecencyScore: prior?.frecencyScore ?? 0,
+      frecencyUpdatedAt: prior?.frecencyUpdatedAt ?? Date.now(),
+      ...(prior?.lastUsedAt !== undefined ? { lastUsedAt: prior.lastUsedAt } : {}),
       updatedAt: Date.now(),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
@@ -496,6 +519,8 @@ export class VaultItems {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
     const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
+    // Migrate history before appending this access so it is counted only once.
+    const items = this.list();
     this.store.appendAudit({
       principalId: ctx.principal ?? (ctx.taskId ? `task:${ctx.taskId}` : 'system'),
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',
@@ -503,10 +528,13 @@ export class VaultItems {
     });
     // Read fresh metadata: callers may reuse an item across several fields.
     // Usage must not move updatedAt, which connector sync uses for edits.
-    const items = this.list();
     const current = items.find((candidate) => candidate.id === item.id);
     if (current) {
+      const now = Date.now();
       current.useCount = (current.useCount ?? 0) + 1;
+      current.frecencyScore = decayVaultUsage(current.frecencyScore ?? 0, current.frecencyUpdatedAt ?? now, now) + 1;
+      current.frecencyUpdatedAt = now;
+      current.lastUsedAt = now;
       this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items));
     }
     return secret;

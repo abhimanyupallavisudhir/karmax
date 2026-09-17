@@ -55,7 +55,7 @@ describe('brand icon selection', () => {
   });
 
   it('accepts exactly the known icons', () => {
-    expect(BRAND_ICONS).toEqual(['diamond', 'knot', 'check', 'check-arrow', 'check-knot', 'check-knot-tilted', 'check-knot-purple', 'check-knot-purple-arrow', 'clover']);
+    expect(BRAND_ICONS).toEqual(['diamond', 'knot', 'check', 'check-arrow', 'check-knot', 'check-knot-tilted', 'check-knot-purple', 'check-knot-purple-arrow', 'gold-check', 'gold-arrow', 'bold-gold-check', 'bold-gold-arrow', 'royal-gold-check', 'royal-gold-arrow', 'clover']);
     for (const icon of BRAND_ICONS) expect(isBrandIcon(icon)).toBe(true);
     expect(isBrandIcon('Diamond')).toBe(false);
     expect(isBrandIcon('../../etc/passwd')).toBe(false);
@@ -69,6 +69,20 @@ describe('brand icon selection', () => {
         const asset = path.join(webDir, 'brand', icon, file);
         expect(fs.existsSync(asset), `${icon}/${file}`).toBe(true);
         expect(fs.statSync(asset).size).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('ships each gold option exactly as reviewed, at every installed icon size', () => {
+    for (const icon of ['gold-check', 'gold-arrow', 'bold-gold-check', 'bold-gold-arrow', 'royal-gold-check', 'royal-gold-arrow']) {
+      expect(isBrandIcon(icon)).toBe(true);
+      expect(brandIconOf({ icon })).toBe(icon);
+      expect(read(`web/brand/${icon}/icon.svg`)).toBe(read(`design/gold-logo-options/${icon}.svg`));
+      for (const [file, size] of [['icon-192.png', 192], ['icon-512.png', 512], ['apple-touch-icon.png', 180]] as const) {
+        const png = fs.readFileSync(path.join(webDir, 'brand', icon, file));
+        expect(png.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+        expect(png.readUInt32BE(16)).toBe(size);
+        expect(png.readUInt32BE(20)).toBe(size);
       }
     }
   });
