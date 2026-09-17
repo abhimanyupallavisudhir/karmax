@@ -59,6 +59,7 @@ upgrades, remote-world cost policy, and the laptop↔cloud Git handoff.
 **Requirements**
 
 - Node ≥ 22 (uses the built-in `node:sqlite`).
+- On Linux, `flock` from `util-linux` (included in the Docker image) enforces one app process per data home and releases automatically after a crash or container replacement.
 - The [Temporal CLI](https://temporal.io/setup/install-temporal-cli) at
   `~/.temporalio/bin/temporal` (or set `TEMPORAL_CLI`). `npm start` runs the dev
   server for you.

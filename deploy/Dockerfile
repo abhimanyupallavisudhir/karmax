@@ -16,7 +16,7 @@ ENV NODE_ENV=production \
     KARMAX_PORT=4505
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init gh git gnupg openssh-client python3 ripgrep \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init gh git gnupg openssh-client python3 ripgrep util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /bin/bash karmax \
     && mkdir -p /app /var/lib/karmax \

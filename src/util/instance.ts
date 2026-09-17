@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { paths } from '../config/paths.js';
 
 /**
@@ -9,7 +10,11 @@ import { paths } from '../config/paths.js';
  * with no benefit: one app already serves the whole todo list. Nothing enforced
  * "one app per home", so nothing warned.
  *
- * Admission is exclusive. Two workers polling the same Temporal queue can load
+ * On Linux admission uses a kernel flock held by the app's file descriptor.
+ * It survives neither process death nor a container replacement, unlike a PID
+ * number persisted in a Docker volume. PID files remain diagnostic metadata and
+ * support upgrades from installations that predate the kernel lock.
+ * Two workers polling the same Temporal queue can load
  * different workflow/activity code, steal each other's activities, duplicate
  * agent fan-out, and make a task appear permanently stuck. Graceful restart
  * releases its registration before spawning the successor, so exclusivity does
@@ -29,6 +34,57 @@ function isAliveDefault(pid: number): boolean {
 
 const instancesDir = () => path.join(paths().state, 'instances');
 const pidFile = (dir: string, pid: number) => path.join(dir, `${pid}.pid`);
+
+interface ProcessIdentity {
+  pidStart?: string;
+  bootId?: string;
+  argv?: string[];
+  cwd?: string;
+}
+
+function processIdentity(pid: number): ProcessIdentity {
+  const read = (file: string) => { try { return fs.readFileSync(file, 'utf8'); } catch { return undefined; } };
+  const stat = read(`/proc/${pid}/stat`);
+  let cwd: string | undefined;
+  try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch { /* unavailable off Linux or without permission */ }
+  return {
+    // comm may contain spaces and parentheses. The suffix starts at field 3;
+    // starttime is field 22, not a wall-clock time that NTP can change.
+    pidStart: stat?.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19],
+    bootId: read('/proc/sys/kernel/random/boot_id')?.trim(),
+    argv: read(`/proc/${pid}/cmdline`)?.split('\0').filter(Boolean),
+    cwd,
+  };
+}
+
+function sameProcess(record: ProcessIdentity, current: ProcessIdentity): boolean {
+  if (record.bootId && current.bootId && record.bootId !== current.bootId) return false;
+  if (record.pidStart && current.pidStart) return record.pidStart === current.pidStart;
+  // Legacy records contain only argv. Preserve a live old app during an upgrade,
+  // but do not mistake tsx/esbuild or another recycled PID for its entrypoint.
+  const entrypoint = record.argv?.[0];
+  if (typeof entrypoint === 'string' && current.argv && current.cwd && path.isAbsolute(entrypoint))
+    return current.argv.some((arg) => path.resolve(current.cwd!, arg) === entrypoint);
+  // If identity cannot be read (e.g. EPERM/non-Linux), keep the live-PID guard.
+  return true;
+}
+
+function lockInstance(dir: string): (() => void) | undefined {
+  if (process.platform !== 'linux') return undefined;
+  // Never unlink this file: all contenders must lock the same inode. flock(1)
+  // receives the parent's open file description as fd 3, so the lock remains
+  // held by this process after the short-lived helper exits.
+  const fd = fs.openSync(path.join(dir, 'app.lock'), 'a', 0o600);
+  const result = spawnSync('flock', ['--exclusive', '--nonblock', '--conflict-exit-code', '73', '3'], {
+    stdio: ['ignore', 'pipe', 'pipe', fd], encoding: 'utf8', timeout: 5_000,
+  });
+  if (result.status !== 0) {
+    fs.closeSync(fd);
+    if (result.status === 73) throw new Error(duplicateInstanceMessage(paths().home, []));
+    throw new Error(`could not acquire the krmax instance lock (Linux requires util-linux/flock): ${result.error?.message ?? result.stderr.trim()}`);
+  }
+  return () => fs.closeSync(fd);
+}
 
 /**
  * Is `dir` located inside `parent`? Symlinks and relative segments are resolved
@@ -50,10 +106,12 @@ export function isInsideDir(dir: string, parent: string): boolean {
 
 /**
  * Scan `dir` for live OTHER app instances, pruning stale pidfiles as it goes.
- * Pure over its injected `isAlive` (tests pass a fake) — no process signals or
- * clock reads of its own beyond the probe.
+ * Once the exclusive kernel lock is held, prior lock-aware records are stale
+ * even if a replacement container reused their PIDs. Legacy records still need
+ * a liveness/identity check so upgrading cannot admit a second old worker.
  */
-export function scanInstances(dir: string, selfPid: number, isAlive: (pid: number) => boolean = isAliveDefault): number[] {
+export function scanInstances(dir: string, selfPid: number, isAlive: (pid: number) => boolean = isAliveDefault,
+  readIdentity: (pid: number) => ProcessIdentity = processIdentity, hasProcessLock = false): number[] {
   let names: string[];
   try {
     names = fs.readdirSync(dir);
@@ -66,7 +124,9 @@ export function scanInstances(dir: string, selfPid: number, isAlive: (pid: numbe
     if (!m) continue;
     const pid = Number(m[1]);
     if (pid === selfPid) continue;
-    if (isAlive(pid)) others.push(pid);
+    let record: ProcessIdentity & { processLock?: boolean } = {};
+    try { record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')) ?? {}; } catch { /* retain the live-PID guard */ }
+    if (!(hasProcessLock && record.processLock === true) && isAlive(pid) && sameProcess(record, readIdentity(pid))) others.push(pid);
     else {
       try {
         fs.rmSync(path.join(dir, name)); // stale holder — clean up
@@ -86,26 +146,27 @@ export interface InstanceRegistration {
 }
 
 export function duplicateInstanceMessage(home: string, others: number[]): string {
-  return `another krmax app instance is already running against ${home} (pid${others.length === 1 ? '' : 's'} ${others.join(', ')}). `
+  const owner = others.length ? `pid${others.length === 1 ? '' : 's'} ${others.join(', ')}` : 'exclusive process lock is held';
+  return `another krmax app instance is already running against ${home} (${owner}). `
     + 'Stop that instance before starting another; concurrent workers can steal activities and corrupt workflow coherence.';
 }
 
 /**
  * Register this process as a live app instance and report any others already
- * running against the same KARMAX_HOME. Best-effort: a filesystem hiccup never
- * blocks boot.
+ * running against the same KARMAX_HOME. Admission fails closed if the Linux
+ * process lock cannot be acquired; silently bypassing it permits two workers.
  */
 export function registerAppInstance(): InstanceRegistration {
   const dir = instancesDir();
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch {
-    return { others: [], release: () => {} };
-  }
-  const others = scanInstances(dir, process.pid);
+  fs.mkdirSync(dir, { recursive: true });
+  const unlock = lockInstance(dir);
+  const others = scanInstances(dir, process.pid, isAliveDefault, processIdentity, !!unlock);
   const self = pidFile(dir, process.pid);
+  const identity = processIdentity(process.pid);
+  const contents = JSON.stringify({ pid: process.pid, home: paths().home, argv: process.argv.slice(1, 3),
+    pidStart: identity.pidStart, bootId: identity.bootId, processLock: !!unlock });
   try {
-    fs.writeFileSync(self, JSON.stringify({ pid: process.pid, home: paths().home, argv: process.argv.slice(1, 3) }));
+    if (!others.length) fs.writeFileSync(self, contents);
   } catch {
     /* best effort — detection still worked */
   }
@@ -116,10 +177,11 @@ export function registerAppInstance(): InstanceRegistration {
       if (released) return;
       released = true;
       try {
-        fs.rmSync(self);
+        if (!others.length && fs.readFileSync(self, 'utf8') === contents) fs.rmSync(self);
       } catch {
         /* already gone */
       }
+      unlock?.();
     },
   };
 }
