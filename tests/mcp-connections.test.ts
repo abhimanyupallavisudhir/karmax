@@ -81,6 +81,17 @@ describe('MCP connections', () => {
       ['browser:chrome-devtools', 'browser:playwright'], project, 'task', () => {});
     expect(servers.map(s => s.name)).toEqual(['chrome-devtools', 'playwright']);
   });
+  it('prepares built-in tools without a vault but rejects saved connections without one', async () => {
+    const world = { handle: { kind: 'worktree', root: dir } } as any;
+    expect((await prepareConnections(undefined, world, ['browser:chrome-devtools'], project, 'task', () => {})).map(s => s.name))
+      .toEqual(['chrome-devtools']);
+    await expect(prepareConnections(undefined, world, ['mcp_' + 'a'.repeat(24)], project, 'task', () => {}))
+      .rejects.toThrow('credential vault');
+    const exec = vi.fn();
+    expect(await prepareConnections(undefined, { handle: { version: 2, sealedProviderRef: 'test', root: dir }, exec } as any,
+      [], project, 'task', () => {})).toEqual([]);
+    expect(exec).not.toHaveBeenCalled();
+  });
   it('inherits tools across parameter layers while preserving an explicit empty selection', () => {
     const manifest = { name: 'example', params: [{ name: 'agent:do', type: 'agent', role: 'do' }] } as any;
     const lower = { 'agent:do': { provider: 'claude', mcpConnections: ['browser:playwright'] } };

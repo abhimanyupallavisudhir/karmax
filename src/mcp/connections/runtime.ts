@@ -6,7 +6,7 @@ import type { World } from '../../world/types.js';
 import type { AgentMcpServer } from '../../contrib/manifests.js';
 import { isRemoteAgentWorld, ensureRemoteNode, ensureRemoteBrowser } from '../../agent/remote-process.js';
 import { mcpServerMap } from '../../autonomy/config-homes.js';
-import { McpConnections, validateMcpSelection } from './store.js';
+import { BUILTIN_MCPS, McpConnections, validateMcpSelection } from './store.js';
 import { connectionHeaders } from './oauth.js';
 const quote = (s: string) => "'" + s.replace(/'/g, "'\"'\"'") + "'";
 let bundle: Promise<string> | undefined;
@@ -16,11 +16,13 @@ async function runnerBundle() {
     .then((result) => result.outputFiles![0]!.text).catch((e) => { bundle = undefined; throw e; });
   return bundle;
 }
-export async function prepareConnections(service: McpConnections, world: World, ids: string[], projectId: string, taskId: string, onCleanup: (cleanup: () => Promise<void>) => void): Promise<AgentMcpServer[]> {
+export async function prepareConnections(service: McpConnections | undefined, world: World, ids: string[], projectId: string, taskId: string, onCleanup: (cleanup: () => Promise<void>) => void): Promise<AgentMcpServer[]> {
   validateMcpSelection(ids);
   const remote = isRemoteAgentWorld(world);
   if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote) throw new Error('Hosted MCP connections require a remote execution environment');
-  const selected = service.selected(ids, projectId);
+  if (!ids.length) return [];
+  if (!service && ids.some(id => !BUILTIN_MCPS.includes(id as any))) throw new Error('MCP connections require the credential vault');
+  const selected = service?.selected(ids, projectId) ?? [];
   const container = world.handle.kind === 'container';
   const root = container ? '/work' : world.handle.root;
   const bin = remote ? await ensureRemoteNode(world) : container ? '/usr/local/bin' : path.dirname(process.execPath);
@@ -31,7 +33,7 @@ export async function prepareConnections(service: McpConnections, world: World, 
     const servers = remote ? await ensureRemoteBrowser(world, browser, bin) : mcpServerMap({ browser });
     for (const [name, spec] of Object.entries(servers)) out.push({ name, ...spec });
   }
-  if (!selected.length) return out;
+  if (!selected.length || !service) return out;
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
   const relative = `.karmax-injection/mcp/${crypto.randomBytes(12).toString('hex')}`;
   const absolute = path.posix.join(root, relative);
