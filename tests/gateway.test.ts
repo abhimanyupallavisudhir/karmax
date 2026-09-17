@@ -1,3 +1,5 @@
+import { platformToolHandlers } from '../src/agent/tools.js';
+import { AuthorizationService } from '../src/platform/authorization.js';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -11,6 +13,7 @@ import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrat
 import { detectConversationImport } from '../src/store/conversation-imports.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
+import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -18,10 +21,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   let h: Harness;
   let base: string;
   let token: string;
+  let loginRoot: string;
+  let loginHomes: ConfigHomeManager;
   const auth = () => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
 
   beforeAll(async () => {
-    h = await bootHarness('mock');
+    loginRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-login-homes-'));
+    loginHomes = new ConfigHomeManager(loginRoot);
+    h = await bootHarness('mock', undefined, { configHomes: loginHomes });
     const gw = await h.startGateway();
     base = gw.url;
     const session: any = await (await fetch(`${base}/api/session`)).json();
@@ -30,6 +37,22 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   }, 60_000);
   afterAll(async () => {
     await h?.stop();
+    if (loginRoot) fs.rmSync(loginRoot, { recursive: true, force: true });
+  });
+
+  it('changes the principal attempt through HTTP and preserves the Merge winner', async () => {
+    const project = h.store.createProject('Principal selection');
+    const first = h.store.createTask({ projectId: project.id, title: 'Attempts', workflow: 'script-exec', workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const second = h.store.createTask({ projectId: project.id, title: 'Attempts', workflow: 'script-exec', workflowVersion: '1.0.0', params: { prompt: 'test', draft: true }, intentId: first.intentId });
+    const select = (id: string) => fetch(`${base}/api/tasks/${id}/principal`, { method: 'POST', headers: auth(), body: '{}' });
+    const response = await select(second.id);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ principalAttemptId: second.id });
+    expect(h.store.listTasks(project.id)[0]!.id).toBe(second.id);
+    h.store.claimAttempt(first.id);
+    expect((await select(second.id)).status).toBe(400);
+    expect(h.store.attemptGroup(first.id)!.principalAttemptId).toBe(first.id);
+    expect((await select('missing-attempt')).status).toBe(404);
   });
 
   it('serves meta with the detected agent provider', async () => {
@@ -111,6 +134,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     } finally {
       fs.rmSync(nativeHome, { recursive: true, force: true });
     }
+  });
+
+  it('keeps task-native downloads available after deleting and reconnecting the source login', async () => {
+    const project = h.store.createProject('Disconnected source history');
+    const task = h.store.createTask({ projectId: project.id, title: 'Completed source',
+      workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'source', draft: true } });
+    h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+      stage: 'done', status: 'done', messages: [], actions: [] } as any);
+    const session = crypto.randomUUID();
+    const home = loginHomes.ensure('codex', 'retention');
+    fs.mkdirSync(path.join(home, 'sessions'));
+    fs.writeFileSync(path.join(home, 'sessions', `rollout-2026-08-14T00-00-00-${session}.jsonl`),
+      JSON.stringify({ type: 'session_meta', payload: { id: session, timestamp: '2026-08-14T00:00:00Z' } }) + '\n' +
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'Retain this native context.' },
+      ] } }) + '\n');
+    fs.writeFileSync(path.join(home, 'auth.json'), '{"token":"old-token"}');
+    h.store.kvSet(`session:${task.id}:do`, session);
+    h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home, provider: 'codex' }));
+    const deleted = await fetch(`${base}/api/organizations/org_personal/accounts/logins/codex/retention`, {
+      method: 'DELETE', headers: auth(),
+    });
+    expect(deleted.status).toBe(200);
+    expect(loginHomes.list().some(login => login.account === 'retention')).toBe(false);
+    expect(fs.existsSync(path.join(home, 'auth.json'))).toBe(false);
+    // Request the first export AFTER deletion, so an already-frozen export cannot mask data loss.
+    const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
+    expect(sessions.do).toMatchObject({ id: session, provider: 'codex', downloadable: true });
+    const downloaded = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
+    expect(downloaded.status, await downloaded.clone().text()).toBe(200);
+    expect(downloaded.headers.get('x-karmax-conversation-source')).toBe('native');
+    expect(await downloaded.text()).toContain('Retain this native context.');
+    const reconnected = await fetch(`${base}/api/organizations/org_personal/accounts/connect`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'codex', account: 'retention' }),
+    });
+    expect(reconnected.status).toBe(200);
+    expect(loginHomes.list().some(login => login.account === 'retention')).toBe(true);
+    expect(h.store.kvGet(`sessionmeta:${task.id}:do`)).toBe(JSON.stringify({ home, provider: 'codex' }));
+    const after: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
+    expect(after.do).toMatchObject({ id: session, downloadable: true });
   });
 
   it('generates forkable JSONL for a new API-backed conversation with no config home', async () => {
@@ -440,7 +503,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
     const interactiveOnly = await fetch(`${base}/api/user/export`, { headers: delegatedAuth });
     expect(interactiveOnly.status).toBe(401);
-    expect(await interactiveOnly.json()).toMatchObject({ error: expect.stringMatching(/interactive human/i) });
+    expect(await interactiveOnly.json()).toMatchObject({ error: 'a signed-in user account is required' });
 
     const audit = h.store.auditSince(0, 2000).find((event) =>
       event.action === 'http.post.repository:write' && event.detail.path.endsWith('/repositories/create')
@@ -538,6 +601,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       if (url.pathname === '/orgs/acme/repos' && init.method === 'POST' && authorization === 'Bearer pinned-token')
         return Response.json({ id: 77, name: 'delegated-repo', private: true,
           ssh_url: 'git@github.com:acme/delegated-repo.git', default_branch: 'main', owner: { login: 'acme' } });
+      if (url.pathname === '/orgs/acme/repos' && init.method === 'POST' && authorization === 'Bearer active-token')
+        return Response.json({ id: 78, name: 'unpinned-repo', private: true,
+          ssh_url: 'git@github.com:acme/unpinned-repo.git', default_branch: 'main', owner: { login: 'acme' } });
+      if (url.pathname === '/user/installations/123/repositories/78' && init.method === 'PUT'
+        && authorization === 'Bearer active-token') return new Response(null, { status: 204 });
       if (url.pathname === '/user/installations/123/repositories/77' && init.method === 'PUT'
         && authorization === 'Bearer pinned-token') return new Response(null, { status: 204 });
       if (url.pathname === '/app/installations/123/access_tokens' && init.method === 'POST')
@@ -610,8 +678,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       method: 'POST', headers: { authorization: `Bearer ${unpinned.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ gitConnectionId: connection.id, name: 'unpinned-repo' }),
     });
-    expect(unpinnedResponse.status).toBe(403);
-    expect(await unpinnedResponse.json()).toMatchObject({ error: expect.stringMatching(/no pinned GitHub account/i) });
+    expect(unpinnedResponse.status).toBe(200);
+    expect(await unpinnedResponse.json()).toMatchObject({ name: 'unpinned-repo' });
+    expect(calls).toContainEqual({ path: '/orgs/acme/repos', method: 'POST', authorization: 'Bearer active-token' });
 
     const substitutedDelegation = h.tokens.delegateHuman(human.token, {
       taskId: 'task-repository-substituted', projectId: project.id, organizationId: organization.id,
@@ -626,7 +695,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     expect(substitutedResponse.status).toBe(400);
     expect(await substitutedResponse.json()).toMatchObject({ error: expect.stringMatching(/pinned GitHub account is not connected/i) });
-    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toHaveLength(1);
+    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toHaveLength(2);
 
     const audits = h.store.auditSince(0, 5000).filter((event) =>
       event.principalId === 'task-agent:task-create-repository:do');
@@ -893,6 +962,21 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       command: `code --goto '${view.worldPath}/out.txt:1'`,
       materialized: false,
     });
+
+    // A still-running tool can checkpoint another attachment before TurnResult.
+    // The drawer reads the snapshot; clicking the button queries the live workflow,
+    // which still has its old actions. Both must resolve the checkpoint.
+    h.store.checkpointReviewInfo(task.id, { caption: 'New attachment before turn completion',
+      actions: [{ kind: 'open', label: 'New attachment', target: 'out.txt' }] });
+    const updated: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(updated.reviewInfo.actions[0].label).toBe('New attachment');
+    const pendingOpen: any = await (await fetch(`${base}/api/tasks/${task.id}/review-action`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ index: 0 }),
+    })).json();
+    expect(pendingOpen.kind).toBe('open');
+    const pendingArtifact = await fetch(`${base}${pendingOpen.url}`, { headers: auth() });
+    expect(pendingArtifact.status).toBe(200);
+    expect(await pendingArtifact.text()).toContain('hello-artifact');
 
     // A bad index is rejected; neither artifact nor conversation-file paths may
     // traverse outside the task world.
@@ -1224,10 +1308,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }
   });
 
-  it('attaches redacted resources and completes a resumable binary upload', async () => {
+  it.each(['human', 'agent'])('%s attaches redacted resources and completes a resumable binary upload', async (kind) => {
     const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());
-    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: `Resource API ${kind}` }) }).then((response) => response.json());
+    const agent = h.tokens.mint({ taskId: 'resource-admin', profileId: 'maintainer',
+      principal: 'task:resource-admin', organizationId: project.organizationId,
+      ceiling: ['project:settings:read', 'project:settings:write'],
+      grantorCaps: ['project:settings:read', 'project:settings:write'] });
+    const resourceAuth = () => kind === 'agent'
+      ? { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' } : auth();
+    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: resourceAuth(),
       body: JSON.stringify({ name: 'Token', driver: 'secret@1', target: { kind: 'environment', name: 'MODEL_TOKEN' },
         access: 'read', isolation: 'fork', publish: 'discard', secret: 'never-return-this' }) });
     expect(secretResponse.status).toBe(200);
@@ -1236,14 +1326,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(secret)).not.toContain('never-return-this');
     expect(secret.credentialHandles).toBeUndefined();
 
-    const volume: any = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+    const volume: any = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: resourceAuth(),
       body: JSON.stringify({ name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' },
         access: 'write', isolation: 'fork', publish: 'review' }) }).then((response) => response.json());
     const upload: any = await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}/uploads`,
-      { method: 'POST', headers: auth() }).then((response) => response.json());
+      { method: 'POST', headers: resourceAuth() }).then((response) => response.json());
     const bytes = Buffer.from('fine-tuned-model-weights');
     const part = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=model.bin&part=0`,
-      { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: bytes });
+      { method: 'PUT', headers: { ...resourceAuth(), 'content-type': 'application/octet-stream' }, body: bytes });
     expect(part.status).toBe(200);
     const empty = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=empty.txt&part=0`,
       { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: Buffer.alloc(0) });
@@ -1252,14 +1342,151 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: Buffer.alloc(0) });
     expect(extraEmpty.status).toBe(400);
     const complete = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}`,
-      { method: 'POST', headers: auth() });
+      { method: 'POST', headers: resourceAuth() });
     expect(complete.status).toBe(200);
     const revision: any = await complete.json();
     expect(revision.bytes).toBe(bytes.length);
     expect(revision.sealedRef).toBeUndefined();
-    const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() }).then((response) => response.json()) as any[];
+    const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: resourceAuth() }).then((response) => response.json()) as any[];
     expect(listed.find((resource) => resource.id === volume.id).revision.bytes).toBe(bytes.length);
     expect(JSON.stringify(listed)).not.toContain('sealedRef');
+    expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}`, {
+      method: 'PATCH', headers: resourceAuth(), body: JSON.stringify({ name: 'Updated model' }),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}/import`, {
+      method: 'POST', headers: resourceAuth(), body: JSON.stringify({ files: [{ path: 'new.txt', data: Buffer.from('new').toString('base64') }] }),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/secrets`, {
+      method: 'POST', headers: resourceAuth(), body: JSON.stringify({ name: 'EXTRA_KEY', value: 'secret-value' }),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/secrets/EXTRA_KEY`, {
+      method: 'DELETE', headers: resourceAuth(),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}`, {
+      method: 'DELETE', headers: resourceAuth(),
+    })).status).toBe(200);
+  });
+
+  it('authorizes historical byte verification in the exact project scope', async () => {
+    const project = h.store.createProject('Verify history');
+    const other = h.store.createProject('Other history');
+    const resource = h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'History', driver: 'volume@1', target: { kind: 'path', path: 'history' },
+      access: 'write', isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+    const revision = await h.resources.importFiles(resource.id, [{ path: 'empty', data: Buffer.alloc(0) }]);
+    const head = await h.resources.importFiles(resource.id, [{ path: 'later', data: Buffer.from('later') }]);
+    const headers = (caps: string[], projectId = project.id, organizationId = project.organizationId) => ({
+      authorization: `Bearer ${h.tokens.mint({ taskId: 'historical-reader', profileId: 'do',
+        principal: 'task:historical-reader', projectId, organizationId, ceiling: caps, grantorCaps: caps }).token}`,
+    });
+    const route = `/api/projects/${project.id}/resources/${resource.id}/revisions/${revision.id}/verify`;
+    for (const denied of [headers([]), headers(['project:settings:read'], other.id),
+      headers(['project:settings:read'], project.id, 'org_foreign')]) {
+      expect((await fetch(`${base}${route}`, { headers: denied })).status).toBe(403);
+    }
+    expect((await fetch(`${base}${route}?organizationId=org_foreign`, {
+      headers: headers(['project:settings:read'], project.id, 'org_foreign'),
+    })).status).toBe(403);
+    const allowed = headers(['project:settings:read']);
+    const response = await fetch(`${base}${route}`, { headers: allowed });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const evidence: any = await response.json();
+    expect(evidence).toMatchObject({ revisionId: revision.id, status: 'complete', verifiedFiles: 1, verifiedBytes: 0 });
+    expect(JSON.stringify(evidence)).not.toMatch(/sealedRef|objectKey|credential|chunks/);
+    const handlers = platformToolHandlers({} as any, { platformRequest: async (method: string, requestPath: string) => {
+      const response = await fetch(`${base}${requestPath}`, { method, headers: allowed });
+      expect(response.status).toBe(200); return response.json();
+    } } as any);
+    expect(JSON.parse(await handlers.verify_resource_revision!({ project_id: project.id,
+      resource_id: resource.id, revision_id: revision.id }))).toEqual(evidence);
+
+    expect((await fetch(`${base}${route}?limit=1001`, { headers: allowed })).status).toBe(400);
+    expect((await fetch(`${base}${route.replace(revision.id, 'unknown')}`, { headers: allowed })).status).toBe(404);
+    expect((await fetch(`${base}${route.replace(resource.id, 'unknown')}`, { headers: allowed })).status).toBe(404);
+    expect(h.store.getResourceAttachment(resource.id)?.currentRevisionId).toBe(head.id);
+  });
+
+  it('keeps direct resource administration scoped and unavailable to proposal-only agents', async () => {
+    const project = h.store.createProject('Scoped resources');
+    const other = h.store.createProject('Other resources');
+    const headersFor = (caps: string[], projectId: string) => ({
+      authorization: `Bearer ${h.tokens.mint({ taskId: 'scoped-resource-agent', profileId: 'do',
+        principal: 'task:scoped-resource-agent', projectId, organizationId: project.organizationId,
+        ceiling: caps, grantorCaps: caps }).token}`, 'content-type': 'application/json',
+    });
+    const routes = [
+      `/api/projects/${project.id}/resources`, `/api/projects/${project.id}/secrets`,
+    ];
+    for (const route of routes) {
+      expect((await fetch(`${base}${route}`, { method: 'POST',
+        headers: headersFor(['task:review:write'], project.id), body: '{}' })).status).toBe(403);
+      expect((await fetch(`${base}${route}`, { method: 'POST',
+        headers: headersFor(['project:settings:write'], other.id), body: '{}' })).status).toBe(403);
+    }
+  });
+
+  it('uses verified identity for personal settings without extra agent permissions', async () => {
+    const human = h.tokens.mintPrincipal('user:personal-owner', ['user:read', 'user:write']);
+    const delegation = h.tokens.delegateHuman(human.token, { taskId: 'personal-agent' })!;
+    const mint = (caps: string[], delegated = true) => h.tokens.mint({ taskId: 'personal-agent', profileId: 'do',
+      principal: 'task:personal-agent', ceiling: caps, grantorCaps: caps,
+      ...(delegated ? { delegationId: delegation.id } : {}) });
+    const call = (agent: ReturnType<typeof mint>) => fetch(`${base}/api/user/default-organization`, {
+      headers: { authorization: `Bearer ${agent.token}` },
+    });
+    expect((await call(mint([]))).status).toBe(200);
+    expect((await call(mint(['user:read'], false))).status).toBe(403);
+    const response = await call(mint(['user:read']));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toHaveProperty('organizationId');
+  });
+
+  it('defaults Avatars off and allows projects to override the organization default', async () => {
+    const project = h.store.createProject('Experimental Avatars');
+    const orgUrl = `${base}/api/organizations/${project.organizationId}/avatar-settings`;
+    const projectUrl = `${base}/api/projects/${project.id}/avatar-settings`;
+    const put = async (url: string, body: object) => {
+      const response = await fetch(url, { method: 'PUT', headers: auth(), body: JSON.stringify(body) });
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await (await fetch(orgUrl, { headers: auth() })).json()).toEqual({ enabled: false });
+    expect(await (await fetch(projectUrl, { headers: auth() })).json())
+      .toEqual({ organization: false, project: 'inherit', effective: false });
+    expect((await fetch(orgUrl, { method: 'PUT', headers: auth(), body: '{}' })).status).toBe(400);
+    expect(await put(projectUrl, { value: 'enabled' })).toMatchObject({ effective: true, organization: false });
+    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: false });
+    await put(orgUrl, { enabled: true });
+    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: true });
+    expect(await put(projectUrl, { value: 'disabled' })).toMatchObject({ effective: false, organization: true });
+    await put(orgUrl, { enabled: false });
+  });
+
+  it('allows delegated Avatar administration without widening the agent grant', async () => {
+    const project = h.store.createProject('Delegated Avatars');
+    h.store.kvSet(`avatars:project:${project.id}`, 'enabled');
+    h.store.setOrganizationMembership(project.organizationId!, 'avatar-owner', 'member');
+    const authorization = new AuthorizationService(h.store);
+    authorization.grant('system:test', { principalId: 'user:avatar-owner', scopeKey: `project:${project.id}`,
+      profileId: 'maintainer' });
+    const ownerCaps = authorization.capabilities('user:avatar-owner', project.id, project.organizationId);
+    const human = h.tokens.mintPrincipal('user:avatar-owner', ownerCaps, project.id, undefined, project.organizationId);
+    const delegation = h.tokens.delegateHuman(human.token, { taskId: 'avatar-admin', projectId: project.id,
+      organizationId: project.organizationId })!;
+    const mint = (caps: string[]) => h.tokens.mint({ taskId: 'avatar-admin', profileId: 'do',
+      principal: 'task:avatar-admin', projectId: project.id, organizationId: project.organizationId,
+      ceiling: caps, grantorCaps: caps, delegationId: delegation.id });
+    const create = (caps: string[]) => fetch(`${base}/api/projects/${project.id}/avatars`, {
+      method: 'POST', headers: { authorization: `Bearer ${mint(caps).token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Delegated helper', prompt: 'Help with project work.', runtime: { provider: 'mock' } }),
+    });
+    const limited = await create(['task:create']);
+    expect(limited.status).toBe(403);
+    expect(h.store.listAvatars(project.id)).toHaveLength(0);
+    const permitted = await create(ownerCaps);
+    expect(permitted.status).toBe(201);
+    expect(h.store.listAvatars(project.id)).toHaveLength(1);
   });
 
   it('offers proposal-driven secrets, environment, and per-world services over typed resources', async () => {
@@ -1448,7 +1675,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, {
       method: 'POST', headers: auth(), body: JSON.stringify({
         type: 'login', label: 'Task-specific policy', domains: 'policy.example.com',
-        policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'task-secret' },
+        policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'task-secret', note: 'Username: administrator\nprivate recovery text' },
       }),
     })).json();
     const project: any = await (await fetch(`${base}/api/projects`, {
@@ -1472,6 +1699,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const asked: any = await (await fetch(`${base}/api/vault/resolve`, {
       method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }),
     })).json();
+    expect(JSON.stringify(asked)).not.toContain('private recovery text');
     expect(asked.status).toBe('needs_approval'); // task "ask" overrides global "never"
 
     const patched: any = await (await fetch(`${base}/api/tasks/${task.id}/authorization`, {
@@ -1484,7 +1712,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const revealed: any = await (await fetch(`${base}/api/vault/resolve`, {
       method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }),
     })).json();
-    expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret' });
+    expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret', notes: 'Username: administrator\nprivate recovery text' });
+    const explicit: any = await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, field: 'password' }),
+    })).json();
+    expect(explicit.value).toBe('task-secret');
+    expect(explicit.notes).toBeUndefined();
+    const notes: any = await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, field: 'note' }),
+    })).json();
+    expect(notes.value).toBe(revealed.notes);
   });
 
   it('changes a running task authorization + vault grants in-flight, freezes once terminal', async () => {
@@ -1555,9 +1792,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(h.store.auditSince().some((entry: any) => entry.action === 'vault.revealed'
       && entry.detail.itemId === created.id && entry.detail.field === 'password')).toBe(true);
 
-    // This administrative endpoint must never become a shortcut around the
-    // item grant/policy checks for a task-agent, even if its role happens to
-    // carry credential:write.
+    // Explicit administrative authority permits inspection for agents too.
     const taskAgent = h.tokens.mint({
       taskId: 'task_admin_reveal', profileId: 'do', principal: 'user:test', organizationId: 'org_personal',
       ceiling: ['credential:write'], grantorCaps: ['credential:write'],
@@ -1567,9 +1802,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       headers: { authorization: `Bearer ${taskAgent.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ field: 'password' }),
     });
-    expect(agentInspection.status).toBe(403);
+    expect(agentInspection.status).toBe(200);
     const agentInspectionBody: any = await agentInspection.json();
-    expect(agentInspectionBody.error).toMatch(/human vault administrator/);
+    expect(agentInspectionBody).toMatchObject({ itemId: created.id, value: 'hunter2' });
 
     // reveal policy 'ask' gates even an all-capability caller
     const asked: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();

@@ -43,7 +43,7 @@ eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.UR
 eval(extractConst('NOTIFY_BEHAVIOURS').replace('const NOTIFY_BEHAVIOURS =', 'global.NOTIFY_BEHAVIOURS ='));
 eval(extractConst('NOTIFY_DEFAULTS', '\n};').replace('const NOTIFY_DEFAULTS =', 'global.NOTIFY_DEFAULTS ='));
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
-  'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'notificationsCard']) eval(extractFn(name));
+  'notificationSoundPrefs', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'notificationsCard']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -51,6 +51,7 @@ const ok = (condition, message) => condition ? pass++ : (fail++, console.error('
 
 // ── defaults ────────────────────────────────────────────────────────────────
 const defaults = notifyPrefs();
+ok(defaults.critical.visual && URGENCY_LEVELS.filter((x) => x !== 'critical').every((x) => !defaults[x].visual), 'only critical shows in-app by default');
 ok(defaults.critical.notify && defaults.critical.sound, 'critical both notifies and sounds by default');
 ok(defaults.high.notify && !defaults.high.sound, 'high notifies quietly by default');
 ok(!defaults.normal.notify && !defaults.normal.sound, 'normal is silent by default');
@@ -84,6 +85,7 @@ for (const type of ['task.escalated', 'view.updated', 'credential.approval-resol
 ok(!inboxEventChanges({ type: 'agent.output' }), 'streaming tokens do not reload the inbox');
 
 // ── what announcing does ────────────────────────────────────────────────────
+global.showVisualNotification = () => {};
 const shown = [];
 const blips = [];                                   // one entry per tone actually started
 global.Notification = function (title, options) {
@@ -137,11 +139,21 @@ delete global.Notification;
 announceInbox([item('a', 'critical')]);
 ok(blips.length === 2, 'the sound still plays where popups are unsupported');
 
+// Sound selection changes the generated tone and caps the playback schedule.
+store.set('karmax-notify-sound', JSON.stringify({ tone: 'soft', duration: 3 }));
+blips.length = 0;
+playNotificationSound('critical');
+ok(blips.length === 8 && blips.every((tone) => tone === 440), 'soft sound repeats for the selected three-second duration');
+store.set('karmax-notify-sound', JSON.stringify({ tone: 'invalid', duration: 999999 }));
+ok(notificationSoundPrefs().tone === 'bell' && notificationSoundPrefs().duration === 0.35, 'invalid sound settings fall back to a bounded brief alert');
+store.delete('karmax-notify-sound');
+
 // ── the settings card ───────────────────────────────────────────────────────
 const card = notificationsCard();
 for (const level of URGENCY_LEVELS) {
   ok(card.includes(`data-notify="${level}:notify"`) && card.includes(`data-notify="${level}:sound"`),
     `${level} has both behaviour switches`);
+  ok(card.includes(`data-notify="${level}:visual"`) && card.includes(`data-notify="${level}:email"`), `${level} has visual and email controls`);
   ok(card.includes(`data-notify-test="${level}"`), `${level} can be tested`);
 }
 ok(card.indexOf('critical') < card.indexOf('>low<'), 'levels are listed loudest first');

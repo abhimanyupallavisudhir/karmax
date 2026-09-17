@@ -1,4 +1,10 @@
+import { probeConnection } from '../mcp/connections/probe.js';
+import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
+import { registrySearch } from '../mcp/connections/registry.js';
+import { beginOAuth, finishOAuth } from '../mcp/connections/oauth.js';
+import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
+import { ServiceConnections, ConnectionError } from '../integrations/service-connections.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -35,7 +41,7 @@ import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
-import { AuthorizationGrantError, type AuthorizationService } from '../platform/authorization.js';
+import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -67,7 +73,7 @@ import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
-import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
+import { actorPrincipal, identityAuditDetail, requireHumanSubject,
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
@@ -78,6 +84,7 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
 export interface GatewayDeps {
+  serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
   bus: KarmaxBus;
@@ -127,6 +134,11 @@ export interface GatewayDeps {
  * apply the conservative fallback, and tests assert the catalog stays complete. */
 export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
+  if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
+  if (p.startsWith('/api/connections')) return p.endsWith('/execute') ? 'connection:use' : 'credential:read';
+  if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
@@ -143,13 +155,14 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
   if (p === '/api/user/export' || p === '/api/user/default-organization'
-    || p === '/api/user/onboarding' || p === '/api/user/account-deletion-request') return 'none';
+    || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
   if (/^\/api\/user\/(?:git-profiles|github-accounts)(?:\/|$)/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
+  if (p === '/api/organization-directory' && read) return 'none';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -192,7 +205,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
-  if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return 'task:conversation:read';
+  // Requesting an explanation spends the organization's model credit and
+  // appends to the timeline, so it is a conversation write, not a read.
+  if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return read ? 'task:conversation:read' : 'task:conversation:message';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
   if (p === '/api/authorization/escalation-targets' || p === '/api/authorization-requests')
     return read ? 'task:read' : 'task:create';
@@ -229,6 +244,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/defaults/')) return 'task:read';
+  if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
+    return read ? 'profile:read' : url?.searchParams.get('projectId') ? 'project:settings:write' : 'organization:edit';
+  }
   if (p.startsWith('/api/profiles')) {
     const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
@@ -488,6 +506,9 @@ export function toPublicPayload(value: unknown): unknown {
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
  *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
 export const DEFAULT_GATEWAY_PORT = 4505;
+/** Online password guessing: this many failures per address or account lock sign-in for the window. */
+const LOGIN_MAX_FAILURES = 10;
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 
 const USER_CAPS = ['*'];
@@ -501,6 +522,7 @@ const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
+  '.woff2': 'font/woff2',
   '.json': 'application/json; charset=utf-8',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.cjs': 'text/javascript; charset=utf-8',
@@ -564,7 +586,8 @@ const ARTIFACT_MIME: Record<string, string> = {
   '.webm': 'video/webm',
   '.mov': 'video/quicktime',
   '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.markdown': 'text/markdown; charset=utf-8',
   '.log': 'text/plain; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
   '.ipynb': 'application/json; charset=utf-8',
@@ -580,6 +603,10 @@ interface Session {
 export class Gateway {
   private sessions = new Map<string, Session>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
+  /** Failed sign-ins per client address and per account. Better Auth's own
+   *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
+   *  directly, so without this a password could be guessed online. */
+  private loginFailures = new Map<string, { count: number; until: number }>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Host-machine affordances (`pass` import, host filesystem paths, a local
@@ -631,6 +658,57 @@ export class Gateway {
     });
   }
 
+  /** The live event stream (`/ws`): every durable event the caller may read. */
+  private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const auth = await this.socketAuth(req, url);
+    if (!auth) { ws.close(4401, 'unauthorized'); return; }
+    const scoped = this.deps.tokens.verify(auth.apiToken);
+    const off = this.fanout.on((ev) => {
+      const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
+      if (scoped?.projectId && projectId !== scoped.projectId) return;
+      if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
+        const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
+        if (!allows(humanCaps ?? [], 'task:event:read')) return;
+      }
+      try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
+    });
+    ws.on('close', off);
+    ws.on('error', off);
+  }
+
+  /** Whether a review-action process id was started for `taskId`. Ids are
+   *  guessable, so the task in the route is the authority, not the id. */
+  private reviewActionBelongsTo(procId: string, taskId: string): boolean {
+    const live = this.reviewActions.get(procId);
+    if (live) return live.taskId === taskId;
+    const durable = this.deps.store.execution(procId);
+    return !!durable && durable.taskId === taskId && durable.kind === 'review-action';
+  }
+
+  private connectionTimer?: ReturnType<typeof setInterval>;
+  private connectionSweep?: Promise<void>;
+  private connections(): ServiceConnections | undefined {
+    if (!this.deps.serviceConnections && this.deps.broker)
+      this.deps.serviceConnections = new ServiceConnections(this.deps.store, this.deps.broker);
+    return this.deps.serviceConnections;
+  }
+  private sweepConnections(): void {
+    if (this.connectionSweep || !this.connections()) return;
+    this.connectionSweep = this.connections()!.reconcile(async (c) => {
+      const task = this.deps.store.getTask(c.taskId!);
+      if (!task || ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')) return true;
+      const message = c.status === 'active'
+        ? `${c.label} is connected. Use list_connections, search_connection_tools, and execute_connection_tool with connection ${c.id}. The account is authorized for this task; continue the requested work.`
+        : `${c.label} connection is ${c.status}. Continue without it or explain the remaining connection step.`;
+      const result = await this.deps.api.resumeAfterCredentialDecision(c.taskId!, message, c.role ?? 'do');
+      if (result.resumed) this.emitTaskEvent({ taskId: c.taskId!, type: 'connection.resolved', ts: Date.now(),
+        payload: { requestId: c.id, connectionId: c.id, status: c.status } });
+      return result.resumed;
+    }).finally(() => { this.connectionSweep = undefined; });
+  }
+
   private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
     const task = this.deps.store.getTask(taskId);
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
@@ -644,7 +722,7 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new PermissionRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private pendingAuthorizationRequests(taskId: string) {
@@ -652,13 +730,13 @@ export class Gateway {
     const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
     if (!organizationId) return [];
     return new AuthorizationRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' });
+      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
   }
 
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
     if (!view) return view;
     const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length
-      + this.pendingAuthorizationRequests(taskId).length;
+      + this.pendingAuthorizationRequests(taskId).length + (this.connections()?.pending(taskId).length ?? 0);
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -743,6 +821,28 @@ export class Gateway {
       if (value !== undefined && to) this.deps.store.kvSet(`${prefix}${to}`, value);
       this.deps.store.kvDelete(`${prefix}${from}`);
     }
+  }
+
+  private clientAddress(req: http.IncomingMessage): string {
+    // Only a hosted cell sits behind a proxy whose forwarded header is trustworthy.
+    const forwarded = this.deps.hosted ? String(req.headers['x-forwarded-for'] ?? '').split(',')[0]!.trim() : '';
+    return forwarded || req.socket.remoteAddress || 'unknown';
+  }
+  private loginBlocked(keys: string[]): boolean {
+    const now = Date.now();
+    for (const [key, record] of this.loginFailures) if (record.until <= now) this.loginFailures.delete(key);
+    return keys.some((key) => (this.loginFailures.get(key)?.count ?? 0) >= LOGIN_MAX_FAILURES);
+  }
+  private noteLoginFailure(keys: string[]): void {
+    const now = Date.now();
+    for (const key of keys) {
+      const record = this.loginFailures.get(key);
+      if (record && record.until > now) record.count += 1;
+      else this.loginFailures.set(key, { count: 1, until: now + LOGIN_FAILURE_WINDOW_MS });
+    }
+  }
+  private clearLoginFailures(keys: string[]): void {
+    for (const key of keys) this.loginFailures.delete(key);
   }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
@@ -899,28 +999,18 @@ export class Gateway {
         wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
       else socket.destroy();
     });
-    wssEvents.on('connection', async (ws, req) => {
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      const auth = await this.socketAuth(req, url);
-      if (!auth) { ws.close(4401, 'unauthorized'); return; }
-      const scoped = this.deps.tokens.verify(auth.apiToken);
-      const off = this.fanout.on((ev) => {
-        const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
-        if (scoped?.projectId && projectId !== scoped.projectId) return;
-        if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
-          const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
-          if (!allows(humanCaps ?? [], 'task:event:read')) return;
-        }
-        try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
-      });
-      ws.on('close', off);
-      ws.on('error', off);
+    wssEvents.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.eventStream(ws, req).catch(() => { try { ws.close(); } catch {} });
     });
     wssTerm.on('connection', (ws, req) => {
       ws.on('error', () => {});
       void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
     });
-    wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
+    wssAction.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.reviewActionStream(ws, req).catch(() => { try { ws.close(); } catch {} });
+    });
     wssPreview.on('connection', (ws, req) => {
       ws.on('error', () => {});
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
@@ -946,6 +1036,9 @@ export class Gateway {
     const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
     // Webhooks give GitHub-backed stores low latency; this durable-state scan is
     // the recovery rail for missed deliveries, restarts, and non-GitHub remotes.
+    this.sweepConnections();
+    this.connectionTimer = setInterval(() => this.sweepConnections(), 5000);
+    this.connectionTimer.unref();
     this.enqueueGitPassBackstop();
     this.gitPassAutoSyncTimer = setInterval(() => this.enqueueGitPassBackstop(), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
     this.gitPassAutoSyncTimer.unref();
@@ -955,6 +1048,7 @@ export class Gateway {
       port,
       close: () =>
         new Promise<void>((resolve) => {
+          if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
           if (this.gitPassAutoSyncTimer) clearInterval(this.gitPassAutoSyncTimer);
@@ -1145,6 +1239,13 @@ export class Gateway {
       res.writeHead(this.deps.store.previewHostnameAllowed(domain) ? 204 : 403,
         { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
+    }
+    if (p.startsWith('/share/conversations/')) {
+      const share = req.method === 'GET' ? publicShare(this.deps.store, p.slice('/share/conversations/'.length)) : undefined;
+      res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      return void res.end(publicConversationHtml(share));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);
@@ -1373,14 +1474,12 @@ export class Gateway {
       // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
       // header) — forwarding services can rarely set custom headers, so the
       // query form is the primary one. Legacy env secret stays accepted.
-      const minted = mailMod.ingestSecret(this.deps.store);
       const presented = url.searchParams.get('secret')
         ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
-      const legacy = process.env.KARMAX_AGENT_MAIL_SECRET;
-      // Constant-time compare so the secret can't be recovered byte-by-byte via
-      // response timing (matches the Stripe webhook check).
-      const secretOk = !!presented && (timingSafeEqualStr(presented, minted) || (!!legacy && timingSafeEqualStr(presented, legacy)));
-      if (!secretOk)
+      // The secret names the organization it may deliver to (compared in constant
+      // time inside); an installation-wide legacy secret still reaches every one.
+      const scope = mailMod.ingestScope(this.deps.store, presented, process.env.KARMAX_AGENT_MAIL_SECRET);
+      if (!scope)
         return this.json(res, 401, { error: `agent-mail ingest requires the webhook secret (the ?secret= in the URL ${this.siteName} shows the operator)` });
       // Providers POST different shapes/encodings; parse by content-type and
       // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
@@ -1400,7 +1499,8 @@ export class Gateway {
       // Routed by recipient to the owning organization; unknown recipients are
       // dropped (never leaked into any tenant's inbox). Never echo the message.
       const { delivered } = new mailMod.AgentMail(this.deps.store)
-        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') });
+        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') },
+          scope.organizationId);
       return this.json(res, 200, { delivered });
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
@@ -1492,19 +1592,26 @@ export class Gateway {
     }
     if (p === '/api/login' && method === 'POST') {
       const b = await this.body(req);
+      const email = String(b.email ?? '').trim().toLowerCase();
+      const throttleKeys = [`ip:${this.clientAddress(req)}`, ...(email ? [`email:${email}`] : [])];
+      if (this.loginBlocked(throttleKeys))
+        return this.json(res, 429, { error: 'too many failed sign-in attempts; try again in a few minutes' });
       if (this.deps.identity) {
         try {
           const response = await this.deps.identity.signIn(String(b.email ?? ''), String(b.password ?? ''), requestHeaders(req.headers));
+          if (response.ok) this.clearLoginFailures(throttleKeys); else this.noteLoginFailure(throttleKeys);
           return this.sendWebResponse(res, response);
-        } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
+        } catch { this.noteLoginFailure(throttleKeys); return this.json(res, 401, { error: 'invalid email or password' }); }
       }
       if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       // Constant-time, like the Stripe webhook and the agent-mail ingest secret:
       // this compares a shared secret on an unauthenticated route.
       if (this.deps.password && timingSafeEqualStr(String(b.password ?? ''), this.deps.password)) {
+        this.clearLoginFailures(throttleKeys);
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
       }
+      this.noteLoginFailure(throttleKeys);
       return this.json(res, 401, { error: 'invalid password' });
     }
     if (p === '/api/setup' && method === 'POST' && this.deps.identity) {
@@ -1658,6 +1765,8 @@ export class Gateway {
       ? `/api/${organizationResource[2]}${organizationResource[3] ?? ''}`
       : p;
 
+    // Authorization is independent of actor type. Personal self-service routes
+    // below require the same verified account subject for browsers and delegates.
     const required = capabilityForRequest(method, p, url);
     if (required) {
       const scope = requestedScope;
@@ -1694,6 +1803,48 @@ export class Gateway {
     }
 
     try {
+      const sharingSettings = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/conversation-sharing$/);
+      if (sharingSettings) {
+        const [, scope, id] = sharingSettings;
+        const organization = scope === 'organizations';
+        if (!(organization ? store.getOrganization(id!) : store.getProject(id!))) return this.json(res, 404, { error: 'scope not found' });
+        const key = `conversation-sharing:${organization ? 'organization' : 'project'}:${id}`;
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (organization ? typeof body.enabled !== 'boolean' : !['inherit', 'disabled'].includes(body.value))
+            return this.json(res, 400, { error: 'invalid sharing setting' });
+          store.kvSet(key, organization ? (body.enabled ? 'enabled' : 'disabled') : body.value);
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { ...(organization ? { enabled: store.kvGet(key) === 'enabled' } : sharingPolicy(store, id!)),
+          canManage: this.deps.tokens.check(token, organization ? 'organization:edit' : 'project:settings:write', requestedScope).ok });
+      }
+      const conversationShare = p.match(/^\/api\/tasks\/([^/]+)\/conversation-share$/);
+      if (conversationShare) {
+        const taskId = conversationShare[1]!;
+        const task = store.getTask(taskId);
+        if (!task) return this.json(res, 404, { error: 'task not found' });
+        // Bind mutations and link discovery to the record itself, even when a
+        // caller supplies a conflicting projectId query parameter.
+        const actualScope = { taskId, projectId: task.projectId, organizationId: store.getProject(task.projectId)?.organizationId };
+        if (!this.deps.tokens.check(token, 'task:conversation:share', actualScope).ok)
+          return this.json(res, 403, { error: 'conversation sharing is not allowed in this project' });
+        const role = url.searchParams.get('role') ?? 'do';
+        const policy = sharingPolicy(store, task.projectId);
+        if (method === 'DELETE') {
+          revokeShare(store, taskId, role);
+          return this.json(res, 200, { revoked: true });
+        }
+        let share = currentShare(store, taskId, role);
+        if (method === 'POST') {
+          if (!policy.effective) return this.json(res, 403, { error: 'Public conversation sharing is disabled by organization or project settings' });
+          const view = await api.getTaskView(token, taskId);
+          const transcript = view?.transcripts?.find(t => t.role === role);
+          const messages = transcript?.messages ?? (role === 'do' ? view?.messages : undefined);
+          if (!messages?.length) return this.json(res, 404, { error: 'conversation not found' });
+          share = createShare(store, taskId, role, messages);
+        } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+        return this.json(res, 200, { enabled: policy.effective, url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
+      }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
         if (bearer) this.sessions.delete(bearer);
@@ -1701,48 +1852,52 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/user/account-deletion-request' && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const privacyContact = (this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).contacts.privacy;
-        const request = { requestedAt: Date.now(), userId: subject.userId, email: session.email };
+        const request = { requestedAt: Date.now(), userId: subject.userId,
+          email: this.deps.identity?.listUsers().find((user) => user.id === subject.userId)?.email ?? session.email };
         store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request));
         if (privacyContact && this.deps.email?.configured()) {
           await this.deps.email.send({ to: privacyContact, subject: `${this.siteName} account deletion request`,
-            text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${session.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
+            text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${request.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
             .catch((error) => console.error('[privacy] deletion-request notification failed:', error instanceof Error ? error.message : error));
         }
         return this.json(res, 202, { ...request, privacyContact: privacyContact ?? null,
           next: 'We will verify ownership and organization/resource transfer needs before irreversible deletion.' });
       }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
+        const operator = allows(authRecord.caps, 'authorization:read');
         if (method === 'GET') {
-          const organization = store.defaultOrganization(subject.userId);
+          const organization = store.defaultOrganization(subject.userId, operator);
           return this.json(res, 200, { organizationId: organization?.id ?? null });
         }
         const b = await this.body(req);
         try {
-          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''));
+          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''), operator);
           return this.json(res, 200, { organizationId: organization.id });
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       }
       if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const organizationId = String(url.searchParams.get('organizationId')
-          ?? store.defaultOrganization(subject.userId)?.id ?? '');
+          ?? store.defaultOrganization(subject.userId, allows(authRecord.caps, 'authorization:read'))?.id ?? '');
         if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
           return this.json(res, 404, { error: 'organization not found' });
         const key = hostedOnboardingKey(subject.userId, organizationId);
+        // Recover older accounts and interrupted signup provisioning on every read.
+        if (this.deps.hosted) this.enableHostedOnboarding(subject.userId, organizationId);
         let record = parseHostedOnboardingRecord(store.kvGet(key));
+        let finishReplay = false;
         if (method === 'PUT') {
           if (!this.deps.hosted || !record)
             return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
           const b = await this.body(req);
           const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
           record = { ...record, display };
-          if (b.finishReplay === true && record.replay)
-            record = { display, completedAt: Date.now() };
+          finishReplay = b.finishReplay === true;
           store.kvSet(key, JSON.stringify(record));
         }
         const credentials = enumerateCredentials(gatherCredentialSources({
@@ -1766,6 +1921,10 @@ export class Gateway {
           card: store.listOrganizationCards(organizationId).length > 0,
           project: store.listProjects().some((project) => project.organizationId === organizationId),
         };
+        if (finishReplay && record?.replay && facts.github && facts.agentLogin && facts.e2b && facts.project) {
+          record = { display: record.display, completedAt: Date.now() };
+          store.kvSet(key, JSON.stringify(record));
+        }
         let status = hostedOnboardingStatus({
           hosted: this.deps.hosted === true,
           organizationId,
@@ -1784,8 +1943,8 @@ export class Gateway {
       }
       if (p === '/api/user/export' && method === 'GET') {
         // Broad task-agent capabilities never imply ownership of a human's
-        // personal archive. Only a verified browser identity has `session.userId`.
-        const subject = requireInteractiveHuman(callerIdentity);
+        // personal archive. Require an authority-verified user subject.
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.identity)
           return this.json(res, 401, { error: 'a signed-in user account is required' });
         const identityData = this.deps.identity.exportUserData(subject.userId);
@@ -1876,6 +2035,11 @@ export class Gateway {
       // Organization is the hosted tenant boundary. Collection discovery is
       // filtered by membership; every nested request was minted an
       // organization-scoped token above, so identifiers cannot cross tenants.
+      if (p === '/api/organization-directory' && method === 'GET') {
+        const subject = requireHumanSubject(callerIdentity);
+        return this.json(res, 200, store.organizationDirectory(subject.userId,
+          allows(authRecord.caps, 'authorization:read')));
+      }
       if (p === '/api/organizations' && method === 'GET') {
         const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
         if (canAuditAll) return this.json(res, 200, store.listOrganizations());
@@ -1903,13 +2067,14 @@ export class Gateway {
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
-        if (!session.email) return this.json(res, 400, { error: 'a verified account is required' });
+        const subject = requireHumanSubject(callerIdentity);
+        const subjectEmail = this.deps.identity?.listUsers().find((user) => user.id === subject.userId)?.email;
+        if (!subjectEmail) return this.json(res, 400, { error: 'a verified account is required' });
         const b = await this.body(req);
         try {
           const invitationToken = String(b.token ?? '');
           const invited = store.organizationInvitationForToken(invitationToken);
-          const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, session.email);
+          const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, subjectEmail);
           this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
           void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
@@ -1921,6 +2086,25 @@ export class Gateway {
         }
       }
 
+      const organizationRoles = p.match(/^\/api\/organizations\/([^/]+)\/roles$/);
+      if (organizationRoles && this.deps.authorization) {
+        const organizationId = organizationRoles[1]!;
+        const actor = actorPrincipal(callerIdentity.actor);
+        const caps = authRecord.caps;
+        if (method === 'GET') return this.json(res, 200, {
+          profiles: this.deps.authorization.profiles(undefined, organizationId),
+          capabilityGroups: CAPABILITY_GROUPS,
+          creatableCapabilities: CAPABILITY_GROUPS.flatMap((group) => group.capabilities)
+            .filter((cap) => allows(ORGANIZATION_GRANT_CEILING, cap.id)
+              && allows(caps, cap.id)).map((cap) => cap.id),
+          canCreate: allows(caps, 'organization:edit'),
+        });
+        if (method === 'POST') {
+          const body = await this.body(req);
+          try { return this.json(res, 201, this.deps.authorization.createOrganizationRole(actor, organizationId, body, caps)); }
+          catch (error) { return this.json(res, error instanceof AuthorizationGrantError ? 403 : 400, { error: (error as Error).message }); }
+        }
+      }
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
       const organizationEntitlementsMatch = p.match(/^\/api\/organizations\/([^/]+)\/entitlements$/);
@@ -1958,17 +2142,16 @@ export class Gateway {
         if (!billing) return this.json(res, 503, { error: 'subscription billing is unavailable' });
         if (action === 'status') {
           if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
-          const interactiveUserId = callerIdentity.actor.kind === 'interactive-human'
-            ? callerIdentity.humanSubject?.userId : undefined;
-          const canManage = Boolean(interactiveUserId
-            && store.organizationMembership(organizationId, interactiveUserId)?.role === 'owner');
+          const billingUserId = callerIdentity.humanSubject?.userId;
+          const canManage = Boolean(billingUserId
+            && this.deps.tokens.check(token, 'payment:write', { organizationId }).ok
+            && store.organizationMembership(organizationId, billingUserId)?.role === 'owner');
           return this.json(res, 200, { ...billing.current(organizationId), canManage });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
-        // Agent-card administration is delegable through payment:write. Paying
-        // for the SaaS itself is not: require live browser presence and the
-        // durable owner membership even after the ordinary capability gate.
-        const billingSubject = requireInteractiveHuman(callerIdentity);
+        // Billing requires payment authority and a verified owner subject,
+        // including securely delegated agents.
+        const billingSubject = requireHumanSubject(callerIdentity);
         if (store.organizationMembership(organizationId, billingSubject.userId)?.role !== 'owner')
           return this.json(res, 403, { error: 'organization owner access is required to administer its subscription' });
         const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
@@ -1986,7 +2169,7 @@ export class Gateway {
                 cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
             store.recordPolicyAcceptance({
               userId: billingSubject.userId,
-              email: session.email,
+              email: this.deps.identity?.listUsers().find((user) => user.id === billingSubject.userId)?.email ?? session.email,
               organizationId,
               context: 'checkout',
               versions,
@@ -2052,9 +2235,18 @@ export class Gateway {
       }
       if (organizationMatch && method === 'PATCH') {
         const b = await this.body(req);
-        if (typeof b.name !== 'string') return this.json(res, 400, { error: 'organization name is required' });
-        try { return this.json(res, 200, store.renameOrganization(organizationMatch[1]!, b.name)); }
-        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        if (b.nameVisibility !== undefined && b.nameVisibility !== 'members' && b.nameVisibility !== 'public')
+          return this.json(res, 400, { error: 'nameVisibility must be members or public' });
+        if (b.name !== undefined && typeof b.name !== 'string')
+          return this.json(res, 400, { error: 'organization name must be a string' });
+        if (b.name === undefined && b.nameVisibility === undefined)
+          return this.json(res, 400, { error: 'organization name or nameVisibility is required' });
+        try {
+          const id = organizationMatch[1]!;
+          if (b.name !== undefined) store.renameOrganization(id, b.name);
+          if (b.nameVisibility !== undefined) store.setOrganizationNameVisibility(id, b.nameVisibility);
+          return this.json(res, 200, store.getOrganization(id));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
       if (organizationExecution) {
@@ -2087,7 +2279,6 @@ export class Gateway {
           `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
-        requireInteractiveHuman(callerIdentity);
         const organizationId = organizationMatch[1]!;
         const organization = store.getOrganization(organizationId);
         if (!organization) return this.json(res, 404, { error: 'organization not found' });
@@ -2333,7 +2524,7 @@ export class Gateway {
       }
       const githubManifest = p.match(/^\/api\/organizations\/([^/]+)\/github\/app-manifest$/);
       if (githubManifest && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!this.deps.tokens.check(token, 'settings:write').ok)
           return this.json(res, 403, { error: `Only a ${this.siteName} installation administrator can create the shared GitHub App` });
@@ -2349,7 +2540,7 @@ export class Gateway {
       }
       const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
       if (githubAuthorize && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const b = await this.body(req);
         const reconnectAccountId = b.accountId ? String(b.accountId) : undefined;
@@ -2370,7 +2561,7 @@ export class Gateway {
       }
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
       if (githubInstallUrl && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         const state = store.createGithubInstallState(githubInstallUrl[1]!, subject.userId);
         return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
@@ -2410,10 +2601,9 @@ export class Gateway {
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
           return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
         try {
-          const githubAccountId = callerIdentity.actor.kind === 'task-agent'
-            ? subject.externalIdentities?.githubAccountId : undefined;
-          if (callerIdentity.actor.kind === 'task-agent' && !githubAccountId)
-            return this.json(res, 403, { error: 'the delegated task has no pinned GitHub account' });
+          // Honor an explicit account scope for either actor; otherwise use
+          // the represented user's active account, including after onboarding.
+          const githubAccountId = subject.externalIdentities?.githubAccountId;
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
               private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
@@ -2422,7 +2612,13 @@ export class Gateway {
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
         const organizationId = organizationProjects[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
+        if (method === 'GET') {
+          // Same per-project filter as GET /api/projects: an organization member
+          // sees the projects they can read, not every project in the tenant.
+          const principal = session.userId && this.deps.authorization && !authRecord?.projectId ? `user:${session.userId}` : undefined;
+          return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId
+            && (!principal || allows(this.deps.authorization!.capabilities(principal, project.id), 'project:read'))));
+        }
         if (method === 'POST') {
           const b = await this.body(req);
           let project;
@@ -2552,7 +2748,7 @@ export class Gateway {
           ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
             && (policy as any)[key] !== current) || managedProvidersChanged;
           if (ownerOnlyChange) {
-            const subject = requireInteractiveHuman(callerIdentity);
+            const subject = requireHumanSubject(callerIdentity);
             if (store.organizationMembership(organizationId, subject.userId)?.role !== 'owner')
               return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
           }
@@ -2562,7 +2758,7 @@ export class Gateway {
       }
 
       if (p === '/api/inbox' && method === 'GET') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
         const items = store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
@@ -2576,17 +2772,23 @@ export class Gateway {
       }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const b = await this.body(req);
         return this.json(res, 200, store.markInbox(subject.userId, inboxItem[1]!, b.unread !== false) ?? null);
       }
       if (p === '/api/inbox/preferences') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
         if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (b.emailUrgencies !== undefined && (!b.emailUrgencies || typeof b.emailUrgencies !== 'object'
+            || Array.isArray(b.emailUrgencies) || Object.entries(b.emailUrgencies).some(([key, value]) =>
+              !['low', 'normal', 'high', 'critical'].includes(key) || typeof value !== 'boolean')))
+            return this.json(res, 400, { error: 'emailUrgencies must map urgency levels to booleans' });
+          const previous = store.getDeliveryPreferences(subject.userId, requestedScope.organizationId);
           return this.json(res, 200, store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
+            emailUrgencies: b.emailUrgencies ?? previous.emailUrgencies,
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
         }
       }
@@ -2597,19 +2799,30 @@ export class Gateway {
         return this.json(res, 200, (this.deps.identity?.listUsers() ?? []).map((u) => ({ ...u, grants: this.deps.authorization?.grants(`user:${u.id}`) ?? [] })));
       }
       if (p === '/api/users' && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.identity) return this.json(res, 400, { error: 'identity service unavailable' });
         const b = await this.body(req);
+        if (b.profileId) {
+          const profile = this.deps.authorization?.profile(String(b.profileId), b.projectId);
+          if (!profile) return this.json(res, 400, { error: 'unknown authorization profile' });
+          if (!b.projectId && (authRecord.projectId || authRecord.projectIds?.length || authRecord.organizationId))
+            return this.json(res, 403, { error: 'this token cannot delegate global access' });
+          for (const capability of profile.capabilities) {
+            if (!this.deps.tokens.check(token, capability, { projectId: b.projectId,
+              organizationId: b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined }).ok)
+              return this.json(res, 403, { error: `you cannot delegate ${capability}` });
+          }
+        }
         const user = await this.deps.identity.createUser({ name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') });
-        if (b.profileId) this.deps.authorization?.grant(`user:${subject.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
+        if (b.profileId) this.deps.authorization?.grant(actorPrincipal(callerIdentity.actor), { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
         return this.json(res, 200, user);
       }
       const resetOnboarding = p.match(/^\/api\/users\/([^/]+)\/onboarding\/reset$/);
-      if (resetOnboarding && method === 'POST') {
-        requireInteractiveHuman(callerIdentity);
+      if ((resetOnboarding || p === '/api/user/onboarding/reset') && method === 'POST') {
         if (!this.deps.hosted)
           return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
-        const userId = resetOnboarding[1]!;
+        // The self-service route takes its target solely from the verified subject.
+        // The operator route retains its user:write capability requirement.
+        const userId = resetOnboarding?.[1] ?? requireHumanSubject(callerIdentity).userId;
         if (!this.deps.identity?.listUsers().some((user) => user.id === userId))
           return this.json(res, 404, { error: 'user not found' });
         // Only presentation state changes. Live setup facts and user work remain intact.
@@ -2619,10 +2832,9 @@ export class Gateway {
       }
       const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
       if (userMatch && method === 'DELETE') {
-        const subject = requireInteractiveHuman(callerIdentity);
-        if (userMatch[1] === subject.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
+        if (userMatch[1] === callerIdentity.humanSubject?.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
         await this.deps.identity?.removeUser(userMatch[1]!);
-        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(`user:${subject.userId}`, g.principalId, g.scopeKey);
+        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), g.principalId, g.scopeKey);
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/authorization/profiles' && method === 'GET') {
@@ -2763,17 +2975,18 @@ export class Gateway {
 
       // Avatars are durable autonomous principals owned by one user. Their
       // prompt/runtime/authority are edited together so a caller never observes
-      // a half-updated identity. Organization/project kill switches are separate
+      // a half-updated identity. Organization defaults and project overrides are separate
       // policy and therefore do not rewrite the Avatar itself.
       const organizationAvatarSettings = p.match(/^\/api\/organizations\/([^/]+)\/avatar-settings$/);
       if (organizationAvatarSettings) {
         const organizationId = organizationAvatarSettings[1]!;
         if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
         if (method === 'GET') return this.json(res, 200, {
-          enabled: store.kvGet(`avatars:organization:${organizationId}`) !== 'disabled',
+          enabled: store.kvGet(`avatars:organization:${organizationId}`) === 'enabled',
         });
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (typeof b.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be a boolean' });
           store.kvSet(`avatars:organization:${organizationId}`, b.enabled === false ? 'disabled' : 'enabled');
           store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor), action: 'avatar.organization-policy.changed',
             scopeKey: `organization:${organizationId}`, detail: { enabled: b.enabled !== false } });
@@ -2824,10 +3037,10 @@ export class Gateway {
           return this.json(res, 200, { availability, avatars: store.listAvatars(projectId).map(view) });
         }
 
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const existing = avatarId ? store.getAvatar(avatarId) : undefined;
         if (avatarId && !existing) return this.json(res, 404, { error: 'avatar not found' });
-        if (existing?.projectId !== projectId) return this.json(res, 404, { error: 'avatar not found' });
+        if (existing && existing.projectId !== projectId) return this.json(res, 404, { error: 'avatar not found' });
         if (method === 'DELETE') {
           if (existing!.ownerUserId !== subject.userId && !canAdmin)
             return this.json(res, 403, { error: 'only the owner or a project administrator can remove this Avatar' });
@@ -2941,8 +3154,25 @@ export class Gateway {
             }
           }
           authorization.capabilities = [...new Set(authorization.capabilities)];
+          // No caller may delegate beyond its grant, including when editing an
+          // Avatar previously authorized by someone else.
+          if (authorization.scope === 'organization'
+            && (authRecord.organizationId && authRecord.organizationId !== organizationId || authRecord.projectId || authRecord.projectIds?.length)
+            || authorization.scope === 'global'
+            && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length))
+            throw new AuthorizationGrantError('this token cannot delegate the selected scope');
+          for (const selectedProject of authorization.projectIds?.length ? authorization.projectIds : [projectId]) {
+            for (const capability of authorization.capabilities) {
+              if (!this.deps.tokens.check(token, capability, { projectId: selectedProject, organizationId }).ok)
+                throw new AuthorizationGrantError(`you cannot delegate ${capability} in project ${selectedProject}`);
+            }
+          }
+
           const githubAccountId = b.githubAccountId === null ? undefined
             : b.githubAccountId ? String(b.githubAccountId) : existing?.githubAccountId;
+          if (githubAccountId && authRecord.externalIdentities?.githubAccountId
+            && githubAccountId !== authRecord.externalIdentities.githubAccountId)
+            throw new AuthorizationGrantError('the selected GitHub account is outside this caller’s account scope');
           if (githubAccountId && this.deps.githubApp?.activeUserAccountId(subject.userId) !== githubAccountId)
             throw new Error('the selected GitHub account is not your active connected account');
 
@@ -3063,10 +3293,18 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const projects = store.projectFolderProjects(projectFolder[1]!, b.folder);
-          const forbidden = projects.find((project) => !this.deps.tokens.check(token, 'project:edit', {
-            projectId: project.id,
-            organizationId: project.organizationId,
-          }).ok);
+          // Browser tokens are minted for the request's anchor project. Resolve
+          // the signed-in user's grants independently for each sibling instead
+          // of treating that token's scope as the user's full authority. Bearers
+          // (including delegated agents) must remain within their minted scope.
+          const forbidden = projects.find((project) => {
+            if (session.userId && this.deps.authorization)
+              return !allows(this.deps.authorization.capabilities(`user:${session.userId}`, project.id, project.organizationId), 'project:edit');
+            return !this.deps.tokens.check(token, 'project:edit', {
+              projectId: project.id,
+              organizationId: project.organizationId,
+            }).ok;
+          });
           if (forbidden)
             return this.json(res, 403, { error: 'Renaming this folder requires edit access to every project it contains.' });
           return this.json(res, 200, store.renameProjectFolder(projectFolder[1]!, b.folder, b.name));
@@ -3118,8 +3356,6 @@ export class Gateway {
       // write-only; .env example files provide lazy suggestions.
       const projectSecrets = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
       if (projectSecrets && ['GET', 'POST', 'DELETE'].includes(method)) {
-        if (method !== 'GET' && this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents must store generated credentials in the vault and propose them for Review' });
         const project = store.getProject(projectSecrets[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.broker || !this.deps.resources)
@@ -3302,8 +3538,6 @@ export class Gateway {
           revision: resource.currentRevisionId ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined,
         })));
         if (method === 'POST') {
-          if (this.deps.tokens.verify(token)?.kind === 'agent')
-            return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
           const b = await this.body(req, 600 * 1024 * 1024);
           const id = newId('resource');
           const driver = String(b.driver ?? 'volume@1');
@@ -3352,8 +3586,6 @@ export class Gateway {
       }
       const copyGlobsMigration = p.match(/^\/api\/projects\/([^/]+)\/resources\/import-copyglobs$/);
       if (copyGlobsMigration && method === 'POST') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'copyGlobs migration is a human project-settings operation' });
         const project = store.getProject(copyGlobsMigration[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         // `hostLocal`, not `hosted` — the same gate as the scan/import routes above,
@@ -3373,14 +3605,40 @@ export class Gateway {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       }
+      const resourceVerification = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/revisions\/([^/]+)\/verify$/);
+      if (resourceVerification && method === 'GET') {
+        // The common request gate requires project:settings:read in the URL's project scope.
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const [, projectId, resourceId, revisionId] = resourceVerification;
+        const resource = store.getResourceAttachment(resourceId!);
+        const revision = store.getResourceRevision(revisionId!);
+        const project = store.getProject(projectId!);
+        // Use canonical ownership here, regardless of optional scope query parameters.
+        if (project && !this.deps.tokens.check(token, 'project:settings:read',
+          { projectId: project.id, organizationId: project.organizationId }).ok)
+          return this.json(res, 403, { error: 'forbidden' });
+        if (!project || !resource || resource.projectId !== project.id
+          || resource.organizationId !== project.organizationId || !revision || revision.attachmentId !== resource.id)
+          return this.json(res, 404, { error: 'resource revision not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'this staged resource must be adopted or discarded from its task Review' });
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const limit = Number(url.searchParams.get('limit') ?? 100);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+          return this.json(res, 400, { error: 'offset must be a nonnegative integer; limit must be 1–1000' });
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          return this.json(res, 200, await this.deps.resources.verifyRevision(projectId!, resourceId!, revisionId!, offset, limit));
+        } catch {
+          return this.json(res, 422, { error: 'resource revision verification is unsupported or unavailable' });
+        }
+      }
       const projectResource = p.match(/^\/api\/projects\/([^/]+)\/resources\/(?!scan$)([^/]+)$/);
       if (projectResource) {
         const resource = store.getResourceAttachment(projectResource[2]!);
         if (!resource || resource.projectId !== projectResource[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
           { error: 'this staged resource must be adopted or discarded from its task Review' });
-        if ((method === 'PATCH' || method === 'DELETE') && this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents cannot administer durable project resources directly' });
         if (method === 'GET') return this.json(res, 200, { ...redactResource(resource),
           revisions: store.listResourceRevisions(resource.id).map(redactResourceRevision) });
         if (method === 'PATCH') {
@@ -3419,8 +3677,6 @@ export class Gateway {
       }
       const projectResourceScan = p.match(/^\/api\/projects\/([^/]+)\/resources\/scan$/);
       if (projectResourceScan && method === 'GET') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents can inventory only their own current world' });
         const project = store.getProject(projectResourceScan[1]!);
         if (!project) return this.json(res, 404, { error: 'project not found' });
         // `hosted` and `hostLocal` are orthogonal: a self-host served on a public
@@ -3433,8 +3689,6 @@ export class Gateway {
       }
       const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
       if (resourceUploadCreate && method === 'POST') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceUploadCreate[2]!);
         if (!resource || resource.projectId !== resourceUploadCreate[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
@@ -3453,8 +3707,6 @@ export class Gateway {
       }
       const resourceUpload = p.match(/^\/api\/resource-uploads\/([^/]+)$/);
       if (resourceUpload) {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents cannot modify durable project resource uploads directly' });
         const upload = resourceUploadSession(store, resourceUpload[1]!);
         if (!upload || upload.projectId !== url.searchParams.get('projectId')) return this.json(res, 404, { error: 'resource upload not found' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
@@ -3513,8 +3765,6 @@ export class Gateway {
       }
       const resourceImport = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/import$/);
       if (resourceImport && method === 'POST') {
-        if (this.deps.tokens.verify(token)?.kind === 'agent')
-          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceImport[2]!);
         if (!resource || resource.projectId !== resourceImport[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
@@ -3612,8 +3862,9 @@ export class Gateway {
           if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
           const principal = projectPrincipalFromBody(b.principal, project.organizationId);
           const profileId = String(b.profileId ?? 'developer');
-          if (!['viewer', 'developer', 'maintainer'].includes(profileId))
-            return this.json(res, 400, { error: 'project access must be Viewer, Developer, or Project maintainer' });
+          if (!['viewer', 'developer', 'maintainer'].includes(profileId)
+            && !store.getAuthorizationProfile(`organization:${project.organizationId}`, profileId))
+            return this.json(res, 400, { error: 'choose a project authorization role' });
           this.deps.authorization?.assertCanGrantSelection(actorPrincipal(callerIdentity.actor),
             project.organizationId, { level: profileId, scope: 'projects', projectIds: [projectId] },
             authRecord?.kind === 'human' ? undefined : authRecord?.caps);
@@ -3934,6 +4185,12 @@ export class Gateway {
         store.deleteTask(viewMatch[1]!);
         return this.json(res, 200, { ok: true });
       }
+      const principalMatch = p.match(/^\/api\/tasks\/([^/]+)\/principal$/);
+      if (principalMatch && method === 'POST') {
+        try {
+          return this.json(res, 200, api.setPrincipalAttempt(token, principalMatch[1]!));
+        } catch (e) { return this.badRequest(res, e); }
+      }
       const attemptsMatch = p.match(/^\/api\/tasks\/([^/]+)\/attempts$/);
       if (attemptsMatch && method === 'GET') {
         const group = api.attemptGroup(token, attemptsMatch[1]!);
@@ -4061,7 +4318,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files);
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault });
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
@@ -4176,6 +4433,14 @@ export class Gateway {
         try { return this.json(res, 200, await api.publishTaskBranch(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      if (p === '/api/agent/github/actions/workflows' && method === 'GET') {
+        try { return this.json(res, 200, await api.listGithubActionsWorkflows(token, {
+          repository: url.searchParams.get('repository') ?? undefined,
+          page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
+          perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
+        })); } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
+      }
       if (p === '/api/agent/github/actions/runs' && method === 'GET') {
         try {
           return this.json(res, 200, await api.listGithubActionsRuns(token, {
@@ -4194,6 +4459,14 @@ export class Gateway {
       if (githubActionsRun && method === 'GET') {
         try { return this.json(res, 200, await api.inspectGithubActionsRun(token, {
           repository: url.searchParams.get('repository') ?? undefined, runId: Number(githubActionsRun[1]),
+          view: (url.searchParams.get('view') ?? undefined) as any,
+          attempt: url.searchParams.has('attempt') ? Number(url.searchParams.get('attempt')) : undefined,
+          jobId: url.searchParams.has('jobId') ? Number(url.searchParams.get('jobId')) : undefined,
+          page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
+          perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
+          offsetLines: url.searchParams.has('offsetLines') ? Number(url.searchParams.get('offsetLines')) : undefined,
+          tailLines: url.searchParams.has('tailLines') ? Number(url.searchParams.get('tailLines')) : undefined,
+          maxChars: url.searchParams.has('maxChars') ? Number(url.searchParams.get('maxChars')) : undefined,
         })); }
         catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
           { error: error instanceof Error ? error.message : String(error) }); }
@@ -4249,6 +4522,7 @@ export class Gateway {
         const b = await this.body(req);
         try {
           return this.json(res, 200, await api.requestPermission(token, {
+            ...(b.projectIds !== undefined ? { projectIds: b.projectIds as string[] } : {}),
             capabilities: Array.isArray(b.capabilities) ? b.capabilities.map(String) : [],
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             reason: String(b.reason ?? ''),
@@ -4312,8 +4586,8 @@ export class Gateway {
         const b = await this.body(req);
         const organizationId = String(url.searchParams.get('organizationId') ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (b.action !== 'approve' && b.action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (b.action !== 'approve' && b.action !== 'deny' && b.action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolveAuthorizationRequest(token, {
             organizationId, requestId: authorizationResolution[1]!, action: b.action,
@@ -4348,8 +4622,8 @@ export class Gateway {
         const b = await this.body(req);
         const action = String(b.action ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (action !== 'approve' && action !== 'deny')
-          return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (action !== 'approve' && action !== 'deny' && action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolvePermissionRequest(token, {
             organizationId,
@@ -4480,13 +4754,17 @@ export class Gateway {
         });
         return this.json(res, 200, { kind: 'run', procId: rec.procId, server: rec.server, openUrls: rec.openUrls });
       }
+      // The capability check above scoped to the task in the path; the process
+      // id must belong to that task too, or a caller could read (or stop) another
+      // tenant's review action — or interactive terminal — by guessing its id.
       const raStopMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)\/stop$/);
       if (raStopMatch && method === 'POST') {
+        if (!this.reviewActionBelongsTo(raStopMatch[2]!, raStopMatch[1]!)) return this.json(res, 404, { error: 'no such action process' });
         return this.json(res, 200, { ok: this.reviewActions.stop(raStopMatch[2]!) });
       }
       const raStatusMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)$/);
       if (raStatusMatch && method === 'GET') {
-        const st = this.reviewActions.status(raStatusMatch[2]!);
+        const st = this.reviewActionBelongsTo(raStatusMatch[2]!, raStatusMatch[1]!) ? this.reviewActions.status(raStatusMatch[2]!) : undefined;
         return this.json(res, st ? 200 : 404, st ?? { error: 'no such action process' });
       }
       const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
@@ -4514,7 +4792,9 @@ export class Gateway {
           if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
           const id = newId('artifact');
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
-          const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
+          // The type is derived from the name, never taken from the request: a
+          // caller-chosen `text/html` would be echoed back inline on this origin.
+          const mediaType = ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
           const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
           const managedStorage = store.listStorageLocations(project.organizationId).find((location) => location.kind === 'managed');
           if (managedStorage) store.reserveStorageUpload(`artifact:${id}`, project.organizationId, managedStorage.id,
@@ -4547,9 +4827,8 @@ export class Gateway {
           const data = await this.deps.objects.get(artifact.objectKey);
           if (crypto.createHash('sha256').update(data).digest('hex') !== artifact.sha256)
             return this.json(res, 502, { error: 'artifact integrity check failed' });
-          res.writeHead(200, { 'content-type': artifact.mediaType, 'content-length': String(data.length),
-            'content-disposition': `inline; filename="${artifact.name.replace(/["\\\r\n]/g, '_')}"`,
-            'cache-control': 'private, no-store' });
+          res.writeHead(200, { ...untrustedContentHeaders(artifact.mediaType, artifact.name),
+            'content-length': String(data.length), 'cache-control': 'private, no-store' });
           return void res.end(data);
         }
         if (method === 'DELETE') {
@@ -4592,7 +4871,8 @@ export class Gateway {
           `${previewMatch[3] ?? '/'}${url.search}`, `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`);
       }
       const previewLeases = p.match(/^\/api\/tasks\/([^/]+)\/preview-leases$/);
-      if (previewLeases && method === 'GET') return this.json(res, 200, store.listPreviewLeases(previewLeases[1]!));
+      if (previewLeases && method === 'GET') return this.json(res, 200,
+        store.listPreviewLeases(previewLeases[1]!).map((lease) => ({ ...lease, tokenHash: undefined })));
       if (previewLeases && method === 'POST') {
         const taskId = previewLeases[1]!;
         const task = store.getTask(taskId);
@@ -4727,7 +5007,6 @@ export class Gateway {
           return this.json(res, 200, explanations);
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
-        requireInteractiveHuman(callerIdentity);
         const project = store.getProject(task.projectId);
         if (!project) return this.json(res, 404, { error: 'task project not found' });
         const body = await this.body(req);
@@ -4736,8 +5015,31 @@ export class Gateway {
         const conversation = await api.taskConversation(token, taskId, role);
         let message: string | undefined;
         let sourceEvent: ReturnType<typeof store.eventBySeq>;
+        let sourceRequest: { text: string; ts: number } | undefined;
         let userContext: string[] = [];
-        if (sourceKey.startsWith('message:')) {
+        if (sourceKey.startsWith('input-request:')) {
+          const saved = store.eventsOfType(taskId, 'conversation.explanation')
+            .find((event) => event.payload?.role === role && event.payload?.sourceKey === sourceKey && event.payload?.sourceRequest);
+          if (saved) {
+            const source = saved.payload.sourceRequest as { text?: unknown; ts?: unknown };
+            if (typeof source.text === 'string' && typeof source.ts === 'number') {
+              sourceRequest = { text: source.text, ts: source.ts };
+            }
+          } else {
+            const view = await api.getTaskView(token, taskId);
+            const followUp = view?.actions.find((action) => action.name === 'followUp');
+            const detail = view?.waitingFor?.detail?.trim();
+            if (!view || view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !detail
+              || !followUp || (followUp.roles?.length && !followUp.roles.includes(role))
+              || sourceKey !== `input-request:${view.updatedAt}` || body.inputRequest !== detail) {
+              return this.json(res, 409, { error: 'This input request has changed. Refresh the conversation and try again.' });
+            }
+            sourceRequest = { text: detail, ts: view.updatedAt };
+          }
+          message = sourceRequest?.text;
+          userContext = conversation.messages.filter((item) => item.role === 'user'
+            && (!Number(item.ts) || Number(item.ts) <= Number(sourceRequest?.ts))).map((item) => item.text);
+        } else if (sourceKey.startsWith('message:')) {
           const id = sourceKey.slice('message:'.length);
           const index = conversation.messages.findIndex((item) => item.id === id && item.role === 'agent');
           if (index >= 0) {
@@ -4784,6 +5086,7 @@ export class Gateway {
           const event = { taskId, type: 'conversation.explanation', ts: Date.now(), payload: {
             role, sourceKey, text: explanation, provider, model: settings.model,
             ...(sourceEvent ? { sourceEvent } : {}),
+            ...(sourceRequest ? { sourceRequest } : {}),
           } };
           const seq = this.emitTaskEvent(event);
           return this.json(res, 200, { ...event, seq });
@@ -5001,6 +5304,49 @@ export class Gateway {
 
       // Agent-role defaults resolve project → organization → bundled/legacy.
       // Unscoped access is reserved for the operator-owned fallback records.
+      if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
+        const organizationId = requestedScope.organizationId;
+        const projectId = requestedScope.projectId;
+        if (!organizationId || !store.getOrganization(organizationId)) return this.json(res, 400, { error: 'Choose an organization or project' });
+        if (projectId && store.getProject(projectId)?.organizationId !== organizationId) return this.json(res, 404, { error: 'Project not found in this organization' });
+        if (!this.deps.broker) return this.json(res, 503, { error: 'Credential vault unavailable' });
+        const connections = new McpConnections(store, this.deps.broker, organizationId);
+        const actor = actorPrincipal(callerIdentity.actor);
+        try {
+          if (p === '/api/mcp/registry' && method === 'GET')
+            return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? ''));
+          if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, connections.list(projectId).map((c) => ({ ...c,
+            connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!connections.secret(c).tokens?.access_token) })));
+          if (p === '/api/mcp' && method === 'POST') {
+            const saved = connections.save(await this.body(req), projectId);
+            store.appendAudit({ principalId: actor, action: 'mcp.connection.saved', scopeKey: auditScope, detail: { id: saved.id, revision: saved.revision } });
+            return this.json(res, 200, saved);
+          }
+          const match = p.match(/^\/api\/mcp\/(mcp_[a-f0-9]{24})(?:\/(authorize|callback|test))?$/);
+          if (match) {
+            const c = connections.get(match[1]!, projectId);
+            if (c.projectId !== projectId) return this.json(res, 403, { error: 'Manage this connection in its owning settings' });
+            if (!match[2] && method === 'DELETE') {
+              connections.remove(c.id, projectId);
+              store.appendAudit({ principalId: actor, action: 'mcp.connection.deleted', scopeKey: auditScope, detail: { id: c.id } });
+              return this.json(res, 200, { ok: true });
+            }
+            if (match[2] === 'test' && method === 'POST') return this.json(res, 200, await probeConnection(connections, c));
+            if (match[2] === 'authorize' && method === 'POST') {
+              const origin = process.env.KARMAX_PUBLIC_URL ?? (hostLocal() ? url.origin : undefined);
+              if (!origin) throw new Error('Configure the public Tavya URL before connecting OAuth');
+              return this.json(res, 200, await beginOAuth(connections, c, actor, new URL('/mcp-callback', origin).href));
+            }
+            if (match[2] === 'callback' && method === 'POST') {
+              const b = await this.body(req);
+              await finishOAuth(connections, c, actor, b.state, b.code);
+              store.appendAudit({ principalId: actor, action: 'mcp.connection.authorized', scopeKey: auditScope, detail: { id: c.id } });
+              return this.json(res, 200, { ok: true });
+            }
+          }
+          return this.json(res, 404, { error: 'MCP route not found' });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : 'Connection failed' }); }
+      }
       if (p === '/api/profiles' && method === 'GET') {
         // Annotate each profile with the workflow(s) that declare its role, so the
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
@@ -5044,7 +5390,7 @@ export class Gateway {
         if (!organizationId) return this.json(res, 404, { error: 'organization not found' });
         const organizations = globals.map((global) => {
           const own = store.getProfile(organizationProfileId(organizationId, global.role));
-          return withRole({ ...(own ?? global), id: organizationProfileId(organizationId, global.role), role: global.role,
+          return withRole({ ...(own ?? global), ...(own?.mcpConnections === undefined && global.mcpConnections !== undefined ? { mcpConnections: global.mcpConnections } : {}), id: organizationProfileId(organizationId, global.role), role: global.role,
             scope: own ? 'organization' : 'inherited', inherited: global });
         });
         if (!pid) return this.json(res, 200, organizations);
@@ -5067,6 +5413,7 @@ export class Gateway {
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        try { validateMcpSelection(b.mcpConnections); } catch (e) { return this.json(res, 400, { error: (e as Error).message }); }
         if (b.provider !== undefined && !isAgentProvider(b.provider)) {
           return this.json(res, 400, { error: `unknown agent provider "${String(b.provider)}"` });
         }
@@ -5090,8 +5437,8 @@ export class Gateway {
           modelProvider: _legacyModelProvider,
           allowedAccounts: _legacyAllowedAccounts,
           auth: _legacyAuth,
-          // The role's workflow owns the capability ceiling (roleCeiling); a submitted
-          // one must neither narrow nor escalate what the role's turns are minted with.
+          // Task authorization owns permissions. A runtime profile must neither
+          // narrow nor escalate the grant selected for the task.
           capabilities: _legacyCapabilities,
           ...rest
         } = b;
@@ -5158,7 +5505,7 @@ export class Gateway {
         return this.json(res, 200, { providers: list, active });
       }
       if ((p === '/api/payments/connect' || organizationPayments?.[2] === 'connect') && method === 'POST') {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         const b = await this.body(req);
         const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
         if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
@@ -5259,6 +5606,97 @@ export class Gateway {
         return this.json(res, 200, { ...result, resumed });
       }
 
+      // Application connections. Derive tenant/task identity from the verified
+      // token; body ids can only narrow the caller's existing authority.
+      if (p === '/api/connections' || p.startsWith('/api/connections/')) {
+        const service = this.connections();
+        if (!service) return this.json(res, 503, { error: 'Connection storage is unavailable' });
+        const org = authRecord.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const callerTaskId = authRecord.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+        const taskId = callerTaskId ?? url.searchParams.get('taskId') ?? undefined;
+        const task = taskId ? store.getTask(taskId) : undefined;
+        if (taskId && (!task || store.getProject(task.projectId)?.organizationId !== org ||
+          !this.deps.tokens.check(token, 'task:read', { projectId: task.projectId, organizationId: org }).ok))
+          return this.json(res, 403, { error: 'Task access denied' });
+        const ownerId = callerIdentity.humanSubject?.userId;
+        const requireOwner = () => requireHumanSubject(callerIdentity).userId;
+        const projectId = task?.projectId;
+        const b = ['POST', 'PUT'].includes(method) ? await this.body(req) : {};
+        try {
+          if (p === '/api/connections/config') {
+            if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: service.configured(), canConfigure: this.deps.tokens.check(token, 'settings:write').ok });
+          }
+          if (p === '/api/connections/catalog' && method === 'GET')
+            return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
+          if (p === '/api/connections' && method === 'GET') {
+            if (!taskId && !ownerId) requireOwner();
+            return this.json(res, 200, service.list(org, { ownerId, taskId, projectId }));
+          }
+          if (p === '/api/connections/request' && method === 'POST') {
+            if (!callerTaskId || !task) return this.json(res, 400, { error: 'A task-agent token is required' });
+            const toolkit = String(b.toolkit ?? '');
+            const available = service.list(org, { taskId, projectId }).find(c => c.toolkit === toolkit && c.status === 'active');
+            if (available) return this.json(res, 200, { status: 'connected', connection: available });
+            const c = service.request(org, toolkit, task.id, authRecord.role ?? 'do', String(b.why ?? ''));
+            if (c.status === 'requested') this.emitTaskEvent({ taskId: task.id, type: 'connection.requested', ts: Date.now(),
+              payload: { requestId: c.id, connectionId: c.id, toolkit: c.toolkit, why: c.why } });
+            return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
+              connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
+          }
+          if (p === '/api/connections/connect' && method === 'POST') {
+            const userId = requireOwner();
+            if (callerTaskId) return this.json(res, 403, { error: 'Connect accounts from the Connections or task page' });
+            if (b.id) {
+              const c = service.get(org, String(b.id));
+              if (c.taskId) {
+                const t = store.getTask(c.taskId);
+                if (!t || !this.deps.tokens.check(token, 'task:edit', { projectId: t.projectId, organizationId: org }).ok)
+                  return this.json(res, 403, { error: 'Task access denied' });
+              }
+            }
+            return this.json(res, 200, await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label, restart: b.restart === true }));
+          }
+          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|tools|execute)$/);
+          if (match) {
+            const id = match[1]!; const action = match[2]!;
+            const c = service.get(org, id);
+            if (action === 'tools' || action === 'execute') {
+              if (!callerTaskId || !projectId) return this.json(res, 403, { error: 'A task-agent token is required' });
+              if (action === 'tools' && method === 'GET') return this.json(res, 200,
+                await service.tools(org, id, callerTaskId, projectId, url.searchParams.get('search') ?? ''));
+              if (action === 'execute' && method === 'POST') {
+                if (!b.arguments || typeof b.arguments !== 'object' || Array.isArray(b.arguments))
+                  return this.json(res, 400, { error: 'arguments must be an object' });
+                return this.json(res, 200, await service.execute(org, id, callerTaskId, projectId, String(b.tool ?? ''), b.arguments));
+              }
+            } else {
+              const userId = requireOwner();
+              if (callerTaskId || (c.ownerId !== userId && !(action === 'disconnect' && !c.ownerId && c.taskId && this.deps.tokens.check(token, 'task:edit', { projectId: store.getTask(c.taskId)?.projectId, organizationId: org }).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
+              if (action === 'refresh' && method === 'POST') {
+                const result = await service.refresh(org, id); this.sweepConnections();
+                return this.json(res, 200, service.view(result));
+              }
+              if (action === 'access' && method === 'PUT') {
+                if (!Array.isArray(b.projectIds) || b.projectIds.some((id: unknown) => typeof id !== 'string'))
+                  return this.json(res, 400, { error: 'projectIds must be an array of project IDs' });
+                for (const projectId of b.projectIds) if (!this.deps.tokens.check(token, 'project:settings:write', { projectId, organizationId: org }).ok)
+                  return this.json(res, 403, { error: 'Project settings access required to share an account' });
+                return this.json(res, 200, await service.share(org, id, userId, b.projectIds));
+              }
+              if (action === 'disconnect' && method === 'POST') {
+                const result = await service.disconnect(org, id, userId); this.sweepConnections();
+                return this.json(res, 200, result);
+              }
+            }
+          }
+          return this.json(res, 404, { error: 'Unknown connection operation' });
+        } catch (e) {
+          if (e instanceof ConnectionError) return this.json(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
+
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
       if (p.startsWith('/api/vault')) {
         // Bind to the caller's own organization (tenant boundary). The token org
@@ -5355,19 +5793,11 @@ export class Gateway {
           }
           return this.json(res, 200, { ...saved, ...(propagated ? { propagated } : {}) });
         }
-        // Human vault inspection is deliberately separate from the agent
-        // `/api/vault/resolve` path. The item's `reveal` policy answers whether
-        // plaintext may be handed to a task agent; it must not make the vault
-        // opaque to an administrator who is responsible for its contents.
-        // Conversely, a task token carrying broad credential administration
-        // must never use this route as a shortcut around its item grant/policy.
+        // Explicit credential administration permits audited inspection for any
+        // authorized actor. Ordinary task use still follows /api/vault/resolve
+        // and its independent per-item grants and reveal policy.
         const viReveal = p.match(/^\/api\/vault\/items\/([^/]+)\/reveal$/);
         if (viReveal && method === 'POST') {
-          try {
-            requireInteractiveHuman(callerIdentity);
-          } catch {
-            return this.json(res, 403, { error: 'a human vault administrator is required' });
-          }
           const item = vault.get(viReveal[1]!);
           if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
           const b = await this.body(req);
@@ -5482,7 +5912,9 @@ export class Gateway {
           const value = field === 'totp'
             ? vault.totp(item, { taskId: callerTaskId, principal })
             : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
-          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+          const notes = b.field == null && item.type === 'login' && item.fields.includes('note')
+            ? vault.resolveField(item, 'note', { taskId: callerTaskId, principal, mode: 'reveal' }) : undefined;
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value, ...(notes !== undefined ? { notes } : {}) });
         }
         // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
         // never through the agent. `username` fills metadata; `totp` fills the
@@ -5697,7 +6129,7 @@ export class Gateway {
           // The push webhook URL (secret included) + Cloudflare worker are still
           // returned for the operator who wants them; the UI hides them for now.
           const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
-          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
+          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store, organizationId)}`;
           return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider, webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
         }
         if (sub === 'connect' && method === 'POST') {
@@ -6027,7 +6459,7 @@ export class Gateway {
 
       const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity))?)?$/);
       if (githubAccountsResource) {
-        const subject = requireInteractiveHuman(callerIdentity);
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp || !this.deps.broker)
           return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
@@ -6079,9 +6511,9 @@ export class Gateway {
       if (userGitResource || resourcePath.startsWith('/api/git-profiles')) {
       const gitResourcePath = userGitResource ? `/api/git-profiles${userGitResource[1] ?? ''}` : resourcePath;
       const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
-      const interactiveGitSubject = userGitResource ? requireInteractiveHuman(callerIdentity) : undefined;
+      const userGitSubject = userGitResource ? requireHumanSubject(callerIdentity) : undefined;
       const gitScope = userGitResource
-        ? userGitScope(interactiveGitSubject!.userId)
+        ? userGitScope(userGitSubject!.userId)
         : resourceOrganizationId;
       if (gitResourcePath === '/api/git-profiles' && method === 'GET') {
         const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
@@ -6089,8 +6521,8 @@ export class Gateway {
           : this.deps.tokens.check(token, 'credential:write', { organizationId: resourceOrganizationId }).ok;
         return this.json(res, 200, {
           profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null, canManage,
-          ...(userGitResource && interactiveGitSubject && this.deps.githubApp
-            ? { githubApp: this.deps.githubApp.status(interactiveGitSubject.userId) }
+          ...(userGitResource && userGitSubject && this.deps.githubApp
+            ? { githubApp: this.deps.githubApp.status(userGitSubject.userId) }
             : {}),
         });
       }
@@ -6392,7 +6824,7 @@ export class Gateway {
           : undefined;
         const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
         const enrich = (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
-          const out = this.enrichAgentDefaults(m, vals, projectId);
+          const out = this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined);
           if (branches) {
             if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
             if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
@@ -6537,8 +6969,25 @@ export class Gateway {
       // activity feed (all events)
       if (p === '/api/activity' && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
-        let events = store.allEventsSince(since, 300);
-        if (authRecord?.projectId) events = events.filter((e) => store.getTask(e.taskId)?.projectId === authRecord?.projectId);
+        // The event log is installation-wide; scope it to the caller's tenant.
+        // A bearer pinned to one project sees that project; an organization- or
+        // multi-project-scoped one sees its own organization/projects; a caller
+        // with no resolvable scope sees nothing rather than everyone's events.
+        const visibleProjects = authRecord?.projectId ? new Set([authRecord.projectId])
+          : authRecord?.projectIds?.length ? new Set(authRecord.projectIds) : undefined;
+        const visibleOrganization = authRecord?.organizationId ?? requestedScope.organizationId;
+        if (!visibleProjects && !visibleOrganization) return this.json(res, 200, []);
+        const projectCache = new Map<string, Project | undefined>();
+        const projectOf = (id: string) => {
+          if (!projectCache.has(id)) projectCache.set(id, store.getProject(id));
+          return projectCache.get(id);
+        };
+        const events = store.allEventsSince(since, 300).filter((e) => {
+          const projectId = store.getTask(e.taskId)?.projectId;
+          if (!projectId) return false;
+          if (visibleProjects) return visibleProjects.has(projectId);
+          return (projectOf(projectId)?.organizationId ?? 'org_personal') === visibleOrganization;
+        });
         return this.json(res, 200, events);
       }
 
@@ -6814,18 +7263,19 @@ export class Gateway {
     })).map((credential) => credential.key);
   }
 
-  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
+  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string, organizationId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
       if ((f.type !== 'agent' && f.type !== 'confirmer' && f.type !== 'responder') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
-      const prof = roleDefaultProfile(this.deps.store, f.role, projectId);
+      const prof = roleDefaultProfile(this.deps.store, f.role, projectId, organizationId);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
+      const mcpConnections = spec.mcpConnections ?? prof?.mcpConnections;
+      const agent = { ...(mcpConnections !== undefined ? { mcpConnections } : {}), provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
       // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
       // normalize). Each agent layer gets the role-default agent knobs filled in,
       // same as a bare agent field; `agentDefault` rides along so the form can
@@ -6838,7 +7288,7 @@ export class Gateway {
               const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
               const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
               const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
-              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+              return { ...l, ...(l.mcpConnections === undefined && prof?.mcpConnections !== undefined ? { mcpConnections: prof.mcpConnections } : {}), provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
             }),
             agentDefault: agent,
           }
@@ -7027,11 +7477,10 @@ export class Gateway {
       const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
       const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {
-        'content-type': inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+        ...untrustedContentHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+          path.basename(relPath)),
         'content-length': String(data.length),
-        'content-disposition': `inline; filename="${path.basename(relPath).replace(/["\\\r\n]/g, '_')}"`,
         'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff',
       });
       res.end(data);
     } catch (error) {
@@ -7246,19 +7695,21 @@ export class Gateway {
           return this.scimJson(res, 201, scimUser(user));
         }
         if ((method === 'PATCH' || method === 'PUT') && id) {
+          // An IdP administers its own organization's users only; `revokeUserSessions`
+          // is installation-wide, so membership is checked before either branch.
+          if (!this.deps.store.organizationMembership(organizationId, id)) return this.scimJson(res, 404, { detail: 'user not found' });
           const activeOperation = body.Operations?.find((operation: any) => String(operation.path ?? '').toLowerCase() === 'active');
           const active = activeOperation ? activeOperation.value !== false : body.active !== false;
           if (!active) {
             this.deps.store.deprovisionOrganizationUser(organizationId, id);
             this.deps.identity.revokeUserSessions(id);
-          } else if (!this.deps.store.organizationMembership(organizationId, id)) {
-            this.deps.store.setOrganizationMembership(organizationId, id, 'member');
           }
           void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
           return this.scimJson(res, 200, user ? scimUser(user, active) : { id, active });
         }
         if (method === 'DELETE' && id) {
+          if (!this.deps.store.organizationMembership(organizationId, id)) return this.scimJson(res, 404, { detail: 'user not found' });
           this.deps.store.deprovisionOrganizationUser(organizationId, id);
           this.deps.identity.revokeUserSessions(id);
           void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
@@ -7483,6 +7934,10 @@ export class Gateway {
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !this.deps.tokens.verify(cached.apiToken)) {
       if (cached) this.deps.tokens.revoke(cached.apiToken);
+      // Entries are keyed by session; a session that ended never comes back to
+      // evict its own, so sweep the expired ones when the cache has grown.
+      if (this.identityTokens.size >= 2_000)
+        for (const [key, entry] of this.identityTokens) if (!this.deps.tokens.verify(entry.apiToken)) this.identityTokens.delete(key);
       cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000, resolvedOrganizationId).token, fingerprint };
       this.identityTokens.set(cacheKey, cached);
     }
@@ -7782,6 +8237,28 @@ function isWorkflowGone(error: unknown): boolean {
 function isWorldGone(error: unknown): boolean {
   const value = error as { message?: string };
   return /(?:not found|does not exist|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
+}
+
+/** Headers for agent- or repository-authored bytes served on the console origin.
+ *  Inert types (images, PDF, video, text) render inline. Active documents —
+ *  `text/html`, `image/svg+xml` — render inline too, but under a CSP `sandbox`
+ *  that gives the document an opaque origin: scripts run (so an HTML report
+ *  works), but the page cannot read the console's cookies or storage, nor make
+ *  a credentialed request to it. Everything else is a download. */
+const INERT_MEDIA = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/(?:mp4|webm|quicktime)|text\/(?:plain|csv)|application\/json)(?:;|$)/i;
+const ACTIVE_DOCUMENT_MEDIA = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)(?:;|$)/i;
+export function untrustedContentHeaders(mediaType: string, filename: string): Record<string, string> {
+  const name = filename.replace(/["\\\r\n]/g, '_');
+  const inert = INERT_MEDIA.test(mediaType);
+  const active = ACTIVE_DOCUMENT_MEDIA.test(mediaType);
+  return {
+    'content-type': inert || active ? mediaType : 'application/octet-stream',
+    'content-disposition': `${inert || active ? 'inline' : 'attachment'}; filename="${name}"`,
+    'content-security-policy': active
+      ? 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads'
+      : "sandbox; default-src 'none'",
+    'x-content-type-options': 'nosniff',
+  };
 }
 
 function escapeHtml(value: string): string {

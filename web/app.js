@@ -58,6 +58,7 @@ const S = {
   projects: [],
   organizations: [],
   organizationId: null,
+  projectSearch: '',
   defaultOrganizationId: null,
   organizationMembers: [],
   teams: [],
@@ -76,7 +77,7 @@ const S = {
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'; null → auto)
   taskFile: null, // URL-owned agent citation handoff ({ path, line? }); null on the ordinary task page
   taskFileLoad: null, // { key, status, result|error } for the current handoff page
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
@@ -149,12 +150,16 @@ function rememberInteractionOrigin(event) {
   // Keep the original control as the event target (pointer-events:none can send
   // a repeat click through to a clickable row underneath). Swallow repeats at
   // capture time while the first request is visibly pending.
+  // Only activation keys count; ordinary typing must never be swallowed, and a
+  // paste/drop into a text field is an upload, not an action on that field —
+  // marking it pending would disable the field the user is typing in.
+  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+  if ((event.type === 'paste' || event.type === 'drop') && /^(?:INPUT|TEXTAREA)$/.test(control.tagName || '')) return;
   if (control.classList?.contains('action-pending')) {
     event.preventDefault?.();
     event.stopImmediatePropagation?.();
     return;
   }
-  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
   const epoch = ++interactionOriginEpoch;
   interactionOrigin = control;
   queueMicrotask(() => {
@@ -322,7 +327,7 @@ function currentOrg() {
 function syncOrganizationSwitcher() {
   const switcher = $('#org-switcher');
   const organization = currentOrg();
-  if (switcher && organization && switcher.value !== organization.id) switcher.value = organization.id;
+  if (switcher && organization) switcher._sync?.();
 }
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
@@ -479,6 +484,7 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
 }
 
 async function applyRoute() {
+  if (S.onboardingCompletion) dismissOnboardingCompletion();
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
@@ -811,6 +817,14 @@ const WORKFLOWS = [
 ];
 const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
+// Hidden workflows remain editable on existing tasks without becoming choices
+// for new tasks. Include the current value so the select cannot imply a switch.
+function taskFormWorkflows(currentWorkflow, existingTask) {
+  return existingTask && !WORKFLOWS.some((w) => w.id === currentWorkflow)
+    ? [...WORKFLOWS, { id: currentWorkflow, label: workflowLabel(currentWorkflow) }]
+    : WORKFLOWS;
+}
+
 const NODES = [
   { key: 'setup', label: 'Setup' },
   { key: 'do', label: 'Working' },
@@ -1029,6 +1043,7 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, model, effort || '')}
     </div>
+    ${mcpPickerHtml(spec?.mcpConnections, inh.mcpConnections)}
     <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
@@ -1040,6 +1055,34 @@ function renderAgentField(f, spec, inherited) {
       </div>
     </div>
   </div>`;
+}
+
+function forkBranchDefaults(task) {
+  const view = task?.lastView || task;
+  const base = view?.status === 'done' ? view.targetBranch || task?.params?.target : view?.branch;
+  return base ? { base } : {};
+}
+
+function prefillForkBranch(box, task) {
+  if (!['do', 'unified'].includes(box.dataset.agent)) return;
+  const root = box.closest('#tf-body');
+  const input = root?.querySelector('[data-field="base"]');
+  const base = forkBranchDefaults(task).base;
+  if (!input || !base || (task.projectId && task.projectId !== S.projectId)) return;
+  input.value = base;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  showForkWorldHelp(root);
+}
+
+function showForkWorldHelp(root) {
+  const input = root?.querySelector('[data-field="base"]');
+  if (!input) return;
+  if (!root.querySelector('.fork-world-help')) {
+    const help = document.createElement('p');
+    help.className = 'task-sub fork-world-help';
+    help.textContent = 'Changing the starting branch excludes the original task’s unpublished files and resources.';
+    input.closest('.form-row')?.append(help);
+  }
 }
 
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
@@ -1059,6 +1102,8 @@ function resumeChosenInner(rf, task) {
   const grants = t ? previousGrantsSummary(t) : '';
   return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
     ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+    : ''}${t && (t.lastView?.status || t.status) !== 'done'
+    ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
     : ''}`;
 }
 
@@ -1138,6 +1183,8 @@ function readAgentSpec(box) {
   const effort = avatar?.runtime?.effort || box.querySelector('.af-effort').value;
   if (model) spec.model = model;
   if (effort) spec.effort = effort;
+  const mcpConnections = readMcpPicker(box);
+  if (mcpConnections !== undefined) spec.mcpConnections = mcpConnections;
   const resumeFrom = readResume(box);
   if (resumeFrom) spec.resumeFrom = resumeFrom;
   return spec;
@@ -1331,11 +1378,138 @@ function collectForm(root, fields) {
     else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
     else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
     else val = el.value === '' ? undefined : el.value;
+    const forkBase = f.name === 'base' && root.querySelector('.agent-field[data-agent="do"] .af-resume-enabled:checked, .agent-field[data-agent="unified"] .af-resume-enabled:checked');
+    if (forkBase && val === undefined) val = inh;
     if (val === undefined) continue;
     // store only when changed from the inherited default (required fields always)
-    if (f.required || !sameJson(val, inh)) out[f.name] = val;
+    if (forkBase || f.required || !sameJson(val, inh)) out[f.name] = val;
   }
   return out;
+}
+
+// Organization selection keeps the displayed name separate from its stable ID.
+// Typing filters choices; only choosing an existing option commits a change.
+function organizationComboHtml(id, selectedId, label) {
+  const organization = organizationById(selectedId);
+  return `<div class="combo organization-combo" id="${esc(id)}">
+    <input value="${esc(organization?.name || '')}" aria-label="${esc(label)}" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${esc(id)}-options" autocomplete="off" placeholder="Search organizations…">
+    <button type="button" class="combo-caret" aria-label="Show ${esc(label.toLowerCase())} options" tabindex="-1">▾</button>
+    <div class="combo-menu" id="${esc(id)}-options" role="listbox" aria-label="${esc(label)}" hidden></div>
+  </div>`;
+}
+
+function wireOrganizationCombo(root, selectedId, onSelect, discover = false) {
+  if (!root) return;
+  const input = root.querySelector('input');
+  const menu = root.querySelector('.combo-menu');
+  const caret = root.querySelector('.combo-caret');
+  let options = S.organizations.map((o) => ({ ...o, accessible: true }));
+  let matches = [];
+  let active = -1;
+  let query = '';
+  let busy = false;
+  const sync = () => { input.value = organizationById(selectedId())?.name || ''; };
+  const dismissOnScroll = (event) => { if (!menu.contains(event.target)) hide(); };
+  const hide = () => {
+    document.removeEventListener('scroll', dismissOnScroll, true);
+    window.removeEventListener('resize', hide);
+    menu.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+    active = -1;
+    sync();
+  };
+  root._sync = hide;
+  const paint = () => {
+    [...menu.querySelectorAll('[role="option"]')].forEach((option, index) => {
+      option.classList.toggle('active', index === active);
+      if (index === active) {
+        input.setAttribute('aria-activedescendant', option.id);
+        option.scrollIntoView({ block: 'nearest' });
+      }
+    });
+    if (active < 0) input.removeAttribute('aria-activedescendant');
+  };
+  const draw = () => {
+    matches = options.filter((o) => o.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
+    if (discover && (!query || 'new organization'.includes(query.toLowerCase())))
+      matches.push({ id: '__new', name: '＋ New organization', accessible: true });
+    active = -1;
+    menu.innerHTML = matches.length ? matches.map((o, index) => `<div class="combo-opt" role="option" id="${root.id}-option-${index}" data-index="${index}" aria-selected="${o.id === selectedId()}" aria-disabled="${!o.accessible}">
+      <div class="combo-opt-head"><span>${esc(o.name)}</span></div>
+      ${o.accessible ? '' : '<div class="combo-opt-description">Membership required — ask an organization administrator for access</div>'}
+    </div>`).join('') : '<div class="combo-empty" role="status">No matching organizations</div>';
+    paint();
+    const rect = root.getBoundingClientRect();
+    const width = Math.min(Math.max(rect.width, 320), window.innerWidth - 16);
+    menu.style.width = `${width}px`;
+    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
+    const below = window.innerHeight - rect.bottom - 8;
+    const above = rect.top - 8;
+    const upwards = below < Math.min(220, menu.scrollHeight) && above > below;
+    menu.style.maxHeight = `${Math.max(0, Math.min(220, upwards ? above : below))}px`;
+    menu.style.top = `${upwards ? rect.top - menu.getBoundingClientRect().height - 3 : rect.bottom + 3}px`;
+  };
+  const show = () => {
+    if (busy) return;
+    menu.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    document.addEventListener('scroll', dismissOnScroll, true);
+    window.addEventListener('resize', hide);
+    draw();
+  };
+  const choose = async (index) => {
+    const option = matches[index];
+    if (!option?.accessible || busy) return;
+    hide();
+    busy = true;
+    input.readOnly = caret.disabled = true;
+    root.setAttribute('aria-busy', 'true');
+    try { await onSelect(option.id); }
+    catch (error) { toast(error.message, true); }
+    finally { busy = false; input.readOnly = caret.disabled = false; root.removeAttribute('aria-busy'); sync(); }
+  };
+  input.addEventListener('focus', async () => {
+    query = '';
+    show();
+    input.select();
+    if (discover) {
+      try {
+        const directory = await api('/api/organization-directory');
+        if (!root.isConnected) return;
+        options = directory;
+        if (!menu.hidden) draw();
+      } catch (error) { toast(error.message, true); }
+    }
+  });
+  input.addEventListener('input', () => { query = input.value; show(); });
+  input.addEventListener('blur', hide);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { event.preventDefault(); hide(); }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) { query = ''; show(); }
+      if (!matches.length) return;
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      active = active < 0 ? (step === 1 ? 0 : matches.length - 1) : (active + step + matches.length) % matches.length;
+      paint();
+    }
+    if (event.key === 'Enter' && !menu.hidden) {
+      event.preventDefault();
+      if (active >= 0) void choose(active);
+      else if (matches.length === 1) void choose(0);
+    }
+  });
+  caret.addEventListener('mousedown', (event) => event.preventDefault());
+  caret.addEventListener('click', () => {
+    if (!menu.hidden) hide();
+    else { query = ''; input.focus(); show(); }
+  });
+  menu.addEventListener('mousedown', (event) => event.preventDefault());
+  menu.addEventListener('click', (event) => {
+    const option = event.target.closest('[data-index]');
+    if (option) void choose(Number(option.dataset.index));
+  });
 }
 
 // A lightweight combobox: a real dropdown that opens on focus and on the caret,
@@ -1353,11 +1527,12 @@ function normalizeComboOption(option) {
 
 function authorizationLevels() {
   return [
-    { id: 'viewer', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', name: 'Project maintainer', scope: 'selectable' },
-    { id: 'administrator', name: 'Administrator', scope: 'organization' },
-    { id: 'god', name: 'God', scope: 'global' },
+    { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
+    { id: 'developer', description: 'Create and manage tasks, work with agents, publish branches, and save skills in the selected scope.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Developer access plus project settings, queues, teams, repositories, and GitHub Actions in the selected scope.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'administrator', description: 'Manage this organization, including projects, members, credentials, and payments.', name: 'Administrator', scope: 'organization' },
+    { id: 'god', description: 'Unrestricted access across every organization and the installation, including global settings and authorization.', name: 'God', scope: 'global' },
+    ...(typeof S !== 'undefined' && S.authorizationCatalogOrganization === S.organizationId ? (S.authorizationCatalog?.profiles || []).filter((role) => role.scopeKey === `organization:${S.organizationId}`).map((role) => ({ ...role, scope: 'selectable' })) : []),
   ];
 }
 
@@ -1371,8 +1546,8 @@ function authorizationScopeSuggestions(projects, query) {
 }
 
 function normalizedAuthorization(value, fallbackProjectId) {
-  const level = authorizationLevels().some((candidate) => candidate.id === value?.level) ? value.level : 'developer';
-  const levelDef = authorizationLevels().find((candidate) => candidate.id === level);
+  const level = (authorizationLevels().some((candidate) => candidate.id === value?.level) || /^role_/.test(value?.level || '')) ? value.level : 'developer';
+  const levelDef = authorizationLevels().find((candidate) => candidate.id === level) || { scope: 'selectable' };
   if (levelDef.scope === 'organization') return { level, scope: 'organization' };
   if (levelDef.scope === 'global') return { level, scope: 'global' };
   if (value?.scope === 'organization') return { level, scope: 'organization' };
@@ -1388,12 +1563,13 @@ function authorizationScopePlaceholder(chips) {
 
 function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
   const selected = normalizedAuthorization(value, fallbackProjectId);
-  const level = authorizationLevels().find((candidate) => candidate.id === selected.level);
+  const level = authorizationLevels().find((candidate) => candidate.id === selected.level) || { id: selected.level, name: 'Unavailable role', scope: 'selectable', description: 'Role details could not be loaded. Reload to view its capabilities.' };
   const names = new Map((projects || []).map((project) => [project.id, project.name]));
   const chips = selected.scope === 'organization' ? ['@organization'] : (selected.projectIds || []);
   return `<div class="authz-editor" id="${esc(id)}" data-authorization="${esc(JSON.stringify(selected))}">
-    <select class="authz-level-select" aria-label="Authorization level">${authorizationLevels().map((candidate) =>
-      `<option value="${candidate.id}" ${candidate.id === selected.level ? 'selected' : ''}>${candidate.name}</option>`).join('')}</select>
+    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
+      `<option value="${esc(candidate.id)}" ${candidate.id === selected.level ? 'selected' : ''}>${esc(candidate.name)}</option>`).join('')}</select>
+    <p class="authz-description task-sub" id="${esc(id)}-description" aria-live="polite">${esc(level.description || "Custom capabilities in the selected scope.")}</p>
     <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
       <div class="authz-scope-field">
         <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('')}</span>
@@ -1510,11 +1686,17 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const chips = root.querySelector('.authz-scope-chips');
   const field = root.querySelector('.authz-scope-field');
   let value = normalizedAuthorization(JSON.parse(root.dataset.authorization || '{}'));
+  const availableLevels = authorizationLevels();
+  if (!availableLevels.some((level) => level.id === value.level)) availableLevels.push({ id: value.level, name: 'Unavailable role', scope: 'selectable', description: 'Role details could not be loaded. Reload to view its capabilities.' });
+  levelSelect.innerHTML = availableLevels.map((level) =>
+    `<option value="${esc(level.id)}" ${level.id === value.level ? 'selected' : ''}>${esc(level.name)}</option>`).join('');
   let active = -1;
   const projectById = new Map((projects || []).map((project) => [project.id, project]));
-  const levelOf = () => authorizationLevels().find((candidate) => candidate.id === value.level);
+  const levelOf = () => availableLevels.find((candidate) => candidate.id === value.level) || { scope: 'selectable' };
   const emit = () => { root._authorizationValue = value; root.dataset.authorization = JSON.stringify(value); onChange?.(value); };
   const drawChips = () => {
+    const description = root.querySelector('.authz-description');
+    if (description) description.textContent = levelOf().description || 'Custom capabilities in the selected scope.';
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
     chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
     input.placeholder = authorizationScopePlaceholder(selected);
@@ -1544,7 +1726,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
     input.value = ''; drawChips(); emit(); show();
   };
   levelSelect.addEventListener('change', () => {
-    const level = authorizationLevels().find((candidate) => candidate.id === levelSelect.value);
+    const level = availableLevels.find((candidate) => candidate.id === levelSelect.value);
     value = level.scope === 'selectable'
       ? normalizedAuthorization({ ...value, level: level.id })
       : { level: level.id, scope: level.scope };
@@ -1665,6 +1847,7 @@ function wireCombo(combo, getOptions, onChange) {
 
 // Wire one agent box's controls: provider→model combobox + one fork source.
 function wireAgentBox(box) {
+  wireMcpPicker(box.querySelector('.mcp-picker'), box.closest?.('[data-mcp-scope]')?.dataset.mcpScope);
   const combo = box.querySelector('.af-model-combo');
   const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
   if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
@@ -1708,6 +1891,7 @@ function wireAgentBox(box) {
     // page); elsewhere the chip stays a plain label.
     const option = chosen?.querySelector('.af-resume-reauth');
     if (option) option.hidden = !box.closest('[data-reauthorize-host]');
+    box.closest('[data-dependency-host]')?._syncForkDependencies();
   };
   // "Re-authorize previous grants?" belongs to the agent box but acts on the
   // hosting form's Authorization / Vault credentials controls, so the box only
@@ -1751,6 +1935,7 @@ function wireAgentBox(box) {
     chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    if (rf && task) prefillForkBranch(box, task);
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -2232,11 +2417,24 @@ function renderFlag(key, dflt) {
 const markdownEnabled = () => renderFlag('karmax-md-render', true);
 const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
 
+// Memory-only overrides are scoped to the task and agent conversation. Unset
+// conversations continue to follow Appearance; reloading drops all overrides.
+function conversationMathEnabled(v, role = 'do') {
+  return S.conversationMath?.[JSON.stringify([v.taskId, role])] ?? mathjaxEnabled();
+}
+
+function toggleConversationMath(v, role) {
+  const enabled = conversationMathEnabled(v, role);
+  S.conversationMath ||= {};
+  S.conversationMath[JSON.stringify([v.taskId, role])] = !enabled;
+  renderTaskPage();
+}
+
 // A message body: Markdown when enabled, otherwise the previous plain-escaped
 // text (the .msg-text pre-wrap handles its newlines). The caller adds the `md`
 // class so the two whitespace models don't collide.
-function renderMessageBody(text) {
-  return markdownEnabled() ? renderMarkdown(text, { math: mathjaxEnabled() }) : esc(text);
+function renderMessageBody(text, math = mathjaxEnabled()) {
+  return markdownEnabled() ? renderMarkdown(text, { math }) : esc(text);
 }
 
 // A little copy control for a message bubble — copies the raw source text (the
@@ -2596,11 +2794,13 @@ function ensureMathJax() {
   return mathjaxLoad;
 }
 function typesetMath(root) {
-  if (!mathjaxEnabled()) return;
   const scope = root || document.getElementById('ck-thread');
-  if (!scope || !scope.querySelector('.md-math')) return;
+  const enabled = () => scope?.id === 'ck-thread'
+    ? conversationMathEnabled({ taskId: scope.dataset.taskId }, scope.dataset.role) && markdownEnabled()
+    : mathjaxEnabled() && markdownEnabled();
+  if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
-    if (!window.MathJax || !window.MathJax.typesetPromise) return;
+    if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
     try { window.MathJax.typesetClear?.([scope]); } catch {}
     window.MathJax.typesetPromise([scope]).catch(() => {});
   });
@@ -2717,7 +2917,7 @@ async function boot() {
   // A social sign-in that Better Auth rejected comes back here with `?error=`
   // (see wireSocialBtn's errorCallbackURL). Same shape as `verified` above:
   // read it, clear it from the URL, and let the card say what happened.
-  S.signInError = socialSignInError(new URLSearchParams(location.search));
+  S.signInError = location.pathname === '/mcp-callback' ? null : socialSignInError(new URLSearchParams(location.search));
   if (S.signInError) {
     const clean = new URL(location.href);
     clean.searchParams.delete('error');
@@ -2739,7 +2939,7 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login') return renderLogin();
+    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login' || location.pathname === '/mcp-callback') return renderLogin();
     if (location.pathname === '/signup') return renderSignup();
     return renderLanding();
   }
@@ -2749,6 +2949,7 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  if (location.pathname === '/mcp-callback') return finishMcpCallback();
   const route = parseRoute(location.pathname);
   if (route.name === 'invite') {
     const invitationToken = new URLSearchParams(location.search).get('token');
@@ -2872,13 +3073,16 @@ async function loadCollaboration() {
   const organizationId = S.organizationId;
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const [members, teams, users] = await Promise.all([
+  const [members, teams, users, catalog] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
+    api(`/api/organizations/${organizationId}/roles`).catch(() => null),
     loadInbox().catch(() => {}),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
+  S.authorizationCatalog = catalog;
+  S.authorizationCatalogOrganization = organizationId;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
@@ -2904,9 +3108,9 @@ function inboxEventChanges(ev) {
   return ev.type === 'view.updated' || ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
-      'credential.approval-requested', 'credential.approval-resolved',
-      'permission.approval-requested', 'permission.approval-resolved',
-      'authorization.approval-requested', 'authorization.approval-resolved'].includes(ev.type);
+      'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
+      'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
+      'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
 let inboxRefreshTimer;
 function scheduleInboxReload() {
@@ -3186,17 +3390,20 @@ function normalizeQuery(q) { return stringifyQuery(parseQueryClient(q || '')); }
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
+// Membership/metadata changes the compact row projection cannot express. A
+// `view.updated` for a task the list has never seen (created elsewhere, or by an
+// agent) is handled separately in connectWs.
 const LIST_RELOAD_EVENTS = new Set([
-  'task.created',
-  'task.deleted',
-  'task.tags-changed',
+  'subtask.created',
   'task.responsibility-changed',
-  'credential.approval-requested',
+  'credential.approval-requested', 'connection.requested',
   'credential.approval-resolved',
   'permission.approval-requested',
   'permission.approval-resolved',
+  'permission.approval-dismissed',
   'authorization.approval-requested',
   'authorization.approval-resolved',
+  'authorization.approval-dismissed',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -3255,6 +3462,10 @@ function patchTaskListFromEvent(ev) {
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
 }
 
+/** Tabs that belong to the selected project (the rail highlights it, the main
+ *  pane shows its tab bar). One list so the two never drift apart again. */
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
@@ -3282,16 +3493,16 @@ function connectWs() {
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
-        if (S.taskTab === 'checkin') scheduleTaskPageRender();
-        else renderTaskEvents();
+        scheduleTaskPageRender();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
-      } else if (ev.type === 'session.started') {
-        refreshTask(); // the session id was just published mid-turn → show the live fork command
-      } else renderTaskEvents();
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.endsWith('.approval-dismissed')) {
+        // Mid-turn metadata changes must not clear output or patch lifecycle state.
+        refreshTask();
+      } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
@@ -3302,17 +3513,21 @@ function connectWs() {
       if (S.tab === 'tasks' && !S.selected) scheduleSearch();
       if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
       renderRail();
-    } else if (LIST_RELOAD_EVENTS.has(ev.type)) {
+    } else if (LIST_RELOAD_EVENTS.has(ev.type)
+      || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
+        && (!ev.payload?.projectId || ev.payload.projectId === S.projectId))) {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
     if (S.organizationId && inboxEventChanges(ev)) scheduleInboxReload();
+    if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
   // queue, activity feed) is driven only by this socket. A silent drop left the
   // page showing stale state as if it were truth, and events missed during the
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
+    wsRetryMs = 1500;
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped) {
@@ -3322,10 +3537,17 @@ function connectWs() {
     }
     wsHadDropped = false;
   };
-  ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
+  ws.onclose = () => {
+    wsHadDropped = true; setWsOnline(false);
+    // Back off while the gateway is down (a restart, an expired session) instead
+    // of hammering it from every open tab at a fixed 1.5 s.
+    setTimeout(connectWs, wsRetryMs);
+    wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
+  };
 }
 
 let wsHadDropped = false;
+let wsRetryMs = 1500; // reconnect delay; doubles per failed attempt up to 30 s, reset on open
 function setWsOnline(online) {
   S.wsOnline = online;
   document.getElementById('ws-offline')?.classList.toggle('hidden', online);
@@ -3433,30 +3655,60 @@ function brandMark() {
 }
 
 async function refreshOnboarding() {
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
+  const userId = S.user?.id;
+  const pageEpoch = S.routeEpoch;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
+    S.onboardingCompletion = null;
     renderOnboarding();
     return;
   }
-  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
-    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
-    S.onboarding = status;
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    acceptOnboardingStatus(status, pageEpoch);
   } catch {
-    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
-    S.onboarding = null;
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    // Keep the last known guide and retry even when the first request failed.
+    renderOnboarding();
+    pollOnboarding();
+    return;
   }
+  renderOnboarding();
+}
+
+// Completion feedback belongs only to the page that observed the transition.
+// It is deliberately absent from both the saved preference and browser storage.
+function acceptOnboardingStatus(status, pageEpoch) {
+  const previous = S.onboarding;
+  if (status.complete && previous?.visible && !previous.complete
+    && previous.organizationId === status.organizationId && pageEpoch === S.routeEpoch) {
+    S.onboardingCompletion = { organizationId: status.organizationId, userId: S.user?.id };
+  } else if (!status.complete) {
+    S.onboardingCompletion = null;
+  }
+  S.onboarding = status;
+}
+
+function dismissOnboardingCompletion() {
+  S.onboardingCompletion = null;
   renderOnboarding();
 }
 
 async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
+  const organizationId = S.organizationId;
+  const userId = S.user?.id;
+  const pageEpoch = S.routeEpoch;
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
-    S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
+    const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    acceptOnboardingStatus(status, pageEpoch);
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
@@ -3474,7 +3726,7 @@ function pollOnboarding() {
   clearTimeout(S.onboardingTimer);
   S.onboardingTimer = setTimeout(() => {
     if (document.hidden) return pollOnboarding();
-    refreshOnboarding();
+    return refreshOnboarding();
   }, 4_000);
 }
 
@@ -3482,11 +3734,29 @@ function renderOnboarding() {
   const host = $('#hosted-onboarding');
   if (!host) return;
   const state = S.onboarding;
+  const completion = S.onboardingCompletion;
+  if (state?.complete && completion?.organizationId === S.organizationId
+    && completion.userId === S.user?.id && S.meta?.hosted) {
+    clearTimeout(S.onboardingTimer);
+    S.onboardingTimer = null;
+    host.hidden = false;
+    host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
+      <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
+      <span><b>Setup complete</b><small>All required steps are finished.</small></span>
+      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">×</button>
+    </div>`;
+    $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
+    return;
+  }
   if (!state?.visible || state.organizationId !== S.organizationId) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
     host.hidden = true;
     host.innerHTML = '';
+    // The shell can repaint after a failed initial load. Keep recovery alive
+    // until this organization's status is known, even without a visible card.
+    if (S.meta?.hosted && S.user && S.organizationId
+      && (!state || state.organizationId !== S.organizationId)) pollOnboarding();
     return;
   }
   host.hidden = false;
@@ -3502,7 +3772,7 @@ function renderOnboarding() {
   const settings = globalRoute('organization');
   const optional = state.steps.optional || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
-    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get ${siteNameMarkup()} ready</h2></div>
+    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Set up ${siteNameMarkup()}</h2></div>
       <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
@@ -3513,7 +3783,7 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot">${state.replay ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
@@ -3537,17 +3807,14 @@ function renderShell() {
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
       <div class="brand">${brandMark()} ${siteNameMarkup()}</div>
-      <select class="org-switcher" id="org-switcher" title="Organization">
-        ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
-        <option value="__new">＋ New organization</option>
-      </select>
+      ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
+      <button class="global-search-trigger" id="topbar-search" title="${esc(commandHint('Search tasks and projects across your workspace', 'nav.globalSearch'))}" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
       <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
-      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
       <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
@@ -3581,11 +3848,14 @@ function renderShell() {
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
-  $('#org-switcher')?.addEventListener('change', (e) => {
-    if (e.target.value === '__new') return createOrganization();
-    const route = organizationLandingRoute(e.target.value);
-    return route ? go(route) : syncOrganizationSwitcher();
-  });
+  wireOrganizationCombo($('#org-switcher'), () => currentOrg()?.id, async (id) => {
+    if (id === '__new') return createOrganization();
+    // Recheck membership before entering an organization discovered on focus.
+    await loadOrganizations();
+    const route = organizationLandingRoute(id);
+    if (route) await go(route);
+    else toast('Organization access is no longer available', true);
+  }, true);
   renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
@@ -3763,7 +4033,9 @@ function editRailFolder(button) {
 // flat list the drag logic can walk. A collapsed folder still shows the open
 // project, so navigating into a tucked-away project never blanks the selection.
 function railProjectRows(projectScoped) {
-  const projects = S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId);
+  const query = (S.projectSearch || '').trim().toLocaleLowerCase();
+  const projects = S.projects.filter((p) => (!S.organizationId || p.organizationId === S.organizationId)
+    && projectPath(p).toLocaleLowerCase().includes(query));
   const root = { path: '', children: [] };
   const nodes = new Map([['', root]]);
   const dir = (path) => {
@@ -3782,7 +4054,7 @@ function railProjectRows(projectScoped) {
   // CSS), so it never reads like the bold active project. Each row's tooltip
   // names its kind for the first-time reader. Folders carry their own "+" so a
   // project can be created in place.
-  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
+  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="${!query}" title="${query ? 'Project' : 'Drag to reorder'}">
           <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
@@ -3790,18 +4062,18 @@ function railProjectRows(projectScoped) {
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
-    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    if (query || !folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
-  return walk(root, 0);
+  return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
   if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
+  const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
   // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
@@ -3813,19 +4085,50 @@ function renderRail() {
       : active.classList.contains('folder-toggle') && active.dataset.folder != null ? `.folder-toggle[data-folder="${CSS.escape(active.dataset.folder)}"]`
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
-  rail.innerHTML = `
-    <div class="label rail-heading"><span>Projects</span><button class="rail-add" id="new-project" type="button" title="New project" aria-label="New project">${ICON.plus}</button></div>
+  // Keep the input node alive during typing, composition, and live refreshes.
+  const searching = active?.id === 'project-search';
+  if (searching) {
+    rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
+    $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
+  } else rail.innerHTML = `
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <label class="rail-search-box">
+      <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+    <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
-    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0" title="${esc(commandHint('Dashboard', 'nav.dashboard'))}">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
     ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
-  $('#new-project')?.addEventListener('click', () => newProject());
+  if (!searching) {
+    $('#new-project')?.addEventListener('click', () => newProject());
+    const search = $('#project-search');
+    search?.addEventListener('input', () => { S.projectSearch = search.value; renderRail(); });
+    search?.addEventListener('keydown', (event) => {
+      if (event.isComposing) return;
+      if (['ArrowDown', 'ArrowUp'].includes(event.key)
+          && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+        event.preventDefault();
+        resetChord();
+        const results = [...rail.querySelectorAll('.project-link')];
+        const result = event.key === 'ArrowDown' ? results[0] : results.at(-1);
+        result?.focus();
+        result?.scrollIntoView({ block: 'nearest' });
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        resetChord();
+        focusRail();
+      }
+    });
+  }
   // Folder headers are native buttons, so click, Enter, and Space all share the
   // same fold behavior during pointer use and the rail's keyboard walk.
   for (const head of rail.querySelectorAll('.folder-toggle')) {
@@ -3855,7 +4158,7 @@ function wireProjectDrag(rail) {
   // above a header means "above that folder", i.e. in the folder's parent.
   const anchors = () => [...rail.querySelectorAll('.proj[draggable="true"], .proj.folder')];
   const rows = projects();
-  if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
+  if ((S.projectSearch || '').trim() || rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
   const end = $('#rail-projects-end');
   for (const row of rows) {
     row.addEventListener('dragstart', (e) => {
@@ -4008,6 +4311,12 @@ function flushBgRender() {
 // WS-driven repaints into one per animation frame: the last state wins and the
 // browser paints once, at a frame boundary.
 let taskPageRenderQueued = false;
+function summarize(p) {
+  if (!p) return '';
+  if (p.text) return p.text.slice(0, 160);
+  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
+}
+
 function scheduleTaskPageRender() {
   if (taskPageRenderQueued) return;
   taskPageRenderQueued = true;
@@ -4038,9 +4347,10 @@ function renderMain() {
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];
+  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings']
+    .filter((tab) => tab !== 'avatars' || S.avatarAvailability?.effective || S.avatars?.length);
   const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', avatars: 'Avatars', settings: 'Project settings' };
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(S.tab);
+  const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
@@ -4522,7 +4832,7 @@ function stageLabel(v) {
   // A human hold is a public software-dev stage, even though the workflow keeps
   // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
   // where to resume. Direct provider blockers may supply a concise specific
-  // summary; ordinary holds retain the stable "Waiting for input" label.
+  // summary; ordinary holds retain the stable "Needs input" label.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   // `do` and `merge` are the replay-stable workflow keys; a person reads them
   // as "working" and "landing" and never has to learn the internal names.
@@ -4807,11 +5117,15 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     clearTimeout(deb);
     deb = setTimeout(run, typing ? 180 : 0); // keystrokes coalesce; clicks apply at once
   };
+  let runEpoch = 0;
   async function run() {
+    const epoch = ++runEpoch;
+    let next;
     try {
-      const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
-      result = r;
-    } catch { result = { tasks: [] }; }
+      next = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
+    } catch { next = { tasks: [] }; }
+    if (epoch !== runEpoch) return; // a newer query (a click after a slow keystroke) already owns the list
+    result = next;
     hi = 0;
     paintList();
   }
@@ -5355,8 +5669,42 @@ function wireDepPicker(values, selfId) {
       onPick: (t) => { known.set(t.id, t); paint([...selectedDepIds(), t.id], true); },
     }),
   );
+  // Both fork entry points use this form. The checkbox is another view of the
+  // ordinary dependency selection, so drafts and manual picker edits stay in sync.
+  const root = box.closest('#tf-body');
+  if (root) {
+    root.dataset.dependencyHost = '';
+    root._syncForkDependencies = () => {
+      const ids = selectedDepIds();
+      root.querySelectorAll('.af-resume-add-dependency').forEach((input) => {
+        input.closest('.af-resume-dependency').hidden = input.dataset.taskId === selfId;
+        input.checked = ids.includes(input.dataset.taskId);
+      });
+    };
+    root.addEventListener('change', (event) => {
+      const input = event.target.closest?.('.af-resume-add-dependency');
+      if (input && input.dataset.taskId !== selfId) {
+        const id = input.dataset.taskId;
+        const source = input.closest('.af-resume-chosen')?._sourceTask;
+        if (source) known.set(id, source);
+        const ids = selectedDepIds().filter((dep) => dep !== id);
+        paint(input.checked ? [...ids, id] : ids, true);
+      }
+      root._syncForkDependencies();
+    });
+  }
   const existing = (Array.isArray(values.triggers) ? values.triggers : []).find((t) => t.kind === 'dependency');
   paint(existing?.tasks || []);
+  root?._syncForkDependencies();
+}
+
+// Keep the source array intact: it is shared with other credential controls.
+function sortVaultItems(items, selectedIds = new Set()) {
+  return [...items].sort((a, b) =>
+    Number(selectedIds.has(b.id)) - Number(selectedIds.has(a.id))
+    || (b.useCount || 0) - (a.useCount || 0)
+    || a.label.localeCompare(b.label)
+    || a.id.localeCompare(b.id));
 }
 
 function vaultItemSearchText(item) {
@@ -5370,6 +5718,8 @@ function vaultItemSearchText(item) {
 // password-manager import panel, while allowing sparse policy overrides for this
 // task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
 function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
+  // Sort on open; keep rows steady while the user changes checkboxes.
+  items = sortVaultItems(items, selectedIds);
   const localPolicies = JSON.parse(JSON.stringify(policyOverrides || {}));
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -5615,7 +5965,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
-          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
+          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
       <div class="tf-scroll">
@@ -5792,6 +6142,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     wireWikiMention(contextTa, projectId);
   }
   paintFormChips();
+  if ((values['agent:do'] || values['agent:unified'])?.resumeFrom?.taskId) showForkWorldHelp($('#tf-body'));
   // Focus the consuming field (prompt/command) with the caret at the end, so
   // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
   // (the consuming field) is resolved once at the top of this function.
@@ -6347,11 +6698,14 @@ function taskAttempts(v) {
     const draft = !!a.params?.draft;
     const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
     const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
-    return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+    const principal = a.id === g.principalAttemptId;
+    const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
+    const crownTitle = g.committedAttemptId ? 'Principal selection is locked after Merge admission' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
+    return `<div class="attempt-item"><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
-    </a>`;
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+    </a></div>`;
   }).join('') : '';
   return `<section class="attempts" aria-label="Task attempts">
     <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
@@ -6360,7 +6714,32 @@ function taskAttempts(v) {
   </section>`;
 }
 
+// Follow the rendered links so keyboard navigation uses the same pinned routes
+// and tab selection as clicking an attempt card.
+function cycleAttempt(delta) {
+  if (!S.selected || !S.view) return;
+  const links = [...document.querySelectorAll('[data-attempt-select]')];
+  const index = links.findIndex((link) => link.dataset.attemptSelect === S.selected);
+  if (links.length < 2 || index < 0) return;
+  links[(index + delta + links.length) % links.length].click();
+}
+
 function wireAttempts(v) {
+  document.querySelectorAll('[data-attempt-principal]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (button.disabled || button.getAttribute('aria-pressed') === 'true') return;
+      button.disabled = true;
+      try {
+        await api(`/api/tasks/${button.dataset.attemptPrincipal}/principal`, { method: 'POST', body: '{}' });
+        await refreshTasks();
+        if (S.selected === v.taskId) {
+          S.viewingAttempt = v.taskId;
+          await refreshTask();
+        }
+      } catch (e) { toast(e.message, true); }
+      finally { button.disabled = false; }
+    });
+  });
   document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
     if (S.addingAttempt) return;
     S.addingAttempt = true;
@@ -6510,6 +6889,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.paramDefaults = {};
   S.attemptGroup = null;
   S.approvalRequests = [];
+  S.connections = [];
   S.permissionRequests = [];
   S.authorizationRequests = [];
   S.approvalItems = [];
@@ -6535,6 +6915,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
+      api(`/api/connections?${approvalQuery}`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
@@ -6545,7 +6926,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents, connections] = await details;
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
@@ -6555,6 +6936,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.permissionRequests = permissionRequests;
     S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
+    S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
     toast(e.message, true);
@@ -6587,7 +6969,7 @@ async function refreshTask() {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems] = await Promise.all([
+    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
@@ -6596,6 +6978,7 @@ async function refreshTask() {
       api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
       api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
+      api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -6612,6 +6995,7 @@ async function refreshTask() {
     S.permissionRequests = permissionRequests;
     S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
+    S.connections = connections;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -6626,7 +7010,10 @@ function closeTask() {
   const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
   const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('dashboard'));
   S.returnRoute = null;
-  return go(back, { replace: true });
+  // A push, not a replace: Back after closing reopens the task that was just
+  // closed, and Back from the task page returns to the list — the history a
+  // user expects. Replacing left two identical list entries, so Back did nothing.
+  return go(back);
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
@@ -6642,6 +7029,7 @@ function closeTaskDom() {
   S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
+  if (reviewActionWs) { try { reviewActionWs.close(); } catch {} reviewActionWs = null; } // …and stops streaming a review action into the next page
 }
 
 // A task's organizational metadata (priority + tags). Both are purely for
@@ -6968,11 +7356,13 @@ function renderTaskPage() {
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  wireResourceReview(v); // Overview and the current conversation input request.
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
-    wireResourceReview(v);
+    wireResourceInventory(v);
   } else if (tab === 'checkin') {
+    wireReviewActions(v);
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
@@ -6983,8 +7373,6 @@ function renderTaskPage() {
     wireParams(v);
     wireTaskAuthorization(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
-  } else if (tab === 'advanced') {
-    renderTaskEvents();
   }
   wireCopyButtons();
   // Restore the pre-render scroll offsets + focus so the box the user was working
@@ -7121,25 +7509,25 @@ function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
   if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
-  if (tab === 'advanced') return advancedTab(v);
   return overviewTab(v);
 }
 
 function approvalRequestsTab(v) {
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
-    .filter((request) => request.status === 'pending').length;
+    .filter((request) => request.status === 'pending' && !request.dismissed).length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status)).length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
-        <p class="task-sub">Credential, permission, and initial authorization decisions raised by this task.</p></div>
+        <p class="task-sub">App connections, credential access, and permission decisions raised by this task.</p></div>
       ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
     </div>
     <div class="approval-list">
+      ${connectionRows(S.connections || [], true)}
       ${permissionRequestRows(S.permissionRequests)}
       ${authorizationRequestRows(S.authorizationRequests || [])}
       ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
         historyLimit: 20,
-        showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length,
+        showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length && !(S.connections || []).length,
       })}
     </div>
   </div>`;
@@ -7148,6 +7536,7 @@ function approvalRequestsTab(v) {
 function wireTaskApprovalRequests(v) {
   const rec = taskRecord(v.taskId);
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  wireConnectionActions(document.getElementById('task-approval-requests'), organizationId, refreshTask);
   wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
     await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
   });
@@ -7476,15 +7865,119 @@ function reviewActionBtn(a, i) {
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
+/** Ask for a secret in a masked field. `window.prompt` shows the value in clear
+ *  and keeps it in the browser's prompt history; every other secret input in the
+ *  console is `type="password"`, so this one is too. Resolves null on cancel. */
+function promptSecret(title, hint) {
+  return new Promise((resolve) => {
+    const host = document.createElement('div'); $('#modal-root').appendChild(host);
+    host.innerHTML = `<div class="palette-scrim secret-prompt-scrim"><form class="palette picker" style="max-width:480px">
+      <div class="fp-head">${esc(title)} <span class="q-spacer"></span><button type="button" class="icon-btn secret-prompt-close">✕</button></div>
+      ${hint ? `<p class="task-sub">${esc(hint)}</p>` : ''}
+      <input type="password" class="secret-prompt-value" autocomplete="off" spellcheck="false" placeholder="New value" style="width:100%">
+      <div class="inline-form" style="margin-top:10px;justify-content:flex-end"><button type="submit" class="btn sm primary">Save</button></div>
+    </form></div>`;
+    const done = (value) => { host.remove(); resolve(value); };
+    host.querySelector('.secret-prompt-close').addEventListener('click', () => done(null));
+    host.querySelector('.secret-prompt-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) done(null); });
+    host.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); done(host.querySelector('.secret-prompt-value').value || null); });
+    host.querySelector('.secret-prompt-value').focus();
+  });
+}
+
 let reviewActionWs = null;
-async function openArtifact(url, external) {
-  if (external) { window.open(url, '_blank', 'noopener'); return; }
+function artifactTextKind(contentType, target) {
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  if (type === 'text/markdown' || /\.(md|markdown)$/i.test(target)) return 'markdown';
+  if (type === 'text/plain' || type === 'text/csv' || type === 'application/json') return 'text';
+  return null;
+}
+
+function showArtifactReader(text, kind, name, blob) {
+  const previousFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card artifact-reader';
+  dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
+  dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
+    <a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    <div class="artifact-reader-content" tabindex="0"></div>`;
+  const content = dialog.querySelector('.artifact-reader-content');
+  if (kind === 'markdown') {
+    content.classList.add('msg-text', 'md');
+    content.innerHTML = renderMarkdown(text);
+  } else {
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    content.appendChild(pre);
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  const download = dialog.querySelector('[data-download]');
+  download.href = objectUrl;
+  download.download = name;
+  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  // Consume Escape before the shell dispatcher can also close the task behind us.
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    dialog.close();
+  });
+  dialog.addEventListener('close', () => {
+    URL.revokeObjectURL(objectUrl);
+    dialog.remove();
+    if (previousFocus?.isConnected) previousFocus.focus();
+  }, { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  dialog.querySelector('[data-close]').focus();
+}
+
+// Types a browser renders without running anything: opened straight from a
+// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
+// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
+// page opened bare would execute with the console's session. Everything else
+// is downloaded.
+const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
+const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
+function openSandboxedDocument(blobUrl, title) {
+  const w = window.open('', '_blank', 'noopener=no');
+  if (!w) return false;
+  w.document.title = title;
+  const frame = w.document.createElement('iframe');
+  // No allow-same-origin: the document gets an opaque origin, so its scripts
+  // cannot read this console's storage or cookies or call its API as the user.
+  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
+  frame.src = blobUrl;
+  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
+  w.document.body.style.margin = '0';
+  w.document.body.appendChild(frame);
+  return true;
+}
+function safeHref(href) {
+  return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
+}
+async function openArtifact(url, external, target = '') {
+  if (external) { if (safeHref(url) !== '#') window.open(url, '_blank', 'noopener'); return; }
   // Artifact endpoints need the auth header, so fetch as a blob then open it.
   try {
     const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
     if (!res.ok) { toast('could not open artifact', true); return; }
-    const obj = URL.createObjectURL(await res.blob());
-    window.open(obj, '_blank', 'noopener');
+    const blob = await res.blob();
+    const name = target.replace(/\\/g, '/').split('/').pop()
+      || /filename="([^"]+)"/i.exec(res.headers.get('content-disposition') || '')?.[1] || 'Attachment';
+    // Readable text (markdown, plain text, CSV, JSON) opens in the in-page reader.
+    const kind = artifactTextKind(res.headers.get('content-type') || '', name);
+    if (kind) {
+      showArtifactReader(await blob.text(), kind, name, blob);
+      return;
+    }
+    const obj = URL.createObjectURL(blob);
+    if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
+    else if (!(ACTIVE_ARTIFACT.test(blob.type) && openSandboxedDocument(obj, name))) {
+      const a = document.createElement('a');
+      a.href = obj; a.download = name; a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); a.remove();
+    }
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
 }
@@ -7521,7 +8014,7 @@ function wireReviewActions(v) {
       btn.disabled = true;
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
-        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'open') { await openArtifact(r.url, r.external, v.reviewInfo?.actions?.[idx]?.target); return; }
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
@@ -7545,10 +8038,11 @@ function wireReviewActions(v) {
         ws.onclose = () => setStopBtn(false);
         setStopBtn(true, r.procId, v.taskId);
         // A server keeps running — open its pages once it's had a moment to boot.
-        if (r.server && Array.isArray(r.openUrls)) {
-          setTimeout(() => r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
-        } else if (Array.isArray(r.openUrls) && r.openUrls.length) {
-          r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
+        const openable = (Array.isArray(r.openUrls) ? r.openUrls : []).filter((u) => /^https?:/i.test(String(u)));
+        if (r.server && openable.length) {
+          setTimeout(() => openable.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+        } else if (openable.length) {
+          openable.forEach((u) => window.open(u, '_blank', 'noopener'));
         }
       } catch (e) { toast(e.message, true); }
       finally { if (btn.isConnected) btn.disabled = false; }
@@ -7557,23 +8051,63 @@ function wireReviewActions(v) {
 }
 
 const resourceReviewCache = new Map();
+const resourceInventoryCache = new Map();
+function resourceReviewPlaceholder() {
+  return '<div id="review-resources"><div class="task-sub" role="status">Loading resource changes…</div></div>';
+}
+
+// Opening a task paints twice (compact view, then history). Share pending reads
+// across those paints; only the current DOM subscriber may render the result.
+function loadResourceReview(v, force = false, inventory = false) {
+  const cache = inventory ? resourceInventoryCache : resourceReviewCache;
+  const cached = cache.get(v.taskId);
+  if (!force && cached?.view === v && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  const entry = { view: v, pending: true, at: Date.now() };
+  entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : ''}`)
+    .then((result) => {
+      entry.pending = false;
+      entry.at = Date.now();
+      return result;
+    }, (error) => {
+      if (cache.get(v.taskId) === entry) cache.delete(v.taskId);
+      throw error;
+    });
+  cache.set(v.taskId, entry);
+  return entry.promise;
+}
+
+// The ignored-file scan can take seconds in a cloud world. It must never hold
+// up the independently available candidate decisions, even on the first open.
+async function wireResourceInventory(v, force = false) {
+  const wrap = document.getElementById('review-resource-inventory');
+  if (!wrap || v.stage !== 'review') return;
+  const isCurrent = beginAsyncElementRender(wrap);
+  try {
+    const inventory = await loadResourceReview(v, force, true);
+    if (!isCurrent()) return;
+    wrap.innerHTML = inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
+      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; ${siteNameMarkup()} did not upload their contents.</div>
+      <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : '';
+  } catch (error) {
+    if (!isCurrent()) return;
+    wrap.innerHTML = `<div class="task-sub" title="${esc(error.message)}">Couldn’t inspect ignored output. <button class="btn sm" data-inventory-retry>Retry</button></div>`;
+    wrap.querySelector('[data-inventory-retry]')?.addEventListener('click', () => wireResourceInventory(v, true));
+  }
+}
 async function wireResourceReview(v, force = false) {
   const wrap = document.getElementById('review-resources');
   if (!wrap || v.stage !== 'review') return;
+  const isCurrent = beginAsyncElementRender(wrap);
   try {
-    const cached = resourceReviewCache.get(v.taskId);
-    let items;
-    if (!force && cached && Date.now() - cached.at < 15_000) items = cached.items;
-    else {
-      const [loaded, inventory] = await Promise.all([
-        api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources`),
-        api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/inventory`).catch(() => ({ entries: [], truncated: false })),
-      ]);
-      items = loaded;
-      resourceReviewCache.set(v.taskId, { at: Date.now(), items, inventory });
+    const items = await loadResourceReview(v, force);
+    if (!isCurrent()) return;
+    if (!items.length) {
+      wrap.classList.add('hidden');
+      wrap.innerHTML = '';
+      return;
     }
-    const inventory = resourceReviewCache.get(v.taskId)?.inventory ?? { entries: [], truncated: false };
-    if (!document.body.contains(wrap) || (!items.length && !inventory.entries?.length)) return;
+    const thread = wrap.closest?.('.ck-thread');
+    const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
     wrap.classList.remove('hidden');
     wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
       const resource = item.resource;
@@ -7588,7 +8122,7 @@ async function wireResourceReview(v, force = false) {
           : candidate.state === 'discarding'
             ? `<div class="inline-form"><span class="chip">Discard interrupted</span><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Retry discard</button></div>`
           : `<span class="chip">${candidate.state === 'adopted' ? 'Adopted into project' : candidate.state === 'discarding' ? 'Discarding staged bytes…' : 'Discarded'}</span>`;
-        return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
+        return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
           <div class="task-sub">${esc(size)} · ${esc(source || '')} → ${esc(target || '')} · ${esc(resource.access || 'read')} access</div>
           <div class="task-sub">Bound to world generation ${esc(String(candidate.worldGeneration))}; staged bytes are encrypted and retained until Adopt/Discard. Estimated retained cost: $0.00 under the current deployment storage policy (usage is recorded).</div></div>${state}</div>`;
       }
@@ -7604,11 +8138,10 @@ async function wireResourceReview(v, force = false) {
       const action = resource.publish === 'review' && changed
         ? `<div class="inline-form"><button class="btn sm primary resource-promote" data-resource-id="${esc(resource.id)}">Promote as new baseline</button><button class="btn sm resource-discard" data-resource-id="${esc(resource.id)}">Discard fork</button></div>`
         : `<span class="chip">${resource.publish === 'discard' ? 'Task fork will be discarded' : 'Unchanged'}</span>`;
-      return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
+      return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
         <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
-    }).join('')}${inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
-      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; ${siteNameMarkup()} did not upload their contents.</div>
-      <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : ''}`;
+    }).join('')}`;
+    if (atBottom) thread.scrollTop = thread.scrollHeight;
     wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
       button.disabled = true; button.textContent = 'Adopting…';
@@ -7650,7 +8183,7 @@ async function wireResourceReview(v, force = false) {
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
   } catch (error) {
-    if (!document.body.contains(wrap)) return;
+    if (!isCurrent()) return;
     wrap.classList.remove('hidden');
     // Raw server text here told the user nothing they could act on; a retry is
     // the only useful next step, so offer that (details stay in the tooltip).
@@ -7877,7 +8410,7 @@ function overviewTab(v) {
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
-         <div id="review-resources" class="hidden"></div>
+         ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
@@ -7988,6 +8521,19 @@ function checkinTab(v) {
   </div>`;
 }
 
+// Task-level review affordances belong at the end of whichever agent is open.
+// Keep previews in Overview and command output hidden until explicitly run.
+function conversationReviewInfo(v) {
+  const info = v.reviewInfo;
+  const caption = info?.caption || info?.summary;
+  if (!caption && !info?.actions?.length && !info?.links?.length && !info?.html) return '';
+  return `<div class="msg agent review-info">
+    <div class="review-info-line"><span class="role">Review info</span>${caption ? `<span class="review-info-caption">${esc(caption)}</span>` : ''}</div>
+    ${info.actions?.length ? `<div class="review-actions" id="review-actions">${info.actions.map((action, index) => reviewActionBtn(action, index)).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
+    ${info.links?.length || info.html ? `<div class="review-actions">${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}${info.html ? '<button class="btn sm" data-tasktab="overview">View preview ↗</button>' : ''}</div>` : ''}
+  </div>`;
+}
+
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
@@ -7996,8 +8542,6 @@ function conversationPane(v, t) {
     : S.taskHistoryError
       ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
       : '';
-  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
-    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -8023,9 +8567,15 @@ function conversationPane(v, t) {
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
-  const request = requestedInput
-    ? `<div class="msg system"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderMessageBody(requestedInput)}</div></div>`
-    : '';
+  if (requestedInput && !entries.some((entry) => entry.type === 'input-request' && entry.request.text === requestedInput)) {
+    entries.push({ type: 'input-request', request: { text: requestedInput, ts: v.updatedAt },
+      sourceKey: `input-request:${v.updatedAt}`, conversationRole: t.role });
+  }
+  const resourceRequestIndex = v.stage === 'review' && requestedInput
+    ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
+  const msgs = historyStatus + (entries.map((entry, index) => renderConversationEntry(
+    index === resourceRequestIndex ? { ...entry, resourceReview: true } : entry, v)).join('')
+    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
@@ -8043,10 +8593,11 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
+      <button class="btn sm" id="share-task-conversation" data-role="${esc(t.role)}">Share</button>
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
 }
 
@@ -8203,7 +8754,26 @@ function conversationEntries(t) {
     posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts,
       sourceKey: `message:${message.id}`, conversationRole: t.role });
   }
-  const combined = [...messages, ...posted.values(), ...visibleActivities];
+  // Explanations retain their input prompt after the human wait is resolved.
+  // sourceRequest.ts can be a workflow revision (e.g. 17), not wall time.
+  // Recover the wait's timestamp where available, otherwise anchor to the first
+  // explanation. Never sort a revision as 1970 or move a request on re-explain.
+  const requests = new Map();
+  for (const event of orderedEvents) {
+    const e = event.payload;
+    if (event.type !== 'conversation.explanation' || e?.role !== t.role || !e.sourceRequest) continue;
+    if (requests.has(e.sourceKey)) continue;
+    const wait = orderedEvents.filter((candidate) => candidate.type === 'view.updated'
+      && candidate.payload?.waitingFor === 'human'
+      && candidate.payload?.waitingDetail?.trim() === e.sourceRequest.text
+      && Number(candidate.ts) <= Number(event.ts)).at(-1);
+    const ts = Number(e.sourceRequest.ts) > 100000000000
+      ? Number(e.sourceRequest.ts) : (wait?.ts ?? event.ts);
+    requests.set(e.sourceKey, { type: 'input-request', request: e.sourceRequest,
+      sourceKey: e.sourceKey, conversationRole: t.role, ts,
+      sortTs: ts, order: wait?.seq ?? event.seq ?? event.ts });
+  }
+  const combined = [...messages, ...posted.values(), ...visibleActivities, ...requests.values()];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
   const explanations = new Map();
   for (const event of orderedEvents) {
@@ -8277,7 +8847,7 @@ function renderConversationText(text, role, v = S.view) {
     const fileUrl = worldFileHref(href, v);
     html += fileUrl
       ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">${esc(match[1])}</a>`
-      : `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+      : `<a href="${esc(safeHref(href))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
   return html + esc(source.slice(at));
@@ -8351,8 +8921,8 @@ function annotateWorldFileLinks(html, v = S.view) {
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
 // else the plain path that renders only the file-citation link subset.
-function renderAgentMessageBody(text, v = S.view) {
-  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text), v) : renderConversationText(text, 'agent', v);
+function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
+  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
 }
 
 function explanationModelLabel(model = S.explanationSettings?.model) {
@@ -8373,25 +8943,30 @@ function explainMessageAffordance(entry, v) {
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
+    <button type="button" class="conversation-math" aria-label="Typeset math in this conversation" aria-pressed="${conversationMathEnabled(v, entry.conversationRole || 'do')}" title="${markdownEnabled() ? 'Toggle math typesetting for this conversation' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
     ${error}
   </div>`;
 }
 
 function renderConversationEntry(entry, v = S.view) {
+  const math = conversationMathEnabled(v, entry.conversationRole || 'do');
   const md = markdownEnabled() ? ' md' : '';
+  if (entry.type === 'input-request') {
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+  }
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
     return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
-    return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text)}</div></div>`;
+    return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text, math)}</div></div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -8410,7 +8985,7 @@ async function runExplanation(v, role, sourceKey, settings) {
   renderTaskPage();
   try {
     const event = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/explanations`, {
-      method: 'POST', body: JSON.stringify({ role, sourceKey, ...(settings ? { settings } : {}) }),
+      method: 'POST', body: JSON.stringify({ role, sourceKey, ...(sourceKey.startsWith('input-request:') ? { inputRequest: humanWaitDetail(v) } : {}), ...(settings ? { settings } : {}) }),
     });
     if (event && !S.taskEvents.some((item) => item.seq != null && item.seq === event.seq)) S.taskEvents.push(event);
   } catch (error) {
@@ -8458,6 +9033,13 @@ function wireExplainMessages(v) {
   $('#main').querySelectorAll('.explain-tools').forEach((tools) => {
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
+    tools.querySelector('.conversation-math')?.addEventListener('click', () => {
+      toggleConversationMath(v, role);
+      // The repaint replaces this button; keep keyboard focus on its successor.
+      const replacement = [...$('#main').querySelectorAll('.explain-tools')]
+        .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
+      replacement?.querySelector('.conversation-math')?.focus({ preventScroll: true });
+    });
     tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(v, role, sourceKey));
     tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(v, role, sourceKey));
   });
@@ -8505,6 +9087,46 @@ function terminalPane(v) {
     </div>`;
 }
 
+async function openConversationShare(v, role) {
+  const endpoint = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation-share?role=${encodeURIComponent(role)}`;
+  try {
+    let state = await api(endpoint);
+    let preview = !state.url && state.enabled ? await api(`/api/tasks/${encodeURIComponent(v.taskId)}/conversation?role=${encodeURIComponent(role)}`) : null;
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'modal-card artifact-reader';
+    dialog.setAttribute('aria-labelledby', 'conversation-share-title');
+    const draw = () => {
+      dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="conversation-share-title">Share conversation</h2><button class="btn sm" data-close>Close</button></header>
+        <div class="artifact-reader-content"><p>Anyone with this link can read the user and agent message text, including any sensitive information in it. Attachments, system messages, and tool activity are excluded. Later messages will not be added.</p>
+        ${!state.enabled ? '<p>Public sharing is disabled in organization or project settings. Existing links are unavailable until sharing is enabled again.</p>' : ''}
+        ${state.url ? `<label class="form-row"><span>Public snapshot link</span><input data-link readonly value="${esc(new URL(state.url, location.origin).href)}"></label><p class="task-sub">Created ${esc(new Date(state.createdAt).toLocaleString())}. Revoke this link before creating a new snapshot.</p><div class="inline-form"><button class="btn sm" data-copy>Copy link</button><a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open snapshot</a><button class="btn sm" data-revoke>Revoke link</button></div>` : `<details><summary>Preview message text</summary>${(preview?.messages || []).filter(m => m.role === 'user' || m.role === 'agent').map(m => `<article><b>${m.role === 'user' ? 'User' : 'Agent'}</b><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</pre></article>`).join('')}</details><button class="btn primary" data-create ${state.enabled ? '' : 'disabled'}>Create public link</button>`}</div>`;
+      dialog.querySelector('[data-close]').onclick = () => dialog.close();
+      dialog.querySelector('[data-copy]')?.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(new URL(state.url, location.origin).href); toast('Link copied'); }
+        catch { dialog.querySelector('[data-link]').select(); toast('Select and copy the link above'); }
+      });
+      const mutate = async (button, method) => {
+        button.disabled = true;
+        try {
+          await api(endpoint, { method });
+          state = await api(endpoint);
+          if (!state.url && state.enabled) preview = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/conversation?role=${encodeURIComponent(role)}`);
+          draw();
+        }
+        catch (error) { button.disabled = false; toast(error.message, true); }
+      };
+      dialog.querySelector('[data-create]')?.addEventListener('click', e => mutate(e.currentTarget, 'POST'));
+      dialog.querySelector('[data-revoke]')?.addEventListener('click', e => mutate(e.currentTarget, 'DELETE'));
+    };
+    draw();
+    dialog.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dialog.close(); } });
+    dialog.addEventListener('close', () => { dialog.remove(); if (previousFocus?.isConnected) previousFocus.focus(); }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  } catch (error) { toast(error.message, true); }
+}
+
 function wireCheckinSidebar(v) {
   $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
@@ -8512,8 +9134,10 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
   $('#fork-task-agent')?.addEventListener('click', (event) => {
     openTaskForm('software-dev', undefined, undefined, {
+      ...forkBranchDefaults(v),
       'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
     });
   });
@@ -8877,19 +9501,6 @@ async function wireTaskAuthorization(v) {
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
-function advancedTab(v) {
-  return `
-    <div class="section-h">Live events</div>
-    <div class="events" id="tp-events"></div>
-    <div class="section-h">Structured state (the view-model floor)</div>
-    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn,
-      // `localPath` goes through localWorldPath() like every other host-path
-      // affordance. The gateway only strips `worldPath` for REMOTE handles, so a
-      // hosted deployment backed by worktree worlds (explicitly supported) was
-      // printing the karmax host's filesystem layout into a remote browser here —
-      // the one place a raw worldPath escaped the hostLocal() gate.
-      world: { available: v.worldAvailable, provider: v.worldProvider, localPath: localWorldPath(v) || undefined }, pr: v.pr }, null, 2))}</pre>`;
-}
 
 function renderDiff(d) {
   return esc(d)
@@ -8925,6 +9536,7 @@ function waitingText(w) {
     const summary = w.summary.replace(/\s+/g, ' ').trim();
     if (summary) return summary.slice(0, 72);
   }
+  if (w?.kind === 'human') return 'Needs input';
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
@@ -8959,8 +9571,8 @@ function conversationTextKey(value) {
 // A normal Do turn uses its final reply as waitingFor.detail so responders and
 // the Overview tab retain the full request. That reply is already the last
 // agent message in the conversation, however, so appending the detail again as
-// an italic "Input requested" row only repeats the same content. Preserve the
-// row when a targeted hold carries a genuinely separate question.
+// an "Input requested" message only repeats the same content. Preserve the
+// message when a targeted hold carries a genuinely separate question.
 function conversationInputRequest(v, entries) {
   const detail = humanWaitDetail(v);
   if (!detail) return '';
@@ -9598,6 +10210,7 @@ function taskActionLabel(v, action) {
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
+  if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
@@ -9610,7 +10223,7 @@ function taskActions(v) {
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
     // actionToast's standard-verb match and produced "Confirm1 — done" instead
     // of "Confirmed" on the most-used control in the app.
-    html += `<button class="btn ${cls}" data-act="${a.name}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
+    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -9631,6 +10244,7 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
+  if (signal === 'confirm' && String(label).toLowerCase() === 'done') return 'Confirmation sent';
   const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
   const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
@@ -9649,6 +10263,46 @@ function confirmTaskAction(action, v = S.view) {
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
+// The choice travels with confirmation; saving the project default is authorized
+// separately on the server. Dismissing this dialog never confirms the proposal.
+async function otherAttemptsConfirmation(action, taskId) {
+  if (action !== 'confirm' && action !== 'openPr') return {};
+  const group = await api(`/api/tasks/${taskId}/attempts`);
+  if (!group?.otherAttemptsChoiceAvailable || group.committedAttemptId || !group.attempts.some((a) => a.id !== taskId
+    && !['done', 'cancelled', 'failed'].includes(a.lastView?.status))) return {};
+  if (group.otherAttemptsDefault !== 'ask') return { otherAttempts: group.otherAttemptsDefault };
+  return new Promise((resolve) => {
+    const root = $('#overlay-root');
+    root.innerHTML = `<div class="palette-scrim" id="attempt-choice-scrim"><div class="palette" role="dialog" aria-modal="true" aria-labelledby="attempt-choice-title" style="width:min(480px,92vw);padding:24px">
+      <h2 id="attempt-choice-title">Keep or cancel other attempts?</h2>
+      <p>Keep lets the other attempts continue and integrate their proposals. Cancel stops the alternatives when this attempt enters Merge.</p>
+      ${group.canSaveOtherAttemptsDefault ? '<label class="form-row"><span><input id="save-attempt-choice" type="checkbox"> Save this choice for future tasks in this project</span></label>' : ''}
+      <div class="actions"><button class="btn" data-attempt-choice="back">Back</button><button class="btn danger" data-attempt-choice="cancel">Cancel other attempts</button><button class="btn primary" data-attempt-choice="keep">Keep other attempts</button></div>
+    </div></div>`;
+    const previousFocus = document.activeElement;
+    const close = (choice) => {
+      const save = !!$('#save-attempt-choice')?.checked;
+      document.removeEventListener('keydown', keydown, true);
+      root.innerHTML = '';
+      previousFocus?.focus();
+      resolve(choice === 'back' ? null : { otherAttempts: choice, saveOtherAttemptsDefault: save });
+    };
+    const keydown = (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close('back'); }
+      if (event.key === 'Tab') {
+        const items = [...root.querySelectorAll('button, input')];
+        const index = items.indexOf(document.activeElement);
+        if (event.shiftKey && index <= 0) { event.preventDefault(); items.at(-1).focus(); }
+        else if (!event.shiftKey && index === items.length - 1) { event.preventDefault(); items[0].focus(); }
+      }
+    };
+    document.addEventListener('keydown', keydown, true);
+    root.querySelectorAll('[data-attempt-choice]').forEach((button) => button.addEventListener('click', () => close(button.dataset.attemptChoice)));
+    $('#attempt-choice-scrim').addEventListener('click', (event) => { if (event.target.id === 'attempt-choice-scrim') close('back'); });
+    root.querySelector('[data-attempt-choice="keep"]').focus();
+  });
+}
+
 function reflectAcceptedTaskAction(taskId, action) {
   if (action !== 'cancel') return;
   markTaskCancelling(taskId);
@@ -9661,19 +10315,27 @@ function wireActions(v) {
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
-      if (!confirmTaskAction(act, v)) return;
+      if (btn.disabled || !confirmTaskAction(act, v)) return;
+      const feedback = beginActionFeedback(btn);
+      let succeeded = false;
       const cancelling = act === 'cancel';
       const label = btn.innerHTML;
-      if (cancelling) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+      btn.disabled = true;
+      btn.textContent = cancelling ? 'Cancelling…' : 'Sending…';
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        const choice = await otherAttemptsConfirmation(act, v.taskId);
+        if (choice === null) return;
+        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act, ...choice }) });
+        succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
         toast(actionToast(act, btn.dataset.label));
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) {
-        if (cancelling) { btn.disabled = false; btn.innerHTML = label; }
         toast(e.message, true);
+      } finally {
+        if (!cancelling || !succeeded) { btn.disabled = false; btn.innerHTML = label; }
+        finishActionFeedback(feedback, succeeded);
       }
     }),
   );
@@ -9766,20 +10428,6 @@ function updateLiveBubble() {
   if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
-function renderTaskEvents() {
-  const box = document.getElementById('tp-events');
-  if (!box) return;
-  box.innerHTML = S.taskEvents
-    .slice(-120)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span>${esc(summarize(e.payload))}</span></div>`)
-    .join('');
-  box.scrollTop = box.scrollHeight;
-}
-function summarize(p) {
-  if (!p) return '';
-  if (p.text) return p.text.slice(0, 160);
-  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
-}
 
 // ── queue ────────────────────────────────────────────────────────────────────
 // Fetch the coordinator's authoritative queue order for every domain currently in
@@ -10527,7 +11175,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the task agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -10658,6 +11306,7 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
     const fields = wf === '__common__' ? commonSettingsFields(scope)
       : settingsFields(wf, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
+    sec.dataset.mcpScope = mcpScope(projectId || null, organizationId);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -10690,6 +11339,7 @@ async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
     sec.querySelector('.quick-defaults-body').hidden = !enabled;
     sec.querySelector('.quick-defaults-enabled').addEventListener('change', (event) => { sec.querySelector('.quick-defaults-body').hidden = !event.target.checked; });
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
+    sec.dataset.mcpScope = mcpScope(projectId || null, organizationId);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -10710,7 +11360,6 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
   );
 }
 
-const quickDefaultsHeader = () => '';
 
 // ── Avatars ──────────────────────────────────────────────────────────────
 function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
@@ -11552,7 +12201,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-avatars">Avatars</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-tools">Tools</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -11572,12 +12221,12 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-tools"><div>MCP connections</div></div><div class="card"><p>Connect services from the Official MCP Registry or add your own server. Choose connections in each Agent’s Tools field.</p><button type="button" class="btn primary" id="project-mcp-manage">Manage connections</button></div>
     <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-avatars"><div>Avatars<small>Whether autonomous principals may be used in this project</small></div></div>
-    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     ${explanationSettingsCard('project')}
     ${profilesCard('project')}
     ${quickSettingsForms('project', proj.id)}
@@ -11589,6 +12238,8 @@ function settingsView(proj) {
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
+    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="card" data-settings-advanced hidden>
       <div class="section-h" data-settings-access="project" hidden>Project name</div>
       <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
@@ -11608,6 +12259,29 @@ function paneError(box, error, retry) {
   box.querySelector('button').addEventListener('click', retry);
 }
 
+async function hydrateConversationSharing(scope, id) {
+  const box = $(`#${scope}-conversation-sharing`);
+  if (!box) return;
+  const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
+  try {
+    const policy = await api(url);
+    box.innerHTML = `<div class="section-h">Public conversation links</div><p class="task-sub">Allow developers to create public snapshots of agent conversations. Anyone with a link can read its message text. Disabling sharing makes existing links unavailable until re-enabled.</p>
+      <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
+        ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
+      </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    box.querySelector('[data-save]').onclick = async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const value = box.querySelector('select').value;
+        await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
+        toast('Public sharing policy saved');
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    };
+  } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
+}
+
 async function hydrateAvatarAvailability(scope, id) {
   const box = scope === 'project' ? $('#project-avatar-settings') : $('#organization-avatar-settings');
   if (!box) return;
@@ -11616,20 +12290,21 @@ async function hydrateAvatarAvailability(scope, id) {
     : `/api/organizations/${encodeURIComponent(id)}/avatar-settings`;
   try {
     const policy = await api(url);
-    if (scope === 'organization') {
-      box.innerHTML = `<label class="choice-row compact"><input type="checkbox" ${policy.enabled ? 'checked' : ''}><span><b>Enable Avatars in this organization</b><small>Projects can disable them individually. Disabling preserves every Avatar and its history.</small></span></label>`;
-      box.querySelector('input').addEventListener('change', async (event) => {
-        try { await api(url, { method: 'PUT', body: JSON.stringify({ enabled: event.target.checked }) }); toast(event.target.checked ? 'Avatars enabled' : 'Avatars disabled'); }
-        catch (error) { event.target.checked = !event.target.checked; toast(error.message, true); }
-      });
-      return;
-    }
-    box.innerHTML = `<label class="form-row"><span>Availability</span><select><option value="inherit" ${policy.project === 'inherit' ? 'selected' : ''}>Inherit organization setting</option><option value="enabled" ${policy.project === 'enabled' ? 'selected' : ''}>Enabled</option><option value="disabled" ${policy.project === 'disabled' ? 'selected' : ''}>Disabled</option></select></label><p class="task-sub">Currently <b>${policy.effective ? 'enabled' : 'disabled'}</b>${policy.organization ? '' : ' because Avatars are disabled for the organization'}. Existing Avatars are retained when disabled.</p>`;
-    box.querySelector('select').addEventListener('change', async (event) => {
-      const previous = policy.project;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ value: event.target.value }) }); await loadAvatars().catch(() => {}); toast('Avatar availability saved'); await hydrateAvatarAvailability(scope, id); }
-      catch (error) { event.target.value = previous; toast(error.message, true); }
-    });
+    const enabled = scope === 'organization' ? policy.enabled : policy.effective;
+    box.innerHTML = `<div class="section-h">Avatars</div><p class="task-sub">Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this default in either direction.' : `Organization default: ${policy.organization ? 'enabled' : 'disabled'}. This project ${policy.project === 'inherit' ? 'inherits the default' : 'overrides the default'}.`} Existing Avatars and their history are retained when disabled.</p>
+      <div class="inline-form"><button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button>${scope === 'project' ? `<button type="button" class="btn sm avatar-availability-inherit" ${policy.project === 'inherit' ? 'disabled' : ''}>Use organization default</button>` : ''}</div>`;
+    const save = async (button, body) => {
+      button.disabled = true;
+      try {
+        await api(url, { method: 'PUT', body: JSON.stringify(body) });
+        await loadAvatars().catch(() => {});
+        renderMain();
+        toast('Avatar availability saved');
+      } catch (error) { button.disabled = false; toast(error.message, true); }
+    };
+    box.querySelector('.avatar-availability-toggle').addEventListener('click', (event) => save(event.currentTarget,
+      scope === 'organization' ? { enabled: !enabled } : { value: enabled ? 'disabled' : 'enabled' }));
+    box.querySelector('.avatar-availability-inherit')?.addEventListener('click', (event) => save(event.currentTarget, { value: 'inherit' }));
   } catch (error) { paneError(box, error, () => hydrateAvatarAvailability(scope, id)); }
 }
 
@@ -12000,11 +12675,6 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
     throw error;
   }
 }
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer); let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  return btoa(binary);
-}
 function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
@@ -12138,6 +12808,7 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
+  hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);
   hydrateProjectData(proj);
@@ -12358,13 +13029,16 @@ function globalSettingsView(embedded = false) {
     ${settingsForms('global')}
     ${explanationSettingsCard('global')}
     ${profilesCard('global')}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full task form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
+    <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
+      <p class="task-sub">Connect your accounts once. Choose which projects may use them. Service credentials are managed by Composio.</p>
+      <div id="service-connections">Loading connections…</div></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
     ${agentMailCard()}
     ${paymentsCard('global')}
+    <div class="settings-section-title" id="settings-tools"><div>MCP connections</div></div><div class="card"><p>Connections shared with this organization’s projects. Choose connections in each Agent’s Tools field.</p><button type="button" class="btn primary" id="organization-mcp-manage">Manage connections</button></div>
     <div class="settings-section-title" id="settings-agents"><div>Codex/Claude</div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
@@ -12379,11 +13053,6 @@ function globalSettingsView(embedded = false) {
             <option value="xai|xAI Grok OAuth (SuperGrok Subscription)">SuperGrok / Grok or X Premium (local browser)</option>
           </select>
           <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
-          <select id="login-browser" title="Browser MCP baseline for this profile">
-            <option value="none">no browser MCP</option>
-            <option value="chrome-devtools">+ chrome-devtools MCP</option>
-            <option value="playwright">+ playwright MCP</option>
-          </select>
           <button class="btn primary" id="login-connect">Connect</button>
         </div>
         <div id="login-result" style="font-size:12px;margin-top:6px"></div>
@@ -12445,8 +13114,8 @@ function renderPhoneAccess(status) {
     : status.state === 'conflict'
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
-    ? `<div class="phone-access-address"><span>Access your ${siteNameMarkup()} at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your ${siteNameMarkup()} at</span><b>Tailscale not set up</b></div>`;
+    ? `<div class="phone-access-address"><span>Open your ${siteNameMarkup()} workspace at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Open your ${siteNameMarkup()} workspace at</span><b>Tailscale not set up</b></div>`;
   const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private ${siteNameMarkup()} address shown here in your phone’s browser.</li>`;
   const recovery = ready
@@ -12466,7 +13135,7 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? `Why this ${siteName()} is not being served` : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? 'Why this workspace address is unavailable' : 'Set up instructions';
   const setupIntro = status.state === 'conflict'
     ? `<p>Tailscale is already configured on this computer; its address currently belongs to another local service or ${siteNameMarkup()} instance.</p>`
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
@@ -12639,7 +13308,7 @@ async function hydratePhoneAccess() {
     revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
-        <span>Access your ${siteNameMarkup()} at</span>
+        <span>Open your ${siteNameMarkup()} workspace at</span>
         <b>${disconnected ? `Could not reach ${siteNameMarkup()}` : 'Could not check Phone Access'}</b>
       </div>
       <div class="phone-setup-body">
@@ -13203,7 +13872,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
 const VAULT_SECRET_LABELS = {
-  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)']],
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
   'ssh-key': [['privateKey', 'private key (PEM)']],
   env: [['env', '.env contents (KEY=VALUE per line)']],
@@ -13221,7 +13890,7 @@ const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent
 // `onclick="window.__toast(…)"` threw `TypeError: window.__toast is not a
 // function` on every tap — silently breaking the affordance for exactly the
 // touch users it was added for.
-function policyTip(text) { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">ⓘ</button>`; }
+function policyTip(text, icon = 'ⓘ') { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">${esc(icon)}</button>`; }
 
 function clearTotpQrPreview(control, clearValue = false) {
   if (!control) return;
@@ -13315,11 +13984,18 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
         </div>
         <div class="approval-request-actions">
-          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
+          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${sortVaultItems(items).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
           <button class="btn sm" data-vreq-act="once">Once</button>
           <button class="btn sm" data-vreq-act="task">This task</button>
           <button class="btn sm" data-vreq-act="always">Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${policyTip(`Once: Approves one credential operation, consumed when used, not at the next agent turn.
+
+This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
+
+Always: Does the same as “This task” and sets this credential’s ${request.mode === 'reveal' ? '“agent sees”' : '“blind use”'} policy to “auto” until changed. The other policy stays unchanged. Future tasks still need a grant for this credential; it is not automatically included in every task. Task-specific policy overrides still apply.
+
+Deny: Rejects this request.`, '?')}
         </div>
       </div>`).join('')
     : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
@@ -13335,25 +14011,27 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
 function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
-  const pendingHtml = pending.map((request) => `<div class="approval-request" data-preq="${esc(request.id)}">
+  const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        <span class="chip approval-needed">approval needed</span>
+        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.</div>
+      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
     </div>
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
+      ${!request.dismissed ? '<button class="btn sm" data-preq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
     </div>
   </div>`).join('');
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
-        <span class="mono">${request.capabilities.map(esc).join(', ')}</span>
+        <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
@@ -13365,10 +14043,10 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.map((request) => {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
-    return `<div class="approval-request" data-areq="${esc(request.id)}">
+    return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
-        <span class="chip approval-needed">approval needed</span>
+        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -13378,6 +14056,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
+      ${canResolve && !request.dismissed ? '<button class="btn sm" data-areq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
     </div>
   </div>`;
   }).join('');
@@ -13397,7 +14076,7 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
         });
-        toast(button.dataset.areqAct === 'deny' ? 'Authorization denied'
+        toast(button.dataset.areqAct === 'dismiss' ? 'Request dismissed' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -13414,10 +14093,10 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
           method: 'POST',
           body: JSON.stringify({ action: button.dataset.preqAct }),
         });
-        const decision = button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
-        toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+        const decision = button.dataset.preqAct === 'dismiss' ? 'Request dismissed' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
-        !result.resume?.resumed && !!result.resume?.reason);
+        button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
         await onResolved?.(result);
       } catch (error) {
         button.disabled = false;
@@ -13466,6 +14145,97 @@ async function importFromConnector(sync, externalIds, onProgress, batchSize = 25
   }
   onProgress?.(totals);
   return totals;
+}
+
+function connectionRows(connections, inTask = false) {
+  const userId = typeof S.user === 'string' ? S.user : S.user?.id;
+  return connections.map(c => {
+    const own = c.ownerId === userId;
+    const canConnect = !c.ownerId || own;
+    const status = { requested: 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
+    const projects = S.projects.filter(p => p.organizationId === c.organizationId);
+    return `<div class="approval-request" data-connection="${esc(c.id)}">
+      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
+        ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
+        <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
+        ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
+          ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
+          <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
+        <span data-connection-result role="status"></span>
+      </div><div class="approval-request-actions">
+        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm primary" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : 'Connect'}${inTask ? ' for this task' : ''}</button>` : ''}
+        ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
+        ${own && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+      </div></div>`;
+  }).join('');
+}
+
+function wireConnectionActions(root, organizationId, refresh) {
+  if (!root) return;
+  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  root.querySelectorAll('[data-connection-action]').forEach(button => button.addEventListener('click', async () => {
+    const row = button.closest('[data-connection]'); const id = row.dataset.connection;
+    const action = button.dataset.connectionAction;
+    const popup = ['connect', 'restart'].includes(action) ? window.open('about:blank', '_blank') : null;
+    if (popup) popup.opener = null;
+    button.disabled = true;
+    try {
+      if (action === 'connect' || action === 'restart') {
+        const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });
+        if (result.url) {
+          if (popup) popup.location.href = result.url;
+          row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
+          button.hidden = true;
+        } else { popup?.close(); await refresh(); }
+      } else {
+        const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
+        await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });
+        await refresh();
+      }
+    } catch (e) { popup?.close(); toast(e.message, true); }
+    finally { button.disabled = false; }
+  }));
+}
+
+async function hydrateConnections(organizationId) {
+  const root = document.getElementById('service-connections'); if (!root) return;
+  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  try {
+    const [config, connections] = await Promise.all([api(`/api/connections/config${oq}`), api(`/api/connections${oq}`)]);
+    if (!root.isConnected) return;
+    root.innerHTML = `${!config.configured ? `<p class="task-sub">An installation administrator needs to configure Composio before accounts can be connected.</p>
+      ${config.canConfigure ? '<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="Composio project API key" autocomplete="off" required aria-label="Composio project API key"><button class="btn sm primary">Set up connections</button></form>' : ''}` : `
+      <form data-connection-search class="inline-form"><input name="search" placeholder="Search apps, e.g. Gmail or Slack" aria-label="Search apps"><button class="btn sm">Search apps</button></form>
+      <div data-connection-catalog></div>`}
+      <div data-connection-list>${connectionRows(connections)}${!connections.length ? '<p class="task-sub">No accounts connected yet.</p>' : ''}</div>`;
+    const refresh = () => hydrateConnections(organizationId);
+    wireConnectionActions(root, organizationId, refresh);
+    root.querySelector('[data-composio-config]')?.addEventListener('submit', async e => {
+      e.preventDefault(); const form = e.currentTarget; const key = form.elements.apiKey.value; form.elements.apiKey.value = '';
+      try { await api(`/api/connections/config${oq}`, { method: 'PUT', body: JSON.stringify({ apiKey: key }) }); await refresh(); }
+      catch (error) { toast(error.message, true); }
+    });
+    root.querySelector('[data-connection-search]')?.addEventListener('submit', async e => {
+      e.preventDefault(); const form = e.currentTarget; const box = root.querySelector('[data-connection-catalog]');
+      box.textContent = 'Searching apps…';
+      try {
+        const apps = await api(`/api/connections/catalog${oq}&search=${encodeURIComponent(form.elements.search.value)}`);
+        box.innerHTML = apps.length ? apps.map(a => `<button type="button" class="btn sm" data-app="${esc(a.slug)}">Connect ${esc(a.name)}</button>`).join(' ') : '<p>No matching apps.</p>';
+        box.querySelectorAll('[data-app]').forEach(button => button.addEventListener('click', async () => {
+          const popup = window.open('about:blank', '_blank'); if (popup) popup.opener = null;
+          button.disabled = true;
+          try {
+            const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ toolkit: button.dataset.app }) });
+            if (popup && result.url) popup.location.href = result.url;
+            box.innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">After signing in, check the account’s status below.</p>`;
+            const list = root.querySelector('[data-connection-list]');
+            list.innerHTML = connectionRows(await api(`/api/connections${oq}`)); wireConnectionActions(list, organizationId, refresh);
+          } catch (error) { popup?.close(); button.disabled = false; toast(error.message, true); }
+        }));
+      } catch (error) { paneError(box, error, () => form.requestSubmit()); }
+    });
+  } catch (error) { if (root.isConnected) paneError(root, error, () => hydrateConnections(organizationId)); }
 }
 
 function passwordsCard() {
@@ -13583,7 +14353,7 @@ async function wireVaultCards(organizationId) {
     };
     const paint = () => {
       list.innerHTML = vaultItems.length
-        ? vaultItems.map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
+        ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
           <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
@@ -13669,7 +14439,7 @@ async function wireVaultCards(organizationId) {
           : item.provenance?.source?.startsWith('connector:')
             ? 'The connected source store is updated too if write-back is on.'
             : 'Metadata and notes are untouched.';
-        const value = prompt(`New ${field} for "${item.label}" (${sourceNote}):`);
+        const value = await promptSecret(`New ${field} for "${item.label}"`, sourceNote);
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
@@ -13946,17 +14716,20 @@ async function wireVaultCards(organizationId) {
   });
   const renderRequests = async () => {
     const rbox = $('#vault-requests-card .vault-requests-list');
-    if (!rbox) return;
+    if (!rbox) { if (refreshVaultRequests === renderRequests) refreshVaultRequests = null; return; }
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
     rbox.innerHTML = credentialRequestRows(requests, items);
     wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
+  refreshVaultRequests = renderRequests; // live: a new/resolved approval repaints this list (connectWs)
   await renderItems();
   await renderConnectors();
   await renderRequests();
 }
+// The organization settings' pending-approvals list, while that page is open.
+let refreshVaultRequests = null;
 
 // ── organization AgentMail inbox ──────────────────────────────────────────────
 function agentMailCard() {
@@ -14137,6 +14910,7 @@ function profileRow(p, scope) {
       ${effortSelectHtml('pf-effort', provider, model, effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
+    ${mcpPickerHtml(inherited ? undefined : p.mcpConnections, p.inherited?.mcpConnections)}
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save agent</button>
       ${p.scope === ownScope ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -14149,6 +14923,8 @@ function profileRow(p, scope) {
 // Standing Confirm/Responder profiles are not shown: those agents are configured
 // directly in their Review route / Responder controls.
 async function hydrateProfiles(scope, projectId, organizationId) {
+  const manage = document.getElementById(projectId ? 'project-mcp-manage' : 'organization-mcp-manage');
+  if (manage) manage.onclick = () => openMcpManager(mcpScope(projectId || null, organizationId));
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
   const renderIsCurrent = beginAsyncElementRender(list);
@@ -14161,6 +14937,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
     : profiles.map((p) => profileRow(p, scope)).join('');
   list.querySelectorAll('[data-profile]').forEach((card) => {
+    wireMcpPicker(card.querySelector('.mcp-picker'), query);
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
     if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
@@ -14175,6 +14952,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       provider: card.querySelector('.pf-provider').value,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
+      mcpConnections: readMcpPicker(card),
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
     };
     const targets = [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
@@ -14221,6 +14999,7 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
   if (!renderIsCurrent()) return;
   box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
     <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  box.dataset.mcpScope = mcpScope(projectId || null, organizationId);
   wireAgentFields(box);
   wireFieldResets(box, [field]);
   const saveButton = box.querySelector('[data-save-review-route]');
@@ -14260,6 +15039,7 @@ function wireGlobalSettings(organizationId) {
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
   wireVaultCards(organizationId);
+  hydrateConnections(organizationId || S.organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
   $('#wf-install')?.addEventListener('click', async () => {
@@ -14297,7 +15077,7 @@ function wireGlobalSettings(organizationId) {
   $('#login-connect')?.addEventListener('click', async () => {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
-    const browserMcp = $('#login-browser').value;
+    const browserMcp = 'none';
     const [modelProvider, authMethod] = provider === 'opencode'
       ? $('#login-opencode-target').value.split('|', 2)
       : [];
@@ -14474,31 +15254,55 @@ function wireInboxView() {
     try { localStorage.setItem('karmax-inbox-show-read', e.target.checked ? '1' : '0'); } catch {}
     renderMain();
   });
-  $('#inbox-read-all')?.addEventListener('click', async () => {
+  $('#inbox-read-all')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     try {
-      await Promise.all(inboxItems().filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
-      await loadCollaboration(); renderMain(); renderRail();
+      await markVisibleInboxRead();
     } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
   });
 }
 
+async function markVisibleInboxRead() {
+  const organizationId = S.organizationId;
+  const items = inboxItems().filter((item) => item.unread);
+  const results = await Promise.allSettled(items.map(async (item) => {
+    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(organizationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ unread: false }),
+    });
+    if (!saved) throw new Error('Notification could not be marked read.');
+  }));
+  if (S.organizationId === organizationId) {
+    items.forEach((item, index) => {
+      if (results[index].status !== 'fulfilled') return;
+      const current = S.inbox.find((candidate) => candidate.id === item.id);
+      if (current) current.unread = false;
+    });
+    // Invalidate reads started before the mutation; they may contain stale unread flags.
+    S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+    updateBell(); renderMain(); renderRail();
+  }
+  const failed = results.filter((result) => result.status === 'rejected');
+  if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
+}
+
 // ── notification behaviour, per urgency ─────────────────────────────────────
-// The list is where asks live; this is what an ask DOES when it arrives. Both
-// behaviours only make sense where the person actually is, so — like the theme —
-// they are per-browser: a system notification needs this browser's permission,
-// and a sound can only be heard here.
+// Browser alerts are local to this device; email preferences are stored on the server.
 const NOTIFY_BEHAVIOURS = [
   { key: 'notify', label: 'System notification' },
   { key: 'sound', label: 'Sound' },
+  { key: 'visual', label: 'Show in app' },
+  { key: 'email', label: 'Email' },
 ];
 // Sensible defaults: silence is the floor, and each level up interrupts a little
 // more. Nothing below high interrupts at all — an inbox that pings for routine
 // news is one people turn off entirely.
 const NOTIFY_DEFAULTS = {
-  critical: { notify: true, sound: true },
-  high: { notify: true, sound: false },
-  normal: { notify: false, sound: false },
-  low: { notify: false, sound: false },
+  critical: { notify: true, sound: true, visual: true },
+  high: { notify: true, sound: false, visual: false },
+  normal: { notify: false, sound: false, visual: false },
+  low: { notify: false, sound: false, visual: false },
 };
 function notifyPrefs() {
   let stored = {};
@@ -14524,12 +15328,39 @@ function announceInbox(items) {
   for (const item of [...items].sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency))) {
     const behaviour = prefs[item.urgency] || prefs.normal;
     if (behaviour.notify) showSystemNotification(item);
+    if (behaviour.visual) showVisualNotification(item);
     // One sound per batch. `items` is urgency-ordered, so the first level that
     // asks for a sound is the loudest one that arrived — five asks landing
     // together are a single event to the person hearing it.
     if (behaviour.sound && !sounded) { playNotificationSound(item.urgency); sounded = true; }
   }
 }
+function showVisualNotification(item) {
+  let region = document.getElementById('notification-alerts');
+  if (!region) {
+    region = document.createElement('div');
+    region.id = 'notification-alerts';
+    region.setAttribute('aria-live', 'polite');
+    document.body.append(region);
+  }
+  const old = [...region.children].find((node) => node.dataset.id === item.id);
+  old?.remove();
+  const alert = document.createElement('div');
+  alert.className = 'notification-alert';
+  alert.dataset.id = item.id;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(item); };
+  alert.lastElementChild.onclick = () => alert.remove();
+  region.prepend(alert);
+  while (region.children.length > 5) region.lastElementChild.remove();
+}
+function notificationSoundPrefs() {
+  let stored;
+  try { stored = JSON.parse(localStorage.getItem('karmax-notify-sound') || '{}'); } catch {}
+  return { tone: ['bell', 'chime', 'soft'].includes(stored?.tone) ? stored.tone : 'bell',
+    duration: [0.35, 1, 3, 5].includes(stored?.duration) ? stored.duration : 0.35 };
+}
+
 function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
@@ -14557,18 +15388,20 @@ function unlockNotificationAudio() {
 document.addEventListener('pointerdown', unlockNotificationAudio, { passive: true });
 document.addEventListener('keydown', unlockNotificationAudio);
 
-// Synthesized rather than shipped: no asset to fetch, no volume surprise, and a
-// critical ask simply gets a second blip instead of a different sound to learn.
+// Synthesize the selected tone locally, with bounded duration and a gentle envelope.
 function playNotificationSound(urgency = 'normal') {
   const Ctx = typeof window === 'undefined' ? null : (window.AudioContext || window.webkitAudioContext);
   if (!Ctx) return false;
   try {
     const ctx = S.audio || (S.audio = new Ctx());
     ctx.resume?.()?.catch?.(() => {});
-    for (const offset of urgency === 'critical' ? [0, 0.18] : [0]) {
+    const { tone, duration } = notificationSoundPrefs();
+    const offsets = duration === 0.35 ? (urgency === 'critical' ? [0, 0.18] : [0])
+      : Array.from({ length: Math.ceil(duration / 0.4) }, (_, i) => i * 0.4);
+    for (const offset of offsets) {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
-      oscillator.frequency.value = urgency === 'critical' ? 880 : 660;
+      oscillator.frequency.value = tone === 'soft' ? 440 : tone === 'chime' ? (offset ? 1046 : 784) : urgency === 'critical' ? 880 : 660;
       oscillator.connect(gain).connect(ctx.destination);
       const at = ctx.currentTime + offset;
       gain.gain.setValueAtTime(0.0001, at);
@@ -14705,10 +15538,10 @@ async function hydrateProfileGithub() {
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileWalkthroughCard(userId) {
-  if (!S.installationAccess || !S.meta?.hosted || !userId) return '';
+  if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
   return `<div class="card"><div class="section-h">Walkthrough</div>
-    <p class="task-sub">Show this user's setup walkthrough again in each organization. Existing work and connections are preserved.</p>
-    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Reset walkthrough</button></div>`;
+    <p class="task-sub">Restart the setup walkthrough in each organization. Existing work and connections are preserved.</p>
+    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Restart walkthrough</button></div>`;
 }
 
 function profileView() {
@@ -14726,19 +15559,8 @@ function profileView() {
   const email = u?.email || '';
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
   const orgs = S.organizations || [];
-  // Every organization the user belongs to (owns or was added to), each linking
-  // to its dashboard. Role comes from the membership loaded alongside the org.
   const orgList = orgs.length
-    ? orgs.map((o) => `<div class="profile-org">
-        <a class="profile-org-link" data-spa href="${globalRoute('dashboard', o)}">
-          <span class="profile-org-mark">◇</span>
-          <span class="profile-org-name">${esc(o.name)}</span>
-          ${o.kind === 'personal' ? '<span class="chip">personal</span>' : ''}
-        </a>
-        ${o.id === S.defaultOrganizationId
-          ? '<span class="chip success">Default</span>'
-          : `<button class="btn sm" type="button" data-default-organization="${esc(o.id)}">Set as default</button>`}
-      </div>`).join('')
+    ? organizationComboHtml('default-organization', S.defaultOrganizationId, 'Default organization')
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
@@ -14830,8 +15652,8 @@ function profileView() {
       ${profileGithubFields()}
     </div>
     <div class="card">
-      <div class="section-h">Organizations</div>
-      <div class="profile-orgs">${orgList}</div>
+      <div class="section-h">Default organization</div>
+      <p class="task-sub">Select your default organization. It opens when you sign in.</p><div class="profile-orgs">${orgList}</div>
     </div>
     ${notificationsCard()}
     <div class="card">
@@ -14868,11 +15690,13 @@ function profileView() {
 // asks; it does not configure them.
 function notificationsCard() {
   const prefs = notifyPrefs();
+  const sound = notificationSoundPrefs();
+  const emailReady = S.meta?.deliveryChannels?.includes('email');
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     granted: '<p class="task-sub">This browser may show system notifications.</p>',
-    denied: '<p class="task-sub">This browser is blocking notifications — allow them in its site settings, or the levels above can only play a sound.</p>',
-    unsupported: '<p class="task-sub">This browser cannot show system notifications; sounds still work.</p>',
+    denied: '<p class="task-sub">This browser is blocking system notifications. Allow them in its site settings; in-app alerts and sounds still work.</p>',
+    unsupported: '<p class="task-sub">This browser cannot show system notifications; in-app alerts and sounds still work.</p>',
     default: '<button class="btn sm" id="notify-permission" type="button">Allow system notifications</button>',
   }[permission] ?? '';
   // Loudest first, the same order the inbox itself is in.
@@ -14887,23 +15711,54 @@ function notificationsCard() {
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level}</span>
         ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
-          aria-label="${behaviour.label} for ${level} urgency" ${prefs[level][behaviour.key] ? 'checked' : ''}/></span>`).join('')}
-        <span><button class="btn sm" type="button" data-notify-test="${level}">Test</button></span>
+          aria-label="${behaviour.label} for ${level} urgency" ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
+        <span><button class="btn sm" type="button" data-notify-test="${level}" title="Test browser alerts">Test</button></span>
       </div>`).join('')}
     </div>
+    <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
+      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : duration + ' seconds'}</option>`).join('')}</select></label>
+      <button class="btn sm" id="notify-preview">Preview sound</button></div>
+    <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
     ${permissionNote}
-    <p class="task-sub">These choices apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
+    <p class="task-sub">System notifications, in-app alerts, and sounds apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
 function wireNotificationsCard() {
+  const organizationId = S.organizationId;
+  api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`).then((prefs) => {
+    if (S.organizationId !== organizationId) return;
+    S.deliveryPreferences = prefs;
+    document.querySelectorAll('[data-notify$=":email"]').forEach((box) => {
+      box.checked = prefs.emailUrgencies?.[box.dataset.notify.split(':')[0]] ?? prefs.email;
+      box.disabled = !S.meta?.deliveryChannels?.includes('email');
+    });
+  }).catch((error) => toast(error.message, true));
+  for (const id of ['notify-tone', 'notify-duration']) $('#' + id)?.addEventListener('change', () => {
+    try { localStorage.setItem('karmax-notify-sound', JSON.stringify({ tone: $('#notify-tone').value, duration: Number($('#notify-duration').value) })); } catch {}
+  });
+  $('#notify-preview')?.addEventListener('click', () => playNotificationSound('critical'));
+
   // The inbox links here by anchor. A SPA render is not a document load, so the
   // browser never honours the fragment on its own — arriving at the profile and
   // being left at the top would make that link a lie.
   if (location.hash === '#notifications')
     requestAnimationFrame(() => $('#notifications')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
-  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', () => {
+  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', async () => {
     const [level, behaviour] = box.dataset.notify.split(':');
+    if (behaviour === 'email') {
+      const boxes = [...document.querySelectorAll('[data-notify$=":email"]')];
+      boxes.forEach((input) => input.disabled = true);
+      try {
+        const prefs = S.deliveryPreferences;
+        const emailUrgencies = Object.fromEntries(URGENCY_LEVELS.map((key) => [key, prefs.emailUrgencies?.[key] ?? prefs.email]));
+        emailUrgencies[level] = box.checked;
+        const saved = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PUT', body: JSON.stringify({ ...prefs, emailUrgencies }) });
+        if (S.organizationId === organizationId) S.deliveryPreferences = saved;
+      } catch (error) { box.checked = !box.checked; toast(error.message, true); }
+      finally { boxes.forEach((input) => input.disabled = false); }
+      return;
+    }
     setNotifyPref(level, behaviour, box.checked);
     // Turning a level on is the natural moment to ask for the permission it needs.
     if (box.checked && behaviour === 'notify' && typeof Notification !== 'undefined' && Notification.permission === 'default')
@@ -14912,12 +15767,13 @@ function wireNotificationsCard() {
   $('#main').querySelectorAll('[data-notify-test]').forEach((button) => button.addEventListener('click', () => {
     const level = button.dataset.notifyTest;
     const behaviour = notifyPrefs()[level];
+    if (behaviour.visual) showVisualNotification({ id: `test-${level}`, urgency: level, kind: 'escalated', task: { title: `Test ${level} notification` } });
     if (behaviour.sound) playNotificationSound(level);
     const shown = behaviour.notify && showSystemNotification({ id: `test-${level}`, urgency: level,
       kind: 'escalated', task: { title: `Test ${level} notification` } });
     toast(behaviour.notify && !shown
       ? 'Allow notifications in this browser to see the popup.'
-      : behaviour.notify || behaviour.sound ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
+      : behaviour.notify || behaviour.sound || behaviour.visual ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
     behaviour.notify && !shown);
   }));
   $('#notify-permission')?.addEventListener('click', async () => {
@@ -14931,25 +15787,24 @@ function wireProfileView() {
   reset?.addEventListener('click', async () => {
     reset.disabled = true;
     try {
-      await api(`/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
-      toast('Walkthrough reset. The user will see it when they next open their workspace.');
+      const ownProfile = reset.dataset.userId === S.user?.id;
+      await api(ownProfile ? '/api/user/onboarding/reset'
+        : `/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
+      if (ownProfile) await refreshOnboarding();
+      toast(ownProfile ? 'Walkthrough restarted.' : 'Walkthrough restarted. The user will see it when they next open their workspace.');
     } catch (error) { toast(error.message, true); }
     finally { reset.disabled = false; }
   });
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   hydrateProfileGithub();
-  document.querySelectorAll('[data-default-organization]').forEach((button) => button.addEventListener('click', async () => {
-    button.disabled = true;
-    try {
-      const preference = await api('/api/user/default-organization', {
-        method: 'PUT', body: JSON.stringify({ organizationId: button.dataset.defaultOrganization }),
-      });
-      S.defaultOrganizationId = preference.organizationId;
-      renderMain();
-      toast('Default organization updated');
-    } catch (error) { toast(error.message, true); button.disabled = false; }
-  }));
+  wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
+    const preference = await api('/api/user/default-organization', {
+      method: 'PUT', body: JSON.stringify({ organizationId }),
+    });
+    S.defaultOrganizationId = preference.organizationId;
+    toast('Default organization updated');
+  });
   const setProfileEditor = (kind) => {
     document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
       panel.hidden = panel.id !== `profile-${kind}-panel`;
@@ -15362,7 +16217,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-avatars">Avatars</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-tools">Tools</a><a href="#settings-defaults">Task defaults</a><a href="#settings-connections">Connected apps</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
@@ -15374,6 +16229,13 @@ function organizationView() {
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card"><label class="form-row">Organization name visibility
+      <select id="organization-name-visibility" disabled>
+        <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Only people added to this organization</option>
+        <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>All users</option>
+      </select></label><p class="task-sub">Controls whether your organization’s name appears in organization search. Access to projects and settings still requires authorization. The operator can always find every organization.</p></div>
+    <div class="card" id="organization-roles">Loading roles…</div>
+    <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
@@ -15381,13 +16243,13 @@ function organizationView() {
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
-    <div class="settings-section-title" id="settings-avatars"><div>Avatars<small>Organization-wide availability</small></div></div>
-    ${AVATAR_RISK_NOTE}
-    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
-
     ${globalSettingsView(true)}
 
-    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div><div id="org-misc-slot"></div>
+    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="settings-section-title" id="settings-experimental"><div>Experimental<small>Optional features for this organization</small></div></div>
+    ${AVATAR_RISK_NOTE}
+    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
+    <div id="org-misc-slot"></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
     <div class="card data-export-card" data-settings-access="organization" hidden>
       <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
@@ -15439,6 +16301,69 @@ function appendPendingInvitation(invitation, projects) {
   box.insertAdjacentHTML('beforeend', pendingInvitationRow(invitation, projects));
 }
 
+function roleAllows(patterns, capability) {
+  return patterns.some((pattern) => pattern === '*' || pattern === capability
+    || (pattern.endsWith(':*') && capability.startsWith(pattern.slice(0, -1))));
+}
+
+function roleCapabilityTree(groups, capabilities, selectable = false) {
+  return groups.map((group) => {
+    const included = group.capabilities.filter((cap) => roleAllows(capabilities, cap.id));
+    if (!included.length) return '';
+    return `<details class="role-capability-group"><summary>${esc(group.label)} <span class="chip">${included.length}</span></summary>
+      <p class="task-sub">${esc(group.description)}</p><ul>${included.map((cap) => `<li>
+        ${selectable ? `<label><input type="checkbox" name="capability" value="${esc(cap.id)}"><b>${esc(cap.label)}</b></label>` : `<b>${esc(cap.label)}</b>`}
+        <code>${esc(cap.id)}</code><p class="task-sub">${esc(cap.description)}</p></li>`).join('')}</ul></details>`;
+  }).join('');
+}
+
+function renderOrganizationRoles() {
+  const root = $('#organization-roles');
+  if (!root) return;
+  const catalog = S.authorizationCatalog;
+  if (!catalog) { root.textContent = 'Could not load roles. Reload this page to try again.'; return; }
+  const levels = authorizationLevels();
+  root.innerHTML = `<div class="section-h">Roles &amp; capabilities</div>
+    <p class="task-sub">Expand a role, then a category to inspect its exact capabilities. Access is limited by the selected projects or organization and by the person granting it. Task actions also depend on workflow state.</p>
+    ${catalog.profiles.slice().sort((a, b) => levels.findIndex((level) => level.id === a.id) - levels.findIndex((level) => level.id === b.id)).map((role) => `<details class="authorization-role">
+      <summary><b>${esc(role.name)}</b><span class="chip">${role.builtin ? 'Built-in' : 'Custom'}</span></summary>
+      <p class="task-sub">${esc(role.description)}</p>
+      ${roleCapabilityTree(catalog.capabilityGroups, role.capabilities)}
+      <details class="role-capability-group"><summary>Exact grant patterns</summary><p class="task-sub">A wildcard (*) grants every matching capability, including future additions. Scope limits still apply; for example, project scope excludes Review-gate approval.</p><ul>${role.capabilities.map((cap) => `<li><code>${esc(cap)}</code></li>`).join('')}</ul></details>
+    </details>`).join('')}
+    ${catalog.canCreate ? `<details class="authorization-role"><summary><b>Create role</b></summary>
+      <form id="create-authorization-role">
+        <label class="form-row">Role name<input name="name" required maxlength="80" placeholder="Release coordinator"></label>
+        <label class="form-row">Description<input name="description" required maxlength="240" placeholder="What this role can do"></label>
+        <p class="task-sub">Choose specific capabilities. Only permissions you can grant within this organization are available. New roles are available for people and tasks; existing grants stay unchanged.</p>
+        ${roleCapabilityTree(catalog.capabilityGroups, catalog.creatableCapabilities, true)}
+        <p class="task-sub" id="role-selection-count" aria-live="polite">0 capabilities selected</p>
+        <p class="task-sub" id="role-create-error" role="alert"></p>
+        <button class="btn primary" type="submit">Create role</button>
+      </form></details>` : ''}
+  `;
+  const form = root.querySelector('form');
+  form?.addEventListener('change', () => {
+    root.querySelector('#role-selection-count').textContent = `${form.querySelectorAll('[name=capability]:checked').length} capabilities selected`;
+  });
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const capabilities = data.getAll('capability');
+    const error = root.querySelector('#role-create-error');
+    if (!capabilities.length) { error.textContent = 'Select at least one capability.'; return; }
+    const button = form.querySelector('[type=submit]');
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${S.organizationId}/roles`, { method: 'POST',
+        body: JSON.stringify({ name: data.get('name'), description: data.get('description'), capabilities }) });
+      await loadCollaboration();
+      await hydrateOrganizationView();
+      toast('Role created');
+    } catch (e) { error.textContent = e.message; button.disabled = false; }
+  });
+}
+
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -15448,6 +16373,7 @@ async function hydrateOrganizationView() {
     && !!$('#org-members');
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
+  hydrateConversationSharing('organization', organizationId);
   hydrateAvatarAvailability('organization', organizationId);
   hydrateOrganizationSubscription(organizationId);
   await loadCollaboration().catch(() => {});
@@ -15456,6 +16382,25 @@ async function hydrateOrganizationView() {
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  const visibility = $('#organization-name-visibility');
+  if (visibility) {
+    visibility.disabled = !S.authorizationCatalog?.canCreate;
+    visibility.onchange = async () => {
+      visibility.disabled = true;
+      try {
+        const updated = await api(`/api/organizations/${organizationId}`, {
+          method: 'PATCH', body: JSON.stringify({ nameVisibility: visibility.value }),
+        });
+        const organization = organizationById(organizationId);
+        if (organization) organization.nameVisibility = updated.nameVisibility;
+        toast('Organization name visibility updated');
+      } catch (error) {
+        visibility.value = organizationById(organizationId)?.nameVisibility || 'members';
+        toast(error.message, true);
+      } finally { visibility.disabled = !S.authorizationCatalog?.canCreate; }
+    };
+  }
+  renderOrganizationRoles();
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
@@ -15734,7 +16679,7 @@ async function hydrateOrganizationView() {
 
 async function createOrganization() {
   const name = prompt('Organization name');
-  if (!name) { if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; return; }
+  if (!name) { syncOrganizationSwitcher(); return; }
   try {
     const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
     await loadOrganizations();
@@ -15744,7 +16689,7 @@ async function createOrganization() {
     await refreshOnboarding();
     renderShell();
     await go(globalRoute('organization'));
-  } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }
+  } catch (error) { toast(error.message, true); syncOrganizationSwitcher(); }
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
@@ -15882,6 +16827,12 @@ function fmtKeys(binding) {
     .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
     .join(' ');
 }
+function commandHint(label, id, next) {
+  const declared = (S.contributions?.commands || []).find((command) => command.id === id);
+  const binding = declared ? declared.keybinding : HOST_COMMANDS.find((command) => command.id === id)?.key;
+  const keys = [binding && fmtKeys(binding), next].filter(Boolean).join(' → ');
+  return keys ? `${label} (${keys})` : label;
+}
 // Subsequence fuzzy match: score (higher = better), or -1 for no match.
 function fuzzyScore(q, s) {
   if (!q) return 0;
@@ -15926,12 +16877,14 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', run: h.run });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', available: !(['nav.newTask', 'nav.search'].includes(h.id) && inRail()), run: h.run });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
+  add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
+  add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
   const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
   add({ id: 'list.quickAdd', title: 'Add quick task', keybinding: 'meta+Enter', group: 'List', palette: false, available: !!$('#add-task'), run: () => $('#add-task')?.click() });
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
@@ -15954,6 +16907,10 @@ function allCommands() {
   // page's tabs. Documented in the help panel's static "On a task page" section
   // (help: false here) so they're discoverable before a page is open.
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
+  const attemptsAvailable = !!(S.selected && S.view && document.querySelectorAll('[data-attempt-select]').length > 1);
+  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: 'a ]', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
+  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: 'a [', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
+  add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
   add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
@@ -16001,7 +16958,9 @@ async function runDeclaredAction(a) {
   if (!confirmTaskAction(a.name, S.view)) return;
   const taskId = S.selected;
   try {
-    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    const choice = await otherAttemptsConfirmation(a.name, taskId);
+    if (choice === null) return;
+    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name, ...choice }) });
     reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, taskActionLabel(S.view, a)));
     setTimeout(refreshTask, 250);
@@ -16078,7 +17037,8 @@ function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId)
 // A data-id row navigates through its .row-link `<a>` overlay (the delegated
 // link router only fires for anchors), so click that; draft rows carry their
 // own click handler on the div, so fall back to the row itself.
-function openCursorRow() { const r = cursorRow(); if (r) (r.querySelector('a.row-link') || r).click(); }
+function openListRow(row) { if (row) (row.querySelector('a.row-link') || row).click(); }
+function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
@@ -16095,11 +17055,15 @@ function openAdjacentTask(delta) {
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
-function railRows() { return [...document.querySelectorAll('#rail .rail-add, #rail .project-link, #rail .folder-toggle, #rail .nav-item')]; }
+function railRows() {
+  // Search results are projects; skip their folder headings during a filtered walk.
+  const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
+  return [...document.querySelectorAll('#rail .rail-add, #project-search, #rail .project-link, #rail .nav-item' + folders)];
+}
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();
-  (rows.find((r) => r.dataset.id === S.projectId) || rows[0])?.focus();
+  (rows.find((r) => r.dataset.project === S.projectId) || rows[0])?.focus();
 }
 function moveRail(delta) {
   const rows = railRows();
@@ -16163,12 +17127,13 @@ function bindKeys() {
     const t = e.target;
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
-    if (e.defaultPrevented) return;
+    if (e.defaultPrevented || e.isComposing) return;
     // The check-in terminal is a focusable <pre> that behaves like a text field:
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
     const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (typing) {
+      resetChord();
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
@@ -16180,7 +17145,11 @@ function bindKeys() {
     if (focusedAction === 'native') return;
     if (focusedAction === 'click') {
       e.preventDefault();
-      t.closest('[role="button"], [tabindex="0"]').click();
+      const control = t.closest('[role="button"], [tabindex="0"]');
+      // List rows navigate through their link overlay, not a container click.
+      // Use the focused control so buttons/chips inside a row keep their action.
+      if (control.matches('#main .task-row, #main .queue-item')) openListRow(control);
+      else control.click();
       return;
     }
     if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
@@ -16410,6 +17379,8 @@ function openHelp() {
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
       ${row('[ / ]', 'Previous / next tab')}
+      ${row('a [ / a ]', 'Previous / next attempt')}
+      ${row('a n', 'New attempt (open editable draft)')}
       ${row('{ / }', 'Previous / next Check-in pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
@@ -16605,7 +17576,7 @@ function renderLanding() {
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation">
-      <a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a>
+      <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
       <div class="landing-nav-actions">
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
@@ -16716,7 +17687,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
@@ -16998,3 +17969,212 @@ function renderSetup() {
 }
 
 boot().catch((e) => { console.error(e); document.getElementById('app').innerHTML = `<div class="empty"><div class="big">Failed to load</div>${esc(e.message)}</div>`; });
+
+// MCP choices belong to the agent, independent of the model login.
+function mcpScope(projectId = S.projectId, organizationId = S.organizationId) {
+  return projectId ? `?projectId=${encodeURIComponent(projectId)}` : `?organizationId=${encodeURIComponent(organizationId)}`;
+}
+function mcpPickerHtml(value, inherited) {
+  return `<div class="mcp-picker" data-value='${esc(JSON.stringify(value ?? null))}' data-inherited='${esc(JSON.stringify(inherited ?? null))}'>
+    <div class="mcp-picker-heading"><b>Tools</b><button type="button" class="btn sm mcp-manage">Manage connections</button></div>
+    <details class="mcp-choices"><summary>Loading tools…</summary><input class="mcp-filter" type="search" aria-label="Search tool connections" placeholder="Search connections…"><div class="mcp-options" role="group" aria-label="Tool connections"></div></details>
+    <label class="mcp-inherit"><input type="checkbox" ${value === undefined ? 'checked' : ''}> Use inherited tools</label><div class="mcp-picker-status" role="status"></div>
+  </div>`;
+}
+function readMcpPicker(root) {
+  const picker = root.querySelector('.mcp-picker');
+  if (!picker || picker.querySelector('.mcp-inherit input').checked) return undefined;
+  return JSON.parse(picker.dataset.value || '[]') || [];
+}
+async function wireMcpPicker(picker, query = mcpScope()) {
+  if (!picker) return;
+  picker.dataset.scope = query;
+  const inherited = JSON.parse(picker.dataset.inherited || 'null');
+  const own = JSON.parse(picker.dataset.value || 'null');
+  let selected = new Set(own ?? inherited ?? []);
+  let connections = [];
+  const defaults = [{ id: 'browser:chrome-devtools', label: 'Chrome DevTools', enabled: true }, { id: 'browser:playwright', label: 'Playwright', enabled: true }];
+  function paint() {
+    const all = [...defaults, ...connections];
+    for (const id of selected) if (!all.some((c) => c.id === id)) all.push({ id, label: 'Unavailable connection', enabled: false });
+    const filter = picker.querySelector('.mcp-filter').value.toLowerCase();
+    picker.querySelector('.mcp-options').innerHTML = all.filter((c) => c.label.toLowerCase().includes(filter)).map((c) =>
+      `<label class="mcp-option"><input type="checkbox" value="${esc(c.id)}" ${selected.has(c.id) ? 'checked' : ''} ${!c.enabled && !selected.has(c.id) ? 'disabled' : ''}><span>${esc(c.label)}${!c.enabled ? ' · unavailable' : c.connected === false ? ' · needs connection' : ''}</span></label>`).join('');
+    const names = [...selected].map((id) => all.find((c) => c.id === id)?.label || id);
+    const inherit = picker.querySelector('.mcp-inherit input').checked;
+    picker.querySelector('summary').textContent = names.length ? `${names.join(', ')}${inherit ? ' · inherited' : ''}` : inherit && inherited === null ? 'Inherited · account browser if configured' : 'Karmax tools only';
+    picker.dataset.value = JSON.stringify([...selected]);
+  }
+  picker.querySelector('.mcp-filter').oninput = paint;
+  picker.querySelector('.mcp-options').onchange = (event) => {
+    const input = event.target;
+    if (input.checked) {
+      if (input.value.startsWith('browser:')) for (const id of [...selected]) if (id.startsWith('browser:')) selected.delete(id);
+      selected.add(input.value);
+    } else selected.delete(input.value);
+    picker.querySelector('.mcp-inherit input').checked = false;
+    paint(); picker.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  picker.querySelector('.mcp-inherit input').onchange = (event) => {
+    if (event.target.checked) selected = new Set(inherited ?? []);
+    paint();
+  };
+  picker.querySelector('.mcp-manage').onclick = () => openMcpManager(query, async () => {
+    connections = await api(`/api/mcp${query}`); paint();
+    for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
+  });
+  try { connections = await api(`/api/mcp${query}`); paint(); }
+  catch (e) { paint(); picker.querySelector('.mcp-picker-status').textContent = e.message; }
+}
+async function openMcpManager(query, changed = async () => {
+  await Promise.all([...document.querySelectorAll('.mcp-picker')].filter((p) => p.dataset.scope === query).map((p) => wireMcpPicker(p, query)));
+}) {
+  const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog'; dialog.setAttribute('aria-label', 'MCP connections');
+  dialog.innerHTML = `<div class="mcp-dialog-header"><div><h2>MCP connections</h2><p>Connect tools once, then choose them for any agent.</p></div><button type="button" class="btn sm mcp-close" aria-label="Close connections">✕</button></div>
+    <div class="mcp-manager-list">Loading connections…</div><button type="button" class="btn primary mcp-add">Add connection</button><div class="mcp-editor" hidden></div><p class="mcp-message" role="status"></p>`;
+  document.body.append(dialog); dialog.showModal();
+  dialog.querySelector('.mcp-close').onclick = () => dialog.close();
+  dialog.addEventListener('close', () => dialog.remove());
+  const message = (s) => { dialog.querySelector('.mcp-message').textContent = s; };
+  async function load() {
+    const connections = await api(`/api/mcp${query}`);
+    const pid = new URLSearchParams(query).get('projectId') || undefined;
+    dialog.querySelector('.mcp-manager-list').innerHTML = connections.length ? connections.map((c) => `<div class="mcp-connection-row"><div><b>${esc(c.label)}</b><small>${esc(c.registry ? `${c.registry.name} · ${c.registry.version}` : c.transport.type === 'stdio' ? 'Custom process' : new URL(c.transport.url).hostname)} · ${c.enabled ? c.connected ? 'Ready to use' : 'Needs authentication' : 'Disabled'}${c.projectId !== pid ? ' · organization connection' : ''}</small></div><div>${c.projectId === pid ? `${c.transport.type !== 'stdio' ? `<button type="button" class="btn sm" data-mcp-test="${c.id}">Test</button>` : ''}${c.auth === 'oauth' ? `<button type="button" class="btn sm" data-mcp-connect="${c.id}">Connect</button>` : ''}<button type="button" class="btn sm" data-mcp-edit="${c.id}">Edit</button><button type="button" class="btn sm" data-mcp-delete="${c.id}">Remove</button>` : ''}</div></div>`).join('') : '<p>No connections yet. Add one from the Official MCP Registry or use your own server.</p>';
+    dialog.querySelectorAll('[data-mcp-edit]').forEach((b) => { b.onclick = () => editor(connections.find((c) => c.id === b.dataset.mcpEdit)); });
+    dialog.querySelectorAll('[data-mcp-delete]').forEach((b) => { b.onclick = async () => {
+      if (b.dataset.confirm !== 'yes') { b.dataset.confirm = 'yes'; b.textContent = 'Confirm removal'; return; }
+      try { await api(`/api/mcp/${b.dataset.mcpDelete}${query}`, { method: 'DELETE' }); await load(); await changed(); } catch (e) { message(e.message); }
+    }; });
+    dialog.querySelectorAll('[data-mcp-test]').forEach((b) => { b.onclick = async () => {
+      b.disabled = true; message('Testing connection…');
+      try { const result = await api(`/api/mcp/${b.dataset.mcpTest}/test${query}`, { method: 'POST', body: '{}' }); message(`Connection works · ${result.tools}${result.moreTools ? '+' : ''} tools${result.resources ? ' · resources' : ''}${result.prompts ? ' · prompts' : ''}`); }
+      catch (e) { message(e.message); } finally { b.disabled = false; }
+    }; });
+    dialog.querySelectorAll('[data-mcp-connect]').forEach((b) => { b.onclick = () => authorize(b.dataset.mcpConnect); });
+  }
+  async function authorize(id, existingWindow) {
+    const popup = existingWindow || window.open('about:blank', '_blank');
+    if (!popup) { message('Allow pop-ups, then click Connect to sign in. Your form is preserved.'); return; }
+    try {
+      const result = await api(`/api/mcp/${id}/authorize${query}`, { method: 'POST', body: '{}' });
+      const authUrl = new URL(result.authorizationUrl), state = authUrl.searchParams.get('state');
+      popup.sessionStorage.setItem(`mcp-oauth:${state}`, JSON.stringify({ id, query, popup: true, back: location.pathname + location.search + location.hash }));
+      // The authorization site must never gain a reference to the task form.
+      popup.opener = null;
+      const channel = new BroadcastChannel(`mcp-oauth:${state}`);
+      const timeout = setTimeout(() => channel.close(), 600000);
+      channel.onmessage = async (event) => {
+        if (event.data !== 'connected') return;
+        clearTimeout(timeout); channel.close();
+        if (dialog.isConnected) { message('Connected. Your agent can now use these tools.'); await load(); await changed(); }
+      };
+      popup.location.replace(authUrl.href);
+      message('Complete sign-in in the new tab. This form will stay here.');
+    } catch (e) { popup.close(); message(e.message); }
+  }
+  function editor(existing) {
+    const box = dialog.querySelector('.mcp-editor'); box.hidden = false;
+    box.innerHTML = `<h3>${existing ? 'Edit connection' : 'Add connection'}</h3>${existing ? '' : `<div class="mcp-registry-search"><label>Official MCP Registry<input type="search" class="mcp-registry-query" placeholder="Search servers, e.g. GitHub" /></label><button type="button" class="btn sm mcp-search">Search</button></div><div class="mcp-registry-results" aria-live="polite"></div><p class="task-sub">Registry listings identify publishers; they are not a security certification. Or enter a custom server below.</p>`}
+      <form class="mcp-connection-form"><label>Connection name<input class="mcp-label" required maxlength="120" placeholder="GitHub — work" value="${esc(existing?.label || '')}"></label>
+      <label>Connection type<select class="mcp-type"><option value="http">Remote HTTPS</option><option value="sse">Remote HTTPS (SSE)</option><option value="stdio">Process in task environment</option></select></label>
+      <label class="mcp-url-row">Server URL<input class="mcp-url" type="url" placeholder="https://example.com/mcp"></label>
+      <div class="mcp-process" hidden><label>Command<input class="mcp-command" placeholder="npx"></label><label>Arguments (JSON array)<textarea class="mcp-args" rows="3" spellcheck="false">[]</textarea></label><label>Public environment values (JSON object)<textarea class="mcp-env" rows="2" spellcheck="false">{}</textarea></label><p class="task-sub">Runs with access to this task’s files. Use pinned package versions. The task environment must provide the command.</p></div>
+      <label>Authentication<select class="mcp-auth"><option value="none">No authentication</option><option value="oauth">Sign in with OAuth</option><option value="secrets">API key / secret values</option></select></label>
+      <div class="mcp-secrets" hidden><p class="task-sub">HTTP header names for remote servers; environment variable names for processes. Saved values are kept in the vault.</p><div class="mcp-secret-fields"></div><button type="button" class="btn sm mcp-secret-add">Add secret</button>${existing?.secretNames?.length ? '<p>Leave existing values blank to keep them.</p>' : ''}</div>
+      <div class="mcp-registry-fields"></div><label class="mcp-enabled"><input type="checkbox" ${existing?.enabled !== false ? 'checked' : ''}> Enabled</label>
+      <div class="mcp-form-actions"><button class="btn primary" type="submit">Save connection</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button></div></form>`;
+    const form = box.querySelector('form'); let registry = existing?.registry; let fields = []; let secretDirty = false;
+    const type = form.querySelector('.mcp-type'); const auth = form.querySelector('.mcp-auth');
+    function sync() {
+      const process = type.value === 'stdio';
+      form.querySelector('.mcp-url-row').hidden = process; form.querySelector('.mcp-url').required = !process;
+      form.querySelector('.mcp-process').hidden = !process; form.querySelector('.mcp-command').required = process;
+      auth.querySelector('[value="oauth"]').disabled = process;
+      if (process && auth.value === 'oauth') auth.value = 'secrets';
+      form.querySelector('.mcp-secrets').hidden = auth.value !== 'secrets';
+    }
+    function addSecret(name = '', value = '') {
+      const row = document.createElement('div'); row.className = 'mcp-secret-row';
+      row.innerHTML = `<input class="mcp-secret-name" aria-label="Secret name" placeholder="${type.value === 'stdio' ? 'API_KEY' : 'Authorization'}" value="${esc(name)}"><input class="mcp-secret-value" type="password" autocomplete="new-password" aria-label="Secret value" placeholder="${existing ? 'Saved value unchanged' : 'Secret value'}" value="${esc(value)}"><button class="btn sm" type="button" aria-label="Remove secret">✕</button>`;
+      row.querySelector('button').onclick = () => { row.remove(); secretDirty = true; };
+      row.oninput = () => { secretDirty = true; };
+      form.querySelector('.mcp-secret-fields').append(row);
+    }
+    function fill(transport) {
+      type.value = transport?.type || 'http'; form.querySelector('.mcp-url').value = transport?.url || '';
+      form.querySelector('.mcp-command').value = transport?.command || '';
+      form.querySelector('.mcp-args').value = JSON.stringify(transport?.args || [], null, 2);
+      form.querySelector('.mcp-env').value = JSON.stringify(transport?.env || {}, null, 2); sync();
+    }
+    auth.value = existing?.auth || 'none'; fill(existing?.transport);
+    for (const name of existing?.secretNames || []) addSecret(name);
+    type.onchange = sync; auth.onchange = sync;
+    form.querySelector('.mcp-secret-add').onclick = () => addSecret();
+    form.querySelector('.mcp-editor-cancel').onclick = () => { box.hidden = true; };
+    let searchGeneration = 0;
+    async function search(cursor = '') {
+      const generation = ++searchGeneration; const results = box.querySelector('.mcp-registry-results'); results.textContent = 'Searching Official MCP Registry…';
+      try {
+        const result = await api(`/api/mcp/registry${query}&search=${encodeURIComponent(box.querySelector('.mcp-registry-query').value)}&cursor=${encodeURIComponent(cursor)}`);
+        if (generation !== searchGeneration || !box.isConnected) return;
+        results.innerHTML = result.servers.length ? result.servers.map((s, i) => `<div class="mcp-registry-result"><b>${esc(s.title)}</b><small>${esc(s.name)} · ${esc(s.version)}</small><p>${esc(s.description)}</p>${s.options.length ? s.options.map((o, j) => `<button type="button" class="btn sm" data-registry-option="${i}:${j}">Use ${esc(o.label)}</button>`).join(' ') : '<small>This server needs custom configuration. Enter its server details below.</small>'}</div>`).join('') : '<p>No matching servers. Try another name or enter a custom server.</p>';
+        results.querySelectorAll('[data-registry-option]').forEach((b) => { b.onclick = () => {
+          const [i, j] = b.dataset.registryOption.split(':').map(Number); const s = result.servers[i], option = s.options[j];
+          registry = { name: s.name, version: s.version }; fields = option.fields;
+          form.querySelector('.mcp-label').value = s.title; fill(option.transport);
+          form.querySelector('.mcp-registry-fields').innerHTML = fields.map((f, n) => `<label>${esc(f.name || f.description || `Argument ${n + 1}`)}${f.isRequired ? ' *' : ''}<input data-registry-field="${n}" type="${f.isSecret ? 'password' : 'text'}" ${f.isRequired && f.value === undefined ? 'required' : ''} value="${esc(f.value ?? f.default ?? '')}" placeholder="${esc(f.description || '')}"></label>`).join('');
+          results.textContent = `Selected ${s.name} · ${s.version}`;
+          form.querySelector('.mcp-label').focus();
+        }; });
+        if (result.nextCursor) { const next = document.createElement('button'); next.type = 'button'; next.className = 'btn sm'; next.textContent = 'More servers'; next.onclick = () => search(result.nextCursor); results.append(next); }
+      } catch (e) { if (generation === searchGeneration) results.textContent = e.message; }
+    }
+    box.querySelector('.mcp-search')?.addEventListener('click', () => search());
+    box.querySelector('.mcp-registry-query')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); search(); } });
+    form.onsubmit = async (event) => {
+      event.preventDefault(); const oauthWindow = auth.value === 'oauth' ? window.open('about:blank', '_blank') : null; const save = form.querySelector('[type="submit"]'); save.disabled = true; message('Saving connection…');
+      try {
+        const transport = type.value === 'stdio' ? { type: 'stdio', command: form.querySelector('.mcp-command').value.trim(), args: JSON.parse(form.querySelector('.mcp-args').value), env: JSON.parse(form.querySelector('.mcp-env').value) } : { type: type.value, url: form.querySelector('.mcp-url').value.trim() };
+        const secrets = {}; const secretRows = [...form.querySelectorAll('.mcp-secret-row')];
+        for (const row of secretRows) { const name = row.querySelector('.mcp-secret-name').value.trim(), value = row.querySelector('.mcp-secret-value').value; if (name && value) secrets[name] = value; }
+        for (const [n, f] of fields.entries()) {
+          const value = form.querySelector(`[data-registry-field="${n}"]`).value;
+          if (!value) continue;
+          if (f.target === 'argument') {
+            if (f.type === 'named' && f.name) transport.args.push(f.name);
+            if (f.isSecret) { const name = `MCP_ARGUMENT_${n}`; secrets[name] = value; transport.args.push(`{{${name}}}`); }
+            else transport.args.push(value);
+          } else if (f.isSecret || transport.type !== 'stdio') secrets[f.name] = value;
+          else transport.env[f.name] = value;
+        }
+        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input').checked, registry,
+          ...(Object.keys(secrets).length || secretDirty ? { secrets, mergeSecrets: !!existing, retainSecretNames: secretRows.map((row) => row.querySelector('.mcp-secret-name').value.trim()) } : {}) }) });
+        box.hidden = true; message('Connection saved. Choose it in Agent → Tools.'); await load(); await changed();
+        if (saved.auth === 'oauth') await authorize(saved.id, oauthWindow); else oauthWindow?.close();
+      } catch (e) { oauthWindow?.close(); message(e.message); }
+      finally { save.disabled = false; }
+    };
+  }
+  dialog.querySelector('.mcp-add').onclick = () => editor();
+  try { await load(); } catch (e) { message(e.message); }
+}
+async function finishMcpCallback() {
+  const params = new URLSearchParams(location.search), state = params.get('state') || '';
+  const key = `mcp-oauth:${state}`; let pending;
+  try { pending = JSON.parse(sessionStorage.getItem(key) || 'null'); } catch {}
+  history.replaceState({}, '', '/mcp-callback');
+  document.querySelector('#app').innerHTML = '<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to Tavya</a></main>';
+  const status = document.querySelector('.mcp-callback p');
+  try {
+    if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
+    if (params.get('error')) throw new Error('Authorization was declined. You can try again in connection settings.');
+    await api(`/api/mcp/${pending.id}/callback${pending.query}`, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
+    sessionStorage.removeItem(key);
+    if (pending.popup) {
+      const channel = new BroadcastChannel(`mcp-oauth:${state}`); channel.postMessage('connected'); channel.close();
+      document.querySelector('.mcp-callback h1').textContent = 'Connected'; status.textContent = 'You can close this tab and return to your task.';
+      window.close(); return;
+    }
+    location.replace(pending.back.startsWith('/') && !pending.back.startsWith('//') ? pending.back : '/');
+  } catch (e) { status.textContent = e.message; }
+}

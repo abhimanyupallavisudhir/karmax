@@ -96,6 +96,28 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.code).not.toBe(0);
   });
 
+  it('just-do: reports finalization while approved output is being saved', async () => {
+    const repo = await h.makeRepo('jd-finalizing');
+    // Hold the actual commit long enough to observe the public workflow view.
+    const hook = path.join(repo, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, '#!/bin/sh\nsleep 2\n', { mode: 0o755 });
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo@1.6.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [baseInput(taskId, repo, { prompt: '@write note.txt :: saved output' })],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 }).toBe('human');
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).state.finalizing, { timeout: 10_000 }).toBe(true);
+    const saving = await view(handle);
+    expect(saving.status).toBe('active');
+    expect(saving.waitingFor).toBeUndefined();
+    expect(saving.actions).toEqual([]);
+    expect((await handle.result()).stage).toBe('done');
+    expect((await view(handle)).state.finalizing).toBeUndefined();
+    expect((await git(repo, ['show', `karmax/${taskId}:note.txt`])).stdout).toContain('saved output');
+  });
+
   it('just-do: injects a follow-up sent mid-turn into the live turn (SPEC §5.6)', async () => {
     const repo = await h.makeRepo('jd-mid');
     const taskId = newId('task');

@@ -18,6 +18,7 @@ function extractFn(name) {
 
 global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
+global.wireMcpPicker = () => {};
 global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -37,7 +38,12 @@ eval(extractFn('wireResumeReauthorization'));
 eval(extractFn('agentRoleLabel'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
+eval(extractFn('mcpPickerHtml'));
 eval(extractFn('renderAgentField'));
+eval(extractFn('forkBranchDefaults'));
+eval(extractFn('prefillForkBranch'));
+eval(extractFn('showForkWorldHelp'));
+eval(extractFn('collectForm'));
 eval(extractFn('readResume'));
 eval(extractFn('readAuthorizationEditor'));
 
@@ -45,10 +51,26 @@ let pass = 0;
 let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
 
+ok(forkBranchDefaults({ lastView: { status: 'cancelled', branch: 'karmax/source', targetBranch: 'main' } }).base === 'karmax/source', 'cancelled forks default to the source branch');
+ok(forkBranchDefaults({ status: 'done', branch: 'karmax/source', targetBranch: 'release' }).base === 'release', 'landed forks default to their merge destination');
+ok(!forkBranchDefaults({}).base, 'a conversation without a branch keeps ordinary defaults');
+global.CSS = { escape: (value) => value };
+global.sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const baseInput = { value: 'main', getAttribute: () => '"main"' };
+const branchForm = { querySelector: (selector) => selector === '[data-field="base"]' ? baseInput : {} };
+ok(collectForm(branchForm, [{ name: 'base', type: 'branch' }]).base === 'main', 'changing a fork to the inherited base remains an explicit branch choice');
+baseInput.value = '';
+ok(collectForm(branchForm, [{ name: 'base', type: 'branch' }]).base === 'main', 'clearing a fork base uses the inherited branch without reselecting the source branch');
+let branchChanges = 0;
+const forkBranchInput = { value: 'main', dispatchEvent: () => branchChanges++ };
+const forkForm = { querySelector: (selector) => selector === '[data-field="base"]' ? forkBranchInput : {} };
+prefillForkBranch({ dataset: { agent: 'do' }, closest: () => forkForm }, { lastView: { status: 'waiting', branch: 'karmax/source' } });
+ok(forkBranchInput.value === 'karmax/source' && branchChanges === 1, 'picking a source fills the branch field and announces the change');
+
 const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
-ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
+ok(!closed.includes('<details class="af-resume') && closed.includes('af-resume-enabled'), 'fork choice uses its explicit toggle');
 ok(closed.includes('provider conversation ID or public ChatGPT/Claude share link'), 'a local console advertises provider ids and public share links');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 
@@ -126,6 +148,7 @@ const hostRoot = { dataset: {}, querySelectorAll: () => [], addEventListener(typ
 let hostAttached = false;
 const dispatched = [];
 const box = {
+  dataset: { agent: 'do' },
   querySelector(selector) {
     return {
       '.af-model-combo': null, '.af-provider': provider, '.af-model': model,
@@ -219,6 +242,54 @@ listeners.get('chosen:change')({ target: chosen.checkbox });
 enabled.checked = false;
 listeners.get('enabled:change')();
 ok(formGrants.ids.length === 0 && editorCalls.at(-1).level === 'developer', 'turning the fork off withdraws re-authorized grants too');
+
+// The fork checkbox shares the normal dependency state and serialized triggers.
+for (const status of ['running', 'waiting', 'failed', 'cancelled']) {
+  ok(resumeChosenInner({ taskId: source.id, role: 'do' }, { ...source, lastView: { status } }).includes('Also add as dependency?'), `${status} source offers a dependency`);
+}
+ok(!resumeChosenInner({ taskId: source.id }, { ...source, lastView: { status: 'done' } }).includes('Also add as dependency?'), 'done source needs no dependency');
+ok(!resumeChosenInner({ taskId: 'unknown' }).includes('Also add as dependency?'), 'unknown source does not guess its completion state');
+eval(extractFn('selectedDepIds'));
+eval(extractFn('dependencyChipHtml'));
+eval(extractFn('wireDepPicker'));
+eval(extractFn('collectTriggers'));
+global.numberedTaskTitle = (task) => task.title;
+let depIds = [], depChange, depPickerClick;
+const depLabel = { hidden: true };
+const depInput = {
+  dataset: { taskId: source.id }, checked: false,
+  closest: (selector) => selector === '.af-resume-dependency' ? depLabel : selector === '.af-resume-add-dependency' ? depInput : { _sourceTask: source },
+};
+const depRoot = {
+  dataset: {}, querySelectorAll: () => [depInput],
+  addEventListener: (_type, callback) => { depChange = callback; },
+};
+const depBox = {
+  set innerHTML(html) { depIds = [...html.matchAll(/data-depid="([^"]+)"/g)].map((match) => match[1]); },
+  querySelectorAll: () => [], closest: () => depRoot,
+  dispatchEvent: () => depChange({ target: { closest: () => null } }),
+};
+global.document = { querySelectorAll: () => depIds.map((id) => ({ dataset: { depid: id } })) };
+global.$ = (selector) => selector === '#dep-chips' ? depBox : selector === '#dep-add' ? { addEventListener: (_type, callback) => { depPickerClick = callback; } } : null;
+global.readCronCells = () => ['*', '*', '*', '*', '*'];
+wireDepPicker({ triggers: [{ kind: 'dependency', tasks: ['manual'] }] });
+ok(!depLabel.hidden && !depInput.checked, 'unfinished fork option is visible and opt-in');
+depInput.checked = true;
+depChange({ target: depInput });
+ok(depIds.join() === `manual,${source.id}`, 'checking preserves existing dependencies and adds source');
+ok(collectTriggers([])[0].tasks.includes(source.id), 'source is serialized in the normal task dependency trigger');
+depChange({ target: depInput });
+ok(depIds.length === 2, 'checking never duplicates the dependency');
+depInput.checked = false;
+depChange({ target: depInput });
+ok(depIds.join() === 'manual', 'unchecking removes only the source dependency');
+depPickerClick();
+picker.onPick(source);
+ok(depInput.checked, 'manual picker additions update the fork checkbox');
+wireDepPicker({ triggers: [{ kind: 'dependency', tasks: [source.id] }] });
+ok(depInput.checked, 'reopening a saved draft restores the checked state');
+wireDepPicker({}, source.id);
+ok(depLabel.hidden, 'a task cannot select itself as a dependency');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

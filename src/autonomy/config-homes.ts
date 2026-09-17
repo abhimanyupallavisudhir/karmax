@@ -7,6 +7,8 @@ import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
+const DISCONNECTED_HOME = '.karmax-disconnected';
+
 /**
  * Config homes (SPEC §7.3). karmax mints one config home per
  * (organization × account × profile)
@@ -24,14 +26,57 @@ export class ConfigHomeManager {
    * Historical flat homes belong only to the personal organization. */
   ensure(provider: Provider, account: string, organizationId = 'org_personal'): string {
     const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
-    fs.mkdirSync(dir, { recursive: true });
+    // Provider CLIs write OAuth tokens here at their own default modes; the
+    // directory itself is what keeps other local users out.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch { /* not the owner; leave it */ }
     return dir;
   }
 
-  /** Delete a login's config home (removes its credentials + settings). */
+  /** Only an explicit login attempt reactivates a disconnected home. Status
+   * polling also calls ensure(), and must not make a removed account reappear. */
+  prepareLogin(provider: Provider, account: string, organizationId = 'org_personal'): string {
+    const dir = this.ensure(provider, account, organizationId);
+    fs.rmSync(path.join(dir, DISCONNECTED_HOME), { force: true });
+    return dir;
+  }
+
+  /** Disconnect credentials, not the task histories sharing this home. Tasks keep
+   * absolute sessionmeta.home references, so retained history must stay in place.
+   * Account discovery hides this history-only home until an explicit reconnect. */
   remove(provider: Provider, account: string, organizationId = 'org_personal'): void {
     const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (!fs.existsSync(dir)) return;
+    if (!fs.lstatSync(dir).isDirectory()) {
+      fs.rmSync(dir, { force: true });
+      return;
+    }
+    const history = provider === 'codex'
+      ? ['sessions', 'archived_sessions', '.karmax-history-recovery', '.karmax-history-backups']
+      : provider === 'claude' ? ['projects']
+      : provider === 'opencode' ? ['data/opencode'] : [];
+    if (!history.length) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+    // Mark before pruning so an interrupted disconnect cannot re-admit a login.
+    // An account home is provider-writable; never follow a pre-existing marker symlink.
+    fs.rmSync(path.join(dir, DISCONNECTED_HOME), { force: true });
+    fs.writeFileSync(path.join(dir, DISCONNECTED_HOME), '', { mode: 0o600 });
+    const prune = (relative: string) => {
+      for (const entry of fs.readdirSync(path.join(dir, relative), { withFileTypes: true })) {
+        const name = relative ? `${relative}/${entry.name}` : entry.name;
+        if (name === DISCONNECTED_HOME) continue;
+        // OpenCode stores its credential alongside the native database/storage.
+        const credential = name === 'data/opencode/auth.json';
+        const retained = !credential && history.some(prefix => name === prefix || name.startsWith(`${prefix}/`));
+        const ancestor = history.some(prefix => prefix.startsWith(`${name}/`));
+        if (entry.isDirectory() && (retained || ancestor)) prune(name);
+        else if (!retained || entry.isSymbolicLink())
+          fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+      }
+    };
+    prune('');
   }
 
   /** Rename a login (move its config home so credentials carry over). */
@@ -49,6 +94,7 @@ export class ConfigHomeManager {
     if (!fs.existsSync(root)) return [];
     return fs.readdirSync(root, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && entry.name === 'organizations'))
+      .filter((entry) => !fs.existsSync(path.join(root, entry.name, DISCONNECTED_HOME)))
       .map(({ name }) => {
       const [provider, ...rest] = name.split('-');
       const dir = path.join(root, name);
@@ -292,6 +338,7 @@ function readJson(file: string): any {
 /** Is a config home logged in? Checks the provider's own credential file and the
  *  karmax token file we write when a `setup-token` flow prints a token. */
 export function isLoggedIn(provider: string, home: string): boolean {
+  if (fs.existsSync(path.join(home, DISCONNECTED_HOME))) return false;
   if (isAcpProvider(provider) && hasAcpHomeLogin(provider, home)) return true;
   if (provider === 'claude') {
     return hasClaudeNativeCredential(home) || !!capturedToken(home);
@@ -330,6 +377,7 @@ export function capturedToken(home: string): string | undefined {
  *  A setup-token-only home (just `karmax-oauth.json`) is NOT fully authed, so
  *  `connect` re-runs login to upgrade it to a full, usage-pollable credential (#6). */
 export function isFullyAuthed(provider: string, home: string): boolean {
+  if (fs.existsSync(path.join(home, DISCONNECTED_HOME))) return false;
   if (isAcpProvider(provider)) return hasAcpHomeLogin(provider, home);
   if (provider === 'claude') return hasClaudeNativeCredential(home);
   const native = provider === 'codex'
@@ -397,6 +445,26 @@ export function hasClaudeNativeCredential(home: string): boolean {
   return false;
 }
 
+/** Names the control plane must never hand to an agent subprocess: every
+ *  `KARMAX_*` variable except the few an agent legitimately reads (its gateway
+ *  address, the runtime protocol, provider command overrides), plus any
+ *  secret-shaped name from another service (Stripe, sandbox providers, cloud
+ *  credentials, GitHub tokens). The `*_FILE` indirections are stripped with
+ *  their targets so the path to a mounted secret does not leak either. */
+const AGENT_VISIBLE_KARMAX_ENV = new Set([
+  'KARMAX_GATEWAY_URL', 'KARMAX_PUBLIC_URL', 'KARMAX_TOKEN', 'KARMAX_RUNTIME_PROTOCOL',
+  'KARMAX_HOME', 'KARMAX_DEPLOYMENT', 'KARMAX_HOST_LOCAL', 'KARMAX_CELL_ID',
+  'KARMAX_ANTHROPIC_BASE_URL', 'KARMAX_OPENAI_BASE_URL', 'KARMAX_KIMI_BASE_URL',
+  'KARMAX_CODEX_USE_EXEC', 'KARMAX_CODEX_EXEC_CMD', 'KARMAX_OPENCODE_CMD', 'KARMAX_KIMI_CMD', 'KARMAX_GROK_CMD',
+  'KARMAX_AGENT_BG_SETTLE_MS', 'KARMAX_CLAUDE_MODEL', 'KARMAX_OPENAI_MODEL', 'KARMAX_AGENT_PROVIDER',
+]);
+const FOREIGN_SECRET_ENV = /^(?:STRIPE_|E2B_|DAYTONA_|AWS_(?:SECRET|SESSION|ACCESS)|GH_TOKEN$|GITHUB_TOKEN$|GITHUB_APP_|NPM_TOKEN$|VAULT_TOKEN$|OP_SERVICE_ACCOUNT_TOKEN$|BW_SESSION$)/;
+export function isControlPlaneSecretEnv(key: string): boolean {
+  const base = key.endsWith('_FILE') ? key.slice(0, -5) : key;
+  if (base.startsWith('KARMAX_')) return !AGENT_VISIBLE_KARMAX_ENV.has(base);
+  return FOREIGN_SECRET_ENV.test(base);
+}
+
 /** Build a clean, isolated environment for an agent spawn (SPEC §7.3 gotcha). */
 export function scrubbedEnv(opts: { provider: Provider; configHome?: string; extra?: Record<string, string> }): Record<string, string> {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
@@ -417,6 +485,12 @@ export function scrubbedEnv(opts: { provider: Provider; configHome?: string; ext
   delete env.KIMI_MODEL_NAME;
   delete env.KIMI_MODEL_BASE_URL;
   for (const provider of MODEL_PROVIDERS) delete env[apiKeyEnv(provider)];
+  // Nor the control plane's own secrets: the agent runs untrusted code, and the
+  // vault key, auth secret, database URL, provider and billing keys all live in
+  // this process's environment (deployment.ts hydrates them from *_FILE too).
+  // Remote worlds cross an allowlist (remote-process.ts); local worlds inherit
+  // the host shell, so strip by name and by shape.
+  for (const key of Object.keys(env)) if (isControlPlaneSecretEnv(key)) delete env[key];
   if (opts.configHome) {
     if (opts.provider === 'claude') env.CLAUDE_CONFIG_DIR = opts.configHome;
     if (opts.provider === 'codex') env.CODEX_HOME = opts.configHome;

@@ -21,6 +21,8 @@ global.renderMessageImages = () => '';
 // Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
 // these assertions stay about the timeline, not the message body renderer.
 global.markdownEnabled = () => false;
+global.mathjaxEnabled = () => true;
+eval(extractFn('conversationMathEnabled'));
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
 global.hostLocal = () => true;
@@ -54,7 +56,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -212,31 +214,144 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 
 // Forking addresses the conversation being viewed, including completed agents
 // and sessions without a native CLI/config home.
+eval(extractFn('reviewActionBtn'));
+eval(extractFn('conversationReviewInfo'));
 eval(extractFn('conversationPane'));
+eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
 global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
 global.openTaskForm = (...args) => { global.openedForkForm = args; };
-const forkView = { taskId: 'source-task', status: 'completed', actions: [] };
-for (const role of ['do', 'merge', 'confirm', 'resolve']) {
-  const html = conversationPane(forkView, { role, messages: [] });
-  ok(html.includes('id="fork-task-agent"') && html.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
-  let click;
-  global.$ = (selector) => selector === '#main'
-    ? { querySelector: () => null, querySelectorAll: () => [] }
-    : selector === '#fork-task-agent'
-      ? { addEventListener: (_type, handler) => { click = handler; } }
-      : null;
-  wireCheckinSidebar(forkView);
-  click({ currentTarget: { dataset: { role } } });
-  const [workflow, draft, prompt, params] = global.openedForkForm;
-  ok(workflow === 'software-dev' && !draft && !prompt
-    && params['agent:do'].resumeFrom.taskId === 'source-task'
-    && params['agent:do'].resumeFrom.role === role,
-    `${role} fork opens a new task form with the correct source and an empty next instruction`);
+const forkView = { taskId: 'source-task', status: 'done', branch: 'karmax/source-task', targetBranch: 'release', actions: [] };
+for (const status of ['done', 'cancelled', 'waiting']) {
+  forkView.status = status;
+  for (const role of ['do', 'merge', 'confirm', 'resolve']) {
+    const html = conversationPane(forkView, { role, messages: [] });
+    ok(html.includes('id="fork-task-agent"') && html.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
+    let click;
+    global.$ = (selector) => selector === '#main'
+      ? { querySelector: () => null, querySelectorAll: () => [] }
+      : selector === '#fork-task-agent'
+        ? { addEventListener: (_type, handler) => { click = handler; } }
+        : null;
+    wireCheckinSidebar(forkView);
+    click({ currentTarget: { dataset: { role } } });
+    const [workflow, draft, prompt, params] = global.openedForkForm;
+    ok(workflow === 'software-dev' && !draft && !prompt
+      && params['agent:do'].resumeFrom.taskId === 'source-task'
+      && params['agent:do'].resumeFrom.role === role
+      && params.base === (status === 'done' ? 'release' : 'karmax/source-task'),
+      `${status} ${role} fork opens a new task form with the correct source, branch and an empty next instruction`);
+  }
 }
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
+
+// Review info is task-wide, compact, and follows the conversation in every role.
+for (const info of [undefined, {}, { completion: 'finished' }]) {
+  ok(conversationReviewInfo({ reviewInfo: info }) === '', 'empty review info reserves no space');
+}
+const reviewView = { ...forkView, reviewInfo: {
+  caption: 'Check <layout>',
+  actions: [{ kind: 'open', label: 'Report', target: 'report.md' }, { kind: 'run', label: 'Preview', command: 'npm start' }],
+  links: [{ label: 'Unsafe link', url: 'javascript:alert(1)' }],
+  html: '<iframe>large preview</iframe>',
+} };
+for (const role of ['do', 'merge', 'confirm', 'resolve']) {
+  const html = conversationPane(reviewView, { role, messages: [{ id: 'final', role: 'agent', text: 'Final response', ts: 1 }] });
+  ok(html.indexOf('Review info') > html.indexOf('Final response'), `${role} review info follows the conversation`);
+  ok(html.includes('Check &lt;layout&gt;'), 'review caption is escaped');
+  ok(html.includes('data-idx="1" data-kind="run"'), 'review actions preserve API indices');
+  ok(html.includes('class="raw hidden" id="review-action-out"'), 'command output takes no space until run');
+  ok(html.includes('href="#"'), 'unsafe legacy link is neutralized');
+  ok(html.includes('data-tasktab="overview"') && !html.includes('<iframe>'), 'large preview is linked in Overview');
+  ok((html.match(/id="review-actions"/g) || []).length === 1, 'review actions have a single wiring target');
+}
+
+
+// Input prompts use the same model picker, pending/error UI, and durable annotations.
+eval(extractFn('humanWaitDetail'));
+eval(extractFn('conversationInputRequest'));
+S.taskEvents = [];
+const requestView = { taskId: 'task-1', status: 'waiting', updatedAt: 1710000010000,
+  waitingFor: { kind: 'human', detail: 'Choose a deployment target.' },
+  actions: [{ name: 'followUp', enabled: true, roles: ['do'] }] };
+const requestTranscript = { role: 'do', messages: [] };
+const requestKey = `input-request:${requestView.updatedAt}`;
+let requestHtml = conversationPane(requestView, requestTranscript);
+ok(requestHtml.includes(`data-source-key="${requestKey}"`) && requestHtml.includes('Explain this with gemini-3.6-flash'),
+  'input requests offer the existing explanation controls');
+S.explanationPending[requestKey] = true;
+ok(conversationPane(requestView, requestTranscript).includes('disabled>Explaining…'), 'input request shows pending explanation');
+delete S.explanationPending[requestKey];
+S.explanationErrors[requestKey] = { message: 'Try again' };
+ok(conversationPane(requestView, requestTranscript).includes('Try again'), 'input request displays explanation errors');
+delete S.explanationErrors[requestKey];
+S.taskEvents = [{ seq: 30, ts: 1710000011000, type: 'conversation.explanation', payload: {
+  role: 'do', sourceKey: requestKey, sourceRequest: { text: requestView.waitingFor.detail, ts: requestView.updatedAt },
+  text: 'Pick where the update should go.', model: 'google/gemini-3.6-flash',
+} }];
+requestHtml = conversationPane(requestView, requestTranscript);
+ok((requestHtml.match(/class="msg agent input-request"/g) || []).length === 1, 'explained current prompt appears once');
+ok(requestHtml.indexOf('Choose a deployment target.') < requestHtml.indexOf('Pick where the update should go.'), 'explanation follows its input prompt');
+const resolvedHtml = conversationPane({ ...requestView, status: 'active', waitingFor: undefined }, requestTranscript);
+ok(resolvedHtml.includes('Choose a deployment target.') && resolvedHtml.includes('Pick where the update should go.'), 'resolved prompt and explanation survive reload');
+ok(!conversationPane(requestView, { role: 'merge', messages: [] }).includes('input-request'), 'input explanation stays in its own conversation');
+
+// The control is present beside Explain and reflects the entire conversation.
+global.markdownEnabled = () => true;
+const mathEntry = { sourceKey: 'message:math', conversationRole: 'merge' };
+ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="true"'), 'math toggle inherits enabled profile');
+S.conversationMath = { [JSON.stringify([S.view.taskId, 'merge'])]: false };
+ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="false"'), 'math toggle reflects conversation override');
+ok(explainMessageAffordance({ ...mathEntry, conversationRole: 'do' }, S.view).includes('aria-pressed="true"'), 'other agent toggle remains enabled');
+global.markdownEnabled = () => false;
+ok(explainMessageAffordance(mathEntry, S.view).includes('disabled><span class="tex-mark"'), 'math toggle explains Markdown prerequisite and is disabled without it');
+
+// Task 219 stored updatedAt=17: a workflow revision must not send an explained
+// request to the start of the thread. Include surrounding history (the original
+// input-request fixture had no messages and used an epoch timestamp).
+const revisionView = { ...requestView, updatedAt: 17 };
+const revisionKey = 'input-request:17';
+const revisionTranscript = { role: 'do', messages: [
+  { id: 'before', role: 'user', text: 'Earlier question', ts: 1710000000000 },
+] };
+const annotation = { seq: 40, ts: 1710000011000, type: 'conversation.explanation', payload: {
+  role: 'do', sourceKey: revisionKey,
+  sourceRequest: { text: revisionView.waitingFor.detail, ts: 17 },
+  text: 'First explanation',
+} };
+S.taskEvents = [];
+const beforeExplanation = conversationPane(revisionView, revisionTranscript);
+ok(beforeExplanation.indexOf('Earlier question') < beforeExplanation.indexOf('Choose a deployment target.'),
+  'unexplained revision-stamped request follows prior messages');
+S.taskEvents = [annotation];
+const afterExplanation = conversationPane(revisionView, revisionTranscript);
+ok(afterExplanation.indexOf('Earlier question') < afterExplanation.indexOf('Choose a deployment target.'),
+  'explaining a revision-stamped request keeps it after prior messages');
+ok((afterExplanation.match(/class="msg agent input-request"/g) || []).length === 1,
+  'revision-stamped request remains visible exactly once');
+let revisionEntries = conversationEntries(revisionTranscript);
+ok(revisionEntries[1].type === 'input-request' && revisionEntries[2].type === 'explanation',
+  'explanation stays directly beneath revision-stamped request');
+const laterTranscript = { role: 'do', messages: [...revisionTranscript.messages,
+  { id: 'later', role: 'user', text: 'Later follow-up', ts: 1710000020000 },
+] };
+S.taskEvents = [{ ...annotation, seq: 50, ts: 1710000030000,
+  payload: { ...annotation.payload, text: 'Second explanation' } }, annotation];
+revisionEntries = conversationEntries(laterTranscript);
+ok(revisionEntries.map((entry) => entry.type).join(',') === 'message,input-request,explanation,explanation,message',
+  'reload and repeated explanation preserve the original request position before later follow-ups');
+S.taskEvents.push({ seq: 39, ts: 1710000010000, type: 'view.updated', payload: {
+  waitingFor: 'human', waitingDetail: revisionView.waitingFor.detail,
+} });
+revisionEntries = conversationEntries(laterTranscript);
+ok(revisionEntries.find((entry) => entry.type === 'input-request').ts === 1710000010000,
+  'durable human-wait event supplies the actual request time when available');
+S.taskEvents = [annotation];
+ok(conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
+  .indexOf('Choose a deployment target.') < conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
+  .indexOf('Later follow-up'), 'resolved revision-stamped request survives a bounded history reload in order');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

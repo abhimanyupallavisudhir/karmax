@@ -69,11 +69,11 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     expect(roleCeiling('do')).toContain('task:escalate');
     expect(roleCeiling('merge')).toContain('task:escalate');
     expect(roleCeiling('confirm')).toContain('task:escalate');
-    // Ordinary Developer task operations are shared; workflow decisions are not.
+    // The selected task grant, rather than the role, decides authorization.
     expect(allows(roleCeiling('merge'), 'create-sub-task')).toBe(true);
-    expect(allows(roleCeiling('merge'), 'settings:write')).toBe(false);
-    expect(roleCeiling('merge')).not.toContain('confirm-decision');
-    expect(roleCeiling('merge')).not.toContain('resolve-decision');
+    expect(allows(roleCeiling('merge'), 'settings:write')).toBe(true);
+    expect(roleCeiling('merge')).toContain('*');
+    expect(roleCeiling('confirm')).toContain('*');
   });
 
   it('keeps the retired Resolve ceiling resolvable so pinned executions replay', () => {

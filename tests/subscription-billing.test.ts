@@ -395,12 +395,12 @@ describe('subscription administration HTTP authorization', () => {
     });
 
   it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
-    'rejects a task agent with payment:write from %s', async (action) => {
+    'rejects an agent without a verified owner subject from %s', async (action) => {
       const agent = tokens.mint({ taskId: `task_billing_attack_${action}`, profileId: 'developer', principal: 'agent:test',
         organizationId: memberOrganizationId, ceiling: ['payment:write'], grantorCaps: ['payment:write'] }).token;
       const response = await post(action, memberOrganizationId, agent);
-      expect(response.status).toBe(401);
-      expect(await response.json()).toMatchObject({ error: 'an interactive human session is required' });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'a verified human subject is required' });
     });
 
   it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
@@ -421,6 +421,21 @@ describe('subscription administration HTTP authorization', () => {
     expect(await stale.json()).toMatchObject({ error: expect.stringMatching(/current billing policy version/i) });
     expect(provider.calls.filter((call) => call.method === 'createCheckout')).toHaveLength(0);
     expect(store.policyAcceptances('me').filter((acceptance) => acceptance.context === 'checkout')).toHaveLength(0);
+  });
+
+  it('allows a delegated owner agent with payment authority to manage billing', async () => {
+    const human = tokens.mintPrincipal('user:me', ['payment:write', 'organization:read'], undefined, undefined, 'org_personal');
+    const delegation = tokens.delegateHuman(human.token, { taskId: 'billing-agent', organizationId: 'org_personal' })!;
+    const agent = tokens.mint({ taskId: 'billing-agent', profileId: 'administrator', principal: 'task:billing-agent',
+      organizationId: 'org_personal', delegationId: delegation.id,
+      ceiling: ['payment:write', 'organization:read'], grantorCaps: ['payment:write', 'organization:read'] });
+    const response = await post('checkout', 'org_personal', agent.token);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ url: 'https://checkout.test/session' });
+    const status = await fetch(`${base}/api/organizations/org_personal/subscription/status`, {
+      headers: { authorization: `Bearer ${agent.token}` },
+    });
+    expect(await status.json()).toMatchObject({ canManage: true });
   });
 
   it('allows the interactive owner of the organization', async () => {

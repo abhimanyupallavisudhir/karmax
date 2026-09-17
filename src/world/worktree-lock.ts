@@ -79,8 +79,10 @@ function abandoned(dir: string): boolean {
       return false; // released underneath us; the next mkdir will win
     }
   }
-  if (typeof owner?.ts === 'number' && Date.now() - owner.ts > STALE_MS) return true;
-  return typeof owner?.pid === 'number' && !alive(owner.pid);
+  // A live holder keeps the lock however long its checkout takes; age alone
+  // only condemns a holder that never recorded a pid.
+  if (typeof owner?.pid === 'number') return !alive(owner.pid);
+  return typeof owner?.ts === 'number' && Date.now() - owner.ts > STALE_MS;
 }
 
 /** Renaming the lock aside is atomic, so of two processes that both judge a lock

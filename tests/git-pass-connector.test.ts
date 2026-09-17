@@ -64,11 +64,17 @@ describe('Git-backed unix pass connector', () => {
     expect(await connector.describe()).toMatchObject({ available: true, canPush: true });
     expect((await connector.list()).map((item) => item.externalId)).toEqual(['sites/example.com']);
     const first = (await connector.pull(['sites/example.com'])).items[0]!;
-    expect(first.secrets).toEqual({ password: 'old-password', totp: 'otpauth://totp/example?secret=OLDSEED' });
+    expect(first.revision).toMatch(/^[a-f0-9]{64}$/);
+    // A fresh checkout has new mtimes but identical encrypted source content.
+    const fresh = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
+      path.join(fixture.root, 'fresh-state'), { allowLocalRepository: true });
+    expect((await fresh.list())[0]!.revision).toBe(first.revision);
+    expect(first.secrets).toEqual({ password: 'old-password', note: 'username: alice\nkeep this note\notpauth://totp/example?secret=OLDSEED\n', totp: 'otpauth://totp/example?secret=OLDSEED' });
 
     await connector.updateSecret('sites/example.com', 'password', 'rotated-password');
+    expect((await connector.list())[0]!.revision).not.toBe(first.revision);
     await connector.push({ externalId: '', type: 'login', label: 'Created account', username: 'new-user',
-      domains: ['created.example'], folder: '', fields: ['password'], secrets: { password: 'generated-password' } });
+      domains: ['created.example'], folder: '', fields: ['password'], secrets: { password: 'generated-password', note: 'username: new-user\n  retain this too  ' } });
 
     const audit = path.join(fixture.root, 'audit');
     run('git', ['clone', fixture.remote, audit]);
@@ -78,10 +84,14 @@ describe('Git-backed unix pass connector', () => {
     const created = fs.readdirSync(path.join(audit, '.password-store', 'karmax')).filter((file) => file.endsWith('.gpg'));
     expect(created).toHaveLength(1);
     expect(fixture.decrypt(path.join(audit, '.password-store', 'karmax', created[0]!)))
-      .toContain('generated-password\nusername: new-user');
+      .toBe('generated-password\nusername: new-user\n  retain this too  ');
     expect(Number(run('git', ['rev-list', '--count', 'HEAD'], { cwd: audit }).trim())).toBe(3);
 
     expect(fs.readdirSync(connectorRoot).filter((name) => name.startsWith('.git-auth-'))).toEqual([]);
+    await connector.updateSecret('sites/example.com', 'note', 'Username: administrator\r\n  free text  ');
+    expect((await connector.pull(['sites/example.com'])).items[0]!.secrets).toMatchObject({
+      password: 'rotated-password', note: 'Username: administrator\r\n  free text  ',
+    });
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }, 30_000);
 

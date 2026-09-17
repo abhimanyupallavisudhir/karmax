@@ -235,6 +235,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'list_connections', description: 'List app accounts explicitly shared with this task or project. Prefer these to requesting passwords; tokens stay server-side.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'request_connection', description: 'Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in this task and it resumes automatically after authorization. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    parameters: { type: 'object', properties: { toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['toolkit', 'why'] },
+  },
+  {
+    name: 'search_connection_tools', description: 'Search tools and input schemas for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
+    parameters: { type: 'object', properties: { connection_id: { type: 'string' }, search: { type: 'string' } }, required: ['connection_id', 'search'] },
+  },
+  {
+    name: 'execute_connection_tool', description: 'Execute one app tool on the exact connected account within the user’s task instructions. Search its schema first. Writes take effect immediately; connecting an account does not authorize unrelated actions. Before retrying a failed write, check whether it succeeded.',
+    parameters: { type: 'object', properties: { connection_id: { type: 'string' }, tool: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['connection_id', 'tool', 'arguments'] },
+  },
+  {
     name: 'list_credentials',
     description:
       'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
@@ -279,7 +295,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'get_credential',
     description:
-      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {
@@ -304,16 +320,26 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
         secrets: {
           type: 'object',
-          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI); api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
+          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI), note; api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
         },
       },
       required: ['type', 'label'],
     },
   },
   {
+    name: 'verify_resource_revision',
+    description: 'Verify an exact historical project resource revision by decrypting and hashing its bytes server-side. Requires project:settings:read in that project. Returns actual revision, storage location, validated tree digest/totals and per-file SHA256/size evidence without keys or internal refs. Default 100 files, maximum 1000 files / 256 MiB per page. Follow response nextOffset as offset on the same revision. Complete means whole-tree byte verification; partial covers only returned files; failed reports unreadable/corrupt storage or invalid offset. A byte-limit without offset progress cannot verify that oversized file. Does not mutate heads or leases.',
+    parameters: {
+      type: 'object', properties: {
+        project_id: { type: 'string' }, resource_id: { type: 'string' }, revision_id: { type: 'string' },
+        offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 },
+      }, required: ['project_id', 'resource_id', 'revision_id'],
+    },
+  },
+  {
     name: 'propose_project_resource',
     description:
-      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service).',
+      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
     parameters: {
       type: 'object',
       properties: {
@@ -470,6 +496,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         task_id: { type: 'string' },
         signal: { type: 'string', enum: ['confirm', 'cancel', 'retry', 'followUp'] },
+        otherAttempts: { type: 'string', enum: ['keep', 'cancel'] },
+        saveOtherAttemptsDefault: { type: 'boolean', description: 'Save the choice for this project; requires project:settings:write.' },
         text: { type: 'string' },
         role: { type: 'string', enum: [...AGENT_ROLE_NAMES] },
       },
@@ -573,12 +601,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'fork_agent',
-    description: 'Branch an attached agent into an independent new task/session, optionally with a different provider/model. The source remains untouched. reauthorize=true starts the fork with the grants the source task ended with (authorization level/scope and approved vault credentials), checked against your own authority.',
+    description: 'Branch an attached agent into an independent new task/session, optionally with a different provider/model. Defaults to the source task branch and unpublished checkpoint, or its merge target after landing. Set base to another branch for normal project initialization. The source remains untouched. reauthorize=true starts the fork with the grants the source task ended with (authorization level/scope and approved vault credentials), checked against your own authority.',
     parameters: {
       type: 'object',
       properties: {
         task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' },
-        target: { type: 'string' }, authorization_profile: { type: 'string' }, reauthorize: { type: 'boolean' },
+        base: { type: 'string', description: 'Starting branch; defaults to the source task branch, or its merge target after landing. Changing it excludes unpublished source state.' }, target: { type: 'string' }, authorization_profile: { type: 'string' }, reauthorize: { type: 'boolean' },
         provider: { type: 'string', enum: ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'] },
         model: { type: 'string' }, effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
       },
@@ -642,20 +670,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_permission',
     description:
-      'Request exact missing Karmax capabilities for this task. The request appears in Approval Requests and is routed ' +
+      'Request exact Karmax capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ' +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
-      'holds every requested capability can approve. Do not request wildcards. An approval or denial resumes the task.',
+      'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
     parameters: {
       type: 'object',
       properties: {
         capabilities: {
           type: 'array',
           items: { type: 'string' },
-          minItems: 1,
+          minItems: 0,
           maxItems: 32,
           description: 'Exact capability names to add to this task, for example settings:read.',
         },
+        projectIds: { type: 'array', items: { type: 'string' }, maxItems: 32,
+          description: 'Additional project IDs in this organization. Existing projects are retained. Supply capabilities: [] for scope only.' },
         audience: {
           type: 'array',
           items: { type: 'string' },
@@ -709,11 +739,23 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'list_github_actions_workflows',
+    description: 'Discover workflow ids, paths and enabled states in an attached repository. Paginated; requires github:actions:read.',
+    parameters: { type: 'object', properties: {
+      repository: { type: 'string' }, page: { type: 'number' }, per_page: { type: 'number' },
+    } },
+  },
+  {
     name: 'inspect_github_actions_run',
-    description: 'Inspect one Actions run, including failed jobs/steps, bounded log excerpts, and artifact metadata. GitHub credentials and signed log URLs never enter the task world.',
+    description: 'Inspect Actions evidence with github:actions:read. Default failure view preserves diagnostics. Use jobs for paginated steps/attempts, log with job_id for any conclusion and bounded tail output, artifacts for metadata, annotations with job_id for check diagnostics, or pending-deployments for current approval waits. Pin attempt for historical jobs/logs. headSha and success/skipped status do not prove deployed code; verify explicit target, readiness, completion and rollback evidence. Credentials and signed URLs stay host-side.',
     parameters: { type: 'object', properties: {
       repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
       run_id: { type: 'number' },
+      view: { type: 'string', enum: ['failure', 'jobs', 'log', 'artifacts', 'annotations', 'pending-deployments'] },
+      attempt: { type: 'number' }, job_id: { type: 'number' }, page: { type: 'number' }, per_page: { type: 'number' },
+      offset_lines: { type: 'number', description: 'Page backwards from the end using nextOffsetLines, within retainedLines.' },
+      tail_lines: { type: 'number', description: 'Log tail lines, default 100, maximum 500.' },
+      max_chars: { type: 'number', description: 'Log output characters, default 16000, maximum 32000. Check tailComplete and truncation flags.' },
     }, required: ['run_id'] },
   },
   {
@@ -788,6 +830,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['confirm', 'revise', 'reject'] },
+        otherAttempts: { type: 'string', enum: ['keep', 'cancel'], description: 'On confirmation, keep sibling attempts running and eligible to merge, or cancel them. The first attempt entering Merge fixes this choice for the group.' },
         text: { type: 'string', description: 'For revise: the feedback the Do agent should act on. For reject: why the work is being cancelled.' },
       },
       required: ['action'],
@@ -868,7 +911,7 @@ export function platformToolHandlers(
           return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
         }
       }
-      ctx.createReviewInfo({
+      await ctx.createReviewInfo({
         caption: args?.caption,
         actions: Array.isArray(args?.actions) ? args.actions : undefined,
         summary: args?.summary,
@@ -962,6 +1005,10 @@ export function platformToolHandlers(
         },
       }));
     },
+    async list_connections() { return JSON.stringify(await platformRequest('GET', '/api/connections')); },
+    async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { toolkit: args?.toolkit, why: args?.why })); },
+    async search_connection_tools(args) { return JSON.stringify(await platformRequest('GET', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/tools?search=${encodeURIComponent(String(args?.search ?? ''))}`)); },
+    async execute_connection_tool(args) { return JSON.stringify(await platformRequest('POST', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/execute`, { tool: args?.tool, arguments: args?.arguments })); },
     async list_credentials() {
       return JSON.stringify(await platformRequest('GET', '/api/vault/available'));
     },
@@ -972,7 +1019,7 @@ export function platformToolHandlers(
       });
       // Mirror request_spend: a parked request surfaces at the Review gate.
       if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {
-        ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+        await ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       }
       return JSON.stringify(r);
     },
@@ -993,6 +1040,14 @@ export function platformToolHandlers(
         username: args?.username, envVar: args?.env_var, secrets: args?.secrets,
       }));
     },
+    async verify_resource_revision(args) {
+      const projectId = encodeURIComponent(String(args?.project_id ?? ''));
+      const resourceId = encodeURIComponent(String(args?.resource_id ?? ''));
+      const revisionId = encodeURIComponent(String(args?.revision_id ?? ''));
+      const query = new URLSearchParams({ offset: String(args?.offset ?? 0), limit: String(args?.limit ?? 100) });
+      return JSON.stringify(await platformRequest('GET',
+        `/api/projects/${projectId}/resources/${resourceId}/revisions/${revisionId}/verify?${query}`));
+    },
     async propose_project_resource(args) {
       const sources = Number(Boolean(args?.path)) + Number(Boolean(args?.vault_item_id));
       const targets = Number(Boolean(args?.target_path)) + Number(Boolean(args?.target_environment))
@@ -1007,7 +1062,7 @@ export function platformToolHandlers(
           : args.target_service ? { kind: 'service', name: String(args.target_service) }
             : { kind: 'environment', name: String(args.target_environment) },
       });
-      ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       return JSON.stringify(result);
     },
     async check_agent_mail(args) {
@@ -1081,7 +1136,7 @@ export function platformToolHandlers(
     },
     async signal_task(args) {
       await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/signal`,
-        { signal: args?.signal, text: args?.text, role: args?.role });
+        { signal: args?.signal, text: args?.text, role: args?.role, otherAttempts: args?.otherAttempts, saveOtherAttemptsDefault: args?.saveOtherAttemptsDefault });
       return 'signalled';
     },
     async reorder_queue(args) {
@@ -1174,7 +1229,7 @@ export function platformToolHandlers(
     async fork_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       return JSON.stringify(await platformRequest('POST', `/api/tasks/${taskId}/fork-agent`, {
-        role: args?.role ?? 'do', title: args?.title, message: args?.message, target: args?.target,
+        role: args?.role ?? 'do', title: args?.title, message: args?.message, base: args?.base, target: args?.target,
         authorizationProfile: args?.authorization_profile, reauthorize: args?.reauthorize === true,
         provider: args?.provider, model: args?.model, effort: args?.effort,
       }));
@@ -1206,6 +1261,7 @@ export function platformToolHandlers(
     async request_permission(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {
         capabilities: Array.isArray(args?.capabilities) ? args.capabilities.map(String) : [],
+        ...(args?.projectIds !== undefined ? { projectIds: args.projectIds } : {}),
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         reason: String(args?.reason ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
@@ -1231,9 +1287,19 @@ export function platformToolHandlers(
       }
       return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs?${query}`));
     },
+    async list_github_actions_workflows(args) {
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['page', args?.page], ['perPage', args?.per_page]])
+        if (value !== undefined) query.set(String(key), String(value));
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/workflows?${query}`));
+    },
     async inspect_github_actions_run(args) {
-      const repository = args?.repository ? `?repository=${encodeURIComponent(String(args.repository))}` : '';
-      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}${repository}`));
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['view', args?.view], ['attempt', args?.attempt],
+        ['jobId', args?.job_id], ['page', args?.page], ['perPage', args?.per_page],
+        ['offsetLines', args?.offset_lines], ['tailLines', args?.tail_lines], ['maxChars', args?.max_chars]])
+        if (value !== undefined) query.set(String(key), String(value));
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}?${query}`));
     },
     async manage_github_actions_run(args) {
       return JSON.stringify(await platformRequest('POST', `/api/agent/github/actions/runs/${Number(args?.run_id)}`, {
@@ -1278,7 +1344,8 @@ export function platformToolHandlers(
     async confirm_decision(args) {
       const action = String(args?.action ?? '');
       if (!['confirm', 'revise', 'reject'].includes(action)) return 'invalid confirm decision — use action: confirm | revise | reject';
-      ctx.confirmDecision({ action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
+      if (args?.otherAttempts !== undefined && !['keep', 'cancel'].includes(args.otherAttempts)) return 'otherAttempts must be keep or cancel';
+      ctx.confirmDecision({ otherAttempts: args?.otherAttempts, action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
       return `confirm decision recorded: ${action}`;
     },
   };

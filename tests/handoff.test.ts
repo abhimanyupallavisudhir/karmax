@@ -6,7 +6,8 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldHandoffService } from '../src/world/handoff.js';
 import { brokerRefreshBranch } from '../src/world/git-broker.js';
-import type { World, WorldHandle } from '../src/world/types.js';
+import { WorktreeProvider } from '../src/world/worktree.js';
+import type { WorldHandle } from '../src/world/types.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 
 describe('hosted/local Git handoff', () => {
@@ -111,19 +112,9 @@ describe('hosted/local Git handoff', () => {
     const sshUrl = 'git@github.com:acme/app.git';
     const handle: WorldHandle = { kind: 'fake-remote', id: 'task-7', root: cloud, branch, base: 'main', repo: sshUrl,
       repos: [{ name: 'app', repo: sshUrl, root: cloud, branch, base: 'main' }] };
-    const world: World = {
-      handle,
-      async exec(command, args, options = {}) {
-        if (command === 'git') return git(options.cwd ?? cloud, args, { env: options.env, timeoutMs: options.timeoutMs });
-        if (command === 'rm') { for (const file of args.filter((arg) => arg !== '-f')) fs.rmSync(path.join(options.cwd ?? cloud, file), { force: true }); return { stdout: '', stderr: '', code: 0 }; }
-        return { stdout: '', stderr: `unsupported ${command}`, code: 1 };
-      },
-      readFile: async () => '', readFileBuffer: async () => Buffer.alloc(0),
-      writeFile: async (file, content) => fs.writeFileSync(path.join(cloud, file), content),
-      writeFileBuffer: async (file, content) => fs.writeFileSync(path.join(cloud, file), content),
-      listFiles: async () => [], startProcess: async () => { throw new Error('unused'); },
-      openPty: async () => { throw new Error('unused'); }, destroy: async () => {},
-    };
+    // Use real filesystem/process operations while retaining the remote kind:
+    // handoff must exercise the broker, including bounded binary transfers.
+    const world = await new WorktreeProvider().open(handle);
     const result = await brokerRefreshBranch(world, async () => ({ env: { GIT_SSH_COMMAND: ssh } }));
     expect(result.updated).toEqual([{ repo: 'app', branch, sha: laptopHead }]);
     expect((await git(cloud, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(laptopHead);
@@ -156,20 +147,9 @@ describe('hosted/local Git handoff', () => {
     const sshUrl = 'git@github.com:acme/app.git';
     const handle: WorldHandle = { kind: 'e2b', id: 'task-cloud', root: cloud, branch, base: 'main', repo: sshUrl,
       repos: [{ name: 'app', repo: sshUrl, root: cloud, branch, base: 'main' }] };
-    const world: World = {
-      handle,
-      async exec(command, args, options = {}) {
-        if (command === 'git') return git(options.cwd ?? cloud, args, { env: options.env, timeoutMs: options.timeoutMs });
-        if (command === 'rm') { for (const file of args.filter((arg) => arg !== '-f')) fs.rmSync(path.join(options.cwd ?? cloud, file), { force: true }); return { stdout: '', stderr: '', code: 0 }; }
-        return { stdout: '', stderr: `unsupported ${command}`, code: 1 };
-      },
-      async readFile(file) { return fs.readFileSync(path.join(cloud, file), 'utf8'); },
-      async readFileBuffer(file) { return fs.readFileSync(path.join(cloud, file)); },
-      async writeFile(file, content) { fs.writeFileSync(path.join(cloud, file), content); },
-      async writeFileBuffer(file, content) { fs.writeFileSync(path.join(cloud, file), content); },
-      async listFiles() { return []; }, async startProcess() { throw new Error('unused'); },
-      async openPty() { throw new Error('unused'); }, async destroy() {},
-    };
+    // Use real filesystem/process operations while retaining the remote kind:
+    // handoff must exercise the broker, including bounded binary transfers.
+    const world = await new WorktreeProvider().open(handle);
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const project = store.createProject('Platform', { worldProvider: 'e2b' }, organization.id);
@@ -270,19 +250,9 @@ describe('hosted/local Git handoff', () => {
     const sshUrl = 'git@github.com:acme/app.git';
     const handle: WorldHandle = { kind: 'e2b', id: 'task-local-source', root: cloud, branch, base: 'main', repo: sshUrl,
       repos: [{ name: 'app', repo: sshUrl, localPath: source, root: cloud, branch, base: 'main' }] };
-    const world: World = {
-      handle,
-      async exec(command, args, options = {}) {
-        if (command === 'git') return git(options.cwd ?? cloud, args, { env: options.env, timeoutMs: options.timeoutMs });
-        return { stdout: '', stderr: `unsupported ${command}`, code: 1 };
-      },
-      async readFile(file) { return fs.readFileSync(path.join(cloud, file), 'utf8'); },
-      async readFileBuffer(file) { return fs.readFileSync(path.join(cloud, file)); },
-      async writeFile(file, content) { fs.writeFileSync(path.join(cloud, file), content); },
-      async writeFileBuffer(file, content) { fs.writeFileSync(path.join(cloud, file), content); },
-      async listFiles() { return []; }, async startProcess() { throw new Error('unused'); },
-      async openPty() { throw new Error('unused'); }, async destroy() {},
-    };
+    // Use real filesystem/process operations while retaining the remote kind:
+    // handoff must exercise the broker, including bounded binary transfers.
+    const world = await new WorktreeProvider().open(handle);
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const project = store.createProject('Platform', { worldProvider: 'e2b', repos: [source] }, organization.id);

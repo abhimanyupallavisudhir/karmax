@@ -78,6 +78,11 @@ describe('project resources', () => {
       { DATABASE_URL: 'postgres://private-per-world-endpoint' });
     world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
     expect(await world.readFile('resources/model/model.bin')).toBe('base-model');
+    const leasesBeforeVerification = store.listResourceLeases(world.handle.id);
+    expect(leasesBeforeVerification.length).toBeGreaterThan(0);
+    expect((await resources.verifyRevision(project.id, volume.id, initial.id)).status).toBe('complete');
+    expect(store.listResourceLeases(world.handle.id)).toEqual(leasesBeforeVerification);
+
     expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
     const wrapped = resources.withEnvironment(world);
     expect((await wrapped.exec('bash', ['-lc', 'printf %s "$TRAINING_TOKEN"'])).stdout).toBe('secret-token');
@@ -390,8 +395,8 @@ describe('project resources', () => {
       signal: async (signal: string) => { signals.push({ taskId, signal }); },
     }) } } as any;
     const api = new KarmaxApi({ store, client, taskQueue: 'karmax', tokens, worlds, resources, broker });
-    const proposal = (token: string, itemId: string) => api.proposeProjectResource(token, {
-      source: { kind: 'vault-item', itemId }, name: 'API key', driver: 'secret@1',
+    const proposal = (token: string, itemId: string, name = 'API key') => api.proposeProjectResource(token, {
+      source: { kind: 'vault-item', itemId }, name, driver: 'secret@1',
       target: { kind: 'environment', name: 'API_KEY' }, access: 'read',
     });
     await expect(proposal(mint((world.handle.generation ?? 1) + 1), own.id)).rejects.toBeInstanceOf(CapabilityError);
@@ -403,12 +408,19 @@ describe('project resources', () => {
     const agentReviewer = tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
       principal: 'user:reviewer', projectId: project.id, organizationId: project.organizationId,
       ceiling: ['task:review:execute'], grantorCaps: ['task:review:execute'] }).token;
-    await expect(api.adoptProjectResource(agentReviewer, task.id, ownProposal.candidate.id))
+    await expect(api.adoptProjectResource(mint(world.handle.generation ?? 1), task.id, ownProposal.candidate.id))
       .rejects.toBeInstanceOf(CapabilityError);
+    await api.adoptProjectResource(agentReviewer, task.id, ownProposal.candidate.id);
     const reviewer = tokens.mintPrincipal('user:reviewer', ['task:review:execute'], project.id,
       undefined, project.organizationId).token;
     await api.adoptProjectResource(reviewer, task.id, ownProposal.candidate.id);
     expect(signals).toContainEqual({ taskId: task.id, signal: 'resourceResolved' });
+    const discardable = await proposal(mint(world.handle.generation ?? 1), own.id, 'Discardable');
+    await expect(api.discardProjectResource(mint(world.handle.generation ?? 1), task.id, discardable.candidate.id))
+      .rejects.toBeInstanceOf(CapabilityError);
+    await api.discardProjectResource(agentReviewer, task.id, discardable.candidate.id);
+    expect(store.listResourceCandidates(task.id).find((candidate) => candidate.id === discardable.candidate.id)?.state).toBe('discarded');
+
     await expect(api.proposeProjectResource(mint(world.handle.generation ?? 1), {
       source: { kind: 'vault-item', itemId: own.id }, name: 'Writable database', driver: 'database@1',
       target: { kind: 'service', name: 'DATABASE_URL' }, access: 'write',

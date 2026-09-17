@@ -142,12 +142,14 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
 
   it('reroutes an already-open ordinary input pause through the editable Responder', async () => {
     const repo = await h.makeRepo('paramedit-responder');
+    // The owner re-routing their own task: who answers a question is a reviewer's
+    // decision, so the token carries `review:approve` (a maintainer-level grant).
     const token = h.tokens.mint({
       taskId: 't-responder',
       profileId: 'do',
       principal: 'user:a',
-      ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task'],
-      grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task'],
+      ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
+      grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
     }).token;
     const project = h.store.createProject('Responder edits', {
       repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false,
@@ -260,8 +262,8 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     const project = h.store.createProject('P', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }, organization.id);
     const token = h.tokens.mint({
       taskId: 't', profileId: 'do', principal: 'user:owner',
-      ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task'],
-      grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task'],
+      ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
+      grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
     }).token;
     const task = await h.api.createTask(token, {
       projectId: project.id, workflow: 'software-dev', prompt: '@write s.txt :: hi\n@review ok',

@@ -1,3 +1,4 @@
+import { validateMcpSelection } from '../mcp/connections/store.js';
 import { AgentProfile, AgentRole, AgentSpec, Provider } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { allRoles } from '../contrib/manifests.js';
@@ -62,6 +63,7 @@ export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfi
   const { model: _model, effort: _effort, auth: _auth, allowedAccounts: _allowedAccounts, ...common } = cleanBase;
   return {
     ...common,
+    ...(spec.mcpConnections !== undefined ? { mcpConnections: validateMcpSelection(spec.mcpConnections) } : {}),
     provider,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
@@ -81,12 +83,18 @@ export function roleDefaultProfile(store: Store, role: AgentRole | string,
   projectId?: string, organizationId?: string): AgentProfile | undefined {
   if (projectId) {
     const project = store.getProfile(projectProfileId(projectId, role));
-    if (project) return project;
+    if (project) {
+      const parent = roleDefaultProfile(store, role, undefined, organizationId ?? store.getProject(projectId)?.organizationId);
+      return { ...project, ...(project.mcpConnections === undefined && parent?.mcpConnections !== undefined ? { mcpConnections: parent.mcpConnections } : {}) };
+    }
     organizationId ??= store.getProject(projectId)?.organizationId;
   }
   if (organizationId) {
     const organization = store.getProfile(organizationProfileId(organizationId, role));
-    if (organization) return organization;
+    if (organization) {
+      const fallback = store.getProfile(`${role}-default`);
+      return { ...organization, ...(organization.mcpConnections === undefined && fallback?.mcpConnections !== undefined ? { mcpConnections: fallback.mcpConnections } : {}) };
+    }
   }
   return store.getProfile(`${role}-default`);
 }

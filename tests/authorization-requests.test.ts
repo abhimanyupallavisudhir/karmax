@@ -38,8 +38,34 @@ function fixture() {
 }
 
 describe('initial authorization delegation requests', () => {
-  it('materializes team selectors as only members who can grant the complete package', async () => {
+  it('dismisses without changing authorization and permits a later denial', async () => {
     const f = fixture();
+    const task = f.store.createTask({ projectId: f.project.id, title: 'Pending', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { draft: true, prompt: 'work' } });
+    const service = new AuthorizationRequests(f.store, 'org_personal');
+    const request = service.request({ projectId: f.project.id, target: { kind: 'task', taskId: task.id },
+      authorization: f.requested, capabilities: [], missingCapabilities: [], audience: ['user:approver'],
+      recipients: ['approver'], reason: 'More access', requestedBy: 'user:requester' });
+    await expect(f.api.resolveAuthorizationRequest(f.tokenFor('limited'), { organizationId: 'org_personal',
+      requestId: request.id, action: 'dismiss' })).rejects.toThrow(/not routed/);
+    await expect(f.api.resolveAuthorizationRequest(f.tokenFor('approver'), { organizationId: 'org_personal',
+      requestId: request.id, action: 'dismiss' })).resolves.toMatchObject({ status: 'pending', dismissed: { by: 'user:approver' } });
+    expect(f.store.getTask(task.id)?.params).toEqual({ draft: true, prompt: 'work' });
+    await expect(f.api.resolveAuthorizationRequest(f.tokenFor('approver'), { organizationId: 'org_personal',
+      requestId: request.id, action: 'deny' })).resolves.toMatchObject({ status: 'denied' });
+  });
+
+  it.each(['human', 'delegated-agent'])('%s routes and resolves authorization with the complete granted package', async (kind) => {
+    const f = fixture();
+    const tokenFor = (userId: string) => {
+      const human = f.tokenFor(userId);
+      if (kind === 'human') return human;
+      const taskId = `delegate-${userId}`;
+      const delegation = f.tokens.delegateHuman(human, { taskId, projectId: f.project.id, organizationId: 'org_personal' })!;
+      const caps = f.tokens.verify(human)!.caps;
+      return f.tokens.mint({ taskId, profileId: 'do', principal: `user:${userId}`, projectId: f.project.id,
+        organizationId: 'org_personal', ceiling: caps, grantorCaps: caps, delegationId: delegation.id }).token;
+    };
     const task = f.store.createTask({
       projectId: f.project.id, title: 'Protected work', workflow: 'just-do', workflowVersion: '1.0.0',
       createdBy: { kind: 'user', userId: 'requester' },
@@ -48,7 +74,7 @@ describe('initial authorization delegation requests', () => {
         principal: 'user:requester', attenuationAccepted: false,
       } },
     });
-    const targets = f.api.authorizationEscalationTargets(f.tokenFor('requester'), {
+    const targets = f.api.authorizationEscalationTargets(tokenFor('requester'), {
       projectId: f.project.id, authorization: f.requested,
     });
     expect(targets.users.map((user) => user.id)).toContain('approver');
@@ -58,7 +84,7 @@ describe('initial authorization delegation requests', () => {
     ]);
     expect(targets.missingCapabilities.length).toBeGreaterThan(0);
 
-    const request = await f.api.requestAuthorization(f.tokenFor('requester'), {
+    const request = await f.api.requestAuthorization(tokenFor('requester'), {
       projectId: f.project.id,
       target: { kind: 'task', taskId: task.id },
       authorization: f.requested,
@@ -71,7 +97,7 @@ describe('initial authorization delegation requests', () => {
     ]);
     expect(f.store.listInbox('limited', 'org_personal')).toEqual([]);
 
-    await f.api.resolveAuthorizationRequest(f.tokenFor('approver'), {
+    await f.api.resolveAuthorizationRequest(tokenFor('approver'), {
       organizationId: 'org_personal', requestId: request.id, action: 'approve',
     });
     expect(f.store.getTask(task.id)?.params._authorization).toMatchObject({
@@ -142,6 +168,7 @@ describe('initial authorization delegation requests', () => {
       authorization: { ...avatarAuthorization, principal: 'user:approver' },
       runtime: { provider: 'mock' }, createdAt: now, updatedAt: now,
     };
+    f.store.kvSet(`avatars:project:${f.project.id}`, 'enabled');
     f.store.upsertAvatar(authorizer);
     const request = await f.api.requestAuthorization(f.tokenFor('requester'), {
       projectId: f.project.id, target: { kind: 'task', taskId: task.id },

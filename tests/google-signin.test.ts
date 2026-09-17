@@ -41,6 +41,7 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}`, ...opts });
   const store = new Store(':memory:');
   const tokens = new TokenAuthority();
+  const authorization = new AuthorizationService(store);
   const gateway = new Gateway({
     api: {} as any,
     store,
@@ -53,12 +54,21 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
     staticDir: process.cwd(),
     agentInfo: { provider: 'mock', reason: 'google sign-in test' },
     identity,
-    authorization: new AuthorizationService(store),
+    authorization,
     worlds: new WorldRegistry(),
   });
   const running = await gateway.listen(port);
   closers.push(() => running.close());
-  return { identity, store, tokens, base: running.url };
+  return { identity, store, tokens, authorization, base: running.url };
+}
+
+/** Delegate the caller's authority; setup users default to God. */
+function delegatedHeaders(tokens: TokenAuthority, userId: string, capabilities: string[] = ['*']): { authorization: string } {
+  const human = tokens.mintPrincipal(`user:${userId}`, capabilities);
+  const delegation = tokens.delegateHuman(human.token, { taskId: 'self-service' })!;
+  const agent = tokens.mint({ taskId: 'self-service', profileId: 'do', role: 'do',
+    principal: `task:self-service`, ceiling: capabilities, grantorCaps: capabilities, delegationId: delegation.id });
+  return { authorization: `Bearer ${agent.token}` };
 }
 
 describe('Google sign-in is off unless configured', () => {
@@ -73,8 +83,8 @@ describe('Google sign-in is off unless configured', () => {
 });
 
 describe('user data export', () => {
-  it('downloads only the signed-in person’s readable, secret-free data as formatted JSON', async () => {
-    const { identity, store, base } = await boot();
+  it.each(['browser', 'agent'])('%s downloads only the represented person’s readable, secret-free data as formatted JSON', async (actor) => {
+    const { identity, store, tokens, base } = await boot();
     const signup = await fetch(`${base}/api/setup`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'Alice', email: 'alice@example.com', password: 'long-enough-password' }),
@@ -84,7 +94,8 @@ describe('user data export', () => {
     const organization = store.listOrganizations(user.id)[0]!;
     store.createProject('Alice project', {}, organization.id);
 
-    const response = await fetch(`${base}/api/user/export`, { headers: { cookie } });
+    const headers = actor === 'agent' ? delegatedHeaders(tokens, user.id) : { cookie };
+    const response = await fetch(`${base}/api/user/export`, { headers });
     const text = await response.text();
     const exported = JSON.parse(text);
 
@@ -99,7 +110,7 @@ describe('user data export', () => {
     expect(exported.security).toMatchObject({ secretsIncluded: false });
 
     const organizationResponse = await fetch(`${base}/api/organizations/${organization.id}/export`, {
-      headers: { cookie },
+      headers,
     });
     const organizationText = await organizationResponse.text();
     expect(organizationResponse.status).toBe(200);
@@ -112,20 +123,24 @@ describe('user data export', () => {
     });
   });
 
-  it('does not allow an agent bearer token to use the self-service export', async () => {
+  it('rejects self-service export without a verified user subject', async () => {
     const { store, tokens, base } = await boot();
     const project = store.createProject('Agent project');
     const token = tokens.mintPrincipal('user:somebody', ['*'], project.id).token;
     const response = await fetch(`${base}/api/user/export`, {
       headers: { authorization: `Bearer ${token}` },
     });
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: 'a verified human subject is required' });
   });
 });
 
 describe('default organization preference', () => {
-  it('starts on the personal workspace and changes only when the user asks', async () => {
-    const { identity, store, base } = await boot();
+  it.each([
+    { actor: 'browser', operator: false }, { actor: 'agent', operator: false },
+    { actor: 'browser', operator: true }, { actor: 'agent', operator: true },
+  ])('$actor (operator: $operator) starts on the personal workspace and selects only accessible defaults', async ({ actor, operator }) => {
+    const { identity, store, tokens, authorization, base } = await boot();
     const signup = await fetch(`${base}/api/setup`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'Alice', email: 'alice@example.com', password: 'long-enough-password' }),
@@ -135,28 +150,46 @@ describe('default organization preference', () => {
     const personal = store.listOrganizations(user.id).find((organization) => organization.kind === 'personal')!;
     const newest = store.createOrganization({ name: 'Newest team', ownerUserId: user.id });
 
-    const initial = await fetch(`${base}/api/user/default-organization`, { headers: { cookie } });
+    // Setup grants God globally. Remove only that grant for the ordinary-member
+    // cases, retaining ownership of the personal and newly created organizations.
+    if (!operator) store.deletePrincipalGrant(`user:${user.id}`, 'global');
+    const capabilities = authorization.capabilities(`user:${user.id}`);
+    expect(capabilities.includes('*')).toBe(operator);
+    const headers = actor === 'agent' ? delegatedHeaders(tokens, user.id, capabilities) : { cookie };
+    const initial = await fetch(`${base}/api/user/default-organization`, { headers });
     expect(initial.status).toBe(200);
     expect(await initial.json()).toEqual({ organizationId: personal.id });
 
     const changed = await fetch(`${base}/api/user/default-organization`, {
-      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      method: 'PUT', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ organizationId: newest.id }),
     });
     expect(changed.status).toBe(200);
     expect(await changed.json()).toEqual({ organizationId: newest.id });
     expect(store.defaultOrganization(user.id)?.id).toBe(newest.id);
 
-    const inaccessible = store.createOrganization({ name: 'Not mine', ownerUserId: 'someone-else' });
-    const rejected = await fetch(`${base}/api/user/default-organization`, {
-      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ organizationId: inaccessible.id }),
+    const other = store.createOrganization({ name: 'Not mine', ownerUserId: 'someone-else' });
+    // Even public name discovery must not let ordinary nonmembers set a default.
+    store.setOrganizationNameVisibility(other.id, 'public');
+    const response = await fetch(`${base}/api/user/default-organization`, {
+      method: 'PUT', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ organizationId: other.id }),
     });
-    expect(rejected.status).toBe(400);
-    expect(store.defaultOrganization(user.id)?.id).toBe(newest.id);
+    expect(response.status).toBe(operator ? 200 : 400);
+    const expected = operator ? other.id : newest.id;
+    expect(await (await fetch(`${base}/api/user/default-organization`, { headers })).json())
+      .toEqual({ organizationId: expected });
+    expect(store.defaultOrganization(user.id, operator)?.id).toBe(expected);
+
+    const missing = await fetch(`${base}/api/user/default-organization`, {
+      method: 'PUT', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ organizationId: 'org_does_not_exist' }),
+    });
+    expect(missing.status).toBe(400);
+    expect(store.defaultOrganization(user.id, operator)?.id).toBe(expected);
   });
 
-  it('does not allow an agent bearer to read or change a user preference', async () => {
+  it('rejects reading or changing a preference without a verified user subject', async () => {
     const { tokens, base } = await boot();
     const token = tokens.mintPrincipal('user:alice', ['*']).token;
     for (const method of ['GET', 'PUT']) {
@@ -164,7 +197,8 @@ describe('default organization preference', () => {
         method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
         ...(method === 'PUT' ? { body: JSON.stringify({ organizationId: 'org_personal' }) } : {}),
       });
-      expect(response.status).toBe(401);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'a verified human subject is required' });
     }
   });
 });

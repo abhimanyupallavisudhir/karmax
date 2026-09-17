@@ -1,8 +1,8 @@
 /**
  * The capability model + attenuation (SPEC §8.1, §8.2). A flat set of named
- * capabilities granted to principals. An agent's effective capabilities are the
- * intersection of its profile-declared ceiling and the granting principal's
- * capabilities — least privilege, capability attenuation.
+ * capabilities granted to principals. Agent tokens preserve the selected task
+ * authorization, attenuated to the granting principal's authority and scope.
+ * Workflow duty does not introduce a second permission tier.
  *
  * Capabilities support `:`-segmented scoping and `*` wildcards, e.g.
  *   merge-into:/repo:main   merge-into:*   use-credential:openai   *
@@ -17,8 +17,8 @@ export type Capability = string;
  */
 export const CAPABILITIES = [
   'task:read', 'task:create', 'task:edit', 'task:signal', 'task:escalate', 'task:delete',
-  'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
-  'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute',
+  'task:conversation:read', 'task:conversation:share', 'task:conversation:fork', 'task:conversation:message',
+  'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute', 'review:approve',
   'task:assign', 'task:subscribe',
   'project:read', 'project:create', 'project:edit', 'project:delete',
   'project:settings:read', 'project:settings:write',
@@ -31,12 +31,11 @@ export const CAPABILITIES = [
   'queue:read', 'queue:write', 'workflow:read', 'workflow:install', 'workflow:edit',
   'profile:read', 'profile:write', 'skill:write',
   'diagnostic:read', 'process:read', 'process:kill',
-  'credential:read', 'credential:write', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
+  'credential:read', 'credential:write', 'connection:use', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
   'settings:read', 'settings:write', 'safe-mode:write',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
-  // Workflow-internal decisions are ordinary capabilities too. They are kept
-  // in the public catalogue so a profile can be edited without knowing hidden
-  // strings; the concrete role profile still provides the second ceiling.
+  // Workflow decisions are discoverable capabilities too. Authorization selects
+  // them; workflow state determines when the corresponding action is valid.
   'resolve-decision', 'confirm-decision', 'merge-into:*',
 ] as const;
 
@@ -49,7 +48,7 @@ export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
   'queue:read', 'workflow:read', 'profile:read',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read',
   'github:actions:read',
-  'credential:read', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
+  'credential:read', 'connection:use', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
 ];
 
 export interface CapabilityDefinition {
@@ -109,9 +108,11 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     id: 'collaboration', label: 'Conversations and review', description: 'Inspect and coordinate agents, and operate review actions.',
     capabilities: [
       ['task:conversation:read', 'Read agent conversations', 'Discover attached agents and read their conversation history.'],
+      ['task:conversation:share', 'Share conversations publicly', 'Create and revoke public conversation snapshots when organization and project policy allows.'],
       ['task:conversation:fork', 'Fork agent conversations', 'Create a new task from an existing agent conversation.'],
       ['task:conversation:message', 'Message forked agents', 'Continue a forked conversation with additional messages.'],
       ['task:review:write', 'Write review information', 'Publish structured review summaries and evidence.'],
+      ['review:approve', 'Approve Review gates and route reviews', 'Confirm a task at its Review gate and change who reviews or answers it — the decisions a human reviewer makes. Held by maintainers and above; not by the default developer profile.'],
       ['task:review:execute', 'Execute review actions', 'Run and stop workflow-declared review actions.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
@@ -136,7 +137,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['workflow:install', 'Install workflows', 'Self-hosted only: install trusted workflow code into the platform worker.'],
       ['workflow:edit', 'Propose workflow changes', 'Manage version pins; on self-hosted servers, propose external workflow code changes.'],
       ['profile:read', 'View agent profiles', 'Read provider, model, account, and role-profile configuration.'],
-      ['profile:write', 'Edit agent profiles', 'Change role profiles and their capability ceilings.'],
+      ['profile:write', 'Edit agent profiles', 'Change agent runtime profiles; task authorization controls permissions.'],
       ['skill:write', 'Save skills', 'Persist reusable agent knowledge and resolution skills.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
@@ -147,7 +148,8 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['process:read', 'View processes', 'Inspect processes managed by karmax.'],
       ['process:kill', 'Stop processes', 'Terminate processes managed by karmax.'],
       ['credential:read', 'View credential metadata', 'Discover credential handles, vault items, and non-secret policy.'],
-      ['credential:write', 'Manage credentials', 'Create, replace, delete, and configure credential handles and vault items, and resolve credential access requests.'],
+      ['connection:use', 'Use connected apps', 'Execute app tools using accounts explicitly shared with the task or project.'],
+      ['credential:write', 'Manage credentials', 'Create, replace, delete, configure, and inspect plaintext credentials and vault items; resolve credential access requests.'],
       ['vault:store', 'Store new credentials', 'Write newly created credentials (accounts an agent registered) back into the vault as items.'],
       ['payment:read', 'View payments', 'Inspect payment methods, limits, and transactions.'],
       ['payment:write', 'Manage payments', 'Create payment resources and authorize spending within policy.'],
@@ -163,7 +165,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['authorization:read', 'View authorization', 'Read profiles, grants, defaults, and the audit log.'],
       ['authorization:write', 'Manage authorization', 'Change profiles, grants, and authorization defaults.'],
       ['user:read', 'View user accounts', 'List human accounts and their access grants.'],
-      ['user:write', 'Manage user accounts', 'Create and remove human accounts.'],
+      ['user:write', 'Manage user accounts', 'Create and remove user accounts. Own-account self-service uses verified identity for humans and delegated agents.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
   {
@@ -244,11 +246,13 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   propose_project_resource: 'task:review:write', adopt_project_resource: 'task:review:execute',
   discard_project_resource: 'task:review:execute',
   list_events: 'task:event:read', diagnostics: 'diagnostic:read', list_processes: 'process:read', kill_process: 'process:kill',
+  list_github_actions_workflows: 'github:actions:read',
   list_github_actions_runs: 'github:actions:read', inspect_github_actions_run: 'github:actions:read',
   manage_github_actions_run: 'github:actions:write', dispatch_github_actions_workflow: 'github:actions:write',
   execute_review_action: 'task:review:execute', stop_review_action: 'task:review:execute',
   list_credentials: 'credential:read', manage_credentials: 'credential:write',
   get_credential: 'credential:read', fill_credential: 'credential:read',
+  list_connections: 'credential:read', request_connection: 'credential:read', search_connection_tools: 'credential:read', execute_connection_tool: 'connection:use',
   request_credential: 'credential:read', store_credential: 'vault:store',
   check_agent_mail: 'credential:read', enroll_passkey: 'credential:read',
   use_passkey: 'credential:read', save_passkey: 'vault:store',

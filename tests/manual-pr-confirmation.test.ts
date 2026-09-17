@@ -1,3 +1,5 @@
+import { KarmaxApi } from '../src/platform/api.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
 import { describe, it, expect } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
@@ -5,6 +7,25 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 
 describe('deferred manual PR confirmation', () => {
+  it('preserves identical deferred-review intent for a human and its authorized delegate', async () => {
+    const store = new Store(':memory:');
+    try {
+      const project = store.createProject('Delegate review');
+      const task = store.createTask({ projectId: project.id, title: 'Review', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'work' } });
+      const tokens = new TokenAuthority();
+      const human = tokens.mintPrincipal('user:reviewer', ['task:signal'], project.id);
+      const delegation = tokens.delegateHuman(human.token, { taskId: 'reviewer-agent', projectId: project.id })!;
+      const agent = tokens.mint({ taskId: 'reviewer-agent', profileId: 'developer', principal: 'task:reviewer-agent',
+        projectId: project.id, ceiling: ['task:signal'], grantorCaps: ['task:signal'], delegationId: delegation.id });
+      const signals: unknown[][] = [];
+      const client = { workflow: { getHandle: () => ({ signal: async (...args: unknown[]) => { signals.push(args); } }) } } as any;
+      const api = new KarmaxApi({ store, tokens, client, taskQueue: 'test' });
+      for (const token of [human.token, agent.token]) await api.signalTask(token, task.id, 'openPr');
+      expect(signals).toEqual([['openPr', { userId: 'reviewer' }], ['openPr', { userId: 'reviewer' }]]);
+    } finally { store.close(); }
+  });
+
   it.each(['authorized', 'wrong-user', 'disabled', 'agent', 'landing', 'revoked'])('%s', async (scenario) => {
     const store = new Store(':memory:');
     try {

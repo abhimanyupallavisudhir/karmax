@@ -168,12 +168,40 @@ export function extractMimeText(raw: string): string {
 /** The installation's webhook secret, minted on first use and stored in the
  *  store — the operator copies a complete URL, never sets an env var. The
  *  legacy KARMAX_AGENT_MAIL_SECRET env remains accepted for old setups. */
-export function ingestSecret(store: AgentMailStore): string {
-  const existing = store.kvGet('agent-mail:secret');
+const kvSecret = (organizationId: string) => `agent-mail:secret:${organizationId}`;
+/** Reverse route for the webhook: sha256(secret) → owning organization. Keyed by
+ *  the hash so the lookup's timing says nothing about the secret's bytes. */
+const kvSecretOwner = (secret: string) => `agent-mail:secret-owner:${crypto.createHash('sha256').update(secret).digest('hex')}`;
+
+/** The organization's webhook secret, minted on first read. It authenticates
+ *  the forwarding service AND names the one tenant its mail may reach: an
+ *  installation-wide secret let any administrator who had seen their own
+ *  webhook URL forge verification mail into every other organization's inbox. */
+export function ingestSecret(store: AgentMailStore, organizationId: string): string {
+  const existing = store.kvGet(kvSecret(organizationId));
   if (existing) return existing;
   const secret = crypto.randomBytes(18).toString('base64url');
-  store.kvSet('agent-mail:secret', secret);
+  store.kvSet(kvSecret(organizationId), secret);
+  store.kvSet(kvSecretOwner(secret), organizationId);
   return secret;
+}
+
+/** What a presented webhook secret unlocks: one organization, or — for the
+ *  installation-wide secret earlier releases minted (and the legacy env var),
+ *  kept so already-configured forwarders keep delivering — every organization
+ *  (`organizationId` undefined). `undefined` means the secret is not accepted. */
+export function ingestScope(store: AgentMailStore, presented: string | undefined, legacyEnvSecret?: string): { organizationId?: string } | undefined {
+  if (!presented) return undefined;
+  const owner = store.kvGet(kvSecretOwner(presented));
+  if (owner && timingSafeEqualStr(store.kvGet(kvSecret(owner)) ?? '', presented)) return { organizationId: owner };
+  const legacy = store.kvGet('agent-mail:secret');
+  if ((legacy && timingSafeEqualStr(presented, legacy)) || (legacyEnvSecret && timingSafeEqualStr(presented, legacyEnvSecret))) return {};
+  return undefined;
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const x = Buffer.from(a); const y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
 /** application/x-www-form-urlencoded → flat object (Mailgun test posts etc.). */
@@ -295,11 +323,12 @@ export class AgentMail {
   /**
    * Ingest an inbound message (the mail webhook), routed to the organization
    * owning the recipient address. Mail for an unknown recipient is dropped —
-   * a catch-all domain forwards everything, including strangers' typos.
+   * a catch-all domain forwards everything, including strangers' typos — and so
+   * is mail whose webhook secret belongs to a different organization (`onlyFor`).
    */
-  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number; sourceId?: string }): { delivered: boolean; message?: AgentMessage } {
+  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number; sourceId?: string }, onlyFor?: string): { delivered: boolean; message?: AgentMessage } {
     const organizationId = this.ownerOf(msg.to);
-    if (!organizationId) return { delivered: false };
+    if (!organizationId || (onlyFor && organizationId !== onlyFor)) return { delivered: false };
     const id = msg.sourceId
       ? `msg_${crypto.createHash('sha256').update(`${organizationId}\0${msg.sourceId}`).digest('hex')}`
       : `msg_${crypto.randomBytes(8).toString('hex')}`;

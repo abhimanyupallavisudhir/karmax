@@ -203,6 +203,21 @@ knowing:
 To run invite-only instead, gate `/api/signup` behind the existing
 organization-invitation flow, which is already token-hash validated.
 
+## Git handoff storage
+
+The trusted Git broker transfers bundles incrementally against commits verified
+in the receiving repository. Already-present tips need no bundle. Bootstrap and
+genuinely large new content use 4 MiB file-transfer chunks; the worker does not
+load an entire bundle into memory. Git itself still needs temporary disk space
+and memory to clone, pack, and import repository objects. Credentials stay on
+the trusted host.
+
+There is no default 256 MiB bundle ceiling. Operators may set
+`KARMAX_MAX_GIT_BUNDLE_MB` to a positive number to impose a per-transfer size
+limit; it is checked before reading bundle payloads. This is separate from
+managed project-resource storage quotas and remote Git hosting limits. Temporary
+clones and bundle files still require sufficient worker and sandbox disk space.
+
 ## Managed storage and customer-owned S3
 
 The deployment object store remains the control-plane default: portable world

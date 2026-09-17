@@ -7,7 +7,8 @@ import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
-import { accountCoordinatorId } from '../src/coordinators/names.js';
+import { mergeQueueId, accountCoordinatorId } from '../src/coordinators/names.js';
+import { mergeQueueDomains } from '../src/domain/types.js';
 
 function input(over: { taskId: string; projectId?: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
   return {
@@ -29,6 +30,9 @@ const view = (h: any) => h.query('view') as Promise<any>;
 describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   let cancellationCleanupFinishedAt = 0;
+  let releaseAttemptMerge: (() => void) | undefined;
+  let attemptMergeGate: Promise<void> | undefined;
+  const gatedAttemptIds = new Set<string>();
   let releaseResourceCandidateTurn: (() => void) | undefined;
   let resourceCandidateTurnReleased = false;
   beforeAll(async () => {
@@ -40,6 +44,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        if (input.role === 'merge' && gatedAttemptIds.has(input.world.handle.id)) await attemptMergeGate;
         const latestUser = input.messages.filter((message) => message.role === 'user').at(-1);
         if (!resourceCandidateTurnReleased
           && latestUser?.text.includes('@resource-candidate-regression')) {
@@ -89,6 +94,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     h = await bootHarness('mock', adapter);
   }, 60_000);
   afterAll(async () => {
+    releaseAttemptMerge?.();
     releaseResourceCandidateTurn?.();
     releaseResourceCandidateTurn = undefined;
     await h?.stop();
@@ -137,6 +143,106 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('export const f');
   });
+
+  it.each(['keep', 'cancel'] as const)('%s other attempts at first Merge admission', async (choice) => {
+    const repo = await h.makeRepo(`attempts-${choice}`);
+    const project = h.store.createProject(`Attempts ${choice}`, { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const first = h.store.createTask({ projectId: project.id, title: 'First', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write first.txt :: first' } });
+    const second = h.store.createTask({ projectId: project.id, title: 'Second', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write second.txt :: second' }, intentId: first.intentId });
+    const handles = await Promise.all([first, second].map((task) => h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ ...input({ taskId: task.id, projectId: project.id, repo, prompt: task.params.prompt }), intentId: first.intentId }],
+    })));
+    for (const handle of handles) await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    h.store.kvSet(`attempt-choice:${first.id}`, choice);
+    await handles[0]!.signal('confirm');
+    expect((await handles[0]!.result() as any).stage).toBe('done');
+    if (choice === 'keep') {
+      expect((await view(handles[1])).stage).toBe('review');
+      await handles[1]!.signal('confirm');
+      expect((await handles[1]!.result() as any).stage).toBe('done');
+      expect((await git(repo, ['show', 'main:second.txt'])).stdout).toContain('second');
+    } else {
+      expect((await handles[1]!.result() as any).stage).toBe('cancelled');
+      expect((await git(repo, ['show', 'main:second.txt'])).code).not.toBe(0);
+    }
+    expect((await git(repo, ['show', 'main:first.txt'])).stdout).toContain('first');
+  });
+
+  it('kept siblings confirmed together own separate, serialized merge queue leases', async () => {
+    const repo = await h.makeRepo('kept-sibling-queue');
+    const project = h.store.createProject('Kept queue', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const first = h.store.createTask({ projectId: project.id, title: 'Queue sibling admission A', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write queued-a.txt :: A' } });
+    const second = h.store.createTask({ projectId: project.id, title: 'Queue sibling admission B', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write queued-b.txt :: B' }, intentId: first.intentId });
+    h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' });
+    gatedAttemptIds.add(first.id);
+    gatedAttemptIds.add(second.id);
+    attemptMergeGate = new Promise<void>((resolve) => { releaseAttemptMerge = resolve; });
+    const handles = await Promise.all([first, second].map((task) => h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ ...input({ taskId: task.id, projectId: project.id, repo, title: task.title, prompt: task.params.prompt }), intentId: first.intentId }],
+    })));
+    try {
+      for (const handle of handles) await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+      await Promise.all(handles.map((handle) => handle.signal('confirm')));
+      // The automatically attached project wiki is also a merge domain. The
+      // second attempt waits on the first sorted domain, not necessarily the code repo.
+      const domains = mergeQueueDomains((await view(handles[0])).state.recoveryWorld, 'main', project.id);
+      const queueHandle = h.client.workflow.getHandle(mergeQueueId(domains[0]!));
+      await expect.poll(async () => {
+        try { return await queueHandle.query('queue'); } catch { return undefined; }
+      }, { timeout: 20_000 }).toMatchObject({ current: expect.any(String), queue: [expect.any(String)] });
+      const queued = await queueHandle.query('queue') as { current: string; queue: string[] };
+      expect(new Set([queued.current, ...queued.queue])).toEqual(new Set([first.id, second.id]));
+      releaseAttemptMerge!();
+      expect(await Promise.all(handles.map((handle) => handle.result()))).toEqual([
+        expect.objectContaining({ stage: 'done' }), expect.objectContaining({ stage: 'done' }),
+      ]);
+      for (const domain of domains) await expect.poll(async () => {
+        const queue = await h.client.workflow.getHandle(mergeQueueId(domain)).query('queue') as { current?: string; queue: string[] };
+        return { current: queue.current ?? null, queue: queue.queue };
+      }).toEqual({ current: null, queue: [] });
+      expect((await git(repo, ['show', 'main:queued-a.txt'])).stdout).toContain('A');
+      expect((await git(repo, ['show', 'main:queued-b.txt'])).stdout).toContain('B');
+    } finally {
+      releaseAttemptMerge?.();
+      attemptMergeGate = undefined;
+      gatedAttemptIds.clear();
+      await Promise.all(handles.map((handle) => handle.signal('cancel').catch(() => undefined)));
+    }
+  }, 60_000);
+
+  it('kept sibling conflicts do not overwrite the first landed attempt or retain a queue lease', async () => {
+    const repo = await h.makeRepo('kept-sibling-conflict');
+    const project = h.store.createProject('Kept conflict', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const first = h.store.createTask({ projectId: project.id, title: 'First edit', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write index.js :: console.log("first")' } });
+    const second = h.store.createTask({ projectId: project.id, title: 'Conflicting edit', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write index.js :: console.log("second")' }, intentId: first.intentId });
+    h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' });
+    const handles = await Promise.all([first, second].map((task) => h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ ...input({ taskId: task.id, projectId: project.id, repo, prompt: task.params.prompt }), intentId: first.intentId }],
+    })));
+    try {
+      for (const handle of handles) await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+      await handles[0]!.signal('confirm');
+      expect(await handles[0]!.result()).toMatchObject({ stage: 'done' });
+      await handles[1]!.signal('confirm');
+      // The mock agent cannot resolve this conflict. The workflow must stop safely.
+      await expect.poll(async () => (await view(handles[1])).stage, { timeout: 30_000 }).toBe('escalated');
+      const target = await git(repo, ['show', 'main:index.js']);
+      expect(target.stdout).toContain('first');
+      expect(target.stdout).not.toMatch(/second|<<<<<<<|>>>>>>>/);
+      const queueHandle = h.client.workflow.getHandle(mergeQueueId(`${repo}:main`));
+      await expect.poll(async () => {
+        const queue = await queueHandle.query('queue') as { current?: string; queue: string[] };
+        return { current: queue.current ?? null, queue: queue.queue };
+      }).toEqual({ current: null, queue: [] });
+      expect(h.store.attemptGroup(first.id)?.otherAttempts).toBe('keep');
+    } finally {
+      await handles[1]!.signal('cancel').catch(() => undefined);
+      await handles[1]!.result();
+    }
+  }, 60_000);
 
   it.each(['1.15.0', '1.20.0'])('v%s runs repository-less work through Do and Review without Git or Merge', async (version) => {
     const taskId = newId('task');

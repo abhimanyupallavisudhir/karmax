@@ -16,6 +16,11 @@ import { hostOf, passEntryMetadata } from './pass-path.js';
 
 const pexec = promisify(execFile);
 
+// Hash ciphertext only: never persist a password hash in plaintext metadata.
+function encryptedRevision(file: string): string {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
 /**
  * External password-store connectors (PLAN-passwords.md §9). The karmax vault
  * is the runtime source of truth; a connector is a **selective mirror**, not a
@@ -60,6 +65,8 @@ export interface ExternalItem {
    *  were last mirrored — decrypting a whole `pass` tree costs seconds per
    *  entry, so re-importing everything must not re-read everything. */
   changedAt?: number;
+  /** Stable fingerprint of the encrypted source; independent of checkout clocks. */
+  revision?: string;
 }
 
 /** An external entry WITH its secrets, ready to write into the vault. */
@@ -166,8 +173,10 @@ export class BitwardenConnector implements CredentialConnector {
     else if (field === 'totp') item.login.totp = value;
     else if (field === 'note') item.notes = value;
     else throw new Error(`Bitwarden write-back does not support the "${field}" field`);
+    // The item JSON now carries the new secret: hand it over on stdin, never in
+    // argv, where every process of the same user could read it from /proc.
     const encoded = Buffer.from(JSON.stringify(item)).toString('base64');
-    await this.exec('bw', ['edit', 'item', externalId, encoded], { env: this.env() });
+    await this.exec('bw', ['edit', 'item', externalId], { env: this.env(), input: encoded });
   }
 }
 
@@ -483,7 +492,7 @@ export class PassConnector implements CredentialConnector {
         label: slash >= 0 ? entry.slice(slash + 1) : entry,
         folder: slash >= 0 ? entry.slice(0, slash) : '',
         domains: domain ? [domain] : [], ...(username ? { username } : {}),
-        fields: ['password'] as VaultFieldName[], ...this.changedAt(entry) };
+        fields: ['password'] as VaultFieldName[], ...this.sourceState(entry) };
     });
   }
   async pull(externalIds: string[]): Promise<PullResult> {
@@ -496,6 +505,7 @@ export class PassConnector implements CredentialConnector {
     const failures: PullResult['failures'] = [];
     for (const id of externalIds) {
       if (!entries.has(id)) continue;
+      const revision = this.sourceState(id);
       let body: string;
       try {
         body = await this.exec('pass', ['show', id]);
@@ -505,26 +515,19 @@ export class PassConnector implements CredentialConnector {
         failures.push({ externalId: id, error: gpgHint(e) });
         continue;
       }
-      const lines = body.replace(/\r/g, '').split('\n');
-      // `pass` convention: the FIRST line is the password; everything after is
-      // free-form notes/fields. Only line 1 is ever the credential for `use`
-      // (fill/inject); an `otpauth://` line anywhere becomes the TOTP seed.
-      const password = lines[0] ?? '';
-      const otp = lines.slice(1).find((l) => l.trim().startsWith('otpauth://'))?.trim();
-      const secrets: Partial<Record<VaultFieldName, string>> = { password };
-      if (otp) secrets.totp = otp;
+      const secrets = passSecrets(body);
       const { domain, username } = passEntryMetadata(id);
       out.push({ externalId: id, type: 'login', label: id, domains: domain ? [domain] : [],
         ...(username ? { username } : {}),
-        fields: Object.keys(secrets) as VaultFieldName[], secrets, ...this.changedAt(id) });
+        fields: Object.keys(secrets) as VaultFieldName[], secrets, ...revision });
     }
     return { items: out, failures };
   }
-  /** The entry file's mtime — `pass` keeps one GPG file per entry, so the
-   *  filesystem already records when a credential last changed. */
-  private changedAt(entry: string): { changedAt?: number } {
+  /** Read the encrypted file's identity without invoking GPG. */
+  private sourceState(entry: string): { changedAt?: number; revision?: string } {
     try {
-      return { changedAt: fs.statSync(path.join(this.storeDir, `${entry}.gpg`)).mtimeMs };
+      const file = path.join(this.storeDir, `${entry}.gpg`);
+      return { changedAt: fs.statSync(file).mtimeMs, revision: encryptedRevision(file) };
     } catch {
       return {};
     }
@@ -560,11 +563,11 @@ export class PassConnector implements CredentialConnector {
       const idx = lines.findIndex((l, i) => i > 0 && l.trim().startsWith('otpauth://'));
       if (idx >= 0) lines[idx] = value;
       else lines.push(value); // no existing seed → append one
-    } else {
+    } else if (field !== 'note') {
       throw new Error(`pass write-back does not support the "${field}" field`);
     }
     try {
-      await this.exec('pass', ['insert', '-m', '-f', externalId], { input: lines.join('\n') + '\n' });
+      await this.exec('pass', ['insert', '-m', '-f', externalId], { input: field === 'note' ? passSecrets(body).password + '\n' + value : lines.join('\n') + '\n' });
     } catch (e) {
       throw new Error(gpgHint(e));
     }
@@ -578,9 +581,11 @@ export class PassConnector implements CredentialConnector {
    */
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
     const name = `karmax/${item.label}`.replace(/[^A-Za-z0-9._@/-]+/g, '-').replace(/\/+/g, '/');
-    const body = [item.secrets.password ?? '', ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n');
+    const body = item.secrets.note !== undefined
+      ? (item.secrets.password ?? '') + '\n' + item.secrets.note
+      : [item.secrets.password ?? '', ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n') + '\n';
     try {
-      await this.exec('pass', ['insert', '-m', '-f', name], { input: body + '\n' });
+      await this.exec('pass', ['insert', '-m', '-f', name], { input: body });
     } catch (e) {
       throw new Error(gpgHint(e));
     }
@@ -726,13 +731,10 @@ export class GitPassConnector implements CredentialConnector {
         for (const externalId of externalIds) {
           if (!available.has(externalId)) continue;
           try {
+            const metadata = this.metadata(store, externalId);
             const body = await this.decrypt(gpgHome, connection, this.entryFile(store, externalId));
-            const lines = body.replace(/\r/g, '').split('\n');
-            const password = lines[0] ?? '';
-            const totp = lines.slice(1).find((line) => line.trim().startsWith('otpauth://'))?.trim();
-            const secrets: Partial<Record<VaultFieldName, string>> = { password };
-            if (totp) secrets.totp = totp;
-            items.push({ ...this.metadata(store, externalId), fields: Object.keys(secrets) as VaultFieldName[], secrets });
+            const secrets = passSecrets(body);
+            items.push({ ...metadata, fields: Object.keys(secrets) as VaultFieldName[], secrets });
           } catch (e) {
             failures.push({ externalId, error: gitPassGpgError(e) });
           }
@@ -755,10 +757,10 @@ export class GitPassConnector implements CredentialConnector {
           const index = lines.findIndex((line, i) => i > 0 && line.trim().startsWith('otpauth://'));
           if (index >= 0) lines[index] = value;
           else lines.push(value);
-        } else {
+        } else if (field !== 'note') {
           throw new Error(`Git-backed pass write-back does not support the "${field}" field`);
         }
-        await this.encrypt(gpgHome, file, lines.join('\n') + '\n', this.recipients(store, path.dirname(file)));
+        await this.encrypt(gpgHome, file, field === 'note' ? passSecrets(body).password + '\n' + value : lines.join('\n') + '\n', this.recipients(store, path.dirname(file)));
       });
       await this.commitAndPush(checkout, fileRelativeTo(checkout, this.entryFile(store, externalId)),
         `Update pass entry ${externalId}`, env);
@@ -777,8 +779,10 @@ export class GitPassConnector implements CredentialConnector {
       }
       const file = this.entryFile(store, externalId);
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      const body = [item.secrets.password, ...(item.username ? [`username: ${item.username}`] : []),
-        ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n') + '\n';
+      const body = item.secrets.note !== undefined
+        ? (item.secrets.password ?? '') + '\n' + item.secrets.note
+        : [item.secrets.password, ...(item.username ? [`username: ${item.username}`] : []),
+          ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n') + '\n';
       await this.withGpg(connection, async (gpgHome) => {
         await this.encrypt(gpgHome, file, body, this.recipients(store, path.dirname(file)));
       });
@@ -853,7 +857,13 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   private gitEnv(connection: GitPassConnection): Record<string, string> {
-    return { ...isolatedGitEnvironment(), ...this.gitEnvironment(connection.gitProfile) };
+    return {
+      ...isolatedGitEnvironment(),
+      ...this.gitEnvironment(connection.gitProfile),
+      // Belt to the URL check's braces: git itself refuses any other transport
+      // (`ext::`, `fd::`, or a helper smuggled in through a redirect).
+      GIT_ALLOW_PROTOCOL: this.options.allowLocalRepository ? 'https:ssh:file' : 'https:ssh',
+    };
   }
 
   private async refresh(connection: GitPassConnection, checkout: string, env: Record<string, string>): Promise<void> {
@@ -934,6 +944,7 @@ export class GitPassConnector implements CredentialConnector {
       ...(username ? { username } : {}),
       fields: ['password'],
       changedAt: stat.mtimeMs,
+      revision: encryptedRevision(this.entryFile(store, externalId)),
     };
   }
 
@@ -1009,10 +1020,13 @@ export class GitPassConnector implements CredentialConnector {
   }
 }
 
+/** HTTPS, `ssh://`, or scp-style `[user@]host:path`. The scp form must not be
+ *  followed by a second colon: `ext::<command>` and `fd::<n>` are git transport
+ *  helpers, not hosts, and would run a program instead of contacting one. */
 function isRemoteGitUrl(value: string): boolean {
   return /^https:\/\/[^\s]+$/i.test(value)
     || /^ssh:\/\/[^\s]+$/i.test(value)
-    || /^(?:[^@\s]+@)?[^:\s/]+:[^\s]+$/.test(value);
+    || /^(?:[^@\s]+@)?[^:\s/]+:(?!:)[^\s]+$/.test(value);
 }
 
 function githubRepositorySlug(value: string): string | undefined {
@@ -1081,6 +1095,15 @@ function gitPassGpgError(error: unknown): string {
     return 'Git-backed pass could not use the supplied GPG key or passphrase';
   }
   return message;
+}
+
+/** Keep the pass body after its first line verbatim; never interpret usernames. */
+export function passSecrets(body: string): Partial<Record<VaultFieldName, string>> {
+  const newline = body.indexOf('\n');
+  const password = (newline < 0 ? body : body.slice(0, newline)).replace(/\r$/, '');
+  const note = newline < 0 ? '' : body.slice(newline + 1);
+  const totp = note.split(/\r?\n/).find((line) => line.trim().startsWith('otpauth://'))?.trim();
+  return { password, note, ...(totp ? { totp } : {}) };
 }
 
 // ── the registry + sync service (state in the store kv) ───────────────────────
@@ -1320,6 +1343,7 @@ export class Connectors {
     if (!connector) throw new Error(`no connector "${name}"`);
     if (opts.writeBack !== undefined) this.setConfig(name, { writeBack: opts.writeBack });
     const source = `connector:${name}`;
+    const isPass = name === 'pass' || name === 'pass-git';
     const vaultItems = this.items.list();
     const mirrored = new Map(vaultItems
       .filter((i) => i.provenance.source === source && i.provenance.externalId)
@@ -1327,14 +1351,19 @@ export class Connectors {
     // An agent-created item written back to this connector is already present
     // in the vault. Import-new must not mirror its external entry back as a
     // duplicate connector item when the resulting Git push wakes auto-sync.
+    // Pass entries written by agents also need their source notes refreshed.
+    if (isPass) for (const item of vaultItems) {
+      const id = item.provenance.externalIds?.[name];
+      if (id) mirrored.set(id, item);
+    }
     const writtenBack = new Set(vaultItems.map((item) => item.provenance.externalIds?.[name])
       .filter((id): id is string => !!id));
 
     // Only ask the store when something might be skippable (a first import has
     // nothing to compare against, and `list()` is itself a CLI round-trip).
-    let wanted = externalIds.filter((id) => !writtenBack.has(id));
+    let wanted = externalIds.filter((id) => isPass || !writtenBack.has(id));
     if (mirrored.size) {
-      const changedAt = new Map((await connector.list()).map((i) => [i.externalId, i.changedAt]));
+      const metadata = new Map((await connector.list()).map((i) => [i.externalId, i]));
       wanted = wanted.filter((id) => {
         // Whole milliseconds on BOTH sides. A source's change marker can be
         // finer-grained than the mirror clock it is compared against — a file
@@ -1343,8 +1372,11 @@ export class Connectors {
         // back as `clock + 0.31…`: strictly greater, hence "changed", hence
         // re-decrypted on every sync from then on. Comparing at the coarser of
         // the two resolutions is what makes the two numbers comparable at all.
-        const at = floorMs(changedAt.get(id));
+        const at = floorMs(metadata.get(id)?.changedAt);
         const item = mirrored.get(id);
+        if (isPass && item?.provenance.passNotesVersion !== 1) return true;
+        const revision = metadata.get(id)?.revision;
+        if (revision !== undefined) return !item || item.provenance.sourceRevision !== revision;
         // Items mirrored before `syncedAt` existed fall back to `updatedAt`,
         // so an upgrade does not force one more full-store re-read; they get a
         // real mirror clock the first time they are pulled again.
@@ -1353,7 +1385,7 @@ export class Connectors {
       });
     }
 
-    const { items: pulled, failures } = await connector.pull(wanted);
+    const { items: pulled, failures } = wanted.length ? await connector.pull(wanted) : { items: [], failures: [] };
     // Nothing at all came back: surface why (a locked GPG key, an expired
     // session) rather than reporting a silent zero-item success.
     if (!pulled.length && failures.length) throw new Error(failures[0]!.error);
@@ -1371,7 +1403,7 @@ export class Connectors {
         // clobber a policy the user has since tuned on an existing item.
         ...(existing ? {} : { policy: opts.policy }),
         secrets: ext.secrets,
-        provenance: { source, externalId: ext.externalId, syncedAt },
+        provenance: { source, externalId: ext.externalId, syncedAt, sourceRevision: ext.revision, ...(isPass ? { passNotesVersion: 1 } : {}) },
       });
       itemIds.push(saved.id);
     }

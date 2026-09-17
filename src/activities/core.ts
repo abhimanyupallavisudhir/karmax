@@ -1,4 +1,7 @@
+import { McpConnections } from '../mcp/connections/store.js';
+import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
+import type { PublishedView, ViewConversation } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -87,6 +90,7 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
+import type { ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
@@ -986,6 +990,66 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       record(args.taskId, 'world.provisioning', { provider: args.kind });
       const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const project = projectId ? store.getProject(projectId) : undefined;
+      const forkPlan = store.getTask(args.taskId)?.params._forkWorld as ForkWorldSource | undefined;
+      const forkSource = forkPlan && forkPlan.base === args.base ? forkPlan : undefined;
+      let forkCheckpoint: import('../domain/types.js').WorldCheckpoint | undefined;
+      if (forkSource) {
+        const sourceTask = store.getTask(forkSource.taskId);
+        if (!sourceTask || sourceTask.projectId !== projectId)
+          throw new Error('fork world does not belong to this project');
+        if (forkSource.unpublished) {
+          if (!deps.checkpoints) throw new Error('world checkpoints are required to fork unpublished work');
+          const saved = store.kvGet(`fork-checkpoint:${args.taskId}`);
+          if (saved) forkCheckpoint = store.getWorldCheckpoint(saved);
+          if (!forkCheckpoint) {
+            // Wait for an idle source, including workflow-owned Git operations.
+            // A gap between two agent turns is not an idle world.
+            const sourceBusy = () => {
+              const view = store.getTask(forkSource.taskId)?.lastView;
+              if (view && ['done', 'cancelled', 'failed'].includes(view.status)) return false;
+              return view?.status === 'active' || Boolean(view?.agentTurn);
+            };
+            if (sourceBusy()) record(args.taskId, 'world.fork-waiting', { sourceTaskId: forkSource.taskId });
+            while (sourceBusy()) {
+              let context: ReturnType<typeof activityContext.current> | undefined;
+              try { context = activityContext.current(); } catch { /* direct activity test */ }
+              context?.cancellationSignal.throwIfAborted();
+              context?.heartbeat({ waitingFor: 'fork-source', taskId: forkSource.taskId });
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+            const source = store.currentWorld(forkSource.taskId) as WorldHandle | undefined;
+            if (!source) throw new Error('source world is unavailable; choose another starting branch to fork only the conversation');
+            // The source may finish while this fork waits for setup. Its world
+            // is deliberately destroyed then; provider status can still say ready
+            // (cached or after a worker restart). Never reopen that world or acquire
+            // a new source lease: use its durable snapshot, preserving the fork's
+            // original branch/files rather than silently switching to the target.
+            const sourceStatus = store.getTask(forkSource.taskId)?.lastView?.status;
+            const finished = (sourceStatus && ['done', 'cancelled', 'failed'].includes(sourceStatus))
+              || store.worldState(source.id) === 'released';
+            if (finished) {
+              forkCheckpoint = store.latestWorldCheckpoint(source.id);
+              if (!forkCheckpoint || forkCheckpoint.generation !== (source.generation ?? 1))
+                throw new Error('source world has finished without a checkpoint for its current generation; choose another starting branch to fork only the conversation');
+            } else {
+              const state = await worlds.status(source);
+              if (state !== 'ready' && source.checkpointId)
+                forkCheckpoint = store.getWorldCheckpoint(source.checkpointId);
+            }
+            if (!forkCheckpoint) {
+              const sourceWorld = await openWorld(source, source.id);
+              if (isRemote(source.kind)) {
+                const pushed = await publishTaskBranch(sourceWorld, source.id);
+                if (pushed.skipped.length) throw new Error(`could not persist fork branch: ${describePublishFailures(pushed)}`);
+              }
+              forkCheckpoint = await deps.checkpoints.checkpoint(sourceWorld.handle, { scrubSecrets: false });
+            }
+            store.kvSet(`fork-checkpoint:${args.taskId}`, forkCheckpoint.id);
+          }
+          if (forkCheckpoint.worldId !== forkSource.taskId || forkCheckpoint.projectId !== projectId)
+            throw new Error('fork checkpoint does not belong to the source task');
+        }
+      }
       const organizationId = project?.organizationId ?? 'org_personal';
       // Resolve the human creator's profile. A tenant-wide identity is only valid
       // for a system-created task with no human ancestor.
@@ -1094,6 +1158,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
         base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
       };
+      if (forkSource) {
+        for (const [index, source] of worldSources.entries()) {
+          const saved = forkSource.repos.find((repo) => sameRepository(repo.source, source)
+            || sameRepository(repo.source, transportSources[index]!));
+          if (saved) repositoryBranches[source] = { base: saved.base,
+            // Companion and explicit repository destinations outrank the
+            // task-wide target, including when an attempt inherits that field.
+            target: repositoryBranches[source]?.target
+              ?? (typeof taskRecord?.params.target === 'string' ? args.target || args.base
+                : saved.target || args.target || args.base) };
+        }
+      }
       if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
@@ -1125,7 +1201,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
       }
       const environmentSelection = projectId
-        ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
+        ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment)
         : { built: false, environment: executionConfig?.environment };
       let activitySignal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
@@ -1201,12 +1277,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        if (forkCheckpoint) {
+          await deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!);
+          if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
+            world.handle.warnings = [...(world.handle.warnings ?? []),
+              'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
+        }
         if (projectId && deps.resources) {
-          world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
+          const revisions = Object.fromEntries((forkCheckpoint?.resources ?? [])
+            .map((resource) => [resource.attachmentId, resource.revisionId]));
+          world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation, revisions);
         }
         if (projectId) {
           const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
-            selection: environmentSelection, resources: deps.resources, runSetupIfUnbuilt: true });
+            selection: environmentSelection, resources: deps.resources, services: forkCheckpoint?.services, runSetupIfUnbuilt: true });
           world.handle = runtime.handle;
           for (const warning of runtime.warnings) record(args.taskId, 'world.warning', { warning });
         }
@@ -1238,11 +1322,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }) as WorldHandle;
         }
         record(args.taskId, 'world.created', { handle: world.handle });
+        if (forkPlan) record(args.taskId, 'world.forked', { sourceTaskId: forkPlan.taskId,
+          base: args.base, checkpointId: forkCheckpoint?.id, unpublished: Boolean(forkCheckpoint) });
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
       } catch (error) {
         // `world` is still live on this path — pass it, or teardown addresses the
         // HOST daemon while the containers live inside the world (a silent no-op).
+        await deps.resources?.release(world.handle).catch(() => undefined);
         await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
@@ -1472,12 +1559,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         /* not running inside a Temporal activity (e.g. a direct unit test) */
       }
 
-      // The workflow mints the agent's scoped credential (SPEC §8.3): effective
-      // capabilities = intersection(role ceiling, granting principal). The two are
-      // orthogonal axes — the ceiling is what this ROLE could ever need (declared by
-      // the workflow), the grant is what the task's authorization profile delegated —
-      // so a Merge agent stays a Merge agent even on an administrator-authorized task.
-      // Human-approved credential escalations recorded after creation
+      // The workflow mints the agent's scoped credential (SPEC §8.3).
+      // Every declared agent role preserves the selected task authorization.
+      // Workflow duty is enforced by stage/decision handlers, not a hidden lower
+      // permission level for Confirm, Resolve, or legacy Merge turns.
+      // Approved credential escalations recorded after creation
       // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
@@ -1515,10 +1601,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...approvedPermissions,
         'task:escalate',
       ])];
-      // An explicit human approval is the only way to extend the task beyond
-      // the workflow role's ordinary ceiling. Fold it into both token axes: the
-      // normal stored task grant remains least-privilege, while the approved
-      // exception is exact, task-scoped, durable, and audited.
+      // Approved permission extensions join the task grant. The role ceiling
+      // admits that grant for declared agent roles; it does not raise the
+      // selected level or bypass the task's scope and durable approval checks.
       const ceiling = avatar
         ? [...new Set(grant)]
         : [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
@@ -1826,7 +1911,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (args.role === 'resolve') {
         const { listResolveSkills, renderSkillsIndex } = await import('../resolve/skills.js');
         const { paths } = await import('../config/paths.js');
-        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
+        const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
+        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content, organizationId)) };
       }
       // Goal mode: the do agent is told to keep driving across turns until the
       // objective is verifiably complete. Appended to the built-in working
@@ -1874,12 +1960,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const promptTask = liveTarget && liveTarget !== args.task.target
         ? { ...args.task, target: liveTarget }
         : args.task;
+      const forkOrigin = store.getTask(args.taskId)?.params._forkWorld as ForkWorldSource | undefined;
+      const forkContext = forkOrigin ? `\n\nThis task forks the conversation of ${forkOrigin.taskId}. Starting branch: ${args.task.base}. `
+        + (forkOrigin.base !== args.task.base
+          ? 'The starting branch was changed. This world uses normal project initialization; the source task’s unpublished files and private resource snapshots were not copied. Verify remembered work against the files present here.'
+          : forkOrigin.unpublished
+            ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
+            : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
+      const attemptGroup = store.attemptGroup(args.taskId);
+      const attemptContext = attemptGroup && attemptGroup.attempts.length > 1
+        ? `\n\nThis task has ${attemptGroup.attempts.length} attempts. Other attempts: ${attemptGroup.otherAttempts ?? store.otherAttemptsDefault(args.taskId)}. `
+          + (args.role === 'confirm' && !attemptGroup.committedAttemptId
+            ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
+            : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
+        : '';
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
         world: args.worldHandle,
-        globalInstructions,
+        globalInstructions: globalInstructions + forkContext + attemptContext,
         projectInstructions,
         bindings,
       });
@@ -1979,6 +2079,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
+      let mcpCleanup: (() => Promise<void>) | undefined;
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
@@ -2082,6 +2183,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Recreate their stable world paths immediately before every turn so a
         // restored cloud sandbox or a repeatedly-forked session can still read them.
         const turnMessages = await materializeFileAttachments(world, messages);
+        if (profile.mcpConnections !== undefined && !deps.broker) throw new Error('MCP connections require the credential vault');
+        const chosenMcp = profile.mcpConnections === undefined ? [] : await prepareConnections(
+          new McpConnections(store, deps.broker!, organizationId), world, profile.mcpConnections, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; });
+        store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } });
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2122,7 +2227,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
-          ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
+          agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
         } },
         {
           adapters: deps.adapters,
@@ -2137,6 +2242,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (t === lastEmit) return;
             lastEmit = t;
             record(args.taskId, 'agent.output', { text: t });
+          },
+          onReviewInfo: (info) => {
+            signal?.throwIfAborted();
+            store.checkpointReviewInfo(args.taskId, info);
+            record(args.taskId, 'review.updated', {});
           },
           onActivity: (activity) => {
             const turnId = args.agentTurnId ?? legacyAgentTurnId;
@@ -2302,11 +2412,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
+        if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
+          store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts);
+        }
         if (confirmTranscript) {
           if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
           if (result.confirmDecision) {
             const d = result.confirmDecision;
-            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
           }
           store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript));
         }
@@ -2324,6 +2437,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (usageAdmissionId && !usageAdmissionFinished) store.finishUsageAdmission(usageAdmissionId, false);
         await releaseSlot();
         releaseConfirm();
+        await mcpCleanup?.();
         publishLegacyAgentState(undefined);
       }
       if (token) deps.tokens?.revoke(token);
@@ -2721,6 +2835,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           error: error instanceof Error ? error.message : String(error),
         });
       }
+    },
+
+    async pendingServiceConnections(taskId: string): Promise<number> {
+      return store.kvEntries('service-connection:').filter(row => {
+        const c = JSON.parse(row.value);
+        return c.taskId === taskId && (['requested', 'connecting'].includes(c.status) || !c.notifiedAt);
+      }).length;
     },
 
     async pendingResourceCandidates(taskId: string): Promise<number> {
@@ -4397,7 +4518,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return true;
     },
 
-    async publishView(taskId: string, view: TaskView): Promise<void> {
+    async publishView(taskId: string, publication: PublishedView, conversationReference?: string): Promise<void> {
+      let view: TaskView;
+      if (conversationReference) {
+        // Immutable, task-scoped snapshots survive worker restarts and activity
+        // retries, including retries after another publication has completed.
+        const key = `view-conversation:${taskId}:${conversationReference}`;
+        if (publication.messages !== undefined) {
+          const json = JSON.stringify({ messages: publication.messages, transcripts: publication.transcripts });
+          const existing = store.kvGet(key);
+          if (existing !== undefined && existing !== json)
+            throw ApplicationFailure.nonRetryable('Conversation publication reference was reused', 'view-publication');
+          store.kvSet(key, json);
+        }
+        const stored = store.kvGet(key);
+        if (!stored)
+          throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+        const conversation: ViewConversation = JSON.parse(stored);
+        view = { ...publication, ...conversation };
+      } else {
+        if (publication.messages === undefined)
+          throw ApplicationFailure.nonRetryable('Full view publication requires messages', 'view-publication');
+        view = publication as TaskView;
+      }
       // A platform lifecycle replacement asks the old workflow to wind down via
       // its cancellation cleanup so turns, children, leases, and worlds settle
       // cleanly. Its final `cancelled` view is an implementation frame, not a
@@ -4415,10 +4558,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const key = lifecycleReplacementKey(taskId);
         if (lifecycleReplacementMatches(store.kvGet(key), runId)) return;
       }
+      // A replacement paused for human input first publishes its bootstrap
+      // frame, before setting waitingFor. That is not a real resumption: the
+      // humanPauseOrigin marker remains until the hold actually wakes. Publishing
+      // it deletes the live escalation and recreates it at normal urgency on the
+      // next frame (Task 201). It can also overwrite the platform's audience
+      // before task.escalated is routed. Suppress only this transient frame at
+      // the activity boundary so existing workflow histories receive the fix.
+      // Persist conversation snapshots above even for suppressed frames: the
+      // next publication may reference the same immutable snapshot.
+      if (view.state?.humanPauseOrigin && view.status === 'active' && !view.waitingFor) return;
       store.saveView(taskId, view);
-      // Entering Merge is the logical commitment boundary. The SQLite compare-and-
-      // set is the winner lease: exactly one attempt may get past this awaited
-      // activity and approach the global merge queue.
+      // First Merge admission freezes whether sibling proposals remain eligible.
+      // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {
         const claim = store.claimAttempt(taskId);
         for (const siblingId of claim.cancel) {
@@ -4429,6 +4581,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           await deps.client?.workflow.getHandle(siblingId).signal('cancel').catch(() => undefined);
         }
+        if (!claim.accepted) throw ApplicationFailure.nonRetryable('Another attempt cancelled this proposal at Merge admission', 'attempt-superseded');
       }
       record(taskId, 'view.updated', {
         stage: view.stage,

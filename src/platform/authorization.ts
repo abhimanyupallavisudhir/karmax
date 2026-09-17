@@ -54,6 +54,9 @@ const maintainer = [
   'project:resource:shared-write',
   'workflow:edit', 'team:write', 'repository:write',
   'github:actions:write',
+  // A maintainer's agent may stand in for a human at a Review gate; a
+  // developer's may not (it reviews through its own Confirm turn instead).
+  'review:approve',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
 // host. Global grants remain the explicit trust root for users, host processes,
@@ -63,20 +66,20 @@ const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
   'project:resource:shared-write',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:read', 'vault:store', 'use-credential:*', 'skill:write',
+  'credential:read', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write',
   'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
   'github:actions:*',
 ];
 
-const ORGANIZATION_GRANT_CEILING: Capability[] = [
+export const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*',
   'project:resource:shared-write',
   // Loading code into the shared worker is installation authority, never tenant authority.
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
+  'credential:*', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'github:actions:*',
 ];
@@ -122,8 +125,13 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [[...maintainer, 'workflow:install'],
-    [...maintainer.filter((capability) => !capability.startsWith('github:actions:')), 'workflow:install'], [
+  maintainer: [
+    // With workflow:install (before it became global authority), with and without `review:approve`…
+    [...maintainer, 'workflow:install'],
+    [...maintainer.filter((capability) => capability !== 'review:approve'), 'workflow:install'],
+    [...maintainer.filter((capability) => !capability.startsWith('github:actions:') && capability !== 'review:approve'), 'workflow:install'],
+    // …and the release just before `review:approve` shipped.
+    maintainer.filter((capability) => capability !== 'review:approve'), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
@@ -197,10 +205,12 @@ export class AuthorizationService {
     }
   }
 
-  profiles(projectId?: string): AuthorizationProfile[] {
+  profiles(projectId?: string, organizationId?: string): AuthorizationProfile[] {
     const global = new Map<string, AuthorizationProfile>(
       this.store.listAuthorizationProfiles('global').filter((p) => p.id !== 'operator').map((p) => [p.id, p]),
     );
+    const org = organizationId ?? (projectId ? this.store.getProject(projectId)?.organizationId : undefined);
+    if (org) for (const p of this.store.listAuthorizationProfiles(organizationScope(org))) global.set(p.id, p);
     if (projectId) {
       for (const p of this.store.listAuthorizationProfiles(projectScope(projectId))) {
         if (p.id !== 'operator') global.set(p.id, p);
@@ -209,8 +219,10 @@ export class AuthorizationService {
     return [...global.values()];
   }
 
-  profile(id: string, projectId?: string): AuthorizationProfile | undefined {
+  profile(id: string, projectId?: string, organizationId?: string): AuthorizationProfile | undefined {
+    const org = organizationId ?? (projectId ? this.store.getProject(projectId)?.organizationId : undefined);
     return (projectId ? this.store.getAuthorizationProfile(projectScope(projectId), id) : undefined)
+      ?? (org ? this.store.getAuthorizationProfile(organizationScope(org), id) : undefined)
       ?? this.store.getAuthorizationProfile('global', id);
   }
 
@@ -229,6 +241,22 @@ export class AuthorizationService {
     this.store.setAuthorizationProfile(scopeKey, saved);
     this.audit(actor, 'authorization.profile.saved', scopeKey, { profileId: saved.id, capabilities: saved.capabilities });
     return { ...saved, scopeKey };
+  }
+
+  createOrganizationRole(actor: string, organizationId: string, input: AuthorizationProfile, actorCaps: Capability[]): AuthorizationProfile {
+    if (!input || typeof input.name !== 'string' || !input.name.trim()
+      || typeof input.description !== 'string' || !input.description.trim() || input.name.length > 80 || input.description.length > 240 || !Array.isArray(input.capabilities)
+      || !input.capabilities.length || input.capabilities.some((cap) => typeof cap !== 'string' || !CAPABILITIES.includes(cap as any)))
+      throw new Error('Choose a name, description, and at least one catalog capability');
+    if (input.capabilities.some((cap) => !allows(ORGANIZATION_GRANT_CEILING, cap) || !allows(actorCaps, cap)))
+      throw new AuthorizationGrantError('You cannot grant these capabilities in this organization');
+    const name = input.name.trim();
+    if (this.profiles(undefined, organizationId).some((role) => role.name.toLowerCase() === name.toLowerCase()))
+      throw new Error('A role with this name already exists');
+    return this.saveProfile(actor, organizationScope(organizationId), {
+      id: `role_${crypto.randomUUID()}`, name, description: input.description.trim(),
+      capabilities: [...new Set(input.capabilities)], builtin: false,
+    });
   }
 
   deleteProfile(actor: string, scopeKey: AuthorizationScope, id: string): void {
@@ -258,7 +286,7 @@ export class AuthorizationService {
 
   grant(actor: string, input: Omit<PrincipalGrant, 'grantedBy' | 'grantedAt'>): PrincipalGrant {
     const projectId = input.scopeKey.startsWith('project:') ? input.scopeKey.slice(8) : undefined;
-    const profile = this.profile(input.profileId, projectId);
+    const profile = this.profile(input.profileId, projectId, input.scopeKey.startsWith('organization:') ? input.scopeKey.slice(13) : undefined);
     if (!profile) throw new Error(`unknown authorization profile ${input.profileId}`);
     const grant: PrincipalGrant = { ...input, grantedBy: actor, grantedAt: Date.now() };
     if (grant.capabilities && grant.capabilities.some((cap) => !allows(profile.capabilities, cap)))
@@ -281,7 +309,7 @@ export class AuthorizationService {
       || (projectId && g.scopeKey === projectScope(projectId)));
     for (const grant of relevant) {
       // A project overlay must not silently redefine an account's global grant.
-      const p = grant.scopeKey === 'global' ? this.profile(grant.profileId) : this.profile(grant.profileId, projectId);
+      const p = grant.scopeKey === 'global' ? this.profile(grant.profileId) : this.profile(grant.profileId, projectId, resolvedOrganizationId);
       if (!p) continue;
       let caps = grant.capabilities ? attenuate(p.capabilities, grant.capabilities) : p.capabilities;
       if (grant.scopeKey.startsWith('project:')) caps = attenuate(caps, PROJECT_GRANT_CEILING);
@@ -359,7 +387,7 @@ export class AuthorizationService {
       : { ...requested, level };
     const normalized = this.normalizeSelection(selection, organizationId, legacy);
     const profile = this.profile(normalized.level,
-      normalized.scope === 'projects' ? normalized.projectIds?.[0] : undefined);
+      normalized.scope === 'projects' ? normalized.projectIds?.[0] : undefined, organizationId);
     if (!profile) throw new Error(`unknown authorization level ${normalized.level}`);
     const ceiling = normalized.scope === 'projects'
       ? attenuate(profile.capabilities, PROJECT_GRANT_CEILING)
@@ -395,12 +423,12 @@ export class AuthorizationService {
     allowLegacyAdministratorProject = false,
   ): AuthorizationSelection {
     const level = String(input.level || '').trim();
-    if (!CANONICAL_AUTHORIZATION_LEVELS.includes(level as any))
+    if (!CANONICAL_AUTHORIZATION_LEVELS.includes(level as any) && !this.store.getAuthorizationProfile(organizationScope(organizationId), level))
       throw new Error(`unknown authorization level ${level}`);
     if (level === 'administrator' && input.scope !== 'organization' && !allowLegacyAdministratorProject)
       throw new Error('Administrator requires organization scope');
     if (level === 'god' && input.scope !== 'global') throw new Error('God requires global scope');
-    if (['viewer', 'developer', 'maintainer'].includes(level) && !['projects', 'organization'].includes(input.scope))
+    if (!['administrator', 'god'].includes(level) && !['projects', 'organization'].includes(input.scope))
       throw new Error(`${level} requires project or organization scope`);
     if (input.scope === 'projects') {
       const projectIds = [...new Set((input.projectIds ?? []).map(String).filter(Boolean))];
@@ -461,7 +489,7 @@ export class AuthorizationService {
     grantorCaps?: Capability[],
   ): EffectiveAuthorization {
     if (selection.scope === 'projects') throw new Error('this organization has no projects to authorize');
-    const profile = this.profile(selection.level);
+    const profile = this.profile(selection.level, undefined, organizationId);
     if (!profile) throw new Error(`unknown authorization level ${selection.level}`);
     const ceiling = selection.scope === 'organization'
       ? attenuate(profile.capabilities, ORGANIZATION_GRANT_CEILING) : profile.capabilities;
@@ -478,11 +506,12 @@ export class AuthorizationService {
     const global = grants.find((grant) => grant.scopeKey === 'global' && grant.profileId === 'god');
     if (global) return { level: 'god', scope: 'global' };
     const organization = grants.find((grant) => grant.scopeKey === organizationScope(organizationId));
-    if (organization && ['viewer', 'developer', 'maintainer', 'administrator'].includes(organization.profileId))
+    if (organization && organization.profileId !== 'god' && this.profile(organization.profileId, undefined, organizationId))
       return { level: organization.profileId, scope: 'organization' };
     const projects = grants.filter((grant) => grant.scopeKey.startsWith('project:')
       && this.store.getProject(grant.scopeKey.slice(8))?.organizationId === organizationId
-      && ['viewer', 'developer', 'maintainer'].includes(grant.profileId));
+      && !['administrator', 'god'].includes(grant.profileId)
+      && this.profile(grant.profileId, grant.scopeKey.slice(8), organizationId));
     if (!projects.length) return undefined;
     const level = projects[0]!.profileId;
     if (projects.some((grant) => grant.profileId !== level)) return undefined;

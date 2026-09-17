@@ -109,7 +109,7 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(schema.parameters.required).toEqual(['capabilities', 'audience', 'reason']);
     expect(schema.parameters.properties.capabilities).toMatchObject({
       type: 'array',
-      minItems: 1,
+      minItems: 0,
       maxItems: 32,
     });
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('request_permission');
@@ -166,8 +166,9 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     } as any);
 
     await handlers.escalate_to_human!({ audience: ['@owners'], message: 'stuck', urgency: 'critical' });
-    await handlers.request_permission!({ capabilities: ['task:create'], audience: ['@owners'], reason: 'why', urgency: 'low' });
+    await handlers.request_permission!({ capabilities: [], projectIds: ['proj_second'], audience: ['@owners'], reason: 'why', urgency: 'low' });
     await handlers.request_credential!({ domain: 'github.com', why: 'need it', urgency: 'high' });
+    expect(sent[1].body.projectIds).toEqual(['proj_second']);
     expect(sent.map((r) => r.body.urgency)).toEqual(['critical', 'low', 'high']);
 
     // Silence stays silent on the wire: the default belongs to the API, which

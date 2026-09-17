@@ -48,6 +48,10 @@ export interface BackupManifest {
 
 /** Key material that decrypts the rest of the payload, relative to `payload/`. */
 const SECRET_FILES = ['vault/vault.key', 'state/auth.db.secret'] as const;
+/** Plaintext secrets that live outside the encrypted vault: keys materialized
+ *  for git/ssh, and provider config homes holding OAuth tokens. `--exclude-secrets`
+ *  promises a payload safe to hand off, so these leave with the key files. */
+const PLAINTEXT_SECRET_DIRS = ['state/git-profiles', 'state/vault-items', 'config-homes'] as const;
 
 /**
  * Create a consistent, portable control-plane backup. Mutable SQLite files use
@@ -128,7 +132,10 @@ export async function createBackup(options: {
       await backupSqlite(path.join(p.temporal, 'temporal.db'), path.join(payload, 'temporal', 'temporal.db'));
     if (!options.externalObjectStore) copyTree(p.objects, path.join(payload, 'objects'));
 
-    if (options.excludeSecrets) for (const relative of SECRET_FILES) fs.rmSync(path.join(payload, relative), { force: true });
+    if (options.excludeSecrets) {
+      for (const relative of SECRET_FILES) fs.rmSync(path.join(payload, relative), { force: true });
+      for (const relative of PLAINTEXT_SECRET_DIRS) fs.rmSync(path.join(payload, relative), { recursive: true, force: true });
+    }
 
     const manifest: BackupManifest = {
       format: 'karmax-backup', version: 1, createdAt: new Date().toISOString(), sourceHome: home,

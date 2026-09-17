@@ -49,7 +49,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action', 'cancel_agent_action',
         'escalate_to_human', 'request_permission',
-        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
+        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'verify_resource_revision', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
         'list_github_actions_runs', 'inspect_github_actions_run', 'manage_github_actions_run', 'dispatch_github_actions_workflow',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
@@ -74,6 +74,21 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     });
   });
 
+  it('routes exact historical verification through the authorized API', async () => {
+    const seen: unknown[] = [];
+    const server = createPlatformMcpServer({ platformRequest: async (...args: unknown[]) => {
+      seen.push(args); return { status: 'partial', nextOffset: 2 };
+    } } as any);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair(); await server.connect(serverT);
+    const c = new Client({ name: 'verification-test', version: '1' }); await c.connect(clientT);
+    const result: any = await c.callTool({ name: 'verify_resource_revision', arguments: {
+      projectId: 'project', resourceId: 'resource', revisionId: 'old', offset: 1, limit: 1,
+    } });
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([['GET', '/api/projects/project/resources/resource/revisions/old/verify?offset=1&limit=1']]);
+    await c.close(); await server.close();
+  });
+
   it('forwards a task resource proposal without adopting it', async () => {
     const seen: unknown[] = [];
     const stub = { proposeProjectResource: async (args: unknown) => { seen.push(args); return { candidate: { id: 'candidate-1' } }; } } as any;
@@ -91,6 +106,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   it('forwards brokered GitHub Actions reads and separately-declared mutations', async () => {
     const seen: unknown[] = [];
     const stub = {
+      listGithubActionsWorkflows: async (args: unknown) => { seen.push(['workflows', args]); return { workflows: [] }; },
       listGithubActionsRuns: async (args: unknown) => { seen.push(['list', args]); return { runs: [] }; },
       inspectGithubActionsRun: async (args: unknown) => { seen.push(['inspect', args]); return { failedJobs: [] }; },
       manageGithubActionsRun: async (args: unknown) => { seen.push(['manage', args]); return { accepted: true }; },
@@ -100,8 +116,9 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     const [clientT, serverT] = InMemoryTransport.createLinkedPair(); await server.connect(serverT);
     const c = new Client({ name: 'github-actions-test', version: '1.0.0' }); await c.connect(clientT);
     for (const [name, args] of [
+      ['list_github_actions_workflows', { repository: 'acme/app', page: 2 }],
       ['list_github_actions_runs', { repository: 'acme/app', branch: 'main', status: 'failure', perPage: 10 }],
-      ['inspect_github_actions_run', { repository: 'acme/app', runId: 42 }],
+      ['inspect_github_actions_run', { repository: 'acme/app', runId: 42, view: 'log', attempt: 1, jobId: 99, tailLines: 20, offsetLines: 3, maxChars: 1000 }],
       ['manage_github_actions_run', { repository: 'acme/app', runId: 42, action: 'rerun-failed' }],
       ['dispatch_github_actions_workflow', { repository: 'acme/app', workflow: 'deploy.yml', ref: 'main', inputs: { dry_run: false } }],
     ] as const) {
@@ -109,8 +126,9 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       expect(result.isError, result.content?.[0]?.text).toBeFalsy();
     }
     expect(seen).toEqual([
+      ['workflows', { repository: 'acme/app', page: 2 }],
       ['list', { repository: 'acme/app', branch: 'main', status: 'failure', perPage: 10 }],
-      ['inspect', { repository: 'acme/app', runId: 42 }],
+      ['inspect', { repository: 'acme/app', runId: 42, view: 'log', attempt: 1, jobId: 99, tailLines: 20, offsetLines: 3, maxChars: 1000 }],
       ['manage', { repository: 'acme/app', runId: 42, action: 'rerun-failed' }],
       ['dispatch', { repository: 'acme/app', workflow: 'deploy.yml', ref: 'main', inputs: { dry_run: false } }],
     ]);
@@ -187,7 +205,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     const result: any = await c.callTool({
       name: 'request_permission',
       arguments: {
-        capabilities: ['settings:read'],
+        capabilities: [],
+        projectIds: ['proj_second'],
         audience: ['@creator', '@team:operators'],
         reason: 'Inspect the outbound email configuration.',
       },
@@ -195,7 +214,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
 
     expect(result.isError).toBeFalsy();
     expect(seen).toEqual([{
-      capabilities: ['settings:read'],
+      capabilities: [],
+      projectIds: ['proj_second'],
       audience: ['@creator', '@team:operators'],
       reason: 'Inspect the outbound email configuration.',
     }]);
@@ -440,7 +460,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     }).token;
     const res: any = await client.callTool({ name: 'save_skill', arguments: { name: 'greet', content: '# hi' } });
     expect(res.isError).toBeFalsy();
-    expect(fs.existsSync(path.join(contentDir, 'skills', 'greet.md'))).toBe(true);
+    // Saved under the calling tenant's directory, never the installation-wide one.
+    expect(fs.existsSync(path.join(contentDir, 'skills', 'organizations', 'org_personal', 'greet.md'))).toBe(true);
   });
 
   it('denies a tool call when the token lacks the capability', async () => {

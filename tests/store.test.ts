@@ -11,6 +11,17 @@ describe('Store', () => {
     store = new Store(':memory:');
   });
 
+  it('patches task fields without replacing unrelated metadata or merging revoked grants', () => {
+    const project = store.createProject('Parameter patches');
+    const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work', _workflowRunId: 'live-run',
+        _authorization: { capabilities: ['old'], delegationId: 'revoked' } } });
+    store.patchTaskParams(task.id, { base: 'main', _authorization: { capabilities: ['new'] },
+      nullable: null, ignored: undefined });
+    expect(store.getTask(task.id)?.params).toEqual({ prompt: 'work', _workflowRunId: 'live-run',
+      base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
+  });
+
   it('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-hosted-remote-'));
     const dbPath = path.join(dir, 'karmax.db');
@@ -488,6 +499,7 @@ describe('Store', () => {
     const p = store.createProject('Acme');
     const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });
     const second = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'second' }, intentId: first.intentId });
+    store.kvSet(`attempt-choice:${second.id}`, 'cancel');
     expect(store.claimAttempt(second.id)).toEqual({ accepted: true, cancel: [first.id] });
     expect(store.claimAttempt(first.id)).toEqual({ accepted: false, cancel: [first.id] });
     const group = store.attemptGroup(first.id)!;

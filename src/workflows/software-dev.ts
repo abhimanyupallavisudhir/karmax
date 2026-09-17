@@ -51,6 +51,7 @@ import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorl
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
+import { conversationPublisher } from '../domain/view-publication.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -1044,8 +1045,15 @@ async function softwareDevImpl(
     };
   }
 
+  const publishConversation = conversationPublisher(workflowInfo().runId,
+    (view, reference) => core.publishView(taskId, view, reference));
   async function publish() {
-    await core.publishView(taskId, buildView());
+    // Apply at the live edge of existing executions as well as new task pins.
+    if (patched('software-dev-conversation-publication-v1')) {
+      await publishConversation(buildView());
+    } else {
+      await core.publishView(taskId, buildView());
+    }
   }
 
   /** Publish an honest point-of-no-return interlock only around an activity that
@@ -2627,7 +2635,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // stale head and exact-candidate verification repeats forever.
   let recoveredLandingNeedsDo = false;
   proposalCycle: for (;;) {
-  // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
+  // ── Do ⇄ Needs input ⇒ PR ⇄ Review ──
   if (!restoredReviewApproved
     && (recoveredLandingNeedsDo || (recoveryStage !== 'pr' && recoveryStage !== 'merge'))) {
   recoveredLandingNeedsDo = false;
@@ -2717,6 +2725,17 @@ Inspect the complete current diff and specifically compare its delta from the re
       stage = 'do';
       status = 'active';
       continue;
+    }
+
+    if (patched('service-connections-wait-v1')) {
+      while (await core.pendingServiceConnections(taskId) && !cancelled && msgs.length === seen) {
+        status = 'waiting';
+        waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
+        await publish();
+        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+      }
+      if (cancelled) return await abort();
+      if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
     }
 
     // A collaboration may settle after the provider's final live-message poll

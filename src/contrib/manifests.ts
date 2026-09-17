@@ -48,7 +48,7 @@ const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', l
 // prompt) while forbidding zero/multiple steps: a question must have an owner.
 const responderField = (): FieldSpec => ({
   name: 'responder', type: 'responder', label: 'Responder',
-  help: 'Who answers when the working agent pauses at Waiting for input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
+  help: 'Who answers when the working agent pauses at Needs input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
   scopes: ALL, bind: 'responder', role: 'responder',
   default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
   // A task can ask for ordinary input more than once, so there is no first-use
@@ -81,6 +81,11 @@ const remoteField = (): FieldSpec => ({
   default: 'none',
   scopes: ['project', 'global'],
   bind: 'project',
+});
+const otherAttemptsField = (): FieldSpec => ({
+  name: 'otherAttempts', type: 'select', label: 'Other task attempts',
+  help: 'ask — the human or agent reviewer chooses Keep or Cancel; without a reviewer, keep. Keep allows other proposals to continue and merge. The first attempt entering Merge fixes the choice for its group.',
+  options: ['ask', 'keep', 'cancel'], default: 'ask', scopes: ['project'], bind: 'project',
 });
 const landingAuthorityField = (): FieldSpec => ({
   name: 'landingAuthority',
@@ -183,7 +188,7 @@ export interface WorkflowRole {
   label: string;
   /** System-prompt template; `{{bindings}}` are filled at turn time (agent/prompt.ts). */
   promptTemplate: string;
-  /** Capability ceiling seeded onto this role's default profile. */
+  /** Historical workflow tool capabilities; declared roles preserve task authorization. */
   capabilities?: string[];
   defaults?: { effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; maxTurns?: number };
 }
@@ -199,7 +204,7 @@ const DO_ROLE: WorkflowRole = {
   // use everything the granting human selected (including organization/global
   // operation); attenuation still removes everything that human did not hold.
   // Workflow decisions and protected-target landing stay in workflow code;
-  // Resolve/Confirm retain their narrow contracts even on a God-authorized task.
+  // Each role keeps its workflow duty without imposing another authorization tier.
   capabilities: [
     // Keep the historical spellings in the declaration for replay/tests; the
     // capability layer normalizes them to the task:* / skill:* families below.
@@ -450,6 +455,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       copyGlobsField(),
       remoteField(),
       landingAuthorityField(),
+      otherAttemptsField(),
       ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
       responderField(),
       confirmerField(),
@@ -467,7 +473,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.5.0',
+    version: '1.6.0',
     description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
     selectable: false,
     requires: [],
@@ -702,21 +708,18 @@ export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIF
 }
 
 /**
- * The capability ceiling a turn is minted against (SPEC §8.2) — always resolved
- * from the declaring workflow, never from a copy stored on the agent profile.
- *
- * The ceiling is the ROLE contract ("what could a Merge agent ever need"), which
- * is orthogonal to the task's authorization grant ("what this task's creator may
- * delegate"); effective caps are the intersection of the two. Because it is the
- * workflow's to declare, it is not a user setting: a persisted copy only ever
- * went stale — profiles seed once, so a role that gained a capability kept the
- * old ceiling forever and the new tool silently 403'd.
- *
- * Every role also gets the self-only human escalation safety valve. An
- * undeclared role is otherwise floored at `signal-completion`.
+ * Declared agent roles share the selected authorization level. Workflow duty
+ * (Do, Confirm, Resolve, or a legacy Merge turn) must not silently narrow it.
+ * The task grant still limits every token, including organization/project scope;
+ * workflow state and decision handlers enforce the stage-specific protocol.
+ * Keep historical capability spellings for compatibility with role discovery.
+ * An undeclared/non-agent role still has no administrative authority.
  */
 export function roleCeiling(name: string, manifests: WorkflowManifest[] = MANIFESTS): string[] {
-  return [...new Set([...(agentRoleDef(name, manifests)?.capabilities ?? ['signal-completion']), 'task:escalate'])];
+  const role = agentRoleDef(name, manifests);
+  return role
+    ? [...new Set(['*', ...(role.capabilities ?? []), 'task:escalate'])]
+    : ['signal-completion', 'task:escalate'];
 }
 
 /** Resolve the transitive closure of `requires` for a set of workflows (SPEC §4.6). */

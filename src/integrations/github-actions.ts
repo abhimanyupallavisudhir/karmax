@@ -16,6 +16,9 @@ export type GithubActionsStatus =
 export interface GithubActionsRun {
   id: number;
   name: string;
+  path?: string;
+  checkSuiteId?: number;
+  referencedWorkflows?: Array<{ path: string; sha: string; ref?: string }>;
   displayTitle?: string;
   workflowId: number;
   runNumber: number;
@@ -67,6 +70,10 @@ export interface GithubActionsStep {
 
 export interface GithubActionsJob {
   id: number;
+  runId?: number;
+  attempt?: number;
+  headSha?: string;
+  checkRunId?: number;
   name: string;
   status: string;
   conclusion?: string;
@@ -82,6 +89,8 @@ export interface GithubActionsArtifact {
   name: string;
   sizeBytes: number;
   expired: boolean;
+  digest?: string;
+  workflowRun?: { id: number; headSha: string; headBranch?: string };
   expiresAt?: string;
   createdAt?: string;
   updatedAt?: string;
@@ -125,6 +134,18 @@ export interface GithubActionsApiOptions {
   maxJobLogs?: number;
 }
 
+/** Views keep large evidence opt-in. Default retains legacy failure diagnostics. */
+export interface GithubActionsInspectOptions {
+  view?: 'failure' | 'jobs' | 'log' | 'artifacts' | 'annotations' | 'pending-deployments';
+  attempt?: number;
+  jobId?: number;
+  page?: number;
+  perPage?: number;
+  tailLines?: number;
+  offsetLines?: number;
+  maxChars?: number;
+}
+
 export class GithubActionsApiError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message);
@@ -154,6 +175,7 @@ export class GithubActionsApi {
   private maxLogDownloadBytes: number;
   private maxLogExcerptChars: number;
   private maxJobLogs: number;
+  private seenTokens = new Set<string>();
 
   constructor(private token: string | GithubActionsTokenProvider, options: GithubActionsApiOptions = {}) {
     this.fetcher = options.fetch ?? fetch;
@@ -189,6 +211,98 @@ export class GithubActionsApi {
     return { total: Number(value?.total_count ?? runs.length), page, perPage, runs };
   }
 
+  async listWorkflows(slug: string, options: { page?: number; perPage?: number } = {}) {
+    validateSlug(slug);
+    const page = positiveBound(options.page, 1, 1, 1000);
+    const perPage = positiveBound(options.perPage, 30, 1, 100);
+    const raw = await this.request<any>(`/repos/${slug}/actions/workflows?per_page=${perPage}&page=${page}`);
+    const workflows = (raw.workflows ?? []).map((w: any) => ({
+      id: w.id, name: w.name, path: w.path, state: w.state, url: w.html_url,
+      createdAt: w.created_at, updatedAt: w.updated_at,
+    }));
+    return { ...pagination(raw.total_count, page, perPage), workflows };
+  }
+
+  async inspectRun(slug: string, runId: number, options: GithubActionsInspectOptions = {}) {
+    validateSlug(slug);
+    const id = positiveId(runId, 'run id');
+    const view = options.view ?? 'failure';
+    if (!['failure', 'jobs', 'log', 'artifacts', 'annotations', 'pending-deployments'].includes(view))
+      throw new Error('invalid GitHub Actions inspection view');
+    if (view === 'failure' && Object.values(options).every((v) => v === undefined || v === 'failure'))
+      return this.inspectFailure(slug, id);
+    if (view === 'failure') throw new Error('Use view jobs or log for attempt and pagination selection');
+    const attempt = options.attempt === undefined ? undefined : positiveId(options.attempt, 'attempt');
+    const page = positiveBound(options.page, 1, 1, 1000);
+    const perPage = positiveBound(options.perPage, 30, 1, 100);
+    const base = `/repos/${slug}/actions/runs/${id}`;
+    const rawRun = await this.request<any>(`${base}${attempt ? `/attempts/${attempt}` : ''}`);
+    if (Number(rawRun.id) !== id || (rawRun.repository?.full_name
+      && String(rawRun.repository.full_name).toLowerCase() !== slug.toLowerCase()))
+      throw new GithubActionsApiError(404, 'Run does not belong to the selected repository');
+    const run = normalizeRun(rawRun);
+    if (attempt !== undefined && run.attempt !== attempt)
+      throw new GithubActionsApiError(404, 'Run attempt does not match the selection');
+    const notices = [
+      'headSha is GitHub run metadata, not proof of deployed code. For workflow_run, correlate triggering revision with explicit checkout/target and completion logs. Success or skipped status alone does not prove readiness, completion, or absence of rollback.',
+    ];
+    const common = { run, notices };
+    if (view === 'jobs') {
+      const raw = await this.request<any>(`${base}/attempts/${run.attempt}/jobs?per_page=${perPage}&page=${page}`);
+      const jobs: GithubActionsJob[] = (raw.jobs ?? []).map(normalizeJob);
+      if (jobs.some((job) => job.runId !== id || job.attempt !== run.attempt))
+        throw new GithubActionsApiError(404, 'Job listing does not match the selected run and attempt');
+      return { ...common, ...pagination(raw.total_count, page, perPage), jobs };
+    }
+    if (view === 'artifacts') {
+      const raw = await this.request<any>(`${base}/artifacts?per_page=${perPage}&page=${page}`);
+      return { ...common, scope: 'run (artifacts are not attempt-scoped)',
+        ...pagination(raw.total_count, page, perPage), artifacts: (raw.artifacts ?? []).map(normalizeArtifact) };
+    }
+    if (view === 'pending-deployments') {
+      const raw = await this.request<any[]>(`${base}/pending_deployments`);
+      return { ...common, scope: 'current run state (not historical attempt)', pendingDeployments: raw.map((d) => ({
+        environment: { id: d.environment?.id, name: d.environment?.name },
+        waitTimer: d.wait_timer, waitTimerStartedAt: d.wait_timer_started_at,
+        currentUserCanApprove: d.current_user_can_approve,
+        reviewers: (d.reviewers ?? []).map((r: any) => ({ type: r.type,
+          name: r.reviewer?.login ?? r.reviewer?.name, id: r.reviewer?.id })),
+      })) };
+    }
+    const jobId = positiveId(options.jobId!, 'job id');
+    const rawJob = await this.request<any>(`/repos/${slug}/actions/jobs/${jobId}`);
+    if (Number(rawJob.id) !== jobId || Number(rawJob.run_id) !== id || Number(rawJob.run_attempt) !== run.attempt)
+      throw new GithubActionsApiError(404, 'Job does not belong to the selected run and attempt');
+    const job = normalizeJob(rawJob);
+    if (view === 'annotations') {
+      if (!job.checkRunId) throw new GithubActionsApiError(404, 'Job has no check run');
+      const check = await this.request<any>(`/repos/${slug}/check-runs/${job.checkRunId}`);
+      if (Number(check.id) !== job.checkRunId || Number(check.check_suite?.id) !== run.checkSuiteId)
+        throw new GithubActionsApiError(404, 'Check does not belong to the selected run');
+      const raw = await this.request<any[]>(`/repos/${slug}/check-runs/${job.checkRunId}/annotations?per_page=${perPage}&page=${page}`);
+      let textBudget = 24000;
+      let textTruncated = false;
+      const bounded = (v: unknown) => {
+        const clean = redactActionsText(String(v ?? ''));
+        const result = clean.slice(0, Math.min(2000, textBudget));
+        textBudget -= result.length;
+        textTruncated ||= result.length < clean.length;
+        return result;
+      };
+      const diagnostics = { ...common, job, ...pagination(check.output?.annotations_count, page, perPage),
+        check: { id: check.id, status: check.status, conclusion: check.conclusion,
+          title: bounded(check.output?.title), summary: bounded(check.output?.summary) },
+        annotations: raw.map((a) => ({ path: bounded(a.path), startLine: a.start_line, endLine: a.end_line,
+          level: a.annotation_level, title: bounded(a.title), message: bounded(a.message) })) };
+      return { ...diagnostics, textTruncated, textLimit: 24000, fieldTextLimit: 2000 };
+    }
+    const tailLines = positiveBound(options.tailLines, 100, 1, 500);
+    const maxChars = positiveBound(options.maxChars, 16000, 256, 32000);
+    const offsetLines = positiveBound(options.offsetLines, 0, 0, 1000000);
+    const log = await this.jobLog(slug, jobId, { tailLines, maxChars, offsetLines });
+    return { ...common, job, log };
+  }
+
   async inspectFailure(slug: string, runId: number): Promise<GithubActionsFailureInspection> {
     validateSlug(slug);
     const id = positiveId(runId, 'run id');
@@ -198,12 +312,18 @@ export class GithubActionsApi {
       this.request<any>(`/repos/${slug}/actions/runs/${id}/artifacts?per_page=100`),
     ]);
     const run = normalizeRun(rawRun);
+    if (run.id !== id || (rawRun.repository?.full_name && String(rawRun.repository.full_name).toLowerCase() !== slug.toLowerCase()))
+      throw new GithubActionsApiError(404, 'Run does not belong to the selected repository');
+    if (jobs.some((job) => job.runId !== undefined && job.runId !== id))
+      throw new GithubActionsApiError(404, 'Job does not belong to the selected run');
     const artifacts = Array.isArray(rawArtifacts?.artifacts)
       ? rawArtifacts.artifacts.map(normalizeArtifact)
       : [];
     const failures = jobs.filter((job) => FAILURE_CONCLUSIONS.has(String(job.conclusion ?? '').toLowerCase()));
     const failedJobs: GithubActionsFailureInspection['failedJobs'] = [];
     const notices: string[] = [];
+    if (jobs.length >= MAX_JOB_PAGES * 100) notices.push('Job listing capped at 1,000; use view jobs with page/perPage for more.');
+    if (Number(rawArtifacts?.total_count) > artifacts.length) notices.push('Artifact listing truncated; use view artifacts with page/perPage for more.');
     for (const job of failures.slice(0, this.maxJobLogs)) {
       try {
         const log = await this.jobLog(slug, job.id);
@@ -264,7 +384,7 @@ export class GithubActionsApi {
     return jobs;
   }
 
-  private async jobLog(slug: string, jobId: number): Promise<{ excerpt: string; downloadedBytes: number; truncated: boolean }> {
+  private async jobLog(slug: string, jobId: number, selection?: { tailLines: number; maxChars: number; offsetLines: number }) {
     const response = await this.send(`/repos/${slug}/actions/jobs/${positiveId(jobId, 'job id')}/logs`, {
       redirect: 'manual',
     });
@@ -272,38 +392,54 @@ export class GithubActionsApi {
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) throw new GithubActionsApiError(502, 'GitHub returned a job-log redirect without a location');
-      const target = safeDownloadTarget(new URL(location, this.apiBase));
+      const target = safeDownloadTarget(parseDownloadLocation(location, this.apiBase));
       // Signed log URLs are bearer credentials in their own right. Never send
       // the installation token to the storage host and never return the URL.
       download = await this.downloadWithoutAuth(target);
     }
     if (!download.ok) throw new GithubActionsApiError(download.status, `GitHub job log download failed (${download.status})`);
-    const body = await boundedText(download, this.maxLogDownloadBytes);
+    const body = await boundedTailText(download, selection ? 64 * 1024 * 1024 : this.maxLogDownloadBytes)
+      .catch(() => { throw new GithubActionsApiError(502, 'GitHub job log stream failed'); });
+    let safeText = body.text;
+    for (const token of this.seenTokens) if (token) safeText = safeText.split(token).join('[REDACTED]');
+    const clean = redactActionsText(safeText).replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\r/g, '');
+    const lines = clean.replace(/\n$/, '').split('\n');
+    const end = selection ? Math.max(0, lines.length - selection.offsetLines) : lines.length;
+    const start = selection ? Math.max(0, end - selection.tailLines) : 0;
+    const selected = selection ? lines.slice(start, end).join('\n') : actionLogExcerpt(clean, this.maxLogExcerptChars);
+    const excerpt = selection ? selected.slice(-selection.maxChars) : selected;
     return {
-      excerpt: actionLogExcerpt(body.text, this.maxLogExcerptChars),
-      downloadedBytes: body.bytes,
-      truncated: body.truncated,
+      excerpt, downloadedBytes: body.bytes,
+      truncated: body.truncated || body.omittedPrefix || excerpt.length < clean.trim().length,
+      downloadTruncated: body.truncated, omittedPrefix: body.omittedPrefix,
+      tailComplete: !body.truncated, retainedBytes: body.retainedBytes,
+      ...(selection ? { tailLines: selection.tailLines, maxChars: selection.maxChars, offsetLines: selection.offsetLines,
+        nextOffsetLines: start > 0 ? selection.offsetLines + (end - start) : null,
+        retainedLines: lines.length, outputTruncated: excerpt.length < selected.length } : {}),
     };
   }
 
   private async request<T = unknown>(pathname: string, init: RequestInit = {}): Promise<T> {
     const response = await this.send(pathname, init);
     if (!response.ok)
-      throw new GithubActionsApiError(response.status, `GitHub Actions API ${response.status}: ${(await response.text()).slice(0, 500)}`);
+      throw new GithubActionsApiError(response.status, `GitHub Actions API request failed (${response.status})`);
     if (response.status === 204) return undefined as T;
-    const text = await response.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    try {
+      const text = await response.text();
+      return (text ? JSON.parse(text) : undefined) as T;
+    } catch { throw new GithubActionsApiError(502, 'GitHub Actions returned an invalid response'); }
   }
 
   private async downloadWithoutAuth(initial: URL): Promise<Response> {
     let target = initial;
     for (let redirects = 0; redirects <= 3; redirects++) {
-      const response = await this.fetcher(target, { redirect: 'manual' });
+      const response = await this.fetcher(target, { redirect: 'manual', signal: AbortSignal.timeout(30000) })
+        .catch(() => { throw new GithubActionsApiError(502, 'GitHub log storage request failed'); });
       if (response.status < 300 || response.status >= 400) return response;
       const location = response.headers.get('location');
       if (!location) throw new GithubActionsApiError(502, 'GitHub log storage redirected without a location');
       if (redirects === 3) throw new GithubActionsApiError(502, 'GitHub job log download redirected too many times');
-      target = safeDownloadTarget(new URL(location, target));
+      target = safeDownloadTarget(parseDownloadLocation(location, target));
     }
     throw new GithubActionsApiError(502, 'GitHub job log download failed');
   }
@@ -313,10 +449,11 @@ export class GithubActionsApi {
       const token = typeof this.token === 'function'
         ? await this.token(forceRefresh ? { forceRefresh: true } : undefined)
         : this.token;
-      return this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
+      this.seenTokens.add(token);
+      return this.fetcher(`${this.apiBase}${pathname}`, { ...init, redirect: 'manual', headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
         'x-github-api-version': '2022-11-28', 'user-agent': 'karmax', ...(init.headers ?? {}),
-      } });
+      }, signal: AbortSignal.timeout(30000) }).catch(() => { throw new GithubActionsApiError(502, 'GitHub Actions request failed'); });
     };
     let response = await once();
     if (response.status === 401 && typeof this.token === 'function') response = await once(true);
@@ -418,7 +555,7 @@ export function renderGithubActionsFailure(
     lines.push('', `Job: ${job.name} (${job.conclusion ?? job.status})${job.url ? ` — ${job.url}` : ''}`);
     const failedSteps = job.steps.filter((step) => FAILURE_CONCLUSIONS.has(String(step.conclusion ?? '').toLowerCase()));
     if (failedSteps.length) lines.push(`Failed steps: ${failedSteps.map((step) => step.name).join(', ')}`);
-    if (job.log?.excerpt) lines.push(job.log.excerpt, ...(job.log.truncated ? ['[GitHub log download was truncated at the safety limit.]'] : []));
+    if (job.log?.excerpt) lines.push(job.log.excerpt, ...(job.log.truncated ? ['[GitHub log output was truncated; use the targeted log view to inspect tail completeness and limits.]'] : []));
     else lines.push('[No job log was available.]');
   }
   if (notices.length) lines.push('', 'Inspection notices:', ...notices.map((notice) => `- ${notice}`));
@@ -526,6 +663,11 @@ function normalizeRun(raw: any): GithubActionsRun {
   return {
     id,
     name: String(raw?.name ?? 'GitHub Actions'),
+    ...(raw?.path ? { path: String(raw.path) } : {}),
+    ...(raw?.check_suite_id ? { checkSuiteId: Number(raw.check_suite_id) } : {}),
+    ...(Array.isArray(raw?.referenced_workflows) ? { referencedWorkflows: raw.referenced_workflows.map((w: any) => ({
+      path: String(w.path ?? ''), sha: String(w.sha ?? ''), ...(w.ref ? { ref: String(w.ref) } : {}),
+    })) } : {}),
     ...(raw?.display_title ? { displayTitle: String(raw.display_title) } : {}),
     workflowId: Number(raw?.workflow_id ?? 0),
     runNumber: Number(raw?.run_number ?? 0),
@@ -552,6 +694,11 @@ function normalizeRun(raw: any): GithubActionsRun {
 function normalizeJob(raw: any): GithubActionsJob {
   return {
     id: positiveId(Number(raw?.id), 'GitHub Actions job id'),
+    ...(raw?.run_id ? { runId: Number(raw.run_id) } : {}),
+    ...(raw?.run_attempt ? { attempt: Number(raw.run_attempt) } : {}),
+    ...(raw?.head_sha ? { headSha: String(raw.head_sha) } : {}),
+    ...(typeof raw?.check_run_url === 'string' && /\/check-runs\/(\d+)$/.test(raw.check_run_url)
+      ? { checkRunId: Number(raw.check_run_url.match(/\/check-runs\/(\d+)$/)[1]) } : {}),
     name: String(raw?.name ?? 'GitHub Actions job'),
     status: String(raw?.status ?? 'unknown'),
     ...(raw?.conclusion ? { conclusion: String(raw.conclusion) } : {}),
@@ -575,40 +722,62 @@ function normalizeArtifact(raw: any): GithubActionsArtifact {
     name: String(raw?.name ?? 'artifact'),
     sizeBytes: Math.max(0, Number(raw?.size_in_bytes ?? 0)),
     expired: Boolean(raw?.expired),
+    ...(raw?.digest ? { digest: String(raw.digest) } : {}),
+    ...(raw?.workflow_run ? { workflowRun: { id: Number(raw.workflow_run.id),
+      headSha: String(raw.workflow_run.head_sha ?? ''),
+      ...(raw.workflow_run.head_branch ? { headBranch: String(raw.workflow_run.head_branch) } : {}) } } : {}),
     ...(raw?.expires_at ? { expiresAt: String(raw.expires_at) } : {}),
     ...(raw?.created_at ? { createdAt: String(raw.created_at) } : {}),
     ...(raw?.updated_at ? { updatedAt: String(raw.updated_at) } : {}),
   };
 }
 
-async function boundedText(response: Response, maxBytes: number): Promise<{ text: string; bytes: number; truncated: boolean }> {
-  if (!response.body) return { text: '', bytes: 0, truncated: false };
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
+/** Scan with a hard network cap and a small rolling buffer, retaining actual
+ * completion output when logs exceed the retained window. Never claim a tail
+ * when the scan cap was hit. No full transcript enters persistence. */
+async function boundedTailText(response: Response, maxBytes: number) {
+  const retain = 1024 * 1024;
+  let tail = Buffer.alloc(0);
   let bytes = 0;
   let truncated = false;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const remaining = maxBytes - bytes;
-      if (remaining <= 0) { truncated = true; break; }
-      if (value.length > remaining) {
-        chunks.push(value.subarray(0, remaining));
-        bytes += remaining;
-        truncated = true;
-        break;
+  if (response.body) {
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const remaining = maxBytes - bytes;
+        const chunk = value.subarray(0, Math.max(0, remaining));
+        bytes += chunk.length;
+        tail = chunk.length >= retain ? Buffer.from(chunk.subarray(-retain))
+          : Buffer.concat([tail.subarray(Math.max(0, tail.length + chunk.length - retain)), chunk]);
+        if (value.length > remaining) { truncated = true; break; }
       }
-      chunks.push(value); bytes += value.length;
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
-  } finally {
-    if (truncated) await reader.cancel().catch(() => {});
-    reader.releaseLock();
   }
-  const joined = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.length; }
-  return { text: new TextDecoder('utf-8', { fatal: false }).decode(joined), bytes, truncated };
+  return { text: tail.toString('utf8'), bytes, retainedBytes: tail.length,
+    omittedPrefix: bytes > tail.length, truncated };
+}
+
+function pagination(total: unknown, page: number, perPage: number) {
+  const count = Number(total ?? 0);
+  return { total: count, page, perPage, hasMore: page * perPage < count,
+    nextPage: page * perPage < count && page < 1000 ? page + 1 : null,
+    pageLimitReached: page === 1000 && page * perPage < count };
+}
+
+/** Defense in depth for credentials printed by workflows. GitHub masks secrets
+ * upstream; do not return recognizable tokens or bearer query strings either. */
+export function redactActionsText(input: string): string {
+  return input.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, '[REDACTED]')
+    .replace(/(authorization\s*[:=]\s*(?:bearer|token)\s+)\S+/gi, '$1[REDACTED]')
+    .replace(/https?:\/\/[^\s<>"']+/g, (url) => {
+      try { const parsed = new URL(url); return parsed.search || parsed.username || parsed.password
+        ? `${parsed.origin}${parsed.pathname}?[REDACTED]` : url; } catch { return '[REDACTED URL]'; }
+    });
 }
 
 /** Prefer explicit runner error markers with context, then retain the tail that
@@ -635,12 +804,11 @@ function workflowId(value: string | number): string {
 }
 
 function validateSlug(slug: string): void {
-  if (!/^[^/\s]+\/[^/\s]+$/.test(slug)) throw new Error('invalid GitHub repository');
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug) || slug.split('/').some((part) => part === '.' || part === '..')) throw new Error('invalid GitHub repository');
 }
 
-/** Reject credential-bearing/private redirect targets. GitHub may use several
- * public storage providers, so a fixed hostname allow-list would be brittle;
- * the invariant is public HTTPS and no forwarded installation credential. */
+/** Only known GitHub log storage domains may receive signed redirects. Reject
+ * arbitrary hosts (including DNS rebinding targets) and never forward auth. */
 function safeDownloadTarget(target: URL): URL {
   if (target.protocol !== 'https:' || target.username || target.password)
     throw new GithubActionsApiError(502, 'GitHub returned an unsafe job-log location');
@@ -658,7 +826,15 @@ function safeDownloadTarget(target: URL): URL {
     || hostname.startsWith('fc') || hostname.startsWith('fd')
     || /^fe[89ab]/.test(hostname)))
     throw new GithubActionsApiError(502, 'GitHub returned a private job-log location');
+  if (target.port && target.port !== '443') throw new GithubActionsApiError(502, 'GitHub returned an unsafe job-log port');
+  if (!['.blob.core.windows.net', '.githubusercontent.com'].some((suffix) => hostname.endsWith(suffix)))
+    throw new GithubActionsApiError(502, 'GitHub returned an unsupported job-log storage host');
   return target;
+}
+
+function parseDownloadLocation(location: string, base: string | URL): URL {
+  try { return new URL(location, base); }
+  catch { throw new GithubActionsApiError(502, 'GitHub returned an invalid job-log location'); }
 }
 
 function positiveId(value: number, label: string): number {

@@ -31,7 +31,7 @@ export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'en
  * values; the gateway's separate human-administrator inspection route resolves
  * one field explicitly and records the reveal in the audit log. */
 export const ITEM_FIELDS: Record<VaultItemType, VaultFieldName[]> = {
-  login: ['password', 'totp'],
+  login: ['password', 'totp', 'note'],
   'api-key': ['secret'],
   'ssh-key': ['privateKey'],
   env: ['env'],
@@ -80,8 +80,14 @@ export interface VaultItem {
     externalId?: string;
     externalIds?: Record<string, string>;
     at: number;
+    /** Import format marker: older pass entries need one complete notes refresh. */
+    passNotesVersion?: number;
     syncedAt?: number;
+    /** Source fingerprint recorded with the last successful import. */
+    sourceRevision?: string;
   };
+  /** Successful field accesses; absent on items created before usage tracking. */
+  useCount?: number;
   updatedAt: number;
 }
 
@@ -183,6 +189,11 @@ export function totpCode(seed: string, nowMs = Date.now(), stepSeconds = 30, dig
     len = Number(u.searchParams.get('digits') ?? len) || len;
     algo = (u.searchParams.get('algorithm') ?? algo).toLowerCase();
   }
+  // The URI comes from an import; bound it before it reaches the HMAC.
+  if (!['sha1', 'sha256', 'sha512'].includes(algo)) throw new Error(`unsupported TOTP algorithm "${algo}"`);
+  if (!Number.isInteger(step) || step < 5 || step > 300) throw new Error(`unsupported TOTP period ${step}`);
+  if (!Number.isInteger(len) || len < 4 || len > 10) throw new Error(`unsupported TOTP digit count ${len}`);
+  if (!secret) throw new Error('TOTP seed is empty');
   const counter = Math.floor(nowMs / 1000 / step);
   const msg = Buffer.alloc(8);
   msg.writeBigUInt64BE(BigInt(counter));
@@ -253,7 +264,7 @@ export class VaultItems {
     envVar?: string;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
-    provenance?: { source: string; taskId?: string; externalId?: string; syncedAt?: number };
+    provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? this.get(args.id) : undefined;
@@ -265,6 +276,12 @@ export class VaultItems {
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     for (const field of ITEM_FIELDS[args.type]) {
       const value = args.secrets?.[field];
+      // Pass notes are a complete snapshot, including an empty replacement.
+      if (field === 'note' && value !== undefined) {
+        this.requireBroker().registerHandle(itemHandle(id, field), value);
+        fields.add(field);
+        continue;
+      }
       if (value?.trim()) {
         this.requireBroker().registerHandle(itemHandle(id, field), value);
         fields.add(field);
@@ -288,10 +305,11 @@ export class VaultItems {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',
         reveal: args.policy?.reveal ?? prior?.policy.reveal ?? 'ask',
       },
-      // Provenance is birth-data: only the mirror clock moves on a re-sync.
+      // Preserve origin identity; only import format and mirror clock change on sync.
       provenance: prior
-        ? { ...prior.provenance, ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
-        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
+        ? { ...prior.provenance, ...(args.provenance?.syncedAt !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
+        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.sourceRevision !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
+      useCount: prior?.useCount ?? 0,
       updatedAt: Date.now(),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
@@ -461,9 +479,12 @@ export class VaultItems {
     caps: Capability[], taskId: string | undefined, item: VaultItem, mode: AccessMode,
     opts: { consume?: boolean; ambient?: boolean } = {},
   ): { status: AccessStatus; reason?: string } {
-    if (taskId && !opts.ambient && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
+    // `never` is absolute: it is checked before a one-shot pass so an approval
+    // that was parked for another reason (a reset report, a mode the human did
+    // not look at) can never be spent on plaintext.
     const policyForTask = this.effectivePolicy(taskId, item);
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
+    if (taskId && !opts.ambient && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
     if (!this.covered(caps, taskId, item)) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
     const policy = mode === 'reveal' ? policyForTask.reveal : policyForTask.use;
     if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (${taskId ? 'task' : 'item'} policy)` };
@@ -480,6 +501,14 @@ export class VaultItems {
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',
       detail: { itemId: item.id, label: item.label, field, ...(ctx.taskId ? { taskId: ctx.taskId } : {}) },
     });
+    // Read fresh metadata: callers may reuse an item across several fields.
+    // Usage must not move updatedAt, which connector sync uses for edits.
+    const items = this.list();
+    const current = items.find((candidate) => candidate.id === item.id);
+    if (current) {
+      current.useCount = (current.useCount ?? 0) + 1;
+      this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items));
+    }
     return secret;
   }
 

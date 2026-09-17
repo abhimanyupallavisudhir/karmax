@@ -40,6 +40,8 @@ export interface ConfirmationPolicy {
 }
 
 export interface Organization {
+  /** Name discovery only; never grants access to organization resources. */
+  nameVisibility: 'members' | 'public';
   id: string;
   name: string;
   slug: string;
@@ -236,6 +238,7 @@ export interface DeliveryPreferences {
   organizationId: string;
   browser: boolean;
   email: boolean;
+  emailUrgencies?: Partial<Record<Urgency, boolean>>;
   slack: boolean;
   routine: boolean;
 }
@@ -1362,6 +1365,8 @@ export interface FieldSpec {
 
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
+  /** Omitted inherits tools; [] explicitly selects no optional connections. */
+  mcpConnections?: string[];
   provider: Provider;
   /** Select a durable Avatar. Provider/model remain snapshotted for replay and
    * display, but current turns resolve the owner-controlled prompt + authority
@@ -1438,7 +1443,7 @@ export interface ConfirmConfig extends Partial<AgentSpec> {
   prompt?: string;
 }
 
-/** Who answers an ordinary "Waiting for input" pause. Unlike the Review route,
+/** Who answers an ordinary "Needs input" pause. Unlike the Review route,
  * this is exactly one step: a selected human audience or a response-agent turn.
  * Agent responses are fed back to the working agent as the requested input. */
 export interface ResponderConfig extends Partial<AgentSpec> {
@@ -1453,6 +1458,7 @@ export interface ResponderConfig extends Partial<AgentSpec> {
  *  `revise` sends the task back to Do (with an optional comment), `reject` cancels. */
 export type ConfirmAction = 'confirm' | 'revise' | 'reject';
 export interface ConfirmDecision {
+  otherAttempts?: 'keep' | 'cancel';
   action: ConfirmAction;
   text?: string;
 }
@@ -1579,6 +1585,7 @@ export interface AuthSource {
 }
 
 export interface AgentProfile {
+  mcpConnections?: string[];
   id: string;
   name: string;
   provider: Provider;
@@ -1589,9 +1596,8 @@ export interface AgentProfile {
   role: AgentRole;
   /** Prompt template path under the content store, or inline text. */
   promptTemplate?: string;
-  /** @deprecated The declaring workflow owns the role's capability ceiling
-   *  (SPEC §8.2), resolved per turn by `roleCeiling(role)`; persisted values are
-   *  ignored. A per-profile copy only ever drifted from the manifest. */
+  /** @deprecated Task authorization owns capability selection. Declared agent
+   *  roles preserve that grant; persisted profile capability copies are ignored. */
   capabilities?: string[];
   maxTurns?: number;
   /** @deprecated Credentials policy is authoritative; persisted values are ignored. */

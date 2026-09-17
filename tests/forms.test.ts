@@ -55,8 +55,17 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(mergeOnly.params.some((f: any) => f.name === 'agent:merge')).toBe(false);
     // each workflow serves its own lifecycle stages (drives the pipeline UI)
     expect(sd.stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'pr', 'review', 'merge', 'done']);
-    expect(schema.map((s: any) => s.name)).not.toContain('just-do');
-    expect(schema.map((s: any) => s.name)).not.toContain('script-exec');
+    // Hidden workflows still need schemas to edit existing drafts. Visibility in
+    // the new-task picker is independent of this endpoint.
+    const justDo = schema.find((s: any) => s.name === 'just-do');
+    expect(justDo.params).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'prompt', type: 'text', bind: 'prompt' }),
+      expect.objectContaining({ name: 'agent:do', type: 'agent' }),
+    ]));
+    const script = schema.find((s: any) => s.name === 'script-exec');
+    expect(script.params).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'command', type: 'text', required: true }),
+    ]));
   });
 
   it('round-trips global and project settings', async () => {
@@ -229,8 +238,19 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect((await get(`/api/tasks/${task.id}/attempts`)).attempts.every((attempt: any) => attempt.params.archived === true)).toBe(true);
     // un-archive so we can finish it, then archive the finished task
     await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: false }) });
-    await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm' });
+    // A sibling now requires the explicit Keep/Cancel choice. Check the HTTP
+    // boundary instead of silently ignoring an error and timing out at Done.
+    const missingChoice = await fetch(`${base}/api/tasks/${task.id}/signal`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ signal: 'confirm' }),
+    });
+    expect(missingChoice.status).toBe(400);
+    expect((await J(missingChoice)).error).toMatch(/keep or cancel/i);
+    expect((await get(`/api/tasks/${task.id}`)).stage).toBe('review');
+    const confirmed = await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm', otherAttempts: 'cancel' });
+    expect(confirmed).toMatchObject({ ok: true });
     await poll(task.id, 'done');
+    expect((await get(`/api/tasks/${task.id}/attempts`)).attempts
+      .find((attempt: any) => attempt.id === draftAttempt.id)?.lastView?.status).toBe('cancelled');
     const ok = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
     expect(ok.status).toBe(200);
 
