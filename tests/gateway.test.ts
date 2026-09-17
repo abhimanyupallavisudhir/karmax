@@ -1593,13 +1593,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
   });
 
-  it('seeds a brand-new project with the krmax-ready prep task', async () => {
+  it('seeds a brand-new project with the tavya init task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's current onActivate prep task automatically (SPEC §4.6) —
     // no manual "activate workflow" step. Covers both create-project routes.
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
-    const prepTitle = 'Make this project krmax-ready';
+    const prepTitle = 'tavya init';
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });
