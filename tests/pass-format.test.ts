@@ -48,3 +48,13 @@ it('supports gopass key-value TOTP and otpauth fields without a YAML separator',
   const updated = updatePassSecret(`pw\ntotp: ${seed}\nusername: alice\n`, 'totp', next);
   expect(updated).toBe(`pw\ntotp: ${next}\nusername: alice\n`);
 });
+
+it('uses the same token precedence as gopass when several representations coexist', () => {
+  const body = `pw\ntotp: ${seed}\notpauth: ${next}\n`;
+  expect(passSecrets(body).totp).toBe(next);
+  const rotated = updatePassSecret(body, 'totp', uri);
+  expect(passSecrets(rotated).totp).toBe(uri);
+  const appended = `pw\ntotp: ${seed}\n${next}\n`;
+  expect(passSecrets(appended).totp).toBe(next);
+  expect(passSecrets(updatePassSecret(appended, 'totp', uri)).totp).toBe(uri);
+});

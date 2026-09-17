@@ -91,6 +91,8 @@ export interface CredentialConnector {
   describe(): Promise<ConnectorInfo>;
   /** Enumerate mirrorable items (metadata only). */
   list(): Promise<ExternalItem[]>;
+  /** Validate a candidate without publishing it to concurrent sync operations. */
+  validateSecret?(secret: string): Promise<ConnectorInfo>;
   /** Fetch the selected items with their secrets. */
   pull(externalIds: string[]): Promise<PullResult>;
   /** Optional write-back of an agent-created item (creates a NEW entry). */
@@ -708,6 +710,20 @@ class GitPassStoreConnector implements CredentialConnector {
     }
   }
 
+  async verify(): Promise<void> {
+    await this.inRepository(async (connection, _checkout, store) => {
+      this.entries(store);
+      await this.withKeyContext(connection, async (home) => {
+        if (connection.crypto === 'age') {
+          await realExec('age-keygen', ['-y', path.join(home, 'identity')]);
+        } else {
+          const keys = await realExec('gpg', ['--homedir', home, '--batch', '--with-colons', '--list-secret-keys']);
+          if (!keys.split('\n').some(line => line.startsWith('sec:'))) throw new Error('GPG private key is required');
+        }
+      });
+    });
+  }
+
   async list(): Promise<ExternalItem[]> {
     return this.inRepository(async (_connection, _checkout, store, _env) =>
       this.entries(store).map((entry) => this.metadata(store, entry)));
@@ -760,6 +776,10 @@ class GitPassStoreConnector implements CredentialConnector {
       }
       const file = this.entryFile(store, externalId);
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const directory = path.dirname(file);
+      if (fs.lstatSync(directory).isSymbolicLink() || !inside(store, fs.realpathSync(directory))) {
+        throw new Error('The pass export directory must be a real directory inside the password store');
+      }
       const body = createPassBody(item.secrets, item.username);
       await this.withKeyContext(connection, async (gpgHome) => {
         await this.encrypt(gpgHome, file, body, this.recipients(store, path.dirname(file)));
@@ -1078,6 +1098,14 @@ export class GitPassConnector implements CredentialConnector {
     catch { return false; }
   }
 
+  async validateSecret(secret: string): Promise<ConnectorInfo> {
+    const candidate = new GitPassConnector(() => secret, this.organizationId, this.gitEnvironment, this.root, this.options);
+    const info = await candidate.describe();
+    if (!info.available) throw new Error(info.detail);
+    for (const store of candidate.stores()) await store.connector.verify();
+    return info;
+  }
+
   async list(): Promise<ExternalItem[]> {
     const stores = this.stores();
     const out: ExternalItem[] = [];
@@ -1394,9 +1422,10 @@ export class Connectors {
     const previous = this.secretFor(name);
     const replacedGitPassStore = name === 'pass-git' && previous !== undefined
       && gitPassRepositoryIdentity(previous) !== gitPassRepositoryIdentity(value);
+    const validated = await connector.validateSecret?.(value);
     this.broker.registerHandle(handle, value);
     try {
-      const info = await connector.describe();
+      const info = validated ?? await connector.describe();
       if (!info.available) throw new Error(info.detail);
       // A selection and write-back consent belong to one external store. Never
       // carry them silently to a different repository during reconfiguration.

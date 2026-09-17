@@ -42,6 +42,8 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     run('gopass', ['config', 'core.autosync', 'false']);
     run('gopass', ['insert', '-m', '-f', 'yaml'], `password\n---\n# keep comment\nusername: alice\ntotp: ${seed}\n`);
     run('gopass', ['insert', '-m', '-f', 'kv'], `password\ntotp: ${seed}\nusername: alice\n`);
+    run('gopass', ['insert', '-m', '-f', 'mixed-kv'], `password\ntotp: ${seed}\notpauth: otpauth://totp/mixed?secret=JBSWY3DPEHPK3PXP\n`);
+    run('gopass', ['insert', '-m', '-f', 'mixed-bare'], `password\ntotp: ${seed}\notpauth://totp/mixed?secret=JBSWY3DPEHPK3PXP\n`);
     run('git', ['push', '-u', 'origin', branch], undefined, store);
 
     const config = { repositoryUrl: remote, gpgPrivateKey: privateKey };
@@ -52,13 +54,14 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     const items = new VaultItems(db, broker, path.join(root, 'state'));
     const connectors = new Connectors(db, items, broker);
     connectors.register(connector);
-    const names = ['standalone', 'appended', 'yaml', 'kv'];
-    expect((await connectors.sync('pass-git', names)).count).toBe(4);
+    await connectors.connect('pass-git', JSON.stringify(config));
+    const names = ['standalone', 'appended', 'yaml', 'kv', 'mixed-kv', 'mixed-bare'];
+    expect((await connectors.sync('pass-git', names)).count).toBe(names.length);
     const compareCodes = (name: string, secret: string) => {
       const before = Date.now();
       const code = run('gopass', ['otp', '-o', name]).trim();
       expect([totpCode(secret, before), totpCode(secret, Date.now())]).toContain(code);
-      if (name !== 'yaml' && name !== 'kv') {
+      if (!['yaml', 'kv', 'mixed-kv'].includes(name)) {
         const beforePass = Date.now();
         const passCode = run('pass', ['otp', name]).trim();
         expect([totpCode(secret, beforePass), totpCode(secret, Date.now())]).toContain(passCode);
@@ -76,8 +79,8 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     run('git', ['pull', '--ff-only'], undefined, store);
     for (const name of names) compareCodes(name, newSeed);
     expect(run('gopass', ['show', '-n', 'yaml'])).toContain('# keep comment');
-    expect((await connectors.sync('pass-git', names)).count).toBe(4);
-    expect((await connectors.sync('pass-git', names)).skipped).toBe(4);
+    expect((await connectors.sync('pass-git', names)).count).toBe(names.length);
+    expect((await connectors.sync('pass-git', names)).skipped).toBe(names.length);
 
     const created = items.save({ type: 'login', label: 'new-otp', secrets: { totp: uri, note: 'retain me\n' }, provenance: { source: 'task:test' } });
     connectors.setConfig('pass-git', { writeBack: true });

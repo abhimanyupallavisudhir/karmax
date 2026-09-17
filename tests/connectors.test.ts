@@ -999,7 +999,10 @@ describe('Git password-store reconfiguration', () => {
   it('resets auto-sync and write-back when mount bindings change, but not when keys rotate', async () => {
     const { items, store, broker } = makeVault();
     const service = new Connectors(store, items, broker);
-    service.register(new GitPassConnector(() => service.secretFor('pass-git')));
+    const connector = new GitPassConnector(() => service.secretFor('pass-git'));
+    // Binding/consent unit test; live verification is exercised with real remotes.
+    connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
+    service.register(connector);
     const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
       mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
     await service.connect('pass-git', JSON.stringify(config));
@@ -1011,4 +1014,28 @@ describe('Git password-store reconfiguration', () => {
     expect(service.config('pass-git').writeBack).toBeUndefined();
     expect(service.config('pass-git').autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
   });
+});
+
+it('keeps the active connector secret unchanged while a replacement is being validated', async () => {
+  const { items, store, broker } = makeVault();
+  const service = new Connectors(store, items, broker);
+  const info = { name: 'candidate', label: 'Candidate', available: true, canPush: false, detail: '' };
+  let rejectCandidate!: (error: Error) => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  service.register({ name: 'candidate', describe: async () => info, list: async () => [], pull: async () => ({ items: [], failures: [] }),
+    validateSecret: async secret => {
+      if (secret === 'working') return info;
+      entered();
+      return new Promise((_resolve, reject) => { rejectCandidate = reject; });
+    },
+  });
+  await service.connect('candidate', 'working');
+  const replacement = service.connect('candidate', 'unverified');
+  const rejected = expect(replacement).rejects.toThrow('invalid candidate');
+  await started;
+  expect(service.secretFor('candidate')).toBe('working');
+  rejectCandidate(new Error('invalid candidate'));
+  await rejected;
+  expect(service.secretFor('candidate')).toBe('working');
 });

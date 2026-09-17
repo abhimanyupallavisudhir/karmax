@@ -11,10 +11,6 @@ function split(body: string) {
     note: newline < 0 ? '' : body.slice(newline + 1) };
 }
 
-function keyValue(note: string, key: string) {
-  return note.split(/\r?\n/).find(line => new RegExp(`^${key}:(?:\\s|$)`).test(line))?.slice(key.length + 1).trim();
-}
-
 function yamlNote(note: string) {
   if (!/^---\r?\n/.test(note)) return undefined;
   const doc = parseDocument(note);
@@ -22,17 +18,31 @@ function yamlNote(note: string) {
   return !doc.errors.length && isMap(doc.contents) ? doc : undefined;
 }
 
+/** Resolve the representation gopass actually uses: otpauth field, bare URI,
+ * then totp field. Read and rotation must use the same selection. */
+function otpLocation(body: string): { value: unknown; key?: string; index?: number; doc?: ReturnType<typeof yamlNote> } | undefined {
+  const { note } = split(body);
+  const doc = yamlNote(note);
+  const lines = body.split(/\r?\n/);
+  const field = (key: string) => {
+    if (doc?.has(key)) return { value: doc.get(key), doc, key };
+    if (doc) return undefined;
+    const index = lines.findIndex((line, i) => i > 0 && new RegExp(`^${key}:(?:\\s|$)`).test(line));
+    return index < 0 ? undefined : { value: lines[index]!.slice(key.length + 1).trim(), key, index };
+  };
+  const explicit = field('otpauth');
+  if (explicit) return explicit;
+  const index = lines.findIndex(isOtp);
+  if (index >= 0) return { value: lines[index]!.trim(), index };
+  return field('totp');
+}
+
 /** Line one is a password unless it is an OTP URI. Preserve all remaining bytes. */
 export function passSecrets(body: string): Secrets {
   const { first, note } = split(body);
-  const doc = yamlNote(note);
-  const structured = doc?.get('otpauth') ?? (doc ? undefined : keyValue(note, 'otpauth'))
-    ?? doc?.get('totp') ?? (doc ? undefined : keyValue(note, 'totp'));
-  const candidate = typeof structured === 'string'
-    ? (structured.startsWith('//') ? `otpauth:${structured}` : structured)
-    : undefined;
-  const uri = [first, ...note.split(/\r?\n/)].find((line) => isTotp(line))?.trim();
-  const totp = candidate && (!isOtp(candidate) || isTotp(candidate)) ? candidate : uri;
+  const value = otpLocation(body)?.value;
+  const candidate = typeof value === 'string' ? (value.startsWith('//') ? `otpauth:${value}` : value) : undefined;
+  const totp = candidate && (!isOtp(candidate) || isTotp(candidate)) ? candidate : undefined;
   return { ...(!isOtp(first) ? { password: first } : {}), note, ...(totp ? { totp } : {}) };
 }
 
@@ -55,24 +65,21 @@ export function updatePassSecret(body: string, field: VaultFieldName, value: str
   if (field === 'note') return `${first}\n${value}`;
   if (field !== 'totp') throw new Error(`pass write-back does not support the "${field}" field`);
   const uri = totpUri(value);
-  if (isTotp(first)) return `${uri}\n${note}`;
+  const location = otpLocation(body);
+  if (location?.doc) {
+    location.doc.set(location.key!, uri);
+    return `${first}\n${location.doc.toString()}`;
+  }
+  if (location?.index !== undefined) {
+    // Keep line endings and all unrelated notes byte-for-byte.
+    const parts = body.split(/(\r?\n)/);
+    parts[location.index * 2] = location.key ? `${location.key}: ${uri}` : uri;
+    return parts.join('');
+  }
   const doc = yamlNote(note);
   if (doc) {
-    const key = doc.has('otpauth') ? 'otpauth' : 'totp';
-    doc.set(key, uri);
+    doc.set('totp', uri);
     return `${first}\n${doc.toString()}`;
-  }
-  const lines = body.split(/\r?\n/);
-  const kvIndex = lines.findIndex((line, index) => index > 0 && /^(otpauth|totp):(?:\s|$)/.test(line));
-  if (kvIndex >= 0) {
-    const key = lines[kvIndex]!.split(':', 1)[0];
-    lines[kvIndex] = `${key}: ${uri}`;
-    return lines.join('\n');
-  }
-  const index = lines.findIndex(isTotp);
-  if (index >= 0) {
-    lines[index] = uri;
-    return lines.join('\n');
   }
   return `${body}${body.endsWith('\n') ? '' : '\n'}${uri}\n`;
 }
