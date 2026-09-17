@@ -8,14 +8,14 @@ All values below are milliseconds. First response is gateway receipt to first pu
 
 | Scenario | Session/world | n | First response median / p95 | Completion median / p95 | Activity completion median / p95 |
 |---|---|---:|---:|---:|---:|
-| conversation | fresh | 10 | 960.6 / 971.0 | 962.1 / 973.9 | 20.9 / 38.2 |
-| conversation | reused/resumed fixture | 10 | 663.2 / 665.8 | 664.3 / 667.9 | 19.1 / 26.0 |
-| one-action | fresh | 10 | 992.5 / 1034.3 | 993.7 / 1035.7 | 51.2 / 67.0 |
-| one-action | reused/resumed fixture | 10 | 694.6 / 724.7 | 695.7 / 726.2 | 52.1 / 73.7 |
-| sequential-actions | fresh | 10 | 1048.5 / 1088.2 | 1049.6 / 1089.5 | 106.6 / 125.3 |
-| sequential-actions | reused/resumed fixture | 10 | 737.9 / 756.6 | 739.0 / 757.8 | 104.9 / 118.6 |
-| parallel-actions | fresh | 10 | 1001.0 / 1006.8 | 1002.6 / 1007.9 | 62.9 / 65.8 |
-| parallel-actions | reused/resumed fixture | 10 | 695.6 / 705.0 | 697.7 / 706.1 | 63.4 / 66.3 |
+| conversation | fresh | 10 | 957.8 / 961.1 | 958.9 / 962.2 | 18.6 / 42.6 |
+| conversation | reused/resumed fixture | 10 | 662.2 / 663.6 | 663.4 / 664.7 | 18.8 / 22.1 |
+| one-action | fresh | 10 | 994.8 / 1002.5 | 996.0 / 1004.1 | 52.9 / 62.9 |
+| one-action | reused/resumed fixture | 10 | 686.9 / 698.9 | 688.1 / 700.3 | 53.6 / 59.6 |
+| sequential-actions | fresh | 10 | 1051.5 / 1132.9 | 1052.5 / 1134.0 | 104.8 / 164.3 |
+| sequential-actions | reused/resumed fixture | 10 | 733.2 / 756.0 | 734.2 / 757.4 | 101.2 / 115.7 |
+| parallel-actions | fresh | 10 | 1001.4 / 1010.0 | 1002.4 / 1011.5 | 61.0 / 69.7 |
+| parallel-actions | reused/resumed fixture | 10 | 699.2 / 710.7 | 700.4 / 715.0 | 58.6 / 80.9 |
 
 Fresh means a new local world and scripted session. Gateway, worker, and fixture server were already running. Reused means the same world plus a scripted session marker; it establishes no provider-cache behavior. Scenarios rotate order each repetition. Parallel actions use distinct fixture accounts; sequential actions include model continuations. Host memory/load admission gates were disabled for this fixture.
 
@@ -25,16 +25,16 @@ The following summaries pool all 80 turns and are not additive: child spans over
 
 | Interval | n | Median ms | p95 ms |
 |---|---:|---:|---:|
-| Receipt to activity start | 80 | 650.4 | 943.2 |
-| Request completion: covered union | 80 | 63.8 | 132.1 |
-| Request completion: unattributed | 80 | 659.5 | 930.1 |
-| world.prepare | 40 | 18.5 | 26.6 |
-| prompt.prepare | 80 | 2.3 | 4.8 |
+| Receipt to activity start | 80 | 646.9 | 943.6 |
+| Request completion: covered union | 80 | 66.9 | 124.3 |
+| Request completion: unattributed | 80 | 652.2 | 930.2 |
+| world.prepare | 40 | 18.0 | 27.6 |
+| prompt.prepare | 80 | 2.3 | 3.2 |
 | admission.host | 80 | 0.2 | 0.3 |
-| adapter.to-first-output.opaque | 80 | 47.6 | 99.5 |
-| service.discovery | 60 | 9.9 | 11.1 |
-| service.execution | 140 | 11.2 | 16.5 |
-| provider.fixture-roundtrip | 200 | 6.8 | 9.6 |
+| adapter.to-first-output.opaque | 80 | 45.2 | 101.3 |
+| service.discovery | 60 | 9.9 | 10.7 |
+| service.execution | 140 | 10.9 | 15.2 |
+| provider.fixture-roundtrip | 200 | 6.8 | 10.3 |
 
 The gap before activity start is substantial in this fixture. It includes workflow scheduling and work between measured boundaries; it must not be assigned entirely to a queue or model inference. Queue publication intervals and Temporal schedule-to-start wall estimates are separate evidence in the raw report. Unknown time remains visible.
 
@@ -49,4 +49,4 @@ npx tsx src/scripts/timing-report.ts benchmarks/results/latency-fixture-2026-09-
 npm run benchmark:latency -- 10 /tmp/new-fixture-run.json
 ```
 
-Verification: relevant integration/unit suite passed 92 tests across 13 files; targeted real Temporal retry/resume test passed. After report refinements, timing/UI unit tests passed 14 tests. TypeScript checking and JavaScript syntax checking were also run. An earlier retry test run overlapped typechecking on the 2 GB host and timed out under memory pressure; it was discarded and rerun sequentially. These test durations are not benchmark samples.
+Verification on the final code: focused timing, UI, managed-service gateway and native MCP integration checks passed; adapter, usage and service suites passed 100 tests; the real Temporal retry/resume test passed. The browser-summary regression was first observed failing and then passed after implementation. TypeScript and JavaScript syntax checks passed. The 80-turn benchmark completed successfully, sequentially after those checks. Test durations are not benchmark samples.

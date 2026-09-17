@@ -18264,6 +18264,7 @@ function timingTab(v) {
   const report = timingReports.get(v.taskId);
   const stats = report ? [['Activity → first text', report.firstResponse], ['Activity → completion', report.completion],
     ['Request → first text', report.requestFirstResponse], ['Request → completion', report.requestCompletion],
+    ...(report.browserFrame ? [['Browser receipt → frame opportunity', report.browserFrame]] : []),
     ...(report.requestFirstResponseWallEstimate?.count ? [['Request → first text (wall estimate)', report.requestFirstResponseWallEstimate]] : []),
     ...(report.requestCompletionWallEstimate?.count ? [['Request → completion (wall estimate)', report.requestCompletionWallEstimate]] : [])] : [];
   return `<div class="section-h">Response timing <button class="btn sm" id="timing-refresh">${report ? 'Refresh' : 'Load measurements'}</button>

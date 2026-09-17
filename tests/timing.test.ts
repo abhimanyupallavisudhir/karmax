@@ -175,3 +175,12 @@ it('correlates external service spans without adding cross-clock coverage', () =
   expect(result.unattributedMs).toBe(20);
   expect(result.externalSpans).toEqual([expect.objectContaining({ name: 'service.execution', durationMs: 5 })]);
 });
+
+it('summarizes browser receipts and counts unacknowledged deliveries as missing', () => {
+  const rows: any[] = [];
+  const delivery = new TimingDelivery(row => rows.push(row));
+  const id = delivery.offer({ taskId: 't', turnId: 'one', attempt: 1 });
+  delivery.offer({ taskId: 't', turnId: 'two', attempt: 1 });
+  delivery.acknowledge({ type: 'timing.frame', id, frameMs: 12 });
+  expect(timingReport(rows).browserFrame).toEqual({ count: 1, missing: 1, medianMs: 12, p95Ms: 12 });
+});

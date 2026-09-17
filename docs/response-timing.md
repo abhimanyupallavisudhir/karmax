@@ -75,7 +75,8 @@ New activity turns that contain that message can be correlated normally.
 Platform-generated continuations without a user receipt have activity samples
 but no invented request latency. Browser receipts are bounded, once-only and
 scoped to the authenticated socket; missing/hidden/disconnected clients remain
-unknown. Multiple viewers yield multiple delivery samples.
+unknown. Multiple viewers yield multiple delivery samples. The `browserFrame` summary reports
+receipt-to-frame median/p95 with unacknowledged socket offers counted as missing.
 
 Timing payloads contain identifiers, numeric counters, fixed operation names,
 provider/model and session/world classifications. They never copy prompts,

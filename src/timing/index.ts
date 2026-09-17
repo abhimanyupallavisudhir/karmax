@@ -232,7 +232,10 @@ export function timingReport(input: TimingRow[]) {
     firstResponse: distribution(values.map(a => a.firstTextMs)),
     completion: distribution(values.map(a => a.status === 'ok' ? a.totalMs : null)),
   }));
-  return { version: 1, attempts, requests, intervals, queueIntervals, cohorts,
+  const frames = new Map(rows.filter(r => r.name === 'delivery.browser-frame').map(r => [r.traceId, r.metadata?.browserFrameMs]));
+  const browserFrame = distribution(rows.filter(r => r.name === 'delivery.socket-roundtrip' && r.phase === 'start')
+    .map(r => frames.get(r.traceId) ?? null));
+  return { version: 1, attempts, requests, intervals, queueIntervals, cohorts, browserFrame,
     cohortDimensions: ['provider', 'model', 'sessionMode', 'worldKind', 'initialOrRetry'],
     firstResponse: distribution(attempts.map(a => a.firstTextMs)),
     completion: distribution(attempts.map(a => a.status === 'ok' ? a.totalMs : null)),
