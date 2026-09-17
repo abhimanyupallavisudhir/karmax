@@ -27,6 +27,7 @@ import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
 import { LoginManager, type LoginCommand } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/resources.js';
+import { WorldCheckpointService } from '../../src/world/checkpoint.js';
 import { WorldHandoffService } from '../../src/world/handoff.js';
 import { AuthorizationService } from '../../src/platform/authorization.js';
 
@@ -59,6 +60,7 @@ export interface Harness {
   api: KarmaxApi;
   resources: ProjectResourceService;
   broker: CredentialBroker;
+  checkpoints?: WorldCheckpointService;
   restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
@@ -75,6 +77,7 @@ export async function bootHarness(
   /** Activity-dep overrides a test needs the worker to run with (e.g. a stub
    *  GitHub endpoint for the pull-request integration). */
   overrides: {
+    checkpoints?: boolean;
     configHomes?: ConfigHomeManager;
     githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService;
@@ -117,6 +120,8 @@ export async function bootHarness(
   paymentRegistry.register(payments);
   paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
+  const checkpoints = overrides.checkpoints
+    ? new WorldCheckpointService(store, worlds, objects, broker, undefined, resources) : undefined;
   const activityDeps = {
     store,
     worlds,
@@ -133,6 +138,7 @@ export async function bootHarness(
     resources,
     objects,
     ...overrides,
+    checkpoints,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
@@ -156,6 +162,7 @@ export async function bootHarness(
     api,
     resources,
     broker,
+    checkpoints,
     async restartWorker() {
       worker.shutdown();
       await runPromise.catch(() => {});

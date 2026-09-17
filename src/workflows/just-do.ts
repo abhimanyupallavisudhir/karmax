@@ -7,7 +7,7 @@ import {
   isCancellation,
   workflowInfo,
 } from '@temporalio/workflow';
-import { ActivityCancellationType } from '@temporalio/common';
+import { ActivityCancellationType, ApplicationFailure } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
@@ -87,6 +87,11 @@ export async function justDoV1_6(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true, true, true, true, true, true, true);
 }
 
+/** Resource-only output is checkpointed; configured Git failures remain fatal. */
+export async function justDoV1_7(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true, true, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
@@ -104,6 +109,7 @@ async function justDoImpl(
   clearsConfirmOnGate = false,
   resourceCandidateReview = false,
   publishesFinalization = false,
+  resourceOnlyFinalization = false,
 ): Promise<{ stage: Stage }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const coordinator = boundedCoordinatorRetries ? boundedCoord : coord;
@@ -365,8 +371,8 @@ async function justDoImpl(
     status = 'active';
   }
 
-  // No merge machinery: the world IS the deliverable. Commit the work to the
-  // task branch so it persists, and keep the worktree for inspection.
+  // No merge machinery: the world IS the deliverable. Persist approved output
+  // before releasing compute; retained local worktrees remain inspectable.
   if (!cancelled && world) {
     if (publishesFinalization) {
       finalizing = true;
@@ -374,8 +380,15 @@ async function justDoImpl(
       waitingFor = undefined;
       await publish();
     }
-    await core.commitWork(world as any, `karmax: ${input.title}`);
-    if (remoteWorldProvider(world.provider ?? world.kind)) await core.publishTaskBranch(world as any);
+    // Old version pins retain their exact activity sequence and result handling.
+    const resourceOnly = resourceOnlyFinalization
+      && await core.checkpointResourceOnlyWork(world as any, input.project.repos ?? []);
+    if (!resourceOnly) {
+      const result = await core.commitWork(world as any, `karmax: ${input.title}`);
+      if (resourceOnlyFinalization && !result.committed)
+        throw ApplicationFailure.nonRetryable('task work was not committed; retaining the world for recovery');
+      if (remoteWorldProvider(world.provider ?? world.kind)) await core.publishTaskBranch(world as any);
+    }
   }
   finalizing = false;
   stage = cancelled ? 'cancelled' : 'done';

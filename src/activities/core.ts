@@ -2733,6 +2733,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return heads;
     },
 
+    /** The current world, including checkouts added during Do, determines whether
+     * Git persistence is needed. A missing configured checkout is never treated
+     * as a resource-only success. Checkpoint before releasing remote compute:
+     * ordinary reports and reviewed resource revisions survive independently of
+     * Git, without promoting any project resource head. */
+    async checkpointResourceOnlyWork(handle: WorldHandle, configuredRepos: string[]): Promise<boolean> {
+      const world = await openWorld(handle);
+      if (worldRepos(world.handle).length) return false;
+      const projectId = store.getTask(handle.id)?.projectId ?? String(world.handle.meta?.projectId ?? '');
+      const project = store.getProject(projectId);
+      if (configuredRepos.length || project?.config.repos?.length || store.listProjectRepositories(projectId).length)
+        throw new Error('configured repositories are missing from the task world');
+      if (deps.checkpoints) {
+        const checkpoint = await deps.checkpoints.checkpoint(world.handle);
+        record(handle.id, 'checkpoint.created', { checkpointId: checkpoint.id,
+          generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 });
+      } else if (isRemote(world.handle.kind) || world.handle.meta?.releaseOnCompletion === true) {
+        throw new Error('world checkpoints are required to preserve resource-only task output');
+      }
+      // Local worlds that are retained remain directly inspectable even when
+      // the caller does not configure the optional checkpoint service.
+      return true;
+    },
+
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
       const world = await openWorld(handle);
       const repos = worldRepos(world.handle);
