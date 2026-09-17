@@ -102,7 +102,7 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     const hook = path.join(repo, '.git', 'hooks', 'pre-commit');
     fs.writeFileSync(hook, '#!/bin/sh\nsleep 2\n', { mode: 0o755 });
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('justDo@1.6.0', {
+    const handle = await h.client.workflow.start('justDo@1.7.0', {
       taskQueue: TASK_QUEUE, workflowId: taskId,
       args: [baseInput(taskId, repo, { prompt: '@write note.txt :: saved output' })],
     });
