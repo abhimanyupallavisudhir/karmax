@@ -1443,7 +1443,7 @@ export interface ConfirmConfig extends Partial<AgentSpec> {
   prompt?: string;
 }
 
-/** Who answers an ordinary "Waiting for input" pause. Unlike the Review route,
+/** Who answers an ordinary "Needs input" pause. Unlike the Review route,
  * this is exactly one step: a selected human audience or a response-agent turn.
  * Agent responses are fed back to the working agent as the requested input. */
 export interface ResponderConfig extends Partial<AgentSpec> {

@@ -4832,7 +4832,7 @@ function stageLabel(v) {
   // A human hold is a public software-dev stage, even though the workflow keeps
   // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
   // where to resume. Direct provider blockers may supply a concise specific
-  // summary; ordinary holds retain the stable "Waiting for input" label.
+  // summary; ordinary holds retain the stable "Needs input" label.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   // `do` and `merge` are the replay-stable workflow keys; a person reads them
   // as "working" and "landing" and never has to learn the internal names.
@@ -9536,6 +9536,7 @@ function waitingText(w) {
     const summary = w.summary.replace(/\s+/g, ' ').trim();
     if (summary) return summary.slice(0, 72);
   }
+  if (w?.kind === 'human') return 'Needs input';
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;

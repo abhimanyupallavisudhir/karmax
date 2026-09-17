@@ -2635,7 +2635,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // stale head and exact-candidate verification repeats forever.
   let recoveredLandingNeedsDo = false;
   proposalCycle: for (;;) {
-  // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
+  // ── Do ⇄ Needs input ⇒ PR ⇄ Review ──
   if (!restoredReviewApproved
     && (recoveredLandingNeedsDo || (recoveryStage !== 'pr' && recoveryStage !== 'merge'))) {
   recoveredLandingNeedsDo = false;
