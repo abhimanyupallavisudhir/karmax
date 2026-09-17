@@ -953,6 +953,8 @@ describe('remote task wiki views', () => {
           project: {},
           title: task.title,
           prompt: 'Follow [[proj:notes/prompt]]',
+          // This fake remote implements wiki files only; browser provisioning is tested separately.
+          agents: { do: { provider: 'mock', mcpConnections: [] } },
           workflow: 'software-dev',
         } as any,
       });

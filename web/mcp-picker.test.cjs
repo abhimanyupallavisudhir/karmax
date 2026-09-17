@@ -1,0 +1,27 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
+const start = source.indexOf('function mcpPickerHtml(');
+const end = source.indexOf('async function wireMcpPicker(', start);
+const context = vm.createContext({ esc: s => String(s).replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll("'", '&#39;').replaceAll('<', '&lt;') });
+vm.runInContext(source.slice(start, end), context);
+const defaultHtml = context.mcpPickerHtml(undefined, undefined);
+assert.match(defaultHtml, /browser:chrome-devtools/);
+assert.match(defaultHtml, /role="combobox"/);
+assert.doesNotMatch(defaultHtml, /Use inherited|Manage connections|account browser/);
+assert.match(defaultHtml, /\+ Add custom MCP/);
+assert.notEqual(defaultHtml, context.mcpPickerHtml(undefined, undefined), 'combobox IDs are unique');
+const read = value => context.readMcpPicker({ querySelector: () => ({ dataset: { value: JSON.stringify(value) } }) });
+assert.equal(read(null), undefined, 'untouched field keeps following parent defaults');
+assert.deepEqual(Array.from(read([])), [], 'clearing every chip persists an explicit empty set');
+assert.deepEqual(Array.from(read(['browser:chrome-devtools', 'browser:playwright'])), ['browser:chrome-devtools', 'browser:playwright']);
+vm.runInContext(source.slice(source.indexOf('const sameJson ='), source.indexOf('function renderResponderField('))
+  + '\nglobalThis.normalizeTools = { spec: normSpec, layers: normLayers, responder: normResponder };', context);
+const normalize = context.normalizeTools;
+const inherited = { provider: 'codex', mcpConnections: ['browser:chrome-devtools'] };
+assert.equal(JSON.stringify(normalize.spec({ provider: 'codex' }, inherited)), JSON.stringify(normalize.spec(inherited)), 'an untouched task follows its parent');
+assert.notEqual(JSON.stringify(normalize.spec({ provider: 'codex', mcpConnections: [] }, inherited)), JSON.stringify(normalize.spec(inherited)), 'tool-only task edits are saved');
+assert.notEqual(JSON.stringify(normalize.layers([{kind:'agent', ...inherited}])), JSON.stringify(normalize.layers([{kind:'agent', ...inherited, mcpConnections: []}])), 'tool-only review-agent edits are saved');
+assert.notEqual(JSON.stringify(normalize.responder({kind:'agent', ...inherited})), JSON.stringify(normalize.responder({kind:'agent', ...inherited, mcpConnections: []})), 'tool-only responder edits are saved');
+console.log('MCP combobox serialization passed');
