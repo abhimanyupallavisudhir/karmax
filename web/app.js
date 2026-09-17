@@ -14528,20 +14528,27 @@ async function wireVaultCards(organizationId) {
     overlay.className = 'modal-overlay';
     let profileData = { profiles: [], defaultProfile: null };
     try { profileData = await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`); } catch {}
-    overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
-      <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
-        <div class="section-h" id="git-pass-title">Connect unix pass through Git</div>
-        <p class="task-sub" style="color:var(--ink-2);margin-top:2px">${siteNameMarkup()} clones the repository into isolated organization storage, decrypts entries only while syncing, and commits and pushes write-back changes.</p>
-      </div><button class="icon-btn" data-git-pass-close aria-label="Close">×</button></div>
-      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
+    const storeFields = () => `      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
       <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detects .password-store)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
       <div class="form-row"><label>Git profile <span class="task-sub">(used for private clone and push)</span></label><select class="git-pass-profile">
         <option value="">Organization default${profileData.defaultProfile ? ` — ${esc(profileData.defaultProfile)}` : ''}</option>
         ${profileData.profiles.map((profile) => `<option value="${esc(profile.name)}">${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}
       </select></div>
-      <div class="form-row"><label>ASCII-armored GPG private key</label><textarea class="git-pass-key" rows="7" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea></div>
-      <div class="form-row"><label>GPG key passphrase <span class="task-sub">(leave blank if none)</span></label><input class="git-pass-passphrase" type="password" autocomplete="new-password" /></div>
-      <p class="task-sub" style="color:var(--ink-3)">The private key and passphrase are stored together as a write-only connector credential. They are imported into a temporary GPG home for each operation and removed afterward.</p>
+      <div class="form-row"><label>Encryption</label><select class="git-pass-crypto"><option value="gpg">GPG (pass / gopass)</option><option value="age">age (gopass)</option></select></div>
+      <div data-git-pass-gpg><div class="form-row"><label>ASCII-armored GPG private key</label><textarea class="git-pass-key" rows="7" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea></div>
+      <div class="form-row"><label>GPG key passphrase <span class="task-sub">(leave blank if none)</span></label><input class="git-pass-passphrase" type="password" autocomplete="new-password" /></div></div>
+      <div data-git-pass-age hidden><div class="form-row"><label>Native age identity</label><textarea class="git-pass-age-key" rows="4" autocomplete="off" spellcheck="false" placeholder="AGE-SECRET-KEY-1…"></textarea></div><p class="task-sub">Paste the decrypted native age identity. SSH keys and age plugins are not supported.</p></div>
+`;
+    overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%;max-height:90vh;overflow:auto" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
+      <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
+        <div class="section-h" id="git-pass-title">Connect unix pass through Git</div>
+        <p class="task-sub" style="color:var(--ink-2);margin-top:2px">Connect a pass or gopass store. ${siteNameMarkup()} syncs selected entries and commits and pushes write-back changes.</p>
+      </div><button class="icon-btn" data-git-pass-close aria-label="Close">×</button></div>
+      <div data-git-pass-root>${storeFields()}</div>
+      <div data-git-pass-mounts></div>
+      <button class="btn sm" data-git-pass-add>Add mounted store</button>
+      <p class="task-sub">Add each gopass mount by name and repository URL. Mount names reserve their folder prefix. New credentials are exported to the root store.</p>
+      <p class="task-sub" style="color:var(--ink-3)">Keys are stored as a write-only connector credential. Temporary key files are removed after each operation. Replacing a connection replaces its complete mount list.</p>
       <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn sm" data-git-pass-cancel>Cancel</button><button class="btn sm primary" data-git-pass-save>${conn?.available ? 'Replace connection' : 'Connect'}</button></div>
     </div>`;
     document.body.appendChild(overlay);
@@ -14549,19 +14556,45 @@ async function wireVaultCards(organizationId) {
     overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
     overlay.querySelector('[data-git-pass-close]').addEventListener('click', close);
     overlay.querySelector('[data-git-pass-cancel]').addEventListener('click', close);
+    overlay.addEventListener('change', (event) => {
+      if (!event.target.matches('.git-pass-crypto')) return;
+      const row = event.target.closest('[data-git-pass-root], [data-git-pass-mount]');
+      row.querySelector('[data-git-pass-gpg]').hidden = event.target.value !== 'gpg';
+      row.querySelector('[data-git-pass-age]').hidden = event.target.value !== 'age';
+    });
+    overlay.querySelector('[data-git-pass-add]').addEventListener('click', () => {
+      if (overlay.querySelectorAll('[data-git-pass-mount]').length >= 16) { toast('At most 16 mounted stores are supported', true); return; }
+      const row = document.createElement('fieldset');
+      row.dataset.gitPassMount = '';
+      row.innerHTML = `<legend>Mounted store</legend><div class="form-row"><label>Mount name</label><input class="git-pass-mount-name" placeholder="work" autocomplete="off" /></div>${storeFields()}<button class="btn sm" data-git-pass-remove>Remove store</button>`;
+      row.querySelector('[data-git-pass-remove]').addEventListener('click', () => row.remove());
+      overlay.querySelector('[data-git-pass-mounts]').appendChild(row);
+      row.querySelector('input').focus();
+    });
+    const readStore = (row) => {
+      const repositoryUrl = row.querySelector('.git-pass-repo').value.trim();
+      const crypto = row.querySelector('.git-pass-crypto').value;
+      const key = row.querySelector(crypto === 'age' ? '.git-pass-age-key' : '.git-pass-key').value.trim();
+      if (!repositoryUrl || !key) throw new Error('Repository URL and encryption key are required for each store');
+      return {
+        repositoryUrl, crypto,
+        storePath: row.querySelector('.git-pass-path').value.trim() || undefined,
+        gitProfile: row.querySelector('.git-pass-profile').value || undefined,
+        ...(crypto === 'age' ? { ageIdentity: key } : {
+          gpgPrivateKey: key, gpgPassphrase: row.querySelector('.git-pass-passphrase').value || undefined,
+        }),
+      };
+    };
     overlay.querySelector('[data-git-pass-save]').addEventListener('click', async (event) => {
-      const repositoryUrl = overlay.querySelector('.git-pass-repo').value.trim();
-      const gpgPrivateKey = overlay.querySelector('.git-pass-key').value.trim();
-      if (!repositoryUrl || !gpgPrivateKey) { toast('Repository URL and GPG private key are required', true); return; }
-      event.currentTarget.disabled = true;
+      const button = event.currentTarget;
+      button.disabled = true;
       try {
-        const connection = {
-          repositoryUrl,
-          storePath: overlay.querySelector('.git-pass-path').value.trim() || undefined,
-          gitProfile: overlay.querySelector('.git-pass-profile').value || undefined,
-          gpgPrivateKey,
-          gpgPassphrase: overlay.querySelector('.git-pass-passphrase').value || undefined,
-        };
+        const connection = readStore(overlay.querySelector('[data-git-pass-root]'));
+        connection.mounts = [...overlay.querySelectorAll('[data-git-pass-mount]')].map(row => {
+          const name = row.querySelector('.git-pass-mount-name').value.trim();
+          if (!name) throw new Error('Each mounted store needs a name');
+          return { name, ...readStore(row) };
+        });
         await api(`/api/vault/connectors/pass-git/connect${oq}`, {
           method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
         });
@@ -14569,7 +14602,7 @@ async function wireVaultCards(organizationId) {
         toast('Git-backed pass connected');
         await renderConnectors();
       } catch (error) {
-        event.currentTarget.disabled = false;
+        button.disabled = false;
         toast(error.message, true);
       }
     });

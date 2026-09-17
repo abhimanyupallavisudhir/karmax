@@ -138,5 +138,6 @@ describe('hosted credential connector runtime', () => {
   it('installs GnuPG so Git-backed unix pass entries can be decrypted', () => {
     const runtime = dockerfile.split('FROM node:22-bookworm-slim').at(-1) ?? '';
     expect(runtime).toMatch(/apt-get install[^\n]*\bgnupg\b/);
+    expect(runtime).toMatch(/apt-get install[^\n]*\bage\b/);
   });
 });

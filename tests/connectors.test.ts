@@ -973,3 +973,42 @@ describe('pass notes preservation and migration', () => {
     expect(items.readSecret(items.get(item.id)!, 'note')).toBe('');
   });
 });
+
+describe('pass TOTP import migration', () => {
+  it('repairs an unchanged OTP-only mirror and removes its old password field', async () => {
+    const { items, store, broker } = makeVault();
+    const uri = 'otpauth://totp/x?secret=JBSWY3DPEHPK3PXP';
+    const old = items.save({ type: 'login', label: 'OTP', secrets: { password: uri },
+      provenance: { source: 'connector:pass-git', externalId: 'otp', sourceRevision: 'same', passNotesVersion: 1 } });
+    const connectors = new Connectors(store, items, broker);
+    connectors.register({ name: 'pass-git',
+      describe: async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: '' }),
+      list: async () => [{ externalId: 'otp', type: 'login', label: 'OTP', fields: ['password'], revision: 'same' }],
+      pull: async () => ({ items: [{ externalId: 'otp', type: 'login', label: 'OTP', fields: ['totp', 'note'], revision: 'same', secrets: { totp: uri, note: '' } }], failures: [] }),
+    });
+    expect((await connectors.sync('pass-git', ['otp'])).count).toBe(1);
+    const updated = items.get(old.id)!;
+    expect(updated.fields).toEqual(['totp', 'note']);
+    expect(items.readSecret(updated, 'password')).toBeUndefined();
+    expect(items.totp(updated, {})).toMatch(/^\d{6}$/);
+    expect((await connectors.sync('pass-git', ['otp'])).skipped).toBe(1);
+  });
+});
+
+describe('Git password-store reconfiguration', () => {
+  it('resets auto-sync and write-back when mount bindings change, but not when keys rotate', async () => {
+    const { items, store, broker } = makeVault();
+    const service = new Connectors(store, items, broker);
+    service.register(new GitPassConnector(() => service.secretFor('pass-git')));
+    const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
+      mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
+    await service.connect('pass-git', JSON.stringify(config));
+    service.setConfig('pass-git', { writeBack: true });
+    service.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] });
+    await service.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' }));
+    expect(service.config('pass-git').writeBack).toBe(true);
+    await service.connect('pass-git', JSON.stringify({ ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] }));
+    expect(service.config('pass-git').writeBack).toBeUndefined();
+    expect(service.config('pass-git').autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
+  });
+});
