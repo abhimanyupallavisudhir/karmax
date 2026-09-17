@@ -30,16 +30,26 @@ describe('just-do durable finalization', () => {
   }, 60_000);
   afterAll(async () => { await h?.stop(); });
 
-  async function start(repos: string[] = [], version = '1.7.0', prepare?: (project: Project) => Promise<void>) {
+  async function start(repos: string[] = [], version?: string, prepare?: (project: Project) => Promise<void>) {
     const project = h.store.createProject(newId('Finalization'), { repos, worldProvider: repos.length ? 'worktree' : 'sandbox-test', defaultBase: 'main' });
     await prepare?.(project);
-    const task = h.store.createTask({ projectId: project.id, title: 'Save report', workflow: 'just-do',
-      workflowVersion: version, params: { prompt: '' } });
-    const handle = await h.client.workflow.start(`justDo@${version}`, {
-      taskQueue: TASK_QUEUE, workflowId: task.id,
-      args: [{ taskId: task.id, projectId: project.id, title: task.title,
-        prompt: '@write reports/result.md :: reviewed report', base: 'main', project: project.config }],
-    });
+    const prompt = '@write reports/result.md :: reviewed report';
+    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    // Current behavior must be reachable through normal API creation. Explicit
+    // old pins still start directly so replay tests retain their historical input.
+    const task = version
+      ? h.store.createTask({ projectId: project.id, title: 'Save report', workflow: 'just-do',
+          workflowVersion: version, params: { prompt } })
+      : await h.api.createTask(token, { projectId: project.id, workflow: 'just-do',
+          params: { prompt, base: 'main' } });
+    const handle = version
+      ? await h.client.workflow.start(`justDo@${version}`, {
+          taskQueue: TASK_QUEUE, workflowId: task.id,
+          args: [{ taskId: task.id, projectId: project.id, title: task.title,
+            prompt, base: 'main', project: project.config }],
+        })
+      : h.client.workflow.getHandle(task.id);
+    if (!version) expect((await handle.describe()).type).toBe('justDo@1.7.0');
     await expect.poll(async () => (await handle.query<any>('view')).waitingFor?.kind,
       { timeout: 15_000 }).toBe('human');
     return { task, handle, world: h.store.currentWorld(task.id) as WorldHandle };
@@ -48,7 +58,7 @@ describe('just-do durable finalization', () => {
   it('saves remote repositoryless output in a restorable checkpoint before releasing the world', async () => {
     let attachmentId = '';
     let baseRevisionId = '';
-    const { task, handle, world } = await start([], '1.7.0', async (project) => {
+    const { task, handle, world } = await start([], undefined, async (project) => {
       const attachment = h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
         name: 'Read-only fixture', driver: 'volume@1', target: { kind: 'path', path: 'data/fixture' },
         access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
