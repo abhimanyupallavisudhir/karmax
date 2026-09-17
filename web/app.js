@@ -5699,10 +5699,15 @@ function wireDepPicker(values, selfId) {
 }
 
 // Keep the source array intact: it is shared with other credential controls.
-function sortVaultItems(items, selectedIds = new Set()) {
+function sortVaultItems(items, selectedIds = new Set(), now = Date.now()) {
+  // Same 30-day half-life as src/util/vault-usage.ts. Normalize every score
+  // to one instant so recently used credentials compete with frequent ones.
+  const score = (item) => (item.frecencyScore ?? item.useCount ?? 0)
+    * 2 ** (-Math.max(0, now - (item.frecencyUpdatedAt ?? now)) / (30 * 24 * 60 * 60 * 1000));
   return [...items].sort((a, b) =>
     Number(selectedIds.has(b.id)) - Number(selectedIds.has(a.id))
-    || (b.useCount || 0) - (a.useCount || 0)
+    || score(b) - score(a)
+    || (b.lastUsedAt || 0) - (a.lastUsedAt || 0)
     || a.label.localeCompare(b.label)
     || a.id.localeCompare(b.id));
 }
