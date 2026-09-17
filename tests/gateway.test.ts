@@ -417,6 +417,27 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
   });
 
+  it('selects every gold logo and serves its preview, favicon and installed app assets', async () => {
+    for (const icon of ['gold-check', 'gold-arrow', 'bold-gold-check', 'bold-gold-arrow', 'royal-gold-check', 'royal-gold-arrow']) {
+      const saved = await fetch(`${base}/api/settings/global/appearance`, {
+        method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon } }),
+      });
+      expect(saved.status, icon).toBe(200);
+      expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toEqual({ icon });
+      for (const file of ['icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png']) {
+        const expected = fs.readFileSync(path.join(webDir, 'brand', icon, file));
+        for (const url of [`/brand/${icon}/${file}`, `/brand/${file}`]) {
+          const response = await fetch(`${base}${url}`);
+          expect(response.status, url).toBe(200);
+          expect(Buffer.from(await response.arrayBuffer())).toEqual(expected);
+        }
+      }
+    }
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'diamond' } }),
+    });
+  });
+
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
     const schemas = (await (await fetch(`${base}/api/schema`, { headers: auth() })).json()) as any[];
     const softwareDev = schemas.find((s) => s.name === 'software-dev');
@@ -1593,13 +1614,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
   });
 
-  it('seeds a brand-new project with the krmax-ready prep task', async () => {
+  it('seeds a brand-new project with the tavya init task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's current onActivate prep task automatically (SPEC §4.6) —
     // no manual "activate workflow" step. Covers both create-project routes.
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
-    const prepTitle = 'Make this project krmax-ready';
+    const prepTitle = 'tavya init';
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });

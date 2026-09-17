@@ -28,7 +28,7 @@ import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGl
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
 import { exportConversationWithPanagent } from '../agent/panagent.js';
-import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
+import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
@@ -5341,7 +5341,8 @@ export class Gateway {
         const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
         const requestedOrganizationId = url.searchParams.get('organizationId') ?? undefined;
-        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr));
+        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr))
+          .map(pr => ({ ...pr, mcpConnections: pr.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] }));
         if (!pid && !requestedOrganizationId) return this.json(res, 200, globals.map(withRole));
         const organizationId = requestedOrganizationId ?? (pid ? store.getProject(pid)?.organizationId : undefined);
         if (!organizationId) return this.json(res, 404, { error: 'organization not found' });

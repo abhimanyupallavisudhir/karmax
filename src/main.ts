@@ -671,6 +671,7 @@ async function main() {
     shuttingDown = true;
     console.log(restart ? '\n  merged source changed; restarting…' : '\n  shutting down…');
     const exit = () => {
+      instance.release(); // hold exclusive admission through worker shutdown
       if (restart && !replacementStarted) {
         replacementStarted = true;
         try { spawnReplacementProcess(); }
@@ -692,7 +693,6 @@ async function main() {
     clearInterval(reconcileSweep);
     clearInterval(deploymentSweep);
     await step(entitlementQueues.stop());
-    instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();
     worldLifecycle.stop();

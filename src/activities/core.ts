@@ -2184,9 +2184,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Recreate their stable world paths immediately before every turn so a
         // restored cloud sandbox or a repeatedly-forked session can still read them.
         const turnMessages = await materializeFileAttachments(world, messages);
-        if (profile.mcpConnections !== undefined && !deps.broker) throw new Error('MCP connections require the credential vault');
         const chosenMcp = profile.mcpConnections === undefined ? [] : await prepareConnections(
-          new McpConnections(store, deps.broker!, organizationId), world, profile.mcpConnections, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; });
+          deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; });
         store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } });
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,

@@ -53,7 +53,7 @@ describe('MCP connections', () => {
   it('validates selections and preserves explicit empty sets across provider/default changes', () => {
     expect(validateMcpSelection([])).toEqual([]);
     expect(() => validateMcpSelection(['karmax'])).toThrow();
-    expect(() => validateMcpSelection(['browser:playwright', 'browser:chrome-devtools'])).toThrow(/one browser/);
+    expect(validateMcpSelection(['browser:playwright', 'browser:chrome-devtools'])).toEqual(['browser:playwright', 'browser:chrome-devtools']);
     const base = { id: 'do-default', name: 'Agent', role: 'do', provider: 'claude' as const, mcpConnections: ['browser:playwright'] };
     store.upsertProfile(base);
     store.upsertProfile({ ...base, id: organizationProfileId('org_personal', 'do') });
@@ -64,6 +64,33 @@ describe('MCP connections', () => {
     expect(codexMcpFlags([{ name: 'test-mcp', command: 'node', env: { TEST_KEY: 'value' } }])).toContain('mcp_servers.test-mcp.command="node"');
     expect(codexMcpFlags([{ name: 'test-mcp', command: 'node', env: { TEST_KEY: 'value' } }])).toContain('mcp_servers.test-mcp.env.TEST_KEY="value"');
     expect(() => codexMcpFlags([{ name: 'bad.name', command: 'node' }])).toThrow(/Invalid/);
+  });
+  it('defaults to Chrome DevTools through organization and project layers, including legacy profiles', () => {
+    store.upsertProfile({ id: organizationProfileId('org_personal', 'do'), name: 'Agent', role: 'do', provider: 'codex' });
+    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual(['browser:chrome-devtools']);
+    store.upsertProfile({ id: 'do-default', name: 'Agent', role: 'do', provider: 'codex' });
+    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual(['browser:chrome-devtools']);
+    store.upsertProfile({ id: organizationProfileId('org_personal', 'do'), name: 'Agent', role: 'do', provider: 'codex', mcpConnections: [] });
+    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual([]);
+    store.upsertProfile({ id: projectProfileId(project, 'do'), name: 'Agent', role: 'do', provider: 'codex' });
+    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual([]);
+    expect(applyAgentSpec(roleDefaultProfile(store, 'do', project)!, { provider: 'codex', mcpConnections: ['browser:playwright'] }).mcpConnections).toEqual(['browser:playwright']);
+  });
+  it('prepares both selected browser MCPs', async () => {
+    const servers = await prepareConnections(service, { handle: { kind: 'worktree', root: dir } } as any,
+      ['browser:chrome-devtools', 'browser:playwright'], project, 'task', () => {});
+    expect(servers.map(s => s.name)).toEqual(['chrome-devtools', 'playwright']);
+  });
+  it('prepares built-in tools without a vault but rejects saved connections without one', async () => {
+    const world = { handle: { kind: 'worktree', root: dir } } as any;
+    expect((await prepareConnections(undefined, world, ['browser:chrome-devtools'], project, 'task', () => {})).map(s => s.name))
+      .toEqual(['chrome-devtools']);
+    await expect(prepareConnections(undefined, world, ['mcp_' + 'a'.repeat(24)], project, 'task', () => {}))
+      .rejects.toThrow('credential vault');
+    const exec = vi.fn();
+    expect(await prepareConnections(undefined, { handle: { version: 2, sealedProviderRef: 'test', root: dir }, exec } as any,
+      [], project, 'task', () => {})).toEqual([]);
+    expect(exec).not.toHaveBeenCalled();
   });
   it('inherits tools across parameter layers while preserving an explicit empty selection', () => {
     const manifest = { name: 'example', params: [{ name: 'agent:do', type: 'agent', role: 'do' }] } as any;

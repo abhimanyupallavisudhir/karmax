@@ -1,4 +1,4 @@
-// Review-only explorations; preserve the installed brand and its source geometry.
+// Generate review artwork and the matching selectable installation brand assets.
 // SVGs: node scripts/generate-gold-logo-options.mjs
 // PNGs + comparison: append the resolved entry path of an installed sharp module.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -53,6 +53,9 @@ for (const [id, label, arrow, bold, rich = false] of options) {
       .replace('</svg>', '</g>\n</svg>');
   }
   writeFileSync(new URL(`${id}.svg`, output), svg);
+  const brandDir = new URL(`../web/brand/${id}/`, import.meta.url);
+  mkdirSync(brandDir, { recursive: true });
+  writeFileSync(new URL('icon.svg', brandDir), svg);
   assets.push({ id, label, svg, bold, rich });
 }
 
@@ -70,6 +73,11 @@ if (process.argv[2]) {
     const x = 48 + (i % 2) * 700, y = 145 + Math.floor(i / 2) * 405;
     const png = await sharp(Buffer.from(svg)).resize(512, 512).png().toBuffer();
     writeFileSync(new URL(`${id}.png`, output), png);
+    const brandDir = new URL(`../web/brand/${id}/`, import.meta.url);
+    writeFileSync(new URL('icon-512.png', brandDir), png);
+    for (const [file, size] of [['icon-192.png', 192], ['apple-touch-icon.png', 180]]) {
+      await sharp(Buffer.from(svg)).resize(size, size).png().toFile(new URL(file, brandDir).pathname);
+    }
     layers.push({ input: await sharp(Buffer.from(svg)).resize(280, 280).png().toBuffer(), left: x, top: y });
     label(x, y + 316, title, 24, '#FFF5CE');
     label(x, y + 348, rich ? 'Heavier strokes / amber-to-champagne gold' : bold ? 'Larger mark / thicker gold / muted knot' : 'Bright gold / dark outlines / silver knot', 17);

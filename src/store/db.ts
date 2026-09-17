@@ -1,3 +1,4 @@
+import { decayVaultUsage, type VaultUsage } from '../util/vault-usage.js';
 import { canonicalAccountName } from '../domain/account-names.js';
 import { validGitBranch } from '../util/git-ref.js';
 import path from 'node:path';
@@ -4130,6 +4131,32 @@ export class Store {
     const r = this.db.prepare('INSERT INTO audit_log (ts, principalId, action, scopeKey, detail) VALUES (?, ?, ?, ?, ?)')
       .run(entry.ts ?? Date.now(), entry.principalId, entry.action, entry.scopeKey ?? 'global', JSON.stringify(entry.detail ?? {}));
     return Number(r.lastInsertRowid);
+  }
+
+  /** One-time frecency backfill, restricted to the caller's existing vault IDs.
+   * Page by sequence so long-lived audit logs never load into memory at once. */
+  vaultUsageHistory(itemIds: string[], now: number): Record<string, VaultUsage> {
+    const usage: Record<string, VaultUsage> = {};
+    for (let offset = 0; offset < itemIds.length; offset += 500) {
+      const ids = itemIds.slice(offset, offset + 500);
+      const query = this.db.prepare(`SELECT seq, ts, json_extract(detail, '$.itemId') itemId
+        FROM audit_log WHERE seq > ? AND action IN ('vault.used', 'vault.revealed')
+        AND json_extract(detail, '$.itemId') IN (${ids.map(() => '?').join(',')})
+        ORDER BY seq LIMIT 1000`);
+      let seq = 0;
+      for (;;) {
+        const rows = query.all(seq, ...ids) as { seq: number; ts: number; itemId: string }[];
+        for (const row of rows) {
+          const value = usage[row.itemId] ??= { useCount: 0, frecencyScore: 0, frecencyUpdatedAt: now };
+          value.useCount++;
+          value.frecencyScore += decayVaultUsage(1, row.ts, now);
+          value.lastUsedAt = Math.max(value.lastUsedAt ?? 0, row.ts);
+          seq = row.seq;
+        }
+        if (rows.length < 1000) break;
+      }
+    }
+    return usage;
   }
 
   auditSince(seq = 0, limit = 500): any[] {

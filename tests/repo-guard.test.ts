@@ -137,9 +137,9 @@ describe('repository selection validation', () => {
       params: { separateAgents: false, 'agent:unified': selected },
     });
 
-    const expected = { do: selected };
+    const expected = { do: { ...selected, mcpConnections: ['browser:chrome-devtools'] } };
     const input = startedInput();
-    expect(input.agents).toEqual(expected);
+    expect(input.agents).toEqual({ do: selected });
 
     // Workflows intentionally do not publish execution metadata (their histories
     // are immutable); the platform enriches any stored/live view with its durable

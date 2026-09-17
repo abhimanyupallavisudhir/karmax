@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { Store } from '../src/store/db.js';
+import { VAULT_USAGE_HALF_LIFE_MS } from '../src/util/vault-usage.js';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -99,17 +101,70 @@ describe('vault usage frequency', () => {
     const { items, store, broker } = makeService();
     const item = items.save({ type: 'login', label: 'Legacy', secrets: { password: 'secret' } });
     delete item.useCount;
+    delete item.frecencyScore;
+    delete item.frecencyUpdatedAt;
     store.kvSet('vault:items:org_personal', JSON.stringify([item]));
     items.list();
     items.get(item.id);
     items.readSecret(item, 'password');
     expect(() => items.resolveField(item, 'totp', { mode: 'use' })).toThrow();
-    expect(items.get(item.id)?.useCount).toBeUndefined();
+    expect(items.get(item.id)?.useCount).toBe(0);
     items.resolveField(item, 'password', { mode: 'use' });
     expect(items.get(item.id)?.useCount).toBe(1);
     broker.deleteHandle(itemHandle(item.id, 'password'));
     expect(() => items.resolveField(item, 'password', { mode: 'use' })).toThrow();
     expect(items.get(item.id)?.useCount).toBe(1);
+  });
+});
+
+describe('vault frecency', () => {
+  it('decays previous accesses, adds new ones, and preserves usage through edits', () => {
+    const clock = vi.spyOn(Date, 'now');
+    try {
+      const at = 1_800_000_000_000;
+      clock.mockReturnValue(at);
+      const { items } = makeService();
+      const item = items.save({ type: 'login', label: 'Login', secrets: { password: 'secret' } });
+      items.resolveField(item, 'password', { mode: 'use' });
+      items.resolveField(item, 'password', { mode: 'use' });
+      clock.mockReturnValue(at + VAULT_USAGE_HALF_LIFE_MS);
+      items.resolveField(item, 'password', { mode: 'reveal' });
+      const usage = { useCount: 3, frecencyScore: 2, frecencyUpdatedAt: Date.now(), lastUsedAt: Date.now() };
+      expect(items.get(item.id)).toMatchObject({ ...usage, updatedAt: at });
+      expect(items.save({ id: item.id, type: 'login', label: 'Renamed', secrets: { password: 'rotated' } }))
+        .toMatchObject(usage);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('backfills all historical accesses once, isolates organizations, and does not double count the next access', () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    const store = new Store(':memory:');
+    try {
+      const { broker, dir } = makeService();
+      const items = new VaultItems(store, broker, dir, 'one');
+      const legacy = items.save({ type: 'login', label: 'Historical', secrets: { password: 'secret' } });
+      delete legacy.frecencyScore;
+      delete legacy.frecencyUpdatedAt;
+      legacy.useCount = 1; // Old tracking had only counted accesses since release.
+      store.kvSet('vault:items:one', JSON.stringify([legacy]));
+      // Cross the audit query's page boundary; denied requests never count.
+      for (let i = 0; i < 1001; i++) store.appendAudit({ ts: Date.now() - VAULT_USAGE_HALF_LIFE_MS,
+        principalId: 'system', action: 'vault.used', detail: { itemId: legacy.id } });
+      store.appendAudit({ principalId: 'system', action: 'vault.revealed', detail: { itemId: legacy.id } });
+      store.appendAudit({ principalId: 'system', action: 'vault.requested', detail: { itemId: legacy.id } });
+      store.appendAudit({ principalId: 'system', action: 'vault.used', detail: { itemId: 'other-org-item' } });
+      const history = vi.spyOn(store, 'vaultUsageHistory');
+      // Resolve directly from a legacy object: migration must precede the new audit entry.
+      items.resolveField(legacy, 'password', { mode: 'use' });
+      expect(items.get(legacy.id)).toMatchObject({ useCount: 1003, frecencyScore: 502.5,
+        lastUsedAt: Date.now(), updatedAt: legacy.updatedAt });
+      const reopened = new VaultItems(store, broker, dir, 'one');
+      expect(reopened.list()[0]?.frecencyScore).toBe(502.5);
+      expect(history).toHaveBeenCalledTimes(1);
+      expect(history).toHaveBeenCalledWith([legacy.id], Date.now());
+      expect(new VaultItems(store, broker, dir, 'two').list()).toEqual([]);
+      expect(store.vaultUsageHistory([], Date.now())).toEqual({});
+    } finally { store.close(); clock.mockRestore(); }
   });
 });
 
