@@ -1255,12 +1255,12 @@ function renderConfirmerField(f, own, inherited, alt) {
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-const normSpec = (s) => (s ? { avatarId: s.avatarId || '', provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
+const normSpec = (s, inherited) => (s ? { avatarId: s.avatarId || '', provider: s.provider, model: s.model || '', effort: s.effort || '', mcpConnections: s.mcpConnections ?? inherited?.mcpConnections } : null);
 // Canonical shape of a confirm layer for changed-vs-inherited comparison.
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
+      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null, mcpConnections: l.mcpConnections }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -1291,7 +1291,7 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null }
+    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
@@ -1349,7 +1349,7 @@ function collectForm(root, fields) {
       const spec = readAgentSpec(box);
       const resumeFrom = spec.resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
-      if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
+      if (resumeFrom || !sameJson(normSpec(spec, inh), normSpec(inh))) out[f.name] = spec;
       continue;
     }
     if (f.type === 'confirmer') {
@@ -2128,7 +2128,7 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     const spec = readAgentSpec(box);
-    return !sameJson(normSpec(spec), normSpec(inh));
+    return !sameJson(normSpec(spec, inh), normSpec(inh));
   }
   if (f.type === 'confirmer') {
     const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
@@ -2173,7 +2173,14 @@ function resetAgentField(box, attr = 'data-inherit') {
   refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
   const eff = box.querySelector('.af-effort');
   if (eff && inh.effort) eff.value = inh.effort;
+  const picker = box.querySelector('.mcp-picker');
+  if (picker) {
+    picker.dataset.value = 'null';
+    picker.dataset.inherited = JSON.stringify(inh.mcpConnections ?? ['browser:chrome-devtools']);
+    wireMcpPicker(picker, picker.dataset.scope);
+  }
   avatar?.dispatchEvent(new Event('change', { bubbles: true }));
+  box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function resetConfirmerField(box, attr = 'data-inherit') {
@@ -12201,7 +12208,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-tools">Tools</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -12221,7 +12228,6 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
-    <div class="settings-section-title" id="project-tools"><div>MCP connections</div></div><div class="card"><p>Connect services from the Official MCP Registry or add your own server. Choose connections in each Agent’s Tools field.</p><button type="button" class="btn primary" id="project-mcp-manage">Manage connections</button></div>
     <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
@@ -13038,7 +13044,6 @@ function globalSettingsView(embedded = false) {
     ${vaultRequestsCard()}
     ${agentMailCard()}
     ${paymentsCard('global')}
-    <div class="settings-section-title" id="settings-tools"><div>MCP connections</div></div><div class="card"><p>Connections shared with this organization’s projects. Choose connections in each Agent’s Tools field.</p><button type="button" class="btn primary" id="organization-mcp-manage">Manage connections</button></div>
     <div class="settings-section-title" id="settings-agents"><div>Codex/Claude</div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
@@ -14923,8 +14928,6 @@ function profileRow(p, scope) {
 // Standing Confirm/Responder profiles are not shown: those agents are configured
 // directly in their Review route / Responder controls.
 async function hydrateProfiles(scope, projectId, organizationId) {
-  const manage = document.getElementById(projectId ? 'project-mcp-manage' : 'organization-mcp-manage');
-  if (manage) manage.onclick = () => openMcpManager(mcpScope(projectId || null, organizationId));
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
   const renderIsCurrent = beginAsyncElementRender(list);
@@ -16217,7 +16220,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-tools">Tools</a><a href="#settings-defaults">Task defaults</a><a href="#settings-connections">Connected apps</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-connections">Connected apps</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
@@ -17975,86 +17978,141 @@ function mcpScope(projectId = S.projectId, organizationId = S.organizationId) {
   return projectId ? `?projectId=${encodeURIComponent(projectId)}` : `?organizationId=${encodeURIComponent(organizationId)}`;
 }
 function mcpPickerHtml(value, inherited) {
-  return `<div class="mcp-picker" data-value='${esc(JSON.stringify(value ?? null))}' data-inherited='${esc(JSON.stringify(inherited ?? null))}'>
-    <div class="mcp-picker-heading"><b>Tools</b><button type="button" class="btn sm mcp-manage">Manage connections</button></div>
-    <details class="mcp-choices"><summary>Loading tools…</summary><input class="mcp-filter" type="search" aria-label="Search tool connections" placeholder="Search connections…"><div class="mcp-options" role="group" aria-label="Tool connections"></div></details>
-    <label class="mcp-inherit"><input type="checkbox" ${value === undefined ? 'checked' : ''}> Use inherited tools</label><div class="mcp-picker-status" role="status"></div>
+  const id = `mcp-tools-${mcpPickerHtml.nextId = (mcpPickerHtml.nextId || 0) + 1}`;
+  return `<div class="mcp-picker" data-value='${esc(JSON.stringify(value ?? null))}' data-inherited='${esc(JSON.stringify(inherited ?? ['browser:chrome-devtools']))}'>
+    <label class="mcp-label-heading" for="${id}">Tools</label>
+    <div class="mcp-combo"><div class="mcp-input-wrap"><div class="mcp-chips"></div><input id="${id}" class="mcp-filter" role="combobox" aria-label="Tools" aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-options" autocomplete="off" placeholder="Add tools…" maxlength="160"><button type="button" class="mcp-caret" aria-label="Show tools">▾</button></div>
+    <div class="mcp-menu" hidden><div class="mcp-options" id="${id}-options" role="listbox" aria-label="Available MCPs" aria-multiselectable="true"></div><button type="button" class="mcp-custom">+ Add custom MCP…</button></div></div>
+    <div class="mcp-picker-status" role="status"></div>
   </div>`;
 }
 function readMcpPicker(root) {
   const picker = root.querySelector('.mcp-picker');
-  if (!picker || picker.querySelector('.mcp-inherit input').checked) return undefined;
-  return JSON.parse(picker.dataset.value || '[]') || [];
+  return picker ? JSON.parse(picker.dataset.value || 'null') ?? undefined : undefined;
 }
 async function wireMcpPicker(picker, query = mcpScope()) {
   if (!picker) return;
   picker.dataset.scope = query;
-  const inherited = JSON.parse(picker.dataset.inherited || 'null');
-  const own = JSON.parse(picker.dataset.value || 'null');
-  let selected = new Set(own ?? inherited ?? []);
-  let connections = [];
-  const defaults = [{ id: 'browser:chrome-devtools', label: 'Chrome DevTools', enabled: true }, { id: 'browser:playwright', label: 'Playwright', enabled: true }];
+  const renderIsCurrent = beginAsyncElementRender(picker);
+  const selected = new Set(JSON.parse(picker.dataset.value || 'null') ?? JSON.parse(picker.dataset.inherited || '["browser:chrome-devtools"]'));
+  const input = picker.querySelector('.mcp-filter'), menu = picker.querySelector('.mcp-menu'), options = picker.querySelector('.mcp-options');
+  let connections = [], servers = [], nextCursor, searchTimer, generation = 0, active = -1, loaded = false, registryStatus = '';
+  const builtins = [{ id: 'browser:chrome-devtools', label: 'chrome-devtools', enabled: true }, { id: 'browser:playwright', label: 'playwright', enabled: true }];
+  const all = () => [...builtins, ...connections];
+  function expand(open) {
+    menu.hidden = !open; input.setAttribute('aria-expanded', String(open));
+    if (open) positionMenu();
+    if (!open) { active = -1; input.removeAttribute('aria-activedescendant'); }
+  }
+  function positionMenu() {
+    const rect = picker.querySelector('.mcp-input-wrap').getBoundingClientRect();
+    let top = 0, bottom = innerHeight;
+    for (let parent = picker.parentElement; parent; parent = parent.parentElement) {
+      if (/auto|scroll|hidden/.test(getComputedStyle(parent).overflowY)) {
+        const bounds = parent.getBoundingClientRect(); top = Math.max(top, bounds.top); bottom = Math.min(bottom, bounds.bottom);
+      }
+    }
+    const below = bottom - rect.bottom, above = rect.top - top;
+    const upward = below < 300 && above > below;
+    menu.classList.toggle('opens-up', upward);
+    menu.style.setProperty('--mcp-results-height', `${Math.max(80, Math.min(260, (upward ? above : below) - 55))}px`);
+  }
+  function markActive(index) {
+    const rows = [...options.querySelectorAll('[role="option"]')];
+    active = rows.length && index !== -1 ? (index + rows.length) % rows.length : -1;
+    rows.forEach((row, i) => row.classList.toggle('active', i === active));
+    if (active >= 0) { input.setAttribute('aria-activedescendant', rows[active].id); rows[active].scrollIntoView({ block: 'nearest' }); }
+    else input.removeAttribute('aria-activedescendant');
+  }
   function paint() {
-    const all = [...defaults, ...connections];
-    for (const id of selected) if (!all.some((c) => c.id === id)) all.push({ id, label: 'Unavailable connection', enabled: false });
-    const filter = picker.querySelector('.mcp-filter').value.toLowerCase();
-    picker.querySelector('.mcp-options').innerHTML = all.filter((c) => c.label.toLowerCase().includes(filter)).map((c) =>
-      `<label class="mcp-option"><input type="checkbox" value="${esc(c.id)}" ${selected.has(c.id) ? 'checked' : ''} ${!c.enabled && !selected.has(c.id) ? 'disabled' : ''}><span>${esc(c.label)}${!c.enabled ? ' · unavailable' : c.connected === false ? ' · needs connection' : ''}</span></label>`).join('');
-    const names = [...selected].map((id) => all.find((c) => c.id === id)?.label || id);
-    const inherit = picker.querySelector('.mcp-inherit input').checked;
-    picker.querySelector('summary').textContent = names.length ? `${names.join(', ')}${inherit ? ' · inherited' : ''}` : inherit && inherited === null ? 'Inherited · account browser if configured' : 'Karmax tools only';
-    picker.dataset.value = JSON.stringify([...selected]);
+    const available = all(), filter = input.value.trim().toLowerCase();
+    picker.querySelector('.mcp-chips').innerHTML = [...selected].map(id => {
+      const c = available.find(c => c.id === id);
+      const label = c?.label || (loaded ? 'Unavailable MCP' : 'Loading MCP…');
+      return `<span class="mcp-chip" ${c?.enabled === false || (!c && loaded) ? 'data-unavailable="true"' : ''}><span>${esc(label)}</span><button type="button" data-remove="${esc(id)}" aria-label="Remove ${esc(label)}">×</button></span>`;
+    }).join('');
+    picker.querySelectorAll('[data-remove]').forEach(button => { button.onclick = () => { selected.delete(button.dataset.remove); change(); input.focus(); }; });
+    let index = 0;
+    const saved = available.filter(c => c.label.toLowerCase().includes(filter) || c.registry?.name.toLowerCase().includes(filter));
+    const registry = servers.filter(s => !connections.some(c => c.registry?.name === s.name));
+    options.innerHTML = saved.map(c => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="${selected.has(c.id)}" aria-disabled="${!c.enabled && !selected.has(c.id)}" data-mcp-id="${esc(c.id)}"><span>${esc(c.label)}${!c.enabled ? '<small>Unavailable</small>' : c.connected === false ? '<small>Needs sign-in</small>' : ''}</span><span>${selected.has(c.id) ? '✓' : ''}</span></button>${!c.id.startsWith('browser:') ? `<button type="button" class="mcp-edit" data-edit="${esc(c.id)}" aria-label="Edit ${esc(c.label)}">Edit</button>` : ''}</div>`).join('')
+      + (registry.length ? '<div class="mcp-group-label">Official MCP Registry</div>' : '')
+      + registry.map((s, i) => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="false" data-registry="${i}"><span>${esc(s.title)}<small>${esc(s.name)}</small></span><span class="mcp-install">Install</span></button></div>`).join('')
+      + (registryStatus ? `<p class="mcp-search-status" role="status">${esc(registryStatus)}</p>` : '')
+      + (!filter ? '<p class="mcp-search-status">Search to find MCPs in the official registry.</p>' : '')
+      + (nextCursor ? '<button type="button" class="mcp-more">More results</button>' : '');
+    options.querySelectorAll('[data-mcp-id]').forEach(button => { button.onclick = () => {
+      if (button.getAttribute('aria-disabled') === 'true') return;
+      const id = button.dataset.mcpId; selected.has(id) ? selected.delete(id) : selected.add(id); change();
+    }; });
+    options.querySelectorAll('[data-registry]').forEach(button => { button.onclick = () => install(registry[Number(button.dataset.registry)]); });
+    options.querySelectorAll('[data-edit]').forEach(button => { button.onclick = () => {
+      const connection = connections.find(c => c.id === button.dataset.edit);
+      install(undefined, connection);
+    }; });
+    options.querySelector('.mcp-more')?.addEventListener('click', () => search(nextCursor));
+    markActive(-1);
+    if (!menu.hidden) positionMenu();
   }
-  picker.querySelector('.mcp-filter').oninput = paint;
-  picker.querySelector('.mcp-options').onchange = (event) => {
-    const input = event.target;
-    if (input.checked) {
-      if (input.value.startsWith('browser:')) for (const id of [...selected]) if (id.startsWith('browser:')) selected.delete(id);
-      selected.add(input.value);
-    } else selected.delete(input.value);
-    picker.querySelector('.mcp-inherit input').checked = false;
-    paint(); picker.dispatchEvent(new Event('change', { bubbles: true }));
+  function change() {
+    picker.dataset.value = JSON.stringify([...selected]); paint();
+    picker.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  async function install(entry, existing) {
+    expand(false);
+    const editQuery = existing && !existing.projectId && query.includes('projectId=') ? mcpScope(null, existing.organizationId) : query;
+    await openMcpEditor(editQuery, async (saved, removedId) => {
+      if (saved) { connections = [...connections.filter(c => c.id !== saved.id), saved]; selected.add(saved.id); }
+      if (removedId) selected.delete(removedId);
+      change();
+      connections = await api(`/api/mcp${query}`); paint();
+      for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
+    }, entry, existing);
+    input.focus(); expand(false);
+  }
+  async function search(cursor = '') {
+    clearTimeout(searchTimer);
+    const current = ++generation, term = input.value.trim();
+    registryStatus = 'Searching registry…'; paint();
+    try {
+      const result = await api(`/api/mcp/registry${query}&search=${encodeURIComponent(term)}&cursor=${encodeURIComponent(cursor)}`);
+      if (current !== generation || !renderIsCurrent()) return;
+      servers = cursor ? [...servers, ...result.servers.filter(s => !servers.some(old => old.name === s.name))] : result.servers;
+      nextCursor = result.nextCursor; registryStatus = servers.length ? '' : 'No registry matches.'; paint();
+    } catch (e) { if (current === generation && renderIsCurrent()) { registryStatus = e.message; paint(); } }
+  }
+  input.onfocus = () => expand(true);
+  input.oninput = () => {
+    clearTimeout(searchTimer); generation++; servers = []; nextCursor = undefined; registryStatus = ''; active = -1;
+    expand(true); paint();
+    if (input.value.trim()) searchTimer = setTimeout(() => search(), 250);
   };
-  picker.querySelector('.mcp-inherit input').onchange = (event) => {
-    if (event.target.checked) selected = new Set(inherited ?? []);
-    paint();
+  input.onkeydown = event => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); const wasClosed = menu.hidden; expand(true); markActive(wasClosed ? 0 : event.key === 'ArrowUp' && active <= 0 ? options.querySelectorAll('[role="option"]').length - 1 : active + (event.key === 'ArrowDown' ? 1 : -1)); }
+    else if (event.key === 'Enter') { event.preventDefault(); if (menu.hidden) expand(true); else if (active >= 0) options.querySelectorAll('[role="option"]')[active]?.click(); }
+    else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); expand(false); }
+    else if (event.key === 'Backspace' && !input.value && selected.size) { selected.delete([...selected].at(-1)); change(); }
   };
-  picker.querySelector('.mcp-manage').onclick = () => openMcpManager(query, async () => {
-    connections = await api(`/api/mcp${query}`); paint();
-    for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
-  });
-  try { connections = await api(`/api/mcp${query}`); paint(); }
-  catch (e) { paint(); picker.querySelector('.mcp-picker-status').textContent = e.message; }
+  picker.querySelector('.mcp-caret').onclick = () => { const open = menu.hidden; input.focus(); expand(open); };
+  // Keep input focus while selecting several entries; Tab still reaches footer actions.
+  options.onmousedown = event => event.preventDefault();
+  picker.onfocusout = event => { if (!picker.contains(event.relatedTarget)) expand(false); };
+  picker.querySelector('.mcp-custom').onclick = () => install();
+  paint();
+  try { const result = await api(`/api/mcp${query}`); if (!renderIsCurrent()) return; connections = result; loaded = true; paint(); }
+  catch (e) { if (!renderIsCurrent()) return; loaded = true; paint(); picker.querySelector('.mcp-picker-status').textContent = e.message; }
 }
-async function openMcpManager(query, changed = async () => {
-  await Promise.all([...document.querySelectorAll('.mcp-picker')].filter((p) => p.dataset.scope === query).map((p) => wireMcpPicker(p, query)));
-}) {
-  const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog'; dialog.setAttribute('aria-label', 'MCP connections');
-  dialog.innerHTML = `<div class="mcp-dialog-header"><div><h2>MCP connections</h2><p>Connect tools once, then choose them for any agent.</p></div><button type="button" class="btn sm mcp-close" aria-label="Close connections">✕</button></div>
-    <div class="mcp-manager-list">Loading connections…</div><button type="button" class="btn primary mcp-add">Add connection</button><div class="mcp-editor" hidden></div><p class="mcp-message" role="status"></p>`;
+async function openMcpEditor(query, changed, entry, existing) {
+  const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog'; dialog.setAttribute('aria-label', existing ? 'Edit MCP' : entry ? 'Install MCP' : 'Add custom MCP');
+  dialog.innerHTML = `<div class="mcp-dialog-header"><h2>${existing ? 'Edit MCP' : entry ? `Install ${esc(entry.title)}` : 'Add custom MCP'}</h2><button type="button" class="btn sm mcp-close" aria-label="Close MCP form">✕</button></div><div class="mcp-editor"></div><p class="mcp-message" role="status"></p><button type="button" class="btn mcp-signin" hidden>Sign in</button>`;
   document.body.append(dialog); dialog.showModal();
+  const closed = new Promise(resolve => dialog.addEventListener('close', () => { dialog.remove(); resolve(); }, { once: true }));
   dialog.querySelector('.mcp-close').onclick = () => dialog.close();
-  dialog.addEventListener('close', () => dialog.remove());
-  const message = (s) => { dialog.querySelector('.mcp-message').textContent = s; };
-  async function load() {
-    const connections = await api(`/api/mcp${query}`);
-    const pid = new URLSearchParams(query).get('projectId') || undefined;
-    dialog.querySelector('.mcp-manager-list').innerHTML = connections.length ? connections.map((c) => `<div class="mcp-connection-row"><div><b>${esc(c.label)}</b><small>${esc(c.registry ? `${c.registry.name} · ${c.registry.version}` : c.transport.type === 'stdio' ? 'Custom process' : new URL(c.transport.url).hostname)} · ${c.enabled ? c.connected ? 'Ready to use' : 'Needs authentication' : 'Disabled'}${c.projectId !== pid ? ' · organization connection' : ''}</small></div><div>${c.projectId === pid ? `${c.transport.type !== 'stdio' ? `<button type="button" class="btn sm" data-mcp-test="${c.id}">Test</button>` : ''}${c.auth === 'oauth' ? `<button type="button" class="btn sm" data-mcp-connect="${c.id}">Connect</button>` : ''}<button type="button" class="btn sm" data-mcp-edit="${c.id}">Edit</button><button type="button" class="btn sm" data-mcp-delete="${c.id}">Remove</button>` : ''}</div></div>`).join('') : '<p>No connections yet. Add one from the Official MCP Registry or use your own server.</p>';
-    dialog.querySelectorAll('[data-mcp-edit]').forEach((b) => { b.onclick = () => editor(connections.find((c) => c.id === b.dataset.mcpEdit)); });
-    dialog.querySelectorAll('[data-mcp-delete]').forEach((b) => { b.onclick = async () => {
-      if (b.dataset.confirm !== 'yes') { b.dataset.confirm = 'yes'; b.textContent = 'Confirm removal'; return; }
-      try { await api(`/api/mcp/${b.dataset.mcpDelete}${query}`, { method: 'DELETE' }); await load(); await changed(); } catch (e) { message(e.message); }
-    }; });
-    dialog.querySelectorAll('[data-mcp-test]').forEach((b) => { b.onclick = async () => {
-      b.disabled = true; message('Testing connection…');
-      try { const result = await api(`/api/mcp/${b.dataset.mcpTest}/test${query}`, { method: 'POST', body: '{}' }); message(`Connection works · ${result.tools}${result.moreTools ? '+' : ''} tools${result.resources ? ' · resources' : ''}${result.prompts ? ' · prompts' : ''}`); }
-      catch (e) { message(e.message); } finally { b.disabled = false; }
-    }; });
-    dialog.querySelectorAll('[data-mcp-connect]').forEach((b) => { b.onclick = () => authorize(b.dataset.mcpConnect); });
-  }
+  const message = s => { dialog.querySelector('.mcp-message').textContent = s; };
   async function authorize(id, existingWindow) {
+    const retry = dialog.querySelector('.mcp-signin'); retry.hidden = false; retry.onclick = () => authorize(id);
     const popup = existingWindow || window.open('about:blank', '_blank');
-    if (!popup) { message('Allow pop-ups, then click Connect to sign in. Your form is preserved.'); return; }
+    if (!popup) { message('Allow pop-ups, then click Sign in to continue.'); return; }
     try {
       const result = await api(`/api/mcp/${id}/authorize${query}`, { method: 'POST', body: '{}' });
       const authUrl = new URL(result.authorizationUrl), state = authUrl.searchParams.get('state');
@@ -18066,7 +18124,7 @@ async function openMcpManager(query, changed = async () => {
       channel.onmessage = async (event) => {
         if (event.data !== 'connected') return;
         clearTimeout(timeout); channel.close();
-        if (dialog.isConnected) { message('Connected. Your agent can now use these tools.'); await load(); await changed(); }
+        if (dialog.isConnected) { await changed(); dialog.close(); }
       };
       popup.location.replace(authUrl.href);
       message('Complete sign-in in the new tab. This form will stay here.');
@@ -18074,15 +18132,15 @@ async function openMcpManager(query, changed = async () => {
   }
   function editor(existing) {
     const box = dialog.querySelector('.mcp-editor'); box.hidden = false;
-    box.innerHTML = `<h3>${existing ? 'Edit connection' : 'Add connection'}</h3>${existing ? '' : `<div class="mcp-registry-search"><label>Official MCP Registry<input type="search" class="mcp-registry-query" placeholder="Search servers, e.g. GitHub" /></label><button type="button" class="btn sm mcp-search">Search</button></div><div class="mcp-registry-results" aria-live="polite"></div><p class="task-sub">Registry listings identify publishers; they are not a security certification. Or enter a custom server below.</p>`}
-      <form class="mcp-connection-form"><label>Connection name<input class="mcp-label" required maxlength="120" placeholder="GitHub — work" value="${esc(existing?.label || '')}"></label>
+    box.innerHTML = `${entry ? `<p class="mcp-entry-description">${esc(entry.description)}</p>${entry.options.length > 1 ? `<label>Installation<select class="mcp-install-option">${entry.options.map((o, i) => `<option value="${i}">${esc(o.label)}</option>`).join('')}</select></label>` : ''}${!entry.options.length ? '<p>Enter the server details to install this MCP.</p>' : ''}` : ''}
+      <form class="mcp-connection-form"><label>Name<input class="mcp-label" required maxlength="120" placeholder="GitHub — work" value="${esc(existing?.label || '')}"></label>
       <label>Connection type<select class="mcp-type"><option value="http">Remote HTTPS</option><option value="sse">Remote HTTPS (SSE)</option><option value="stdio">Process in task environment</option></select></label>
       <label class="mcp-url-row">Server URL<input class="mcp-url" type="url" placeholder="https://example.com/mcp"></label>
       <div class="mcp-process" hidden><label>Command<input class="mcp-command" placeholder="npx"></label><label>Arguments (JSON array)<textarea class="mcp-args" rows="3" spellcheck="false">[]</textarea></label><label>Public environment values (JSON object)<textarea class="mcp-env" rows="2" spellcheck="false">{}</textarea></label><p class="task-sub">Runs with access to this task’s files. Use pinned package versions. The task environment must provide the command.</p></div>
       <label>Authentication<select class="mcp-auth"><option value="none">No authentication</option><option value="oauth">Sign in with OAuth</option><option value="secrets">API key / secret values</option></select></label>
       <div class="mcp-secrets" hidden><p class="task-sub">HTTP header names for remote servers; environment variable names for processes. Saved values are kept in the vault.</p><div class="mcp-secret-fields"></div><button type="button" class="btn sm mcp-secret-add">Add secret</button>${existing?.secretNames?.length ? '<p>Leave existing values blank to keep them.</p>' : ''}</div>
-      <div class="mcp-registry-fields"></div><label class="mcp-enabled"><input type="checkbox" ${existing?.enabled !== false ? 'checked' : ''}> Enabled</label>
-      <div class="mcp-form-actions"><button class="btn primary" type="submit">Save connection</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button></div></form>`;
+      <div class="mcp-registry-fields"></div>${existing ? `<label class="mcp-enabled"><input type="checkbox" ${existing.enabled !== false ? 'checked' : ''}> Enabled</label>` : ''}
+      <div class="mcp-form-actions"><button class="btn primary" type="submit">${existing ? 'Save changes' : 'Save and add'}</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button>${existing ? '<button class="btn sm mcp-delete" type="button">Delete MCP</button>' : ''}</div></form>`;
     const form = box.querySelector('form'); let registry = existing?.registry; let fields = []; let secretDirty = false;
     const type = form.querySelector('.mcp-type'); const auth = form.querySelector('.mcp-auth');
     function sync() {
@@ -18110,27 +18168,24 @@ async function openMcpManager(query, changed = async () => {
     for (const name of existing?.secretNames || []) addSecret(name);
     type.onchange = sync; auth.onchange = sync;
     form.querySelector('.mcp-secret-add').onclick = () => addSecret();
-    form.querySelector('.mcp-editor-cancel').onclick = () => { box.hidden = true; };
-    let searchGeneration = 0;
-    async function search(cursor = '') {
-      const generation = ++searchGeneration; const results = box.querySelector('.mcp-registry-results'); results.textContent = 'Searching Official MCP Registry…';
-      try {
-        const result = await api(`/api/mcp/registry${query}&search=${encodeURIComponent(box.querySelector('.mcp-registry-query').value)}&cursor=${encodeURIComponent(cursor)}`);
-        if (generation !== searchGeneration || !box.isConnected) return;
-        results.innerHTML = result.servers.length ? result.servers.map((s, i) => `<div class="mcp-registry-result"><b>${esc(s.title)}</b><small>${esc(s.name)} · ${esc(s.version)}</small><p>${esc(s.description)}</p>${s.options.length ? s.options.map((o, j) => `<button type="button" class="btn sm" data-registry-option="${i}:${j}">Use ${esc(o.label)}</button>`).join(' ') : '<small>This server needs custom configuration. Enter its server details below.</small>'}</div>`).join('') : '<p>No matching servers. Try another name or enter a custom server.</p>';
-        results.querySelectorAll('[data-registry-option]').forEach((b) => { b.onclick = () => {
-          const [i, j] = b.dataset.registryOption.split(':').map(Number); const s = result.servers[i], option = s.options[j];
-          registry = { name: s.name, version: s.version }; fields = option.fields;
-          form.querySelector('.mcp-label').value = s.title; fill(option.transport);
-          form.querySelector('.mcp-registry-fields').innerHTML = fields.map((f, n) => `<label>${esc(f.name || f.description || `Argument ${n + 1}`)}${f.isRequired ? ' *' : ''}<input data-registry-field="${n}" type="${f.isSecret ? 'password' : 'text'}" ${f.isRequired && f.value === undefined ? 'required' : ''} value="${esc(f.value ?? f.default ?? '')}" placeholder="${esc(f.description || '')}"></label>`).join('');
-          results.textContent = `Selected ${s.name} · ${s.version}`;
-          form.querySelector('.mcp-label').focus();
-        }; });
-        if (result.nextCursor) { const next = document.createElement('button'); next.type = 'button'; next.className = 'btn sm'; next.textContent = 'More servers'; next.onclick = () => search(result.nextCursor); results.append(next); }
-      } catch (e) { if (generation === searchGeneration) results.textContent = e.message; }
+    form.querySelector('.mcp-editor-cancel').onclick = () => dialog.close();
+    form.querySelector('.mcp-delete')?.addEventListener('click', async event => {
+      const button = event.currentTarget;
+      if (button.dataset.confirm !== 'yes') { button.dataset.confirm = 'yes'; button.textContent = 'Confirm deletion'; return; }
+      button.disabled = true;
+      try { await api(`/api/mcp/${existing.id}${query}`, { method: 'DELETE' }); await changed(undefined, existing.id); dialog.close(); }
+      catch (e) { message(e.message); button.disabled = false; }
+    });
+    function fillEntry(index = 0) {
+      registry = { name: entry.name, version: entry.version };
+      form.querySelector('.mcp-label').value = entry.title;
+      const option = entry.options[index];
+      if (!option) return;
+      fields = option.fields; fill(option.transport);
+      form.querySelector('.mcp-registry-fields').innerHTML = fields.map((f, n) => `<label>${esc(f.name || f.description || `Argument ${n + 1}`)}${f.isRequired ? ' *' : ''}<input data-registry-field="${n}" type="${f.isSecret ? 'password' : 'text'}" ${f.isRequired ? 'required' : ''} value="${esc(f.value ?? f.default ?? '')}" placeholder="${esc(f.description || '')}"></label>`).join('');
     }
-    box.querySelector('.mcp-search')?.addEventListener('click', () => search());
-    box.querySelector('.mcp-registry-query')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); search(); } });
+    if (entry) fillEntry();
+    box.querySelector('.mcp-install-option')?.addEventListener('change', event => fillEntry(Number(event.target.value)));
     form.onsubmit = async (event) => {
       event.preventDefault(); const oauthWindow = auth.value === 'oauth' ? window.open('about:blank', '_blank') : null; const save = form.querySelector('[type="submit"]'); save.disabled = true; message('Saving connection…');
       try {
@@ -18147,16 +18202,18 @@ async function openMcpManager(query, changed = async () => {
           } else if (f.isSecret || transport.type !== 'stdio') secrets[f.name] = value;
           else transport.env[f.name] = value;
         }
-        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input').checked, registry,
+        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input')?.checked ?? true, registry,
           ...(Object.keys(secrets).length || secretDirty ? { secrets, mergeSecrets: !!existing, retainSecretNames: secretRows.map((row) => row.querySelector('.mcp-secret-name').value.trim()) } : {}) }) });
-        box.hidden = true; message('Connection saved. Choose it in Agent → Tools.'); await load(); await changed();
-        if (saved.auth === 'oauth') await authorize(saved.id, oauthWindow); else oauthWindow?.close();
+        existing = saved; // Retrying a failed refresh must update this MCP, not create a duplicate.
+        await changed(saved);
+        if (saved.auth === 'oauth') { message('Saved. Complete sign-in to use this MCP.'); box.hidden = true; await authorize(saved.id, oauthWindow); }
+        else { oauthWindow?.close(); dialog.close(); }
       } catch (e) { oauthWindow?.close(); message(e.message); }
       finally { save.disabled = false; }
     };
   }
-  dialog.querySelector('.mcp-add').onclick = () => editor();
-  try { await load(); } catch (e) { message(e.message); }
+  editor(existing);
+  return closed;
 }
 async function finishMcpCallback() {
   const params = new URLSearchParams(location.search), state = params.get('state') || '';

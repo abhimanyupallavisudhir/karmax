@@ -4,6 +4,8 @@ import { Store } from '../store/db.js';
 import { allRoles } from '../contrib/manifests.js';
 import { CLAUDE_DEFAULT_MODEL } from './effort.js';
 
+export const DEFAULT_MCP_CONNECTIONS = ['browser:chrome-devtools'];
+
 /**
  * The default per-role profiles, derived from the roles the active workflows
  * declare (SPEC §7.1) — not a hardcoded role list. A workflow that
@@ -17,6 +19,7 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
     provider,
     ...(model ? { model } : {}),
     role: r.name,
+    mcpConnections: [...DEFAULT_MCP_CONNECTIONS],
     ...(r.defaults?.effort ? { effort: r.defaults.effort } : {}),
     ...(r.defaults?.maxTurns ? { maxTurns: r.defaults.maxTurns } : {}),
     // no maxTurns unless declared ⇒ unlimited (runaway backstop only)
@@ -85,18 +88,19 @@ export function roleDefaultProfile(store: Store, role: AgentRole | string,
     const project = store.getProfile(projectProfileId(projectId, role));
     if (project) {
       const parent = roleDefaultProfile(store, role, undefined, organizationId ?? store.getProject(projectId)?.organizationId);
-      return { ...project, ...(project.mcpConnections === undefined && parent?.mcpConnections !== undefined ? { mcpConnections: parent.mcpConnections } : {}) };
+      return { ...project, mcpConnections: project.mcpConnections ?? parent?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }
     organizationId ??= store.getProject(projectId)?.organizationId;
   }
   if (organizationId) {
     const organization = store.getProfile(organizationProfileId(organizationId, role));
     if (organization) {
-      const fallback = store.getProfile(`${role}-default`);
-      return { ...organization, ...(organization.mcpConnections === undefined && fallback?.mcpConnections !== undefined ? { mcpConnections: fallback.mcpConnections } : {}) };
+      const fallback = roleDefaultProfile(store, role);
+      return { ...organization, mcpConnections: organization.mcpConnections ?? fallback?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }
   }
-  return store.getProfile(`${role}-default`);
+  const fallback = store.getProfile(`${role}-default`);
+  return fallback ? { ...fallback, mcpConnections: fallback.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] } : undefined;
 }
 
 /** Resolves the profile for a role, honoring explicit/task/default precedence. */
@@ -110,7 +114,7 @@ export class ProfileResolver {
     const id = explicitId ?? taskProfiles?.[role];
     if (id) {
       const p = this.store.getProfile(id);
-      if (p) return p;
+      if (p) return { ...p, mcpConnections: p.mcpConnections ?? roleDefaultProfile(this.store, role, projectId)?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }
     const def = roleDefaultProfile(this.store, role, projectId);
     if (def) return def;
@@ -122,6 +126,7 @@ export class ProfileResolver {
       provider: this.fallbackProvider,
       ...(model ? { model } : {}),
       role,
+      mcpConnections: [...DEFAULT_MCP_CONNECTIONS],
     };
   }
 }

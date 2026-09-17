@@ -26,8 +26,8 @@ export async function prepareConnections(service: McpConnections, world: World, 
   const bin = remote ? await ensureRemoteNode(world) : container ? '/usr/local/bin' : path.dirname(process.execPath);
   const node = remote || container ? path.posix.join(bin, 'node') : process.execPath;
   const out: AgentMcpServer[] = [];
-  const browser = ids.includes('browser:chrome-devtools') ? 'chrome-devtools' : ids.includes('browser:playwright') ? 'playwright' : undefined;
-  if (browser) {
+  for (const browser of ['chrome-devtools', 'playwright'] as const) {
+    if (!ids.includes(`browser:${browser}`)) continue;
     const servers = remote ? await ensureRemoteBrowser(world, browser, bin) : mcpServerMap({ browser });
     for (const [name, spec] of Object.entries(servers)) out.push({ name, ...spec });
   }
