@@ -1,3 +1,4 @@
+import { TimingTrace, withTiming, timingReport } from '../src/timing/index.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -53,9 +54,11 @@ describe('MCP across complete API agent turns', () => {
       endpoint.listen(0, '127.0.0.1'); await once(endpoint, 'listening');
       setEnv(provider === 'claude' ? 'KARMAX_ANTHROPIC_BASE_URL' : 'KARMAX_OPENAI_BASE_URL', `http://127.0.0.1:${(endpoint.address() as any).port}`);
       const adapter = provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
-      const turn = adapter.runTurn({ profile: { id: 'test', name: 'test', role: 'do', provider, mcpConnections: [connection.id] }, world, agentMcp: servers,
+      const timingRows: any[] = [];
+      const trace = new TimingTrace({ taskId: 'turn', turnId: 'turn-1', attempt: 1 }, row => timingRows.push(row));
+      const turn = withTiming(trace, () => trace.measure('agent.attempt', () => adapter.runTurn({ profile: { id: 'test', name: 'test', role: 'do', provider, mcpConnections: [connection.id] }, world, agentMcp: servers,
         role: 'do', systemPrompt: 'Test only', messages: [{ id: 'one', ts: 0, role: 'user', text: 'Use MCP' }], resolvedAuth: { apiKey: 'test-model-key' }, maxTurns: 4 },
-      { emit() {}, emitActivity() {} } as any);
+      { emit() {}, emitActivity() {} } as any)));
       if (failure) await expect(turn).rejects.toThrow(/500/);
       else {
         expect((await turn).output).toBe('MCP verified'); expect(requests).toHaveLength(3);
@@ -66,6 +69,12 @@ describe('MCP across complete API agent turns', () => {
         expect(JSON.parse(results[1]).contents[0].text).toBe('resource content');
         expect(requests[0].tools.some((t: any) => t.name === 'platform_request')).toBe(true);
       }
+      const timing = timingReport(timingRows);
+      expect(timing.attempts[0]?.status).toBe(failure ? 'failed' : 'ok');
+      expect(timing.intervals.find(r => r.name === 'provider.roundtrip')?.count).toBe(failure ? 1 : 3);
+      expect(timing.intervals.find(r => r.name === 'tool.discovery.native')?.count).toBeGreaterThan(0);
+      if (!failure) expect(timing.intervals.find(r => r.name === 'tool.execution.native')?.count).toBe(2);
+      expect(JSON.stringify(timingRows)).not.toContain('test-model-key');
       const pid = Number(fs.readFileSync(pidFile, 'utf8'));
       await expect.poll(() => { try { process.kill(pid, 0); return true; } catch { return false; } }, { timeout: 5000 }).toBe(false);
     });

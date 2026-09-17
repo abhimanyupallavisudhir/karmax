@@ -3502,6 +3502,13 @@ function connectWs() {
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
         scheduleTaskPageRender();
       }
+      if (ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
+        const received = performance.now();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify({ type: 'timing.frame', id: ev.timingDeliveryId, frameMs: performance.now() - received }));
+        }));
+      }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
@@ -6587,6 +6594,7 @@ const TASK_TABS = [
   { key: 'checkin', label: 'Check-in' },
   { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
+  { key: 'timing', label: 'Timing' },
 ];
 
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
@@ -7371,6 +7379,7 @@ function renderTaskPage() {
   wireAttempts(v);
   wireStageTransitions(v);
   wireWorkflowMode(v);
+  wireTiming(v);
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
@@ -7527,6 +7536,7 @@ function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
   if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
+  if (tab === 'timing') return timingTab(v);
   return overviewTab(v);
 }
 
@@ -18245,4 +18255,46 @@ async function finishMcpCallback() {
     }
     location.replace(pending.back.startsWith('/') && !pending.back.startsWith('//') ? pending.back : '/');
   } catch (e) { status.textContent = e.message; }
+}
+
+// Timing is fetched on demand, independently of the bounded conversation window.
+const timingReports = new Map();
+function timingMs(value) { return value == null ? 'Unknown' : `${(value / 1000).toFixed(3)} s`; }
+function timingTab(v) {
+  const report = timingReports.get(v.taskId);
+  const stats = report ? [['Activity → first text', report.firstResponse], ['Activity → completion', report.completion],
+    ['Request → first text', report.requestFirstResponse], ['Request → completion', report.requestCompletion],
+    ...(report.requestFirstResponseWallEstimate?.count ? [['Request → first text (wall estimate)', report.requestFirstResponseWallEstimate]] : []),
+    ...(report.requestCompletionWallEstimate?.count ? [['Request → completion (wall estimate)', report.requestCompletionWallEstimate]] : [])] : [];
+  return `<div class="section-h">Response timing <button class="btn sm" id="timing-refresh">${report ? 'Refresh' : 'Load measurements'}</button>
+    <button class="btn sm" id="timing-download" ${report ? '' : 'disabled'}>Export JSON</button></div>
+    <div id="timing-error" class="task-sub"></div>
+    ${report ? `<table><thead><tr><th>Interval</th><th>Samples</th><th>Missing</th><th>Median</th><th>p95</th></tr></thead><tbody>${stats.map(([name, d]) => `<tr><td>${name}</td><td>${d.count}</td><td>${d.missing}</td><td>${timingMs(d.medianMs)}</td><td>${timingMs(d.p95Ms)}</td></tr>`).join('')}</tbody></table>
+    <p class="task-sub" title="Cross-process wall-clock estimates, queue observations, service calls and browser frame evidence are included in the JSON export. Missing data is never treated as zero. CLI time includes startup, transport, provider queueing and inference.">Monotonic measurements · unknown intervals stay unknown</p>
+    <details class="card"><summary>All measured intervals</summary><table><thead><tr><th>Interval</th><th>Samples</th><th>Missing</th><th>Median</th><th>p95</th></tr></thead><tbody>${report.intervals.map(d => `<tr><td>${esc(d.name)}</td><td>${d.count}</td><td>${d.missing}</td><td>${timingMs(d.medianMs)}</td><td>${timingMs(d.p95Ms)}</td></tr>`).join('')}</tbody></table></details>
+    <details class="card"><summary>Request paths</summary>${report.requests.map(r => `<details><summary>${esc(r.requestId)} · ${timingMs(r.completionMs)}</summary><p class="task-sub">Before activity: ${timingMs(r.preActivityMs)} · Unattributed: ${timingMs(r.completionBreakdown?.unattributedMs)}</p><table><thead><tr><th>Interval</th><th title="Rows may overlap. Do not add them.">Elapsed union</th></tr></thead><tbody>${(r.completionBreakdown?.spans || []).map(s => `<tr><td>${esc(s.name)}</td><td>${timingMs(s.unionMs)}</td></tr>`).join('')}</tbody></table></details>`).join('')}</details>
+    ${report.attempts.map(a => `<details class="card"><summary>${esc(a.metadata.provider || 'Unknown provider')} · ${esc(a.metadata.model || 'unreported model')} · ${esc(a.metadata.sessionMode || 'unknown session')} · attempt ${a.attempt ?? '?'} · ${esc(a.status)} · ${timingMs(a.totalMs)}</summary>
+      <table><thead><tr><th>Interval</th><th>Calls</th><th title="Overlapping calls count once. Rows may overlap each other.">Elapsed union</th><th title="Concurrent work adds together here.">Work sum</th></tr></thead><tbody>${a.spans.map(span => `<tr><td>${esc(span.name)}</td><td>${span.count}</td><td>${timingMs(span.unionMs)}</td><td>${timingMs(span.sumMs)}</td></tr>`).join('')}
+      <tr><td>Unattributed</td><td></td><td>${timingMs(a.unattributedMs)}</td><td></td></tr></tbody></table>
+      ${a.externalSpans?.length ? `<table title="Different process clocks; these spans are correlated but excluded from this activity's coverage calculation."><thead><tr><th>Other processes</th><th>Duration</th><th>Status</th></tr></thead><tbody>${a.externalSpans.map(s => `<tr><td>${esc(s.name)}</td><td>${timingMs(s.durationMs)}</td><td>${esc(s.status)}</td></tr>`).join('')}</tbody></table>` : ''}
+      <span class="task-sub">${a.openSpans} unfinished spans</span></details>`).join('') || '<p class="task-sub">No instrumented agent turns yet.</p>'}` : ''}`;
+}
+function wireTiming(v) {
+  const refresh = document.getElementById('timing-refresh');
+  if (!refresh) return;
+  refresh.onclick = async () => {
+    refresh.disabled = true;
+    try {
+      const report = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/timing`);
+      if (timingReports.size >= 10) timingReports.delete(timingReports.keys().next().value);
+      timingReports.set(v.taskId, report);
+      if (S.selected === v.taskId && S.taskTab === 'timing') renderTaskPage();
+    } catch (e) { const error = document.getElementById('timing-error'); if (error) error.textContent = e.message; }
+    finally { refresh.disabled = false; }
+  };
+  document.getElementById('timing-download').onclick = () => {
+    const blob = new Blob([JSON.stringify(timingReports.get(v.taskId), null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = `${v.taskId}-timing.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
 }

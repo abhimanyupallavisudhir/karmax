@@ -1,3 +1,5 @@
+import { TimingDelivery } from '../timing/delivery.js';
+import { TimingTrace, withTiming, toolFailed } from '../timing/index.js';
 import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
@@ -288,7 +290,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
-  if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
+  if (/\/(events|timing)$/.test(p) || p === '/api/activity') return 'task:event:read';
   if (/\/(sessions|agents|conversation(?:\.jsonl)?)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
@@ -665,6 +667,12 @@ export class Gateway {
     const auth = await this.socketAuth(req, url);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
     const scoped = this.deps.tokens.verify(auth.apiToken);
+    const delivery = new TimingDelivery(row => this.deps.store.appendEvent({ taskId: row.taskId,
+      type: 'timing', ts: row.wallMs, payload: { ...row } }));
+    ws.on('message', data => {
+      if (data.toString().length > 1024) return;
+      try { delivery.acknowledge(JSON.parse(data.toString())); } catch { /* invalid observation */ }
+    });
     const off = this.fanout.on((ev) => {
       const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
@@ -672,7 +680,15 @@ export class Gateway {
         const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
         if (!allows(humanCaps ?? [], 'task:event:read')) return;
       }
-      try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
+      try {
+        const payload = ev.payload as Record<string, unknown>;
+        const timingDeliveryId = (ev.type === 'agent.activity' && payload.kind === 'message' && payload.title
+          || ev.type === 'agent.output' && payload.source === 'assistant' && payload.text)
+          ? delivery.offer({ taskId: ev.taskId, turnId: typeof payload.turnId === 'string' ? payload.turnId : undefined,
+            workflowRunId: typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined,
+            attempt: typeof payload.attempt === 'number' ? payload.attempt : undefined }) : undefined;
+        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
+      } catch { /* ignore */ }
     });
     ws.on('close', off);
     ws.on('error', off);
@@ -1216,6 +1232,7 @@ export class Gateway {
 
   // ─── request handling ────────────────────────────────────────────────────────
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
+    const receivedAt = { monoMs: performance.now(), wallMs: Date.now() };
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
     const previewOrigin = configuredPreviewOrigin();
@@ -1250,12 +1267,12 @@ export class Gateway {
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);
     if (p === '/app.webmanifest' && req.method === 'GET') return this.webManifest(res);
-    if (p.startsWith('/api/')) return this.api(req, res, url);
+    if (p.startsWith('/api/')) return this.api(req, res, url, receivedAt);
     if (p === '/ws') return; // handled by ws
     return this.static(p, res, req);
   }
 
-  private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+  private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, receivedAt = { monoMs: performance.now(), wallMs: Date.now() }) {
     const p = url.pathname;
     const method = req.method ?? 'GET';
 
@@ -4023,7 +4040,7 @@ export class Gateway {
           const b = await this.body(req);
           const project = store.getProject(projectId);
           if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-          const task = await api.createTask(token, { projectId, ...b });
+          const task = await api.createTask(token, { projectId, ...b }, receivedAt);
           return this.json(res, 200, task);
         }
       }
@@ -4318,7 +4335,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault });
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault }, receivedAt);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
@@ -4923,6 +4940,8 @@ export class Gateway {
       if (fileMatch && method === 'GET') {
         return this.serveArtifact(res, fileMatch[1]!, url.searchParams.get('path') ?? '', true);
       }
+      const timingMatch = p.match(/^\/api\/tasks\/([^/]+)\/timing$/);
+      if (timingMatch && method === 'GET') return this.json(res, 200, await api.taskTiming(token, timingMatch[1]!));
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
@@ -5664,12 +5683,16 @@ export class Gateway {
             const c = service.get(org, id);
             if (action === 'tools' || action === 'execute') {
               if (!callerTaskId || !projectId) return this.json(res, 403, { error: 'A task-agent token is required' });
+              const trace = new TimingTrace({ taskId: callerTaskId, role: authRecord.role,
+                turnId: authRecord.executionId, workflowRunId: authRecord.executionRunId, attempt: authRecord.executionAttempt }, row => {
+                store.appendEvent({ taskId: callerTaskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
+              });
               if (action === 'tools' && method === 'GET') return this.json(res, 200,
-                await service.tools(org, id, callerTaskId, projectId, url.searchParams.get('search') ?? ''));
+                await withTiming(trace, () => trace.measure('service.discovery', () => service.tools(org, id, callerTaskId, projectId, url.searchParams.get('search') ?? ''))));
               if (action === 'execute' && method === 'POST') {
                 if (!b.arguments || typeof b.arguments !== 'object' || Array.isArray(b.arguments))
                   return this.json(res, 400, { error: 'arguments must be an object' });
-                return this.json(res, 200, await service.execute(org, id, callerTaskId, projectId, String(b.tool ?? ''), b.arguments));
+                return this.json(res, 200, await withTiming(trace, () => trace.measure('service.execution', () => service.execute(org, id, callerTaskId, projectId, String(b.tool ?? ''), b.arguments), undefined, undefined, toolFailed)));
               }
             } else {
               const userId = requireOwner();

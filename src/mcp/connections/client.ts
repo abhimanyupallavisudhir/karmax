@@ -1,3 +1,4 @@
+import { timed, toolFailed } from '../../timing/index.js';
 import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { JSONRPCMessageSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -61,12 +62,12 @@ export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], 
   const close = async () => { await Promise.allSettled(clients.map((c) => c.close())); };
   try {
     for (const server of servers) {
-      const client = await connectWorldMcp(world, server, signal); clients.push(client);
+      const client = await timed('tool.connection.start', () => connectWorldMcp(world, server, signal)); clients.push(client);
       const capabilities = client.getServerCapabilities();
       const protocolTool = (operation: string, description: string, properties: Record<string, unknown>, required: string[], run: (args: any) => Promise<any>) => {
         const name = `mcp_${crypto.createHash('sha256').update(server.name + '\0protocol:' + operation).digest('hex').slice(0, 24)}`;
         tools.push({ name, description: `${server.name}: ${description}`, parameters: { type: 'object', properties, required } });
-        handlers[name] = run;
+        handlers[name] = args => timed('tool.execution.native', () => run(args), { operation: name }, toolFailed);
       };
       if (capabilities?.resources) {
         protocolTool('resources/list', 'List resources', { cursor: { type: 'string' } }, [], (args) => client.listResources(args));
@@ -82,7 +83,7 @@ export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], 
       let cursor: string | undefined; let pages = 0;
       do {
         if (++pages > 10) throw new Error('MCP tool catalog has too many pages');
-        const page = await client.listTools(cursor ? { cursor } : undefined);
+        const page = await timed('tool.discovery.native', () => client.listTools(cursor ? { cursor } : undefined));
         catalogBytes += Buffer.byteLength(JSON.stringify(page));
         if (catalogBytes > 1024 * 1024) throw new Error('Selected MCP tool descriptions exceed 1 MiB; select fewer connections');
         for (const tool of page.tools) {
@@ -90,7 +91,7 @@ export async function apiMcpTools(world: World, servers: AgentMcpServer[] = [], 
           const name = `mcp_${crypto.createHash('sha256').update(server.name + '\0' + tool.name).digest('hex').slice(0, 24)}`;
           if (handlers[name]) throw new Error('MCP server returned duplicate tool names');
           tools.push({ name, description: `${server.name}: ${tool.name}\n${tool.description ?? ''}`.slice(0, 8000), parameters: tool.inputSchema });
-          handlers[name] = (args) => client.callTool({ name: tool.name, arguments: args }, undefined, { timeout: 60_000 });
+          handlers[name] = (args) => timed('tool.execution.native', () => client.callTool({ name: tool.name, arguments: args }, undefined, { timeout: 60_000 }), { operation: name }, toolFailed);
         }
         cursor = page.nextCursor;
       } while (cursor);

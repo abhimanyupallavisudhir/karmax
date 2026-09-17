@@ -70,6 +70,9 @@ export interface ScopedToken {
   audience: 'karmax-platform';
   /** Stable execution/turn lease that caused this credential to exist. */
   executionId?: string;
+  /** Measurement provenance only; never grants authority. */
+  executionAttempt?: number;
+  executionRunId?: string;
   worldGeneration?: number;
   kind: 'agent' | 'human' | 'system';
   /** The executor is deliberately distinct from the authority grantor in
@@ -96,6 +99,9 @@ export interface MintArgs {
   ttlMs?: number;
   audience?: ScopedToken['audience'];
   executionId?: string;
+  /** Measurement provenance only; never grants authority. */
+  executionAttempt?: number;
+  executionRunId?: string;
   worldGeneration?: number;
   /** Opaque authority-minted delegation provenance. Callers cannot supply a
    * user id or external account directly to token minting. */
@@ -264,6 +270,8 @@ export class TokenAuthority {
       parentTokenId: args.parentTokenId,
       audience: args.audience ?? 'karmax-platform',
       executionId: args.executionId,
+      executionAttempt: args.executionAttempt,
+      executionRunId: args.executionRunId,
       worldGeneration: args.worldGeneration,
       kind: args.principal.startsWith('system:') ? 'system' : 'agent',
       actor: args.principal.startsWith('system:')

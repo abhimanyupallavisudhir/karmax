@@ -1,3 +1,4 @@
+import { timingReport, type TimingRow } from '../src/timing/index.js';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -1285,6 +1286,14 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // of replaying the whole turn from scratch
     const events = h.store.eventsSince(taskId, 0);
     expect(events.some((e) => e.type === 'turn.resumed')).toBe(true);
+    const timing = timingReport(events.filter(e => e.type === 'timing').map(e => e.payload as unknown as TimingRow));
+    const measured = timing.attempts.filter(a => a.attempt === 1 || a.attempt === 2);
+    expect(measured.map(a => a.status)).toEqual(['failed', 'ok']);
+    expect(new Set(measured.map(a => a.turnId)).size).toBe(1);
+    expect(measured[1]?.metadata.sessionMode).toBe('resumed');
+    expect(timing.completion.count).toBe(1);
+    expect(timing.completion.missing).toBe(1);
+
     // Attempts share one logical turn id, but the UI must not fold the retry's
     // fresh "started" row over the prior failure (task #353). The activity event
     // carries the Temporal attempt so both rows remain independently auditable.
