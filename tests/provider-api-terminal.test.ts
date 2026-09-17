@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { TimingTrace, withTiming } from '../src/timing/index.js';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
 import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
@@ -14,16 +15,19 @@ const ctx: any = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('metered provider API terminal outcomes', () => {
-  it('accepts an Anthropic end_turn without requiring signal_completion', async () => {
+  it.each([false, true])('accepts an Anthropic end_turn without requiring signal_completion (timing: %s)', async (tracing) => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn',
         usage: { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 } }),
     }));
-    const turn = await new ClaudeAdapter().runTurn({
+    const rows: any[] = [];
+    const invoke = () => new ClaudeAdapter().runTurn({
       profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
     } as any, ctx);
+    const turn = await (tracing ? withTiming(new TimingTrace({ taskId: 'fixture' }, row => rows.push(row)), invoke) : invoke());
+    expect(rows.filter(row => row.name === 'provider.usage')).toHaveLength(tracing ? 1 : 0);
     expect(turn.termination).toEqual({ kind: 'success', status: 'end_turn', reason: 'end_turn' });
     expect(turn.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 4, cacheWriteTokens: 2,
       inputTokensIncludeCacheRead: false, totalTokens: 21 });
@@ -56,16 +60,19 @@ describe('metered provider API terminal outcomes', () => {
     });
   });
 
-  it('accepts an OpenAI completed response without requiring signal_completion', async () => {
+  it.each([false, true])('accepts an OpenAI completed response without requiring signal_completion (timing: %s)', async (tracing) => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ id: 'r1', status: 'completed', usage: { input_tokens: 10, output_tokens: 5,
         input_tokens_details: { cached_tokens: 6 } }, output: [{ type: 'message', content: [{ type: 'output_text', text: 'done' }] }] }),
     }));
-    const turn = await new CodexAdapter().runTurn({
+    const rows: any[] = [];
+    const invoke = () => new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'o', provider: 'codex', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
     } as any, ctx);
+    const turn = await (tracing ? withTiming(new TimingTrace({ taskId: 'fixture' }, row => rows.push(row)), invoke) : invoke());
+    expect(rows.filter(row => row.name === 'provider.usage')).toHaveLength(tracing ? 1 : 0);
     expect(turn.termination).toEqual({ kind: 'success', status: 'completed' });
     expect(turn.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 6,
       inputTokensIncludeCacheRead: true, totalTokens: 15 });

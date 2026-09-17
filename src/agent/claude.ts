@@ -165,7 +165,9 @@ export class ClaudeAdapter implements AgentAdapter {
         currentTiming()?.markOnce('first.output');
         return data;
       });
-      currentTiming()?.mark('provider.usage', reportedUsage.add(data.usage, 'claude'));
+      // Usage accounting is required even when timing collection is absent.
+      const roundUsage = reportedUsage.add(data.usage, 'claude');
+      currentTiming()?.mark('provider.usage', roundUsage);
       messages.push({ role: 'assistant', content: data.content });
       const toolUses = (data.content ?? []).filter((b: any) => b.type === 'tool_use');
       const text = (data.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');

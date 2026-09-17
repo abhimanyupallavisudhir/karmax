@@ -294,7 +294,9 @@ export class CodexAdapter implements AgentAdapter {
       currentTiming()?.markOnce('first.output');
       return data;
       });
-      currentTiming()?.mark('provider.usage', reportedUsage.add(data.usage, 'codex'));
+      // Usage accounting is required even when timing collection is absent.
+      const roundUsage = reportedUsage.add(data.usage, 'codex');
+      currentTiming()?.mark('provider.usage', roundUsage);
       respId = data.id ?? respId;
       // Checkpoint the session as soon as we have one. This is the sole writer of
       // the crash-resume record: without it a worker restart or heartbeat timeout
