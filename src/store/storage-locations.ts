@@ -107,9 +107,16 @@ export class StorageLocationService {
       const objects = this.objectStore(location.id);
       const expected = Buffer.from('karmax storage connection test');
       await objects.put(key, expected);
-      const actual = await objects.get(key);
+      try {
+        const actual = await objects.get(key);
+        if (!actual.equals(expected)) throw new Error('S3 read-back did not match the test object');
+      } catch (error) {
+        // A failed read must not strand the successfully written probe. Keep
+        // the original failure if cleanup fails too; a retry probes a new key.
+        await objects.delete(key).catch(() => {});
+        throw error;
+      }
       await objects.delete(key);
-      if (!actual.equals(expected)) throw new Error('S3 read-back did not match the test object');
       return this.store.saveStorageLocation({ ...location, status: 'ready', lastCheckedAt: Date.now(),
         lastError: undefined, updatedAt: Date.now() });
     } catch (error) {

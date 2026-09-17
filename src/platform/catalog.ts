@@ -51,6 +51,14 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/mcp/:id/callback?projectId= (or organizationId; body {state, code}; finishes the initiating actor’s OAuth session)',
   ],
   resources: ['GET /api/resource-drivers'],
+  storage: [
+    'GET /api/organizations/:organizationId/storage (locations, connection status, and byte usage)',
+    'POST /api/organizations/:organizationId/storage (connect S3: body {name, endpoint, bucket, region?, prefix?, accessKeyId, secretAccessKey, sessionToken?}; credentials are vaulted)',
+    'PUT /api/organizations/:organizationId/storage/:storageId (update connection; re-test before use)',
+    'POST /api/organizations/:organizationId/storage/:storageId/test (write/read/delete connection probe)',
+    'PUT /api/organizations/:organizationId/storage/:storageId/default (requires a tested connection)',
+    'DELETE /api/organizations/:organizationId/storage/:storageId (refuses managed or in-use storage)',
+  ],
   resourceAuthorization: 'Direct project resource and secret administration uses project:settings:write, including storageLocationId and uploads. Agents with this capability may act directly in any project covered by their token. Narrow task agents use propose_project_resource; adoption/discard requires task:review:execute.',
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId (PATCH body {name} or {config})',

@@ -12,9 +12,10 @@
  * This wrapper closes the gap: it opens ONE Chrome with a real
  * `--remote-debugging-port`, then runs `chrome-devtools-mcp` in `--browserUrl`
  * attach mode against it. The agent drives that browser through the MCP and
- * karmax fills into the same browser over the same port. Chrome lives only for
- * the MCP's lifetime (memory-friendly; no karmax daemon) and is torn down with
- * it. If Chrome can't be found or launched, we fall back to the plain pipe MCP
+ * karmax fills into the same browser over the same port. Chrome normally lives
+ * only for the MCP's lifetime. Task-isolated remote worlds opt into keeping it
+ * alive across turns, including human approvals. If Chrome can't be found or
+ * launched, we fall back to the plain pipe MCP
  * so the browser tools still work (fill just won't reach it — today's behavior;
  * never a regression).
  *
@@ -23,6 +24,7 @@
  *   KARMAX_CDP_MCP_VERSION  chrome-devtools-mcp version to run via npx
  *   KARMAX_CDP_CHROME       explicit Chrome executable (else auto-detected)
  *   KARMAX_CDP_USER_DATA_DIR  Chrome profile dir (default a temp dir)
+ *   KARMAX_CDP_KEEP_ALIVE=1  keep Chrome until its isolated world is stopped
  *   KARMAX_CDP_HEADFUL=1     launch a visible browser (default headless=new)
  * Any extra argv is forwarded to chrome-devtools-mcp.
  */
@@ -37,6 +39,7 @@ const VERSION = process.env.KARMAX_CDP_MCP_VERSION || 'latest';
 // In a remote sandbox the chrome-devtools-mcp binary is already baked/installed;
 // point at it directly instead of resolving through npx.
 const MCP_BIN = process.env.KARMAX_CDP_MCP_BIN || '';
+const KEEP_ALIVE = process.env.KARMAX_CDP_KEEP_ALIVE === '1';
 const EXTRA = process.argv.slice(2);
 const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 
@@ -123,6 +126,7 @@ async function main() {
   ensureOvercommit(); // remote sandboxes: let Chrome's V8 renderer reserve its CodeRange
   const userDataDir = process.env.KARMAX_CDP_USER_DATA_DIR
     || fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cdp-'));
+  fs.mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
   const headless = process.env.KARMAX_CDP_HEADFUL === '1' ? [] : ['--headless=new'];
   const chromeArgs = [
     ...headless, `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
@@ -141,7 +145,8 @@ async function main() {
 
   let browser;
   try {
-    browser = spawn(chrome, chromeArgs, { stdio: 'ignore' });
+    browser = spawn(chrome, chromeArgs, { stdio: 'ignore', detached: KEEP_ALIVE });
+    if (KEEP_ALIVE) browser.unref();
   } catch (e) {
     log(`failed to spawn Chrome (${e?.message ?? e}) — falling back to pipe mode`);
     const mcp = runMcp(undefined);
@@ -169,8 +174,8 @@ async function main() {
   log(`Chrome ready on :${PORT}; attaching chrome-devtools-mcp`);
   const mcp = runMcp(`http://127.0.0.1:${PORT}`);
   const killChrome = () => { try { browser.kill('SIGKILL'); } catch { /* ignore */ } };
-  process.on('exit', killChrome);
-  mcp.on('exit', (code) => { killChrome(); process.exit(code ?? 0); });
+  if (!KEEP_ALIVE) process.on('exit', killChrome);
+  mcp.on('exit', (code) => { if (!KEEP_ALIVE) killChrome(); process.exit(code ?? 0); });
 }
 
 main().catch((e) => { log(`fatal: ${e?.message ?? e}`); process.exit(1); });

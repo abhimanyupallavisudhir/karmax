@@ -42,6 +42,32 @@ describe('organization storage locations', () => {
       .rejects.toThrow(/public address|https/i);
   });
 
+  it.each(['read failure', 'read mismatch', 'read and cleanup failure', 'cleanup failure'])(
+    'fails the connection and cleans up its probe after %s', async (failure) => {
+      const f = fixture();
+      const calls: string[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        calls.push(method);
+        if (method === 'PUT') return new Response('', { status: 200 });
+        if (method === 'DELETE') return failure.includes('cleanup')
+          ? new Response('delete denied', { status: 403 }) : new Response(null, { status: 204 });
+        if (failure === 'read mismatch') return new Response('wrong data');
+        if (failure === 'cleanup failure') return new Response('karmax storage connection test');
+        return new Response('read denied', { status: 403 });
+      }));
+      const location = await f.locations.connectS3(f.project.organizationId!, {
+        name: 'Probe failure', endpoint: 'https://objects.example', bucket: 'test-bucket',
+        accessKeyId: 'key', secretAccessKey: 'secret',
+      });
+      const expected = failure === 'read mismatch' ? /read-back did not match/
+        : failure === 'cleanup failure' ? /delete denied/ : /read denied/;
+      await expect(f.locations.test(f.project.organizationId!, location.id)).rejects.toThrow(expected);
+      expect(calls).toEqual(['PUT', 'GET', 'DELETE']);
+      expect(f.locations.view(f.project.organizationId!, location.id).status).toBe('error');
+      expect(() => f.locations.setDefault(f.project.organizationId!, location.id)).toThrow(/unavailable/);
+    });
+
   it('enforces the managed physical-byte quota before retaining snapshot chunks', async () => {
     const f = fixture(1024);
     const managed = f.locations.defaultLocation(f.project.organizationId!);

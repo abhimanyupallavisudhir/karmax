@@ -326,11 +326,17 @@ export class AgentMail {
    * a catch-all domain forwards everything, including strangers' typos — and so
    * is mail whose webhook secret belongs to a different organization (`onlyFor`).
    */
-  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number }, onlyFor?: string): { delivered: boolean; message?: AgentMessage } {
+  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number; sourceId?: string }, onlyFor?: string): { delivered: boolean; message?: AgentMessage } {
     const organizationId = this.ownerOf(msg.to);
     if (!organizationId || (onlyFor && organizationId !== onlyFor)) return { delivered: false };
+    const id = msg.sourceId
+      ? `msg_${crypto.createHash('sha256').update(`${organizationId}\0${msg.sourceId}`).digest('hex')}`
+      : `msg_${crypto.randomBytes(8).toString('hex')}`;
+    const existing = this.all(organizationId);
+    // Polling may replay a boundary message; keep its original arrival time.
+    if (existing.some((message) => message.id === id)) return { delivered: false };
     const record: AgentMessage = {
-      id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+      id,
       from: msg.from,
       to: msg.to,
       subject: msg.subject,
@@ -339,7 +345,7 @@ export class AgentMail {
       ...(extractLink(msg.text) ? { link: extractLink(msg.text) } : {}),
       receivedAt: msg.receivedAt ?? Date.now(),
     };
-    const next = [...this.all(organizationId), record].slice(-MAX_MESSAGES);
+    const next = [...existing, record].slice(-MAX_MESSAGES);
     this.store.kvSet(kvMessages(organizationId), JSON.stringify(next));
     return { delivered: true, message: record };
   }

@@ -269,6 +269,8 @@ describe('remote subscription agents', () => {
         KARMAX_CDP_CHROME: '/opt/karmax/browsers/chromium',
         KARMAX_CDP_NO_SANDBOX: '1',
         KARMAX_CDP_SET_OVERCOMMIT: '1',
+        KARMAX_CDP_KEEP_ALIVE: '1',
+        KARMAX_CDP_USER_DATA_DIR: '/workspace/.karmax-injection/agent/browser-profile',
       },
     });
     expect(world.files.get('.karmax-injection/agent/chrome-cdp-launcher.mjs')?.toString()).toContain('--remote-debugging-port');

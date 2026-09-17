@@ -5,6 +5,7 @@ import { fillCardInWorld } from '../src/autonomy/card-fill.js';
 describe('remote secure card fill', () => {
   it('passes PAN/CVC only on stdin — never argv, env, or output', async () => {
     const exec = vi.fn(async (_cmd: string, argv: string[], options: any) => {
+      expect(argv.slice(0, 2)).toEqual(['--input-type=module', '-e']);
       expect(argv.join(' ')).not.toContain('4242424242424242');
       expect(argv.join(' ')).not.toContain('123');
       // The environment is NOT a safe channel, which this test used to assert it
@@ -51,7 +52,7 @@ describe('remote secure card fill', () => {
         // Simulate a lost first chunk: the tail alone is not valid JSON, but it
         // still holds the whole PAN.
         truncated = String(options.input).slice(5);
-        const child = spawnSync(process.execPath, ['--input-type=module', '-e', argv[1]!], {
+        const child = spawnSync(process.execPath, argv, {
           input: truncated,
           env: { ...process.env, ...options.env },
           encoding: 'utf8',

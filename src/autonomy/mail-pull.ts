@@ -2,7 +2,7 @@ import { MailboxConfig, defaultMailboxRegistry } from './mailbox.js';
 import { extractMimeText, cleanAddress, htmlToText } from './agent-mail.js';
 
 /** A fetched message with the fields ingest needs (recipient/sender resolved). */
-export interface PulledMessage { to: string; from: string; subject?: string; text: string }
+export interface PulledMessage { to: string; from: string; subject?: string; text: string; sourceId?: string }
 
 /**
  * Pull-based mail intake (PLAN-passwords.md §8). Unlike the webhook (push) path,
@@ -170,6 +170,7 @@ export class AgentMailPuller implements Puller {
       const from = m.from ?? m.sender ?? 'unknown@unknown';
       const text = m.text ?? m.extracted_text ?? m.plain ?? m.preview ?? (m.html ? htmlToText(m.html) : '');
       const { delivered: ok } = this.deps.ingest({
+        ...(messageId ? { sourceId: `agentmail:${address}:${messageId}` } : {}),
         to: cleanAddress(to),
         from: cleanAddress(from),
         subject: m.subject,
