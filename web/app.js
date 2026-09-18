@@ -6036,6 +6036,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
                 <span class="tf-vault-count" id="tf-vault-count">Loading…</span>
               </button>
             </div>
+            ${taskPaymentsHtml("tf-payments")}
             <div class="form-row" data-row="__creds">
               <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Codex/Claude</label></div>
               <div id="cred-editor-newtask">Loading…</div>
@@ -6055,6 +6056,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
         </div>
       </footer>
     </div>`;
+  wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
   activeTaskFormKeyController = formKeyController;
   const releaseFormKeys = () => {
@@ -6254,6 +6256,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // through auto-save, draft, and queue the same way the prompt text does.
   const formState = () => {
     const body = collectForm($('#tf-body'), fields);
+    const paymentPolicy = readTaskPayments($('#tf-payments')) ?? values.paymentPolicy;
+    if (paymentPolicy) body.paymentPolicy = paymentPolicy;
     if (formImages.length) body.images = [...formImages];
     if (formFiles.length) body.files = [...formFiles];
     // Triggers + repeatable are generic (workflow-agnostic) params, not part of the
@@ -6282,7 +6286,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   const hasContent = ({ body, notes }) => {
     // Wiki context alone (default or edited) isn't "content" worth a draft — it
     // rides along once there's a real prompt/command. Exclude it from the scan.
-    const { wikiContext: _wc, ...rest } = body;
+    const { wikiContext: _wc, paymentPolicy: _paymentPolicy, ...rest } = body;
     return notes.trim() !== '' ||
       hasPolicy() ||
       formImages.length > 0 ||
@@ -6579,6 +6583,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       releaseFormKeys();
       return;
     }
+    if (e.key === 'Escape' && e.target.closest?.('.task-payments')?.querySelector('[aria-expanded="true"]')) return;
     const action = taskFormKeyAction(e, secondaryModalOpen);
     if (!action) return;
     e.preventDefault();
@@ -7479,6 +7484,7 @@ function renderTaskPage() {
   } else if (tab === 'parameters') {
     wireParams(v);
     wireTaskAuthorization(v);
+    wireTaskPayments($('#tp-payments'), rec?.projectId || S.projectId, rec?.params?.paymentPolicy, v.taskId);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   }
   wireCopyButtons();
@@ -9504,6 +9510,7 @@ function parametersTab(v) {
   return `
     ${paramsSection(v)}
     ${authorizationSection(v)}
+    ${!taskRecord(v.taskId)?.params?.draft && (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) ? taskPaymentsHtml("tp-payments", true) : ''}
     <div class="section-h">Codex/Claude</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Drag to reorder, toggle to disable — for this task only.</p>
     <div id="cred-editor-task">Loading…</div>`;
@@ -9536,6 +9543,7 @@ function authorizationSection(v) {
           <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
         </button>
       </div>
+      ${taskPaymentsHtml("tp-payments", true)}
       <div class="params-save-bar" data-save-state="saved">
         <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
@@ -13490,22 +13498,28 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Payments</div>
-    <p class="task-sub" style="margin-top:0">Agents can make payments with a virtual card.</p>
+    <div class="section-h">Task defaults</div>
+    ${taskPaymentsHtml(`pay-defaults-${scope}`)}
+    <button class="btn sm" data-savepolicy="${scope}">Save defaults</button>
+    <div class="section-h" style="margin-top:20px">Saved cards</div>
     <div class="cards-list" style="margin-bottom:10px"></div>
-    <div class="settings-grid">
-      <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
-      <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
-      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
-      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" inputmode="numeric" placeholder="MM/YY" /></label>
-      <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
-      <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
-      <label class="form-row">City<input class="card-city" /></label>
-      <label class="form-row">Postal code<input class="card-postal" /></label>
-      <label class="form-row">Country<input class="card-country" placeholder="GB" maxlength="2" /></label>
-      <label class="form-row">Restrict to merchants<input class="card-merchants" placeholder="optional, comma-separated domains" /></label>
+    <details class="payment-add-card"><summary>Add card</summary>
+    <div class="payment-card-form">
+      <div class="payment-field-pair"><label class="form-row">Card name<input class="card-label" placeholder="e.g. Work expenses" /></label>
+      <label class="form-row">Limit (USD)<input class="card-cap" type="number" min="0.01" step="0.01" placeholder="250.00" /></label></div>
+      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="1234 5678 9012 3456" /></label>
+      <div class="payment-field-pair"><label class="form-row">Expiry<input class="card-expiry" autocomplete="off" inputmode="numeric" placeholder="MM/YY" /></label>
+      <label class="form-row">CVC<input class="card-cvc" type="password" autocomplete="off" inputmode="numeric" placeholder="•••" /></label></div>
+      <fieldset class="payment-address"><legend>Billing address</legend>
+      <label class="form-row">Street address<input class="card-line1" autocomplete="billing address-line1" /></label>
+      <div class="payment-field-pair"><label class="form-row">City<input class="card-city" autocomplete="billing address-level2" /></label>
+      <label class="form-row">Postal code<input class="card-postal" autocomplete="billing postal-code" /></label></div>
+      <label class="form-row">Country<input class="card-country" placeholder="US" maxlength="2" autocomplete="billing country" /></label>
+      </fieldset>
+      <details class="payment-restrictions"><summary>Merchant restrictions</summary><label class="form-row">Allowed domains<input class="card-merchants" placeholder="example.com, shop.example.com" /></label></details>
     </div>
     <button class="btn primary" data-addcard="${scope}">Add card</button>
+    </details>
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets ${siteNameMarkup()} issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
@@ -13538,12 +13552,6 @@ function paymentsCard(scope) {
         </div>
       </div>
     </details>
-    <div class="section-h" style="margin-top:16px">Spend limits</div>
-    <div class="settings-grid">
-      <label class="form-row">Allowance per task (USD)<input class="pay-allow" type="number" step="0.01" placeholder="unlimited" /></label>
-      <label class="form-row">Approval threshold (USD)<input class="pay-thresh" type="number" step="0.01" placeholder="never" /></label>
-    </div>
-    <button class="btn sm" data-savepolicy="${scope}">Save spend limits</button>
     ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
       <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
@@ -13891,15 +13899,17 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}
-  if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
-  if (policy.threshold != null) box.querySelector('.pay-thresh').value = (policy.threshold / 100).toFixed(2);
+  const defaults = box.querySelector('.task-payments');
+  await wireTaskPayments(defaults, projectId, undefined, undefined, organizationId);
   box.querySelector(`[data-savepolicy]`).addEventListener('click', async () => {
-    const a = box.querySelector('.pay-allow').value;
-    const t = box.querySelector('.pay-thresh').value;
-    const values = { ...policy };
-    values.allowance = a === '' ? undefined : Math.round(Number(a) * 100);
-    values.threshold = t === '' ? undefined : Math.round(Number(t) * 100);
-    try { await api(sUrl, { method: 'PUT', body: JSON.stringify({ values }) }); toast('Budget policy saved'); } catch (e) { toast(e.message, true); }
+    try {
+      const selected = readTaskPayments(defaults);
+      if (!selected) throw new Error('Payment defaults are still loading');
+      const { allowance, threshold, ...rest } = policy;
+      await api(sUrl, { method: 'PUT', body: JSON.stringify({ values: { ...rest, ...selected } }) });
+      policy = { ...rest, ...selected };
+      toast('Payment defaults saved');
+    } catch (e) { toast(e.message, true); }
   });
   const renderCards = async () => {
     let cards = [];
@@ -13908,6 +13918,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     // The org-settings surface shows the org's own cards (+ legacy global);
     // the project surface shows project cards (its org's cards appear too).
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
+    defaults._setCards?.(cards);
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
@@ -18411,6 +18422,109 @@ async function finishMcpCallback() {
     }
     location.replace(pending.back.startsWith('/') && !pending.back.startsWith('//') ? pending.back : '/');
   } catch (e) { status.textContent = e.message; }
+}
+
+
+function taskPaymentsHtml(id, live = false) {
+  return `<div class="task-payments" id="${id}">
+    <label class="payment-cards-label" for="${id}-search">Cards</label>
+    <div class="payment-picker mcp-combo"><div class="mcp-input-wrap"><div class="mcp-chips"></div>
+      <input id="${id}-search" class="payment-search" role="combobox" aria-expanded="false" aria-controls="${id}-options" aria-autocomplete="list" autocomplete="off" placeholder="Loading…" disabled>
+      <button class="payment-caret" type="button" aria-label="Choose cards" disabled>▾</button></div>
+      <div class="mcp-menu" hidden><div class="mcp-options" id="${id}-options" role="listbox" aria-multiselectable="true" aria-label="Cards"></div></div>
+    </div>
+    <div class="payment-budget-row"><label for="${id}-budget" title="Payments above this task’s total budget ask for approval. Leave blank for no budget limit.">Budget (USD)</label>
+      <input id="${id}-budget" class="payment-budget" type="number" min="0" step="0.01" placeholder="Unlimited" disabled>
+      ${live ? '<span class="payment-spent" role="status" title="Includes payments reserved for checkout">Loading spent…</span>' : ''}</div>
+    ${live ? '<button class="btn sm payment-save" type="button" disabled>Save payments</button>' : ''}
+    <span class="payment-error" role="status"></span>
+  </div>`;
+}
+function readTaskPayments(box) {
+  if (!box?.dataset.policy) return undefined;
+  const budget = box.querySelector('.payment-budget');
+  if (!budget.checkValidity()) throw new Error('Enter a non-negative budget in USD');
+  const cents = budget.value === '' ? null : Math.round(Number(budget.value) * 100);
+  if (cents !== null && !Number.isSafeInteger(cents)) throw new Error('Enter a valid budget in USD');
+  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: cents };
+}
+async function wireTaskPayments(box, projectId, initial, taskId, organizationId) {
+  if (!box) return;
+  organizationId ||= S.projects.find(p => p.id === projectId)?.organizationId || S.organizationId;
+  const query = projectId ? `projectId=${encodeURIComponent(projectId)}` : `organizationId=${encodeURIComponent(organizationId)}`;
+  const input = box.querySelector('.payment-search'), menu = box.querySelector('.mcp-menu'), options = box.querySelector('.mcp-options');
+  const budget = box.querySelector('.payment-budget'), save = box.querySelector('.payment-save');
+  try {
+    const [cards0, org, project, live] = await Promise.all([
+      api(`/api/cards?${query}`).catch(error => { if (taskId) return []; throw error; }),
+      taskId ? {} : api(`/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`),
+      !taskId && projectId ? api(`/api/settings/project/${encodeURIComponent(projectId)}/payments`) : {},
+      taskId ? api(`/api/tasks/${encodeURIComponent(taskId)}/payments`) : null,
+    ]);
+    if (!box.isConnected) return;
+    let cards = (cards0.length ? cards0 : live?.cards || []).filter(c => c.status !== 'canceled' && c.status !== 'inactive');
+    const inherited = { cardIds: project.cardIds ?? org.cardIds,
+      budget: Object.hasOwn(project, 'budget') ? project.budget : project.allowance ?? (Object.hasOwn(org, 'budget') ? org.budget : org.allowance ?? null) };
+    const policy = (taskId && S.paymentEdits?.[taskId]) || live || initial || inherited;
+    let selected = new Set(policy.cardIds ?? cards.map(c => c.id)), active = -1;
+    budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);
+    input.disabled = budget.disabled = box.querySelector('.payment-caret').disabled = false;
+    input.placeholder = 'Choose cards…';
+    if (live) box.querySelector('.payment-spent').textContent = `${usd(live.spent)} spent`;
+    function expand(open) { menu.hidden = !open; input.setAttribute('aria-expanded', String(open)); active = -1; input.removeAttribute('aria-activedescendant'); }
+    function paint() {
+      box.dataset.policy = JSON.stringify({ cardIds: [...selected] });
+      box.querySelector('.mcp-chips').innerHTML = [...selected].map(id => {
+        const name = cards.find(c => c.id === id)?.label || 'Unavailable card';
+        return `<span class="mcp-chip"><span>${esc(name)}</span><button type="button" data-remove="${esc(id)}" aria-label="Remove ${esc(name)}">×</button></span>`;
+      }).join('');
+      box.querySelectorAll('[data-remove]').forEach(button => button.onclick = () => { selected.delete(button.dataset.remove); change(); input.focus(); });
+      const filtered = cards.filter(c => c.label.toLowerCase().includes(input.value.toLowerCase()));
+      options.innerHTML = filtered.map((c, i) => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${i}" aria-selected="${selected.has(c.id)}" data-card="${esc(c.id)}"><span>${esc(c.label)}${c.last4 ? `<small>•••• ${esc(c.last4)}</small>` : ''}</span><span>${selected.has(c.id) ? '✓' : ''}</span></button></div>`).join('') || '<span class="payment-empty">No matching cards</span>';
+      options.querySelectorAll('[data-card]').forEach(button => button.onclick = () => { const id = button.dataset.card; selected.has(id) ? selected.delete(id) : selected.add(id); input.value = ''; change(); input.focus(); });
+    }
+    function change() {
+      paint();
+      if (taskId) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; }
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    box._setCards = next => { cards = next.filter(c => c.status !== 'canceled' && c.status !== 'inactive'); paint(); };
+    input.onfocus = () => expand(true);
+    input.oninput = () => { paint(); expand(true); };
+    box.querySelector('.payment-caret').onclick = () => { const open = menu.hidden; input.focus(); expand(open); };
+    box.addEventListener('focusout', () => setTimeout(() => { if (!box.contains(document.activeElement)) expand(false); }, 0));
+    input.onkeydown = event => {
+      const rows = [...options.querySelectorAll('[role="option"]')];
+      if (event.key === 'Escape' && !menu.hidden) { event.preventDefault(); event.stopPropagation(); expand(false); }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault(); if (menu.hidden) expand(true);
+        active = rows.length ? (active + (event.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length : -1;
+        rows.forEach((r, i) => r.classList.toggle('active', i === active));
+        if (rows[active]) { input.setAttribute('aria-activedescendant', rows[active].id); rows[active].scrollIntoView({ block: 'nearest' }); }
+      }
+      if (event.key === 'Enter' && !menu.hidden) { event.preventDefault(); rows[active]?.click(); }
+    };
+    budget.addEventListener('input', () => { if (taskId && budget.checkValidity()) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; } });
+    paint();
+    if (live && !live.canEdit) {
+      box.querySelectorAll('input, button').forEach(control => { control.disabled = true; });
+      if (save) save.hidden = true;
+      return;
+    }
+    if (save) {
+      save.disabled = !S.paymentEdits?.[taskId];
+      save.onclick = async () => {
+        save.disabled = true;
+        try {
+          const policy = readTaskPayments(box);
+          const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/payments`, { method: 'PUT', body: JSON.stringify(policy) });
+          delete S.paymentEdits?.[taskId];
+          box.querySelector('.payment-spent').textContent = `${usd(result.spent)} spent`;
+          toast(result.released.length ? 'Budget saved; pending payment approved' : 'Payments saved');
+        } catch (e) { save.disabled = false; toast(e.message, true); }
+      };
+    }
+  } catch (e) { box.querySelector('.payment-error').textContent = e.message; }
 }
 
 // Timing is fetched on demand, independently of the bounded conversation window.

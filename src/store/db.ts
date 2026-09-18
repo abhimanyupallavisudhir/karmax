@@ -149,6 +149,23 @@ export class Store {
     this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.migrate();
     this.migrateData();
+    this.paymentTransaction(() => {
+      if (this.kvGet('migration:unique-card-names')) return;
+      const rows = this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
+        FROM cards c LEFT JOIN projects p ON c.scope='project' AND c.scopeId=p.id ORDER BY c.createdAt, c.id`).all() as any[];
+      const seen = new Map<string, Set<string>>();
+      for (const card of rows) {
+        const org = card.scope === 'organization' ? card.scopeId : card.organizationId ?? 'org_personal';
+        const names = seen.get(org) ?? new Set<string>();
+        seen.set(org, names);
+        const base = String(card.label).trim() || 'Card';
+        let name = base, suffix = 2;
+        while (names.has(name.toLowerCase())) name = `${base} (${suffix++})`;
+        names.add(name.toLowerCase());
+        if (name !== card.label) this.db.prepare('UPDATE cards SET label=? WHERE id=?').run(name, card.id);
+      }
+      this.kvSet('migration:unique-card-names', '1');
+    });
   }
 
   /** One-time data migrations (idempotent; run every boot). */
@@ -4488,6 +4505,18 @@ export class Store {
   setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
     // A fresh epoch prevents an in-flight span crossing a rapid off/on cycle.
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
+    if (workflow === 'payments') {
+      if (values.budget !== undefined && values.budget !== null && (!Number.isSafeInteger(values.budget) || Number(values.budget) < 0))
+        throw new Error('Budget must be a non-negative amount in cents');
+      if (values.cardIds !== undefined) {
+        const project = this.getProject(scopeKey);
+        const org = project?.organizationId ?? (scopeKey.startsWith('organization:') ? scopeKey.slice(13) : 'org_personal');
+        const cards = this.listCards(project?.id, org);
+        if (!Array.isArray(values.cardIds) || values.cardIds.some(id => !cards.some(card => card.id === id && card.status !== 'canceled')))
+          throw new Error('Choose available cards from this organization');
+      }
+    }
+
     if (values.otherAttempts !== undefined && !['ask', 'keep', 'cancel'].includes(values.otherAttempts as string))
       throw new Error('otherAttempts must be ask, keep, or cancel');
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && values.remote === 'none')
@@ -5539,16 +5568,40 @@ export class Store {
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
 
+  /** Keep policy accounting and reservation insertion atomic across workers. */
+  paymentTransaction<T>(fn: () => T): T {
+    const nested = this.db.inTransaction();
+    if (!nested) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.db.dialect === 'postgres') this.db.exec('LOCK TABLE cards, payment_spend_requests IN SHARE ROW EXCLUSIVE MODE');
+      const result = fn();
+      if (!nested) this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      if (!nested) this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   createCard(c: { id: string; provider: string; scope: 'project' | 'organization' | 'global'; scopeId?: string;
     label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number;
     externalId?: string; currency?: string; status?: string; cardholderId?: string; last4?: string }) {
-    this.db
-      .prepare(`INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt,
-        externalId, currency, status, cardholderId, last4) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available,
-        c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt, c.externalId ?? null,
-        c.currency ?? 'usd', c.status ?? 'active', c.cardholderId ?? null, c.last4 ?? null);
+    this.paymentTransaction(() => {
+      const organizationId = c.scope === 'project' ? this.getProject(c.scopeId!)?.organizationId
+        : c.scope === 'organization' ? c.scopeId : 'org_personal';
+      c.label = c.label.trim();
+      if (!c.label || this.listOrganizationCards(organizationId ?? 'org_personal')
+        .some(card => card.label.trim().toLowerCase() === c.label.toLowerCase()))
+        throw new Error('Card name must be unique in the organization');
+      this.db
+        .prepare(`INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt,
+          externalId, currency, status, cardholderId, last4) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available,
+          c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt, c.externalId ?? null,
+          c.currency ?? 'usd', c.status ?? 'active', c.cardholderId ?? null, c.last4 ?? null);
+    });
   }
+
   getCard(id: string): any {
     const r = this.db.prepare('SELECT * FROM cards WHERE id = ?').get(id) as any;
     return r ? cardRow(r) : undefined;
@@ -5685,7 +5738,7 @@ export class Store {
     if (input.taskId) { clauses.push('taskId=?'); values.push(input.taskId); }
     if (input.status) { clauses.push('status=?'); values.push(input.status); }
     return this.db.prepare(`SELECT * FROM payment_spend_requests${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''}
-      ORDER BY createdAt DESC`).all(...values) as any[];
+      ORDER BY createdAt DESC, rowid DESC`).all(...values) as any[];
   }
   /** `amount` is patchable because a request starts life as a *reservation* — an
    * upper bound the agent asked for — and the rail later reports what it really
@@ -5709,14 +5762,14 @@ export class Store {
   paymentSpent(taskId: string): number {
     this.expirePaymentSpendRequests();
     const row = this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
-      WHERE taskId=? AND (status IN ('consumed','settled')
+      WHERE taskId=? AND (status IN ('authorizing','consumed','settled')
         OR (status='authorized' AND expiresAt>?))`).get(taskId, Date.now()) as any;
     return Number(row?.amount ?? 0);
   }
-  cardPaymentSpent(cardId: string): number {
+  cardPaymentSpent(cardId: string, railOnly = false): number {
     this.expirePaymentSpendRequests();
     const row = this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
-      WHERE cardId=? AND (status IN ('consumed','settled')
+      WHERE cardId=? AND (status IN (${railOnly ? "'consumed','settled'" : "'authorizing','consumed','settled'"})
         OR (status='authorized' AND expiresAt>?))`).get(cardId, Date.now()) as any;
     return Number(row?.amount ?? 0);
   }
@@ -5734,7 +5787,7 @@ export class Store {
   expirePaymentSpendRequests(now = Date.now()): number {
     return Number(this.db.prepare(`UPDATE payment_spend_requests
       SET status='expired', reason='request expired', updatedAt=?
-      WHERE expiresAt<=? AND status IN ('authorized','pending_approval','needs_funding')`)
+      WHERE expiresAt<=? AND status='authorized'`)
       .run(now, now).changes);
   }
   /** `amount` is what the rail actually authorized, which `findPaymentAuthorization`

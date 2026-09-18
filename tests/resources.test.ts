@@ -16,20 +16,22 @@ import { ensureWorldExcluded } from '../src/world/secret-exclude.js';
 import { itemHandle, VaultItems } from '../src/autonomy/vault-items.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { CapabilityError, KarmaxApi } from '../src/platform/api.js';
+import { worldWorkingRelativePath } from '../src/world/types.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
 describe('project resources', () => {
-  it('Git-excludes file secrets only in the task worktree that owns them', async () => {
+  it.each([undefined, 'nested'] as const)('Git-excludes file secrets only in their owning worktree (%s layout)', async (layout) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-secret-exclude-'));
     const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
     fs.writeFileSync(path.join(repo, 'README.md'), 'base\n');
     await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
     const provider = new WorktreeProvider(path.join(dir, 'worlds'));
-    const first = await provider.create({ taskId: 'secret-a', repo, base: 'main', target: 'main' });
-    await first.writeFile('.env.local', 'TOKEN=secret');
-    await ensureWorldExcluded(first, '.env.local');
+    const first = await provider.create({ taskId: 'secret-a', repo, base: 'main', target: 'main', layout });
+    const target = worldWorkingRelativePath(first.handle, '.env.local');
+    await first.writeFile(target, 'TOKEN=secret');
+    await ensureWorldExcluded(first, target);
     expect((await first.exec('git', ['status', '--porcelain'])).stdout).not.toContain('.env.local');
     await first.exec('git', ['add', '-A']);
     expect((await first.exec('git', ['diff', '--cached', '--name-only'])).stdout.trim()).toBe('');

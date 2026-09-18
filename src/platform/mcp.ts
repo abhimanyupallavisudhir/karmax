@@ -556,7 +556,8 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     inputSchema: {
       path: z.string().optional(), vaultItemId: z.string().optional(), field: z.string().optional(), name: z.string(),
       driver: z.enum(['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1']).optional(),
-      targetPath: z.string().optional(), targetEnvironment: z.string().optional(), targetService: z.string().optional(),
+      targetPath: z.string().describe('Path relative to the task working directory (the sole development checkout, or the workspace for multiple development repositories).').optional(),
+      targetEnvironment: z.string().optional(), targetService: z.string().optional(),
       access: z.enum(['read', 'write']).optional(), publish: z.enum(['discard', 'review']).optional(),
     },
   }, async (a) => wrap(() => {
