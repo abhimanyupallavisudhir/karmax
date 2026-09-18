@@ -1,8 +1,9 @@
-// Real layout regression: PLAYWRIGHT_MODULE=/path/to/playwright node web/conversation-scroll.browser.test.cjs
+// Real layout regression: npx playwright install chromium
+// Run: node web/conversation-scroll.browser.test.cjs
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const { chromium } = require('playwright');
 const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 function fn(name) {
   const start = src.indexOf(`function ${name}(`);

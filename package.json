@@ -39,6 +39,7 @@
     "@temporalio/workflow": "^1.20.2",
     "better-auth": "^1.6.23",
     "e2b": "^2.33.0",
+    "esbuild": "0.28.1",
     "imapflow": "^1.5.0",
     "node-pty": "^1.1.0",
     "nodemailer": "^9.0.3",
@@ -46,14 +47,14 @@
     "tsx": "^4.19.2",
     "ws": "^8.18.0",
     "yaml": "^2.9.0",
-    "zod": "^4.0.0",
-    "esbuild": "0.28.1"
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/pg": "^8.15.5",
     "@types/ws": "^8.5.13",
     "@vitest/coverage-v8": "^4.1.10",
+    "playwright": "1.63.0",
     "typescript": "^5.7.2",
     "vitest": "^4.1.10"
   }
