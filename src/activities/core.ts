@@ -1282,6 +1282,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
+          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
+          const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
+            || sameRepository(repo.repo, wikiSource));
+          if (wiki) wiki.role = 'project-wiki';
+        }
+        // A platform-owned companion must not unexpectedly move agents out of
+        // the project's only development repository. Keep `root` as the world
+        // boundary so the wiki remains accessible, and select that development
+        // checkout as the default cwd. Genuine multi-development-repo projects
+        // retain the encompassing root as their working directory.
+        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
         if (forkCheckpoint) {
           await deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!);
           if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
@@ -1301,19 +1314,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (profile) world.handle.meta = { ...world.handle.meta,
           gitProfile: profile.name, gitProfileScope: gitBinding.scope };
-        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
-          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
-          const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
-            || sameRepository(repo.repo, wikiSource));
-          if (wiki) wiki.role = 'project-wiki';
-        }
-        // A platform-owned companion must not unexpectedly move agents out of
-        // the project's only development repository. Keep `root` as the world
-        // boundary so the wiki remains accessible, and select that development
-        // checkout as the default cwd. Genuine multi-development-repo projects
-        // retain the encompassing root as their working directory.
-        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
-        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
             ...(wikiRepository ? [wikiRepository.id] : [])] };
@@ -2003,12 +2003,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
             : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
         : '';
+      const paymentService = deps.payments ? new BudgetService(store, deps.paymentRegistry ?? deps.payments) : undefined;
+      const paymentCards = paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant }) ?? [];
+      const paymentPolicy = paymentService?.policy(args.task.projectId, args.taskId);
+      const paymentContext = paymentCards.length ? `\n\nPayment cards available to this task: ${JSON.stringify(paymentCards.map(c => ({ name: c.label, id: c.id })))}. `
+        + `Task budget (USD): ${paymentPolicy?.budget == null ? 'unlimited' : (paymentPolicy.budget / 100).toFixed(2)}. `
+        + `Spent/reserved (USD): ${(store.paymentSpent(args.taskId) / 100).toFixed(2)}. `
+        + 'Use request_spend with card_name to choose a card. Follow the user’s restrictions on each card. Over-budget payments require approval.' : '';
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
         world: args.worldHandle,
-        globalInstructions: globalInstructions + forkContext + attemptContext,
+        globalInstructions: (globalInstructions ?? '') + forkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
       });
@@ -2338,6 +2345,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                     throw new Error('payment request is not an active reservation for this task');
                   const card = request.cardId ? store.getCard(request.cardId) : undefined;
                   if (!card) throw new Error('secure fill requires a reserved card');
+                  if (!new BudgetService(store, deps.paymentRegistry ?? deps.payments!).cards({
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant,
+                  }).some(c => c.id === card.id)) throw new Error('card is no longer selected for this task');
                   // Any rail that can resolve a card's secret half is fillable; the
                   // mock rail deliberately cannot, because it moves no real money.
                   const provider = deps.paymentRegistry?.forCard(card as any);

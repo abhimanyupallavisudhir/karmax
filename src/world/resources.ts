@@ -11,7 +11,7 @@ import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { worldRelativePath, worldRepos } from './types.js';
+import { worldRelativePath, worldRepos, worldWorkingRelativePath } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
   SIG_ENQUEUE_RESOURCE_PUBLISH, SIG_RELEASE_RESOURCE_PUBLISH,
@@ -320,7 +320,8 @@ export class ProjectResourceService {
     return this.engine.objectStoreForAttachment(attachment);
   }
 
-  /** Materialize all enabled project defaults into a newly-created generation. */
+  /** Materialize all enabled project defaults into a newly-created generation.
+   * The caller must select the agent workdir before resolving path targets. */
   async materialize(projectId: string, taskId: string, world: World, generation = world.handle.generation ?? 1,
     revisions: Record<string, string | undefined> = {}): Promise<WorldHandle> {
     const ephemeralPaths = new Set<string>(Array.isArray(world.handle.meta?.ephemeralPaths)
@@ -336,14 +337,16 @@ export class ProjectResourceService {
           if (!attachment.credentialHandles[0]) throw new Error(`resource "${attachment.name}" has no configured credential`);
           const value = this.resolveSecret(attachment, taskId);
           if (attachment.target.kind === 'path') {
-            const target = safePath(attachment.target.path);
+            const target = worldWorkingRelativePath(world.handle, attachment.target.path);
             await world.writeFile(target, value);
-            await world.exec('chmod', ['600', target]);
+            await world.exec('chmod', ['600', target], { cwd: world.handle.root });
             await ensureWorldExcluded(world, target);
             ephemeralPaths.add(target);
+            projections[attachment.id] = { target, revisionId, access: attachment.access };
           }
         } else if (isSnapshotDriver(attachment.driver)) {
-          const target = attachment.target.kind === 'path' ? safePath(attachment.target.path) : undefined;
+          const target = attachment.target.kind === 'path'
+            ? worldWorkingRelativePath(world.handle, attachment.target.path) : undefined;
           if (!target) throw new Error(`resource "${attachment.name}" requires a path target`);
           if (target !== '.') await ensureWorldExcluded(world, target);
           if (revisionId) {
@@ -359,14 +362,14 @@ export class ProjectResourceService {
                 if (world.writeFileBuffer) await world.writeFileBuffer(temporary, data);
                 else await world.writeFile(temporary, data.toString('base64'));
                 const appended = world.writeFileBuffer
-                  ? await world.exec('bash', ['-lc', `cat ${quote(temporary)} >> ${quote(relative)} && rm -f ${quote(temporary)}`])
-                  : await world.exec('bash', ['-lc', `base64 -d ${quote(temporary)} >> ${quote(relative)} && rm -f ${quote(temporary)}`]);
+                  ? await world.exec('bash', ['-lc', `cat ${quote(temporary)} >> ${quote(relative)} && rm -f ${quote(temporary)}`], { cwd: world.handle.root })
+                  : await world.exec('bash', ['-lc', `base64 -d ${quote(temporary)} >> ${quote(relative)} && rm -f ${quote(temporary)}`], { cwd: world.handle.root });
                 if (appended.code !== 0) throw new Error(appended.stderr || `could not restore ${relative}`);
               }
             });
           }
           if (attachment.access === 'read')
-            await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`]);
+            await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`], { cwd: world.handle.root });
           projections[attachment.id] = { target, revisionId, access: attachment.access };
         } else throw new Error(`no resource driver registered for ${attachment.driver}`);
         this.store.updateResourceLease(lease.id, 'active', JSON.stringify({ driver: attachment.driver }));
@@ -464,9 +467,9 @@ export class ProjectResourceService {
       if (lease.state !== 'active') continue;
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
       if (!attachment?.enabled || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
-      const target = safePath(attachment.target.path);
+      const target = resourcePath(world.handle, attachment);
       await world.writeFile(target, this.resolveSecret(attachment, lease.taskId));
-      await world.exec('chmod', ['600', target]);
+      await world.exec('chmod', ['600', target], { cwd: world.handle.root });
       await ensureWorldExcluded(world, target);
     }
     return this.withEnvironment(world);
@@ -478,7 +481,7 @@ export class ProjectResourceService {
     for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
       if (attachment?.target.kind === 'path' && isSecretLike(attachment))
-        await world.exec('rm', ['-f', safePath(attachment.target.path)]).catch(() => undefined);
+        await world.exec('rm', ['-f', resourcePath(handle, attachment)], { cwd: handle.root }).catch(() => undefined);
     }
   }
 
@@ -495,7 +498,7 @@ export class ProjectResourceService {
       // write permission before a local/provider cleanup tries to unlink them;
       // otherwise a perfectly released resource can make world destruction fail.
       if (world && attachment?.access === 'read' && attachment.target.kind === 'path')
-        await world.exec('chmod', ['-R', 'u+w', safePath(attachment.target.path)]).catch(() => undefined);
+        await world.exec('chmod', ['-R', 'u+w', resourcePath(handle, attachment)], { cwd: handle.root }).catch(() => undefined);
       this.store.updateResourceLease(lease.id, 'released');
       if (attachment) this.store.appendAudit({ principalId: `task:${lease.taskId}`, action: 'resource:release',
         scopeKey: `project:${attachment.projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id } });
@@ -657,7 +660,8 @@ export class ProjectResourceService {
       || sourcePath.startsWith('.karmax-injection/'))
       throw new Error('candidate path must name declared non-secret task output, not the world root or an injection path');
     const projections = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>);
-    if (projections.some((projection) => projection.target && pathsOverlap(projection.target, sourcePath)))
+    if (projections.some((projection) => projection.target
+      && pathsOverlap(projection.target, worldWorkingRelativePath(handle, sourcePath))))
       throw new Error('path already belongs to an attached resource; promote that resource instead');
     if (this.store.listResourceCandidates(taskId, false).some((candidate) => candidate.sourcePath
       && pathsOverlap(candidate.sourcePath, sourcePath)))
@@ -772,7 +776,7 @@ export class ProjectResourceService {
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
         .map((projection) => projection.target).filter((value): value is string => Boolean(value)),
       ...this.store.listResourceCandidates(taskId, false).map((candidate) => candidate.sourcePath)
-        .filter((value): value is string => Boolean(value)),
+        .filter((value): value is string => Boolean(value)).map((value) => worldWorkingRelativePath(handle, value)),
     ];
     const found: IgnoredResourceInventory['entries'] = [];
     let truncated = false;
@@ -836,7 +840,7 @@ export class ProjectResourceService {
         continue;
       }
       const captured = await this.engine.capture(attachment,
-        filesFromWorld(world, safePath(attachment.target.path), attachment));
+        filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment));
       const revision = this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
         engine: this.engine.id, ...captured, metadata: { checkpoint: true }, createdByTaskId: lease.taskId });
       refs.push({ attachmentId: attachment.id, revisionId: revision.id });
@@ -881,7 +885,7 @@ export class ProjectResourceService {
       .find((candidate) => candidate.attachmentId === attachmentId && candidate.state === 'active');
     if (!lease) throw new Error('task has no active lease for resource');
     if (attachment.target.kind !== 'path') throw new Error('resource has no filesystem state to publish');
-    return { attachment, lease, target: safePath(attachment.target.path), world: await this.worlds.open(handle) };
+    return { attachment, lease, target: resourceAbsolutePath(handle, attachment), world: await this.worlds.open(handle) };
   }
 
   private requiredAttachment(id: string): ResourceAttachment {
@@ -1122,6 +1126,22 @@ async function* cleanupChunks(chunks: AsyncIterable<Buffer>, cleanup?: () => Pro
   finally { await cleanup?.(); }
 }
 function isSecretLike(value: ResourceAttachment): boolean { return credentialResource(value); }
+/** Projections are physical, world-root-relative paths, pinned for the lifetime
+ * of a generation. Honor historical root projections even if the agent cwd has
+ * since changed; never capture an unrelated file from the new cwd. */
+function resourcePath(handle: WorldHandle, attachment: ResourceAttachment): string {
+  const projections = handle.meta?.resourceProjections as Record<string, { target?: string }> | undefined;
+  const pinned = projections?.[attachment.id]?.target;
+  if (pinned) return safePath(pinned);
+  if (attachment.target.kind !== 'path') throw new Error('resource has no filesystem target');
+  // Historical file secrets were root-relative and recorded only as ephemeral.
+  if (Array.isArray(handle.meta?.ephemeralPaths) && handle.meta.ephemeralPaths.includes(attachment.target.path))
+    return safePath(attachment.target.path);
+  return worldWorkingRelativePath(handle, attachment.target.path);
+}
+function resourceAbsolutePath(handle: WorldHandle, attachment: ResourceAttachment): string {
+  return path.posix.join(handle.root, resourcePath(handle, attachment));
+}
 function isSnapshotDriver(value: string): boolean { return snapshotResource(value); }
 function fileShaped(value: ResourceAttachment): boolean { return value.source.shape === 'file'; }
 function parseCopyEnv(value: string): Array<{ name: string; value: string }> {

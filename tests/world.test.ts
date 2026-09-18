@@ -13,6 +13,10 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import { ApplicationFailure } from '@temporalio/common';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { forkWorldSource } from '../src/world/fork.js';
+import { ProjectResourceService, ObjectSnapshotEngine } from '../src/world/resources.js';
+import { LocalObjectStore } from '../src/store/objects.js';
+import { Vault } from '../src/autonomy/vault.js';
+import { CredentialBroker } from '../src/autonomy/broker.js';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -206,23 +210,73 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
-  it('attaches the project wiki as a branch-and-merge companion repository', async () => {
+  it.each([false, true])('restores resources beside the agent with a companion wiki (multiple development repos: %s)', async (multiple) => {
     const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
     const store = new Store(':memory:');
-    const project = store.createProject('Wiki world', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const sources = [repo];
+    if (multiple) {
+      const extra = path.join(contentDir, 'extra'); fs.mkdirSync(extra);
+      await gitOrThrow(extra, ['init', '-q', '-b', 'main']); await ensureIdentity(extra);
+      await gitOrThrow(extra, ['commit', '--allow-empty', '-q', '-m', 'init']);
+      sources.push(extra);
+    }
+    const project = store.createProject('Wiki world', { repos: sources, defaultBase: 'main', defaultTarget: 'main' });
     const task = store.createTask({ projectId: project.id, title: 'Edit both', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'x' } });
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(home));
+    const broker = new CredentialBroker(new Vault(path.join(contentDir, 'vault')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(contentDir, 'objects')), broker), broker);
+    const ledger = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Ledger', driver: 'object-tree@1', target: { kind: 'path', path: 'runs/spend.sqlite' },
+      access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
+    // Larger than a snapshot chunk exercises append as well as the initial write.
+    const bytes = Buffer.alloc(5 * 1024 * 1024 + 17, 0x71);
+    await resources.importFiles(ledger.id, [{ path: 'spend.sqlite', data: bytes }]);
+    const dataset = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Dataset', driver: 'volume@1', target: { kind: 'path', path: 'data' },
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+    await resources.importFiles(dataset.id, [{ path: 'packets.jsonl', data: Buffer.from('dataset') }]);
+    broker.registerHandle('resource:wiki-test', 'private-token');
+    store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'File secret', driver: 'secret@1', target: { kind: 'path', path: '.env.local' },
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:wiki-test'], publish: 'discard' });
     const core = makeCoreActivities({ store, worlds, adapters: new Map(),
-      profiles: new ProfileResolver(store, 'mock'), contentDir });
+      profiles: new ProfileResolver(store, 'mock'), contentDir, resources });
     try {
-      const handle = await core.createWorld({ taskId: task.id, repos: [repo], base: 'main', target: 'main', kind: 'worktree' });
-      expect(handle.repos).toHaveLength(2);
+      const handle = await core.createWorld({ taskId: task.id, repos: sources, base: 'main', target: 'main', kind: 'worktree' });
+      expect(handle.repos).toHaveLength(multiple ? 3 : 2);
       expect(handle.repos!.find((candidate) => candidate.role === 'project-wiki')).toMatchObject({
         branch: `karmax/${task.id}`, base: 'main', target: 'main',
       });
-      expect(handle.workdir).toBe(handle.repos!.find((candidate) => candidate.role !== 'project-wiki')!.root);
+      const cwd = handle.workdir ?? handle.root;
+      expect(cwd).toBe(multiple ? handle.root : handle.repos!.find((candidate) => candidate.role !== 'project-wiki')!.root);
+      expect(fs.readFileSync(path.join(cwd, 'runs/spend.sqlite')).equals(bytes)).toBe(true);
+      if (!multiple) expect(fs.existsSync(path.join(handle.root, 'runs/spend.sqlite'))).toBe(false);
+      const datasetFile = path.join(cwd, 'data/packets.jsonl');
+      expect(fs.readFileSync(datasetFile, 'utf8')).toBe('dataset');
+      expect(fs.statSync(datasetFile).mode & 0o222).toBe(0);
+      const world = await worlds.open(handle);
+      for (const checkout of handle.repos!) {
+        const status = await world.exec('git', ['status', '--porcelain'], { cwd: checkout.root });
+        expect(status.code).toBe(0);
+        expect(status.stdout.trim()).toBe('');
+      }
+      expect(fs.statSync(path.join(cwd, '.env.local')).mode & 0o777).toBe(0o600);
+      await resources.scrubSecrets(handle);
+      expect(fs.existsSync(path.join(cwd, '.env.local'))).toBe(false);
+      await resources.prepare(world);
+      expect(fs.readFileSync(path.join(cwd, '.env.local'), 'utf8')).toBe('private-token');
+      fs.writeFileSync(path.join(cwd, 'runs/spend.sqlite'), 'updated');
+      expect(await resources.summarize(task.id, ledger.id)).toMatchObject({ modified: 1, deleted: 0 });
+      const refs = await resources.checkpoint(handle);
+      expect((await resources.verifyRevision(project.id, ledger.id, refs[0]!.revisionId)).verifiedBytes).toBe(7);
+      expect((await resources.promote(task.id, ledger.id)).revision.bytes).toBe(7);
+      await expect(resources.proposePath(task.id, { path: 'runs/spend.sqlite', name: 'Duplicate',
+        target: { kind: 'path', path: 'other.sqlite' } })).rejects.toThrow(/already belongs/);
+      await resources.release(handle);
+      expect(fs.statSync(datasetFile).mode & 0o200).toBe(0o200);
       await worlds.open(handle).then((world) => world.destroy());
     } finally {
       fs.rmSync(contentDir, { recursive: true, force: true });

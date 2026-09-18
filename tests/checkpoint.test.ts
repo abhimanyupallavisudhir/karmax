@@ -157,12 +157,23 @@ describe('portable world checkpoints', () => {
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
-    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker);
+    const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources);
+    const ledger = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Ledger', driver: 'object-tree@1', target: { kind: 'path', path: 'runs/spend.sqlite' },
+      access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
+    await resources.importFiles(ledger.id, [{ path: 'spend.sqlite', data: Buffer.from('original') }]);
 
     const world = await worlds.create('worktree', { taskId: task.id, repos: [development, wiki], base: 'main',
       repositoryBranches: { [wiki]: { base: 'project-wiki', target: 'project-wiki' } } });
     world.handle.repos![1]!.role = 'project-wiki';
     world.handle.meta = { projectId: project.id };
+    // Reproduce the old ordering: resources at the boundary, followed by an
+    // agent cwd inside the development checkout. Capture must honor the pinned
+    // location, then restore into the new generation's selected cwd.
+    world.handle = await resources.materialize(project.id, task.id, world);
+    await world.writeFile('runs/spend.sqlite', 'historical ledger');
+    world.handle.workdir = world.handle.repos![0]!.root;
     world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
     await world.writeFile('wiki/unpublished.md', 'portable wiki edit\n');
     const checkpoint = await checkpoints.checkpoint(world.handle);
@@ -187,6 +198,9 @@ describe('portable world checkpoints', () => {
     expect(restoredHandle.workdir).toBe(restoredRepos[0]!.root);
     const restored = await worlds.open(restoredHandle);
     expect(await restored.readFile('wiki/unpublished.md')).toBe('portable wiki edit\n');
+    expect(await restored.readFile('development/runs/spend.sqlite')).toBe('historical ledger');
+    expect(fs.existsSync(path.join(restoredHandle.root, 'runs/spend.sqlite'))).toBe(false);
+    expect(await resources.summarize(task.id, ledger.id)).toMatchObject({ added: 0, modified: 0, deleted: 0 });
 
     await restored.destroy();
     store.close();
