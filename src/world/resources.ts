@@ -404,7 +404,7 @@ export class ProjectResourceService {
     for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
       if (lease.state !== 'active') continue;
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
-      if (!attachment || !isSecretLike(attachment)) continue;
+      if (!attachment?.enabled || !isSecretLike(attachment)) continue;
       if (attachment.target.kind === 'environment' || attachment.target.kind === 'service')
         env[attachment.target.name] = this.resolveSecret(attachment, lease.taskId);
     }
@@ -431,13 +431,42 @@ export class ProjectResourceService {
       ...(Object.keys(refs).length ? { serviceEnvironmentHandles: refs } : {}) } };
   }
 
+  /** Environment defaults apply at the next open/turn boundary, including worlds
+   * created before the attachment. Never rematerialize snapshots or overwrite
+   * files here, and never revive a previously released/failed lease. */
+  private refreshEnvironmentLeases(handle: WorldHandle): void {
+    const task = this.store.getTask(handle.id);
+    const current = this.store.currentWorld(handle.id);
+    const generation = handle.generation ?? 1;
+    if (!task || !current || (current.generation ?? 1) !== generation
+      || this.store.worldState(handle.id) === 'released'
+      || current.meta?.projectId !== task.projectId || handle.meta?.projectId !== task.projectId) return;
+    const project = this.store.getProject(task.projectId);
+    if (!project) return;
+    const existing = new Set(this.store.listResourceLeases(handle.id, generation).map((lease) => lease.attachmentId));
+    for (const attachment of this.store.listResourceAttachments(project.id)) {
+      if (attachment.organizationId !== project.organizationId || !isSecretLike(attachment)
+        || attachment.target.kind === 'path' || existing.has(attachment.id)) continue;
+      // Resolve before recording the lease: a transient broker failure must
+      // fail this open, but remain retryable on the next one.
+      this.resolveSecret(attachment, task.id);
+      const lease = this.store.createResourceLease({ attachmentId: attachment.id, taskId: task.id,
+        worldId: handle.id, worldGeneration: generation, access: attachment.access, state: 'active',
+        sealedDriverRef: JSON.stringify({ driver: attachment.driver }) });
+      this.store.appendAudit({ principalId: `task:${task.id}`, action: 'resource:lease',
+        scopeKey: `project:${project.id}`, detail: { attachmentId: attachment.id, leaseId: lease.id,
+          access: attachment.access, worldGeneration: generation } });
+    }
+  }
+
   /** Rehydrate path credentials after a park/resume and wrap environment
    * credentials for this one access. Provider snapshots are scrubbed first. */
   async prepare(world: World): Promise<World> {
+    this.refreshEnvironmentLeases(world.handle);
     for (const lease of this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1)) {
       if (lease.state !== 'active') continue;
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
-      if (!attachment || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
+      if (!attachment?.enabled || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
       const target = resourcePath(world.handle, attachment);
       await world.writeFile(target, this.resolveSecret(attachment, lease.taskId));
       await world.exec('chmod', ['600', target], { cwd: world.handle.root });
