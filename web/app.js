@@ -14327,6 +14327,29 @@ function wireConnectionActions(root, organizationId, refresh) {
   }));
 }
 
+async function wireInstallationComposioCard() {
+  const box = document.getElementById('installation-composio-card'); if (!box) return;
+  try {
+    const config = await api('/api/connections/config');
+    if (!box.isConnected) return;
+    box.innerHTML = `<div class="section-h">Composio <span class="chip">${config.configured ? 'configured' : 'setup required'}</span></div>
+      <p class="task-sub">One Composio project API key serves every organization in this installation. Users connect their own accounts in Organization → Connected apps and choose which projects may use them.</p>
+      ${config.canConfigure ? `<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="${config.configured ? 'New key to replace the configured key' : 'Composio project API key'}" autocomplete="new-password" required aria-label="Composio project API key"><button class="btn sm primary">${config.configured ? 'Replace API key' : 'Set up connections'}</button></form>` : ''}`;
+    box.querySelector('[data-composio-config]')?.addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget; const button = form.querySelector('button');
+      const apiKey = form.elements.apiKey.value; form.elements.apiKey.value = '';
+      button.disabled = true;
+      try {
+        await api('/api/connections/config', { method: 'PUT', body: JSON.stringify({ apiKey }) });
+        toast('Composio configured for this installation');
+        await wireInstallationComposioCard();
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    });
+  } catch (error) { if (box.isConnected) paneError(box, error, wireInstallationComposioCard); }
+}
+
 async function hydrateConnections(organizationId) {
   const root = document.getElementById('service-connections'); if (!root) return;
   const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
@@ -14334,17 +14357,12 @@ async function hydrateConnections(organizationId) {
     const [config, connections] = await Promise.all([api(`/api/connections/config${oq}`), api(`/api/connections${oq}`)]);
     if (!root.isConnected) return;
     root.innerHTML = `${!config.configured ? `<p class="task-sub">An installation administrator needs to configure Composio before accounts can be connected.</p>
-      ${config.canConfigure ? '<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="Composio project API key" autocomplete="off" required aria-label="Composio project API key"><button class="btn sm primary">Set up connections</button></form>' : ''}` : `
+      ${config.canConfigure ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-composio">Set up Composio in Installation settings</a>` : ''}` : `
       <form data-connection-search class="inline-form"><input name="search" placeholder="Search apps, e.g. Gmail or Slack" aria-label="Search apps"><button class="btn sm">Search apps</button></form>
       <div data-connection-catalog></div>`}
       <div data-connection-list>${connectionRows(connections)}${!connections.length ? '<p class="task-sub">No accounts connected yet.</p>' : ''}</div>`;
     const refresh = () => hydrateConnections(organizationId);
     wireConnectionActions(root, organizationId, refresh);
-    root.querySelector('[data-composio-config]')?.addEventListener('submit', async e => {
-      e.preventDefault(); const form = e.currentTarget; const key = form.elements.apiKey.value; form.elements.apiKey.value = '';
-      try { await api(`/api/connections/config${oq}`, { method: 'PUT', body: JSON.stringify({ apiKey: key }) }); await refresh(); }
-      catch (error) { toast(error.message, true); }
-    });
     root.querySelector('[data-connection-search]')?.addEventListener('submit', async e => {
       e.preventDefault(); const form = e.currentTarget; const box = root.querySelector('[data-connection-catalog]');
       box.textContent = 'Searching apps…';
@@ -16233,12 +16251,13 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
+      <div class="settings-section-title" id="installation-composio"><div>Composio<small>App connection setup shared by every organization</small></div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
@@ -16363,6 +16382,7 @@ function wireInstallationSettings() {
   wireAppearanceCard();
   wireHostCapacityCard();
   wireInstallationGithubCard();
+  wireInstallationComposioCard();
   wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
