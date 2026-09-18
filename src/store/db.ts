@@ -943,24 +943,43 @@ export class Store {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
+  /** Slug validation and the write must share a transaction/lock with project
+   * transfers. Otherwise an insert that checked a name before a move could
+   * wait for its commit and then create a duplicate destination URL. */
+  private projectNameTransaction<T>(write: () => T): T {
+    const ownTransaction = !this.db.inTransaction();
+    if (ownTransaction) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.db.dialect === 'postgres') this.db.exec('LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE');
+      const value = write();
+      if (ownTransaction) this.db.exec('COMMIT');
+      return value;
+    } catch (error) {
+      if (ownTransaction) this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Project {
-    if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
-    const path = parseProjectPath(name);
-    assertRoutableName('project', path.name);
-    this.assertUniqueProjectName(organizationId, path.name);
-    config = writableProjectConfig(config);
-    validateProjectExecutionConfig(config);
-    const ord = (this.db
-      .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
-      .get(organizationId) as any).m + 1;
-    const p: Project = { id: newId('proj'), organizationId, name: path.name, createdAt: Date.now(), config, order: ord,
-      ...(path.folder ? { folder: path.folder } : {}) };
-    this.db
-      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord, folder) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null);
-    // every project gets a default task list
-    this.createList(p.id, 'Tasks');
-    return p;
+    return this.projectNameTransaction(() => {
+      if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+      const path = parseProjectPath(name);
+      assertRoutableName('project', path.name);
+      this.assertUniqueProjectName(organizationId, path.name);
+      config = writableProjectConfig(config);
+      validateProjectExecutionConfig(config);
+      const ord = (this.db
+        .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
+        .get(organizationId) as any).m + 1;
+      const p: Project = { id: newId('proj'), organizationId, name: path.name, createdAt: Date.now(), config, order: ord,
+        ...(path.folder ? { folder: path.folder } : {}) };
+      this.db
+        .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord, folder) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null);
+      // every project gets a default task list
+      this.createList(p.id, 'Tasks');
+      return p;
+    });
   }
 
   getProject(id: string): Project | undefined {
@@ -975,14 +994,16 @@ export class Store {
   }
 
   renameProject(id: string, name: string): Project {
-    const existing = this.getProject(id);
-    if (!existing) throw new Error(`no project ${id}`);
-    const path = parseProjectPath(name);
-    assertRoutableName('project', path.name);
-    this.assertUniqueProjectName(existing.organizationId ?? 'org_personal', path.name, id);
-    this.db.prepare('UPDATE projects SET name = ?, folder = ? WHERE id = ?').run(path.name, path.folder ?? null, id);
-    const { folder: _, ...rest } = existing;
-    return { ...rest, name: path.name, ...(path.folder ? { folder: path.folder } : {}) };
+    return this.projectNameTransaction(() => {
+      const existing = this.getProject(id);
+      if (!existing) throw new Error(`no project ${id}`);
+      const path = parseProjectPath(name);
+      assertRoutableName('project', path.name);
+      this.assertUniqueProjectName(existing.organizationId ?? 'org_personal', path.name, id);
+      this.db.prepare('UPDATE projects SET name = ?, folder = ? WHERE id = ?').run(path.name, path.folder ?? null, id);
+      const { folder: _, ...rest } = existing;
+      return { ...rest, name: path.name, ...(path.folder ? { folder: path.folder } : {}) };
+    });
   }
 
   /** Project URLs use the leaf name only, so the leaf's slug must be unique in
@@ -2757,6 +2778,7 @@ export class Store {
     /** Effective confirmer snapshot, recorded once for a new logical task. */
     confirmer?: unknown;
   }): TaskRecord {
+    this.assertProjectNotTransferring(input.projectId);
     const listId =
       input.listId ?? this.listLists(input.projectId)[0]?.id ?? this.createList(input.projectId, 'Tasks').id;
     const ord =
@@ -3199,6 +3221,8 @@ export class Store {
    * A previously queued task that was moved back to drafts keeps its permalink.
    */
   clearDraft(taskId: string) {
+    const projectId = this.getTask(taskId)?.projectId;
+    if (projectId) this.assertProjectNotTransferring(projectId);
     const t = this.getTask(taskId);
     if (!t) return;
     // A single UPDATE makes MAX+1 allocation safe even if two Store instances
@@ -4199,6 +4223,8 @@ export class Store {
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     const prefix = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
     for (const projectId of projectIds) {
+      exact.run(`project-transfer-current:${projectId}`);
+      exact.run(`project-transfer-lock:${projectId}`);
       exact.run(`authz:default:project:${projectId}`);
       exact.run(`credpolicy:project:${projectId}`);
       exact.run(`avatars:project:${projectId}`);
@@ -4207,6 +4233,7 @@ export class Store {
       prefix.run(workflowPrefix, workflowPrefix);
     }
     for (const taskId of taskIds) {
+      exact.run(`project-transfer-history:${taskId}`);
       const sharePrefix = `conversation-share-index:${taskId}:`;
       const shares = this.db.prepare('SELECT v FROM kv WHERE substr(k, 1, length(?))=?').all(sharePrefix, sharePrefix) as Array<{ v: string }>;
       for (const share of shares) exact.run(`conversation-share:${share.v}`);
@@ -4491,11 +4518,23 @@ export class Store {
       .run(scopeKey, workflow, JSON.stringify(values));
   }
 
+  /** Fence late asynchronous provisioning across an organization transfer. */
+  assertProjectOrganization(projectId: string, organizationId: string): void {
+    const project = this.getProject(projectId);
+    if (!project || project.organizationId !== organizationId) throw new Error('project organization changed; reload and retry');
+    this.assertProjectNotTransferring(projectId);
+  }
+
+  assertProjectNotTransferring(projectId: string): void {
+    const lock = this.kvGet(`project-transfer-lock:${projectId}`);
+    if (lock && JSON.parse(lock).expiresAt > Date.now()) throw new Error('project move in progress; retry when it finishes');
+  }
+
   // ─── Project resources ──────────────────────────────────────────────────
 
   createResourceAttachment(input: Omit<ResourceAttachment, 'id' | 'createdAt' | 'updatedAt' | 'enabled'>
     & Partial<Pick<ResourceAttachment, 'id' | 'createdAt' | 'updatedAt' | 'enabled'>>): ResourceAttachment {
-    if (!this.getProject(input.projectId)) throw new Error('resource project not found');
+    this.assertProjectOrganization(input.projectId, input.organizationId);
     const now = input.createdAt ?? Date.now();
     const value: ResourceAttachment = { ...input, id: input.id ?? newId('resource'), enabled: input.enabled ?? true,
       createdAt: now, updatedAt: input.updatedAt ?? now };
@@ -5410,6 +5449,7 @@ export class Store {
 
   createExecution(input: Omit<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>
     & Partial<Pick<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>>): ExecutionRecord {
+    this.assertProjectOrganization(input.projectId, input.organizationId);
     const startedAt = input.startedAt ?? Date.now();
     const value: ExecutionRecord = { ...input, state: input.state ?? 'starting', startedAt,
       heartbeatAt: input.heartbeatAt ?? startedAt };
@@ -5645,6 +5685,7 @@ export class Store {
   createPaymentSpendRequest(input: { organizationId: string; projectId: string; taskId: string;
     cardId?: string; amount: number; currency?: string; merchant?: string; why?: string;
     status: string; reason?: string; shortfall?: number; expiresAt?: number }): any {
+    this.assertProjectOrganization(input.projectId, input.organizationId);
     const now = Date.now();
     const id = newId('spend');
     this.db.prepare(`INSERT INTO payment_spend_requests
@@ -5861,8 +5902,9 @@ export class Store {
     let revoked = 0;
     for (const row of this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all() as any[]) {
       try {
-        const record = JSON.parse(row.json) as { projectId?: string; organizationId?: string };
-        if ((scope.projectId && record.projectId === scope.projectId)
+        const record = JSON.parse(row.json) as { projectId?: string; projectIds?: string[]; organizationId?: string; taskId?: string };
+        if ((scope.projectId && (record.projectId === scope.projectId || record.projectIds?.includes(scope.projectId)
+          || (record.taskId && this.getTask(record.taskId)?.projectId === scope.projectId)))
           || (scope.organizationId && record.organizationId === scope.organizationId))
           revoked += Number(update.run(now, row.tokenHash).changes);
       } catch {}
@@ -6156,7 +6198,7 @@ function parseJsonOptional<T>(value: unknown): T | undefined {
   return typeof value === 'string' && value ? JSON.parse(value) as T : undefined;
 }
 
-function slugify(value: string): string {
+export function slugify(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
 }
 

@@ -1133,6 +1133,11 @@ export class KarmaxApi {
     // project/global defaults could never reach an unqueued task. Keeping the
     // task sparse means it re-resolves against the live defaults when it's
     // finally queued (createTask below for immediate start, queueTask for drafts).
+    // Resolution may await external policy. Do not persist a task prepared
+    // against an organization that changed while we were awaiting it.
+    this.require(token, 'create_task', { projectId: args.projectId });
+    if (this.deps.store.getProject(project.id)?.organizationId !== project.organizationId)
+      throw new ValidationError('Project moved while preparing this task. Reload and retry.');
     let task = this.deps.store.createTask({
       projectId: args.projectId,
       title,
@@ -1626,6 +1631,11 @@ export class KarmaxApi {
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     if ((files as FileRef[] | undefined)?.length) input.files = files as FileRef[];
     if (_discardProgress === true) input.discardProgress = true;
+    const transferLock = this.deps.store.kvGet(`project-transfer-lock:${project.id}`);
+    if (this.deps.store.getProject(project.id)?.organizationId !== project.organizationId
+      || transferLock && JSON.parse(transferLock).expiresAt > Date.now()
+      || this.deps.store.kvGet(`project-transfer-history:${task.id}`))
+      throw new ValidationError('Project moved or is moving. Reload and start a new task.');
     return { startType, input, version: manifest.version };
   }
 
@@ -2229,6 +2239,11 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = this.deps.store.withPendingReviewInfo(taskId, view);
+      if (this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
+        const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
+        view = history;
+      }
+
       // Existing parked executions recorded only "account". Read the small
       // coordinator projection to explain that wait without replaying the task
       // or restarting its agent. New lease results already carry this detail.
@@ -2254,6 +2269,8 @@ export class KarmaxApi {
         ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
           : { actions: this.lifecycleActions(view) }),
+        ...(this.deps.store.kvGet(`project-transfer-history:${taskId}`)
+          ? { actions: [], stageTransitions: [] } : {}),
       };
     };
     // Snapshot-first (the default). The workflow persists `lastView` to the store on
