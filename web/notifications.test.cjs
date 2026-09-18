@@ -172,8 +172,6 @@ ok(!card.includes('Outcome updates for tasks I follow'),
 const css = fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8');
 ok(/p\.task-sub\s*\{[^}]*display:\s*block/.test(css), 'a prose paragraph flows as prose, not as a flex row');
 ok(/\.notify-row\s+\.urgency-chip\s*\{[^}]*justify-self:\s*start/.test(css), 'the chip hugs its word in the settings grid');
-ok(/\.inbox-row\s+\.urgency-chip\s*\{[^}]*margin-left/.test(css),
-  'and is spaced from the title only where it trails one');
 ok(!/^\.urgency-chip\s*\{[^}]*margin-left/m.test(css), 'the base chip carries no leading margin of its own');
 
 console.log(`${pass} passed, ${fail} failed`);

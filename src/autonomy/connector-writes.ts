@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { CredentialBroker } from './broker.js';
 import type { VaultFieldName } from './vault-items.js';
 
@@ -30,6 +31,7 @@ export function readConnectorWrites(store: OutboxStore, organizationId: string):
  * including when write-back is disabled and the retry worker is suspended. */
 export function deleteItemConnectorWrites(store: OutboxStore, broker: CredentialBroker | undefined,
   organizationId: string, itemId: string): void {
+  store.kvSet(`pass-writeback:${organizationId}:${itemId}`, JSON.stringify({ fields: {}, generation: randomUUID() }));
   const entries = readConnectorWrites(store, organizationId);
   const removed = entries.filter(entry => entry.itemId === itemId);
   if (!removed.length) return;

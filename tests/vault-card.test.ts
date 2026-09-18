@@ -127,6 +127,7 @@ describe('BudgetService over the vault-card rail', () => {
     provider = new VaultCardProvider(store, new CredentialBroker(new Vault(dir)));
     budget = new BudgetService(store, provider);
     projectId = store.createProject('P', {}).id;
+    store.setSettings(projectId, 'payments', { budget: null });
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 

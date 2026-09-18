@@ -490,3 +490,20 @@ describe('zero-exposure CDP fill (§5B)', () => {
     })).rejects.toThrow(/Karmax-managed chrome-devtools browser.*cdpUrl/);
   });
 });
+
+// RFC 6238 Appendix B: independently published SHA-256 and SHA-512 vectors.
+it('matches RFC 6238 SHA-256/SHA-512 vectors and a custom time step', () => {
+  const encode = (text: string) => {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; let bits = 0; let value = 0; let out = '';
+    for (const byte of Buffer.from(text)) { value = (value << 8) | byte; bits += 8; while (bits >= 5) { bits -= 5; out += alphabet[(value >>> bits) & 31]; } }
+    if (bits) out += alphabet[(value << (5 - bits)) & 31];
+    return out;
+  };
+  const seeds = { SHA256: encode('12345678901234567890123456789012'), SHA512: encode('1234567890123456789012345678901234567890123456789012345678901234') };
+  for (const [time, sha256, sha512] of [[59, '46119246', '90693936'], [1111111109, '68084774', '25091201'], [20000000000, '77737706', '47863826']] as const) {
+    expect(totpCode(`otpauth://totp/test?secret=${seeds.SHA256}&algorithm=SHA256&digits=8`, time * 1000)).toBe(sha256);
+    expect(totpCode(`otpauth://totp/test?secret=${seeds.SHA512}&algorithm=SHA512&digits=8`, time * 1000)).toBe(sha512);
+  }
+  const seed = encode('12345678901234567890');
+  expect(totpCode(`otpauth://totp/test?secret=${seed}&period=60&digits=8`, 119000)).toBe('94287082');
+});

@@ -192,7 +192,7 @@ export class MockPaymentProvider implements PaymentProvider {
     if (!c) return { ok: false, reason: 'no such card' };
     if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
     if (c.merchantLock?.length && (!merchant || !c.merchantLock.includes(merchant))) return { ok: false, reason: 'merchant not allowed' };
-    if (this.store.cardPaymentSpent(cardId) + amount > c.cap) return { ok: false, reason: 'exceeds card cap' };
+    if (this.store.cardPaymentSpent(cardId, true) + amount > c.cap) return { ok: false, reason: 'exceeds card cap' };
     if (amount > c.available) return { ok: false, reason: 'insufficient funds' };
     this.store.updateCard(cardId, { available: c.available - amount });
     return { ok: true, transactionId: newId('txn') };
@@ -266,7 +266,8 @@ export class VaultCardProvider implements PaymentProvider {
       last4: details.number.slice(-4), createdAt: Date.now(),
     };
     this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details));
-    this.store.createCard(card);
+    try { this.store.createCard(card); }
+    catch (error) { this.broker.deleteHandle(cardSecretHandle(card.id)); throw error; }
     return card;
   }
   async getCard(cardId: string): Promise<Card | undefined> {
@@ -819,7 +820,7 @@ export interface SpendInputs {
   allowance?: number;
   /** total already spent against the allowance (cents). */
   spent: number;
-  /** review threshold: a single spend above this needs human confirm even within allowance. */
+  /** @deprecated Ignored. Approval depends only on the cumulative task budget. */
   threshold?: number;
   /** funds available on the card (cents). */
   available: number;
@@ -830,8 +831,8 @@ export interface SpendInputs {
 }
 
 /**
- * Decide a spend (SPEC §7.6): hard cap → denied; over allowance or over the review
- * threshold → needs_approval; within policy but underfunded → needs_funding; else
+ * Decide a spend: hard cap → denied; over budget → needs_approval;
+ * within policy but underfunded → needs_funding; else
  * granted. Funding availability is orthogonal to the policy limits.
  */
 export function evaluateSpend(i: SpendInputs): SpendDecision {
@@ -843,10 +844,7 @@ export function evaluateSpend(i: SpendInputs): SpendDecision {
   }
   if (i.amount > i.hardCap) return { status: 'denied', reason: 'exceeds the card hard cap' };
   if (i.allowance !== undefined && i.spent + i.amount > i.allowance) {
-    return { status: 'needs_approval', reason: `over the agent allowance (${i.spent}+${i.amount} > ${i.allowance})` };
-  }
-  if (i.threshold !== undefined && i.amount > i.threshold) {
-    return { status: 'needs_approval', reason: `above the review threshold (${i.threshold})` };
+    return { status: 'needs_approval', reason: `over the task budget (${i.spent}+${i.amount} > ${i.allowance})` };
   }
   if (i.amount > i.available) {
     return { status: 'needs_funding', reason: 'insufficient funds on the card', shortfall: i.amount - i.available };
@@ -871,6 +869,7 @@ export interface SpendArgs {
   merchant?: string;
   why?: string;
   cardId?: string;
+  cardName?: string;
 }
 export interface SpendResult extends SpendDecision {
   cardId?: string;
@@ -889,14 +888,8 @@ export class BudgetService {
     return this.rails instanceof PaymentRegistry ? this.rails.forCard(card) : this.rails;
   }
 
-  /** allowance/threshold resolve project → organization (cents). */
-  private policy(projectId: string, organizationId?: string): { allowance?: number; threshold?: number } {
-    const org = organizationId ?? this.store.getProject(projectId)?.organizationId ?? 'org_personal';
-    const g = (this.store.getSettings(`organization:${org}`, 'payments')
-      ?? (org === 'org_personal' ? this.store.getSettings('global', 'payments') : undefined)
-      ?? {}) as any;
-    const p = (this.store.getSettings(projectId, 'payments') ?? {}) as any;
-    return { allowance: p.allowance ?? g.allowance, threshold: p.threshold ?? g.threshold };
+  policy(projectId: string, taskId?: string): PaymentPolicy {
+    return resolvePaymentPolicy(this.store, projectId, taskId);
   }
 
   private spent(taskId: string): number {
@@ -919,25 +912,28 @@ export class BudgetService {
       : Math.max(0, card.cap - this.store.cardPaymentSpent(card.id));
   }
 
-  private cards(ctx: SpendCtx): Card[] {
+  cards(ctx: SpendCtx): Card[] {
     const visible = this.store.listCards(ctx.projectId, ctx.organizationId)
-      .filter((card) => card.status !== 'canceled') as Card[];
-    const scoped = (ctx.capabilities ?? []).filter((capability) => capability.startsWith('use-card:'));
-    if (!scoped.length) return visible;
-    return visible.filter((card) => scoped.includes('use-card:*') || scoped.includes(`use-card:${card.id}`));
+      .filter((card) => card.status !== 'canceled' && card.status !== 'inactive') as Card[];
+    const storedCaps = (this.store.getTask(ctx.taskId)?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
+    const scoped = (ctx.capabilities ?? storedCaps ?? []).filter((capability) => capability.startsWith('use-card:'));
+    const selected = this.policy(ctx.projectId, ctx.taskId).cardIds;
+    return visible.filter(card => (!selected || selected.includes(card.id))
+      && (!scoped.length || scoped.includes('use-card:*') || scoped.includes(`use-card:${card.id}`)));
   }
 
   private existing(ctx: SpendCtx, args: SpendArgs): any {
     return this.store.listPaymentSpendRequests({ taskId: ctx.taskId }).find((request) =>
-      ['pending_approval', 'needs_funding', 'authorized', 'consumed', 'settled'].includes(request.status)
-      && request.expiresAt > Date.now() && request.amount === args.amount
+      ['authorizing', 'pending_approval', 'needs_funding', 'authorized', 'consumed', 'settled'].includes(request.status)
+      && (['authorizing', 'pending_approval', 'needs_funding'].includes(request.status) || request.expiresAt > Date.now())
+      && request.amount === args.amount
       && (!args.cardId || request.cardId === args.cardId)
       && (request.merchant ?? undefined) === args.merchant
       && (request.why ?? undefined) === args.why);
   }
 
   private result(request: any): SpendResult {
-    const status: SpendStatus = request.status === 'pending_approval' ? 'needs_approval'
+    const status: SpendStatus = ['pending_approval', 'authorizing'].includes(request.status) ? 'needs_approval'
       : ['authorized', 'consumed', 'settled'].includes(request.status) ? 'granted'
         : request.status === 'needs_funding' ? 'needs_funding' : 'denied';
     return { status, reason: request.reason ?? undefined, shortfall: request.shortfall ?? undefined,
@@ -951,17 +947,26 @@ export class BudgetService {
   async request(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
     if (!Number.isSafeInteger(args.amount) || args.amount <= 0)
       return { status: 'denied', reason: 'amount must be a positive number of cents' };
+    if (args.cardName) {
+      const matches = this.cards(ctx).filter(card => card.label.trim().toLowerCase() === args.cardName!.trim().toLowerCase());
+      if (matches.length !== 1 || (args.cardId && args.cardId !== matches[0]!.id))
+        return { status: 'denied', reason: 'Card name must identify one permitted card' };
+      args = { ...args, cardId: matches[0]!.id };
+    }
     const duplicate = this.existing(ctx, args);
-    if (duplicate) return this.result(duplicate);
+    if (duplicate) {
+      if (duplicate.cardId && !this.cards(ctx).some(c => c.id === duplicate.cardId))
+        return { status: 'denied', reason: 'card is no longer selected for this task', requestId: duplicate.id };
+      return this.result(duplicate);
+    }
     const organizationId = ctx.organizationId ?? this.store.getProject(ctx.projectId)?.organizationId ?? 'org_personal';
     const visibleCards = this.cards(ctx);
     const card = args.cardId
       ? visibleCards.find((candidate) => candidate.id === args.cardId)
       : visibleCards[0];
+    if (!card && args.cardId) return { status: 'denied', reason: 'the requested card is not available to this task' };
     if (!card) {
-      const reason = args.cardId
-          ? 'the requested card is not available to this project'
-          : 'no permitted card is configured for this project — add one or grant use-card access';
+      const reason = 'no card is selected for this task — choose a card in task parameters';
       const pending = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
         taskId: ctx.taskId, amount: args.amount, merchant: args.merchant, why: args.why,
         status: 'needs_funding', reason, shortfall: args.amount });
@@ -969,32 +974,29 @@ export class BudgetService {
     }
     const provider = this.provider(card);
     const refreshed = await provider.getCard(card.id) ?? card;
-    const { allowance, threshold } = this.policy(ctx.projectId, ctx.organizationId);
-    const decision = evaluateSpend({
-      amount: args.amount,
-      allowance,
-      spent: this.spent(ctx.taskId),
-      threshold,
-      available: refreshed.available,
-      hardCap: this.remainingCap(provider, refreshed),
-      merchant: args.merchant,
-      merchantLock: refreshed.merchantLock,
-    });
-    if (decision.status !== 'granted') {
-      const status = decision.status === 'needs_approval' ? 'pending_approval' : decision.status;
-      const pending = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
+    const reserved = this.store.paymentTransaction(() => {
+      if (!this.cards(ctx).some(c => c.id === card.id))
+        return { request: { status: 'denied', reason: 'card is no longer selected for this task' }, created: false };
+      const duplicate = this.existing(ctx, args);
+      if (duplicate) return { request: duplicate, created: false };
+      const { budget } = this.policy(ctx.projectId, ctx.taskId);
+      const decision = evaluateSpend({ amount: args.amount, allowance: budget ?? undefined,
+        spent: this.spent(ctx.taskId), available: refreshed.available,
+        hardCap: this.remainingCap(provider, refreshed), merchant: args.merchant,
+        merchantLock: refreshed.merchantLock });
+      const status = decision.status === 'granted'
+        ? provider.authorizationMode === 'webhook' ? 'authorized' : 'authorizing'
+        : decision.status === 'needs_approval' ? 'pending_approval' : decision.status;
+      const request = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
         taskId: ctx.taskId, cardId: card.id, amount: args.amount, currency: card.currency,
-        merchant: args.merchant, why: args.why, status, reason: decision.reason,
-        shortfall: decision.shortfall });
-      let fundingUrl: string | undefined;
-      if (decision.status === 'needs_funding') fundingUrl = (await provider.balance(organizationId)).fundingUrl;
+        merchant: args.merchant, why: args.why, status, reason: decision.reason, shortfall: decision.shortfall });
+      return { request, created: true };
+    });
+    const pending = reserved.request;
+    if (!reserved.created || pending.status !== 'authorizing') {
+      const fundingUrl = pending.status === 'needs_funding' ? (await provider.balance(organizationId)).fundingUrl : undefined;
       return { ...this.result(pending), fundingUrl };
     }
-    const pending = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
-      taskId: ctx.taskId, cardId: card.id, amount: args.amount, currency: card.currency,
-      merchant: args.merchant, why: args.why,
-      status: provider.authorizationMode === 'webhook' ? 'authorized' : 'authorizing' });
-    if (provider.authorizationMode === 'webhook') return this.result(pending);
     const auth = await provider.authorize(card.id, args.amount, args.merchant);
     if (!auth.ok) {
       return this.result(this.store.updatePaymentSpendRequest(pending.id, {
@@ -1010,7 +1012,23 @@ export class BudgetService {
     }));
   }
 
-  async approve(requestId: string, resolvedBy: string): Promise<SpendResult> {
+  /** Re-evaluate the oldest requests first; later requests cannot jump the queue. */
+  async reconcileTask(ctx: SpendCtx): Promise<SpendResult[]> {
+    const results: SpendResult[] = [];
+    const pending = this.store.listPaymentSpendRequests({ taskId: ctx.taskId })
+      .filter(r => r.status === 'pending_approval').reverse();
+    for (const request of pending) {
+      const policy = this.policy(ctx.projectId, ctx.taskId);
+      if (policy.budget !== null && this.spent(ctx.taskId) + request.amount > policy.budget) break;
+      if (!this.cards(ctx).some(card => card.id === request.cardId)) break;
+      const result = await this.approve(request.id, 'system:task-budget', true);
+      results.push(result);
+      if (result.status !== 'granted') break;
+    }
+    return results;
+  }
+
+  async approve(requestId: string, resolvedBy: string, withinBudget = false): Promise<SpendResult> {
     const request = this.store.getPaymentSpendRequest(requestId);
     if (!request) return { status: 'denied', reason: 'spend request not found' };
     if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
@@ -1021,31 +1039,44 @@ export class BudgetService {
         taskId: request.taskId,
         organizationId: request.organizationId,
       })[0];
+    if (card && !this.cards({ projectId: request.projectId, taskId: request.taskId, organizationId: request.organizationId }).some(c => c.id === card.id))
+      return { status: 'denied', reason: 'card is no longer selected for this task', requestId };
     if (!card) return this.result(this.store.updatePaymentSpendRequest(request.id,
       { status: 'denied', reason: 'card no longer exists', resolvedBy }));
     if (!request.cardId) this.store.setPaymentSpendRequestCard(request.id, card.id);
     const provider = this.provider(card);
     const refreshed = await provider.getCard(card.id) ?? card;
-    if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
-      return this.result(this.store.updatePaymentSpendRequest(request.id,
-        { status: 'denied', reason: 'card is not active', resolvedBy }));
-    // Re-count the ceiling here. Everything else queued while this request waited
-    // for a human has been charged in the meantime, and on a webhook rail approval
-    // is the LAST place a cap breach can be caught: it never calls `authorize()`.
-    if (request.amount > this.remainingCap(provider, refreshed)) {
-      return this.result(this.store.updatePaymentSpendRequest(request.id,
-        { status: 'denied', reason: 'exceeds the card hard cap', resolvedBy }));
-    }
-    if (refreshed.available < request.amount) {
-      return this.result(this.store.updatePaymentSpendRequest(request.id, {
-        status: 'needs_funding', reason: 'insufficient funds on the card',
-        shortfall: request.amount - refreshed.available, resolvedBy,
-      }));
-    }
-    if (provider.authorizationMode === 'webhook') {
-      return this.result(this.store.updatePaymentSpendRequest(request.id,
-        { status: 'authorized', reason: 'approved', shortfall: 0, resolvedBy, expiresAt: Date.now() + 30 * 60_000 }));
-    }
+    let wonClaim = false;
+    const claimed = this.store.paymentTransaction(() => {
+      const current = this.store.getPaymentSpendRequest(requestId)!;
+      if (!['pending_approval', 'needs_funding'].includes(current.status)) return current;
+      const policy = this.policy(request.projectId, request.taskId);
+      if (withinBudget && policy.budget !== null && this.spent(request.taskId) + request.amount > policy.budget) return current;
+      if (!this.cards({ projectId: request.projectId, taskId: request.taskId }).some(c => c.id === card.id)) return current;
+      if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
+        return this.store.updatePaymentSpendRequest(request.id,
+          { status: 'denied', reason: 'card is not active', resolvedBy });
+      // Re-count the ceiling here. Everything else queued while this request waited
+      // for a human has been charged in the meantime, and on a webhook rail approval
+      // is the LAST place a cap breach can be caught: it never calls `authorize()`.
+      if (request.amount > this.remainingCap(provider, refreshed)) {
+        return this.store.updatePaymentSpendRequest(request.id,
+          { status: 'denied', reason: 'exceeds the card hard cap', resolvedBy });
+      }
+      if (refreshed.available < request.amount) {
+        return this.store.updatePaymentSpendRequest(request.id, {
+          status: 'needs_funding', reason: 'insufficient funds on the card',
+          shortfall: request.amount - refreshed.available, resolvedBy,
+        });
+      }
+      if (provider.authorizationMode === 'webhook') {
+        return this.store.updatePaymentSpendRequest(request.id,
+          { status: 'authorized', reason: 'approved', shortfall: 0, resolvedBy, expiresAt: Date.now() + 30 * 60_000 });
+      }
+      wonClaim = true;
+      return this.store.updatePaymentSpendRequest(request.id, { status: 'authorizing', resolvedBy });
+    });
+    if (!wonClaim) return this.result(claimed);
     const auth = await provider.authorize(card.id, request.amount, request.merchant ?? undefined);
     if (!auth.ok) return this.result(this.store.updatePaymentSpendRequest(request.id,
       { status: 'needs_funding', reason: auth.reason, shortfall: request.amount, resolvedBy }));
@@ -1054,22 +1085,24 @@ export class BudgetService {
       providerId: auth.transactionId!, kind: 'transaction', status: 'settled',
       amount: request.amount, currency: request.currency, merchant: request.merchant });
     return this.result(this.store.updatePaymentSpendRequest(request.id,
-      { status: 'settled', providerAuthorizationId: auth.transactionId, reason: 'approved', resolvedBy }));
+      { status: 'settled', providerAuthorizationId: auth.transactionId, reason: 'approved', resolvedBy, expiresAt: Date.now() + 30 * 60_000 }));
   }
 
   deny(requestId: string, resolvedBy: string): SpendResult {
-    const request = this.store.getPaymentSpendRequest(requestId);
-    if (!request) return { status: 'denied', reason: 'spend request not found' };
-    // Same terminal-status guard `approve` has, and for a sharper reason: money.
-    // `paymentSpent`/`cardPaymentSpent` total only consumed/settled/live-authorized
-    // rows, so flipping an already-settled request to `denied` erased it from the
-    // task's allowance and the card's cap while the charge had already gone
-    // through — the agent got that budget back and could spend it a second time,
-    // and the transaction ledger disagreed with the allowance from then on.
-    // A reviewer clicking Deny on a stale list is all it took.
-    if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
-    return this.result(this.store.updatePaymentSpendRequest(request.id,
-      { status: 'denied', reason: 'denied by reviewer', resolvedBy }));
+    return this.store.paymentTransaction(() => {
+      const request = this.store.getPaymentSpendRequest(requestId);
+      if (!request) return { status: 'denied', reason: 'spend request not found' };
+      // Same terminal-status guard `approve` has, and for a sharper reason: money.
+      // `paymentSpent`/`cardPaymentSpent` total only consumed/settled/live-authorized
+      // rows, so flipping an already-settled request to `denied` erased it from the
+      // task's allowance and the card's cap while the charge had already gone
+      // through — the agent got that budget back and could spend it a second time,
+      // and the transaction ledger disagreed with the allowance from then on.
+      // A reviewer clicking Deny on a stale list is all it took.
+      if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
+      return this.result(this.store.updatePaymentSpendRequest(request.id,
+        { status: 'denied', reason: 'denied by reviewer', resolvedBy }));
+    });
   }
 
   /** Back-compatible test/helper entry point. */
@@ -1081,4 +1114,29 @@ export class BudgetService {
     const first = await this.request(ctx, args);
     return first.requestId ? this.approve(first.requestId, 'system:settle') : first;
   }
+}
+
+export interface PaymentPolicy { cardIds: string[]; budget: number | null }
+
+/** Defaults apply to new tasks; an explicit empty selection permits no cards. */
+export function resolvePaymentPolicy(store: Store, projectId: string, taskId?: string): PaymentPolicy {
+  const org = store.getProject(projectId)?.organizationId ?? 'org_personal';
+  const g = (store.getSettings(`organization:${org}`, 'payments')
+    ?? (org === 'org_personal' ? store.getSettings('global', 'payments') : undefined) ?? {}) as any;
+  const p = (store.getSettings(projectId, 'payments') ?? {}) as any;
+  const t = taskId ? (store.getTask(taskId)?.params as any)?.paymentPolicy : undefined;
+  const layer = t ?? p;
+  return { cardIds: layer.cardIds ?? g.cardIds ?? store.listCards(projectId, org).filter(c => c.status !== 'canceled').map(c => c.id),
+    budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance
+      ?? (Object.hasOwn(g, 'budget') ? g.budget : g.allowance ?? 0) };
+}
+
+export function validatePaymentPolicy(store: Store, projectId: string | undefined, organizationId: string, value: unknown): asserts value is PaymentPolicy {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid payment policy');
+  const p = value as PaymentPolicy;
+  if (p.budget !== null && (!Number.isSafeInteger(p.budget) || p.budget < 0))
+    throw new Error('Budget must be a non-negative amount in cents');
+  const cards = store.listCards(projectId, organizationId);
+  if (!Array.isArray(p.cardIds) || p.cardIds.some(id => typeof id !== 'string' || !cards.some(c => c.id === id && c.status !== 'canceled' && c.status !== 'inactive')))
+    throw new Error('Choose available cards from this organization');
 }

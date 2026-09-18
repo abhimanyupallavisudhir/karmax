@@ -1345,3 +1345,27 @@ it('deletes pending export snapshots with the vault item even while retries are 
   expect(service.pendingWrites()).toEqual([]);
   expect(broker.hasHandle(handle)).toBe(false);
 });
+
+it('queues Git rotations before remote revision lookup and respects dismissal during lookup', async () => {
+  const { items, store, broker } = makeVault();
+  const service = new Connectors(store, items, broker);
+  const connector = new GitPassConnector(() => service.secretFor('pass-git'));
+  connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
+  service.register(connector);
+  await service.connect('pass-git', JSON.stringify({ repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test' }));
+  service.setConfig('pass-git', { writeBack: true });
+  const item = items.save({ type: 'login', label: 'Entry', secrets: { password: 'local' },
+    provenance: { source: 'connector:pass-git', externalId: 'entry' } });
+  connector.catalog = async () => { throw new Error('transport unavailable'); };
+  expect((await service.propagate(item.id, ['password']))?.error).toBeTruthy();
+  expect(service.discardWrites('pass-git')).toBe(1);
+  let updates = 0;
+  connector.updateSecrets = async () => { updates++; };
+  connector.catalog = async () => {
+    expect(service.discardWrites('pass-git')).toBe(1);
+    return { items: [{ externalId: 'entry', type: 'login', label: 'Entry', fields: ['password'], revision: 'rev' }], failures: [] };
+  };
+  await service.propagate(item.id, ['password']);
+  expect(updates).toBe(0);
+  expect(service.discardWrites('pass-git')).toBe(0);
+});

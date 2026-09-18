@@ -179,6 +179,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
+  if (/^\/api\/tasks\/[^/]+\/payments$/.test(p)) return read ? 'task:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/github\/app-manifest$/.test(p)) return 'settings:write';
@@ -4191,6 +4192,31 @@ export class Gateway {
         if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
+      const taskPayments = p.match(/^\/api\/tasks\/([^/]+)\/payments$/);
+      if (taskPayments && (method === 'GET' || method === 'PUT')) {
+        const task = store.getTask(taskPayments[1]!);
+        if (!task) return this.json(res, 404, { error: 'no such task' });
+        const { BudgetService, resolvePaymentPolicy } = await import('../autonomy/payments.js');
+        let released: string[] = [];
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          await api.setTaskPaymentPolicy(token, task.id, body);
+          if (this.deps.paymentRegistry || this.deps.payments) {
+            const service = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
+            const results = await service.reconcileTask({ projectId: task.projectId, taskId: task.id });
+            released = results.filter(r => r.status === 'granted').map(r => r.requestId!);
+            if (released.length) await api.signalTask(token, task.id, 'followUp',
+              `Payment requests ${released.join(', ')} now fit the task budget and are ready. Continue using the same requests.`).catch(() => undefined);
+          }
+        }
+        const policy = resolvePaymentPolicy(store, task.projectId, task.id);
+        const cards = store.listCards(task.projectId).filter(card => policy.cardIds.includes(card.id))
+          .map(({ id, label, last4, status }) => ({ id, label, last4, status }));
+        return this.json(res, 200, { ...policy, cards,
+          canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
+            && this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId }).ok,
+          spent: store.paymentSpent(task.id), released });
+      }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {
         const b = await this.body(req);
@@ -6025,6 +6051,20 @@ export class Gateway {
                 });
                 return this.json(res, 200, config);
               }
+              if (connName[1] === 'pass-git') {
+                if (action === 'check') {
+                  const secret = connectors.secretFor('pass-git');
+                  if (!secret) throw new Error('Connect a password store first');
+                  return this.json(res, 200, await connectors.get('pass-git')!.validateSecret!(secret));
+                }
+                if (action === 'catalog') {
+                  const { GitPassConnector } = await import('../autonomy/connectors.js');
+                  const connector = connectors.get('pass-git');
+                  if (connector instanceof GitPassConnector) return this.json(res, 200, await connector.catalog());
+                }
+                if (action === 'retry-write-back') return this.json(res, 200, await connectors.retryWriteBack(String(b.itemId ?? '')) ?? { skipped: 'write-back disabled' });
+                if (action === 'accept-remote') return this.json(res, 200, await connectors.acceptRemote(String(b.itemId ?? '')));
+              }
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
               if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
                 { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
@@ -6231,6 +6271,9 @@ export class Gateway {
           : this.deps.paymentRegistry?.active(cardOrg) ?? this.deps.payments;
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
         try {
+          const name = String(b.label ?? 'Card').trim();
+          if (!name || store.listOrganizationCards(cardOrg).some(c => c.label.trim().toLowerCase() === name.toLowerCase()))
+            return this.json(res, 400, { error: 'Card name must be unique in the organization' });
           const card = await provider.provisionCard({
             scope: b.scope === 'project' ? 'project' : 'organization',
             scopeId: b.scope === 'project' ? b.projectId : cardOrg,

@@ -107,6 +107,15 @@ jobs:
             | tar -xz -C ~/.temporalio/bin temporal
           ~/.temporalio/bin/temporal --version
 
+      - name: Verify gopass 1.16.1 compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/gopass-1.16.1"
+          archive="$RUNNER_TEMP/gopass-1.16.1.tar.gz"
+          curl -fsSL 'https://github.com/gopasspw/gopass/releases/download/v1.16.1/gopass-1.16.1-linux-amd64.tar.gz' -o "$archive"
+          echo "be77309ba4491cedfb847155380fc04c3f356231d368721ee3c69b77ab0c0eb7  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gopass-1.16.1" gopass
+          GOPASS_BIN="$RUNNER_TEMP/gopass-1.16.1/gopass" npx vitest run tests/git-pass-interop.test.ts
+
       - run: npm run typecheck
       - run: npm test
 

@@ -813,7 +813,7 @@ describe('GitHub-authoritative merge activity', () => {
     expect(methods).toContain('PUT');
   });
 
-  it('parks one superseded merge-ref run once and follows a newer successful run without reopening the PR', async () => {
+  it('reconciles a cancelled merge-ref run before bounded retry and follows a newer successful run without reopening the PR', async () => {
     const cancellation = 'Canceling since a higher priority waiting request for CI-refs/pull/113/merge exists.';
     let checkSummary = cancellation;
     let inspectionLog = cancellation;
@@ -904,17 +904,17 @@ describe('GitHub-authoritative merge activity', () => {
       detail: expect.stringMatching(/bounded exact-head reconciliation/is) });
     expect(first).not.toHaveProperty('releaseAdmission');
     expect(repeated).toMatchObject({ status: 'waiting',
-      detail: expect.stringMatching(/supersession.*keep polling/is) });
+      detail: 'Waiting for CI' });
     expect(repeated).not.toHaveProperty('releaseAdmission');
     expect(core.store.eventsSince(task.id, 0)
       .filter((event) => event.type === 'github.ci.terminal-observed')).toHaveLength(1);
-    expect(reruns).toBe(0);
+    expect(reruns).toBe(1);
 
     newerActive = true;
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
       status: 'waiting', detail: expect.stringMatching(/equivalent same-head.*31737743300.*in_progress/is),
     });
-    expect(reruns).toBe(0);
+    expect(reruns).toBe(1);
 
     newerSucceeded = true;
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
@@ -933,64 +933,48 @@ describe('GitHub-authoritative merge activity', () => {
     inspectionLog = "passing fixture: You're out of usage credits. Your prepaid balance has now been fully consumed.\nThe operation was canceled.";
     const bounded = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
     expect(bounded).toMatchObject({ status: 'waiting', detail: expect.stringMatching(/bounded exact-head reconciliation/i) });
-    expect(reruns).toBe(0);
+    expect(reruns).toBe(1);
     core.store.close();
     core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, dbPath);
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
       status: 'waiting', detail: 'Waiting for CI',
     });
-    expect(reruns).toBe(1);
+    expect(reruns).toBe(2);
     await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(reruns).toBe(1);
+    expect(reruns).toBe(2);
 
-    // The no-Actions fallback consumes the same classifier and parks the
-    // unchanged proposal outside fallback admission while a replacement is
-    // still becoming visible.
+    // No diagnostic text is promoted to authority when Actions access is
+    // missing, even when it looks exactly like a provider message.
     actionsAvailable = false;
     readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'StatusContext', context: 'CI', state: 'FAILURE',
         targetUrl: `https://github.com/${SLUG}/actions/runs/44`, description: cancellation,
       }] } } };
+    const spoofed = [cancellation, 'Recent account payments have failed',
+      'The job was not started because your account is locked due to a billing issue.',
+      'Actions is disabled for this repository', 'AssertionError: expected 2 to equal 3'];
+    for (const available of [false, true]) {
+      actionsAvailable = available;
+      actionsForbidden = true;
+      for (const description of spoofed) {
+        readiness.statusCheckRollup.contexts.nodes[0].description = description;
+        const outcome = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+        expect(outcome).toMatchObject({ status: 'needs-human', releaseAdmission: true,
+          waitReason: 'GitHub Actions inspection unavailable' });
+        expect(outcome.detail).toContain(description);
+        expect(outcome.waitReason).not.toMatch(/billing|approval/);
+      }
+    }
+    expect(core.store.eventsSince(task.id, 0).filter(event => event.type === 'github.ci.repair-requested')).toHaveLength(0);
+    readiness.statusCheckRollup.contexts.nodes = [{ __typename: 'CheckRun', name: 'CI',
+      status: 'COMPLETED', conclusion: 'CANCELLED', detailsUrl: `https://github.com/${SLUG}/actions/runs/44` }];
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
-      status: 'waiting', releaseAdmission: true,
-      detail: expect.stringMatching(/equivalent CI request.*admission is released/is),
+      status: 'waiting', releaseAdmission: true, detail: expect.stringMatching(/interrupted check.*admission is released/is),
     });
-    const duplicateFallback = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(duplicateFallback).toMatchObject({ status: 'waiting', releaseAdmission: true,
-      detail: expect.stringMatching(/admission is released/is) });
-
-    // Missing App Actions access is diagnostic metadata, not the owner of the
-    // CI disposition. Permission-safe PR evidence still sends deterministic
-    // failures to Do, keeps supersession informational, and routes only direct
-    // provider/account evidence to a human.
-    actionsAvailable = true;
-    actionsForbidden = true;
-    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
-      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
-        __typename: 'StatusContext', context: 'CI', state: 'FAILURE',
-        targetUrl: `https://github.com/${SLUG}/actions/runs/44`, description: 'AssertionError: expected 2 to equal 3',
-      }] } } };
-    const deterministic = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(deterministic).toMatchObject({
-      status: 'needs-revision',
-      detail: expect.stringMatching(/Actions permission can be reauthorized separately.*does not change.*classification/is),
-      repair: { kind: 'ci', fingerprint: expect.any(String) },
-    });
-    const repairFingerprint = deterministic.repair?.fingerprint;
-    await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(core.store.eventsSince(task.id, 0).filter((event) => event.type === 'github.ci.repair-requested'
-      && event.payload?.key === repairFingerprint)).toHaveLength(1);
-
-    readiness.statusCheckRollup.contexts.nodes[0].description = cancellation;
-    const forbiddenSuperseded = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(forbiddenSuperseded).toMatchObject({ status: 'waiting', releaseAdmission: true,
-      detail: expect.stringMatching(/equivalent CI request.*admission is released/is) });
-    expect(forbiddenSuperseded.detail).not.toMatch(/grant the GitHub App/i);
-
-    readiness.statusCheckRollup.contexts.nodes[0].description = 'GitHub Actions is disabled for this repository';
+    readiness.statusCheckRollup.contexts.nodes[0].conclusion = 'ACTION_REQUIRED';
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
-      status: 'needs-human', detail: expect.stringMatching(/provider or account condition/i),
+      status: 'needs-human', waitReason: 'GitHub Actions action required',
     });
   });
 
@@ -1270,6 +1254,7 @@ describe('GitHub-authoritative merge activity', () => {
 
   it('v1.20 treats behind as mechanical fallback admission and failures as ejection', async () => {
     let liveHead = 'reviewed-head';
+    let speculativeConclusion = 'failure';
     let readiness: any = { mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND',
       statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
     const mutations: string[] = [];
@@ -1282,12 +1267,12 @@ describe('GitHub-authoritative merge activity', () => {
         merged: false, head: { ref: 'karmax/task_fair', sha: liveHead }, base: { ref: 'main' },
       });
       if (method === 'GET' && url.pathname.endsWith('/commits/merge-group-failure/check-runs'))
-        return Response.json({ check_runs: [{ id: 501, name: 'speculative CI', conclusion: 'failure',
+        return Response.json({ check_runs: [{ id: 501, name: 'speculative CI', conclusion: speculativeConclusion,
           details_url: 'https://github.test/checks/501' }] });
       if (method === 'GET' && url.pathname.endsWith('/commits/merge-group-failure/status'))
         return Response.json({ statuses: [] });
       if (method === 'GET' && url.pathname.endsWith('/check-runs/501/annotations'))
-        return Response.json([{ path: 'src/prefix.ts', start_line: 7, message: 'prefix assertion failed' }]);
+        return Response.json([{ path: 'src/prefix.ts', start_line: 7, message: 'prefix assertion failed: expected "recent account payments have failed" and "requires approval"' }]);
       if (method === 'GET' && url.pathname.endsWith('/check-runs/501'))
         return Response.json({ output: { title: 'Queue build failed', summary: 'A + B is incompatible' } });
       if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
@@ -1377,10 +1362,19 @@ describe('GitHub-authoritative merge activity', () => {
       beforeCommit: { oid: 'merge-group-failure' } }] } };
     const superseded = await core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' });
     expect(superseded).toMatchObject({
-      status: 'waiting',
-      detail: expect.stringMatching(/higher priority waiting request.*superseded.*without.*releasing its landing position.*requesting human input/is),
+      status: 'needs-revision',
+      detail: expect.stringMatching(/higher priority waiting request.*prefix assertion failed/is),
     });
     expect(superseded).not.toHaveProperty('releaseAdmission');
+    speculativeConclusion = 'action_required';
+    await expect(core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' }))
+      .resolves.toMatchObject({ status: 'needs-human', waitReason: 'GitHub Actions action required', releaseAdmission: true });
+    speculativeConclusion = 'startup_failure';
+    await expect(core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' }))
+      .resolves.toMatchObject({ status: 'needs-human', waitReason: 'GitHub Actions failure needs inspection', releaseAdmission: true });
+    speculativeConclusion = 'cancelled';
+    await expect(core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' }))
+      .resolves.toMatchObject({ status: 'retryable-error', releaseAdmission: true });
   });
 
   it('v1.20 observes an explicitly external landing authority without shadow mutations', async () => {
