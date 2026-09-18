@@ -33,10 +33,17 @@ function ok(condition, message) {
 // Task detail page — the Parameters tab renders the same control.
 global.paramsSection = () => '';
 global.authorizationSection = () => '';
+// Isolate the account-control title from the task/payment sections, including
+// the read-only payment section shown once a task has finished.
+global.taskRecord = () => ({ params: {} });
+global.TERMINAL_STAGES = ['done', 'cancelled'];
+global.taskPaymentsHtml = () => '';
 eval(extractFn('parametersTab'));
-const tab = parametersTab({});
-ok(/<div class="section-h">Codex\/Claude<\/div>/.test(tab), 'Parameters tab titles the section "Codex/Claude"');
-ok(!/<div class="section-h">Credentials<\/div>/.test(tab), 'Parameters tab no longer titles it "Credentials"');
+for (const view of [{ stage: 'do' }, { stage: 'done' }, { stage: 'merge', pointOfNoReturnPassed: true }]) {
+  const tab = parametersTab(view);
+  ok(/<div class="section-h">Codex\/Claude<\/div>/.test(tab), 'Parameters tab titles the section "Codex/Claude"');
+  ok(!/<div class="section-h">Credentials<\/div>/.test(tab), 'Parameters tab no longer titles it "Credentials"');
+}
 
 // New-task form (openTaskForm) label.
 ok(/>Codex\/Claude<\/label>/.test(src), 'new-task form labels the control "Codex/Claude"');
