@@ -711,6 +711,10 @@ export interface ProjectEnvironmentSpec {
 }
 
 export interface EnvironmentBuildRecord {
+  /** Authority and attempt that produced this provider-owned artifact. */
+  organizationId?: string;
+  transferGeneration?: string;
+  buildId?: string;
   provider: string;
   digest: string;
   status: 'building' | 'ready' | 'failed';

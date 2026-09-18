@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Store } from './db.js';
 import type { EnvironmentBuildRecord, ProjectEnvironmentSpec } from '../domain/types.js';
 
 const KV_SPEC = 'project-environment:';
@@ -9,6 +10,7 @@ const KV_BUILDS = 'project-environment-builds:';
 export interface ProjectEnvironmentStore {
   kvGet(key: string): string | undefined;
   kvSet(key: string, value: string): void;
+  getProject?: Store['getProject'];
 }
 
 export class ProjectEnvironment {
@@ -58,8 +60,69 @@ export class ProjectEnvironment {
   readyBuild(projectId: string, provider: string, digest: string): EnvironmentBuildRecord | undefined {
     const record = this.builds(projectId).find((candidate) =>
       candidate.provider === provider && candidate.digest === digest);
+    const generation = this.store.kvGet(`project-transfer-current:${projectId}`);
+    // Legacy unscoped builds are usable only before the first transfer. Never
+    // let a late legacy callback recreate selectable source-owned artifacts.
+    if (record?.organizationId) {
+      if (this.store.getProject?.(projectId)?.organizationId !== record.organizationId
+        || (generation ?? '') !== record.transferGeneration) return undefined;
+    } else if (generation) return undefined;
     return record?.status === 'ready' && record.ref ? record : undefined;
   }
+}
+
+export interface EnvironmentBuildScope {
+  organizationId: string;
+  transferGeneration: string;
+}
+export type EnvironmentBuildAttempt = EnvironmentBuildScope & {
+  projectId: string; provider: string; digest: string; buildId: string;
+};
+
+/** Serialize build admission/completion with transfer cutover across gateways.
+ * No transaction is held while the provider builds the artifact. */
+function buildTransaction<T>(store: Store, projectId: string, work: () => T): T {
+  store.db.exec('BEGIN IMMEDIATE');
+  try {
+    if (store.db.dialect === 'postgres')
+      store.db.prepare('SELECT id FROM projects WHERE id=? FOR UPDATE').get(projectId);
+    const result = work();
+    store.db.exec('COMMIT');
+    return result;
+  } catch (error) { store.db.exec('ROLLBACK'); throw error; }
+}
+function sameBuildScope(store: Store, projectId: string, scope: EnvironmentBuildScope): boolean {
+  return store.getProject(projectId)?.organizationId === scope.organizationId
+    && (store.kvGet(`project-transfer-current:${projectId}`) ?? '') === scope.transferGeneration;
+}
+
+export function beginEnvironmentBuild(store: Store, projectId: string, scope: EnvironmentBuildScope,
+  provider: string, digest: string): EnvironmentBuildAttempt {
+  return buildTransaction(store, projectId, () => {
+    store.assertProjectOrganization(projectId, scope.organizationId);
+    if (!sameBuildScope(store, projectId, scope)) throw new Error('Project moved while preparing the build. Reload and retry.');
+    const environments = new ProjectEnvironment(store);
+    if (environments.builds(projectId).some(b => b.provider === provider && b.digest === digest && b.status === 'building'))
+      throw new Error('This environment is already building. Wait for it to finish.');
+    const attempt = { ...scope, projectId, provider, digest, buildId: crypto.randomUUID() };
+    environments.recordBuild(projectId, { ...scope, provider, digest, buildId: attempt.buildId, status: 'building' });
+    return attempt;
+  });
+}
+
+/** Success and failure use the same fence. A deleted/superseded attempt cannot
+ * recreate build metadata or overwrite a newer destination build. */
+export function finishEnvironmentBuild(store: Store, attempt: EnvironmentBuildAttempt,
+  result: { status: 'ready'; ref: string } | { status: 'failed'; error: string }): boolean {
+  return buildTransaction(store, attempt.projectId, () => {
+    if (!sameBuildScope(store, attempt.projectId, attempt)) return false;
+    const environments = new ProjectEnvironment(store);
+    const current = environments.builds(attempt.projectId).find(b => b.provider === attempt.provider && b.digest === attempt.digest);
+    if (current?.status !== 'building' || current.buildId !== attempt.buildId) return false;
+    const { projectId, ...record } = attempt;
+    environments.recordBuild(projectId, { ...record, ...result });
+    return true;
+  });
 }
 
 export interface EnvironmentProposal {

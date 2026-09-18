@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,12 +13,15 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { chromium } from 'playwright';
 import ts from 'typescript';
+import * as environmentBuilder from '../src/world/environment-build.js';
+import * as environmentRecords from '../src/store/project-environment.js';
+import { selectProjectEnvironment } from '../src/world/project-runtime.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
 let nextPort = 49500;
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const fn of cleanups.splice(0).reverse()) await fn(); });
-async function fixture() {
+afterEach(async () => { vi.restoreAllMocks(); for (const fn of cleanups.splice(0).reverse()) await fn(); });
+async function fixture(options: { fullApp?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-transfer-'));
   const store = new Store(':memory:');
   const tokens = new TokenAuthority(store);
@@ -32,7 +35,8 @@ async function fixture() {
   const worlds = new WorldRegistry();
   const client = { workflow: { getHandle: () => ({ describe: async () => ({ status: { name: 'COMPLETED' } }) }) } } as any;
   const api = new KarmaxApi({ store, tokens, client, worlds, authorization, taskQueue: 'test' });
-  const gateway = new Gateway({ api, store, tokens, client, worlds, authorization, taskQueue: 'test', staticDir: dir,
+  const gateway = new Gateway({ api, store, tokens, client, worlds, authorization, taskQueue: 'test', staticDir: options.fullApp ? path.resolve('web') : dir,
+    providerConnections: { resolve: (organizationId: string) => ({ apiKey: `test-key-${organizationId}`, config: {} }), list: () => [] } as any,
     bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
     identity: { connectOrganizationNames: () => {}, session: async (headers: Headers) => headers.get('cookie') === 'test=alice'
       ? { user: { id: 'alice', name: 'Alice', email: 'alice@example.com' }, session: { id: 'session-alice' } } : undefined,
@@ -107,6 +111,35 @@ describe('project transfer HTTP authorization', () => {
 });
 
 describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer browser flow', () => {
+  it('moves from Advanced settings using the complete app and keeps destination routing after reload', async () => {
+    const f = await fixture({ fullApp: true });
+    const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+    cleanups.push(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+    page.setDefaultTimeout(10_000);
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.context().addCookies([{ name: 'test', value: 'alice', url: f.server.url }]);
+    await page.goto(`${f.server.url}/source/project/settings`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.settings-nav a[href="#project-advanced"]').click();
+    await page.locator('#move-project').click();
+    await page.selectOption('[data-destination]', f.destination.id);
+    await page.waitForFunction("!document.querySelector('[role=dialog] [type=submit]')?.disabled");
+    await page.locator('[role="dialog"] [type="submit"]').click();
+    await page.waitForURL('**/destination/project/settings');
+    await page.locator('.settings-nav a[href="#project-advanced"]').click();
+    await page.waitForSelector('#project-name');
+    expect(f.store.getProject(f.project.id)?.organizationId).toBe(f.destination.id);
+    expect(await page.locator('#org-switcher input').inputValue()).toContain('Destination');
+    expect(new URL(page.url()).pathname).toBe('/destination/project/settings');
+    expect(await page.locator('#project-name').inputValue()).toBe('Project');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator('.settings-nav a[href="#project-advanced"]').click();
+    expect(await page.locator('#move-project').isVisible()).toBe(true);
+    expect(await page.locator('#org-switcher input').inputValue()).toContain('Destination');
+    expect(errors).toEqual([]);
+  });
+
   it('previews, handles a stale plan, and moves through the real HTTP API', async () => {
     const f = await fixture();
     fs.writeFileSync(path.join(f.dir, 'index.html'), '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><button id="move">Move to organization…</button><div id="modal-root"></div></body></html>');
@@ -167,6 +200,81 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     expect(f.store.getProject(f.project.id)?.organizationId).toBe(f.destination.id);
     expect(await page.evaluate("window.visited")).toBe(`/moved/${f.project.id}/settings`);
     expect(errors).toEqual([]);
+  });
+});
+
+function deferredBuild() {
+  let resolve!: (value: environmentBuilder.EnvironmentBuildResult) => void, reject!: (error: Error) => void;
+  const promise = new Promise<environmentBuilder.EnvironmentBuildResult>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+describe('environment builds across project transfers', () => {
+  it('blocks active builds and duplicate launches, then invalidates the old preview when the build finishes', async () => {
+    const f = await fixture();
+    const environments = new environmentRecords.ProjectEnvironment(f.store);
+    const spec = environments.setSpec(f.project.id, { setup: ['echo test'] });
+    const digest = environments.digest(spec);
+    const pending = deferredBuild();
+    const build = vi.spyOn(environmentBuilder, 'buildEnvironment').mockReturnValue(pending.promise);
+    const before = await (await f.request(f.route + `?destinationOrganizationId=${f.destination.id}`)).json() as any;
+    const buildRoute = `/api/projects/${f.project.id}/environment/build`;
+    expect((await f.request(buildRoute, { provider: 'e2b' })).status).toBe(202);
+    expect(build).toHaveBeenCalledWith(expect.objectContaining({ connection: expect.objectContaining({ apiKey: `test-key-${f.source.id}` }) }));
+    const active = await (await f.request(f.route + `?destinationOrganizationId=${f.destination.id}`)).json() as any;
+    expect(active.blockers).toContainEqual(expect.objectContaining({ code: 'environment-builds' }));
+    expect((await f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: before.id })).status).toBe(409);
+    expect((await f.request(buildRoute, { provider: 'e2b' })).status).toBe(400);
+    expect(build).toHaveBeenCalledTimes(1);
+    pending.resolve({ ref: 'source-private-snapshot' });
+    await expect.poll(() => environments.readyBuild(f.project.id, 'e2b', digest)?.ref).toBe('source-private-snapshot');
+    // The build history itself participates in the plan, even once inactive.
+    expect((await f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: before.id })).status).toBe(409);
+    const fresh = await (await f.request(f.route + `?destinationOrganizationId=${f.destination.id}`)).json() as any;
+    expect(fresh.blockers).toEqual([]);
+    expect((await f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: fresh.id })).status).toBe(200);
+    expect(selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined).built).toBe(false);
+  });
+
+  it.each([
+    { outcome: 'success', roundTrip: false }, { outcome: 'failure', roundTrip: false },
+    { outcome: 'success', roundTrip: true }, { outcome: 'failure', roundTrip: true },
+  ])('fences a late $outcome callback across transfer (round trip: $roundTrip)', async ({ outcome, roundTrip }) => {
+    const f = await fixture();
+    const environments = new environmentRecords.ProjectEnvironment(f.store);
+    const spec = environments.setSpec(f.project.id, { setup: ['echo test'] });
+    const digest = environments.digest(spec);
+    const old = deferredBuild(), current = deferredBuild();
+    vi.spyOn(environmentBuilder, 'buildEnvironment').mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    const finish = vi.spyOn(environmentRecords, 'finishEnvironmentBuild');
+    const buildRoute = `/api/projects/${f.project.id}/environment/build`;
+    expect((await f.request(buildRoute, { provider: 'e2b' })).status).toBe(202);
+    // Fault injection: reproduce missing bookkeeping from an old gateway or
+    // recovery process while its provider promise still exists. Normal active
+    // builds are blocked above; the completion fence must be independent of it.
+    f.store.kvDelete(`project-environment-builds:${f.project.id}`);
+    const move = async (destinationOrganizationId: string) => {
+      const preview = await (await f.request(f.route + `?destinationOrganizationId=${destinationOrganizationId}`)).json() as any;
+      expect(preview.blockers).toEqual([]);
+      expect((await f.request(f.route, { destinationOrganizationId, previewId: preview.id })).status).toBe(200);
+    };
+    await move(f.destination.id);
+    if (roundTrip) await move(f.source.id);
+    expect((await f.request(buildRoute, { provider: 'e2b' })).status).toBe(202);
+    current.resolve({ ref: 'current-generation-snapshot' });
+    await expect.poll(() => environments.readyBuild(f.project.id, 'e2b', digest)?.ref).toBe('current-generation-snapshot');
+    const beforeCompletion = environments.builds(f.project.id);
+    if (outcome === 'success') old.resolve({ ref: 'source-org-private-snapshot' });
+    else old.reject(new Error('source build failed late'));
+    await expect.poll(() => finish.mock.calls.length).toBe(2);
+    expect(finish.mock.results[1]?.value).toBe(false);
+    expect(environments.builds(f.project.id)).toEqual(beforeCompletion);
+    expect(selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined).environment?.snapshot).toBe('current-generation-snapshot');
+    // Legacy callbacks have no provenance: even direct writes cannot make
+    // their source-owned artifact selectable after any transfer generation.
+    environments.recordBuild(f.project.id, { provider: 'e2b', digest, status: 'ready', ref: 'legacy-source-snapshot' });
+    expect(environments.readyBuild(f.project.id, 'e2b', digest)).toBeUndefined();
+    expect(selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined).built).toBe(false);
   });
 });
 

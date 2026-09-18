@@ -3469,7 +3469,9 @@ export class Gateway {
       if (projectEnvironment && ['GET', 'PUT', 'POST'].includes(method)) {
         const project = store.getProject(projectEnvironment[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
-        const { ProjectEnvironment, proposeEnvironment } = await import('../store/project-environment.js');
+        const buildScope = { organizationId: project.organizationId,
+          transferGeneration: store.kvGet(`project-transfer-current:${project.id}`) ?? '' };
+        const { ProjectEnvironment, proposeEnvironment, beginEnvironmentBuild, finishEnvironmentBuild } = await import('../store/project-environment.js');
         const environments = new ProjectEnvironment(store);
         const sub = projectEnvironment[2];
         try {
@@ -3502,16 +3504,15 @@ export class Gateway {
             const digest = environments.digest(spec);
             const connection = ['e2b', 'daytona'].includes(provider)
               ? this.deps.providerConnections?.resolve(project.organizationId, provider) : undefined;
-            environments.recordBuild(project.id, { provider, digest, status: 'building' });
             const { buildEnvironment } = await import('../world/environment-build.js');
+            const attempt = beginEnvironmentBuild(store, project.id, buildScope, provider, digest);
             void buildEnvironment({ provider, projectId: project.id, digest, spec,
               ...(connection ? { connection: { apiKey: connection.apiKey,
                 apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target,
                 template: (connection.config as any)?.template } } : {}) })
-              .then((result) => environments.recordBuild(project.id,
-                { provider, digest, ref: result.ref, status: 'ready' }))
-              .catch((error) => environments.recordBuild(project.id,
-                { provider, digest, status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }));
+              .then((result) => finishEnvironmentBuild(store, attempt, { ref: result.ref, status: 'ready' }),
+                (error) => finishEnvironmentBuild(store, attempt,
+                  { status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }));
             return this.json(res, 202, { building: { provider, digest } });
           }
         } catch (error) {

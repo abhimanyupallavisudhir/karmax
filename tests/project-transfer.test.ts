@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { ProjectTransfers } from '../src/platform/project-transfer.js';
 import { AuthorizationService, DEFAULT_AUTHORIZATION_PROFILES } from '../src/platform/authorization.js';
+import { beginEnvironmentBuild, finishEnvironmentBuild, ProjectEnvironment } from '../src/store/project-environment.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 
 const stores: Store[] = [];
@@ -207,5 +208,39 @@ describe('transfer capabilities on existing installations', () => {
     store.setAuthorizationProfile('global', { ...administrator, name: 'Customized', capabilities: ['project:read'] });
     new AuthorizationService(store);
     expect(store.getAuthorizationProfile('global', 'administrator').capabilities).toEqual(['project:read']);
+  });
+});
+
+
+describe('environment build admission during transfer', () => {
+  it('rejects a source connection captured before a move-away-and-back and fences superseded attempts', async () => {
+    const { store, project, source, destination, transfers } = fixture();
+    const original = { organizationId: source.id, transferGeneration: '' };
+    let preview = transfers.preview(project.id, destination.id);
+    await transfers.move(project.id, destination.id, preview.id);
+    preview = transfers.preview(project.id, source.id);
+    await transfers.move(project.id, source.id, preview.id);
+    expect(() => beginEnvironmentBuild(store, project.id, original, 'e2b', 'digest')).toThrow(/moved/);
+    const scope = { organizationId: source.id, transferGeneration: store.kvGet(`project-transfer-current:${project.id}`)! };
+    const attempt = beginEnvironmentBuild(store, project.id, scope, 'e2b', 'digest');
+    expect(finishEnvironmentBuild(store, attempt, { status: 'failed', error: 'provider failure' })).toBe(true);
+    const replacement = beginEnvironmentBuild(store, project.id, scope, 'e2b', 'digest');
+    expect(finishEnvironmentBuild(store, attempt, { status: 'ready', ref: 'old' })).toBe(false);
+    expect(finishEnvironmentBuild(store, replacement, { status: 'ready', ref: 'new' })).toBe(true);
+    expect(new ProjectEnvironment(store).readyBuild(project.id, 'e2b', 'digest')?.ref).toBe('new');
+  });
+
+  it('refuses build admission while transfer liveness checks hold the project fence', async () => {
+    const { store, project, destination, source } = fixture();
+    const task = store.createTask({ projectId: project.id, title: 'History', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'history' } });
+    store.saveView(task.id, { taskId: task.id, status: 'done' } as any);
+    let release!: () => void;
+    const waiting = new Promise<boolean>(resolve => { release = () => resolve(true); });
+    const transfers = new ProjectTransfers(store, { principal: 'operator', authorize: () => {}, workflowClosed: () => waiting });
+    const preview = transfers.preview(project.id, destination.id);
+    const moving = transfers.move(project.id, destination.id, preview.id);
+    expect(() => beginEnvironmentBuild(store, project.id, { organizationId: source.id, transferGeneration: '' }, 'e2b', 'digest')).toThrow(/move in progress/);
+    release();
+    await moving;
   });
 });

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { Store, deleteRows, slugify } from '../store/db.js';
+import { ProjectEnvironment } from '../store/project-environment.js';
 import type { Project } from '../domain/types.js';
 
 export class ProjectTransferError extends Error {
@@ -50,6 +51,8 @@ export class ProjectTransfers {
     const block = (code: string, message: string, condition: unknown) => { if (condition) blockers.push({ code, message }); };
     const rows = (table: string) => s.db.prepare(`SELECT * FROM ${table} WHERE projectId=?`).all(projectId) as any[];
     const tasks = (s.db.prepare('SELECT id FROM tasks WHERE projectId=? ORDER BY id').all(projectId) as any[]).map(r => s.getTask(r.id)!);
+    const environmentBuilds = new ProjectEnvironment(s).builds(projectId);
+    block('environment-builds', 'Wait for environment builds to finish before moving.', environmentBuilds.some(b => b.status === 'building'));
     const owners = s.listOrganizationMemberships(destinationOrganizationId).filter(m => m.role === 'owner').map(m => m.userId).sort();
     block('owner', 'The destination needs an organization owner.', !owners.length);
     block('name-conflict', 'A project with this name already exists in the destination. Rename this project first.',
@@ -97,7 +100,7 @@ export class ProjectTransfers {
     block('unmanaged-repositories', 'Attach configured repositories through the repository catalog before moving.',
       project.config.repos?.some(repo => !sourceRepos.some(r => r.sshUrl === repo)));
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
-      project, destination, generation: s.kvGet(`project-transfer-current:${projectId}`), owners, tasks, repositories, destinationRepos, linked, wiki,
+      project, destination, environmentBuilds, generation: s.kvGet(`project-transfer-current:${projectId}`), owners, tasks, repositories, destinationRepos, linked, wiki,
       memberships: s.listProjectMemberships(projectId),
       profiles: s.db.prepare('SELECT * FROM authorization_profiles WHERE scopeKey=?').all(`project:${projectId}`),
       grants: s.db.prepare('SELECT * FROM principal_grants WHERE scopeKey=?').all(`project:${projectId}`),
