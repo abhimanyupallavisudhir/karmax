@@ -15436,19 +15436,25 @@ function inboxView() {
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row priority-${URGENCY_LEVELS[urgencyRank(item.urgency)]} ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
-      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.resource?.name || item.kind)}</b>${urgencyChip(item.urgency)}
-      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
-      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
+      <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
+      <div class="task-main">
+        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
+        <div class="task-sub"><span class="chip">${esc(inboxRowLabel(item))}</span>${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}">${new Date(item.createdAt).toLocaleString()}</time></div>
+      </div>
+      <div class="task-right"><button class="btn sm" data-inbox-toggle="${esc(item.id)}">${item.unread ? 'Read' : 'Unread'}</button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
     <p class="task-sub">Sorted by priority, newest first within each level. System notifications and sounds are set in
       <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
 }
 
 function wireInboxView() {
-  $('#main').querySelectorAll('[data-inbox]').forEach((row) => row.addEventListener('click', (e) => {
-    if (e.target.closest('[data-inbox-toggle]')) return;
-    openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
-  }));
+  $('#main').querySelectorAll('[data-inbox]').forEach((row) => {
+    row.addEventListener('focus', () => { S.cursorId = rowKey(row); applyCursor(); });
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('[data-inbox-toggle]')) return;
+      openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
+    });
+  });
   $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
     const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
     try {
@@ -17227,7 +17233,7 @@ function focusFollowup() {
 function cursorRows() {
   return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
 }
-function rowKey(r) { return r.dataset.id || r.dataset.draft; }
+function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox; }
 function applyCursor() {
   cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
 }

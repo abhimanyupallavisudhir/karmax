@@ -128,6 +128,13 @@ ok(html.includes('href="/personal/inbox/escalated"'), 'empty sub-tabs are still 
 ok(html.includes('id="inbox-show-read"'), 'the panel offers the Show read toggle');
 ok(!/id="inbox-show-read"[^>]*checked/.test(html), 'Show read is unchecked by default');
 ok(html.includes('Task 1'), 'rows render the task title');
+ok(/class="task-row inbox-row/.test(html), 'notifications reuse task-row styling');
+ok(/class="task-title"><span class="task-num">#1<\/span> Task 1/.test(html), 'task number and title share the task title line');
+ok(/class="task-main"/.test(html) && /class="task-right"/.test(html), 'notification content and actions use task row columns');
+ok(/class="status-dot /.test(html), 'notifications use task status dots');
+ok(/data-inbox="1" tabindex="0"/.test(html), 'notification rows can receive keyboard focus');
+ok(/data-inbox-toggle="1">Read<\/button>/.test(html), 'Read remains available');
+
 ok(!html.includes('Task 3'), 'a read row is not rendered while Show read is off');
 ok(!html.includes('Task 4'), 'All does not render an unread routine update');
 ok(html.includes('<span>2 unread</span>'), 'the All toolbar count excludes routine updates');
