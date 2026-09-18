@@ -656,7 +656,7 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'world.created', description: "A task's local or cloud world was provisioned.", fields: {} },
   { type: 'world.parked', description: "A waiting task's metered world compute was paused while durable state was retained.", fields: {} },
   { type: 'world.destroyed', description: "A task's world was torn down.", fields: {} },
-  { type: 'spend.requested', description: 'An agent requested spend above the auto-approve threshold.', fields: { status: 'string', reason: 'string' } },
+  { type: 'spend.requested', description: 'An agent requested a payment under its task budget.', fields: { status: 'string', reason: 'string' } },
 ];
 
 /** The full event catalog: every workflow's declared events + the platform events,

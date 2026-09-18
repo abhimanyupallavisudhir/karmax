@@ -16,6 +16,11 @@ const payload = new Uint8Array(workerData.payload);
 const encoder = new TextEncoder();
 let startupError;
 const client = new Client({ connectionString: workerData.connectionString });
+// PostgreSQL reports I (idle), T (transaction), or E (failed transaction).
+// Use the server state: a batch can end in COMMIT after unrelated statements,
+// and a failed transaction still needs ROLLBACK before it becomes idle.
+let transactionOpen = false;
+client.connection.on('readyForQuery', ({ status }) => { transactionOpen = status !== 'I'; });
 const connected = client.connect().catch((error) => { startupError = error; });
 
 function splitStatements(sql) {
@@ -137,7 +142,7 @@ function translate(statement) {
 }
 
 function response(value) {
-  const bytes = encoder.encode(JSON.stringify({ ok: true, value }));
+  const bytes = encoder.encode(JSON.stringify({ ok: true, value, transactionOpen }));
   let delivered = bytes;
   if (bytes.length > payload.length) {
     const file = path.join(os.tmpdir(), `karmax-postgres-${process.pid}-${crypto.randomUUID()}.json`);
@@ -151,7 +156,7 @@ function response(value) {
 }
 
 function failure(error) {
-  const bytes = encoder.encode(JSON.stringify({ ok: false, error: {
+  const bytes = encoder.encode(JSON.stringify({ ok: false, transactionOpen, error: {
     message: error instanceof Error ? error.message : String(error),
     stack: error instanceof Error ? error.stack : undefined,
     code: error?.code,
