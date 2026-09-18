@@ -1282,6 +1282,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
+          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
+          const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
+            || sameRepository(repo.repo, wikiSource));
+          if (wiki) wiki.role = 'project-wiki';
+        }
+        // A platform-owned companion must not unexpectedly move agents out of
+        // the project's only development repository. Keep `root` as the world
+        // boundary so the wiki remains accessible, and select that development
+        // checkout as the default cwd. Genuine multi-development-repo projects
+        // retain the encompassing root as their working directory.
+        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
         if (forkCheckpoint) {
           await deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!);
           if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
@@ -1301,19 +1314,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (profile) world.handle.meta = { ...world.handle.meta,
           gitProfile: profile.name, gitProfileScope: gitBinding.scope };
-        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
-          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
-          const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
-            || sameRepository(repo.repo, wikiSource));
-          if (wiki) wiki.role = 'project-wiki';
-        }
-        // A platform-owned companion must not unexpectedly move agents out of
-        // the project's only development repository. Keep `root` as the world
-        // boundary so the wiki remains accessible, and select that development
-        // checkout as the default cwd. Genuine multi-development-repo projects
-        // retain the encompassing root as their working directory.
-        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
-        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
             ...(wikiRepository ? [wikiRepository.id] : [])] };

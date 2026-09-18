@@ -97,8 +97,16 @@ describe('fork world initialization', () => {
       expect(await fork.readFile(`${prefix}committed.txt`)).toBe('unlanded commit');
       expect(await fork.readFile(`${prefix}nested/new.txt`)).toBe('untracked nested file');
       await expect(fork.readFile(`${prefix}later.txt`)).rejects.toThrow();
-      expect(await fork.readFile('data/value.txt')).toBe('unpublished resource');
-      await fork.writeFile('data/value.txt', 'fork changed');
+      // File APIs are world-root-relative; resources belong beside the agent
+      // in the development checkout, including when setup adds a companion wiki.
+      expect(fork.handle.workdir).toBe(forkRepo.root);
+      expect(await fork.readFile(`${prefix}data/value.txt`)).toBe('unpublished resource');
+      await expect(fork.readFile('data/value.txt')).rejects.toThrow(/ENOENT/);
+      const agentRead = await fork.exec('cat', ['data/value.txt']);
+      expect(agentRead.code).toBe(0);
+      expect(agentRead.stdout).toBe('unpublished resource');
+      await fork.writeFile(`${prefix}data/value.txt`, 'fork changed');
+      expect(await resources.summarize(fork.handle.id, volume.id)).toMatchObject({ added: 0, modified: 1, deleted: 0 });
       if (!finished) expect(await source.readFile('data/value.txt')).toBe('unpublished resource');
       if (finished) expect(opened.mock.calls.some(([handle]) => handle.id === sourceTask.id)).toBe(false);
       expect(store.currentWorld(sourceTask.id)?.generation).toBe(source.handle.generation);
@@ -108,7 +116,10 @@ describe('fork world initialization', () => {
       const freshRepo = fresh.handle.repos!.find((entry) => entry.role !== 'project-wiki')!;
       expect(await fresh.readFile(`${freshRepo.name}/file.txt`)).toBe('main');
       await expect(fresh.readFile(`${freshRepo.name}/committed.txt`)).rejects.toThrow();
-      expect(await fresh.readFile('data/value.txt')).toBe('promoted');
+      expect(await fresh.readFile(`${freshRepo.name}/data/value.txt`)).toBe('promoted');
+      const freshAgentRead = await fresh.exec('cat', ['data/value.txt']);
+      expect(freshAgentRead.code).toBe(0);
+      expect(freshAgentRead.stdout).toBe('promoted');
       expect(capture).not.toHaveBeenCalled();
     } finally {
       for (const handle of created) await (await worlds.open(handle)).destroy();
