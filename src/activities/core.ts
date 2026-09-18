@@ -1,4 +1,4 @@
-import { TimingTrace, withTiming, timed } from '../timing/index.js';
+import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
@@ -986,7 +986,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
-      const trace = new TimingTrace({ taskId: args.taskId }, row => record(args.taskId, 'timing', { ...row }));
+      const trace = installationTiming(store, { taskId: args.taskId }, row => record(args.taskId, 'timing', { ...row }));
       try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
       return withTiming(trace, () => trace.measure('world.prepare', async () => {
       const remote = isRemote(args.kind);
@@ -1483,11 +1483,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         timingSignal = activity.cancellationSignal;
         timingTurnId ??= `legacy:${activity.info.workflowExecution?.runId ?? 'standalone'}:${activity.info.activityId}`;
         // Cross-clock estimate only: Temporal schedule to worker receipt.
-        scheduleToStartWallEstimateMs = Date.now() - activity.info.currentAttemptScheduledTimestampMs;
+        if (timingEnabled(store)) scheduleToStartWallEstimateMs = Date.now() - activity.info.currentAttemptScheduledTimestampMs;
       } catch { /* direct fixture */ }
-      const requestIds = args.messages.slice(args.deliveredMessages ?? 0)
-        .filter(m => m.role === 'user').map(m => `${args.taskId}:${m.id}`);
-      const trace = new TimingTrace({ taskId: args.taskId, turnId: timingTurnId, workflowRunId,
+      const requestIds = timingEnabled(store) ? args.messages.slice(args.deliveredMessages ?? 0)
+        .filter(m => m.role === 'user').map(m => `${args.taskId}:${m.id}`) : undefined;
+      const trace = installationTiming(store, { taskId: args.taskId, turnId: timingTurnId, workflowRunId,
         attempt: timingAttempt, role: args.role, requestIds }, row => record(args.taskId, 'timing', { ...row }));
       trace.signal = timingSignal;
       return withTiming(trace, () => trace.measure('agent.attempt', async () => {
@@ -4637,21 +4637,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Persist conversation snapshots above even for suppressed frames: the
       // next publication may reference the same immutable snapshot.
       if (view.state?.humanPauseOrigin && view.status === 'active' && !view.waitingFor) return;
-      let workflowRunId: string | undefined;
-      try { workflowRunId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
-      const previousView = store.getTask(taskId)?.lastView;
-      const accountBefore = previousView?.waitingFor?.kind === 'account';
-      const accountAfter = view.waitingFor?.kind === 'account';
-      if (accountBefore !== accountAfter) {
-        const trace = new TimingTrace({ taskId, workflowRunId, role: view.agentTurn?.role }, row => record(taskId, 'timing', { ...row }));
-        trace.mark(accountAfter ? 'account.wait.observed.start' : 'account.wait.observed.end');
-      }
-      const before = previousView?.agentTurn;
-      const after = view.agentTurn;
-      if (before?.turnId !== after?.turnId || before?.state !== after?.state) {
-        const trace = new TimingTrace({ taskId, workflowRunId, turnId: after?.turnId ?? before?.turnId,
-          role: after?.role ?? before?.role }, row => record(taskId, 'timing', { ...row }));
-        trace.mark(`queue.observed.${after?.state ?? 'released'}`);
+      if (timingEnabled(store)) {
+        let workflowRunId: string | undefined;
+        try { workflowRunId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
+        const previousView = store.getTask(taskId)?.lastView;
+        const accountBefore = previousView?.waitingFor?.kind === 'account';
+        const accountAfter = view.waitingFor?.kind === 'account';
+        if (accountBefore !== accountAfter) {
+          const trace = installationTiming(store, { taskId, workflowRunId, role: view.agentTurn?.role }, row => record(taskId, 'timing', { ...row }));
+          trace.mark(accountAfter ? 'account.wait.observed.start' : 'account.wait.observed.end');
+        }
+        const before = previousView?.agentTurn;
+        const after = view.agentTurn;
+        if (before?.turnId !== after?.turnId || before?.state !== after?.state) {
+          const trace = installationTiming(store, { taskId, workflowRunId, turnId: after?.turnId ?? before?.turnId,
+            role: after?.role ?? before?.role }, row => record(taskId, 'timing', { ...row }));
+          trace.mark(`queue.observed.${after?.state ?? 'released'}`);
+        }
       }
       store.saveView(taskId, view);
       // First Merge admission freezes whether sibling proposals remain eligible.

@@ -3,6 +3,7 @@ import { benchmarkLatency } from '../benchmarks/latency.js';
 
 it('correlates HTTP receipt, real Temporal dispatch, fresh/resumed worlds and managed actions', async () => {
   const result = await benchmarkLatency(1);
+  expect(result.disabledRecordingRows).toBe(0);
   expect(result.groups).toHaveLength(8);
   for (const group of result.groups) {
     expect(group.attempts).toBe(1);

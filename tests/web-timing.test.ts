@@ -13,7 +13,7 @@ describe('Timing task tab', () => {
     trace.mark('adapter.invoked', { provider: 'mock', model: '<img onerror=bad>' }); end();
     const context = vm.createContext({
       esc: (s: unknown) => String(s).replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
-      report: timingReport(rows),
+      report: timingReport(rows), S: { meta: {timingEnabled:true} },
     });
     vm.runInContext(helpers + '\ntimingReports.set("t", report);', context);
     const rendered = vm.runInContext('timingTab({taskId:"t"})', context);
@@ -25,4 +25,24 @@ describe('Timing task tab', () => {
     expect(rendered).not.toContain('<img onerror=bad>');
     expect(rendered).toContain('Export JSON');
   });
+});
+
+it('hides cached historical reports and export controls when disabled', () => {
+ const context = vm.createContext({ S: {meta:{}}, report: {} });
+ vm.runInContext(helpers + '\ntimingReports.set("t", report);', context);
+ expect(vm.runInContext('timingTab({taskId:"t"})', context)).toBe('');
+});
+
+it('removes the tab from navigation and clears cached measurements on a live disable', () => {
+ const context = vm.createContext({ S: {meta:{timingEnabled:true},taskTab:'timing',activity:[{type:'timing'}],taskEvents:[{type:'timing'}]},document:{getElementById:()=>null} });
+ vm.runInContext(helpers+'\ntimingReports.set("t", {}); applyTimingSetting(false);',context);
+ expect(vm.runInContext('timingReports.size',context)).toBe(0);
+ expect(vm.runInContext('S.taskTab',context)).toBe('overview');
+ expect(vm.runInContext('S.activity.length + S.taskEvents.length',context)).toBe(0);
+ const navigation=source.slice(source.indexOf('const TASK_TABS ='),source.indexOf('function visibleTaskTabs()'));
+ const visible=source.slice(source.indexOf('function visibleTaskTabs()'),source.indexOf('function defaultTaskTab(v)'));
+ vm.runInContext(navigation+visible,context);
+ expect(vm.runInContext('visibleTaskTabs().some(t=>t.key==="timing")',context)).toBe(false);
+ vm.runInContext('S.meta.timingEnabled=true',context);
+ expect(vm.runInContext('visibleTaskTabs().some(t=>t.key==="timing")',context)).toBe(true);
 });

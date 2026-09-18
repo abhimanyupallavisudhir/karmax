@@ -47,49 +47,75 @@ export interface TimingRow extends TimingContext {
 }
 const processClock = randomUUID();
 const local = new AsyncLocalStorage<TimingTrace>();
-export const currentTiming = () => local.getStore();
-export const withTiming = <T>(trace: TimingTrace, fn: () => T): T => local.run(trace, fn);
+export const currentTiming = () => { const trace = local.getStore(); return trace?.enabled() ? trace : undefined; };
+export const withTiming = <T>(trace: TimingTrace, fn: () => T): T => trace.enabled() ? local.run(trace, fn) : local.getStore() ? local.exit(fn) : fn();
 export const timed = <T>(name: string, fn: () => Promise<T>, metadata?: TimingMetadata, isFailure?: (value: T) => boolean): Promise<T> =>
   currentTiming()?.measure(name, fn, metadata, undefined, isFailure) ?? fn();
 
 export class TimingTrace {
-  readonly traceId = randomUUID();
+  readonly traceId: string;
   readonly clockId: string;
   private once = new Set<string>();
   /** Observes cancellation; does not cancel or alter the underlying operation. */
   signal?: AbortSignal;
   constructor(readonly context: TimingContext, private sink: (row: TimingRow) => void,
-    private now: () => number = () => performance.now(), clockId?: string) {
+    private now: () => number = () => performance.now(), clockId?: string, private active: () => boolean = () => true) {
+    this.traceId = this.enabled() ? randomUUID() : '';
     this.clockId = clockId ?? processClock;
   }
-  private emit(name: string, phase: TimingRow['phase'], extra: Partial<TimingRow> = {}) {
-    const row: TimingRow = { ...this.context, version: 1, id: randomUUID(), traceId: this.traceId,
-      clockId: this.clockId, wallMs: Date.now(), monoMs: this.now(), name, phase, ...extra };
-    // Measurement must never alter provider/tool outcomes or trigger a retry.
-    try { this.sink(row); } catch { /* observability is best effort */ }
-    return row;
+  enabled(): boolean {
+    try { if (this.active()) return true; } catch { /* fail closed */ }
+    this.active = () => false; return false;
   }
-  mark(name: string, metadata?: TimingMetadata, at?: { monoMs: number; wallMs: number }) { this.emit(name, 'mark', { metadata, ...at }); }
+  private emit(name: string, phase: TimingRow['phase'], extra: Partial<TimingRow> = {}) {
+    try {
+      const row: TimingRow = { ...this.context, version: 1, id: randomUUID(), traceId: this.traceId,
+        clockId: this.clockId, wallMs: Date.now(), monoMs: this.now(), name, phase, ...extra };
+      this.sink(row);
+      return row;
+    } catch { this.active = () => false; return undefined; }
+  }
+
+  mark(name: string, metadata?: TimingMetadata, at?: { monoMs: number; wallMs: number }) { if (!this.enabled()) return; this.emit(name, 'mark', { metadata, ...at }); }
   markOnce(name: string, metadata?: TimingMetadata, key = name) {
-    if (this.once.has(key)) return;
+    if (!this.enabled() || this.once.has(key)) return;
     this.once.add(key); this.mark(name, metadata);
   }
-  start(name: string, metadata?: TimingMetadata) {
+  start(name: string, metadata?: TimingMetadata): (status?: TimingRow['status'], finishMetadata?: TimingMetadata) => void {
+    if (!this.enabled()) return () => {};
     const spanId = randomUUID(); const start = this.emit(name, 'start', { spanId, metadata });
+    if (!start) return () => {};
     let ended = false;
     return (status: TimingRow['status'] = 'ok', finishMetadata?: TimingMetadata) => {
-      if (ended) return; ended = true;
-      const monoMs = this.now();
-      this.emit(name, 'end', { spanId, monoMs, durationMs: Math.max(0, monoMs - start.monoMs), status,
-        metadata: finishMetadata ?? metadata });
+      if (ended || !this.enabled()) return; ended = true;
+      try {
+        const monoMs = this.now();
+        this.emit(name, 'end', { spanId, monoMs, durationMs: Math.max(0, monoMs - start.monoMs), status,
+          metadata: finishMetadata ?? metadata });
+      } catch { this.active = () => false; }
     };
   }
   async measure<T>(name: string, fn: () => Promise<T>, metadata?: TimingMetadata, signal?: AbortSignal, isFailure?: (value: T) => boolean): Promise<T> {
+    if (!this.enabled()) return fn();
     const end = this.start(name, metadata);
     const cancellation = signal ?? this.signal;
     try { const result = await fn(); end(cancellation?.aborted ? 'cancelled' : isFailure?.(result) ? 'failed' : 'ok'); return result; }
     catch (e) { end(cancellation?.aborted ? 'cancelled' : 'failed'); throw e; }
   }
+}
+
+/** Read shared persistent settings at each boundary, including across worker processes. */
+export function timingEnabled(store?: { getSettings(scope: string, key: string): Record<string, unknown> | undefined }): boolean {
+  try { return store?.getSettings('global', 'timing')?.enabled === true; } catch { return false; }
+}
+export function installationTiming(store: Parameters<typeof timingEnabled>[0], context: TimingContext, sink: (row: TimingRow) => void): TimingTrace {
+  let snapshot: Record<string, unknown> | undefined;
+  try { snapshot = store?.getSettings('global', 'timing'); } catch { /* fail closed */ }
+  return new TimingTrace(context, sink, undefined, undefined, () => {
+    if (snapshot?.enabled !== true) return false;
+    const current = store?.getSettings('global', 'timing');
+    return current?.enabled === true && current.revision === snapshot.revision;
+  });
 }
 
 export function distribution(samples: (number | null)[]) {

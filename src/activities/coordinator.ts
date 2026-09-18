@@ -1,4 +1,4 @@
-import { TimingTrace } from '../timing/index.js';
+import { installationTiming, timingEnabled } from '../timing/index.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context } from '@temporalio/activity';
 import type { ProviderNativeDiagnostic } from '../agent/limits.js';
@@ -126,9 +126,10 @@ function agentQueueTarget(deps: CoordinatorActivityDeps,
 export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
   const { client, taskQueue } = deps;
   const timing = (taskId: string, turnId: string, name: string) => {
+    if (!timingEnabled(deps.store)) return;
     let workflowRunId: string | undefined;
     try { workflowRunId = Context.current().info.workflowExecution?.runId; } catch { /* direct call */ }
-    new TimingTrace({ taskId, turnId, workflowRunId }, row => deps.store?.appendEvent?.({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } })).mark(name);
+    installationTiming(deps.store, { taskId, turnId, workflowRunId }, row => deps.store?.appendEvent?.({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } })).mark(name);
   };
   return {
     /** Enqueue a task for the merge slot, creating the coordinator if needed. */

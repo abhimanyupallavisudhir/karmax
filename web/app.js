@@ -2895,6 +2895,7 @@ async function checkConsoleRevision() {
       location.reload();
       return true;
     }
+    applyTimingSetting(meta.timingEnabled);
     if (!S.meta?.consoleRevision && meta.consoleRevision) S.meta.consoleRevision = meta.consoleRevision;
   } catch {}
   return false;
@@ -3493,6 +3494,7 @@ function connectWs() {
   ws.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
@@ -3508,10 +3510,10 @@ function connectWs() {
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
         scheduleTaskPageRender();
       }
-      if (ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
+      if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
         const received = performance.now();
         requestAnimationFrame(() => requestAnimationFrame(() => {
-          if (S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
+          if (S.meta?.timingEnabled && S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'timing.frame', id: ev.timingDeliveryId, frameMs: performance.now() - received }));
         }));
       }
@@ -6603,6 +6605,8 @@ const TASK_TABS = [
   { key: 'timing', label: 'Timing' },
 ];
 
+function visibleTaskTabs() { return TASK_TABS.filter(t => t.key !== 'timing' || S.meta?.timingEnabled === true); }
+
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
 // is asking the human to decide (an enabled `confirm` action — the Review gate),
 // the conversation that led here is the thing to read, so open Check-in on the
@@ -7366,6 +7370,7 @@ function renderTaskPage() {
   const main = $('#main');
   if (!v || !main) return;
   if (S.taskFile) return renderTaskFilePage(v, S.taskFile);
+  if (S.taskTab === 'timing' && !S.meta?.timingEnabled) S.taskTab = null;
   if (!S.taskTab) S.taskTab = defaultTaskTab(v); // resolved once at open; never auto-switches under the user
   const tab = S.taskTab;
   // A background refresh (or a just-sent follow-up) re-renders the whole page,
@@ -7426,7 +7431,7 @@ function renderTaskPage() {
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
-          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
+          ${visibleTaskTabs().map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
           ${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="local-checkout">Work locally</button>' : ''}
         </div>
       </div>
@@ -7595,7 +7600,7 @@ function wireWorkflowMode(v) {
 // Switch the open task page to another of its tabs, pinning the tab in the URL
 // (replace, not push — Back should leave the task, not walk through its tabs).
 function setTaskTab(key) {
-  if (!TASK_TABS.some((t) => t.key === key) || S.taskTab === key) return;
+  if (!visibleTaskTabs().some((t) => t.key === key) || S.taskTab === key) return;
   S.conversationFullscreen = false;
   S.taskTab = key;
   if (S.selected) history.replaceState({}, '', `${taskUrl(S.selected)}/${key}`);
@@ -7604,8 +7609,8 @@ function setTaskTab(key) {
 
 // Cycle the open task page's tabs ([ and ]), wrapping at the ends.
 function cycleTaskTab(delta) {
-  const i = Math.max(0, TASK_TABS.findIndex((t) => t.key === S.taskTab));
-  setTaskTab(TASK_TABS[(i + delta + TASK_TABS.length) % TASK_TABS.length].key);
+  const i = Math.max(0, visibleTaskTabs().findIndex((t) => t.key === S.taskTab));
+  setTaskTab(visibleTaskTabs()[(i + delta + visibleTaskTabs().length) % visibleTaskTabs().length].key);
 }
 
 function taskTabBody(v, tab) {
@@ -16238,6 +16243,7 @@ function installationView() {
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
+      <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
@@ -16362,6 +16368,14 @@ function wireInstallationSettings() {
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();
+  $('#timing-enabled')?.addEventListener('change', async event => {
+    const control = event.currentTarget; control.disabled = true;
+    try {
+      await api('/api/settings/global/timing', { method: 'PUT', body: JSON.stringify({ values: { enabled: control.checked } }) });
+      applyTimingSetting(control.checked);
+    } catch (error) { control.checked = S.meta?.timingEnabled === true; toast(error.message, true); }
+    finally { control.disabled = false; }
+  });
   wireInstallationGithubCard();
   wirePaidLaunchCard();
   wireStripePlatformCard();
@@ -18401,8 +18415,24 @@ async function finishMcpCallback() {
 
 // Timing is fetched on demand, independently of the bounded conversation window.
 const timingReports = new Map();
+function applyTimingSetting(enabled) {
+  enabled = enabled === true;
+  if (S.meta?.timingEnabled === enabled) return;
+  S.meta = { ...S.meta, timingEnabled: enabled };
+  if (!enabled) {
+    timingReports.clear();
+    S.activity = (S.activity || []).filter(e => e.type !== 'timing');
+    S.taskEvents = (S.taskEvents || []).filter(e => e.type !== 'timing');
+    if (S.taskTab === 'timing') S.taskTab = 'overview';
+  }
+  const control = document.getElementById('timing-enabled');
+  if (control) control.checked = enabled;
+  if (S.selected && S.view) renderTaskPage();
+  else if (S.tab === 'activity') bgRenderMain();
+}
 function timingMs(value) { return value == null ? 'Unknown' : `${(value / 1000).toFixed(3)} s`; }
 function timingTab(v) {
+  if (!S.meta?.timingEnabled) return "";
   const report = timingReports.get(v.taskId);
   const stats = report ? [['Activity → first text', report.firstResponse], ['Activity → completion', report.completion],
     ['Request → first text', report.requestFirstResponse], ['Request → completion', report.requestCompletion],
@@ -18423,12 +18453,14 @@ function timingTab(v) {
       <span class="task-sub">${a.openSpans} unfinished spans</span></details>`).join('') || '<p class="task-sub">No instrumented agent turns yet.</p>'}` : ''}`;
 }
 function wireTiming(v) {
+  if (!S.meta?.timingEnabled) return;
   const refresh = document.getElementById('timing-refresh');
   if (!refresh) return;
   refresh.onclick = async () => {
     refresh.disabled = true;
     try {
       const report = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/timing`);
+      if (!S.meta?.timingEnabled) return;
       if (timingReports.size >= 10) timingReports.delete(timingReports.keys().next().value);
       timingReports.set(v.taskId, report);
       if (S.selected === v.taskId && S.taskTab === 'timing') renderTaskPage();
@@ -18436,6 +18468,7 @@ function wireTiming(v) {
     finally { refresh.disabled = false; }
   };
   document.getElementById('timing-download').onclick = () => {
+    if (!S.meta?.timingEnabled) return;
     const blob = new Blob([JSON.stringify(timingReports.get(v.taskId), null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = `${v.taskId}-timing.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);

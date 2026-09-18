@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { TimingTrace, timingReport } from '../timing/index.js';
+import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
 import { requireHumanSubject } from './identity.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
@@ -1037,7 +1037,7 @@ export class KarmaxApi {
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
     },
-    receivedAt = { monoMs: performance.now(), wallMs: Date.now() },
+    receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined,
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
     const project = this.deps.store.getProject(args.projectId);
@@ -1335,7 +1335,7 @@ export class KarmaxApi {
     const initialFiles = taskOverrides.files as FileRef[] | undefined;
     if (initialFiles?.length) input.files = initialFiles;
 
-    const requestTiming = new TimingTrace({ taskId: task.id, requestIds: [`${task.id}:m0`] }, row => {
+    const requestTiming = installationTiming(this.deps.store, { taskId: task.id, requestIds: [`${task.id}:m0`] }, row => {
       this.deps.store.appendEvent({ taskId: task.id, type: 'timing', ts: row.wallMs, payload: { ...row } });
     });
     requestTiming.mark('request.received', { requestId: `${task.id}:m0` }, receivedAt);
@@ -3754,13 +3754,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async taskTiming(token: string, taskId: string) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
+    if (!timingEnabled(this.deps.store)) throw new Error('Timing is disabled for this installation');
     return timingReport(this.deps.store.eventsOfType(taskId, 'timing').map(e => e.payload as unknown as import('../timing/index.js').TimingRow));
   }
 
   async taskEvents(token: string, taskId: string, since = 0, limit?: number) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
-    return this.deps.store.eventsSince(taskId, since, limit);
+    return this.deps.store.eventsSince(taskId, since, limit, !timingEnabled(this.deps.store));
   }
 
   /** Resolve an Actions request through the calling task's project attachment.
@@ -4136,7 +4137,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt = { monoMs: performance.now(), wallMs: Date.now() }): Promise<Message | undefined> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
@@ -4411,7 +4412,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        const trace = new TimingTrace({ taskId, requestIds: [`${taskId}:${followUp.id}`] }, row => {
+        const trace = installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:${followUp.id}`] }, row => {
           this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
         });
         trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt);
