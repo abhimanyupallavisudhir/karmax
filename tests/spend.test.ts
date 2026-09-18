@@ -29,6 +29,7 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     projectId = (await post('/api/projects', { name: 'Pay', config: { repos: [repo] } })).id;
     const card = await post('/api/cards', { scope: 'project', projectId, label: 'Ops', cap: 1000000 });
     cardId = card.id;
+    h.store.setSettings(projectId, 'payments', { budget: null });
     await post(`/api/cards/${cardId}/fund`, { amount: 500000 }); // $5,000.00
   }, 60_000);
   afterAll(async () => {
@@ -115,6 +116,12 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     const otherCard = await post('/api/cards', { scope: 'project', projectId: otherProject.id, label: 'Other', cap: 1000 });
     expect((await fetch(`${base}/api/tasks/${created.id}/payments`, { method: 'PUT', headers: auth(),
       body: JSON.stringify({ cardIds: [otherCard.id], budget: 100 }) })).status).not.toBe(200);
+  });
+
+  it('captures the zero organization default on new tasks', async () => {
+    const project = h.store.createProject('Zero defaults', {});
+    const task = await post(`/api/projects/${project.id}/tasks`, { workflow: 'just-do', draft: true, params: { prompt: 'Default budget' } });
+    expect(task.params.paymentPolicy.budget).toBe(0);
   });
 
   it('captures inherited defaults and preserves them when a draft is replaced', async () => {

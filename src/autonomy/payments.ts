@@ -1128,7 +1128,7 @@ export function resolvePaymentPolicy(store: Store, projectId: string, taskId?: s
   const layer = t ?? p;
   return { cardIds: layer.cardIds ?? g.cardIds ?? store.listCards(projectId, org).filter(c => c.status !== 'canceled').map(c => c.id),
     budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance
-      ?? (Object.hasOwn(g, 'budget') ? g.budget : g.allowance ?? null) };
+      ?? (Object.hasOwn(g, 'budget') ? g.budget : g.allowance ?? 0) };
 }
 
 export function validatePaymentPolicy(store: Store, projectId: string | undefined, organizationId: string, value: unknown): asserts value is PaymentPolicy {

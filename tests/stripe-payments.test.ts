@@ -22,6 +22,7 @@ describe('Stripe Issuing organization rail', () => {
     store = new Store(':memory:');
     organizationId = store.createOrganization({ name: 'Tenant A' }).id;
     projectId = store.createProject('Payments', {}, organizationId).id;
+    store.setSettings(`organization:${organizationId}`, 'payments', { budget: null });
     fetcher = vi.fn(async (url: string, init?: RequestInit) => {
       if (url === 'https://connect.stripe.com/oauth/token')
         return json({ stripe_user_id: 'acct_tenant_a', livemode: false });
