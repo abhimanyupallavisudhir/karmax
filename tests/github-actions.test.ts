@@ -79,6 +79,38 @@ describe('GitHub Actions API', () => {
     expect(renderGithubActionsFailure(decision)).toContain('tests/web-console-ux.test.ts');
   });
 
+  it.each([
+    'taskPaymentsHtml("tp-payments", true)',
+    'tests/payments.test.ts:14: AssertionError: expected budget to equal 100',
+    'tests/billing.test.ts:14: AssertionError: prepaid balance differs',
+  ])('does not mistake a test annotation for an account block: %s', (source) => {
+    const annotation = `tests/web-regressions.test.ts:14: ReferenceError: taskRecord is not defined\n${source}`;
+    expect(classifyGithubActionsDiagnostic(annotation)).toBeUndefined();
+    expect(classifyGithubActionsFailure(inspection(annotation), {
+      providerContext: `typecheck + tests: FAILURE\n${annotation}`,
+    }).disposition).toBe('revision');
+  });
+
+  it.each([
+    'The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the Billing & plans section of your settings.',
+    'GitHub annotation: Recent account payments failed and the spending limit must be increased',
+    'Workflow did not start because your spending limit needs to be increased',
+  ])('retains actual GitHub billing diagnostics: %s', (providerContext) => {
+    expect(classifyGithubActionsDiagnostic(providerContext)).toBe('human');
+    expect(classifyGithubActionsFailure(inspection(''), { providerContext })).toMatchObject({
+      disposition: 'human', waitReason: 'GitHub Actions billing action required',
+    });
+  });
+
+  it('does not label an approval or permission block as billing because its check mentions payments', () => {
+    expect(classifyGithubActionsFailure(inspection('', { conclusion: 'action_required' }), {
+      providerContext: 'payments: ACTION_REQUIRED',
+    })).toMatchObject({ disposition: 'human', waitReason: 'GitHub Actions approval required' });
+    expect(classifyGithubActionsFailure(inspection(''), {
+      providerContext: 'payments: FAILURE\nResource not accessible by integration',
+    })).toMatchObject({ disposition: 'human', waitReason: 'GitHub Actions permission required' });
+  });
+
   it('routes only direct provider evidence and action_required to a human', () => {
     const annotation = classifyGithubActionsFailure(inspection('AssertionError: ordinary test failure'), {
       providerContext: 'GitHub check annotation: Actions is disabled for this repository',

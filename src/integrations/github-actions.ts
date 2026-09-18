@@ -164,7 +164,15 @@ const DEFAULT_MAX_LOG_DOWNLOAD = 8 * 1024 * 1024;
 const DEFAULT_MAX_LOG_EXCERPT = 64 * 1024;
 const DEFAULT_MAX_JOB_LOGS = 8;
 const MAX_JOB_PAGES = 10;
-const HUMAN_CONFIGURATION_FAILURE = /(?:billing|payment|spending limit|budget|prepaid|quota for (?:actions|minutes)|included minutes|actions (?:is|are) disabled|workflow(?:s)? (?:is|are) disabled|no hosted runners?|not permitted to use (?:actions|this action)|resource not accessible by integration|requires? approval|approve and run|action required)/i;
+// Check annotations can contain source snippets and assertion messages, just
+// like job logs. A billing-related identifier or filename is not evidence of
+// an account restriction; require a diagnostic describing the restriction.
+const BILLING_CONFIGURATION_FAILURE = /\b(?:recent account payments (?:have )?failed|(?:your |the )?spending limit (?:needs? to be|must be) increased|(?:increase|exceeded|reached) (?:your |the )?spending limit|(?:your |the )?prepaid balance has (?:now )?been (?:fully )?(?:consumed|exhausted)|(?:account|actions) (?:is |has been )?(?:blocked|disabled|suspended) (?:due to|because of) (?:a )?(?:billing|payment) (?:issue|failure|problem))\b/i;
+const HUMAN_CONFIGURATION_FAILURE = /\b(?:quota for (?:actions|minutes)|included minutes|actions (?:is|are) disabled|workflow(?:s)? (?:is|are) disabled|no hosted runners?|not permitted to use (?:actions|this action)|resource not accessible by integration|requires? approval|approve and run|action required)\b/i;
+function isHumanConfigurationFailure(input: string): boolean {
+  return BILLING_CONFIGURATION_FAILURE.test(input) || HUMAN_CONFIGURATION_FAILURE.test(input);
+}
+
 const SUPERSEDED_RUN_FAILURE = /(?:cancel(?:ing|led) since (?:a )?higher priority waiting request|higher priority waiting request .* exists|cancel(?:ing|led) .* newer (?:request|workflow run|run)|supersed(?:e|ed|ing) by (?:a )?(?:newer|higher.priority) (?:request|workflow run|run)|concurrency (?:group|queue).*(?:cancel|supersed))/i;
 const TRANSIENT_RUNNER_FAILURE = /(?:the hosted runner|runner (?:has|was|is) (?:lost|disconnected|offline)|failed to (?:acquire|start|create|provision) (?:a )?runner|no runner matching|service unavailable|internal server error|gateway timeout|connection (?:reset|timed out)|network (?:error|failure)|temporary failure|try again later|job was cancelled because|received a shutdown signal|lost communication with the server|the operation was canceled)/i;
 const TRANSIENT_RUN_CONCLUSION_DIAGNOSTIC = /(?:\bconclu(?:ded|sion)\s*[:=]?\s*|\bstate\s*[:=]\s*|:\s*)(?:cancelled|stale|startup_failure|timed_out)\b/i;
@@ -482,7 +490,7 @@ export function classifyGithubActionsFailure(
   // provider/check/annotation evidence collected outside the job log.
   const providerEvidence = githubActionsProviderEvidence(inspection, options.providerContext);
   const conclusion = String(inspection.run.conclusion ?? '').toLowerCase();
-  if (HUMAN_CONFIGURATION_FAILURE.test(providerEvidence) || conclusion === 'action_required') return {
+  if (isHumanConfigurationFailure(providerEvidence) || conclusion === 'action_required') return {
     disposition: 'human',
     reason: 'GitHub reported an account, billing, permission, approval, runner-availability, or repository configuration problem that changing the proposal cannot fix.',
     waitReason: githubActionsHumanWaitReason(providerEvidence, conclusion),
@@ -512,7 +520,7 @@ export function classifyGithubActionsFailure(
  * allocating a run/job whose logs can be downloaded. `undefined` means the
  * text contains no safe provider-level signal and should remain a code failure. */
 export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry' | 'superseded' | undefined {
-  if (HUMAN_CONFIGURATION_FAILURE.test(input)) return 'human';
+  if (isHumanConfigurationFailure(input)) return 'human';
   if (SUPERSEDED_RUN_FAILURE.test(input)) return 'superseded';
   if (TRANSIENT_RUNNER_FAILURE.test(input) || TRANSIENT_RUN_CONCLUSION_DIAGNOSTIC.test(input)) return 'retry';
   return undefined;
@@ -521,7 +529,7 @@ export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry
 /** Project a direct GitHub diagnostic into a stable, concise task-status label.
  * The detailed annotation/check output remains durable in the wait detail. */
 export function githubActionsHumanWaitReason(input: string, conclusion = ''): string {
-  if (/billing|payment|spending limit|budget|prepaid/i.test(input))
+  if (BILLING_CONFIGURATION_FAILURE.test(input))
     return 'GitHub Actions billing action required';
   if (/quota for (?:actions|minutes)|included minutes/i.test(input))
     return 'GitHub Actions quota action required';

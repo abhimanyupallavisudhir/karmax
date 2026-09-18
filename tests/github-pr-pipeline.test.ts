@@ -47,6 +47,8 @@ let actionsJobConclusion = 'timed_out';
 let actionsJobLog = 'Error: The hosted runner lost communication with the server\n';
 let actionsReplacementSuccess = false;
 let actionsInspectionForbidden = false;
+let checkAnnotations: unknown[] = [];
+let annotationReads = 0;
 
 async function remoteForBranch(branch: string, slug?: string): Promise<string | undefined> {
   if (slug && remoteBySlug.has(slug)) return remoteBySlug.get(slug);
@@ -81,6 +83,11 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   const body = init.body ? JSON.parse(String(init.body)) : {};
   const json = (status: number, value: unknown) =>
     new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+  if (u.pathname === `/repos/${SLUG}/check-runs/99/annotations`) {
+    annotationReads++;
+    return json(200, checkAnnotations);
+  }
+  if (u.pathname === `/repos/${SLUG}/check-runs/99`) return json(200, { output: {} });
   if (actionsInspectionForbidden && u.pathname.startsWith(`/repos/${SLUG}/actions/`) && method === 'GET')
     return json(403, { message: 'Resource not accessible by integration' });
   if (u.pathname === `/repos/${SLUG}/actions/runs/42` && method === 'GET') return json(200, {
@@ -342,6 +349,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     actionsJobLog = 'Error: The hosted runner lost communication with the server\n';
     actionsReplacementSuccess = false;
     actionsInspectionForbidden = false;
+    checkAnnotations = [];
+    annotationReads = 0;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -670,10 +679,16 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       'no hosted runners; not permitted to use this action; resource not accessible by integration;',
       'requires approval; approve and run; action required.',
     ].join('\n');
+    // Task 278: GitHub repeats test errors as check annotations. The payment
+    // identifier in that source excerpt must not turn CI repair into billing.
+    checkAnnotations = [{ path: 'tests/web-regressions.test.ts', start_line: 14,
+      annotation_level: 'failure',
+      message: 'ReferenceError: taskRecord is not defined\n taskPaymentsHtml("tp-payments", true)',
+    }];
     githubReadiness = {
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
-        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        __typename: 'CheckRun', databaseId: 99, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
         detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
       }] } },
     };
@@ -693,6 +708,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(h.store.eventsSince(task.id, beforeLanding)
       .filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
     const repaired = await view(handle);
+    expect(annotationReads).toBeGreaterThan(0);
     expect(repaired.prs).toHaveLength(1);
     expect(repaired.messages.map((message: any) => message.text).join('\n'))
       .toMatch(/Classification: revision.*repair the proposal/is);
