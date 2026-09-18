@@ -72,7 +72,7 @@ eval(extractFn('updateLiveBubble'));
 function makeBubble() {
   return { innerHTML: '', _scrolled: false, classList: { remove() {} }, scrollIntoView() { this._scrolled = true; } };
 }
-// Reader parked at the bottom (scrollHeight - scrollTop - clientHeight < 40).
+// Reader parked at the bottom (scrollHeight - scrollTop - clientHeight <= 2).
 bubble = makeBubble();
 thread = { scrollHeight: 1000, scrollTop: 970, clientHeight: 30 };
 updateLiveBubble();
@@ -84,6 +84,10 @@ thread = { scrollHeight: 1000, scrollTop: 100, clientHeight: 300 };
 updateLiveBubble();
 ok(bubble._scrolled === false, 'scrolled up → streaming text does not steal the view');
 ok(bubble.innerHTML.includes('streaming text'), 'the bubble content still updates while scrolled up');
+bubble = makeBubble();
+thread = { scrollHeight: 1000, scrollTop: 680, clientHeight: 300 };
+updateLiveBubble();
+ok(bubble._scrolled === false, 'even a small upward scroll releases the live stream from the bottom');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

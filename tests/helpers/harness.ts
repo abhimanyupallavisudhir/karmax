@@ -64,7 +64,7 @@ export interface Harness {
   restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
-  startGateway(opts?: { password?: string;
+  startGateway(opts?: { password?: string; hosted?: boolean; port?: number; identity?: import('../../src/auth/identity.js').IdentityService;
     serviceConnections?: import('../../src/integrations/service-connections.js').ServiceConnections;
     loginCommand?: LoginCommand;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
@@ -205,12 +205,14 @@ export async function bootHarness(
         githubApp: opts?.githubApp ?? overrides.githubApp,
         serviceConnections: opts?.serviceConnections,
         password: opts?.password,
+        hosted: opts?.hosted,
+        identity: opts?.identity,
         worlds,
         objects,
         resources,
         handoffs,
       });
-      const started = await gw.listen();
+      const started = await gw.listen(opts?.port);
       gateways.push(started.close);
       return started;
     },

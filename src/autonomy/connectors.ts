@@ -13,6 +13,8 @@ import { CredentialBroker } from './broker.js';
 import { GitProfiles } from './git-profiles.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
 import { hostOf, passEntryMetadata } from './pass-path.js';
+import { passSecrets, updatePassSecret, createPassBody } from './pass-format.js';
+export { passSecrets } from './pass-format.js';
 
 const pexec = promisify(execFile);
 
@@ -89,6 +91,8 @@ export interface CredentialConnector {
   describe(): Promise<ConnectorInfo>;
   /** Enumerate mirrorable items (metadata only). */
   list(): Promise<ExternalItem[]>;
+  /** Validate a candidate without publishing it to concurrent sync operations. */
+  validateSecret?(secret: string): Promise<ConnectorInfo>;
   /** Fetch the selected items with their secrets. */
   pull(externalIds: string[]): Promise<PullResult>;
   /** Optional write-back of an agent-created item (creates a NEW entry). */
@@ -106,10 +110,7 @@ export type Exec = (cmd: string, args: string[], opts?: { env?: Record<string, s
 
 const realExec: Exec = async (cmd, args, opts) => {
   const child = pexec(cmd, args, { env: { ...process.env, ...(opts?.env ?? {}) }, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
-  if (opts?.input) {
-    child.child.stdin?.write(opts.input);
-    child.child.stdin?.end();
-  }
+  child.child.stdin?.end(opts?.input);
   return (await child).stdout;
 };
 
@@ -546,8 +547,7 @@ export class PassConnector implements CredentialConnector {
   }
   /**
    * Field-level update that preserves the notes on lines 2+: read the whole
-   * entry, replace only line 1 (password) or the `otpauth://` line (totp), and
-   * re-insert. This is why "line 1 is the password" is enforced precisely.
+   * entry, update the password or token while preserving its format, and re-insert.
    */
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
     let body: string;
@@ -556,18 +556,9 @@ export class PassConnector implements CredentialConnector {
     } catch (e) {
       throw new Error(gpgHint(e));
     }
-    const lines = body.replace(/\r/g, '').replace(/\n$/, '').split('\n');
-    if (field === 'password') {
-      lines[0] = value;
-    } else if (field === 'totp') {
-      const idx = lines.findIndex((l, i) => i > 0 && l.trim().startsWith('otpauth://'));
-      if (idx >= 0) lines[idx] = value;
-      else lines.push(value); // no existing seed → append one
-    } else if (field !== 'note') {
-      throw new Error(`pass write-back does not support the "${field}" field`);
-    }
+    const updated = updatePassSecret(body, field, value);
     try {
-      await this.exec('pass', ['insert', '-m', '-f', externalId], { input: field === 'note' ? passSecrets(body).password + '\n' + value : lines.join('\n') + '\n' });
+      await this.exec('pass', ['insert', '-m', '-f', externalId], { input: updated });
     } catch (e) {
       throw new Error(gpgHint(e));
     }
@@ -581,9 +572,7 @@ export class PassConnector implements CredentialConnector {
    */
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
     const name = `karmax/${item.label}`.replace(/[^A-Za-z0-9._@/-]+/g, '-').replace(/\/+/g, '/');
-    const body = item.secrets.note !== undefined
-      ? (item.secrets.password ?? '') + '\n' + item.secrets.note
-      : [item.secrets.password ?? '', ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n') + '\n';
+    const body = createPassBody(item.secrets, item.username);
     try {
       await this.exec('pass', ['insert', '-m', '-f', name], { input: body });
     } catch (e) {
@@ -626,7 +615,11 @@ interface GitPassConnection {
   /** Optional organization Git profile; otherwise the organization default. */
   gitProfile?: string;
   /** ASCII-armored secret key. It stays in the credential broker at rest. */
-  gpgPrivateKey: string;
+  gpgPrivateKey?: string;
+  /** GPG remains the default for existing connections. */
+  crypto?: 'gpg' | 'age';
+  /** Native age secret identities (not plugins or filesystem references). */
+  ageIdentity?: string;
   /** Optional passphrase for the secret key. */
   gpgPassphrase?: string;
 }
@@ -662,7 +655,7 @@ async function serializeGitPass<T>(key: string, work: () => Promise<T>): Promise
  * Git transport credentials come from an organization Git profile; the GPG
  * private key and its passphrase remain one opaque connector secret.
  */
-export class GitPassConnector implements CredentialConnector {
+class GitPassStoreConnector implements CredentialConnector {
   readonly name = 'pass-git';
 
   constructor(
@@ -717,6 +710,20 @@ export class GitPassConnector implements CredentialConnector {
     }
   }
 
+  async verify(): Promise<void> {
+    await this.inRepository(async (connection, _checkout, store) => {
+      this.entries(store);
+      await this.withKeyContext(connection, async (home) => {
+        if (connection.crypto === 'age') {
+          await realExec('age-keygen', ['-y', path.join(home, 'identity')]);
+        } else {
+          const keys = await realExec('gpg', ['--homedir', home, '--batch', '--with-colons', '--list-secret-keys']);
+          if (!keys.split('\n').some(line => line.startsWith('sec:'))) throw new Error('GPG private key is required');
+        }
+      });
+    });
+  }
+
   async list(): Promise<ExternalItem[]> {
     return this.inRepository(async (_connection, _checkout, store, _env) =>
       this.entries(store).map((entry) => this.metadata(store, entry)));
@@ -725,7 +732,7 @@ export class GitPassConnector implements CredentialConnector {
   async pull(externalIds: string[]): Promise<PullResult> {
     return this.inRepository(async (connection, _checkout, store, _env) => {
       const available = new Set(this.entries(store));
-      return this.withGpg(connection, async (gpgHome) => {
+      return this.withKeyContext(connection, async (gpgHome) => {
         const items: ExternalSecretItem[] = [];
         const failures: PullResult['failures'] = [];
         for (const externalId of externalIds) {
@@ -736,7 +743,7 @@ export class GitPassConnector implements CredentialConnector {
             const secrets = passSecrets(body);
             items.push({ ...metadata, fields: Object.keys(secrets) as VaultFieldName[], secrets });
           } catch (e) {
-            failures.push({ externalId, error: gitPassGpgError(e) });
+            failures.push({ externalId, error: connection.crypto === 'age' ? 'Could not decrypt this entry with the supplied age identity' : gitPassGpgError(e) });
           }
         }
         return { items, failures };
@@ -747,20 +754,10 @@ export class GitPassConnector implements CredentialConnector {
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
     await this.inRepository(async (connection, checkout, store, env) => {
       if (!this.entries(store).includes(externalId)) throw new Error(`pass entry "${externalId}" was not found`);
-      await this.withGpg(connection, async (gpgHome) => {
+      await this.withKeyContext(connection, async (gpgHome) => {
         const file = this.entryFile(store, externalId);
         const body = await this.decrypt(gpgHome, connection, file);
-        const lines = body.replace(/\r/g, '').replace(/\n$/, '').split('\n');
-        if (field === 'password') {
-          lines[0] = value;
-        } else if (field === 'totp') {
-          const index = lines.findIndex((line, i) => i > 0 && line.trim().startsWith('otpauth://'));
-          if (index >= 0) lines[index] = value;
-          else lines.push(value);
-        } else if (field !== 'note') {
-          throw new Error(`Git-backed pass write-back does not support the "${field}" field`);
-        }
-        await this.encrypt(gpgHome, file, field === 'note' ? passSecrets(body).password + '\n' + value : lines.join('\n') + '\n', this.recipients(store, path.dirname(file)));
+        await this.encrypt(gpgHome, file, updatePassSecret(body, field, value), this.recipients(store, path.dirname(file)));
       });
       await this.commitAndPush(checkout, fileRelativeTo(checkout, this.entryFile(store, externalId)),
         `Update pass entry ${externalId}`, env);
@@ -769,8 +766,8 @@ export class GitPassConnector implements CredentialConnector {
 
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
     return this.inRepository(async (connection, checkout, store, env) => {
-      if (item.type !== 'login' || item.secrets.password === undefined) {
-        throw new Error('Git-backed pass write-back supports login items with a password');
+      if (item.type !== 'login' || (item.secrets.password === undefined && !item.secrets.totp)) {
+        throw new Error('Git-backed pass write-back supports login items with a password or TOTP');
       }
       let stem = safePassName(item.label);
       let externalId = `karmax/${stem}`;
@@ -779,11 +776,12 @@ export class GitPassConnector implements CredentialConnector {
       }
       const file = this.entryFile(store, externalId);
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      const body = item.secrets.note !== undefined
-        ? (item.secrets.password ?? '') + '\n' + item.secrets.note
-        : [item.secrets.password, ...(item.username ? [`username: ${item.username}`] : []),
-          ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n') + '\n';
-      await this.withGpg(connection, async (gpgHome) => {
+      const directory = path.dirname(file);
+      if (fs.lstatSync(directory).isSymbolicLink() || !inside(store, fs.realpathSync(directory))) {
+        throw new Error('The pass export directory must be a real directory inside the password store');
+      }
+      const body = createPassBody(item.secrets, item.username);
+      await this.withKeyContext(connection, async (gpgHome) => {
         await this.encrypt(gpgHome, file, body, this.recipients(store, path.dirname(file)));
       });
       await this.commitAndPush(checkout, fileRelativeTo(checkout, file), `Add pass entry ${externalId}`, env);
@@ -811,7 +809,16 @@ export class GitPassConnector implements CredentialConnector {
       if (url.username || url.password) throw new Error('repository URL must not embed credentials; select a Git profile instead');
     }
     const gpgPrivateKey = String(value.gpgPrivateKey ?? '').trim();
-    if (!gpgPrivateKey) throw new Error('an armored GPG private key is required');
+    const crypto = value.crypto ?? 'gpg';
+    if (crypto !== 'gpg' && crypto !== 'age') throw new Error('password-store encryption must be gpg or age');
+    const ageIdentity = String(value.ageIdentity ?? '').trim();
+    if (crypto === 'age') {
+      const identities = ageIdentity.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+      if (ageIdentity.length > 2 * 1024 * 1024 || !identities.length
+        || identities.some(line => !/^AGE-SECRET-KEY-1[0-9A-Z]{58}$/.test(line))) {
+        throw new Error('age identity must contain native AGE-SECRET-KEY-1 identities');
+      }
+    } else if (!gpgPrivateKey) throw new Error('an armored GPG private key is required');
     if (gpgPrivateKey.length > 2 * 1024 * 1024) throw new Error('GPG private key is too large');
     const storePath = String(value.storePath ?? '').trim().replace(/\\/g, '/');
     if (storePath && (path.posix.isAbsolute(storePath) || storePath.split('/').includes('..'))) {
@@ -823,7 +830,8 @@ export class GitPassConnector implements CredentialConnector {
       repositoryUrl,
       ...(storePath ? { storePath } : {}),
       ...(gitProfile ? { gitProfile } : {}),
-      gpgPrivateKey,
+      crypto,
+      ...(crypto === 'age' ? { ageIdentity } : { gpgPrivateKey }),
       ...(value.gpgPassphrase ? { gpgPassphrase: String(value.gpgPassphrase) } : {}),
     };
   }
@@ -899,7 +907,7 @@ export class GitPassConnector implements CredentialConnector {
     const conventional = path.join(checkout, '.password-store');
     const conventionalStat = fs.lstatSync(conventional, { throwIfNoEntry: false });
     if (conventionalStat?.isDirectory() && !conventionalStat.isSymbolicLink()) return conventional;
-    if (regularFile(path.join(checkout, '.gpg-id'))) return checkout;
+    if (regularFile(path.join(checkout, this.format().recipients))) return checkout;
     const queue = [checkout];
     let visited = 0;
     while (queue.length) {
@@ -908,11 +916,11 @@ export class GitPassConnector implements CredentialConnector {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         if (entry.name === '.git' || entry.isSymbolicLink()) continue;
         const child = path.join(dir, entry.name);
-        if (entry.isFile() && entry.name === '.gpg-id') return dir;
+        if (entry.isFile() && entry.name === this.format().recipients) return dir;
         if (entry.isDirectory()) queue.push(child);
       }
     }
-    throw new Error('no password store was found (set the path containing .gpg-id)');
+    throw new Error('no password store was found (set the path containing .gpg-id or .age-recipients)');
   }
 
   private entries(store: string): string[] {
@@ -924,11 +932,11 @@ export class GitPassConnector implements CredentialConnector {
         if (entry.name === '.git' || entry.isSymbolicLink()) continue;
         const child = path.join(dir, entry.name);
         if (entry.isDirectory()) queue.push(child);
-        else if (entry.isFile() && entry.name.endsWith('.gpg')) files.push(child);
+        else if (entry.isFile() && entry.name.endsWith(this.format().extension)) files.push(child);
         if (files.length > 100_000) throw new Error('password store contains too many entries');
       }
     }
-    return files.map((file) => path.relative(store, file).slice(0, -4).split(path.sep).join('/')).sort();
+    return files.map((file) => path.relative(store, file).slice(0, -this.format().extension.length).split(path.sep).join('/')).sort();
   }
 
   private metadata(store: string, externalId: string): ExternalItem {
@@ -953,7 +961,7 @@ export class GitPassConnector implements CredentialConnector {
     if (!normalized || path.posix.isAbsolute(normalized) || normalized.split('/').includes('..')) {
       throw new Error('invalid pass entry id');
     }
-    const file = path.resolve(store, `${normalized}.gpg`);
+    const file = path.resolve(store, `${normalized}${this.format().extension}`);
     if (!inside(store, file)) throw new Error('invalid pass entry id');
     return file;
   }
@@ -961,11 +969,11 @@ export class GitPassConnector implements CredentialConnector {
   private recipients(store: string, start: string): string[] {
     let dir = start;
     for (;;) {
-      const idFile = path.join(dir, '.gpg-id');
+      const idFile = path.join(dir, this.format().recipients);
       if (regularFile(idFile)) {
         const recipients = fs.readFileSync(idFile, 'utf8').split(/\r?\n/)
           .map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
-        if (!recipients.length) throw new Error(`${path.relative(store, idFile) || '.gpg-id'} has no recipients`);
+        if (!recipients.length) throw new Error(`${path.relative(store, idFile) || this.format().recipients} has no recipients`);
         return recipients;
       }
       if (dir === store) break;
@@ -973,17 +981,28 @@ export class GitPassConnector implements CredentialConnector {
       if (!inside(store, parent) && parent !== store) break;
       dir = parent;
     }
-    throw new Error(`no .gpg-id applies to ${path.relative(store, start) || '.'}`);
+    throw new Error(`no ${this.format().recipients} applies to ${path.relative(store, start) || '.'}`);
   }
 
-  private async withGpg<T>(connection: GitPassConnection, work: (home: string) => Promise<T>): Promise<T> {
+  private format() {
+    return this.connection().crypto === 'age'
+      ? { extension: '.age', recipients: '.age-recipients' }
+      : { extension: '.gpg', recipients: '.gpg-id' };
+  }
+
+  private async withKeyContext<T>(connection: GitPassConnection, work: (home: string) => Promise<T>): Promise<T> {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const home = fs.mkdtempSync(path.join(this.root, '.gpg-'));
+    const home = fs.mkdtempSync(path.join(this.root, '.key-'));
     fs.chmodSync(home, 0o700);
     try {
-      await realExec('gpg', ['--homedir', home, '--batch', '--yes', '--import'], { input: `${connection.gpgPrivateKey}\n` });
+      if (connection.crypto === 'age') {
+        fs.writeFileSync(path.join(home, 'identity'), `${connection.ageIdentity}\n`, { mode: 0o600 });
+      } else {
+        await realExec('gpg', ['--homedir', home, '--batch', '--yes', '--import'], { input: `${connection.gpgPrivateKey}\n` });
+      }
       return await work(home);
     } catch (e) {
+      if (connection.crypto === 'age') throw new Error('Git-backed pass could not decrypt or encrypt with the supplied age identity and recipients');
       throw new Error(gitPassGpgError(e));
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
@@ -991,6 +1010,7 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   private decrypt(home: string, connection: GitPassConnection, file: string): Promise<string> {
+    if (connection.crypto === 'age') return realExec('age', ['--decrypt', '--identity', path.join(home, 'identity'), file]);
     return realExec('gpg', ['--homedir', home, '--batch', '--yes', '--pinentry-mode', 'loopback',
       '--passphrase-fd', '0', '--decrypt', file], { input: `${connection.gpgPassphrase ?? ''}\n` });
   }
@@ -998,10 +1018,16 @@ export class GitPassConnector implements CredentialConnector {
   private async encrypt(home: string, file: string, plaintext: string, recipients: string[]): Promise<void> {
     const temp = `${file}.karmax-${process.pid}-${Date.now()}`;
     try {
-      const args = ['--homedir', home, '--batch', '--yes', '--trust-model', 'always', '--output', temp];
+      const age = this.connection().crypto === 'age';
+      // Native recipients only: never let store data request an executable age plugin.
+      if (age && recipients.some(recipient => !/^age1[0-9a-z]{58}$/.test(recipient))) {
+        throw new Error('age stores require native age1 recipients');
+      }
+      const args = age ? ['--encrypt', '--output', temp]
+        : ['--homedir', home, '--batch', '--yes', '--trust-model', 'always', '--output', temp];
       for (const recipient of recipients) args.push('--recipient', recipient);
-      args.push('--encrypt');
-      await realExec('gpg', args, { input: plaintext });
+      if (!age) args.push('--encrypt');
+      await realExec(age ? 'age' : 'gpg', args, { input: plaintext });
       fs.chmodSync(temp, 0o600);
       fs.renameSync(temp, file);
     } finally {
@@ -1017,6 +1043,107 @@ export class GitPassConnector implements CredentialConnector {
     if (pushed.code !== 0) {
       throw new Error(`password-store changed remotely or could not be pushed; retry to refresh it: ${pushed.stderr || pushed.stdout}`);
     }
+  }
+}
+
+/** Compose explicitly connected gopass stores. Mount configuration lives on the
+ * user's machine, so never infer or fetch additional remotes from repository data.
+ * Mounts reserve their prefix, as in gopass. New exports go to the root store. */
+export class GitPassConnector implements CredentialConnector {
+  readonly name = 'pass-git';
+  constructor(
+    private secret: () => string | undefined,
+    private organizationId = 'org_personal',
+    private gitEnvironment: (profile?: string) => Record<string, string> = () => ({}),
+    private root = path.join(paths().state, 'connectors', 'pass-git'),
+    private options: GitPassOptions = {},
+  ) {}
+
+  private stores(): { prefix: string; connector: GitPassStoreConnector }[] {
+    const raw = this.secret();
+    let config: any;
+    try { config = raw ? JSON.parse(raw) : undefined; }
+    catch { throw new Error('Git-backed pass connection is invalid'); }
+    const mounts = config?.mounts ?? [];
+    if (!Array.isArray(mounts) || mounts.length > 16) throw new Error('At most 16 password-store mounts are supported');
+    const prefixes: string[] = [];
+    const make = (secret: string | undefined) => new GitPassStoreConnector(() => secret,
+      this.organizationId, this.gitEnvironment, this.root, this.options);
+    const children = mounts.map((mount: any) => {
+      const name = mount?.name;
+      if (typeof name !== 'string' || !/^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*$/.test(name)
+        || prefixes.some(prefix => name + '/' === prefix || (name + '/').startsWith(prefix) || prefix.startsWith(name + '/'))
+        || mount.mounts !== undefined) throw new Error('Mount names must be unique, non-overlapping relative paths');
+      const prefix = name + '/';
+      prefixes.push(prefix);
+      return { prefix, connector: make(JSON.stringify(mount)) };
+    });
+    return [{ prefix: '', connector: make(raw) }, ...children];
+  }
+
+  async describe(): Promise<ConnectorInfo> {
+    try {
+      const stores = this.stores();
+      const infos = await Promise.all(stores.map(store => store.connector.describe()));
+      const unavailable = infos.find(info => !info.available);
+      return unavailable ?? { ...infos[0]!, detail: infos[0]!.detail + (stores.length > 1 ? `; ${stores.length - 1} mounted stores` : '') };
+    } catch (e) {
+      return { name: this.name, label: 'unix pass / gopass (Git)', available: false, canPush: true, setup: 'git-pass',
+        detail: e instanceof Error ? e.message : 'Invalid password-store connection' };
+    }
+  }
+
+  matchesRepository(repository: Repository): boolean {
+    try { return this.stores().some(store => store.connector.matchesRepository(repository)); }
+    catch { return false; }
+  }
+
+  async validateSecret(secret: string): Promise<ConnectorInfo> {
+    const candidate = new GitPassConnector(() => secret, this.organizationId, this.gitEnvironment, this.root, this.options);
+    const info = await candidate.describe();
+    if (!info.available) throw new Error(info.detail);
+    for (const store of candidate.stores()) await store.connector.verify();
+    return info;
+  }
+
+  async list(): Promise<ExternalItem[]> {
+    const stores = this.stores();
+    const out: ExternalItem[] = [];
+    for (const { prefix, connector } of stores) {
+      for (const item of await connector.list()) {
+        if (!prefix && stores.some(store => store.prefix && item.externalId.startsWith(store.prefix))) continue;
+        out.push({ ...item, externalId: prefix + item.externalId, label: prefix + item.label,
+          folder: prefix ? prefix + (item.folder ?? '') : item.folder });
+      }
+    }
+    return out;
+  }
+
+  async pull(externalIds: string[]): Promise<PullResult> {
+    const stores = this.stores();
+    const result: PullResult = { items: [], failures: [] };
+    for (const { prefix, connector } of stores) {
+      const ids = externalIds.filter(id => prefix ? id.startsWith(prefix) : !stores.some(store => store.prefix && id.startsWith(store.prefix)));
+      if (!ids.length) continue;
+      const pulled = await connector.pull(ids.map(id => id.slice(prefix.length)));
+      result.items.push(...pulled.items.map(item => ({ ...item, externalId: prefix + item.externalId,
+        label: prefix + item.label, folder: prefix ? prefix + (item.folder ?? '') : item.folder })));
+      result.failures.push(...pulled.failures.map(failure => ({ ...failure, externalId: prefix + failure.externalId })));
+    }
+    return result;
+  }
+
+  async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    const stores = this.stores();
+    const store = stores.find(store => store.prefix && externalId.startsWith(store.prefix)) ?? stores[0]!;
+    await store.connector.updateSecret(externalId.slice(store.prefix.length), field, value);
+  }
+
+  async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
+    const stores = this.stores();
+    // A mount named karmax would shadow all root exports.
+    if (stores.some(store => store.prefix.startsWith('karmax/'))) throw new Error('The karmax mount reserves the export folder; rename that mount before exporting');
+    return stores[0]!.connector.push(item);
   }
 }
 
@@ -1047,8 +1174,13 @@ function githubRepositorySlug(value: string): string | undefined {
 function gitPassRepositoryIdentity(secret: string | undefined): string | undefined {
   if (!secret) return undefined;
   try {
-    const repositoryUrl = String(JSON.parse(secret)?.repositoryUrl ?? '').trim().replace(/\/$/, '');
-    return (githubRepositorySlug(repositoryUrl) ?? repositoryUrl) || undefined;
+    const config = JSON.parse(secret);
+    const identity = (store: any) => {
+      const url = String(store.repositoryUrl ?? '').trim().replace(/\/$/, '');
+      return [githubRepositorySlug(url) ?? url, store.storePath ?? '', store.crypto ?? 'gpg'];
+    };
+    return JSON.stringify([identity(config), (config.mounts ?? []).map((mount: any) =>
+      [mount.name, ...identity(mount)]).sort((a: string[], b: string[]) => a[0]!.localeCompare(b[0]!))]);
   } catch {
     return undefined;
   }
@@ -1095,15 +1227,6 @@ function gitPassGpgError(error: unknown): string {
     return 'Git-backed pass could not use the supplied GPG key or passphrase';
   }
   return message;
-}
-
-/** Keep the pass body after its first line verbatim; never interpret usernames. */
-export function passSecrets(body: string): Partial<Record<VaultFieldName, string>> {
-  const newline = body.indexOf('\n');
-  const password = (newline < 0 ? body : body.slice(0, newline)).replace(/\r$/, '');
-  const note = newline < 0 ? '' : body.slice(newline + 1);
-  const totp = note.split(/\r?\n/).find((line) => line.trim().startsWith('otpauth://'))?.trim();
-  return { password, note, ...(totp ? { totp } : {}) };
 }
 
 // ── the registry + sync service (state in the store kv) ───────────────────────
@@ -1299,13 +1422,16 @@ export class Connectors {
     const previous = this.secretFor(name);
     const replacedGitPassStore = name === 'pass-git' && previous !== undefined
       && gitPassRepositoryIdentity(previous) !== gitPassRepositoryIdentity(value);
+    const validated = await connector.validateSecret?.(value);
     this.broker.registerHandle(handle, value);
     try {
-      const info = await connector.describe();
+      const info = validated ?? await connector.describe();
       if (!info.available) throw new Error(info.detail);
       // A selection and write-back consent belong to one external store. Never
       // carry them silently to a different repository during reconfiguration.
-      if (replacedGitPassStore) this.store.kvSet(kvConfig(this.organizationId, name), '{}');
+      if (replacedGitPassStore) this.store.kvSet(kvConfig(this.organizationId, name), JSON.stringify({
+        autoSync: { enabled: false, importNew: false, externalIds: [] },
+      }));
       return info;
     } catch (error) {
       if (previous === undefined) this.broker.deleteHandle(handle);
@@ -1374,7 +1500,7 @@ export class Connectors {
         // the two resolutions is what makes the two numbers comparable at all.
         const at = floorMs(metadata.get(id)?.changedAt);
         const item = mirrored.get(id);
-        if (isPass && item?.provenance.passNotesVersion !== 1) return true;
+        if (isPass && item?.provenance.passNotesVersion !== 2) return true;
         const revision = metadata.get(id)?.revision;
         if (revision !== undefined) return !item || item.provenance.sourceRevision !== revision;
         // Items mirrored before `syncedAt` existed fall back to `updatedAt`,
@@ -1403,7 +1529,8 @@ export class Connectors {
         // clobber a policy the user has since tuned on an existing item.
         ...(existing ? {} : { policy: opts.policy }),
         secrets: ext.secrets,
-        provenance: { source, externalId: ext.externalId, syncedAt, sourceRevision: ext.revision, ...(isPass ? { passNotesVersion: 1 } : {}) },
+        ...(isPass ? { replaceSecrets: true } : {}),
+        provenance: { source, externalId: ext.externalId, syncedAt, sourceRevision: ext.revision, ...(isPass ? { passNotesVersion: 2 } : {}) },
       });
       itemIds.push(saved.id);
     }

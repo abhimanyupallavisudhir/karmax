@@ -48,6 +48,9 @@ describe('TOTP (RFC 6238)', () => {
     expect(uri(1234567890)).toBe('89005924');
     expect(uri(20000000000)).toBe('65353130');
   });
+  it('rejects HOTP instead of silently generating a time-based code', () => {
+    expect(() => totpCode(`otpauth://hotp/x?secret=${SEED}&counter=1`)).toThrow(/Only TOTP/);
+  });
   it('defaults to 6 digits for a bare base32 seed', () => {
     expect(totpCode(SEED, 59 * 1000)).toBe('287082');
   });

@@ -247,6 +247,18 @@ for (const status of ['done', 'cancelled', 'waiting']) {
   }
 }
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
+const keyTranscript = { role: 'do', messages: [] };
+S.taskEvents = [{ seq: 900, ts: 1710000001000, type: 'agent.activity', payload: {
+  role: 'do', turnId: 'stable-turn', attempt: 1, id: 'command', kind: 'command', phase: 'started', title: 'npm test',
+} }];
+const runningKey = conversationPane(forkView, keyTranscript).match(/data-conversation-key="([^"]+)"/)[1];
+S.taskEvents.push({ seq: 901, ts: 1710000002000, type: 'agent.activity', payload: {
+  ...S.taskEvents[0].payload, phase: 'completed', detail: 'Passed',
+} });
+const completedKey = conversationPane(forkView, keyTranscript).match(/data-conversation-key="([^"]+)"/)[1];
+ok(runningKey === completedKey, 'tool updates keep a stable DOM key across event sequence numbers');
+S.taskEvents = [];
+
 
 // Review info is task-wide, compact, and follows the conversation in every role.
 for (const info of [undefined, {}, { completion: 'finished' }]) {
