@@ -117,35 +117,68 @@ function constant(name) {
     });
     const notification = '[data-inbox="critical"]';
     const reference = '#task-reference .task-row';
-    await page.locator(notification).hover();
-    await page.waitForTimeout(150);
-    const notificationHover = await outline(notification);
-    await page.locator(reference).hover();
-    await page.waitForTimeout(150);
-    assert.deepEqual(notificationHover, await outline(reference), 'hover outlines match');
-    await page.mouse.move(0, 0);
-    await page.evaluate(() => {
-      document.querySelector('[data-inbox="critical"]').classList.add('cursor');
-      document.querySelector('#task-reference .task-row').classList.add('cursor');
-    });
-    await page.waitForTimeout(150);
-    assert.deepEqual(await outline(notification), await outline(reference), 'cursor outlines match');
-    await page.evaluate(() => {
-      document.querySelector('[data-inbox="critical"]').classList.remove('cursor');
-      document.querySelector('#task-reference .task-row').classList.remove('cursor');
-    });
+    for (const theme of ['light', 'dark', 'system-dark']) {
+      await page.emulateMedia({ colorScheme: theme === 'light' ? 'light' : 'dark' });
+      await page.evaluate(theme => {
+        if (theme === 'system-dark') delete document.documentElement.dataset.theme;
+        else document.documentElement.dataset.theme = theme;
+      }, theme);
+      await page.mouse.move(0, 0);
+      await page.waitForTimeout(150);
+      assert.deepEqual(await outline(notification), await outline(reference), theme + ': resting outlines match');
+      await page.locator(notification).hover();
+      await page.waitForTimeout(150);
+      const notificationHover = await outline(notification);
+      await page.locator(reference).hover();
+      await page.waitForTimeout(150);
+      assert.deepEqual(notificationHover, await outline(reference), theme + ': hover outlines match');
+      await page.mouse.move(0, 0);
+      await page.evaluate(() => {
+        document.querySelector('[data-inbox="critical"]').classList.add('cursor');
+        document.querySelector('#task-reference .task-row').classList.add('cursor');
+      });
+      await page.waitForTimeout(150);
+      assert.deepEqual(await outline(notification), await outline(reference), theme + ': cursor outlines match');
+      await page.evaluate(() => {
+        document.querySelector('[data-inbox="critical"]').classList.remove('cursor');
+        document.querySelector('#task-reference .task-row').classList.remove('cursor');
+      });
+      // Keyboard modality makes :focus-visible apply, unlike a mouse click.
+      await page.keyboard.press('Tab');
+      await page.locator(notification).focus();
+      await page.waitForTimeout(150);
+      const notificationFocus = await outline(notification);
+      await page.locator(reference).focus();
+      await page.locator(reference).evaluate(el => el.classList.add('cursor'));
+      await page.waitForTimeout(150);
+      assert.deepEqual(notificationFocus, await outline(reference), theme + ': keyboard focus outlines match');
+      await page.evaluate(() => {
+        document.activeElement.blur();
+        S.cursorId = undefined;
+        applyCursor();
+      });
+      await page.waitForTimeout(150);
+    }
+    await page.evaluate(() => document.documentElement.dataset.theme = 'light');
     await page.waitForTimeout(150);
     const dir = process.env.INBOX_SCREENSHOT_DIR;
     if (dir) {
       fs.mkdirSync(dir, { recursive: true });
       await page.screenshot({ path: path.join(dir, 'notifications-comparison.png'), fullPage: true });
+      await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
+      await page.waitForTimeout(150); // Let the shared border-color transition settle before capture.
+      await page.screenshot({ path: path.join(dir, 'notifications-comparison-dark.png'), fullPage: true });
+      await page.evaluate(() => document.documentElement.dataset.theme = 'light');
+      await page.waitForTimeout(150);
     }
     await page.locator('#task-reference').evaluate(el => el.remove());
     if (dir) {
       await page.screenshot({ path: path.join(dir, 'notifications-desktop.png'), fullPage: true });
       await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
+      await page.waitForTimeout(150); // Let the shared border-color transition settle before capture.
       await page.screenshot({ path: path.join(dir, 'notifications-dark.png'), fullPage: true });
       await page.evaluate(() => document.documentElement.dataset.theme = 'light');
+      await page.waitForTimeout(150);
     }
     await page.setViewportSize({ width: 390, height: 844 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no horizontal page overflow');
