@@ -1070,13 +1070,14 @@ describe('connector export and propagation regressions', () => {
       async (_cmd, args) =>
         JSON.stringify(
           args.includes('note')
-            ? { category: 'SECURE_NOTE', notesPlain: 'note text' }
+            ? { category: 'SECURE_NOTE', fields: [{ id: 'notesPlain', type: 'STRING', purpose: 'NOTES', value: 'note text' }] }
             : args.includes('ssh')
               ? { category: 'SSH_KEY', fields: [{ id: 'private_key', value: 'private key' }] }
               : {
                   category: 'LOGIN',
                   fields: [
                     { id: 'password', value: 'pw' },
+                    { id: 'notesPlain', type: 'STRING', purpose: 'NOTES', value: 'login note' },
                     { id: 'otp', type: 'OTP', value: 'otpauth://totp/example?secret=JBSWY3DPEHPK3PXP', totp: '123456' },
                   ],
                 },
@@ -1086,7 +1087,7 @@ describe('connector export and propagation regressions', () => {
     expect(result.items.map((x) => x.secrets)).toEqual([
       { note: 'note text' },
       { privateKey: 'private key' },
-      { password: 'pw', totp: 'otpauth://totp/example?secret=JBSWY3DPEHPK3PXP' },
+      { password: 'pw', note: 'login note', totp: 'otpauth://totp/example?secret=JBSWY3DPEHPK3PXP' },
     ]);
   });
   it('attempts other fields and stores after a failed rotation, persists and retries only failed work', async () => {
@@ -1368,4 +1369,60 @@ it('queues Git rotations before remote revision lookup and respects dismissal du
   await service.propagate(item.id, ['password']);
   expect(updates).toBe(0);
   expect(service.discardWrites('pass-git')).toBe(0);
+});
+
+describe.each(['LOGIN', 'SECURE_NOTE'])('1Password CLI %s notes', (category) => {
+  it.each([
+    { name: 'legacy content', fields: [], legacy: 'legacy note', expected: 'legacy note' },
+    { name: 'legacy empty note', fields: [], legacy: '', expected: '' },
+    { name: 'CLI 2 takes precedence', fields: [{ id: 'notesPlain', value: 'current' }], legacy: 'old', expected: 'current' },
+    { name: 'CLI 2 empty note takes precedence', fields: [{ id: 'notesPlain', value: '' }], legacy: 'old', expected: '' },
+    { name: 'cleared CLI 2 field does not restore legacy content', fields: [{ id: 'notesPlain' }], legacy: 'old', expected: undefined },
+    { name: 'absent note', fields: [], legacy: undefined, expected: undefined },
+  ])('$name', async ({ fields, legacy, expected }) => {
+    const connector = new OnePasswordConnector(() => 'token', async () => JSON.stringify({
+      category, notesPlain: legacy,
+      fields: fields.map(field => ({ type: 'STRING', purpose: 'NOTES', label: 'notesPlain', ...field })),
+    }));
+    const result = await connector.pull(['entry']);
+    expect(result.failures).toEqual([]);
+    expect(result.items[0]!.secrets).toEqual(expected === undefined ? {} : { note: expected });
+    expect(result.items[0]!.fields).toEqual(expected === undefined ? [] : ['note']);
+  });
+
+  it('preserves and updates a mirrored note, including explicit empty and deleted source fields', async () => {
+    const { store, items, broker } = makeVault();
+    const service = new Connectors(store, items, broker);
+    const type = category === 'LOGIN' ? 'login' : 'note';
+    const password = type === 'login' ? { password: 'synthetic-password' } : {};
+    const original = 'first line\r\nsecond line\n';
+    const item = items.save({ type, label: 'Entry', secrets: { ...password, note: original },
+      provenance: { source: 'connector:1password', externalId: 'entry' } });
+    let value: string | undefined = original;
+    let present = true;
+    service.register(new OnePasswordConnector(() => 'token', async (_command, args) => JSON.stringify(
+      args[1] === 'list' ? [{ id: 'entry', title: 'Entry', category }] : {
+        id: 'entry', title: 'Entry', category,
+        fields: [
+          ...(type === 'login' ? [{ id: 'password', type: 'CONCEALED', purpose: 'PASSWORD', value: password.password }] : []),
+          ...(present ? [{ id: 'notesPlain', type: 'STRING', purpose: 'NOTES', label: 'notesPlain', value }] : []),
+        ],
+      },
+    )));
+    for (const next of [original, 'updated\n  note  ', '', undefined]) {
+      value = next;
+      const result = await service.sync('1password', ['entry']);
+      expect(result).toMatchObject({ count: 1, itemIds: [item.id], failures: [] });
+      const saved = items.get(item.id)!;
+      expect(items.readSecret(saved, 'note')).toBe(next);
+      expect(saved.fields.includes('note')).toBe(next !== undefined);
+      if (type === 'login') expect(items.readSecret(saved, 'password')).toBe(password.password);
+    }
+    // Removing the source field entirely must also remove an existing mirror value.
+    items.save({ id: item.id, type, secrets: { note: 'local old note' } });
+    present = false;
+    expect((await service.sync('1password', ['entry'])).count).toBe(1);
+    expect(items.get(item.id)!.fields).not.toContain('note');
+    expect(items.readSecret(items.get(item.id)!, 'note')).toBeUndefined();
+  });
 });

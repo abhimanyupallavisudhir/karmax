@@ -274,7 +274,10 @@ export class OnePasswordConnector implements CredentialConnector {
         const key = val('private_key') ?? val('privateKey') ?? val('private key');
         if (key) secrets.privateKey = key;
       }
-      if ((type === 'login' || type === 'note') && full.notesPlain) secrets.note = full.notesPlain;
+      // CLI 2 represents notes as a field. Its presence is authoritative even
+      // when cleared; only older payloads fall back to the top-level property.
+      const note = byId.has('notesPlain') ? val('notesPlain') : full.notesPlain;
+      if ((type === 'login' || type === 'note') && typeof note === 'string') secrets.note = note;
       out.push({
         externalId: id,
         type,
