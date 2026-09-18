@@ -1,5 +1,5 @@
 import { isMap, parseDocument } from 'yaml';
-import type { VaultFieldName } from './vault-items.js';
+import { ITEM_FIELDS, type VaultItemType, type VaultFieldName } from './vault-items.js';
 
 type Secrets = Partial<Record<VaultFieldName, string>>;
 const isTotp = (value: string) => /^otpauth:\/\/totp\//.test(value.trim());
@@ -60,9 +60,23 @@ function totpUri(value: string): string {
 
 /** Update a field without losing OTP-only entries or gopass YAML metadata. */
 export function updatePassSecret(body: string, field: VaultFieldName, value: string): string {
+  const typed = typedPassItem(body);
+  if (typed) {
+    if (!ITEM_FIELDS[typed.type].includes(field)) throw new Error('Field does not belong to this password-store item');
+    return createPassItem({ ...typed, secrets: { ...typed.secrets, [field]: value } });
+  }
   const { first, note } = split(body);
-  if (field === 'password') return isOtp(first) ? `${value}\n${body}` : `${value}\n${note}`;
-  if (field === 'note') return `${first}\n${value}`;
+  if (field === 'password') {
+    if (/[\r\n]/.test(value)) throw new Error('Native pass passwords must occupy one line');
+    return isOtp(first) ? `${value}\n${body}` : `${value}\n${note}`;
+  }
+  if (field === 'note') {
+    const updated = `${first}\n${value}`;
+    // Notes and appended/YAML tokens share the same physical text. A notes
+    // replacement must not delete or implicitly rotate the separate TOTP field.
+    const token = passSecrets(body).totp;
+    return token && passSecrets(updated).totp !== token ? updatePassSecret(updated, 'totp', token) : updated;
+  }
   if (field !== 'totp') throw new Error(`pass write-back does not support the "${field}" field`);
   const uri = totpUri(value);
   const location = otpLocation(body);
@@ -89,4 +103,98 @@ export function createPassBody(secrets: Secrets, username?: string): string {
   if (secrets.password === undefined && secrets.totp) return `${totpUri(secrets.totp)}\n${note}`;
   const body = `${secrets.password ?? ''}\n${note}`;
   return secrets.totp ? updatePassSecret(body, 'totp', secrets.totp) : body;
+}
+
+
+export interface PassItem {
+  type: VaultItemType;
+  label?: string;
+  username?: string;
+  domains?: string[];
+  secrets: Secrets;
+}
+
+const typedMarker = 'karmax-vault-item:';
+
+/** Non-login entries need an explicit type; pass itself only defines line one.
+ * The payload is inside the encrypted file, never a plaintext sidecar. API
+ * keys retain a useful first line for `pass -c`; multiline values stay exact. */
+export function createPassItem(item: PassItem): string {
+  if (!Object.hasOwn(ITEM_FIELDS, item.type)) throw new Error('Unsupported password-store item type');
+  for (const [field, value] of Object.entries(item.secrets)) {
+    if (!ITEM_FIELDS[item.type].includes(field as VaultFieldName) || typeof value !== 'string')
+      throw new Error('Invalid password-store secret field');
+  }
+  if (item.type === 'login') {
+    if (item.secrets.password && /[\r\n]/.test(item.secrets.password))
+      throw new Error('Native pass passwords must occupy one line');
+    return createPassBody(item.secrets, item.username);
+  }
+  if (item.secrets[ITEM_FIELDS[item.type][0]!] === undefined) throw new Error('Password-store item has no secret');
+  const firstField =
+    item.type === 'api-key' && item.secrets.secret !== undefined && !/[\r\n]/.test(item.secrets.secret)
+      ? 'secret'
+      : undefined;
+  const secrets = { ...item.secrets };
+  if (firstField) delete secrets.secret;
+  return `${firstField ? item.secrets.secret : ''}\n${typedMarker}1\n${JSON.stringify({
+    type: item.type,
+    ...(item.label !== undefined ? { label: item.label } : {}),
+    ...(item.username !== undefined ? { username: item.username } : {}),
+    ...(item.domains !== undefined ? { domains: item.domains } : {}),
+    secrets,
+    ...(firstField ? { firstField } : {}),
+  })}\n`;
+}
+
+function typedPassItem(body: string): PassItem | undefined {
+  const { first, note } = split(body);
+  if (!note.startsWith(typedMarker)) return undefined;
+  const newline = note.indexOf('\n');
+  if (newline < 0 || note.slice(0, newline).replace(/\r$/, '') !== `${typedMarker}1`)
+    throw new Error('Unsupported password-store item format');
+  let data: any;
+  try {
+    data = JSON.parse(note.slice(newline + 1));
+  } catch {
+    throw new Error('Invalid password-store item payload');
+  }
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    !Object.hasOwn(ITEM_FIELDS, data.type) ||
+    data.type === 'login' ||
+    !data.secrets ||
+    typeof data.secrets !== 'object' ||
+    Array.isArray(data.secrets) ||
+    (data.label !== undefined && typeof data.label !== 'string') ||
+    (data.username !== undefined && typeof data.username !== 'string') ||
+    (data.domains !== undefined &&
+      (!Array.isArray(data.domains) || data.domains.some((v: unknown) => typeof v !== 'string'))) ||
+    (data.firstField !== undefined && (data.type !== 'api-key' || data.firstField !== 'secret'))
+  )
+    throw new Error('Invalid password-store item payload');
+  for (const [field, value] of Object.entries(data.secrets)) {
+    if (!ITEM_FIELDS[data.type as VaultItemType].includes(field as VaultFieldName) || typeof value !== 'string')
+      throw new Error('Invalid password-store secret field');
+  }
+  const primary = ITEM_FIELDS[data.type as VaultItemType][0]!;
+  if (
+    (data.firstField && data.secrets.secret !== undefined) ||
+    (!data.firstField && (first !== '' || data.secrets[primary] === undefined))
+  )
+    throw new Error('Invalid password-store primary field');
+  // Never spread untrusted payload keys into a connector item: routing and
+  // revision metadata belong to the encrypted file that was actually read.
+  return {
+    type: data.type,
+    ...(data.label !== undefined ? { label: data.label } : {}),
+    ...(data.username !== undefined ? { username: data.username } : {}),
+    ...(data.domains !== undefined ? { domains: data.domains } : {}),
+    secrets: { ...data.secrets, ...(data.firstField ? { secret: first } : {}) },
+  };
+}
+
+export function parsePassItem(body: string): PassItem {
+  return typedPassItem(body) ?? { type: 'login', secrets: passSecrets(body) };
 }

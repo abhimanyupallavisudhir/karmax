@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { passSecrets, updatePassSecret, createPassBody } from '../src/autonomy/pass-format.js';
+import { passSecrets, updatePassSecret, createPassBody, createPassItem, parsePassItem } from '../src/autonomy/pass-format.js';
 
 const seed = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
 const uri = `otpauth://totp/example?secret=${seed}`;
@@ -57,4 +57,66 @@ it('uses the same token precedence as gopass when several representations coexis
   const appended = `pw\ntotp: ${seed}\n${next}\n`;
   expect(passSecrets(appended).totp).toBe(next);
   expect(passSecrets(updatePassSecret(appended, 'totp', uri)).totp).toBe(uri);
+});
+
+
+describe('typed password-store exports', () => {
+  const cases = [
+    ['api-key', 'secret', 'key-with-special-characters'],
+    ['api-key', 'secret', 'multi\nline\r\nkey'],
+    ['note', 'note', 'first line\n---\nlast line\n'],
+    ['ssh-key', 'privateKey', '-----BEGIN PRIVATE KEY-----\nsynthetic\n'],
+    ['env', 'env', 'TOKEN=a\nOTHER=b\n'],
+    ['passkey', 'passkey', '{"credentialId":"test","privateKey":"test"}'],
+  ] as const;
+  it.each(cases)('round-trips and rotates %s/%s without losing metadata', (type, field, value) => {
+    const item = { type, label: 'A label', username: 'alice', domains: ['example.com'], secrets: { [field]: value } };
+    const body = createPassItem(item);
+    expect(parsePassItem(body)).toEqual(item);
+    expect(parsePassItem(updatePassSecret(body, field, value + '!'))).toEqual({
+      ...item,
+      secrets: { [field]: value + '!' },
+    });
+    if (type === 'api-key' && !value.includes('\n')) expect(body.split('\n')[0]).toBe(value);
+  });
+  it('keeps native login formatting and rejects unrepresentable fields', () => {
+    expect(createPassItem({ type: 'login', secrets: { password: 'pw', totp: uri } })).toMatch(/^pw\n/);
+    expect(() => createPassItem({ type: 'api-key', secrets: { password: 'wrong' } })).toThrow();
+  });
+  it('does not silently downgrade corrupt or future typed data to a login', () => {
+    expect(() => parsePassItem('\nkarmax-vault-item:1\n{broken')).toThrow();
+    expect(() => parsePassItem('\nkarmax-vault-item:99\n{}')).toThrow();
+  });
+  it.each([`pw\n${uri}\n`, `pw\n---\ntotp: ${seed}\n`, `${uri}\nnotes`])(
+    'preserves TOTP when replacing notes: %s',
+    (body) => {
+      const updated = updatePassSecret(body, 'note', 'replacement notes');
+      expect(passSecrets(updated).totp).toBeDefined();
+      expect(updated).toContain('replacement notes');
+    },
+  );
+});
+
+it('does not allow encrypted payload metadata to redirect a connector import', () => {
+  const body =
+    '\nkarmax-vault-item:1\n' +
+    JSON.stringify({
+      type: 'note',
+      secrets: { note: 'text' },
+      externalId: 'victim',
+      revision: 'forged',
+      fields: ['password'],
+    });
+  expect(parsePassItem(body)).toEqual({ type: 'note', secrets: { note: 'text' } });
+});
+
+
+it('rejects multiline password rotations instead of silently changing the pass fields', () => {
+  expect(()=>updatePassSecret('old\nnotes','password','first\nsecond')).toThrow(/one line/);
+});
+
+
+it('reads typed entries edited with CRLF line endings without changing the secret bytes', () => {
+  const item={type:'note' as const,label:'note',secrets:{note:'one\ntwo\r\n'}};
+  expect(parsePassItem(createPassItem(item).replaceAll('\n','\r\n'))).toEqual(item);
 });
