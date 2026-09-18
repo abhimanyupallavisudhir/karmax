@@ -814,6 +814,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .ck-terminal-copy svg { display: block; }
 .ck-live { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); flex: none; animation: pulse 1.4s ease-in-out infinite; }
 .ck-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+/* Conversation focus view stays below dialogs, menus and notifications. */
+.ck-pane.ck-fullscreen { position: fixed; inset: 0; z-index: 40; height: 100%; background: var(--paper); }
 .ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
    min-height is the content size) — without it a long conversation grows the
