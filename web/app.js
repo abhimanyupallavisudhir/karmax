@@ -14810,14 +14810,31 @@ async function wireVaultCards(organizationId) {
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
+      ${c.pendingWrites?.length ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button><button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
-      ${(c.pendingWrites || []).map(write => `<span>${esc(write.label)}: pending write-back <button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button><button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
+      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back <button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button><button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
+      row.querySelector('[data-conn-discard]')?.addEventListener('click', async () => {
+        if (!confirm('Stop retrying pending writes to this store? Credentials stay in the vault.')) return;
+        try {
+          await api(`/api/vault/connectors/${name}/discard-writes${oq}`, {method:'POST',body:'{}'});
+          await renderConnectors();
+        } catch (error) { toast(error.message, true); }
+      });
+      row.querySelector('[data-conn-retry]')?.addEventListener('click', async (event) => {
+        event.currentTarget.disabled = true;
+        try {
+          const results = await api(`/api/vault/connectors/${name}/retry-writes${oq}`, {method:'POST',body:'{}'});
+          const failure = results.find(result => result.error);
+          toast(failure?.error || 'Retry complete', !!failure);
+        } catch (error) { toast(error.message, true); }
+        await renderConnectors();
+      });
       row.querySelector('[data-git-pass-check]')?.addEventListener('click', async (event) => {
         const button = event.currentTarget; button.disabled = true;
         try {
@@ -14869,7 +14886,7 @@ async function wireVaultCards(organizationId) {
         <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
           <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option ${conn?.config?.autoSync?.policy?.use !== 'ask' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.use === 'ask' ? 'selected' : ''}>ask</option></select></label>
           <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option ${!conn?.config?.autoSync?.policy?.reveal || conn.config.autoSync.policy.reveal === 'ask' ? 'selected' : ''}>ask</option><option ${conn?.config?.autoSync?.policy?.reveal === 'auto' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.reveal === 'never' ? 'selected' : ''}>never</option></select></label>
-          ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+          ${(conn?.canPush || conn?.canUpdate) ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="${conn?.canPush ? 'Export new credentials and update existing entries' : 'Update existing entries only; new credentials cannot be exported to this store'}"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
           ${name === 'pass-git' ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Refresh the credentials selected above after password-store changes"><input type="checkbox" class="imp-keep" ${conn?.config?.autoSync?.enabled ? 'checked' : ''}/> Keep selected credentials updated</label>
           <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Select the entire store now and automatically import credentials added later"><input type="checkbox" class="imp-new" ${conn?.config?.autoSync?.importNew ? 'checked' : ''}/> Import new credentials automatically</label>` : ''}
         </div>

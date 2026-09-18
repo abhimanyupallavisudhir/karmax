@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { expect, it } from 'vitest';
-import { GitPassConnector, Connectors } from '../src/autonomy/connectors.js';
+import { GitPassConnector, PassConnector, Connectors } from '../src/autonomy/connectors.js';
 import { VaultItems, totpCode } from '../src/autonomy/vault-items.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
@@ -61,6 +61,56 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     const connectors = new Connectors(db, items, broker);
     connectors.register(connector);
     await connectors.connect('pass-git', JSON.stringify(config));
+    const local = new PassConnector(
+      async (cmd, args, opts) =>
+        execFileSync(cmd, args, {
+          env: { ...env, ...opts?.env },
+          input: opts?.input,
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }),
+      store,
+    );
+    for (const [type, field, value] of [
+      ['api-key', 'secret', 'synthetic-key'],
+      ['note', 'note', 'one\ntwo\n'],
+      ['ssh-key', 'privateKey', 'private\nkey'],
+      ['env', 'env', 'A=one\n'],
+      ['passkey', 'passkey', '{"credentialId":"test"}'],
+    ] as const) {
+      const entry = {
+        externalId: `karmax/local-${type}`,
+        type,
+        label: 'same label',
+        fields: [field],
+        secrets: { [field]: value },
+      };
+      const exported = await local.push(entry);
+      {
+        expect(await local.push(entry)).toEqual(exported);
+        await expect(local.push({ ...entry, secrets: { [field]: 'different' } })).rejects.toThrow(/not overwritten/);
+      }
+      expect((await local.pull([exported.externalId])).items[0]?.secrets[field]).toBe(value);
+      await local.updateSecret(exported.externalId, field, value + '!');
+      expect((await local.pull([exported.externalId])).items[0]?.secrets[field]).toBe(value + '!');
+    }
+    const collisionA = await local.push({
+      externalId: '',
+      type: 'login',
+      label: 'a b',
+      fields: ['password'],
+      secrets: { password: 'one' },
+    });
+    const collisionB = await local.push({
+      externalId: '',
+      type: 'login',
+      label: 'a-b',
+      fields: ['password'],
+      secrets: { password: 'two' },
+    });
+    expect(collisionA.externalId).not.toBe(collisionB.externalId);
+    expect((await local.pull([collisionA.externalId])).items[0]?.secrets.password).toBe('one');
+    run('git', ['push'], undefined, store);
     const names = ['standalone', 'appended', 'yaml', 'kv', 'mixed-kv', 'mixed-bare', ...variants.map(([name]) => name!)];
     expect((await connectors.sync('pass-git', names)).count).toBe(names.length);
     const compareCodes = (name: string, secret: string) => {
