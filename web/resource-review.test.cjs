@@ -34,14 +34,14 @@ function setup(api) {
   const inventory = panel();
   const context = vm.createContext({ api, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), asyncElementRenderEpoch: new WeakMap(),
     document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, confirm: () => true, toast: () => {},
-    S: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, conversationMathEnabled: () => true, renderAgentMessageBody: String, explainMessageAffordance: () => '',
+    S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, conversationMathEnabled: () => true, renderAgentMessageBody: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
     conversationEntries: () => [], subTasksSection: () => '', agentForksSection: () => '', pipelineLarge: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
     approvalRequestsTab: () => 'approvals', parametersTab: () => 'parameters',
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
-  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'overviewTab', 'safeHref', 'reviewActionBtn', 'conversationReviewInfo', 'conversationPane', 'renderConversationEntry']) {
+  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'overviewTab', 'safeHref', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'conversationPane', 'renderConversationEntry']) {
     vm.runInContext(extract(name), context);
   }
   context.checkinTab = (v) => context.conversationPane(v, { role: 'do' });

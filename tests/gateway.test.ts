@@ -1014,6 +1014,27 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await fs.promises.symlink('/etc/passwd', `${view.worldPath}/escape-link`);
     const symlinkEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=escape-link`, { headers: auth() });
     expect(symlinkEscape.status).toBe(400);
+    await fs.promises.unlink(`${view.worldPath}/escape-link`);
+
+    // Land through the real workflow and release the Git worktree. The same
+    // authenticated attachment URL must survive; no Git fallback can supply
+    // the saved review bytes after this file is changed in the target checkout.
+    const confirmed = await fetch(`${base}/api/tasks/${task.id}/signal`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ signal: 'confirm' }),
+    });
+    expect(confirmed.status).toBe(200);
+    let landed: any;
+    for (let i = 0; i < 80; i++) {
+      landed = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+      if (landed.stage === 'done' && !fs.existsSync(view.worldPath)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(landed.stage).toBe('done');
+    expect(fs.existsSync(view.worldPath)).toBe(false);
+    await fs.promises.writeFile(path.join(repo, 'out.txt'), 'later target edits');
+    const retained = await fetch(`${base}${opened.url}`, { headers: auth() });
+    expect(retained.status).toBe(200);
+    expect(await retained.text()).toContain('hello-artifact');
   });
 
   it('inherits defaults live: drafts store only overrides and re-resolve when queued', async () => {
@@ -1593,13 +1614,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
   });
 
-  it('seeds a brand-new project with the krmax-ready prep task', async () => {
+  it('seeds a brand-new project with the tavya init task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's current onActivate prep task automatically (SPEC §4.6) —
     // no manual "activate workflow" step. Covers both create-project routes.
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
-    const prepTitle = 'Make this project krmax-ready';
+    const prepTitle = 'tavya init';
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });

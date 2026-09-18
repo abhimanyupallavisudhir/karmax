@@ -65,6 +65,7 @@ export interface Harness {
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
   startGateway(opts?: { password?: string; hosted?: boolean; port?: number; identity?: import('../../src/auth/identity.js').IdentityService;
+    serviceConnections?: import('../../src/integrations/service-connections.js').ServiceConnections;
     loginCommand?: LoginCommand;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
       url: string; internalUrl: string; close: () => Promise<void> }>;
@@ -202,6 +203,7 @@ export async function bootHarness(
         configHomes,
         login,
         githubApp: opts?.githubApp ?? overrides.githubApp,
+        serviceConnections: opts?.serviceConnections,
         password: opts?.password,
         hosted: opts?.hosted,
         identity: opts?.identity,

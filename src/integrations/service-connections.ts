@@ -1,3 +1,4 @@
+import { currentTiming, timed, toolFailed } from '../timing/index.js';
 import crypto from 'node:crypto';
 import Composio from '@composio/client';
 import type { Store } from '../store/db.js';
@@ -110,7 +111,8 @@ export class ServiceConnections {
   }
   private async locked<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(key) ?? Promise.resolve();
-    const work = previous.catch(() => {}).then(fn);
+    const waitEnd = currentTiming()?.start('service.lock.wait');
+    const work = previous.catch(() => {}).then(() => { waitEnd?.(); return fn(); });
     this.locks.set(key, work);
     try { return await work; } finally { if (this.locks.get(key) === work) this.locks.delete(key); }
   }
@@ -236,7 +238,7 @@ export class ServiceConnections {
   }
   async tools(org: string, id: string, taskId: string, projectId: string, search: string) {
     const c = this.authorized(org, id, taskId, projectId);
-    return this.remote(() => this.backend().tools(c.toolkit, search.slice(0, 200)));
+    return timed('service.catalog.remote', () => this.remote(() => this.backend().tools(c.toolkit, search.slice(0, 200))));
   }
   async execute(org: string, id: string, taskId: string, projectId: string, slug: string, args: Record<string, unknown>) {
     return this.locked(id, async () => {
@@ -245,14 +247,14 @@ export class ServiceConnections {
       // Reject meta-tools, including proxy, remote bash and connection managers.
       if (!/^[A-Z][A-Z0-9_]{1,199}$/.test(slug) || !slug.startsWith(c.toolkit.toUpperCase() + '_') || slug.startsWith('COMPOSIO_'))
         throw new ConnectionError('Tool does not belong to this connection', 403);
-      if (!await this.remote(() => this.backend().active(c.accountId!, c.toolkit))) {
+      if (!await timed('service.account-check.remote', () => this.remote(() => this.backend().active(c.accountId!, c.toolkit)))) {
         c.status = 'expired'; c.sessionId = undefined; this.save(c);
         throw new ConnectionError('Account access expired; reconnect it in Connections', 409);
       }
       // Membership may have changed while checking the provider account.
       this.authorized(org, id, taskId, projectId);
       this.audit(c, `task:${taskId}`, 'execute', slug);
-      return this.remote(() => this.backend().execute(c.sessionId!, slug, args));
+      return timed('service.action.remote', () => this.remote(() => this.backend().execute(c.sessionId!, slug, args)), undefined, toolFailed);
     });
   }
   private audit(c: ServiceConnection, principalId: string, action: string, tool?: string) {

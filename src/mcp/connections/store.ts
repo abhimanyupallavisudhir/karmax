@@ -17,7 +17,6 @@ export function validateMcpSelection(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length > 24 || value.some((v) => typeof v !== 'string'
     || (!BUILTIN_MCPS.includes(v as any) && !/^mcp_[a-f0-9]{24}$/.test(v)))) throw new Error('Tools must be a list of MCP connection IDs');
   if (new Set(value).size !== value.length) throw new Error('Tools contains duplicate connections');
-  if (BUILTIN_MCPS.every((id) => value.includes(id))) throw new Error('Choose one browser connection');
   return value;
 }
 function bounded(value: unknown, max: number, label: string): string {

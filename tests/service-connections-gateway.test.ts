@@ -33,7 +33,7 @@ describe('connection gateway flow', () => {
     project = store.createProject('Project', {}, org).id;
     const createTask = () => store.createTask({ projectId: project, title: 'Read mail', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'Read mail' }, createdBy: { kind: 'user', userId: 'alice' } });
     taskId = createTask().id; otherTask = createTask().id;
-    const mint = (id: string, caps: string[]) => tokens.mint({ taskId: id, profileId: 'developer', role: 'do', principal: 'user:alice', projectId: project,
+    const mint = (id: string, caps: string[]) => tokens.mint({ taskId: id, profileId: 'developer', role: 'do', executionId: 'measured-turn', executionAttempt: 2, principal: 'user:alice', projectId: project,
       organizationId: org, ceiling: caps, grantorCaps: caps }).token;
     agent = mint(taskId, ['task:read', 'credential:read', 'connection:use']);
     forbiddenAgent = mint(otherTask, ['task:read', 'credential:read', 'connection:use']);
@@ -79,6 +79,15 @@ describe('connection gateway flow', () => {
     expect(search.status).toBe(200); expect(await search.json()).toEqual([expect.objectContaining({ slug: 'GMAIL_FETCH_EMAILS' })]);
     const result = await request(`/api/connections/${id}/execute`, { token: agent, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } });
     expect(result.status).toBe(200); expect(await result.json()).toMatchObject({ successful: true });
+    const timing = store.eventsOfType(taskId, 'timing').map(e => e.payload);
+    expect(timing).toEqual(expect.arrayContaining([expect.objectContaining({
+      name: 'service.execution', phase: 'end', turnId: 'measured-turn', attempt: 2, status: 'ok',
+    })]));
+    const report = await request(`/api/tasks/${taskId}/timing`);
+    expect(report.status).toBe(200);
+    expect((await report.json() as any).observations.length).toBeGreaterThan(0);
+    expect((await request(`/api/tasks/${taskId}/timing`, { token: agent })).status).toBe(403);
+    for (const secret of ['exact-account', 'private-session', 'Fixture mail', 'secret-api-key']) expect(JSON.stringify(timing)).not.toContain(secret);
     const exposed = JSON.stringify(await (await request('/api/connections', { token: agent })).json());
     for (const secret of ['exact-account', 'private-session', 'secret-api-key', '/link/private']) expect(exposed).not.toContain(secret);
   });

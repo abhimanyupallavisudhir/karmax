@@ -1,3 +1,4 @@
+import { currentTiming } from '../timing/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -273,7 +274,7 @@ function updateActivity(update: SessionUpdate, prior: Map<string, ToolCall>) {
     const tool = { ...(old ?? {}), ...update } as ToolCall;
     prior.set(update.toolCallId, tool);
     const status = tool.status ?? 'in_progress';
-    const phase = status === 'failed' ? 'failed' : status === 'completed' ? 'completed' : status === 'pending' ? 'started' : 'updated';
+    const phase = status === 'failed' ? 'failed' : status === 'completed' ? 'completed' : status === 'pending' || !old ? 'started' : 'updated';
     const kind =
       tool.kind === 'execute' ? 'command'
       : ['read', 'edit', 'delete', 'move'].includes(tool.kind ?? '') ? 'file'
@@ -342,6 +343,7 @@ export class AcpAdapter implements AgentAdapter {
     const control = await startControlBridge(platformToolHandlers(input.world, ctx));
     const custody = createCustodyEnv(spec.env);
     spec.env = custody.env;
+    const startupEnd = currentTiming()?.start('process.acp-startup');
     const child = spawn(spec.command, spec.args, {
       cwd: input.world.handle.root,
       env: spec.env,
@@ -464,10 +466,11 @@ export class AcpAdapter implements AgentAdapter {
       })
       .onNotification(methods.client.session.update, ({ params }) => {
         if (sessionId && params.sessionId !== sessionId) return;
+        currentTiming()?.markOnce('provider.first-event');
         const update = params.update;
         if (update.sessionUpdate === 'agent_message_chunk') {
           finalText += textOf(update.content);
-          ctx.emit(finalText);
+          ctx.emit(finalText, 'assistant');
         }
         const activity = updateActivity(update, tools);
         if (activity) ctx.emitActivity(activity);
@@ -494,6 +497,7 @@ export class AcpAdapter implements AgentAdapter {
           clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
           clientInfo: { name: 'karmax', version: '1.0.0' },
         });
+        startupEnd?.();
         if (init.protocolVersion !== PROTOCOL_VERSION) {
           throw new Error(`${this.provider} ACP protocol ${init.protocolVersion} is incompatible with ${PROTOCOL_VERSION}`);
         }
@@ -591,12 +595,14 @@ export class AcpAdapter implements AgentAdapter {
             })(), 1200)
           : undefined;
         let result;
+        const roundEnd = currentTiming()?.start('provider.acp-roundtrip.opaque');
         try {
           result = await agent.request(methods.agent.session.prompt, {
             sessionId,
             prompt: promptBlocks,
           }, { cancellationSignal: ctx.signal });
         } finally {
+          roundEnd?.(ctx.signal?.aborted || result?.stopReason === 'cancelled' ? 'cancelled' : result?.stopReason === 'end_turn' ? 'ok' : 'failed');
           if (followPoll) clearInterval(followPoll);
         }
         // The SDK dispatches notifications independently from request responses.
@@ -608,6 +614,7 @@ export class AcpAdapter implements AgentAdapter {
       if (ctx.signal?.aborted) throw new Error(`${this.provider} ACP turn cancelled`);
       if (response.stopReason === 'cancelled') {
         if (steered) {
+          currentTiming()?.mark('provider.interrupted', { operation: 'followup-steering' });
           // Cancelled to hand a mid-turn follow-up to the next turn — a clean
           // boundary, not a failure. `delivered` is unchanged, so the workflow
           // loops back to Do and delivers the follow-up (software-dev §5.6).

@@ -463,7 +463,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     onActivate: {
       spawnTask: {
         workflow: 'software-dev',
-        title: 'Make this project krmax-ready',
+        title: 'tavya init',
         prompt:
           "## Initial set-up task for krmax-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\n3) For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them.\nIt is important to use the \"default\" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press \"Queue\" and the agent will do the above.]",
         hostedPrompt:

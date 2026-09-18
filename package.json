@@ -19,7 +19,9 @@
     "typecheck": "tsc --noEmit",
     "reset": "tsx src/scripts/reset.ts",
     "backup": "tsx src/scripts/backup.ts",
-    "restore": "tsx src/scripts/restore.ts"
+    "restore": "tsx src/scripts/restore.ts",
+    "benchmark:latency": "tsx benchmarks/latency.ts",
+    "timing:report": "tsx src/scripts/timing-report.ts"
   },
   "dependencies": {
     "@1password/sdk": "^0.4.1",

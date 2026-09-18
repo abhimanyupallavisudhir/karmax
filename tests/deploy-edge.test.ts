@@ -115,8 +115,10 @@ describe('public edge (Caddy) image', () => {
   // makes the Caddyfile above valid at all.
   it('builds Caddy with the rate-limit module', () => {
     const dockerfile = read('Caddy.Dockerfile');
-    expect(dockerfile).toContain('xcaddy build');
-    expect(dockerfile).toContain('github.com/mholt/caddy-ratelimit');
+    expect(dockerfile).toContain('COPY build-caddy.sh /usr/local/bin/build-caddy.sh');
+    expect(dockerfile).toContain('RUN sh /usr/local/bin/build-caddy.sh');
+    expect(read('build-caddy.sh')).toContain('xcaddy build');
+    expect(read('build-caddy.sh')).toContain('github.com/mholt/caddy-ratelimit@v0.1.0');
   });
 
   for (const compose of ['compose.turnkey.yml', 'compose.hosted.yml']) {
