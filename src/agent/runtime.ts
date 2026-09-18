@@ -10,7 +10,7 @@ export interface RunTurnDeps {
   /** Stream incremental output to the task's live event log. */
   onEmit?: (text: string, source?: 'assistant' | 'tool') => void;
   /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
-  onReviewInfo?: (info: ReviewInfo) => void | Promise<void>;
+  onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
@@ -75,6 +75,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let completed = false;
   let openPrRequested = false;
   let reviewInfo: ReviewInfo | undefined;
+  let reviewPublication = Promise.resolve();
   let resolution: Transition | undefined;
   let confirmDecision: ConfirmDecision | undefined;
   let raise: RaiseToParent | undefined;
@@ -108,12 +109,18 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       completed = true; // a verdict ends the confirm turn
     },
     async createReviewInfo(info) {
-      // Accumulate `actions` across calls (an agent may attach them incrementally);
-      // every other field is last-write-wins.
-      const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
-      const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
-      reviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
-      await deps.onReviewInfo?.(reviewInfo);
+      // Providers can dispatch tools concurrently. Serialize accumulation with
+      // publication so an overlapping call cannot overwrite another's actions.
+      const publication = reviewPublication.then(async () => {
+        const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
+        const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+        const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
+        await deps.onReviewInfo?.(nextReviewInfo, info);
+        reviewInfo = nextReviewInfo;
+      });
+      // A rejected attachment must not prevent the agent correcting it later.
+      reviewPublication = publication.catch(() => {});
+      await publication;
     },
     createSubTask(t) {
       subTasks.push(t);
