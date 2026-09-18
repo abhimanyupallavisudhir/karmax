@@ -3495,6 +3495,7 @@ function connectWs() {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
+    if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
@@ -6856,7 +6857,7 @@ function mergeTaskHistory(events) {
     if (event.type === 'conversation.explanation')
       explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
   }
-  S.taskEvents = [...ordinary, ...explanations.values()];
+  S.taskEvents = [...ordinary, ...explanations.values()].filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true);
 }
 
 async function refreshTaskHistory(taskId) {
@@ -10896,7 +10897,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.reverse();
+    S.activity = activity.filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true).reverse();
     renderMain();
   } catch {}
 }

@@ -46,3 +46,19 @@ it('removes the tab from navigation and clears cached measurements on a live dis
  vm.runInContext('S.meta.timingEnabled=true',context);
  expect(vm.runInContext('visibleTaskTabs().some(t=>t.key==="timing")',context)).toBe(true);
 });
+
+
+it('does not restore timing rows from HTTP responses that finish after disabling', async () => {
+ let resolve: (events: any[]) => void = () => {};
+ const pending = new Promise<any[]>(done => { resolve = done; });
+ const context = vm.createContext({ S: {meta:{timingEnabled:true},projectId:'p'},api:()=>pending,renderMain:()=>{} });
+ const history = source.slice(source.indexOf('function mergeTaskHistory('),source.indexOf('async function refreshTaskHistory('));
+ const activity = source.slice(source.indexOf('async function seedActivity('),source.indexOf('function activityView('));
+ vm.runInContext(history+activity,context);
+ const load = vm.runInContext('seedActivity()',context);
+ vm.runInContext('S.meta.timingEnabled=false',context);
+ resolve([{type:'timing',seq:1},{type:'fixture',seq:2}]); await load;
+ vm.runInContext('mergeTaskHistory([{type:"timing",seq:1},{type:"fixture",seq:2}])',context);
+ expect(vm.runInContext('S.activity.map(e=>e.type).join()',context)).toBe('fixture');
+ expect(vm.runInContext('S.taskEvents.map(e=>e.type).join()',context)).toBe('fixture');
+});
