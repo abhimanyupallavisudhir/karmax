@@ -40,6 +40,7 @@ let releaseFrontHeldRepair: (() => void) | undefined;
 let frontHeldRepairGate: Promise<void> = Promise.resolve();
 const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
 let exactCandidateRevisions = 0;
+let actionsHaveSteps = true;
 let actionsRunAttempt = 1;
 let actionsReruns = 0;
 let actionsRunConclusion = 'failure';
@@ -112,7 +113,7 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/jobs` && method === 'GET') return json(200, { jobs: [{
     id: 99, name: 'unit tests', status: 'completed', conclusion: actionsJobConclusion,
     html_url: `https://github.com/${SLUG}/actions/runs/42/job/99`,
-    steps: [{ number: 1, name: 'Run tests', status: 'completed', conclusion: actionsJobConclusion }],
+    steps: actionsHaveSteps ? [{ number: 1, name: 'Run tests', status: 'completed', conclusion: actionsJobConclusion }] : [],
   }] });
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/artifacts` && method === 'GET') return json(200, { artifacts: [] });
   if (u.pathname === `/repos/${SLUG}/actions/jobs/99/logs` && method === 'GET')
@@ -342,6 +343,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     frontHeldRepairGate = Promise.resolve();
     exactCandidateTurns.length = 0;
     exactCandidateRevisions = 0;
+    actionsHaveSteps = true;
     actionsRunAttempt = 1;
     actionsReruns = 0;
     actionsRunConclusion = 'failure';
@@ -683,7 +685,9 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     // identifier in that source excerpt must not turn CI repair into billing.
     checkAnnotations = [{ path: 'tests/web-regressions.test.ts', start_line: 14,
       annotation_level: 'failure',
-      message: 'ReferenceError: taskRecord is not defined\n taskPaymentsHtml("tp-payments", true)',
+      message: 'ReferenceError: taskRecord is not defined\n taskPaymentsHtml("tp-payments", true)\n' +
+        'Expected "recent account payments have failed"; "Actions is disabled"; "requires approval"; ' +
+        '"The hosted runner lost communication with the server"; "Canceling since a higher priority waiting request exists"',
     }];
     githubReadiness = {
       mergeStateStatus: 'UNSTABLE',
@@ -754,9 +758,13 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(actionsReruns).toBe(1);
   }, 120_000);
 
-  it('projects a direct action_required hold with concise status and durable evidence', async () => {
-    const repo = await repoWithOrigin('github-action-required');
-    const project = h.store.createProject('GitHub action required', { repos: [repo], remote: 'pr' });
+  it.each([
+    ['action_required', 'GitHub Actions action required'],
+    ['startup_failure', 'GitHub Actions failure needs inspection'],
+    ['failure', 'GitHub Actions failure needs inspection'],
+  ])('projects a structured %s hold with neutral status and durable evidence', async (conclusion, summary) => {
+    const repo = await repoWithOrigin(`github-${conclusion}`);
+    const project = h.store.createProject(`GitHub ${conclusion}`, { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
       installationId: 'action-required', accountLogin: 'acme', accountType: 'Organization' });
     const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
@@ -774,13 +782,14 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       }],
     });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
-    actionsRunConclusion = 'action_required';
-    actionsJobConclusion = 'action_required';
-    actionsJobLog = 'The workflow is awaiting repository-owner approval.\n';
+    actionsRunConclusion = conclusion;
+    actionsHaveSteps = false;
+    actionsJobConclusion = conclusion;
+    actionsJobLog = 'Unrecognized provider diagnostic: account locked due to a billing issue.\n';
     githubReadiness = {
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
-        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED',
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: conclusion.toUpperCase(),
         detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
       }] } },
     };
@@ -788,19 +797,21 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
     await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 30_000 }).toMatchObject({
       kind: 'human',
-      summary: 'GitHub Actions approval required',
-      detail: expect.stringMatching(/run CI #1.*concluded action_required.*Classification: human/is),
+      summary,
+      detail: expect.stringMatching(new RegExp(`run CI #1.*concluded ${conclusion}.*Classification: human`, 'is')),
     });
     // The workflow query is live state; publishView persists the projection in
     // the following activity. Wait for that durable boundary instead of racing
     // the worker immediately after the query observes the hold.
     await expect.poll(() => h.store.getTask(task.id)?.lastView?.waitingFor, { timeout: 30_000 }).toMatchObject({
-      kind: 'human', summary: 'GitHub Actions approval required',
+      kind: 'human', summary,
     });
     const waitEvent = h.store.eventsSince(task.id, 0).findLast((event) =>
-      event.type === 'view.updated' && event.payload?.waitingSummary === 'GitHub Actions approval required');
-    expect(waitEvent?.payload).toMatchObject({ waitingFor: 'human', waitingSummary: 'GitHub Actions approval required' });
+      event.type === 'view.updated' && event.payload?.waitingSummary === summary);
+    expect(waitEvent?.payload).toMatchObject({ waitingFor: 'human', waitingSummary: summary });
 
+    expect(actionsReruns).toBe(0);
+    expect(h.store.eventsSince(task.id, 0).filter(event => event.type === 'github.ci.repair-requested')).toHaveLength(0);
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
@@ -882,7 +893,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(actionsReruns).toBe(0);
   }, 120_000);
 
-  it('bounds a superseded cancellation with no visible replacement outside landing admission', async () => {
+  it('bounds a structured cancellation with no visible replacement outside landing admission', async () => {
     const repo = await repoWithOrigin('github-actions-forbidden-bounded');
     const project = h.store.createProject('Bound forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -905,8 +916,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadiness = {
       mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
-        __typename: 'StatusContext', context: 'unit tests', state: 'FAILURE',
-        targetUrl: `https://github.com/${SLUG}/actions/runs/42/job/98`,
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'CANCELLED',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/98`,
         description: 'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
       }] } },
     };
