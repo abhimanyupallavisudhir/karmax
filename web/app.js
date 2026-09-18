@@ -12640,7 +12640,7 @@ async function hydrateProjectEnvironment(proj) {
   const box = $('#project-environment-box'); if (!box) return;
   try {
     const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
-    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div></div>`;
+    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
@@ -12658,6 +12658,26 @@ async function hydrateProjectEnvironment(proj) {
       </div>
       <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : ''}`;
+    box.querySelectorAll('[data-environment-recover]').forEach(button => button.addEventListener('click', async () => {
+      const record = builds.find(build => build.recoveryRevision === button.dataset.environmentRecover);
+      if (!record) return;
+      const artifact = record.artifactName || `karmax-env-${proj.id.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${record.digest}`.toLowerCase();
+      const cleanup = ['worktree', 'memory'].includes(record.provider)
+        ? 'Verify that the gateway which started this build has stopped working on it. No provider artifact needs removal.'
+        : `Stop the builder or build job in ${record.provider} first, and remove its image or snapshot named “${artifact}”.`
+          + (record.builderId ? ` Builder: ${record.builderId}.` : ' For older builds, locate the builder in the provider dashboard or on the build host.')
+          + (record.buildHost ? ` Build host: ${record.buildHost}.` : '');
+      const note = prompt(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
+      if (!note?.trim()) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${proj.id}/environment/build/recover`, { method: 'POST', body: JSON.stringify({
+          provider: record.provider, digest: record.digest, revision: record.recoveryRevision, cleanupConfirmed: true, cleanupNote: note.trim(),
+        }) });
+        toast('Build recovered. You can rebuild or move the project.');
+        await hydrateProjectEnvironment(proj);
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    }));
     $('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);

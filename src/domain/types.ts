@@ -715,6 +715,10 @@ export interface EnvironmentBuildRecord {
   organizationId?: string;
   transferGeneration?: string;
   buildId?: string;
+  artifactName?: string;
+  builderId?: string;
+  buildHost?: string;
+  recoveredFrom?: string;
   provider: string;
   digest: string;
   status: 'building' | 'ready' | 'failed';

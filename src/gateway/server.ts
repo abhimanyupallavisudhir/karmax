@@ -3465,20 +3465,23 @@ export class Gateway {
       }
 
       // Environment recipe, repo-derived proposal, and immutable provider build.
-      const projectEnvironment = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build))?$/);
+      const projectEnvironment = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build(?:\/recover)?))?$/);
       if (projectEnvironment && ['GET', 'PUT', 'POST'].includes(method)) {
         const project = store.getProject(projectEnvironment[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         const buildScope = { organizationId: project.organizationId,
           transferGeneration: store.kvGet(`project-transfer-current:${project.id}`) ?? '' };
-        const { ProjectEnvironment, proposeEnvironment, beginEnvironmentBuild, finishEnvironmentBuild } = await import('../store/project-environment.js');
+        const { ProjectEnvironment, proposeEnvironment, beginEnvironmentBuild, finishEnvironmentBuild,
+          recoverEnvironmentBuild, environmentBuildRevision, environmentBuildIsActive, recordEnvironmentBuilder,
+        } = await import('../store/project-environment.js');
         const environments = new ProjectEnvironment(store);
         const sub = projectEnvironment[2];
         try {
           if (method === 'GET' && !sub) {
             const spec = environments.spec(project.id);
             return this.json(res, 200, { spec: spec ?? null,
-              digest: spec ? environments.digest(spec) : null, builds: environments.builds(project.id) });
+              digest: spec ? environments.digest(spec) : null, builds: environments.builds(project.id).map(build => ({ ...build,
+                recoveryRevision: environmentBuildRevision(build) })) });
           }
           if (method === 'PUT' && !sub) {
             const body = await this.body(req);
@@ -3496,6 +3499,13 @@ export class Gateway {
                 .some((service) => service.kind === 'per-world'),
             }));
           }
+          if (method === 'POST' && sub === 'build/recover') {
+            const body = await this.body(req);
+            if (typeof body.provider !== 'string' || typeof body.digest !== 'string' || typeof body.revision !== 'string'
+              || typeof body.cleanupNote !== 'string') return this.json(res, 400, { error: 'Inspect the build and confirm provider cleanup before recovering it.' });
+            recoverEnvironmentBuild(store, project.id, buildScope, body, actorPrincipal(callerIdentity.actor));
+            return this.json(res, 200, { recovered: true });
+          }
           if (method === 'POST' && sub === 'build') {
             const spec = environments.spec(project.id);
             if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
@@ -3506,7 +3516,9 @@ export class Gateway {
               ? this.deps.providerConnections?.resolve(project.organizationId, provider) : undefined;
             const { buildEnvironment } = await import('../world/environment-build.js');
             const attempt = beginEnvironmentBuild(store, project.id, buildScope, provider, digest);
-            void buildEnvironment({ provider, projectId: project.id, digest, spec,
+            void buildEnvironment({ provider, projectId: project.id, digest, spec, buildId: attempt.buildId,
+              onBuilderCreated: id => recordEnvironmentBuilder(store, attempt, id),
+              assertActive: () => { if (!environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.'); },
               ...(connection ? { connection: { apiKey: connection.apiKey,
                 apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target,
                 template: (connection.config as any)?.template } } : {}) })

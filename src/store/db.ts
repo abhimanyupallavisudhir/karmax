@@ -4223,6 +4223,8 @@ export class Store {
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     const prefix = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
     for (const projectId of projectIds) {
+      const recoveryPrefix = `environment-build-recovery:${projectId}:`;
+      prefix.run(recoveryPrefix, recoveryPrefix);
       exact.run(`project-transfer-current:${projectId}`);
       exact.run(`project-transfer-lock:${projectId}`);
       exact.run(`authz:default:project:${projectId}`);

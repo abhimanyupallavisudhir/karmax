@@ -52,7 +52,7 @@ export class ProjectTransfers {
     const rows = (table: string) => s.db.prepare(`SELECT * FROM ${table} WHERE projectId=?`).all(projectId) as any[];
     const tasks = (s.db.prepare('SELECT id FROM tasks WHERE projectId=? ORDER BY id').all(projectId) as any[]).map(r => s.getTask(r.id)!);
     const environmentBuilds = new ProjectEnvironment(s).builds(projectId);
-    block('environment-builds', 'Wait for environment builds to finish before moving.', environmentBuilds.some(b => b.status === 'building'));
+    block('environment-builds', 'Finish environment builds, or recover abandoned builds in Project settings → Environment, before moving.', environmentBuilds.some(b => b.status === 'building'));
     const owners = s.listOrganizationMemberships(destinationOrganizationId).filter(m => m.role === 'owner').map(m => m.userId).sort();
     block('owner', 'The destination needs an organization owner.', !owners.length);
     block('name-conflict', 'A project with this name already exists in the destination. Rename this project first.',

@@ -111,6 +111,31 @@ describe('project transfer HTTP authorization', () => {
 });
 
 describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer browser flow', () => {
+  it('recovers an abandoned build from the full settings page and permits rebuilding', async () => {
+    const f = await fixture({ fullApp: true });
+    const environments = new environmentRecords.ProjectEnvironment(f.store);
+    const spec = environments.setSpec(f.project.id, { setup: ['echo test'] });
+    const digest = environments.digest(spec);
+    environmentRecords.beginEnvironmentBuild(f.store, f.project.id, { organizationId: f.source.id, transferGeneration: '' }, 'worktree', digest);
+    const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+    cleanups.push(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+    page.setDefaultTimeout(10_000);
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.context().addCookies([{ name: 'test', value: 'alice', url: f.server.url }]);
+    await page.goto(`${f.server.url}/source/project/settings`, { waitUntil: 'domcontentloaded' });
+    let confirmation = '';
+    page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept('The old gateway is stopped; no host artifact exists.'); });
+    await page.locator('[data-environment-recover]').click();
+    await expect.poll(() => environments.builds(f.project.id)[0]?.status).toBe('failed');
+    expect(confirmation).toContain('does not stop or delete provider resources for you');
+    expect(confirmation).toContain('another gateway');
+    await page.locator('#environment-build').click();
+    await expect.poll(() => environments.readyBuild(f.project.id, 'worktree', digest)?.ref).toBe('host');
+    expect(errors).toEqual([]);
+  });
+
   it('moves from Advanced settings using the complete app and keeps destination routing after reload', async () => {
     const f = await fixture({ fullApp: true });
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
@@ -210,6 +235,37 @@ function deferredBuild() {
 }
 
 describe('environment builds across project transfers', () => {
+  it.each(['success', 'failure'])('requires authorized cleanup confirmation and fences a late %s after HTTP recovery', async outcome => {
+    const f = await fixture();
+    const environments = new environmentRecords.ProjectEnvironment(f.store);
+    const spec = environments.setSpec(f.project.id, { setup: ['echo test'] });
+    const digest = environments.digest(spec);
+    const old = deferredBuild(), current = deferredBuild();
+    vi.spyOn(environmentBuilder, 'buildEnvironment').mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    const finish = vi.spyOn(environmentRecords, 'finishEnvironmentBuild');
+    const base = `/api/projects/${f.project.id}/environment`;
+    expect((await f.request(base + '/build', { provider: 'e2b' })).status).toBe(202);
+    const { builds } = await (await f.request(base)).json() as any;
+    const request = { provider: 'e2b', digest, revision: builds[0].recoveryRevision, cleanupConfirmed: true,
+      cleanupNote: 'Stopped source provider build and deleted its snapshot.' };
+    const reader = f.tokens.mintPrincipal('user:reader', ['project:read', 'project:settings:read'], f.project.id, 60_000, f.source.id).token;
+    expect((await f.request(base + '/build/recover', request, reader)).status).toBe(403);
+    expect((await f.request(base + '/build/recover', { ...request, cleanupConfirmed: false })).status).toBe(400);
+    expect(environments.builds(f.project.id)[0]?.status).toBe('building');
+    expect((await f.request(base + '/build/recover', request)).status).toBe(200);
+    const preview = await (await f.request(f.route + `?destinationOrganizationId=${f.destination.id}`)).json() as any;
+    expect(preview.blockers).toEqual([]);
+    expect((await f.request(base + '/build', { provider: 'e2b' })).status).toBe(202);
+    expect((await f.request(base + '/build/recover', request)).status).toBe(400);
+    current.resolve({ ref: 'new-snapshot' });
+    await expect.poll(() => environments.readyBuild(f.project.id, 'e2b', digest)?.ref).toBe('new-snapshot');
+    if (outcome === 'success') old.resolve({ ref: 'abandoned-snapshot' });
+    else old.reject(new Error('abandoned build failed'));
+    await expect.poll(() => finish.mock.calls.length).toBe(2);
+    expect(finish.mock.results[1]?.value).toBe(false);
+    expect(environments.readyBuild(f.project.id, 'e2b', digest)?.ref).toBe('new-snapshot');
+  });
+
   it('blocks active builds and duplicate launches, then invalidates the old preview when the build finishes', async () => {
     const f = await fixture();
     const environments = new environmentRecords.ProjectEnvironment(f.store);

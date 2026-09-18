@@ -83,6 +83,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST|DELETE /api/projects/:projectId/services', 'GET /api/projects/:projectId/services/compose-import',
     'GET|PUT /api/projects/:projectId/environment', 'GET /api/projects/:projectId/environment/proposal',
     'POST /api/projects/:projectId/environment/build',
+    'POST /api/projects/:projectId/environment/build/recover — invalidate an abandoned attempt after stopping the builder and removing provider artifacts; requires provider, digest, revision from GET environment, cleanupConfirmed:true, cleanupNote',
     'GET|POST /api/projects/:projectId/members',
     'DELETE /api/projects/:projectId/members/user|team|organization/:principalId',
   ],
