@@ -2810,8 +2810,12 @@ function typesetMath(root) {
   if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
     if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
-    try { window.MathJax.typesetClear?.([scope]); } catch {}
-    window.MathJax.typesetPromise([scope]).catch(() => {});
+    const pending = [...scope.querySelectorAll('.md-math')].filter((node) => !node.dataset.typeset);
+    if (!pending.length) return;
+    pending.forEach((node) => { node.dataset.typeset = '1'; });
+    window.MathJax.typesetPromise(pending).catch(() => {
+      pending.forEach((node) => { delete node.dataset.typeset; });
+    });
   });
 }
 
@@ -7288,6 +7292,75 @@ function openTagPicker(rec, setTags) {
   input.focus();
 }
 
+// Keep the reading position relative to a message, not a pixel offset that
+// changes when earlier tool output or history grows.
+function captureConversationScroll(thread) {
+  if (!thread) return null;
+  const top = thread.getBoundingClientRect().top;
+  const anchor = [...thread.querySelectorAll('[data-conversation-key]')]
+    .find((row) => row.getBoundingClientRect().bottom > top);
+  return { top: thread.scrollTop, atBottom: thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2,
+    key: anchor?.dataset.conversationKey, offset: anchor ? anchor.getBoundingClientRect().top - top : 0 };
+}
+function restoreConversationScroll(thread, state) {
+  if (!state || state.atBottom) { thread.scrollTop = thread.scrollHeight; return; }
+  const anchor = [...thread.querySelectorAll('[data-conversation-key]')]
+    .find((row) => row.dataset.conversationKey === state.key);
+  const delta = anchor ? anchor.getBoundingClientRect().top - thread.getBoundingClientRect().top - state.offset : state.top - thread.scrollTop;
+  // Even a redundant scrollTop assignment can interrupt touch momentum.
+  if (Math.abs(delta) > 0.5) thread.scrollTop += delta;
+}
+
+// Retain the scroll container AND its ancestors in the document. Detaching and
+// reinserting a scroller interrupts native wheel/touch scrolling even if its
+// scrollTop is restored. Everything outside this path is freshly rendered.
+function patchTaskPage(main, html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const previous = main.querySelector('#ck-thread');
+  const next = template.content.querySelector('#ck-thread');
+  const same = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
+  next?.querySelectorAll('[data-conversation-key]').forEach((row) => { row.conversationMarkup = row.outerHTML; });
+  if (!same) {
+    if (previous) window.MathJax?.typesetClear?.([previous]);
+    main.replaceChildren(template.content);
+    return false;
+  }
+  const oldRows = new Map([...previous.querySelectorAll('[data-conversation-key]')].map((row) => [row.dataset.conversationKey, row]));
+  const list = previous.querySelector('.thread');
+  let cursor = list.firstChild;
+  for (const fresh of [...next.querySelector('.thread').childNodes]) {
+    const old = fresh.nodeType === 1 ? oldRows.get(fresh.dataset.conversationKey) : null;
+    const row = old && !old.querySelector('#review-resources') && old.conversationMarkup === fresh.conversationMarkup ? old : fresh;
+    if (old && row !== old) {
+      // A running tool can gain output without closing details already opened.
+      const details = [...old.querySelectorAll('details')];
+      row.querySelectorAll('details').forEach((detail, i) => { if (details[i]) detail.open = details[i].open; });
+    }
+    if (row === cursor) cursor = cursor.nextSibling;
+    else list.insertBefore(row, cursor);
+  }
+  while (cursor) {
+    const nextSibling = cursor.nextSibling;
+    if (cursor.nodeType === 1) window.MathJax?.typesetClear?.([cursor]);
+    cursor.remove();
+    cursor = nextSibling;
+  }
+  // Walk both ancestor paths upward, replacing siblings without moving the
+  // retained child. These wrappers contain layout only, with no event handlers.
+  let oldChild = previous, newChild = next;
+  while (oldChild !== main) {
+    const parent = oldChild.parentNode, freshParent = newChild.parentNode;
+    for (const node of [...parent.childNodes]) if (node !== oldChild) node.remove();
+    const siblings = [...freshParent.childNodes];
+    const index = siblings.indexOf(newChild);
+    for (const node of siblings.slice(0, index)) parent.insertBefore(node, oldChild);
+    for (const node of siblings.slice(index + 1)) parent.appendChild(node);
+    oldChild = parent; newChild = freshParent;
+  }
+  return true;
+}
+
 function renderTaskPage() {
   const v = S.view;
   const main = $('#main');
@@ -7306,11 +7379,9 @@ function renderTaskPage() {
   const prevThread = sameTab ? document.getElementById('ck-thread') : null;
   // A conversation pins to the bottom (latest message) — keep it pinned across
   // re-renders unless the user has scrolled up to read history.
-  const threadScroll = prevThread
-    ? { top: prevThread.scrollTop, atBottom: prevThread.scrollHeight - prevThread.scrollTop - prevThread.clientHeight < 40 }
-    : null;
-  // A background re-render (WS event while an agent streams) rebuilds the whole
-  // pane, which would drop any text the user has selected in the transcript.
+  const threadScroll = captureConversationScroll(prevThread);
+  // Changed messages may replace selected nodes; preserve the selection even
+  // when the selected message cannot be retained.
   // Snapshot the selection as character offsets and re-apply it after the swap —
   // the same treatment scroll/focus already get.
   const threadSel = prevThread ? captureThreadSelection(prevThread) : null;
@@ -7325,7 +7396,7 @@ function renderTaskPage() {
   const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
     ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
-  main.innerHTML = `
+  const retainedThread = patchTaskPage(main, `
     <div class="task-page">
       <div class="tp-head">
         ${parentTaskContext(v)}
@@ -7361,7 +7432,7 @@ function renderTaskPage() {
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">${taskActions(v)}</div></div>
-    </div>`;
+    </div>`);
   const attemptList = main.querySelector('.attempts-list');
   if (attemptList) {
     if (attemptScroll !== null) attemptList.scrollLeft = attemptScroll;
@@ -7411,7 +7482,7 @@ function renderTaskPage() {
   const newBody = document.getElementById('tp-body');
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   const thread = document.getElementById('ck-thread');
-  if (thread) thread.scrollTop = threadScroll && !threadScroll.atBottom ? threadScroll.top : thread.scrollHeight;
+  if (thread) restoreConversationScroll(thread, retainedThread ? threadScroll : null);
   if (thread) {
     restoreThreadSelection(thread, threadSel);
     wireMessageCopies(thread);
@@ -8140,7 +8211,7 @@ async function wireResourceReview(v, force = false) {
       return;
     }
     const thread = wrap.closest?.('.ck-thread');
-    const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
+    const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
     wrap.classList.remove('hidden');
     wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
       const resource = item.resource;
@@ -8628,7 +8699,8 @@ function conversationPane(v, t) {
   const resourceRequestIndex = v.stage === 'review' && requestedInput
     ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
   const msgs = historyStatus + (entries.map((entry, index) => renderConversationEntry(
-    index === resourceRequestIndex ? { ...entry, resourceReview: true } : entry, v)).join('')
+    index === resourceRequestIndex ? { ...entry, resourceReview: true } : entry, v)
+    .replace(' ', ` data-conversation-key="${esc(entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`)}" `)).join('')
     || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
@@ -9086,17 +9158,20 @@ function openExplanationForm(v, role, sourceKey) {
 
 function wireExplainMessages(v) {
   $('#main').querySelectorAll('.explain-tools').forEach((tools) => {
+    tools.conversationView = v;
+    if (tools.dataset.wired) return;
+    tools.dataset.wired = '1';
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
     tools.querySelector('.conversation-math')?.addEventListener('click', () => {
-      toggleConversationMath(v, role);
+      toggleConversationMath(tools.conversationView, role);
       // The repaint replaces this button; keep keyboard focus on its successor.
       const replacement = [...$('#main').querySelectorAll('.explain-tools')]
         .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
       replacement?.querySelector('.conversation-math')?.focus({ preventScroll: true });
     });
-    tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(v, role, sourceKey));
-    tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(v, role, sourceKey));
+    tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(tools.conversationView, role, sourceKey));
+    tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(tools.conversationView, role, sourceKey));
   });
 }
 
@@ -10478,7 +10553,7 @@ function updateLiveBubble() {
   // Follow the stream only when the reader is already parked at the bottom; if
   // they've scrolled up to read history, hold their view fixed as text streams in.
   const thread = document.getElementById('ck-thread');
-  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
+  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
   b.classList.remove('hidden');
   b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
   if (atBottom) b.scrollIntoView({ block: 'nearest' });

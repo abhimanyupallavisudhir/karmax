@@ -83,6 +83,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Install Chromium for browser regressions
+        run: npx playwright install --with-deps chromium
+
       # Integration tests boot a real Temporal dev server. src/temporal/dev-server.ts
       # looks here by default; pinned so a CLI release cannot break the build.
       - name: Install Temporal CLI
