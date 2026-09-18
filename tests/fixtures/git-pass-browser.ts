@@ -10,6 +10,7 @@ import { chromium, type Browser } from 'playwright';
 import { bootHarness, type Harness } from '../helpers/harness.js';
 import { IdentityService } from '../../src/auth/identity.js';
 import { findFreePortFrom } from '../../src/util/ports.js';
+import { encryptIdentity } from '../helpers/age-encrypted-identity.js';
 import { totpCode } from '../../src/autonomy/vault-items.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pass-browser-'));
@@ -38,7 +39,8 @@ try {
   const gpgPrivateKey = run('gpg', ['--homedir', gpgHome, '--armor', '--export-secret-keys', fingerprint]);
   const ageKey = path.join(root, 'age.key');
   run('age-keygen', ['-o', ageKey]);
-  const ageIdentity = fs.readFileSync(ageKey, 'utf8');
+  const encryptedAgeKey = path.join(root, 'identity.age');
+  await encryptIdentity(ageKey, encryptedAgeKey, 'browser-test-passphrase');
   const ageRecipient = run('age-keygen', ['-y', ageKey]).trim();
   for (const [name, backend] of [['root', 'gpg'], ['work', 'age']]) {
     const repo = path.join(root, name! + '.git');
@@ -126,12 +128,22 @@ try {
   await mount.locator('.git-pass-repo').fill(gitBase+'/work.git');
   await mount.locator('.git-pass-profile').selectOption('staging');
   await mount.locator('.git-pass-crypto').selectOption('age');
-  await mount.locator('.git-pass-age-key').fill(ageIdentity);
+  await mount.locator('.git-pass-age-file').setInputFiles(encryptedAgeKey);
+  await mount.locator('.git-pass-age-passphrase').fill('browser-test-passphrase');
+  await mount.locator('.git-pass-verify-entry').fill('otp');
   const connected = page.waitForResponse(r => r.url().includes('/connectors/pass-git/connect') && r.request().method() === 'POST');
   await page.locator('[data-git-pass-save]').click();
   const connection = await connected;
   assert.equal(connection.status(), 200, await connection.text());
+  const checks = (await connection.json()).connector.checks;
+  assert.equal(checks.length, 2);
+  assert(checks.every((check: any) => check.read === 'verified' && check.encryption && check.push));
   await page.locator('[data-git-pass-root]').waitFor({ state: 'detached' });
+  const checked = page.waitForResponse(response => response.url().includes('/connectors/pass-git/check'));
+  await row.locator('[data-git-pass-check]').click();
+  const checkedResponse = await checked;
+  assert.equal(checkedResponse.status(), 200);
+  assert.deepEqual((await checkedResponse.json()).checks, checks);
   await row.locator('[data-conn-import]').click();
   await page.waitForFunction("document.querySelectorAll('.imp-pick').length === 2");
   await page.locator('.imp-all').check();
@@ -171,6 +183,21 @@ try {
     assert(requests.some(r => r.authorized && r.path === `/${name}.git/git-upload-pack`));
     assert(requests.some(r => r.authorized && r.path === `/${name}.git/git-receive-pack`));
   }
+  // A rejected remote write is durable and can be retried from the real UI.
+  const rootItem = listed.body.find((item: any) => item.provenance.externalId === 'otp');
+  const hook = path.join(root, 'root.git', 'hooks', 'pre-receive');
+  fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  const rejected = await api('/api/vault/items'+oq, { id: rootItem.id, type: 'login', secrets: { totp: seed } });
+  assert(rejected.body.propagated?.error);
+  await page.reload();
+  await page.locator(`[data-write-retry="${rootItem.id}"]`).waitFor();
+  fs.rmSync(hook);
+  const retried = page.waitForResponse(response => response.url().includes('/retry-write-back'));
+  await page.locator(`[data-write-retry="${rootItem.id}"]`).click();
+  assert.equal((await retried).status(), 200);
+  await page.locator(`[data-write-retry="${rootItem.id}"]`).waitFor({ state: 'detached' });
+  run('git', ['pull', '--ff-only'], path.join(root, 'root-source'));
+  assert(run('gpg', ['--homedir', gpgHome, '--batch', '-d', path.join(root, 'root-source', 'otp.gpg')]).includes(seed));
   // Bad transport credentials must fail visibly without replacing the working connector.
   await api(`/api/organizations/${org.id}/git-profiles`, { name: 'wrong', userName: 'Test', userEmail: 'test@example.invalid', githubToken: 'wrong-token' });
   await row.locator('[data-git-pass-connect]').click();

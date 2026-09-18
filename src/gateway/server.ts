@@ -6050,6 +6050,20 @@ export class Gateway {
                 });
                 return this.json(res, 200, config);
               }
+              if (connName[1] === 'pass-git') {
+                if (action === 'check') {
+                  const secret = connectors.secretFor('pass-git');
+                  if (!secret) throw new Error('Connect a password store first');
+                  return this.json(res, 200, await connectors.get('pass-git')!.validateSecret!(secret));
+                }
+                if (action === 'catalog') {
+                  const { GitPassConnector } = await import('../autonomy/connectors.js');
+                  const connector = connectors.get('pass-git');
+                  if (connector instanceof GitPassConnector) return this.json(res, 200, await connector.catalog());
+                }
+                if (action === 'retry-write-back') return this.json(res, 200, await connectors.retryWriteBack(String(b.itemId ?? '')) ?? { skipped: 'write-back disabled' });
+                if (action === 'accept-remote') return this.json(res, 200, await connectors.acceptRemote(String(b.itemId ?? '')));
+              }
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
               if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
                 { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
