@@ -435,7 +435,15 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .inbox-controls .switch input { width:30px; height:18px; }
 /* The kind sub-tabs sit under the page title, so they are not the sticky bar. */
 .inbox-tabs { position:static; }
+/* Row border, padding, and hover/focus treatments come from .task-row. */
 .inbox-row .task-sub { flex-wrap:wrap; }
+.inbox-project { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
+.inbox-row time { font-size:12px; color:var(--ink-3); white-space:nowrap; }
+.inbox-read[aria-pressed="true"] { color:var(--merged); }
+@media (max-width: 700px) {
+  .inbox-row { grid-template-columns:auto minmax(0, 1fr); }
+  .inbox-row .task-right { grid-column:2; justify-content:flex-end; gap:10px; }
+}
 .priority-bars { letter-spacing:1px; }
 .inbox-row .urgency-chip { white-space:nowrap; }
 /* Priority uses labels and bars, so color is never the only cue. */
