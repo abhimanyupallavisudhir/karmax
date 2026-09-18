@@ -14583,6 +14583,7 @@ async function wireVaultCards(organizationId) {
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+          if (result.propagated?.error) { toast('Saved in vault; remote write-back failed: ' + result.propagated.error + '. Retry from the connector panel.', true); await renderConnectors(); return; }
           toast(result.propagated?.connector ? `Secret updated (also pushed to ${result.propagated.connector})` : 'Secret updated');
         } catch (e) { toast(e.message, true); }
       }));
@@ -14666,7 +14667,7 @@ async function wireVaultCards(organizationId) {
       <div class="form-row"><label>Encryption</label><select class="git-pass-crypto"><option value="gpg">GPG (pass / gopass)</option><option value="age">age (gopass)</option></select></div>
       <div data-git-pass-gpg><div class="form-row"><label>ASCII-armored GPG private key</label><textarea class="git-pass-key" rows="7" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea></div>
       <div class="form-row"><label>GPG key passphrase <span class="task-sub">(leave blank if none)</span></label><input class="git-pass-passphrase" type="password" autocomplete="new-password" /></div></div>
-      <div data-git-pass-age hidden><div class="form-row"><label>Native age identity</label><textarea class="git-pass-age-key" rows="4" autocomplete="off" spellcheck="false" placeholder="AGE-SECRET-KEY-1…"></textarea></div><p class="task-sub">Paste the decrypted native age identity. SSH keys and age plugins are not supported.</p></div>
+      <div data-git-pass-age hidden><div class="form-row"><label>Native age identity</label><textarea class="git-pass-age-key" rows="4" autocomplete="off" spellcheck="false" placeholder="AGE-SECRET-KEY-1…"></textarea></div><p class="task-sub">Paste a native identity, or upload your encrypted gopass identity file below. SSH keys and age plugins are not supported.</p><div class="form-row"><label>Encrypted age identity file</label><input type="file" class="git-pass-age-file" /></div><div class="form-row"><label>Identity file passphrase</label><input type="password" class="git-pass-age-passphrase" autocomplete="new-password" /></div></div><div class="form-row"><label>Entry to verify (optional; otherwise first entry)</label><input class="git-pass-verify-entry" placeholder="example.com" /></div>
 `;
     overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%;max-height:90vh;overflow:auto" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
       <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
@@ -14700,16 +14701,21 @@ async function wireVaultCards(organizationId) {
       overlay.querySelector('[data-git-pass-mounts]').appendChild(row);
       row.querySelector('input').focus();
     });
-    const readStore = (row) => {
+    const readStore = async (row) => {
       const repositoryUrl = row.querySelector('.git-pass-repo').value.trim();
       const crypto = row.querySelector('.git-pass-crypto').value;
       const key = row.querySelector(crypto === 'age' ? '.git-pass-age-key' : '.git-pass-key').value.trim();
-      if (!repositoryUrl || !key) throw new Error('Repository URL and encryption key are required for each store');
+      const file = crypto === 'age' ? row.querySelector('.git-pass-age-file').files[0] : undefined;
+      if (file && key) throw new Error('Use either a native identity or an encrypted file');
+      if (file?.size > 2 * 1024 * 1024) throw new Error('Identity file is too large');
+      const encrypted = file ? btoa(Array.from(new Uint8Array(await file.arrayBuffer()), byte => String.fromCharCode(byte)).join('')) : undefined;
+      if (!repositoryUrl || (!key && !encrypted)) throw new Error('Repository URL and encryption key are required for each store');
       return {
         repositoryUrl, crypto,
+        validationEntry: row.querySelector('.git-pass-verify-entry').value.trim() || undefined,
         storePath: row.querySelector('.git-pass-path').value.trim() || undefined,
         gitProfile: row.querySelector('.git-pass-profile').value || undefined,
-        ...(crypto === 'age' ? { ageIdentity: key } : {
+        ...(crypto === 'age' ? (encrypted ? { ageIdentityEncrypted: encrypted, agePassphrase: row.querySelector('.git-pass-age-passphrase').value } : { ageIdentity: key }) : {
           gpgPrivateKey: key, gpgPassphrase: row.querySelector('.git-pass-passphrase').value || undefined,
         }),
       };
@@ -14718,17 +14724,17 @@ async function wireVaultCards(organizationId) {
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        const connection = readStore(overlay.querySelector('[data-git-pass-root]'));
-        connection.mounts = [...overlay.querySelectorAll('[data-git-pass-mount]')].map(row => {
+        const connection = await readStore(overlay.querySelector('[data-git-pass-root]'));
+        connection.mounts = await Promise.all([...overlay.querySelectorAll('[data-git-pass-mount]')].map(async row => {
           const name = row.querySelector('.git-pass-mount-name').value.trim();
           if (!name) throw new Error('Each mounted store needs a name');
-          return { name, ...readStore(row) };
-        });
-        await api(`/api/vault/connectors/pass-git/connect${oq}`, {
+          return { name, ...await readStore(row) };
+        }));
+        const result = await api(`/api/vault/connectors/pass-git/connect${oq}`, {
           method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
         });
         close();
-        toast('Git-backed pass connected');
+        toast('Git-backed pass connected. ' + (result.connector?.checks || []).map(check => `${check.store}: ${check.read === 'verified' ? 'entry decrypted' : 'empty store'}, encryption ${check.encryption ? 'verified' : 'unavailable'}, push transport ${check.push ? 'reachable' : 'unavailable'}`).join('; ') + '. A real push can still be rejected by server policy.');
         await renderConnectors();
       } catch (error) {
         button.disabled = false;
@@ -14746,12 +14752,31 @@ async function wireVaultCards(organizationId) {
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
       ${c.setup === 'git-pass'
-        ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>`
+        ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      ${(c.pendingWrites || []).map(write => `<span>${esc(write.label)}: pending write-back <button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button><button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
+      row.querySelector('[data-git-pass-check]')?.addEventListener('click', async (event) => {
+        const button = event.currentTarget; button.disabled = true;
+        try {
+          const result = await api(`/api/vault/connectors/pass-git/check${oq}`, { method: 'POST', body: '{}' });
+          toast((result.checks || []).map(check => `${check.store}: ${check.read === 'verified' ? 'entry decrypted' : 'empty store'}, encryption ${check.encryption ? 'verified' : 'unavailable'}, push transport ${check.push ? 'reachable' : 'unavailable'}`).join('; ') + '. Server policy may still reject an actual push.');
+        } catch (error) { toast(error.message, true); }
+        finally { button.disabled = false; }
+      });
+      row.querySelectorAll('[data-write-retry], [data-write-remote]').forEach(button => button.addEventListener('click', async () => {
+        const remote = button.hasAttribute('data-write-remote');
+        if (remote && !confirm('Replace this vault item with the current remote entry and discard the pending write-back?')) return;
+        button.disabled = true;
+        try {
+          const result = await api(`/api/vault/connectors/pass-git/${remote ? 'accept-remote' : 'retry-write-back'}${oq}`, { method: 'POST', body: JSON.stringify({ itemId: remote ? button.dataset.writeRemote : button.dataset.writeRetry }) });
+          if (result.skipped) throw new Error(result.skipped);
+          toast(remote ? 'Imported remote value' : 'Write-back completed'); await renderItems(); await renderConnectors();
+        } catch (error) { toast(error.message, true); button.disabled = false; }
+      }));
       row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
         const button = row.querySelector('[data-conn-connect]');
         button.disabled = true;
@@ -14802,7 +14827,17 @@ async function wireVaultCards(organizationId) {
     const countEl = overlay.querySelector('.imp-count');
     const refreshCount = () => { const n = tree.querySelectorAll('.imp-pick:checked').length; countEl.textContent = n ? `· ${n} selected` : ''; };
     let ext = [];
-    try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
+    let storeFailures = [];
+    try {
+      const result = await api(`/api/vault/connectors/${name}/${name === 'pass-git' ? 'catalog' : 'list'}${oq}`, { method: 'POST', body: '{}' });
+      ext = name === 'pass-git' ? result.items : result;
+      storeFailures = name === 'pass-git' ? result.failures : [];
+      if (storeFailures.length) {
+        const notice = document.createElement('p'); notice.className = 'task-sub';
+        notice.textContent = storeFailures.map(failure => `${failure.store}: ${failure.error}`).join('; ') + '. Reopen Import to retry unavailable stores.';
+        tree.before(notice);
+      }
+    }
     catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
     if (!ext.length) tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import yet.</span>';
     const folders = {};

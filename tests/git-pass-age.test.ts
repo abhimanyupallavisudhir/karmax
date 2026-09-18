@@ -124,3 +124,109 @@ describe('age and mounted Git password stores', () => {
   });
 
 });
+
+it('verifies actual entry decryption and distinguishes transport from encryption readiness', async () => {
+  const f = fixture(); const wrong = fixture(); const c = connector(f.config, f.root);
+  expect((await c.validateSecret(JSON.stringify(f.config))).checks).toEqual([
+    { store: 'root', entry: 'example', read: 'verified', encryption: true, push: true },
+  ]);
+  await expect(c.validateSecret(JSON.stringify({ ...f.config, ageIdentity: wrong.config.ageIdentity }))).rejects.toThrow(/verification/);
+  await expect(c.validateSecret(JSON.stringify({ ...f.config, validationEntry: 'missing' }))).rejects.toThrow(/verification/);
+  fs.writeFileSync(path.join(f.seed, '.age-recipients'), 'invalid-recipient\n');
+  run('git', ['add', '.'], f.seed); run('git', ['commit', '-m', 'unusable encryption recipients'], f.seed); run('git', ['push'], f.seed);
+  expect((await c.validateSecret(JSON.stringify(f.config))).checks?.[0]).toMatchObject({ read: 'verified', encryption: false });
+});
+
+it('keeps healthy mounts available when another repository disappears', async () => {
+  const f = fixture(); const mount = fixture();
+  const config = { ...f.config, mounts: [{ ...mount.config, name: 'work' }] };
+  const c = connector(config, f.root);
+  const kv = new Map<string, string>();
+  const db = { kvGet: (key: string) => kv.get(key), kvSet: (key: string, value: string) => { kv.set(key, value); }, appendAudit: () => 0 };
+  const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
+  const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
+  const service = new Connectors(db, items, broker); service.register(c);
+  await service.connect('pass-git', JSON.stringify(config));
+  service.setAutoSync('pass-git', { keepUpdated: true, importNew: true, externalIds: [] });
+  await c.list(); fs.rmSync(mount.remote, { recursive: true });
+  const catalog = await c.catalog();
+  expect(catalog.items.map(item => item.externalId)).toEqual(['example']);
+  expect(catalog.failures).toEqual([{ store: 'work/', error: expect.any(String) }]);
+  const pulled = await c.pull(['example', 'work/example']);
+  expect(pulled.items.map(item => item.externalId)).toEqual(['example']);
+  expect(pulled.failures[0]?.externalId).toBe('work/example');
+  const automatic = await service.autoSync('pass-git', 'backstop');
+  expect(automatic?.count).toBe(1);
+  expect(automatic?.failures).toEqual([{ externalId: 'work/', error: expect.any(String) }]);
+});
+
+it('persists failed write-back, blocks remote conflicts and imports an explicitly accepted remote value', async () => {
+  const f = fixture();
+  const kv = new Map<string, string>();
+  const db = { kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
+  const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
+  const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
+  const makeService = () => {
+    const service = new Connectors(db, items, broker);
+    service.register(new GitPassConnector(() => service.secretFor('pass-git'), 'org_personal', () => ({}), path.join(f.root, 'state'), { allowLocalRepository: true }));
+    return service;
+  };
+  let service = makeService();
+  await service.connect('pass-git', JSON.stringify(f.config));
+  const synced = await service.sync('pass-git', ['example'], { writeBack: true });
+  const id = synced.itemIds[0]!;
+  items.save({ id, type: 'login', secrets: { password: 'local-new' } });
+  const hook = path.join(f.remote, 'hooks', 'pre-receive');
+  fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  await expect(service.propagate(id, ['password'])).rejects.toThrow(/pushed/);
+  expect(JSON.stringify([...kv])).not.toContain('local-new');
+  service = makeService();
+  expect((await service.describe())[0]?.pendingWrites).toEqual([{ itemId: id, label: expect.any(String) }]);
+  fs.rmSync(hook);
+  run('age', ['-r', run('age-keygen', ['-y', f.identity]).trim(), '-o', path.join(f.seed, 'new.age')], undefined, 'remote-new\nkeep remote note\n');
+  fs.renameSync(path.join(f.seed, 'new.age'), path.join(f.seed, 'example.age'));
+  run('git', ['add', '.'], f.seed); run('git', ['commit', '-m', 'concurrent remote edit'], f.seed); run('git', ['push'], f.seed);
+  await expect(service.retryWriteBack(id)).rejects.toThrow(/Remote entry changed/);
+  const blocked = await service.sync('pass-git', ['example']);
+  expect(blocked.failures).toHaveLength(1);
+  expect(items.readSecret(items.get(id)!, 'password')).toBe('local-new');
+  await service.acceptRemote(id);
+  expect(items.readSecret(items.get(id)!, 'password')).toBe('remote-new');
+  expect((await service.describe())[0]?.pendingWrites).toEqual([]);
+  items.save({ id, type: 'login', secrets: { password: 'retry-new', totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } });
+  fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  await expect(service.propagate(id, ['password', 'totp'])).rejects.toThrow();
+  fs.rmSync(hook); await makeService().retryWriteBack(id);
+  expect((await connector(f.config, f.root).pull(['example'])).items[0]?.secrets.password).toBe('retry-new');
+  expect((await connector(f.config, f.root).pull(['example'])).items[0]?.secrets.totp).toContain('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ');
+  // A sync that decrypted an older value must not overwrite a rotation that
+  // completed while it was pulling from Git.
+  const active = service.get('pass-git')!;
+  const originalPull = active.pull.bind(active);
+  active.pull = async ids => {
+    const stale = await originalPull(ids);
+    items.save({ id, type: 'login', secrets: { password: 'concurrent-local' } });
+    await service.propagate(id, ['password']);
+    return stale;
+  };
+  const raced = await service.sync('pass-git', ['example']);
+  expect(raced.failures[0]?.error).toContain('changed during import');
+  expect(items.readSecret(items.get(id)!, 'password')).toBe('concurrent-local');
+
+  expect((await service.describe())[0]?.pendingWrites).toEqual([]);
+});
+
+it('accepts encrypted age identities, rejects wrong passphrases and cleans temporary plaintext', async () => {
+  const f = fixture();
+  const { encryptIdentity } = await import('./helpers/age-encrypted-identity.js');
+  const encrypted = path.join(f.root, 'identity.age');
+  await encryptIdentity(f.identity, encrypted, 'test-only-passphrase');
+  const config = { ...f.config, ageIdentity: undefined, ageIdentityEncrypted: fs.readFileSync(encrypted).toString('base64'), agePassphrase: 'test-only-passphrase' };
+  const c = connector(config, f.root);
+  expect((await c.validateSecret(JSON.stringify(config))).checks?.[0]?.read).toBe('verified');
+  expect((await c.pull(['example'])).items[0]?.secrets.password).toBe('pw');
+  await c.updateSecret('example', 'password', 'encrypted-identity-rotation');
+  expect((await c.pull(['example'])).items[0]?.secrets.password).toBe('encrypted-identity-rotation');
+  await expect(c.validateSecret(JSON.stringify({ ...config, agePassphrase: 'wrong' }))).rejects.toThrow(/verification/);
+  expect(fs.readdirSync(path.join(f.root, 'state')).filter(name => name.startsWith('.key-'))).toEqual([]);
+}, 60_000);
