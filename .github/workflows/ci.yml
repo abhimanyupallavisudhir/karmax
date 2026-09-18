@@ -85,7 +85,7 @@ jobs:
 
       - run: npm ci
 
-      - name: Install browser for password-store end-to-end test
+      - name: Install Chromium for browser regressions
         run: npx playwright install --with-deps chromium
 
       - name: Install password-store interoperability tools
