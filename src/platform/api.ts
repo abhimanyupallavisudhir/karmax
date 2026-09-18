@@ -1,4 +1,6 @@
 import { resolvePaymentPolicy, validatePaymentPolicy } from '../autonomy/payments.js';
+import { randomUUID } from 'node:crypto';
+import { TimingTrace, timingReport } from '../timing/index.js';
 import { requireHumanSubject } from './identity.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
@@ -559,7 +561,7 @@ export class KarmaxApi {
 
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
-    const message: Message = { id: `u${now}`, role: 'user', text, ts: now };
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', text, ts: now };
     await this.workflowHandle(taskId).signal(SIG.followUp, message, role);
     this.publishConversationMessage(taskId, role, message);
     return message;
@@ -1036,6 +1038,7 @@ export class KarmaxApi {
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
     },
+    receivedAt = { monoMs: performance.now(), wallMs: Date.now() },
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
     const project = this.deps.store.getProject(args.projectId);
@@ -1339,6 +1342,11 @@ export class KarmaxApi {
     const initialFiles = taskOverrides.files as FileRef[] | undefined;
     if (initialFiles?.length) input.files = initialFiles;
 
+    const requestTiming = new TimingTrace({ taskId: task.id, requestIds: [`${task.id}:m0`] }, row => {
+      this.deps.store.appendEvent({ taskId: task.id, type: 'timing', ts: row.wallMs, payload: { ...row } });
+    });
+    requestTiming.mark('request.received', { requestId: `${task.id}:m0` }, receivedAt);
+    const dispatchEnd = requestTiming.start('workflow.dispatch');
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
     // Bounded + compensated: if the engine won't accept it (wedged/unreachable),
@@ -1356,6 +1364,7 @@ export class KarmaxApi {
           `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
+    dispatchEnd();
     this.saveAgentSnapshot(task.id, manifest, input);
     // These attempts were explicitly requested as part of creation, so start all
     // of them. addAttempt() remains intentionally different: it creates one draft
@@ -3754,6 +3763,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
+  async taskTiming(token: string, taskId: string) {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'list_events', { projectId: task?.projectId, taskId });
+    return timingReport(this.deps.store.eventsOfType(taskId, 'timing').map(e => e.payload as unknown as import('../timing/index.js').TimingRow));
+  }
+
   async taskEvents(token: string, taskId: string, since = 0, limit?: number) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
@@ -4133,7 +4148,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }): Promise<Message | undefined> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt = { monoMs: performance.now(), wallMs: Date.now() }): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
@@ -4244,7 +4259,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
       if (signal === SIG.followUp) {
         const now = Date.now();
-        const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) };
+        const msg: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) };
         const messages = terminal.messages.map((m) => ({ ...m }));
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
@@ -4305,7 +4320,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         throw new Error(`this hold is waiting on the ${holdRole} agent, not ${role}; send the follow-up to ${holdRole} or resume ${stageName(heldOrigin)}`);
       const now = Date.now();
       const followUp: Message = {
-        id: `u${now}`,
+        id: `u${randomUUID()}`,
         role: 'user',
         text: text ?? '',
         ts: now,
@@ -4399,7 +4414,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (signal === SIG.followUp) {
         const now = Date.now();
         followUp = {
-          id: `u${now}`,
+          id: `u${randomUUID()}`,
           role: 'user',
           text: text ?? '',
           ts: now,
@@ -4408,7 +4423,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        await handle.signal(SIG.followUp, followUp, role);
+        const trace = new TimingTrace({ taskId, requestIds: [`${taskId}:${followUp.id}`] }, row => {
+          this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
+        });
+        trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt);
+        await trace.measure('workflow.dispatch', () => handle.signal(SIG.followUp, followUp, role));
         // A signal mutates workflow memory immediately, but workflows deliberately
         // publish their full cached view only at lifecycle boundaries. Journal the
         // accepted message separately so every open conversation can render it

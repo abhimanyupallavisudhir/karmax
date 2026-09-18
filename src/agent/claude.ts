@@ -1,3 +1,5 @@
+import { ReportedUsage } from '../timing/usage.js';
+import { currentTiming, timed } from '../timing/index.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -83,6 +85,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // lost its reasoning effort here (the old fallback, claude-sonnet-4-5, is real
     // but not effort-capable, so `claudeMessagesEffort` returned undefined for it).
     const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
+    currentTiming()?.mark('provider.selected', { provider: 'claude', model });
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
     const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
@@ -103,8 +106,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
-    const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
-      inputTokensIncludeCacheRead: false, totalTokens: 0 };
+    const reportedUsage = new ReportedUsage();
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed. This path rebuilds the full
@@ -132,45 +134,46 @@ export class ClaudeAdapter implements AgentAdapter {
     for (let i = 0; i < maxIters; i++) {
       if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
       ctx.heartbeat?.(); // let Temporal deliver a pending cancellation
-      const res = await fetch(`${baseUrl}/v1/messages`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model,
-          // A whole coding response (a rewritten file, a long explanation + tool call)
-          // can exceed 8192 output tokens; too low a cap truncates mid-response, which
-          // the loop below then has to recover from at the cost of an extra billed
-          // round trip. Derived per model (see effort.ts) instead of hard-coded.
-          max_tokens: claudeMaxTokens(model),
-          system: input.systemPrompt,
-          messages,
-          tools,
-          // Reasoning effort (SPEC §10.5) — sent only on models that accept it.
-          ...(claudeMessagesEffort(model, input.profile.effort) ? { output_config: { effort: claudeMessagesEffort(model, input.profile.effort) } } : {}),
-        }),
-        signal: ctx.signal,
+      const data = await timed('provider.roundtrip', async () => {
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model,
+            // A whole coding response (a rewritten file, a long explanation + tool call)
+            // can exceed 8192 output tokens; too low a cap truncates mid-response, which
+            // the loop below then has to recover from at the cost of an extra billed
+            // round trip. Derived per model (see effort.ts) instead of hard-coded.
+            max_tokens: claudeMaxTokens(model),
+            system: input.systemPrompt,
+            messages,
+            tools,
+            // Reasoning effort (SPEC §10.5) — sent only on models that accept it.
+            ...(claudeMessagesEffort(model, input.profile.effort) ? { output_config: { effort: claudeMessagesEffort(model, input.profile.effort) } } : {}),
+          }),
+          signal: ctx.signal,
+        });
+        if (!res.ok) {
+          const message = `Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`;
+          throw providerErrorFromMessage('claude', message, 'structured');
+        }
+        const data = (await res.json()) as any;
+        currentTiming()?.markOnce('first.output');
+        return data;
       });
-      if (!res.ok) {
-        const message = `Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`;
-        throw providerErrorFromMessage('claude', message, 'structured');
-      }
-      const data = (await res.json()) as any;
-      usage.inputTokens += Number(data.usage?.input_tokens ?? 0);
-      usage.outputTokens += Number(data.usage?.output_tokens ?? 0);
-      usage.cacheReadTokens += Number(data.usage?.cache_read_input_tokens ?? 0);
-      usage.cacheWriteTokens += Number(data.usage?.cache_creation_input_tokens ?? 0);
-      usage.totalTokens += Number(data.usage?.input_tokens ?? 0) + Number(data.usage?.output_tokens ?? 0)
-        + Number(data.usage?.cache_read_input_tokens ?? 0) + Number(data.usage?.cache_creation_input_tokens ?? 0);
+      // Usage accounting is required even when timing collection is absent.
+      const roundUsage = reportedUsage.add(data.usage, 'claude');
+      currentTiming()?.mark('provider.usage', roundUsage);
       messages.push({ role: 'assistant', content: data.content });
       const toolUses = (data.content ?? []).filter((b: any) => b.type === 'tool_use');
       const text = (data.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
       if (text) {
         finalText = text;
-        ctx.emit(text);
+        ctx.emit(text, 'assistant');
         ctx.emitActivity({ id: `message-${i}`, kind: 'message', phase: 'completed', title: text });
       }
       if (toolUses.length === 0) {
@@ -228,7 +231,7 @@ export class ClaudeAdapter implements AgentAdapter {
       session: input.session,
       output: finalText,
       delivered: deliveredIndex,
-      usage,
+      usage: reportedUsage.total(),
     };
     } finally { await mcp.close(); }
   }
@@ -507,6 +510,7 @@ export class ClaudeAdapter implements AgentAdapter {
       settleDeadline ??= Date.now() + settleGraceMs;
       return Date.now() < settleDeadline;
     };
+    const startupEnd = currentTiming()?.start('process.sdk-startup.opaque');
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -626,6 +630,8 @@ export class ClaudeAdapter implements AgentAdapter {
     let publishedSession = false;
     try {
       for await (const message of iterator) {
+        startupEnd?.();
+        currentTiming()?.markOnce('provider.first-event');
         if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {
           const inventory = (message as any).mcp_servers ?? [];
           const missing = (input.agentMcp ?? []).filter((s) => !inventory.some((c: any) => c.name === s.name && c.status === 'connected'));
@@ -701,7 +707,7 @@ export class ClaudeAdapter implements AgentAdapter {
           }
           if (text) {
             finalText = text;
-            ctx.emit(text);
+            ctx.emit(text, 'assistant');
             ctx.emitActivity({
               id: String((message as any).uuid ?? `message-${Date.now()}`),
               kind: 'message',
@@ -889,16 +895,11 @@ export class ClaudeAdapter implements AgentAdapter {
       session,
       output: finalText,
       delivered: deliveredIndex,
-      ...(successfulResult.usage ? { usage: {
-        inputTokens: Number(successfulResult.usage.input_tokens ?? 0),
-        outputTokens: Number(successfulResult.usage.output_tokens ?? 0),
-        cacheReadTokens: Number(successfulResult.usage.cache_read_input_tokens ?? 0),
-        cacheWriteTokens: Number(successfulResult.usage.cache_creation_input_tokens ?? 0),
-        inputTokensIncludeCacheRead: false,
-        totalTokens: Number(successfulResult.usage.input_tokens ?? 0) + Number(successfulResult.usage.output_tokens ?? 0)
-          + Number(successfulResult.usage.cache_read_input_tokens ?? 0)
-          + Number(successfulResult.usage.cache_creation_input_tokens ?? 0),
-      } } : {}),
+      usage: (() => {
+        const reported = new ReportedUsage();
+        reported.add(successfulResult.usage, 'claude');
+        return reported.total();
+      })(),
       ...(pending ? { pendingSubagents: pending } : {}),
       ...(pendingShells ? { pendingBackgroundShells: pendingShells } : {}),
     };

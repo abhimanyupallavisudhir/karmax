@@ -46,7 +46,14 @@ describe('conversation message events', () => {
 
     expect(signal).toHaveBeenCalledWith('followUp', message, 'do');
     expect(message).toMatchObject({ role: 'user', text: 'One more requirement' });
-    const events = store.eventsSince(task.id, 0);
+    const journal = store.eventsSince(task.id, 0);
+    const events = journal.filter(event => event.type === 'conversation.message');
+    const timing = journal.filter(event => event.type === 'timing').map(event => event.payload);
+    expect(timing).toEqual([
+      expect.objectContaining({ name: 'request.received', phase: 'mark', requestIds: [`${task.id}:${message?.id}`] }),
+      expect.objectContaining({ name: 'workflow.dispatch', phase: 'start' }),
+      expect.objectContaining({ name: 'workflow.dispatch', phase: 'end', status: 'ok' }),
+    ]);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'conversation.message',
