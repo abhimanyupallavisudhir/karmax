@@ -18575,7 +18575,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
     if (!box.isConnected) return;
     let cards = (cards0.length ? cards0 : live?.cards || []).filter(c => c.status !== 'canceled' && c.status !== 'inactive');
     const inherited = { cardIds: project.cardIds ?? org.cardIds,
-      budget: Object.hasOwn(project, 'budget') ? project.budget : project.allowance ?? (Object.hasOwn(org, 'budget') ? org.budget : org.allowance ?? null) };
+      budget: Object.hasOwn(project, 'budget') ? project.budget : project.allowance ?? (Object.hasOwn(org, 'budget') ? org.budget : org.allowance ?? 0) };
     const policy = (taskId && S.paymentEdits?.[taskId]) || live || initial || inherited;
     let selected = new Set(policy.cardIds ?? cards.map(c => c.id)), active = -1;
     budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);

@@ -65,6 +65,7 @@ describe('BudgetService over the mock rail', () => {
     provider = new MockPaymentProvider(store);
     budget = new BudgetService(store, provider);
     projectId = store.createProject('P', {}).id;
+    store.setSettings(projectId, 'payments', { budget: null });
   });
 
   it('needs_funding when no card is configured', async () => {
@@ -227,6 +228,31 @@ describe('BudgetService over the mock rail', () => {
 
 
 describe('task payment policy', () => {
+  it('defaults to zero and inherits editable organization and project budgets', async () => {
+    const store = new Store(':memory:');
+    try {
+      const project = store.createProject('Default budget', {});
+      const provider = new MockPaymentProvider(store);
+      const service = new BudgetService(store, provider);
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 1000 });
+      await provider.fund(card.id, 1000);
+      expect(service.policy(project.id).budget).toBe(0);
+      expect((await service.request({ projectId: project.id, taskId: 'default-budget' }, { amount: 1 })).status).toBe('needs_approval');
+      expect(store.paymentSpent('default-budget')).toBe(0);
+      const org = `organization:${project.organizationId}`;
+      store.setSettings(org, 'payments', { budget: 500 });
+      expect(service.policy(project.id).budget).toBe(500);
+      store.setSettings(project.id, 'payments', { cardIds: [card.id] });
+      expect(service.policy(project.id).budget).toBe(500);
+      store.setSettings(org, 'payments', { budget: null });
+      expect(service.policy(project.id).budget).toBeNull();
+      store.setSettings(project.id, 'payments', { budget: 200 });
+      expect(service.policy(project.id).budget).toBe(200);
+      store.setSettings(project.id, 'payments', { budget: null });
+      expect(service.policy(project.id).budget).toBeNull();
+    } finally { store.close(); }
+  });
+
   it('selects by name, counts across cards, and releases pending requests in order', async () => {
     const store = new Store(':memory:');
     const provider = new MockPaymentProvider(store);
