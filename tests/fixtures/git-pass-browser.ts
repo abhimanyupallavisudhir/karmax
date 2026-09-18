@@ -139,6 +139,11 @@ try {
   assert.equal(checks.length, 2);
   assert(checks.every((check: any) => check.read === 'verified' && check.encryption && check.push));
   await page.locator('[data-git-pass-root]').waitFor({ state: 'detached' });
+  const checked = page.waitForResponse(response => response.url().includes('/connectors/pass-git/check'));
+  await row.locator('[data-git-pass-check]').click();
+  const checkedResponse = await checked;
+  assert.equal(checkedResponse.status(), 200);
+  assert.deepEqual((await checkedResponse.json()).checks, checks);
   await row.locator('[data-conn-import]').click();
   await page.waitForFunction("document.querySelectorAll('.imp-pick').length === 2");
   await page.locator('.imp-all').check();

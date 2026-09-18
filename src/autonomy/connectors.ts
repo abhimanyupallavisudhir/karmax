@@ -1691,7 +1691,9 @@ export class Connectors {
   async acceptRemote(itemId: string) {
     const pending = this.pending(itemId);
     if (!pending.externalId || pending.binding !== gitPassRepositoryIdentity(this.secretFor('pass-git'))) throw new Error('Write-back connection changed; review the current connection');
-    return this.sync('pass-git', [pending.externalId], { acceptRemote: true });
+    const result = await this.sync('pass-git', [pending.externalId], { acceptRemote: true });
+    if (result.count !== 1 || result.failures.length) throw new Error(result.failures[0]?.error ?? 'Remote value was not imported');
+    return result;
   }
 
   async propagate(itemId: string, fields: VaultFieldName[]): Promise<{ connector: string; fields: VaultFieldName[] } | undefined> {
