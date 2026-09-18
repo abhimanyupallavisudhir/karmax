@@ -38,6 +38,18 @@ ok(projectModal.includes('/checkout`'), 'project action loads a server-generated
 ok(projectModal.includes('plan.cloneScript') && projectModal.includes('plan.updateScript'), 'project modal offers clone and update commands');
 ok(localModal.includes('localConversationHandoff(v, checkout.cwd)'), 'local materialization renders agent handoffs');
 
+ok(taskModal.includes('remoteTerminalHandoff(v)'), 'task handoff includes remote terminal access');
+ok(taskModal.includes("copyNativeAttachCommand(v)"), 'remote terminal action uses the existing ticket API');
+const remoteContext = {};
+const vmRemote = require('node:vm');
+try {
+  vmRemote.runInNewContext(slice('function remoteTerminalHandoff(v)', 'async function openLocalCheckout(v)')
+    + "\nremote = remoteTerminalHandoff({worldAvailable:true}); missing = remoteTerminalHandoff({}); local = remoteTerminalHandoff({worldAvailable:true, worldPath:'/tmp/world'});", remoteContext);
+  ok(remoteContext.remote.includes('Copy terminal command'), 'remote world offers a terminal command');
+  ok(remoteContext.remote.includes('title=') && remoteContext.remote.includes('five minutes'), 'tooltip explains CLI requirement and ticket lifetime');
+  ok(remoteContext.missing === '' && remoteContext.local === '', 'no remote option for missing or local worlds');
+} catch (error) { ok(false, error.message); }
+
 // Execute the command builder against a bound snapshot, including shell metacharacters.
 const vm = require('node:vm');
 const snapshot = { id: 'old-session', exportId: '11111111-1111-4111-8111-111111111111', provider: 'codex',

@@ -9389,25 +9389,40 @@ function localConversationHandoff(v, cwd, portable = false) {
     }).join('')}</div>`;
 }
 
+// Reuse the metered, permission-checked terminal path for either cloud provider.
+// Mint the short-lived ticket only when requested, never while rendering.
+function remoteTerminalHandoff(v) {
+  if (!v.worldAvailable || v.worldPath) return '';
+  return `<div class="section-h">Connect to cloud world</div>
+    <button class="btn sm local-remote-terminal" title="Requires the Karmax CLI on your computer. Opens a shell in this task’s live cloud world; edits apply immediately. The one-time command expires in five minutes. Cloud compute is metered while connected.">Copy terminal command</button>`;
+}
+
 async function openLocalCheckout(v) {
   if (hostLocal()) return materializeLocalCheckout(v);
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    ${remoteTerminalHandoff(v)}
     <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
   </div></div>`;
   const wireClose = () => {
+    host.querySelector('.local-remote-terminal')?.addEventListener('click', () => copyNativeAttachCommand(v));
     host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
   wireClose();
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
-  catch (error) { host.remove(); return toast(error.message, true); }
+  catch (error) {
+    const loading = host.querySelector('.modal-loading');
+    if (loading) { loading.className = 'task-sub'; loading.textContent = error.message; }
+    return;
+  }
   if (!host.isConnected) return;
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    ${remoteTerminalHandoff(v)}
     <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
@@ -9507,7 +9522,7 @@ async function copyNativeAttachCommand(v) {
   try {
     const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/terminal-ticket`, { method: 'POST', body: '{}' });
     const command = [...(result.attachArgv || ['karmax']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
-      .map((part) => JSON.stringify(String(part))).join(' ');
+      .map((part) => "'" + String(part).replaceAll("'", "'\"'\"'") + "'").join(' ');
     await copyToClipboard(command);
     toast('One-time attach command copied');
   } catch (error) { toast(error.message, true); }
