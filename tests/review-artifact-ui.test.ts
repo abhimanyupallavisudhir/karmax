@@ -20,7 +20,7 @@ describe('review artifact reader', () => {
     return { context, show, open, fetch, run: () => context.openArtifact('/artifact', false, target) };
   }
 
-  it('consumes reader Escape before the shell can close the selected task', () => {
+  it.each([false, true])('consumes reader Escape before full screen or the task (full screen: %s)', (fullscreen) => {
     const listeners: Record<string, (event: any) => void> = {};
     const control = { classList: { add: vi.fn() }, addEventListener: vi.fn(), focus: vi.fn() };
     const dialog = {
@@ -29,19 +29,30 @@ describe('review artifact reader', () => {
       showModal: vi.fn(), close: vi.fn(),
     };
     const closeTask = vi.fn();
+    const pane = { classList: { toggle: vi.fn() } };
+    const state = { selected: 'task-1', conversationFullscreen: fullscreen };
+    const root = { childElementCount: 0 };
+    const select = (selector: string) => {
+      if (selector === '#overlay-root' || selector === '#modal-root') return root;
+      if (selector === '.ck-pane') return pane;
+      if (selector === '.ck-fullscreen') return state.conversationFullscreen ? pane : null;
+      return null;
+    };
     let shellKeydown: (event: any) => void;
     const context = vm.createContext({
       document: { activeElement: null, createElement: () => dialog,
         body: { appendChild: vi.fn() },
         addEventListener: (_name: string, handler: (event: any) => void) => { shellKeydown = handler; } },
       URL: { createObjectURL: () => 'blob:test' }, esc: (s: string) => s,
-      renderMarkdown: () => '', closeTask, S: { selected: 'task-1' },
-      $: () => ({ childElementCount: 0 }), resetChord: vi.fn(), inRail: () => false,
+      renderMarkdown: () => '', closeTask, S: state,
+      $: select, resetChord: vi.fn(), inRail: () => false,
       focusedEnterAction: () => null,
     });
     vm.runInContext(source + '\n' + app.slice(app.indexOf('function closeTopOverlay()'),
       app.indexOf('// -- the dispatcher')) + '\n' + app.slice(app.indexOf('function bindKeys()'),
       app.indexOf('// -- global search:')), context);
+    const fullscreenStart = app.indexOf('function setConversationFullscreen(');
+    vm.runInContext(app.slice(fullscreenStart, app.indexOf('\n}', fullscreenStart) + 2), context);
     context.showArtifactReader('report', 'markdown', 'report.md', {});
     context.bindKeys();
     const event = { key: 'Escape', defaultPrevented: false, stopPropagation: vi.fn(),
@@ -53,8 +64,20 @@ describe('review artifact reader', () => {
     expect(event.stopPropagation).toHaveBeenCalledOnce();
     expect(event.defaultPrevented).toBe(true);
     expect(closeTask).not.toHaveBeenCalled();
-    // The next Escape, after the reader is gone, still closes the task normally.
-    shellKeydown!({ key: 'Escape', defaultPrevented: false });
+    expect(state.conversationFullscreen).toBe(fullscreen);
+    const nextEscape = () => ({ key: 'Escape', defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; } });
+    if (fullscreen) {
+      // Once the reader is gone, Escape exits full screen without closing the task.
+      const exitEvent = nextEscape();
+      shellKeydown!(exitEvent);
+      expect(exitEvent.defaultPrevented).toBe(true);
+      expect(state.conversationFullscreen).toBe(false);
+      expect(pane.classList.toggle).toHaveBeenCalledWith('ck-fullscreen', false);
+      expect(closeTask).not.toHaveBeenCalled();
+    }
+    // With neither reader nor full screen open, Escape closes the task normally.
+    shellKeydown!(nextEscape());
     expect(closeTask).toHaveBeenCalledOnce();
   });
 

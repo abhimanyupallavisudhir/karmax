@@ -216,6 +216,7 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 // and sessions without a native CLI/config home.
 eval(extractFn('reviewActionBtn'));
 eval(extractFn('conversationReviewInfo'));
+eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));

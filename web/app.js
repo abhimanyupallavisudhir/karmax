@@ -23,6 +23,8 @@ function formatBytes(value) {
 // the no-build-step console self-contained while still giving every button a
 // proper text alternative through its aria-label/title.
 const ICON = {
+  expand: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg>',
+  collapse: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3m13 5h-5V3M8 21v-5H3m13 5v-5h5"/></svg>',
   save: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.2 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8.8a2 2 0 0 0-.6-1.4l-3.8-3.8a2 2 0 0 0-1.4-.6Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>',
   form: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h1"/><path d="M12 13h4"/><path d="M8 17h1"/><path d="M12 17h4"/></svg>',
   more: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
@@ -6879,6 +6881,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // check-in pane re-resolves to the stage's agent.
   S.taskTab = wantTab || null;
   S.checkinSel = null;
+  S.conversationFullscreen = false;
   // A repeatable series has no running workflow — open the config page instead
   // (edit its parameters + triggers, see its runs, run again).
   const rec = taskRecord(taskId);
@@ -7052,6 +7055,7 @@ function closeTaskDom() {
   S.taskFile = null;
   S.taskFileLoad = null;
   S.checkinSel = null;
+  S.conversationFullscreen = false;
   S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
@@ -7521,6 +7525,7 @@ function wireWorkflowMode(v) {
 // (replace, not push — Back should leave the task, not walk through its tabs).
 function setTaskTab(key) {
   if (!TASK_TABS.some((t) => t.key === key) || S.taskTab === key) return;
+  S.conversationFullscreen = false;
   S.taskTab = key;
   if (S.selected) history.replaceState({}, '', `${taskUrl(S.selected)}/${key}`);
   renderTaskPage();
@@ -8502,6 +8507,7 @@ function adjacentCheckinPane(panes, current, delta) {
 function selectCheckinPane(v, key, openShell = false) {
   if (!key) return;
   const changed = key !== checkinSelection(v);
+  if (changed) S.conversationFullscreen = false;
   S.checkinSel = key;
   if (changed) renderTaskPage();
   // Selecting the sidebar's "Open terminal" action is deliberately enough to
@@ -8545,7 +8551,7 @@ function checkinTab(v) {
         ${localWorldPath(v) ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
       </div>
     </div>
-    <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
+    <div class="ck-pane${S.conversationFullscreen && sel !== 'terminal' ? ' ck-fullscreen' : ''}">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
   </div>`;
 }
 
@@ -8560,6 +8566,26 @@ function conversationReviewInfo(v) {
     ${info.actions?.length ? `<div class="review-actions" id="review-actions">${info.actions.map((action, index) => reviewActionBtn(action, index)).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
     ${info.links?.length || info.html ? `<div class="review-actions">${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}${info.html ? '<button class="btn sm" data-tasktab="overview">View preview ↗</button>' : ''}</div>` : ''}
   </div>`;
+}
+
+// Expand in place so live messages, scroll position and unsent attachments survive.
+function conversationFullscreenButton() {
+  const active = !!S.conversationFullscreen;
+  const label = active ? 'Exit full screen' : 'Full screen';
+  return `<button type="button" class="btn sm icon-btn" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
+}
+
+function setConversationFullscreen(active) {
+  S.conversationFullscreen = active;
+  $('.ck-pane')?.classList.toggle('ck-fullscreen', active);
+  const button = $('#conversation-fullscreen');
+  if (!button) return;
+  const label = active ? 'Exit full screen' : 'Full screen';
+  button.setAttribute('aria-label', label);
+  button.setAttribute('title', active ? 'Exit full screen (Esc)' : label);
+  button.setAttribute('aria-pressed', String(active));
+  button.innerHTML = active ? ICON.collapse : ICON.expand;
+  button.focus({ preventScroll: true });
 }
 
 function conversationPane(v, t) {
@@ -8624,6 +8650,7 @@ function conversationPane(v, t) {
       <button class="btn sm" id="share-task-conversation" data-role="${esc(t.role)}">Share</button>
       <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
+      ${conversationFullscreenButton()}
     </div>
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
@@ -9162,6 +9189,7 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
   $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
   $('#fork-task-agent')?.addEventListener('click', (event) => {
     openTaskForm('software-dev', undefined, undefined, {
@@ -17156,6 +17184,12 @@ function bindKeys() {
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
     const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
+    if (e.key === 'Escape' && !overlayOpen && $('.ck-fullscreen')) {
+      e.preventDefault();
+      resetChord();
+      setConversationFullscreen(false);
+      return;
+    }
     if (typing) {
       resetChord();
       if (e.key === 'Escape') { t.blur(); resetChord(); }
