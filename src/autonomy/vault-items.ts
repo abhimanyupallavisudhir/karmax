@@ -189,6 +189,7 @@ export function totpCode(seed: string, nowMs = Date.now(), stepSeconds = 30, dig
   let algo = 'sha1';
   if (secret.startsWith('otpauth://')) {
     const u = new URL(secret);
+    if (u.hostname !== 'totp') throw new Error('Only TOTP otpauth URIs are supported');
     secret = u.searchParams.get('secret') ?? '';
     step = Number(u.searchParams.get('period') ?? step) || step;
     len = Number(u.searchParams.get('digits') ?? len) || len;
@@ -284,6 +285,8 @@ export class VaultItems {
     envVar?: string;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
+    /** Internal connector snapshot: remove fields absent from the source. */
+    replaceSecrets?: boolean;
     provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
@@ -294,6 +297,12 @@ export class VaultItems {
     if (!label) throw new Error('a vault item needs a label');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
+    if (args.replaceSecrets) for (const field of fields) {
+      if (args.secrets?.[field] === undefined || (field !== 'note' && !args.secrets[field]?.trim())) {
+        this.requireBroker().deleteHandle(itemHandle(id, field));
+        fields.delete(field);
+      }
+    }
     for (const field of ITEM_FIELDS[args.type]) {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
