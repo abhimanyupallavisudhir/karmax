@@ -4760,7 +4760,7 @@ function seriesRow(t) {
       <span class="status-dot ${dot}" title="repeatable series"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-sub"><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
@@ -4793,7 +4793,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot waiting" title="waiting for trigger"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub"><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
@@ -4811,7 +4811,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub"><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Run task</button>
@@ -4833,7 +4833,6 @@ function taskRow(t, { showTags = true } = {}) {
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
-          <span class="wf">${esc(workflowLabel(t.workflow))}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
           ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
@@ -15463,6 +15462,29 @@ function urgencyChip(urgency) {
   const level = URGENCY_LEVELS[urgencyRank(urgency)];
   return `<span class="urgency-chip ${level}" aria-label="${level} priority"><span class="priority-bars" aria-hidden="true">${'▮'.repeat(urgencyRank(level) + 1)}</span> ${level}</span>`;
 }
+function inboxTimeLabel(ts, now = Date.now()) {
+  const date = new Date(ts);
+  const today = new Date(now);
+  const yesterday = new Date(now);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return 'yesterday';
+  if (date.toDateString() !== today.toDateString()) {
+    return date.toLocaleDateString(undefined, {
+      month: 'short', day: 'numeric', ...(date.getFullYear() !== today.getFullYear() ? { year: 'numeric' } : {}),
+    });
+  }
+  const minutes = Math.max(0, Math.floor((now - ts) / 60000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+}
+
+function inboxProjectLabel(item) {
+  const projectId = item.task?.projectId || item.resource?.projectId || item.subject?.projectId;
+  return S.projects?.find((project) => project.id === projectId)?.name || '';
+}
+
 function inboxView() {
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
@@ -15471,19 +15493,25 @@ function inboxView() {
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row priority-${URGENCY_LEVELS[urgencyRank(item.urgency)]} ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
-      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.resource?.name || item.kind)}</b>${urgencyChip(item.urgency)}
-      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
-      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
+      <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
+      <div class="task-main">
+        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
+        <div class="task-sub">${inboxProjectLabel(item) ? `<span class="inbox-project" title="${esc(inboxProjectLabel(item))}">${esc(inboxProjectLabel(item))}</span>` : ''}<span class="chip">${esc(inboxRowLabel(item))}</span></div>
+      </div>
+      <div class="task-right">${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}" title="${esc(new Date(item.createdAt).toLocaleString())}">${esc(inboxTimeLabel(item.createdAt))}</time><button class="icon-btn inbox-read" data-inbox-toggle="${esc(item.id)}" aria-label="${item.unread ? 'Mark as read' : 'Mark as unread'}" title="${item.unread ? 'Mark as read' : 'Mark as unread'}" aria-pressed="${!item.unread}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
     <p class="task-sub">Sorted by priority, newest first within each level. System notifications and sounds are set in
       <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
 }
 
 function wireInboxView() {
-  $('#main').querySelectorAll('[data-inbox]').forEach((row) => row.addEventListener('click', (e) => {
-    if (e.target.closest('[data-inbox-toggle]')) return;
-    openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
-  }));
+  $('#main').querySelectorAll('[data-inbox]').forEach((row) => {
+    row.addEventListener('focus', () => { S.cursorId = rowKey(row); applyCursor(); });
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('[data-inbox-toggle]')) return;
+      openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
+    });
+  });
   $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
     const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
     try {
@@ -17262,7 +17290,7 @@ function focusFollowup() {
 function cursorRows() {
   return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
 }
-function rowKey(r) { return r.dataset.id || r.dataset.draft; }
+function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox; }
 function applyCursor() {
   cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
 }
