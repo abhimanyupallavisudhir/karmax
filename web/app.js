@@ -3920,13 +3920,28 @@ let editingRailItem = null;
 // theme, so it lives in localStorage — keyed per organization because the rail
 // shows one organization's projects at a time.
 function railCollapsedFolders() {
-  try { return new Set(JSON.parse(localStorage.getItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`) || '[]')); }
-  catch { return new Set(); }
+  const key = `karmax-rail-folders:${S.organizationId || 'org_personal'}`;
+  // If storage is unavailable, keep explicit choices for this session.
+  if (S.railFolderFallback?.has(key)) return new Set(S.railFolderFallback.get(key));
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || '[]');
+    return new Set(Array.isArray(saved) ? saved.filter((path) => typeof path === 'string') : []);
+  } catch { return new Set(); }
+}
+function saveRailCollapsedFolders(folded) {
+  const key = `karmax-rail-folders:${S.organizationId || 'org_personal'}`;
+  try {
+    localStorage.setItem(key, JSON.stringify([...folded]));
+    S.railFolderFallback?.delete(key);
+  } catch {
+    S.railFolderFallback ||= new Map();
+    S.railFolderFallback.set(key, new Set(folded));
+  }
 }
 function toggleRailFolder(path) {
   const folded = railCollapsedFolders();
   if (!folded.delete(path)) folded.add(path);
-  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...folded])); } catch {}
+  saveRailCollapsedFolders(folded);
   renderRail();
 }
 
@@ -3951,7 +3966,7 @@ function replaceProjectRouteAfterRename(projectId, previousBase) {
 function renameCollapsedRailFolder(previous, next) {
   const folded = [...railCollapsedFolders()].map((path) =>
     path === previous || path.startsWith(`${previous}/`) ? `${next}${path.slice(previous.length)}` : path);
-  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...new Set(folded)])); } catch {}
+  saveRailCollapsedFolders(new Set(folded));
 }
 
 // One compact editor serves both project links and folder headers. It deliberately
@@ -4088,7 +4103,7 @@ function railProjectRows(projectScoped) {
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
-    if (query || !folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
@@ -4112,6 +4127,7 @@ function renderRail() {
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
   // Keep the input node alive during typing, composition, and live refreshes.
+  const scrollTop = rail.scrollTop;
   const searching = active?.id === 'project-search';
   if (searching) {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
@@ -4171,6 +4187,7 @@ function renderRail() {
   }));
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
+  rail.scrollTop = scrollTop;
 }
 
 // HTML5 drag-and-drop reordering of the rail's project links. The rail holds more
