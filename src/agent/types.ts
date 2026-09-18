@@ -48,7 +48,7 @@ export interface PlatformToolContext {
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
    *  granted (settled or authorization reserved) | needs_approval |
    *  needs_funding | denied. */
-  requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
+  requestSpend(args: { amount: number; merchant?: string; why?: string; cardName?: string; cardId?: string }): Promise<{
     status: 'granted' | 'needs_approval' | 'needs_funding' | 'denied';
     reason?: string;
     transactionId?: string;

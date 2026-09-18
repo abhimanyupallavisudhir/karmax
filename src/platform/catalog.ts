@@ -266,6 +266,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/payments/requests',
     'POST /api/organizations/:organizationId/payments/requests/:id/:decision',
     'GET /api/organizations/:organizationId/payments/transactions',
+    'GET /api/tasks/:taskId/payments (selected cardIds, budget in cents or null, spent in cents)',
+    'PUT /api/tasks/:taskId/payments (payment:write; body {cardIds, budget}; releases pending payments that now fit)',
     'GET|POST /api/cards',
     'POST /api/cards/:id/fund',
     'DELETE /api/cards/:id',

@@ -293,7 +293,7 @@ describe('Stripe Issuing organization rail', () => {
       const registry = new PaymentRegistry(store);
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
-      store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', threshold: 1_000 });
+      store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', budget: 1_000 });
       const ctx = { organizationId, projectId, taskId: 'task_gate' };
       const first = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'first' });
       const second = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'second' });

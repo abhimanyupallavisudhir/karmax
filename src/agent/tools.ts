@@ -205,7 +205,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         amount: { type: 'number', description: 'Amount in cents.' },
-        card_id: { type: 'string', description: 'Optional card id. Required when the task can use more than one card and a specific rail is intended.' },
+        card_id: { type: 'string', description: 'Optional card id, as an alternative to card_name.' },
+        card_name: { type: 'string', description: 'Name of the card to use (unique within the organization). Follow the user’s instructions about which card to use.' },
         merchant: { type: 'string' },
         why: { type: 'string', description: 'Why this purchase is needed (shown to the human).' },
       },
@@ -981,6 +982,7 @@ export function platformToolHandlers(
     async request_spend(args) {
       const r = await ctx.requestSpend({
         amount: Number(args?.amount ?? 0),
+        cardName: args?.card_name ? String(args.card_name) : undefined,
         cardId: args?.card_id ? String(args.card_id) : undefined,
         merchant: args?.merchant ? String(args.merchant) : undefined,
         why: args?.why ? String(args.why) : undefined,
