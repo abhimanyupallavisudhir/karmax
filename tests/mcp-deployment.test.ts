@@ -28,7 +28,7 @@ describe.skipIf(!target)('MCP real deployment boundary', () => {
     const provider = target === 'container' ? new ContainerWorldProvider(path.join(dir, 'worlds')) : target === 'e2b' ? new E2BWorldProvider() : new DaytonaWorldProvider();
     let world: Awaited<ReturnType<typeof provider.create>> | undefined;
     try {
-      world = await provider.create({ taskId: `mcp-live-${Date.now()}`, base: 'main' });
+      world = await provider.create({ taskId: `mcp-live-${Date.now()}`, base: 'main', network: { unrestricted: true } });
       const root = target === 'container' ? '/work' : world.handle.root;
       await world.writeFile('.fixture/mcp-server.mjs', fs.readFileSync(path.resolve('tests/fixtures/mcp-hostile.mjs'), 'utf8'));
       const project = store.createProject('Deployment test');
