@@ -91,7 +91,7 @@ jobs:
       - name: Install password-store interoperability tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends age gnupg pass pass-extension-otp
+          sudo apt-get install -y --no-install-recommends age gnupg oathtool pass pass-extension-otp
           archive="$RUNNER_TEMP/gopass.tar.gz"
           curl -fsSL 'https://github.com/gopasspw/gopass/releases/download/v1.17.2/gopass-1.17.2-linux-amd64.tar.gz' -o "$archive"
           echo "95df834e451dec445565b8132efd4d9d18cb889b56d0fc65382d4ac3efdefb08  $archive" | sha256sum -c -

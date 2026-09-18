@@ -2070,11 +2070,11 @@ esac
       expect(created.writeBack).toEqual([
         { connector: 'pass', externalId: 'karmax/Agent-created-pass-rotation' },
       ]);
-      expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\n');
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\nusername: agent@example.com\n');
 
       // Real pass entries often contain notes below line 1. Rotation must use
       // updateSecret, not push, so those lines survive.
-      fs.writeFileSync(entryFile, 'initial\nusername: agent@example.com\nkeep this note\n');
+      fs.appendFileSync(entryFile, 'keep this note\n');
       const rotated: any = await (await fetch(`${base}/api/vault/store`, {
         method: 'POST',
         headers: agentAuth,
