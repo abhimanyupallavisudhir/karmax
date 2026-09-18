@@ -67,7 +67,7 @@ export interface PlatformToolContext {
   /** Call the capability-checked karmax gateway under this turn's scoped token. */
   platformRequest?(method: string, path: string, body?: unknown): Promise<unknown>;
   /** Stream incremental output to the task's live event log. */
-  emit(text: string): void;
+  emit(text: string, source?: 'assistant' | 'tool'): void;
   /** Publish a structured provider item for the durable conversation timeline. */
   emitActivity(activity: AgentActivity): void;
   /** Called as soon as the provider session id is known (mid-turn), so the task can

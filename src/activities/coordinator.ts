@@ -1,3 +1,4 @@
+import { TimingTrace } from '../timing/index.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context } from '@temporalio/activity';
 import type { ProviderNativeDiagnostic } from '../agent/limits.js';
@@ -63,6 +64,7 @@ export interface CoordinatorActivityDeps {
   taskQueue: string;
   store?: {
     readonly hosted: boolean;
+    appendEvent?(event: import('../domain/types.js').KarmaxEvent): number;
     getSettings(scopeKey: string, workflow: string): Record<string, unknown> | undefined;
     getProject(projectId: string): { organizationId?: string } | undefined;
     getTask(taskId: string): { projectId: string } | undefined;
@@ -123,6 +125,11 @@ function agentQueueTarget(deps: CoordinatorActivityDeps,
  */
 export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
   const { client, taskQueue } = deps;
+  const timing = (taskId: string, turnId: string, name: string) => {
+    let workflowRunId: string | undefined;
+    try { workflowRunId = Context.current().info.workflowExecution?.runId; } catch { /* direct call */ }
+    new TimingTrace({ taskId, turnId, workflowRunId }, row => deps.store?.appendEvent?.({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } })).mark(name);
+  };
   return {
     /** Enqueue a task for the merge slot, creating the coordinator if needed. */
     async enqueueMerge(domain: string, taskId: string): Promise<void> {
@@ -224,6 +231,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       title?: string;
       projectId?: string;
     }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string; blocked?: boolean; queueId: string }> {
+      timing(item.taskId, item.turnId, 'queue.slot.requested');
       const target = agentQueueTarget(deps, item);
       await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
         workflowId: target.workflowId,
@@ -292,6 +300,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: AccountProvider,
       allowed?: string[],
     ): Promise<{ waiting: boolean; earliestResetAt?: number; detail?: string }> {
+      timing(taskId, turnId, 'queue.account.requested');
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,

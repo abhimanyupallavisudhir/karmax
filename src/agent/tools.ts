@@ -1,3 +1,4 @@
+import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
@@ -879,7 +880,7 @@ export function platformToolHandlers(
     if (!ctx.platformRequest) throw new Error('karmax gateway is unavailable to this agent');
     return ctx.platformRequest(method, requestPath, body);
   };
-  return {
+  const handlers: Record<string, (args: any) => Promise<string>> = {
     async bash(args) {
       const cmd = String(args?.command ?? '');
       const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000 });
@@ -1349,4 +1350,11 @@ export function platformToolHandlers(
       return `confirm decision recorded: ${action}`;
     },
   };
+  const trace = currentTiming();
+  return Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name,
+    (args: any) => {
+      const execute = () => timed(name === 'search_connection_tools' ? 'tool.discovery.managed' : 'tool.execution.platform',
+        () => handler(args), { operation: name });
+      return trace ? withTiming(trace, execute) : execute();
+    }]));
 }
