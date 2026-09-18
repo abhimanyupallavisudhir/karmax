@@ -31,7 +31,7 @@ function fn(name) {
       window.role = 'do'; window.count = 30; window.extra = 0;
       window.taskTabBody = () => `<div class="ck-layout"><div class="ck-side">Agents</div><div class="ck-pane"><div class="ck-thread" id="ck-thread" data-task-id="${S.view.taskId}" data-role="${role}"><div class="thread">${Array.from({ length: count }, (_, i) => `<div class="entry" data-conversation-key="${i}">${i === 0 ? 'Extra<br>'.repeat(extra) : ''}Message ${i}<details><summary>Details</summary><pre>Output</pre></details></div>`).join('')}</div></div></div></div>`;
     });
-    await page.addScriptTag({ content: ['captureConversationScroll', 'restoreConversationScroll', 'patchTaskPage', 'renderTaskPage'].map(fn).join('\n') });
+    await page.addScriptTag({ content: ['captureConversationScroll', 'restoreConversationScroll', 'patchTaskAncestors', 'patchTaskPage', 'renderTaskPage'].map(fn).join('\n') });
     const result = await page.evaluate(() => {
       renderTaskPage();
       const thread = document.getElementById('ck-thread');

@@ -7338,6 +7338,21 @@ function restoreConversationScroll(thread, state) {
 function patchTaskPage(main, html) {
   const template = document.createElement('template');
   template.innerHTML = html;
+  const oldParams = main.querySelector('#tp-params');
+  const newParams = template.content.querySelector('#tp-params');
+  if (oldParams && newParams && oldParams.dataset.renderKey === newParams.dataset.renderKey) {
+    const fields = schemaFor(S.view.workflow).filter((f) => f.scopes.includes('task') && (S.view.editableParams || []).includes(f.name));
+    const current = collectParamEdits(oldParams, fields);
+    const incoming = collectParamEdits(newParams, fields);
+    const draft = S.paramEditDrafts[S.view.taskId];
+    // Dirty fields belong to the local editor, including transient empty input
+    // that the stored-value serializer deliberately omits. Clean fields must
+    // still pick up changes from another operator or new server defaults.
+    if (fields.every((f) => isParamDraftField(draft, f.name) || sameJson(current[f.name], incoming[f.name]))) {
+      patchTaskAncestors(main, oldParams, newParams);
+      return false;
+    }
+  }
   const previous = main.querySelector('#ck-thread');
   const next = template.content.querySelector('#ck-thread');
   const same = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
@@ -7367,6 +7382,11 @@ function patchTaskPage(main, html) {
     cursor.remove();
     cursor = nextSibling;
   }
+  patchTaskAncestors(main, previous, next);
+  return true;
+}
+
+function patchTaskAncestors(main, previous, next) {
   // Walk both ancestor paths upward, replacing siblings without moving the
   // retained child. These wrappers contain layout only, with no event handlers.
   let oldChild = previous, newChild = next;
@@ -7379,7 +7399,6 @@ function patchTaskPage(main, html) {
     for (const node of siblings.slice(index + 1)) parent.appendChild(node);
     oldChild = parent; newChild = freshParent;
   }
-  return true;
 }
 
 function renderTaskPage() {
@@ -10164,7 +10183,11 @@ function paramsSection(v) {
     : `<div class="task-sub" style="color:var(--ink-3)">${terminal
       ? 'This task has finished. Parameters are read-only.'
       : 'Locked after queue — send a follow-up to change direction.'}</div>`;
-  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
+  // Identity and lifecycle/schema changes must replace the form. Ordinary task
+  // events retain the connected controls, preserving native editing state.
+  const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields, [...editable], inheritedAll,
+    fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec))]);
+  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields" data-render-key="${esc(renderKey)}">${rows}${footer}</div>`;
 }
 
 function isParamDraftField(draft, name) {
@@ -10277,6 +10300,8 @@ function wireParams(v) {
     return;
   }
   const root = document.getElementById('tp-params');
+  if (root?.paramsWired) return; // retained controls already own their handlers
+  if (root) root.paramsWired = true;
   if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
