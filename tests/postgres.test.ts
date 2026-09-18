@@ -5,6 +5,8 @@ import { Pool } from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { IdentityService } from '../src/auth/identity.js';
 import { openStore, Store } from '../src/store/db.js';
+import { openSqlDatabase } from '../src/store/sql.js';
+import { BudgetService, MockPaymentProvider } from '../src/autonomy/payments.js';
 
 const url = process.env.KARMAX_TEST_POSTGRES_URL;
 const integration = url ? describe : describe.skip;
@@ -15,6 +17,50 @@ integration('PostgreSQL cutover', () => {
     await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
   });
   afterAll(async () => { await admin?.end(); });
+
+  it('tracks transactions after multi-statement commits, comments and failed statements', () => {
+    const db = openSqlDatabase(url!);
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      db.exec('SELECT 1; COMMIT');
+      expect(db.inTransaction()).toBe(false);
+      db.exec('-- begin with a comment\nBEGIN; SELECT 1');
+      expect(db.inTransaction()).toBe(true);
+      expect(() => db.exec('SELECT * FROM missing_payment_table')).toThrow();
+      expect(db.inTransaction()).toBe(true);
+      db.exec('ROLLBACK');
+      expect(db.inTransaction()).toBe(false);
+      expect(() => db.exec('BEGIN; COMMIT; SELECT * FROM missing_payment_table')).toThrow();
+      expect(db.inTransaction()).toBe(false);
+    } finally { db.close(); }
+  });
+
+  it('locks payment accounting in a real transaction and preserves nested rollback', async () => {
+    const store = new Store(url!);
+    try {
+      expect(store.db.inTransaction()).toBe(false);
+      const project = store.createProject('Postgres payments');
+      const provider = new MockPaymentProvider(store);
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 10000 });
+      await provider.fund(card.id, 10000);
+      const task = store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 } } });
+      const service = new BudgetService(store, provider);
+      const ctx = { projectId: project.id, taskId: task.id };
+      const results = await Promise.all([service.request(ctx, { amount: 100, why: 'first' }),
+        service.request(ctx, { amount: 100, why: 'second' })]);
+      expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);
+      store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { cardIds: [card.id], budget: 200 } });
+      expect((await service.reconcileTask(ctx)).map(r => r.status)).toEqual(['granted']);
+      expect(store.paymentSpent(task.id)).toBe(200);
+      expect(store.db.inTransaction()).toBe(false);
+      store.db.exec('BEGIN');
+      store.paymentTransaction(() => store.updateCard(card.id, { available: 1 }));
+      expect(store.db.inTransaction()).toBe(true);
+      store.db.exec('ROLLBACK');
+      expect(store.getCard(card.id).available).toBe(9800);
+    } finally { store.close(); }
+  });
 
   it('patches task fields without replacing unrelated metadata or merging revoked grants', () => {
     const store = new Store(url!);
