@@ -1,0 +1,81 @@
+import { describe, expect, it, vi } from 'vitest';
+import { Context } from '@temporalio/activity';
+import { Store } from '../src/store/db.js';
+import { ProfileResolver } from '../src/agent/profiles.js';
+import { makeCoreActivities } from '../src/activities/core.js';
+import type { TaskView } from '../src/domain/types.js';
+
+describe('parking during agent admission', () => {
+  it.each([false, true])('publishes startup without checkpointing or parking (recovery handle: %s)', async recovery => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Admission');
+    const task = store.createTask({ projectId: project.id, title: 'Start', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const handle = { id: task.id, kind: 'e2b', root: '/workspace', branch: 'task', base: 'main' };
+    let parked = false;
+    const worlds = { get: () => ({ parkable: true }),
+      status: vi.fn(async () => parked ? 'parked' : 'ready'),
+      park: vi.fn(async () => { parked = true; return handle; }) };
+    const checkpoint = vi.fn(async () => { throw new Error('startup must not enter an expensive checkpoint'); });
+    const deps = { store, worlds: worlds as any, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') };
+    const core = makeCoreActivities({ ...deps, checkpoints: { checkpoint } as any });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'agentSlot', detail: 'Starting agent' }, messages: [], actions: [], updatedAt: 1,
+      state: recovery ? { recoveryWorld: handle } : {}, ...(recovery ? {} : { world: handle }) } as TaskView;
+    try {
+      await core.publishView(task.id, view);
+      expect(store.getTask(task.id)?.lastView?.waitingFor).toEqual(view.waitingFor);
+      expect(worlds.status).not.toHaveBeenCalled();
+      expect(worlds.park).not.toHaveBeenCalled();
+      expect(checkpoint).not.toHaveBeenCalled();
+
+      // Actual resource waits retain the cost-control behavior, including old
+      // workflow versions that expose their world only in recovery state.
+      const parking = makeCoreActivities(deps);
+      for (const waitingFor of [{ kind: 'agentSlot', detail: 'Waiting for host capacity to start agent' },
+        { kind: 'account', provider: 'codex' }, { kind: 'human', audience: ['@creator'] }]) {
+        parked = false;
+        await parking.publishView(task.id, { ...view, waitingFor } as TaskView);
+        expect(parked).toBe(true);
+      }
+      expect(worlds.park).toHaveBeenCalledTimes(3);
+    } finally { store.close(); }
+  });
+
+  it.each(['heartbeat', 'durable'])('heartbeats slow world setup with the %s retry session and clears its timer on failure', async source => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Slow setup');
+    const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const heartbeat = vi.fn();
+    const turnId = `${task.id}#1`;
+    store.kvSet(`turnsession:${turnId}`, 'prior-session');
+    const context = vi.spyOn(Context, 'current').mockReturnValue({ heartbeat,
+      cancellationSignal: new AbortController().signal,
+      info: { attempt: 2, workflowExecution: { runId: 'run', workflowId: task.id }, activityId: '1',
+        currentAttemptScheduledTimestampMs: Date.now(),
+        ...(source === 'heartbeat' ? { heartbeatDetails: { session: 'prior-session' } } : {}) },
+    } as any);
+    let rejectOpen!: (error: Error) => void;
+    const opening = new Promise<never>((_, reject) => { rejectOpen = reject; });
+    const worlds = { get: () => ({ capabilities: { remote: false } }), open: () => opening } as any;
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const run = core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: turnId, messages: [],
+        worldHandle: { id: task.id, kind: 'memory', root: '/workspace', branch: 'task', base: 'main' },
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'software-dev', agents: { do: { provider: 'mock' } } },
+      } as any);
+      const failed = expect(run).rejects.toThrow('setup unavailable');
+      await vi.advanceTimersByTimeAsync(130_000);
+      expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(130);
+      expect(heartbeat.mock.calls.every(([details]) => details?.session === 'prior-session')).toBe(true);
+      rejectOpen(new Error('setup unavailable'));
+      await failed;
+      const beats = heartbeat.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(heartbeat).toHaveBeenCalledTimes(beats);
+    } finally { vi.useRealTimers(); context.mockRestore(); store.close(); }
+  });
+});
