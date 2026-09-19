@@ -91,6 +91,40 @@ describe('CodexAppServerClient', () => {
     await expect(p).rejects.toThrow(/closed/);
   });
 
+  it('receives a large fragmented response without starving the control plane', async () => {
+    const { client, stdout } = harness();
+    const pending = client.request('thread/resume', {});
+    const content = 'x'.repeat(32 * 1024 * 1024);
+    const wire = JSON.stringify({ id: 1, result: { content } }) + '\n';
+    const started = performance.now();
+    for (let offset = 0; offset < wire.length; offset += 4096)
+      stdout.write(wire.slice(offset, offset + 4096));
+    expect((await pending).content).toBe(content);
+    // Generous for a ~100ms linear parse, but catches the former multi-second
+    // repeated copy/scan that blocked health checks and cloud keep-alives.
+    expect(performance.now() - started).toBeLessThan(2000);
+    client.close();
+  });
+
+  it('preserves UTF-8 characters split across stdout buffers', () => {
+    const { client, stdout } = harness();
+    const got: any[] = [];
+    client.onNotification((_method, params) => got.push(params));
+    const wire = Buffer.from(JSON.stringify({ method: 'message', params: 'हैलो 🌍' }) + '\n');
+    for (const byte of wire) stdout.write(Buffer.from([byte]));
+    expect(got).toEqual(['हैलो 🌍']);
+    client.close();
+  });
+
+  it('ignores late output and the rest of a batch after closing', () => {
+    const { client, stdout } = harness();
+    const got: string[] = [];
+    client.onNotification((method) => { got.push(method); client.close(); });
+    stdout.write('{"method":"first"}\n{"method":"second"}\n');
+    stdout.write('{"method":"late"}\n');
+    expect(got).toEqual(['first']);
+  });
+
   it('turns an asynchronous stdin EPIPE into a request rejection instead of an uncaught process error', async () => {
     const stdout = new PassThrough();
     const stdin = new PassThrough();

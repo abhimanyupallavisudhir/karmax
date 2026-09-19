@@ -894,9 +894,10 @@ export class Gateway {
       this.enqueueGitPassAutoSync(organizationId, async () => {
         const { defaultConnectors } = await import('../autonomy/connectors.js');
         const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId);
-        await defaultConnectors(this.deps.store, vault, this.deps.broker, organizationId,
-          { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
-          .autoSync('pass-git', 'backstop');
+        const connectors = defaultConnectors(this.deps.store, vault, this.deps.broker, organizationId,
+          { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp });
+        await connectors.retryWrites({dueOnly:true});
+        await connectors.autoSync('pass-git', 'backstop');
       });
     }
   }
@@ -6081,9 +6082,25 @@ export class Gateway {
                 });
                 return this.json(res, 200, config);
               }
+              if (connName[1] === 'pass-git') {
+                if (action === 'check') {
+                  const secret = connectors.secretFor('pass-git');
+                  if (!secret) throw new Error('Connect a password store first');
+                  return this.json(res, 200, await connectors.get('pass-git')!.validateSecret!(secret));
+                }
+                if (action === 'catalog') {
+                  const { GitPassConnector } = await import('../autonomy/connectors.js');
+                  const connector = connectors.get('pass-git');
+                  if (connector instanceof GitPassConnector) return this.json(res, 200, await connector.catalog());
+                }
+                if (action === 'retry-write-back') return this.json(res, 200, await connectors.retryWriteBack(String(b.itemId ?? '')) ?? { skipped: 'write-back disabled' });
+                if (action === 'accept-remote') return this.json(res, 200, await connectors.acceptRemote(String(b.itemId ?? '')));
+              }
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
               if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
                 { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
+              if (action === 'discard-writes') return this.json(res, 200, {discarded:connectors.discardWrites(connName[1]!)});
+              if (action === 'retry-writes') return this.json(res, 200, await connectors.retryWrites({connector:connName[1]!}));
               if (action === 'write-back') return this.json(res, 200, (await connectors.writeBack(connName[1]!, String(b.itemId ?? ''))) ?? { skipped: 'write-back disabled for this connector' });
             } catch (e) {
               return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
@@ -6117,7 +6134,12 @@ export class Gateway {
                 secrets: { passkey: JSON.stringify(creds) },
                 provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
               });
-              return this.json(res, 200, { itemId: saved.id, label: saved.label, count: creds.length });
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              const writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+                {hostLocal:this.hostLocal,hosted:this.deps.hosted,githubApp:this.deps.githubApp}).writeBackCreated(saved.id);
+              for (const result of writeBack) store.appendAudit({principalId:callerTaskId ? `task:${callerTaskId}` : principal,
+                action:result.error ? 'vault.write_back.failed' : 'vault.write_back',detail:{itemId:saved.id,...result}});
+              return this.json(res, 200, { itemId: saved.id, label: saved.label, count: creds.length, ...(writeBack.length ? {writeBack} : {}) });
             }
             if (p === '/api/vault/passkey/login' && method === 'POST') {
               if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no passkey item — enroll one first' });

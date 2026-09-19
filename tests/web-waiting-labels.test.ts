@@ -97,6 +97,18 @@ describe('waiting labels in task summaries', () => {
     })).toBe('landing');
   });
 
+  it.each([
+    'GitHub Actions action required',
+    'GitHub Actions failure needs inspection',
+    'GitHub Actions inspection unavailable',
+  ])('preserves the structured status %s despite misleading diagnostic text', (summary) => {
+    const detail = 'tests/billing.test.ts: expected "recent account payments have failed"; requires approval';
+    expect(waitingText({ kind: 'human', summary, detail })).toBe(summary);
+    expect(stageLabel({ stage: 'merge', status: 'waiting', state: {},
+      waitingFor: { kind: 'human', summary, detail } })).toBe(summary);
+    expect(waitingText({ kind: 'human', detail })).toBe('Needs input');
+  });
+
   it('projects verbose workflow details to short wait labels', () => {
     expect(waitingText({
       kind: 'agentSlot',

@@ -1,6 +1,6 @@
 import { platformToolHandlers } from '../src/agent/tools.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -2034,13 +2034,15 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     fs.writeFileSync(fakePass, `#!/bin/sh
 case "$1" in
   show) cat "$KARMAX_TEST_PASS_ENTRY" ;;
-  insert) cat > "$KARMAX_TEST_PASS_ENTRY" ;;
+  insert) cat > "$KARMAX_TEST_PASS_ENTRY"; mkdir -p "$PASSWORD_STORE_DIR"; touch "$PASSWORD_STORE_DIR/export.gpg" ;;
   *) exit 1 ;;
 esac
 `);
     fs.chmodSync(fakePass, 0o755);
     const previousPath = process.env.PATH;
     const previousEntry = process.env.KARMAX_TEST_PASS_ENTRY;
+    const previousStore = process.env.PASSWORD_STORE_DIR;
+    process.env.PASSWORD_STORE_DIR = fakeHome;
     process.env.PATH = `${fakeHome}${path.delimiter}${previousPath ?? ''}`;
     process.env.KARMAX_TEST_PASS_ENTRY = entryFile;
     try {
@@ -2068,7 +2070,7 @@ esac
         }),
       })).json();
       expect(created.writeBack).toEqual([
-        { connector: 'pass', externalId: 'karmax/Agent-created-pass-rotation' },
+        { connector: 'pass', externalId: `karmax/${created.id}.login` },
       ]);
       expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\nusername: agent@example.com\n');
 
@@ -2089,6 +2091,20 @@ esac
       expect(fs.readFileSync(entryFile, 'utf8')).toBe(
         'rotated\nusername: agent@example.com\nkeep this note\n',
       );
+      const { PasskeyManager } = await import('../src/autonomy/passkey.js');
+      const { parsePassItem } = await import('../src/autonomy/pass-format.js');
+      const credentials = [{ credentialId: 'test-id', privateKey: 'test-key', rpId: 'example.com', userHandle: 'test-user', signCount: 0 }];
+      const harvest = vi.spyOn(PasskeyManager.prototype, 'harvest').mockResolvedValue(credentials);
+      try {
+        const response = await fetch(`${base}/api/vault/passkey/save`, {
+          method: 'POST', headers: agentAuth, body: JSON.stringify({authenticatorId:'test',label:'Enrolled passkey'}),
+        });
+        expect(response.status).toBe(200);
+        const saved: any = await response.json();
+        expect(saved.writeBack).toEqual([{connector:'pass',externalId:`karmax/${saved.itemId}.passkey`}]);
+        expect(parsePassItem(fs.readFileSync(entryFile,'utf8')).secrets.passkey).toBe(JSON.stringify(credentials));
+      } finally { harvest.mockRestore(); }
+
     } finally {
       await fetch(`${base}/api/vault/connectors/pass/config`, {
         method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: false }),
@@ -2097,6 +2113,8 @@ esac
       else process.env.PATH = previousPath;
       if (previousEntry === undefined) delete process.env.KARMAX_TEST_PASS_ENTRY;
       else process.env.KARMAX_TEST_PASS_ENTRY = previousEntry;
+      if (previousStore === undefined) delete process.env.PASSWORD_STORE_DIR;
+      else process.env.PASSWORD_STORE_DIR=previousStore;
       fs.rmSync(fakeHome, { recursive: true, force: true });
     }
   });
@@ -2106,6 +2124,16 @@ esac
     expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass', 'pass-git']);
     // In CI none of the CLIs are configured, so each reports a clear reason.
     for (const c of conns) { expect(typeof c.available).toBe('boolean'); expect(c.detail).toBeTruthy(); }
+  });
+
+  it('requires connector administration for retrying or discarding pending writes', async () => {
+    const reader=h.tokens.mint({taskId:'task_retry_reader',profileId:'do',principal:'user:test',ceiling:['credential:read'],grantorCaps:['credential:read']});
+    for(const action of ['retry-writes','discard-writes']){
+      const denied=await fetch(`${base}/api/vault/connectors/pass-git/${action}`,{method:'POST',headers:{authorization:`Bearer ${reader.token}`,'content-type':'application/json'},body:'{}'});
+      expect(denied.status).toBe(403);
+      const allowed=await fetch(`${base}/api/vault/connectors/pass-git/${action}`,{method:'POST',headers:auth(),body:'{}'});
+      expect(allowed.status).toBe(200);
+    }
   });
 
   it('agent mailbox: per-org address, shared-secret ingest, reads, and tenant isolation', async () => {

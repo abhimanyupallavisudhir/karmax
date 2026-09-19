@@ -108,7 +108,7 @@ describe('1Password connector', () => {
     'op whoami': '{"user_uuid":"x"}',
     'op item list': JSON.stringify([{ id: 'op1', title: 'GH', category: 'LOGIN', urls: [{ href: 'https://github.com' }] }]),
     'op item get op1': JSON.stringify({ id: 'op1', title: 'GH', category: 'LOGIN', urls: [{ href: 'https://github.com' }],
-      fields: [{ id: 'username', value: 'octo' }, { id: 'password', value: 'sw0rd' }, { id: 'otp', type: 'OTP', totp: '123456' }] }),
+      fields: [{ id: 'username', value: 'octo' }, { id: 'password', value: 'sw0rd' }, { id: 'otp', type: 'OTP', value: 'JBSWY3DPEHPK3PXP', totp: '123456' }] }),
   });
   it('lists and pulls a login with its OTP', async () => {
     const c = new OnePasswordConnector(() => 'tok', exec);
@@ -116,7 +116,7 @@ describe('1Password connector', () => {
     expect((await c.list())[0]!.type).toBe('login');
     const [pulled] = (await c.pull(['op1'])).items;
     expect(pulled!.username).toBe('octo');
-    expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: '123456' });
+    expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: 'JBSWY3DPEHPK3PXP' });
   });
 
   it('does not connect without a service-account token', async () => {
@@ -925,8 +925,9 @@ describe('pass notes preservation and migration', () => {
     const connector = new PassConnector(async (cmd, args, opts) => {
       if (args[0] === 'show') return 'pw\nold notes\n';
       writes.push(opts!.input!);
+      if (args[0] === 'insert' && args[2] === 'export') fs.writeFileSync(path.join(opts!.env!.PASSWORD_STORE_DIR!, 'export.gpg'),'test ciphertext');
       return '';
-    });
+    }, fs.mkdtempSync(path.join(os.tmpdir(),'pass-notes-')));
     const note = 'Username: administrator\r\n  extra  ';
     await connector.updateSecret('vps', 'note', note);
     await connector.push({ externalId: '', type: 'login', label: 'VPS', domains: [],
@@ -1038,4 +1039,390 @@ it('keeps the active connector secret unchanged while a replacement is being val
   rejectCandidate(new Error('invalid candidate'));
   await rejected;
   expect(service.secretFor('candidate')).toBe('working');
+});
+
+
+describe('connector export and propagation regressions', () => {
+  it('exposes creation separately from field updates', async () => {
+    const { store, items, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => undefined));
+    connectors.register(new OnePasswordConnector(() => undefined));
+    connectors.register(new OnePasswordSdkConnector(() => undefined));
+    for (const info of await connectors.describe()) {
+      expect(info.canPush).toBe(false);
+      expect(info.canUpdate).toBe(true);
+    }
+  });
+  it('reports unsupported creation instead of silently skipping an enabled connector', async () => {
+    const { store, items, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => undefined));
+    connectors.setConfig('bitwarden', { writeBack: true });
+    const item = items.save({ type: 'note', label: 'note', secrets: { note: 'synthetic' } });
+    expect(await connectors.writeBackCreated(item.id)).toEqual([
+      expect.objectContaining({ connector: 'bitwarden', error: expect.any(String) }),
+    ]);
+  });
+  it('imports 1Password CLI notes, SSH keys and source TOTP seeds', async () => {
+    const c = new OnePasswordConnector(
+      () => 'token',
+      async (_cmd, args) =>
+        JSON.stringify(
+          args.includes('note')
+            ? { category: 'SECURE_NOTE', fields: [{ id: 'notesPlain', type: 'STRING', purpose: 'NOTES', value: 'note text' }] }
+            : args.includes('ssh')
+              ? { category: 'SSH_KEY', fields: [{ id: 'private_key', value: 'private key' }] }
+              : {
+                  category: 'LOGIN',
+                  fields: [
+                    { id: 'password', value: 'pw' },
+                    { id: 'notesPlain', type: 'STRING', purpose: 'NOTES', value: 'login note' },
+                    { id: 'otp', type: 'OTP', value: 'otpauth://totp/example?secret=JBSWY3DPEHPK3PXP', totp: '123456' },
+                  ],
+                },
+        ),
+    );
+    const result = await c.pull(['note', 'ssh', 'login']);
+    expect(result.items.map((x) => x.secrets)).toEqual([
+      { note: 'note text' },
+      { privateKey: 'private key' },
+      { password: 'pw', note: 'login note', totp: 'otpauth://totp/example?secret=JBSWY3DPEHPK3PXP' },
+    ]);
+  });
+  it('attempts other fields and stores after a failed rotation, persists and retries only failed work', async () => {
+    const { store, items, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    const calls: string[] = [];
+    let fail = true;
+    for (const name of ['a', 'b']) {
+      connectors.register({
+        name,
+        describe: async () => ({ name, label: name, available: true, detail: '', canPush: true }),
+        list: async () => [],
+        pull: async () => ({ items: [], failures: [] }),
+        push: async () => ({ externalId: name }),
+        updateSecret: async (_id, field) => {
+          calls.push(name + ':' + field);
+          if (name === 'a' && field === 'password' && fail) throw new Error('offline');
+        },
+      });
+      connectors.setConfig(name, { writeBack: true });
+    }
+    const item = items.save({ type: 'login', label: 'login', secrets: { password: 'pw', note: 'note' } });
+    await connectors.writeBackCreated(item.id);
+    const result = await connectors.propagate(item.id, ['password', 'note']);
+    expect(calls).toEqual(['a:password', 'a:note', 'b:password', 'b:note']);
+    expect(result?.error).toBeTruthy();
+    expect(connectors.pendingWrites()).toHaveLength(1);
+    const fresh = new Connectors(store, items, broker);
+    for (const name of ['a', 'b']) fresh.register(connectors.get(name)!);
+    fail = false;
+    calls.length = 0;
+    await fresh.retryWrites();
+    expect(calls).toEqual(['a:password']);
+    expect(fresh.pendingWrites()).toEqual([]);
+  });
+});
+
+describe('durable connector outbox', () => {
+  it('protects a failed local rotation from stale imports and respects disabled write-back', async () => {
+    const { store, items, broker } = makeVault();
+    const service = new Connectors(store, items, broker);
+    let fail = true;
+    let value = 'old';
+    service.register({
+      name: 'source',
+      describe: async () => ({ name: 'source', label: 'source', available: true, detail: '', canPush: false }),
+      list: async () => [{ externalId: 'id', type: 'login', label: 'login', fields: ['password'] }],
+      pull: async () => ({
+        items: [
+          { externalId: 'id', type: 'login', label: 'login', fields: ['password'], secrets: { password: value } },
+        ],
+        failures: [],
+      }),
+      updateSecret: async (_id, _field, next) => {
+        if (fail) throw new Error('secret must never persist: ' + next);
+        value = next;
+      },
+    });
+    const imported = await service.sync('source', ['id'], { writeBack: true });
+    const id = imported.itemIds[0]!;
+    items.save({ id, type: 'login', secrets: { password: 'new-secret' } });
+    expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
+    expect(JSON.stringify(service.pendingWrites())).not.toContain('new-secret');
+    expect((await service.sync('source', ['id'])).count).toBe(0);
+    expect(items.readSecret(items.get(id)!, 'password')).toBe('new-secret');
+    service.setConfig('source', { writeBack: false });
+    fail = false;
+    await service.retryWrites();
+    expect(value).toBe('old');
+    service.setConfig('source', { writeBack: true });
+    await service.retryWrites();
+    expect(value).toBe('new-secret');
+    expect(service.pendingWrites()).toEqual([]);
+  });
+  it('does not lose a newer rotation while an older write is in flight', async () => {
+    const { store, items, broker } = makeVault();
+    const service = new Connectors(store, items, broker);
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => (start = resolve));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const values: string[] = [];
+    service.register({
+      name: 'source',
+      describe: async () => ({ name: 'source', label: 'source', available: true, detail: '', canPush: true }),
+      list: async () => [],
+      pull: async () => ({ items: [], failures: [] }),
+      push: async () => ({ externalId: 'id' }),
+      updateSecret: async (_id, _field, value) => {
+        values.push(value);
+        if (value === 'first') {
+          start();
+          await gate;
+        }
+      },
+    });
+    service.setConfig('source', { writeBack: true });
+    const item = items.save({ type: 'login', label: 'login', secrets: { password: 'first' } });
+    await service.writeBackCreated(item.id);
+    const first = service.propagate(item.id, ['password']);
+    await started;
+    items.save({ id: item.id, type: 'login', secrets: { password: 'second' } });
+    const second = service.propagate(item.id, ['password']);
+    release();
+    await Promise.all([first, second]);
+    expect(values).toEqual(['first', 'second']);
+    expect(service.pendingWrites()).toEqual([]);
+  });
+  it('cannot send queued writes to a replacement connection', async () => {
+    const { store, items, broker } = makeVault();
+    const service = new Connectors(store, items, broker);
+    let writes = 0;
+    service.register({
+      name: 'source',
+      describe: async () => ({ name: 'source', label: 'source', available: true, detail: '', canPush: true }),
+      list: async () => [],
+      pull: async () => ({ items: [], failures: [] }),
+      push: async () => {
+        writes++;
+        throw new Error('offline');
+      },
+    });
+    await service.connect('source', 'first-account');
+    service.setConfig('source', { writeBack: true });
+    const item = items.save({ type: 'note', label: 'note', secrets: { note: 'sensitive' } });
+    await service.writeBackCreated(item.id);
+    await service.connect('source', 'second-account');
+    expect((await service.retryWrites())[0]?.error).toMatch(/store changed/);
+    expect(writes).toBe(1);
+  });
+});
+
+it('publishes local pass ciphertext exclusively when another writer wins the name', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pass-exclusive-'));
+  try {
+    fs.writeFileSync(path.join(root, '.gpg-id'), 'test recipient');
+    const c = new PassConnector(async (_cmd, args, opts) => {
+      expect(args).toEqual(['insert', '-m', 'export']);
+      fs.writeFileSync(path.join(opts!.env!.PASSWORD_STORE_DIR!, 'export.gpg'), 'our ciphertext');
+      fs.writeFileSync(path.join(root, 'karmax', 'same.gpg'), 'other ciphertext');
+      return '';
+    }, root);
+    await expect(
+      c.push({ externalId: 'karmax/same', type: 'note', label: 'same', fields: ['note'], secrets: { note: 'ours' } }),
+    ).rejects.toThrow();
+    expect(fs.readFileSync(path.join(root, 'karmax', 'same.gpg'), 'utf8')).toBe('other ciphertext');
+    expect(fs.readdirSync(path.join(root, 'karmax'))).toEqual(['same.gpg']);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('uses field assignments for 1Password edits instead of destructive JSON templates', async () => {
+  const writes: any[] = [];
+  const c = new OnePasswordConnector(
+    () => 'token',
+    async (_cmd, args, opts) => {
+      writes.push({ args, opts });
+      return '{}';
+    },
+  );
+  await c.updateSecret('id', 'privateKey', 'synthetic-key');
+  expect(writes[0].args).toEqual(['item', 'edit', 'id', 'private_key=synthetic-key']);
+  expect(writes[0].opts.input).toBeUndefined();
+});
+
+it('does not let an in-flight stale import undo a completed rotation', async () => {
+  const { store, items, broker } = makeVault();
+  const service = new Connectors(store, items, broker);
+  let value = 'old';
+  let wait = false;
+  let started!: () => void;
+  const reading = new Promise<void>((resolve) => (started = resolve));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  service.register({
+    name: 'source',
+    describe: async () => ({ name: 'source', label: 'source', available: true, detail: '', canPush: false }),
+    list: async () => [{ externalId: 'id', type: 'login', label: 'login', fields: ['password'] }],
+    pull: async () => {
+      const snapshot = value;
+      if (wait) {
+        started();
+        await gate;
+      }
+      return {
+        items: [
+          { externalId: 'id', type: 'login', label: 'login', fields: ['password'], secrets: { password: snapshot } },
+        ],
+        failures: [],
+      };
+    },
+    updateSecret: async (_id, _field, next) => {
+      value = next;
+    },
+  });
+  const imported = await service.sync('source', ['id'], { writeBack: true });
+  const id = imported.itemIds[0]!;
+  wait = true;
+  const syncing = service.sync('source', ['id']);
+  await reading;
+  const oldVersion = items.get(id)!.updatedAt;
+  items.save({ id, type: 'login', secrets: { password: 'new' } });
+  expect(items.get(id)!.updatedAt).toBeGreaterThan(oldVersion);
+  await service.propagate(id, ['password']);
+  expect(service.pendingWrites()).toEqual([]);
+  release();
+  expect((await syncing).skipped).toBe(1);
+  expect(items.readSecret(items.get(id)!, 'password')).toBe('new');
+});
+
+it('does not resurrect a dismissed write when an in-flight attempt fails', async () => {
+  const { store, items, broker } = makeVault();
+  const service = new Connectors(store, items, broker);
+  let started!: () => void;
+  const writing = new Promise<void>((resolve) => (started = resolve));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  service.register({
+    name: 'source',
+    describe: async () => ({ name: 'source', label: 'source', available: true, detail: '', canPush: true }),
+    list: async () => [],
+    pull: async () => ({ items: [], failures: [] }),
+    push: async () => {
+      started();
+      await gate;
+      throw new Error('offline');
+    },
+  });
+  service.setConfig('source', { writeBack: true });
+  const item = items.save({ type: 'note', label: 'note', secrets: { note: 'secret' } });
+  const attempt = service.writeBackCreated(item.id);
+  await writing;
+  const handle = service.pendingWrites()[0]!.snapshotHandle!;
+  expect(service.discardWrites('source')).toBe(1);
+  release();
+  await attempt;
+  expect(service.pendingWrites()).toEqual([]);
+  expect(broker.hasHandle(handle)).toBe(false);
+  expect(items.readSecret(items.get(item.id)!, 'note')).toBe('secret');
+});
+
+it('deletes pending export snapshots with the vault item even while retries are disabled', async () => {
+  const {store,items,broker}=makeVault();const service=new Connectors(store,items,broker);
+  service.register({name:'source',describe:async()=>({name:'source',label:'source',available:true,detail:'',canPush:true}),list:async()=>[],pull:async()=>({items:[],failures:[]}),push:async()=>{throw new Error('offline');}});
+  service.setConfig('source',{writeBack:true});
+  const item=items.save({type:'note',label:'note',secrets:{note:'secret'}});
+  await service.writeBackCreated(item.id);
+  const handle=service.pendingWrites()[0]!.snapshotHandle!;
+  expect(broker.hasHandle(handle)).toBe(true);
+  const status=(await service.describe())[0]!.pendingWrites[0]!;
+  expect(status).not.toHaveProperty('snapshotHandle');
+  expect(status).not.toHaveProperty('target');
+  service.setConfig('source',{writeBack:false});
+  items.delete(item.id);
+  expect(service.pendingWrites()).toEqual([]);
+  expect(broker.hasHandle(handle)).toBe(false);
+});
+
+it('queues Git rotations before remote revision lookup and respects dismissal during lookup', async () => {
+  const { items, store, broker } = makeVault();
+  const service = new Connectors(store, items, broker);
+  const connector = new GitPassConnector(() => service.secretFor('pass-git'));
+  connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
+  service.register(connector);
+  await service.connect('pass-git', JSON.stringify({ repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test' }));
+  service.setConfig('pass-git', { writeBack: true });
+  const item = items.save({ type: 'login', label: 'Entry', secrets: { password: 'local' },
+    provenance: { source: 'connector:pass-git', externalId: 'entry' } });
+  connector.catalog = async () => { throw new Error('transport unavailable'); };
+  expect((await service.propagate(item.id, ['password']))?.error).toBeTruthy();
+  expect(service.discardWrites('pass-git')).toBe(1);
+  let updates = 0;
+  connector.updateSecrets = async () => { updates++; };
+  connector.catalog = async () => {
+    expect(service.discardWrites('pass-git')).toBe(1);
+    return { items: [{ externalId: 'entry', type: 'login', label: 'Entry', fields: ['password'], revision: 'rev' }], failures: [] };
+  };
+  await service.propagate(item.id, ['password']);
+  expect(updates).toBe(0);
+  expect(service.discardWrites('pass-git')).toBe(0);
+});
+
+describe.each(['LOGIN', 'SECURE_NOTE'])('1Password CLI %s notes', (category) => {
+  it.each([
+    { name: 'legacy content', fields: [], legacy: 'legacy note', expected: 'legacy note' },
+    { name: 'legacy empty note', fields: [], legacy: '', expected: '' },
+    { name: 'CLI 2 takes precedence', fields: [{ id: 'notesPlain', value: 'current' }], legacy: 'old', expected: 'current' },
+    { name: 'CLI 2 empty note takes precedence', fields: [{ id: 'notesPlain', value: '' }], legacy: 'old', expected: '' },
+    { name: 'cleared CLI 2 field does not restore legacy content', fields: [{ id: 'notesPlain' }], legacy: 'old', expected: undefined },
+    { name: 'absent note', fields: [], legacy: undefined, expected: undefined },
+  ])('$name', async ({ fields, legacy, expected }) => {
+    const connector = new OnePasswordConnector(() => 'token', async () => JSON.stringify({
+      category, notesPlain: legacy,
+      fields: fields.map(field => ({ type: 'STRING', purpose: 'NOTES', label: 'notesPlain', ...field })),
+    }));
+    const result = await connector.pull(['entry']);
+    expect(result.failures).toEqual([]);
+    expect(result.items[0]!.secrets).toEqual(expected === undefined ? {} : { note: expected });
+    expect(result.items[0]!.fields).toEqual(expected === undefined ? [] : ['note']);
+  });
+
+  it('preserves and updates a mirrored note, including explicit empty and deleted source fields', async () => {
+    const { store, items, broker } = makeVault();
+    const service = new Connectors(store, items, broker);
+    const type = category === 'LOGIN' ? 'login' : 'note';
+    const password = type === 'login' ? { password: 'synthetic-password' } : {};
+    const original = 'first line\r\nsecond line\n';
+    const item = items.save({ type, label: 'Entry', secrets: { ...password, note: original },
+      provenance: { source: 'connector:1password', externalId: 'entry' } });
+    let value: string | undefined = original;
+    let present = true;
+    service.register(new OnePasswordConnector(() => 'token', async (_command, args) => JSON.stringify(
+      args[1] === 'list' ? [{ id: 'entry', title: 'Entry', category }] : {
+        id: 'entry', title: 'Entry', category,
+        fields: [
+          ...(type === 'login' ? [{ id: 'password', type: 'CONCEALED', purpose: 'PASSWORD', value: password.password }] : []),
+          ...(present ? [{ id: 'notesPlain', type: 'STRING', purpose: 'NOTES', label: 'notesPlain', value }] : []),
+        ],
+      },
+    )));
+    for (const next of [original, 'updated\n  note  ', '', undefined]) {
+      value = next;
+      const result = await service.sync('1password', ['entry']);
+      expect(result).toMatchObject({ count: 1, itemIds: [item.id], failures: [] });
+      const saved = items.get(item.id)!;
+      expect(items.readSecret(saved, 'note')).toBe(next);
+      expect(saved.fields.includes('note')).toBe(next !== undefined);
+      if (type === 'login') expect(items.readSecret(saved, 'password')).toBe(password.password);
+    }
+    // Removing the source field entirely must also remove an existing mirror value.
+    items.save({ id: item.id, type, secrets: { note: 'local old note' } });
+    present = false;
+    expect((await service.sync('1password', ['entry'])).count).toBe(1);
+    expect(items.get(item.id)!.fields).not.toContain('note');
+    expect(items.readSecret(items.get(item.id)!, 'note')).toBeUndefined();
+  });
 });

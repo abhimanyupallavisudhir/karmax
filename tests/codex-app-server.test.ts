@@ -166,6 +166,7 @@ describe('CodexAdapter app-server security policy', () => {
     const requests = await run('11111111-1111-4111-8111-111111111111');
     expect(requests.find((r) => r.method === 'thread/resume')?.params).toMatchObject({
       threadId: '11111111-1111-4111-8111-111111111111',
+      excludeTurns: true,
       sandbox: 'danger-full-access',
       approvalPolicy: 'never',
     });
@@ -179,6 +180,7 @@ describe('CodexAdapter app-server security policy', () => {
     const requests = await run('11111111-1111-4111-8111-111111111111', undefined, true);
     expect(requests.find((r) => r.method === 'thread/fork')?.params).toMatchObject({
       threadId: '11111111-1111-4111-8111-111111111111', sandbox: 'danger-full-access', approvalPolicy: 'never',
+      excludeTurns: true,
     });
     expect(requests.some((r) => r.method === 'thread/resume')).toBe(false);
     expect(requests.find((r) => r.method === 'turn/start')?.params.threadId).toBe('thread-forked');

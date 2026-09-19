@@ -138,3 +138,43 @@ prove the absence of vulnerabilities.
 
 The broad run was not one uninterrupted green suite. Use the commands above to
 reproduce the relevant checks; preserve per-run results and explicit skips.
+
+## Daytona
+
+Unit and SDK-contract regressions (no account or cloud credit required):
+
+```bash
+npx vitest run tests/daytona-world.test.ts tests/daytona-sdk.test.ts tests/provision-git.test.ts
+```
+
+With `DAYTONA_API_KEY` supplied securely in the environment, run these sequentially:
+
+```bash
+npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts
+KARMAX_DAYTONA_LIVE_BUILD=1 npx vitest run tests/daytona-environment-live.test.ts
+KARMAX_DAYTONA_LIVE_WORKFLOW=1 npx vitest run tests/daytona-workflow-live.test.ts
+KARMAX_MCP_LIVE_WORLD=daytona npx vitest run tests/mcp-deployment.test.ts
+```
+
+These create billable sandboxes and delete their own resources in `finally`.
+Use a dedicated `KARMAX_HOME` to isolate their sandbox ownership labels. The
+workflow test boots its own real Temporal server and uses a deterministic mock
+model; it does not connect to a running Karmax service. The lifecycle suite also
+initializes the actual native Codex app-server over a remote PTY, without a model
+call. Coverage includes the API-key-only default, repository provisioning and
+credential cleanup, files/stdin, background processes, terminals, signed HTTP
+previews, desktop viewers, archive/cold restore, MCP credential scope and cleanup,
+image sizing, and building/using a setup snapshot.
+
+Daytona snapshots carry their own CPU/memory allocation; overrides apply to OCI
+image creation. The adapter reports differing snapshot allocation in world
+warnings instead of sending an invalid resource override. Custom network rules
+require an eligible Daytona account tier. On lower tiers, the network test checks
+an actionable rejection and absence of leaked sandboxes; it does not claim to
+have verified allowlist enforcement. The other live tests use unrestricted
+sandbox networking, still subject to Daytona account-level restrictions.
+
+The setup-snapshot build test needs `write:snapshots` and `delete:snapshots` on
+the Daytona API key and an explicit `KARMAX_DAYTONA_LIVE_BUILD=1`. Sandbox-only
+keys can exercise every other live test. Missing snapshot permission is tested
+as an actionable error at the SDK boundary.

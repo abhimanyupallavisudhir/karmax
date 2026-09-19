@@ -16,27 +16,35 @@ const DEFAULT_IDLE_MS = 10 * 60_000;
 export interface DaytonaSandboxLike {
   id: string;
   state?: string;
+  cpu?: number;
+  memory?: number;
+  gpu?: number;
+  waitUntilStarted?(timeout?: number): Promise<void>;
+  waitUntilStopped?(timeout?: number): Promise<void>;
   process: {
     executeCommand(command: string, cwd?: string, env?: Record<string, string>, timeoutSeconds?: number): Promise<any>;
     createSession?(id: string): Promise<void>;
-    executeSessionCommand?(id: string, request: { command: string; async?: boolean; runAsync?: boolean }): Promise<any>;
+    executeSessionCommand?(id: string, request: { command: string; runAsync?: boolean }): Promise<any>;
     getSessionCommand?(id: string, commandId: string): Promise<any>;
     getSessionCommandLogs?(id: string, commandId: string, onStdout?: (chunk: string) => void,
       onStderr?: (chunk: string) => void): Promise<any>;
     deleteSession?(id: string): Promise<void>;
-    createPty(options: Record<string, unknown>): Promise<any>;
+    createPty(options: { id: string; cwd?: string; envs?: Record<string, string>; cols?: number; rows?: number;
+      onData: (data: Uint8Array) => void }): Promise<any>;
   };
   fs: {
     downloadFile(remotePath: string): Promise<Buffer>;
     uploadFile(value: Buffer, remotePath: string): Promise<void>;
   };
-  getUserHomeDir(): Promise<string>;
+  getUserHomeDir(): Promise<string | undefined>;
   getSignedPreviewUrl(port: number, expiresInSeconds?: number): Promise<{ url: string; token?: string }>;
   computerUse?: { start(): Promise<unknown>; getStatus?(): Promise<unknown> };
   refreshData?(): Promise<void>;
+  updateNetworkSettings?(settings: { networkBlockAll?: boolean; domainAllowList?: string; networkAllowList?: string }): Promise<void>;
   labels?: Record<string, string>;
   /** Re-arm the auto-stop countdown. Present in current SDKs; when absent the
    * keep-alive falls back to a no-op command (which is sandbox activity). */
+  refreshActivity?(): Promise<void>;
   setAutostopInterval?(minutes: number): Promise<unknown>;
   start(timeoutSeconds?: number): Promise<void>;
   stop(timeoutSeconds?: number, force?: boolean): Promise<void>;
@@ -78,11 +86,12 @@ export class DaytonaWorldProvider implements WorldProvider {
   }
 
   async create(spec: WorldSpec): Promise<World> {
+    spec.signal?.throwIfAborted();
     const connection = this.connection(spec.organizationId);
     const factory = this.factoryFor(connection);
     const environment = spec.environment ?? {};
     const flavor = environment.flavor ?? 'headless';
-    const selectedSnapshot = environment.snapshot ?? (flavor === 'desktop'
+    const selectedSnapshot = environment.snapshot ?? (environment.image ? undefined : flavor === 'desktop'
       ? connection?.config.desktopSnapshot ?? this.desktopSnapshot
       : connection?.config.snapshot ?? this.snapshot);
     // Daytona's create API is a discriminated choice. A pre-built snapshot wins;
@@ -91,32 +100,49 @@ export class DaytonaWorldProvider implements WorldProvider {
       ? connection?.config.desktopImage ?? this.desktopImage
       : connection?.config.image ?? this.image);
     const network = daytonaNetwork(spec);
-    const sandbox = await factory.create({
+    const labels = { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel(), karmaxGeneration: String(spec.generation ?? 1) };
+    const trustedSsh = Boolean(spec.gitCredentials?.sshKey || Object.keys(spec.gitCredentials?.repositories ?? {}).length);
+    let sandbox = await findProvisioningSandbox(factory, labels);
+    let adopted = Boolean(sandbox);
+    if (!sandbox) sandbox = await factory.create({
       ...(selectedSnapshot ? { snapshot: selectedSnapshot } : {}),
       ...(selectedImage ? { image: selectedImage } : {}),
       // `karmaxHome` scopes orphan reaping to sandboxes THIS deployment
       // created: several karmax instances can share one Daytona account, and
       // reaping by task id alone would delete another instance's live worlds.
-      labels: { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel() }, public: false,
+      labels, public: false,
       // `autoDeleteInterval: -1` means the provider NEVER reaps this sandbox —
       // it auto-stops, auto-archives at 24h, then bills archived storage
       // indefinitely. karmax owns the teardown: the workflow's destroyWorld
       // plus WorldLifecycleManager's orphan sweep (which finds these by label).
       autoStopInterval: Math.max(1, Math.ceil(this.idleMs / 60_000)), autoArchiveInterval: 24 * 60,
-      autoDeleteInterval: -1, ...network,
-      ...(spec.resources ? { resources: { cpu: spec.resources.cpu,
-        memory: spec.resources.memoryMb ? spec.resources.memoryMb / 1024 : undefined, gpu: spec.resources.gpu } } : {}),
+      autoDeleteInterval: -1, ...(trustedSsh ? { networkBlockAll: false } : network),
+      ...(selectedImage && spec.resources ? { resources: { cpu: spec.resources.cpu,
+        memory: spec.resources.memoryMb ? Math.ceil(spec.resources.memoryMb / 1024) : undefined, gpu: spec.resources.gpu } } : {}),
+    }).catch(async (error) => {
+      const recovered = await findProvisioningSandbox(factory, labels).catch(() => undefined);
+      if (!recovered) throw explainDaytonaError(error);
+      adopted = true;
+      return recovered;
     });
     this.sandboxes.set(sandbox.id, sandbox);
     this.states.set(sandbox.id, 'ready');
     try {
+      spec.signal?.throwIfAborted();
+      if (adopted) { await sandbox.refreshData?.(); await startSandbox(sandbox); }
+      const resourceWarnings = selectedImage ? [] : snapshotResourceWarnings(sandbox, spec);
       if (flavor === 'desktop') {
         if (!sandbox.computerUse) throw new Error('the selected Daytona environment does not support Computer Use');
         await sandbox.computerUse.start();
       }
       const home = await sandbox.getUserHomeDir();
+      if (!home || !path.posix.isAbsolute(home)) throw new Error('Daytona did not return an absolute user home directory');
       const root = path.posix.join(home, 'karmax');
-      const provisioner = provisionTarget(sandbox);
+      const provisioner = provisionTarget(sandbox, spec.signal);
+      if (adopted) {
+        await provisionRun(provisioner, `rm -rf ${quote(root)} && mkdir -p ${quote(root)}`);
+        if (trustedSsh && !spec.network?.unrestricted) await updateNetwork(sandbox, { networkBlockAll: false });
+      }
       await provisionGitCredentials(provisioner, spec, home);
       const provisioned = await provisionGitRepos(provisioner, spec, {
         root, home,
@@ -124,6 +150,8 @@ export class DaytonaWorldProvider implements WorldProvider {
         copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote Daytona world',
       });
       await provisionRun(provisioner, `rm -f ${quote(path.posix.join(home, '.ssh'))}/karmax-auth-*`);
+      if (trustedSsh && !spec.network?.unrestricted) await updateNetwork(sandbox, network);
+      spec.signal?.throwIfAborted();
       const handle: WorldHandle = {
         version: 2, kind: this.kind, provider: this.kind, id: spec.taskId, root, workspaceRoot: root,
         branch: spec.branch ?? `karmax/${spec.taskId}`, base: provisioned.repos[0]?.base ?? spec.base,
@@ -134,7 +162,7 @@ export class DaytonaWorldProvider implements WorldProvider {
         meta: { releaseOnCompletion: true, environmentFlavor: flavor,
           ...(provisioned.ephemeralPaths.length ? { ephemeralPaths: provisioned.ephemeralPaths } : {}),
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
-        ...(provisioned.warnings.length ? { warnings: provisioned.warnings } : {}),
+        ...([...provisioned.warnings, ...resourceWarnings].length ? { warnings: [...provisioned.warnings, ...resourceWarnings] } : {}),
       };
       return new DaytonaWorld(handle, sandbox, this.idleMs);
     } catch (error) {
@@ -150,7 +178,7 @@ export class DaytonaWorldProvider implements WorldProvider {
     const id = reference.sandboxId;
     const sandbox = this.sandboxes.get(id) ?? await this.factoryFor(this.connection(reference.organizationId)).get(id);
     await sandbox.refreshData?.();
-    if (!['started', 'starting'].includes(String(sandbox.state ?? '').toLowerCase())) await sandbox.start(90);
+    await startSandbox(sandbox);
     if (handle.meta?.environmentFlavor === 'desktop') {
       if (!sandbox.computerUse) throw new Error('the Daytona world no longer exposes Computer Use');
       await sandbox.computerUse.start();
@@ -163,9 +191,14 @@ export class DaytonaWorldProvider implements WorldProvider {
   async park(handle: WorldHandle): Promise<WorldHandle> {
     const reference = this.reference(handle);
     const id = reference.sandboxId;
-    if (this.states.get(id) === 'parked') return handle;
     const sandbox = this.sandboxes.get(id) ?? await this.factoryFor(this.connection(reference.organizationId)).get(id);
-    await sandbox.archive();
+    await sandbox.refreshData?.();
+    if (!['archived', 'archiving'].includes(String(sandbox.state))) {
+      if (sandbox.state === 'starting') await sandbox.waitUntilStarted?.(90);
+      if (sandbox.state === 'stopping') await sandbox.waitUntilStopped?.(90);
+      else if (sandbox.state !== 'stopped') await sandbox.stop(90);
+      await sandbox.archive();
+    }
     this.sandboxes.set(id, sandbox);
     this.states.set(id, 'parked');
     return handle;
@@ -207,7 +240,7 @@ export class DaytonaWorldProvider implements WorldProvider {
         catch { return false; }
       },
       destroy: async () => {
-        await sandbox.delete(60);
+        await deleteSandbox(sandbox);
         this.sandboxes.delete(sandbox.id);
         this.states.set(sandbox.id, 'missing');
       },
@@ -242,7 +275,7 @@ export class DaytonaWorldProvider implements WorldProvider {
 
   private factoryFor(connection: ResolvedWorldProviderConnection | undefined): DaytonaFactory {
     if (this.factory) return this.factory;
-    const key = `${connection?.organizationId ?? 'environment'}:${connection?.apiKey.slice(-8) ?? ''}`;
+    const key = crypto.createHash('sha256').update(JSON.stringify(connection ?? {})).digest('hex');
     let factory = this.factories.get(key);
     if (!factory) {
       factory = defaultDaytonaFactory(connection);
@@ -323,30 +356,49 @@ class DaytonaWorld implements World {
     const sessionId = `karmax-${crypto.randomBytes(8).toString('hex')}`;
     await processApi.createSession(sessionId);
     const wrapped = `cd ${quote(this.cwd(spec.cwd))} && ${envPrefix(remoteEnv(spec.env))}bash -lc ${quote(spec.command)}`;
-    const started = await processApi.executeSessionCommand(sessionId, { command: wrapped, async: true, runAsync: true });
-    const commandId = String(started.cmdId);
+    let commandId: string;
+    try {
+      const started = await processApi.executeSessionCommand(sessionId, { command: wrapped, runAsync: true });
+      if (!started.cmdId) throw new Error('Daytona did not return a background command ID');
+      commandId = String(started.cmdId);
+    } catch (error) {
+      await processApi.deleteSession(sessionId).catch(() => undefined);
+      throw error;
+    }
     const output = new Set<(value: string) => void>();
     const exits = new Set<(code: number | null) => void>();
     const pending: string[] = [];
     let attached = false;
-    const emit = (chunk: string) => { if (!attached) pending.push(chunk); for (const listener of output) listener(chunk); };
-    void processApi.getSessionCommandLogs(sessionId, commandId, emit, emit).catch((error) => emit(String(error?.message ?? error)));
     let stopped = false;
     let exitCode: number | null = null;
+    let cleanup: Promise<void> | undefined;
+    const removeSession = () => cleanup ??= processApi.deleteSession!(sessionId);
+    const emit = (chunk: string) => { if (!attached) pending.push(chunk); for (const listener of output) listener(chunk); };
+    const logs = processApi.getSessionCommandLogs(sessionId, commandId, emit, emit)
+      .catch((error) => emit(String(error?.message ?? error)));
     const stopKeepAlive = this.keepAlive();
+    const finish = (code: number) => {
+      if (exitCode !== null) return;
+      exitCode = code;
+      stopKeepAlive();
+      for (const listener of exits) listener(code);
+    };
     void (async () => {
       while (!stopped) {
         const status = await processApi.getSessionCommand!(sessionId, commandId);
-        if (status.exitCode != null) { exitCode = Number(status.exitCode); break; }
+        if (status.exitCode != null) {
+          await logs;
+          await removeSession();
+          finish(Number(status.exitCode));
+          return;
+        }
         await delay(250);
       }
-      stopKeepAlive();
-      for (const listener of exits) listener(exitCode);
-    })().catch(() => { stopKeepAlive(); exitCode = -1; for (const listener of exits) listener(exitCode); });
+    })().catch(async () => { await removeSession().catch(() => undefined); finish(-1); });
     return {
       onOutput(listener) { output.add(listener); if (!attached) { attached = true; for (const chunk of pending.splice(0)) listener(chunk); } return () => output.delete(listener); },
       onExit(listener) { if (exitCode != null) queueMicrotask(() => listener(exitCode)); else exits.add(listener); return () => exits.delete(listener); },
-      async kill() { stopped = true; stopKeepAlive(); await processApi.deleteSession!(sessionId); if (exitCode == null) { exitCode = -1; for (const listener of exits) listener(exitCode); } },
+      async kill() { stopped = true; try { await removeSession(); } finally { finish(-1); } },
     };
   }
 
@@ -357,16 +409,25 @@ class DaytonaWorld implements World {
     let attached = false;
     let exited = false;
     let exitCode: number | null = null;
+    const decoder = new TextDecoder();
     const terminal = await this.sandbox.process.createPty({ id: `karmax-${crypto.randomBytes(8).toString('hex')}`,
       cwd: this.cwd(spec.cwd), envs: remoteEnv(spec.env), cols: spec.cols ?? 80, rows: spec.rows ?? 24,
       onData: (data: Uint8Array) => {
-        const chunk = new TextDecoder().decode(data);
+        const chunk = decoder.decode(data, { stream: true });
         if (!attached) pending.push(chunk);
         for (const listener of output) listener(chunk);
       } });
-    await terminal.waitForConnection?.();
-    const stopKeepAlive = this.keepAlive();
-    if (spec.command) await terminal.sendInput(`${spec.command}\n`);
+    let stopKeepAlive = () => {};
+    try {
+      await terminal.waitForConnection?.();
+      stopKeepAlive = this.keepAlive();
+      if (spec.command) await terminal.sendInput(`${spec.command}\n`);
+    } catch (error) {
+      stopKeepAlive();
+      try { await terminal.kill?.(); } catch { /* preserve startup failure */ }
+      try { await terminal.disconnect?.(); } catch { /* preserve startup failure */ }
+      throw error;
+    }
     void Promise.resolve(terminal.wait?.()).then((result) => {
       stopKeepAlive();
       exited = true;
@@ -391,7 +452,10 @@ class DaytonaWorld implements World {
       },
       async write(data) { await terminal.sendInput(data); },
       async resize(cols, rows) { await terminal.resize(cols, rows); },
-      async close() { stopKeepAlive(); if (terminal.kill) await terminal.kill(); else await terminal.disconnect?.(); },
+      async close() {
+        stopKeepAlive();
+        try { if (!exited) await terminal.kill?.(); } finally { await terminal.disconnect?.(); }
+      },
     };
   }
 
@@ -432,24 +496,17 @@ class DaytonaWorld implements World {
     return addCheckoutViaExec(this, spec);
   }
 
-  async destroy(): Promise<void> { await this.sandbox.delete(60); }
+  async destroy(): Promise<void> { await deleteSandbox(this.sandbox); }
 
-  /**
-   * Daytona's `autoStopInterval` is a wall-clock idle timer set once at create;
-   * unlike E2B's renewable timeout nothing refreshes it, so a long agent turn
-   * that merely holds a PTY or session command open can have its sandbox
-   * stopped underneath it mid-flight (E2B documents the same hazard and solves
-   * it in `keepAlive` — this mirrors it). Re-arm through the control plane when
-   * the SDK exposes it; otherwise run a no-op command, which is itself sandbox
-   * activity. Harmless if Daytona already counts an open session as activity.
-   */
+  /** Open processes need control-plane activity even when producing no output. */
   private keepAlive(): () => void {
     let stopped = false;
     const minutes = Math.max(1, Math.ceil(this.idleMs / 60_000));
     const refresh = () => {
       if (stopped) return;
-      void Promise.resolve(this.sandbox.setAutostopInterval
-        ? this.sandbox.setAutostopInterval(minutes)
+      void Promise.resolve(this.sandbox.refreshActivity
+        ? this.sandbox.refreshActivity()
+        : this.sandbox.setAutostopInterval ? this.sandbox.setAutostopInterval(minutes)
         : this.sandbox.process.executeCommand('true', undefined, undefined, 15)).catch(() => undefined);
     };
     refresh();
@@ -483,19 +540,79 @@ function applyPreviewPath(target: URL, requestPath: string): void {
 
 /** Trusted-provisioning adapter over the sandbox SDK. Never catches: real SDK
  * errors must reach the caller unchanged. */
-function provisionTarget(sandbox: DaytonaSandboxLike): ProvisionTarget {
+function provisionTarget(sandbox: DaytonaSandboxLike, signal?: AbortSignal): ProvisionTarget {
   return {
     async run(command, timeoutMs) {
-      const result = await sandbox.process.executeCommand(command, undefined, undefined, Math.max(1, Math.ceil(timeoutMs / 1000)));
+      signal?.throwIfAborted();
+      const result = await sandbox.process.executeCommand(`bash -c ${quote(command)}`, undefined, undefined, Math.max(1, Math.ceil(timeoutMs / 1000)));
       return { stdout: String(result?.result ?? result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
         code: Number(result?.exitCode ?? 0) };
     },
-    async writeFile(remotePath, content) { await sandbox.fs.uploadFile(Buffer.from(content), remotePath); },
+    async writeFile(remotePath, content) { signal?.throwIfAborted(); await sandbox.fs.uploadFile(Buffer.from(content), remotePath); },
   };
+}
+
+function explainDaytonaError(error: unknown): unknown {
+  if (/network access is restricted and cannot be overridden/i.test(String(error)))
+    return new Error('Custom network rules require Daytona Tier 3 or higher. Upgrade Daytona or select unrestricted networking in Compute settings; Daytona account restrictions still apply.', { cause: error });
+  return error;
+}
+
+async function findProvisioningSandbox(factory: DaytonaFactory, labels: Record<string, string>): Promise<DaytonaSandboxLike | undefined> {
+  if (!factory.list) return undefined;
+  const matches = (await factory.list(labels)).filter((sandbox) =>
+    Object.entries(labels).every(([key, value]) => sandbox.labels?.[key] === value));
+  if (matches.length > 1) throw new Error(`Multiple Daytona sandboxes exist for task generation ${labels.karmaxTaskId}/${labels.karmaxGeneration}`);
+  return matches[0];
+}
+
+async function updateNetwork(sandbox: DaytonaSandboxLike, settings: { networkBlockAll?: boolean; domainAllowList?: string }): Promise<void> {
+  if (!sandbox.updateNetworkSettings) throw new Error('This Daytona SDK cannot apply the task network policy');
+  await sandbox.updateNetworkSettings(settings).catch((error) => { throw explainDaytonaError(error); });
+}
+
+/** Deletes are retried by teardown and orphan reconciliation. Daytona's list
+ * index can briefly retain a deleted sandbox, so a confirmed 404 is success. */
+async function deleteSandbox(sandbox: DaytonaSandboxLike): Promise<void> {
+  try { await sandbox.delete(60); }
+  catch (error) {
+    if ((error as { statusCode?: number })?.statusCode !== 404) throw error;
+  }
+}
+
+async function startSandbox(sandbox: DaytonaSandboxLike): Promise<void> {
+  // archive() returns while storage migration is still running. A cold open
+  // must not try to start it until that transition has finished.
+  const until = Date.now() + 120_000;
+  while (sandbox.state === 'archiving') {
+    if (!sandbox.refreshData || Date.now() >= until) throw new Error('Timed out waiting for Daytona to finish archiving');
+    await delay(1000);
+    await sandbox.refreshData();
+  }
+  if (sandbox.state === 'stopping') await sandbox.waitUntilStopped?.(90);
+  if (['starting', 'pending_build', 'building', 'pulling_snapshot'].includes(String(sandbox.state)))
+    await sandbox.waitUntilStarted?.(120);
+  else if (sandbox.state !== 'started') await sandbox.start(120);
+}
+
+/** Snapshot sizing is fixed by its author, including Daytona's default. Only
+ * image builds accept resource overrides; do not rely on the SDK's resize API,
+ * which is not implemented by every deployed Daytona control plane. */
+function snapshotResourceWarnings(sandbox: DaytonaSandboxLike, spec: WorldSpec): string[] {
+  const requested = spec.resources;
+  if (!requested) return [];
+  if (requested.gpu && requested.gpu > (sandbox.gpu ?? 0))
+    throw new Error('The Daytona snapshot has insufficient GPUs. Select a GPU snapshot or an image with the requested resources.');
+  if ((requested.cpu !== undefined && sandbox.cpu !== undefined && requested.cpu !== sandbox.cpu)
+    || (requested.memoryMb !== undefined && sandbox.memory !== undefined && requested.memoryMb !== sandbox.memory * 1024))
+    return [`Daytona snapshot allocation: ${sandbox.cpu ?? '?'} CPUs, ${sandbox.memory ?? '?'} GiB RAM. CPU and memory settings apply to image builds; choose an image or a differently sized snapshot to change them.`];
+  return [];
 }
 
 function daytonaNetwork(spec: WorldSpec): Record<string, unknown> {
   if (spec.network?.unrestricted) return { networkBlockAll: false };
+  if (spec.network?.allowCidrs?.length)
+    throw new Error('Daytona cannot combine CIDR rules with the domain allowlist needed by task agents. Use allowed domains or an unrestricted network.');
   let gateway: string[] = [];
   try {
     const value = process.env.KARMAX_REMOTE_GATEWAY_URL ?? process.env.KARMAX_PUBLIC_URL;
@@ -506,12 +623,11 @@ function daytonaNetwork(spec: WorldSpec): Record<string, unknown> {
     'deb.debian.org', 'security.debian.org', 'archive.ubuntu.com', 'security.ubuntu.com', 'dl.google.com',
     'api.anthropic.com', 'claude.ai', 'api.openai.com', 'chatgpt.com', 'auth.openai.com',
     ...gateway, ...(spec.network?.allowDomains ?? [])])];
-  return { networkBlockAll: true, domainAllowList: domains.join(','),
-    ...(spec.network?.allowCidrs?.length ? { networkAllowList: spec.network.allowCidrs.join(',') } : {}) };
+  return { domainAllowList: domains.join(',') };
 }
 
 function defaultDaytonaFactory(connection?: ResolvedWorldProviderConnection): DaytonaFactory {
-  let client: any;
+  let client: import('@daytona/sdk').Daytona | undefined;
   const sdk = async () => {
     if (!client) {
       try {
@@ -526,9 +642,11 @@ function defaultDaytonaFactory(connection?: ResolvedWorldProviderConnection): Da
     async get(id) { return (await sdk()).get(id); },
     async list(labels) {
       const client = await sdk();
-      // Older SDKs have no label-filtered list; reaping is best-effort and must
-      // degrade to "cannot enumerate" rather than throwing inside the sweep.
-      return typeof client.list === 'function' ? await client.list(labels) : [];
+      const sandboxes: DaytonaSandboxLike[] = [];
+      for await (const sandbox of client.list({ labels })) {
+        if (Object.entries(labels).every(([key, value]) => sandbox.labels?.[key] === value)) sandboxes.push(sandbox);
+      }
+      return sandboxes;
     } };
 }
 

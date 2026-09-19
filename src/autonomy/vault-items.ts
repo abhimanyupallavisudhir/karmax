@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CredentialBroker } from './broker.js';
+import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
 import { paths } from '../config/paths.js';
@@ -83,6 +84,7 @@ export interface VaultItem {
     at: number;
     /** Import format marker: older pass entries need one complete notes refresh. */
     passNotesVersion?: number;
+    connectorFormatVersion?: number;
     syncedAt?: number;
     /** Source fingerprint recorded with the last successful import. */
     sourceRevision?: string;
@@ -287,7 +289,7 @@ export class VaultItems {
     secrets?: Partial<Record<VaultFieldName, string>>;
     /** Internal connector snapshot: remove fields absent from the source. */
     replaceSecrets?: boolean;
-    provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; syncedAt?: number; sourceRevision?: string };
+    provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; connectorFormatVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? this.get(args.id) : undefined;
@@ -336,13 +338,14 @@ export class VaultItems {
       },
       // Preserve origin identity; only import format and mirror clock change on sync.
       provenance: prior
-        ? { ...prior.provenance, ...(args.provenance?.syncedAt !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
-        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.sourceRevision !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
+        ? { ...prior.provenance, ...(args.provenance?.syncedAt !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.connectorFormatVersion ? {connectorFormatVersion:args.provenance.connectorFormatVersion} : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
+        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.sourceRevision !== undefined ? { sourceRevision: args.provenance.sourceRevision } : {}), ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.connectorFormatVersion ? {connectorFormatVersion:args.provenance.connectorFormatVersion} : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
       useCount: prior?.useCount ?? 0,
       frecencyScore: prior?.frecencyScore ?? 0,
       frecencyUpdatedAt: prior?.frecencyUpdatedAt ?? Date.now(),
       ...(prior?.lastUsedAt !== undefined ? { lastUsedAt: prior.lastUsedAt } : {}),
-      updatedAt: Date.now(),
+      // Also serves as an optimistic revision for in-flight connector pulls.
+      updatedAt: Math.max(Date.now(), (prior?.updatedAt ?? 0) + 1),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
     // Key material may have changed — drop any materialized copies.
@@ -371,7 +374,7 @@ export class VaultItems {
         ? { externalIds: { ...item.provenance.externalIds, [connector]: externalId } }
         : {}),
     };
-    item.updatedAt = Date.now();
+    item.updatedAt = Math.max(Date.now(), item.updatedAt + 1);
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
     return item;
   }
@@ -381,13 +384,14 @@ export class VaultItems {
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
     item.policy = { ...item.policy, ...patch };
-    item.updatedAt = Date.now();
+    item.updatedAt = Math.max(Date.now(), item.updatedAt + 1);
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
     return item;
   }
 
   delete(id: string) {
     const item = this.get(id);
+    deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id);
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify(this.list().filter((i) => i.id !== id)));
     for (const field of item?.fields ?? []) this.broker?.deleteHandle(itemHandle(id, field));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
