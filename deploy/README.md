@@ -172,6 +172,14 @@ Task VMs are deliberately excluded: Git plus encrypted portable checkpoints are
 their durable form. Copy backups to encrypted off-host storage. Anyone holding a
 backup can recover the vault, so protect it like production credentials.
 
+On Linux hosts with the util-linux `hardlink` command, completed backups share
+identical large object-store files automatically. This preserves every restore
+point and its verified bytes while avoiding a full physical copy of unchanged
+checkpoints on every deployment. To compact existing backups, run
+`sh deploy/compact-backups.sh`. Treat completed backup directories as immutable;
+copy files out before editing them. The live data volume is never linked to a
+backup. The release workflow also retains its existing 14-day age limit.
+
 `restore` verifies Karmax's per-file hashes before changing data, restores the
 Karmax and Temporal databases, reapplies the current Temporal schema, and retains the
 destination's domain. It requires typing `RESTORE` and will not delete Docker
