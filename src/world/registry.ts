@@ -1,3 +1,4 @@
+import { WorldOperationLock } from './operation-lock.js';
 import { World, WorldHandle, WorldKind, WorldLifecycleState, WorldProvider, WorldSpec } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { MemoryWorldProvider } from './memory.js';
@@ -11,6 +12,8 @@ import { DaytonaWorldProvider } from './daytona.js';
  * worktree → container → remote is a config change, not a code change.
  */
 export class WorldRegistry {
+  private readonly operations = new WorldOperationLock();
+  private readonly accessors = new Map<string, number>();
   private providers = new Map<WorldKind, WorldProvider>();
   private resolveHandle?: (handle: WorldHandle) => WorldHandle | undefined;
   private recover?: (handle: WorldHandle, error: unknown) => Promise<WorldHandle | undefined>;
@@ -61,21 +64,42 @@ export class WorldRegistry {
     return this.get(kind).create(spec);
   }
 
+  withOperation<T>(worldId: string, operation: () => Promise<T>): Promise<T> {
+    return this.operations.run(worldId, operation);
+  }
+
+  holdAccess(worldId: string): () => void {
+    this.accessors.set(worldId, this.activeAccessCount(worldId) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = this.activeAccessCount(worldId) - 1;
+      if (count > 0) this.accessors.set(worldId, count);
+      else this.accessors.delete(worldId);
+    };
+  }
+  activeAccessCount(worldId: string): number { return this.accessors.get(worldId) ?? 0; }
+
   async open(handle: WorldHandle): Promise<World> {
-    const current = this.resolveHandle?.(handle) ?? handle;
-    try {
-      return await this.get(current.kind).open(current);
-    } catch (error) {
-      const restored = await this.recover?.(current, error);
-      if (!restored) throw error;
-      return this.get(restored.kind).open(restored);
-    }
+    return this.withOperation(handle.id, async () => {
+      const current = this.resolveHandle?.(handle) ?? handle;
+      try {
+        return await this.get(current.kind).open(current);
+      } catch (error) {
+        const restored = await this.recover?.(current, error);
+        if (!restored) throw error;
+        return this.get(restored.kind).open(restored);
+      }
+    });
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
-    const current = this.resolveHandle?.(handle) ?? handle;
-    const provider = this.get(current.kind);
-    return provider.park ? provider.park(current) : current;
+    return this.withOperation(handle.id, async () => {
+      const current = this.resolveHandle?.(handle) ?? handle;
+      const provider = this.get(current.kind);
+      return provider.park ? provider.park(current) : current;
+    });
   }
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {

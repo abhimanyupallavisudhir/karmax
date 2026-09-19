@@ -3,7 +3,7 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import type { PublishedView, ViewConversation } from '../domain/view-publication.js';
+import type { PublishedView, ViewConversation, LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -906,15 +906,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
-    let world: World;
+    // Pin access before admission, but never wait for capacity while holding a
+    // transition lock: the previous owner needs that lock to release its lease.
+    const releaseAccess = worlds.holdAccess?.(handle.id);
+    const open = async (): Promise<World | undefined> => {
+      const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
+      if (isRemote(current.kind) && deps.runners) {
+        const leaseId = current.meta?.worldLeaseId;
+        if (typeof leaseId !== 'string' || store.worldLease(leaseId)?.state !== 'active') return undefined;
+      }
+      let world: World;
+      try { world = await worlds.open(current); }
+      catch (e) {
+        const recovered = await recoverVanishedWorld(current, taskId, e);
+        if (!recovered) throw e;
+        world = recovered;
+      }
+      return deps.resources ? await deps.resources.prepare(world) : world;
+    };
     try {
-      world = await worlds.open(await ensureRunnerLease(handle, taskId));
-    } catch (e) {
-      const recovered = await recoverVanishedWorld(handle, taskId, e);
-      if (!recovered) throw e;
-      world = recovered;
-    }
-    return deps.resources ? await deps.resources.prepare(world) : world;
+      for (;;) {
+        await ensureRunnerLease(handle, taskId);
+        const world = await (worlds.withOperation ? worlds.withOperation(handle.id, open) : open());
+        if (world) return world;
+        // A park already in flight may have released the lease while we waited
+        // for its transition. Re-enter admission before opening the provider.
+      }
+    } finally { releaseAccess?.(); }
   }
 
   // A remote sandbox can vanish out-of-band while a task is parked (provider GC,
@@ -980,6 +998,83 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } catch (error) {
       fs.rmSync(root, { recursive: true, force: true });
       throw error;
+    }
+  }
+
+  async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
+    const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
+    const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
+    if ((view.status !== 'waiting' && view.status !== 'blocked') || startingAgent
+      || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
+    let ctx: ReturnType<typeof activityContext.current> | undefined;
+    try { ctx = activityContext.current(); } catch { /* direct tests */ }
+    const valid = () => {
+      ctx?.cancellationSignal.throwIfAborted();
+      if ((worlds.activeAccessCount?.(waitingWorld.id) ?? 0) > 0) return false;
+      const current = store.currentWorld(waitingWorld.id) as WorldHandle | undefined;
+      if (store.worldState(waitingWorld.id) === 'released') return false;
+      if (current && (current.kind !== waitingWorld.kind
+        || (current.generation ?? 1) !== (waitingWorld.generation ?? 1))) return false;
+      const ownLease = typeof current?.meta?.worldLeaseId === 'string'
+        && store.worldLease(current.meta.worldLeaseId)?.state === 'active' ? 1 : 0;
+      if (store.activeWorldLeaseCount(waitingWorld.id) > ownLease) return false;
+      const task = store.taskMetadata(taskId);
+      const saved = task?.lastView;
+      return store.kvGet(`view-lifecycle:${taskId}`) === fence
+        && saved?.updatedAt === view.updatedAt && saved.status === view.status && saved.stage === view.stage
+        && JSON.stringify(saved.waitingFor) === JSON.stringify(view.waitingFor)
+        && (!task?.params._workflowRunId || !ctx
+          || task.params._workflowRunId === ctx.info.workflowExecution?.runId);
+    };
+    const maintain = async () => {
+      if (!valid()) return;
+      const before = await worlds.status(waitingWorld);
+      if (!valid()) return;
+      if (before === 'ready') {
+        if (deps.checkpoints) {
+          try {
+            // The branch is the portable checkpoint's committed layer. Push
+            // it through the trusted broker before capturing the dirty delta.
+            if (isRemote(waitingWorld.kind)) {
+              const remoteWorld = await openWorld(waitingWorld, taskId);
+              const projectId = String(remoteWorld.handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
+              if (store.listProjectRepositories(projectId).length) {
+                await enrollLiveProjectRepositories(remoteWorld, taskId);
+                const pushed = await publishTaskBranch(remoteWorld, taskId);
+                if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+                record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' });
+              }
+            }
+            const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
+            record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
+              generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 });
+          } catch (error) {
+            record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) });
+          }
+        }
+
+        if (!valid()) return;
+        await worlds.park(waitingWorld);
+      }
+      // Retry after a worker crash between parking and lease cleanup must finish
+      // the accounting even when the provider is already parked.
+      if ((before === 'ready' || before === 'parked') && await worlds.status(waitingWorld) === 'parked') {
+        const current = (store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle;
+        const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
+        if (leaseId) {
+          deps.runners?.release(leaseId, current.kind);
+          store.updateWorldMeta(current, { worldLeaseId: null });
+        }
+        store.setWorldState((store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle, 'parked');
+        record(taskId, 'world.parked', { provider: waitingWorld.kind, reason: view.waitingFor?.kind ?? view.stage });
+      }
+    };
+    try {
+      await (worlds.withOperation ? worlds.withOperation(waitingWorld.id, maintain) : maintain());
+    } catch (error) {
+      if (ctx?.cancellationSignal.aborted) throw error;
+      if (retryFailure) throw error; // Separate maintenance retries without republishing status.
+      record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` });
     }
   }
 
@@ -1561,7 +1656,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // the existing activity execution instead, so the activity can repair the
         // persisted view without changing workflow history.
         if (!args.agentTurnId && actx.info.workflowExecution) {
-          legacyAgentTurnId = `legacy:${actx.info.workflowExecution.runId}:${actx.info.activityId}`;
+          legacyAgentTurnId = `legacy:${actx.info.workflowExecution?.runId}:${actx.info.activityId}`;
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
@@ -4598,7 +4693,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return true;
     },
 
-    async publishView(taskId: string, publication: PublishedView, conversationReference?: string): Promise<void> {
+    async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
       let view: TaskView;
       if (conversationReference) {
         // Immutable, task-scoped snapshots survive worker restarts and activity
@@ -4692,67 +4787,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         agentTurn: view.agentTurn?.state ?? null,
         agentRole: view.agentTurn?.role ?? null,
       });
-      // A waiting or blocked task owns durable state, not continuously-metered compute.
-      // Parking is an implementation detail inside this existing activity (no new
-      // workflow command, so old Temporal histories remain replay-compatible).
-      // Every later operation goes through worlds.open(), which transparently
-      // resumes a paused provider before a terminal, artifact, agent turn, or merge.
-      // software-dev also stores the handle in structured recovery state, while
-      // newer workflow views expose it directly. Accept both shapes. Crucially,
-      // skip providers that cannot really park: even a no-op lifecycle detour on
-      // every waiting publish creates avoidable activity contention precisely
-      // while parent/child cancellation signals need to settle promptly.
-      const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
-      // Existing version-pinned workflows publish this transient frame before
-      // requesting admission and again after a slot is granted. Checkpointing
-      // here can take longer than publishView's timeout and parks the sandbox
-      // that the next activity must immediately resume. Keep the compatibility
-      // check in the activity; genuine capacity/account/human waits still park.
-      const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
-      if ((view.status === 'waiting' || view.status === 'blocked')
-        && !startingAgent && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
-        try {
-          const before = await worlds.status(waitingWorld);
-          if (before === 'ready') {
-            if (deps.checkpoints) {
-              try {
-                // The branch is the portable checkpoint's committed layer. Push
-                // it through the trusted broker before capturing the dirty delta.
-                if (isRemote(waitingWorld.kind)) {
-                  const remoteWorld = await openWorld(waitingWorld, taskId);
-                  const projectId = String(remoteWorld.handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
-                  if (store.listProjectRepositories(projectId).length) {
-                    await enrollLiveProjectRepositories(remoteWorld, taskId);
-                    const pushed = await publishTaskBranch(remoteWorld, taskId);
-                    if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
-                    record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' });
-                  }
-                }
-                const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
-                record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
-                  generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 });
-              } catch (error) {
-                record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) });
-              }
-            }
-            await worlds.park(waitingWorld);
-            if (await worlds.status(waitingWorld) === 'parked') {
-              const current = (store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle;
-              const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
-              if (leaseId) {
-                deps.runners?.release(leaseId, current.kind);
-                store.updateWorldMeta(current, { worldLeaseId: null });
-              }
-              store.setWorldState((store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle, 'parked');
-              record(taskId, 'world.parked', { provider: waitingWorld.kind, reason: view.waitingFor?.kind ?? view.stage });
-            }
-          }
-        } catch (error) {
-          // Auto-pause remains the cost backstop; a transient park failure must
-          // never roll back or retry the authoritative view update.
-          record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` });
-        }
-      }
+      const fence = newId('publication');
+      store.kvSet(`view-lifecycle:${taskId}`, fence);
+      if (options?.separateLifecycle) return fence;
+      await maintainWaitingWorld(taskId, view, fence, false);
+
+    },
+
+    async parkWaitingWorld(taskId: string, view: LifecyclePublication, fence: string): Promise<void> {
+      let ctx: ReturnType<typeof activityContext.current> | undefined;
+      try { ctx = activityContext.current(); } catch { /* direct tests */ }
+      ctx?.heartbeat({ phase: 'waiting-world' });
+      const timer = ctx ? setInterval(() => ctx!.heartbeat({ phase: 'waiting-world' }), 5_000) : undefined;
+      try { await maintainWaitingWorld(taskId, view, fence); }
+      finally { if (timer) clearInterval(timer); }
     },
 
     async recordEvent(taskId: string, type: string, payload: Record<string, unknown>): Promise<void> {
