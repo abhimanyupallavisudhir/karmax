@@ -1,5 +1,7 @@
 # Live model latency with fixture services: 2026-09-18
 
+**Local-world baseline:** these are local git worlds inside the collector’s E2B environment. For actual deployed tavya.io E2B task provisioning and follow-ups, see [the SaaS E2B collection](latency-e2b-results.md).
+
 Measured 320 successfully completed turns (272 valid workloads; 48 workload mismatches) through an isolated Karmax gateway, real Temporal worker, SQLite, local git worlds, runtime, production direct API adapters, and managed-service gateway. **Real OpenAI/Anthropic models; simulated read-only services.** This is not tavya.io deployment latency, fully live external-service latency, or a Grok comparison.
 
 The run used the task #286 candidate based on master 8fbdb43c, in its E2B sandbox: Linux x64, Node v22.16.0, 2 available CPUs, approximately 2 GB RAM, Temporal CLI 1.7.2. One turn at a time; provider order alternates by repetition and scenario order rotates. No other tests or builds ran during collection. Local worlds are fresh or reused; worker/gateway remain running. Host memory/load admission gates were disabled only in the isolated harness. Production installation settings were untouched. The workflow uses the harness fixture profile for credential/admission bookkeeping, then dispatches through the real provider adapter. No CLI/SDK startup, cloud-world provisioning, deployment queue contention, or browser paint is measured.

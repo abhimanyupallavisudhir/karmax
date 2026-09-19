@@ -199,3 +199,6 @@ are enforced before each real request. The estimated cost is not a billing invoi
 
 See [live model measurements](latency-live-results.md) for the September 18 isolated
 OpenAI/Anthropic collection, validation exclusions, usage, and bottleneck evidence.
+
+See [deployed E2B measurements](latency-e2b-results.md) for the September 19
+production tavya.io startup, follow-up, native-agent and browser observations.
