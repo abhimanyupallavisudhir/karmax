@@ -763,6 +763,9 @@ export class CodexAdapter implements AgentAdapter {
       if (resuming && input.fork) {
         const forked = await client.request<any>('thread/fork', {
           threadId: preparedSession,
+          // The native history stays in Codex. We only need the thread id;
+          // returning all prior tool/image payloads can stream tens of MB.
+          excludeTurns: true,
           cwd,
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
@@ -775,6 +778,7 @@ export class CodexAdapter implements AgentAdapter {
         // on-request in current Codex), discarding karmax's headless posture.
         await client.request('thread/resume', {
           threadId: preparedSession,
+          excludeTurns: true,
           cwd,
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
