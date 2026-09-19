@@ -119,7 +119,7 @@ test('close, search, or another task invalidate a pending selection; repeated cl
 
 test('failed lookup is retryable and does not masquerade as an empty attempt', async () => {
   const a = task('a'); let offline = true;
-  const h = harness({ tasks: [a], attempts: { a: [a] }, agents: { a: session('a') }, failure: url => offline && url.endsWith('/sessions') });
+  const h = harness({ tasks: [a], attempts: { a: [a] }, agents: { a: session('a') }, failure: url => offline && url.split('?')[0].endsWith('/sessions') });
   await tick(); await h.click();
   assert.equal(h.errors.length, 1); assert.equal(h.picks.length, 0);
   assert.ok(!h.nodes['pk-list'].innerHTML.includes('pk-sessions'));

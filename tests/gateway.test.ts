@@ -114,6 +114,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     // infer it from the retained native file instead of hiding the handoff.
     h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: nativeHome }));
     try {
+      const read = vi.spyOn(fs, 'readFileSync');
+      try {
+        const metadata: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions?metadata=1`, { headers: auth() })).json();
+        expect(metadata.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true });
+        expect(metadata.do.exportId).toBeUndefined();
+        expect(metadata.do.downloadUrl).toBeUndefined();
+        expect(read.mock.calls.some(([file]) => String(file).includes(sessionId))).toBe(false);
+      } finally { read.mockRestore(); }
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
       expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.154.0-alpha.11' });
       const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
@@ -1930,6 +1938,28 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
     const third: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: { authorization: `Bearer ${other.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ itemId: item.id }) })).json();
     expect(third.status).toBe('needs_approval');
+  });
+
+  it('lists task approval counts without hydrating each task conversation', async () => {
+    const project = h.store.createProject('Compact approval list');
+    const taskIds = new Set<string>();
+    for (let i = 0; i < 30; i++) {
+      const task = h.store.createTask({ projectId: project.id, title: `Task ${i}`, workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'x', draft: true } });
+      taskIds.add(task.id);
+      h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [{ id: 'large', text: 'x'.repeat(10_000), role: 'agent', ts: 1 }],
+        actions: [], state: {}, updatedAt: 1 });
+    }
+    const hydrate = vi.spyOn(h.store, 'getTask');
+    try {
+      const response = await fetch(`${base}/api/projects/${project.id}/tasks?includeArchived=1`, { headers: auth() });
+      expect(response.status).toBe(200);
+      const listed: any = await response.json();
+      expect(listed).toHaveLength(30);
+      expect(listed.every((task: any) => !task.lastView.messages)).toBe(true);
+      expect(hydrate.mock.calls.filter(([id]) => taskIds.has(id))).toHaveLength(0);
+    } finally { hydrate.mockRestore(); }
   });
 
   it('projects credential approvals onto the task, notifies its human, and resumes it after resolution', async () => {
