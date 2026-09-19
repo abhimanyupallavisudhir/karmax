@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Pool } from 'pg';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IdentityService } from '../src/auth/identity.js';
 import { openStore, Store } from '../src/store/db.js';
 import { openSqlDatabase } from '../src/store/sql.js';
@@ -35,6 +35,53 @@ integration('PostgreSQL cutover', () => {
       expect(events.map(event => event.payload.text)).toEqual(['ordered']);
       expect(await store.taskProjectIds(events.map(event => event.taskId))).toEqual(new Map([[taskId, project.id]]));
     } finally { store.close(); }
+  });
+
+  it('reads task details and review audiences without the synchronous PostgreSQL bridge', async () => {
+    const store = new Store(url!);
+    try {
+      const org = store.createOrganization({ name: 'Async audience', ownerUserId: 'owner' });
+      const project = store.createProject('Detail', {}, org.id);
+      const task = store.createTask({ projectId: project.id, title: 'Review', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture' }, confirmationPolicy: {
+          rule: 'any', targets: [{ kind: 'project-role', projectId: project.id, role: 'owner' }],
+        } });
+      store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+        messages: [{ id: 'm', text: 'history', role: 'agent', ts: 1 }], state: {}, actions: [], updatedAt: 1 });
+      const expected = store.getTask(task.id);
+      const prepare = vi.spyOn(store.db, 'prepare').mockImplementation(() => { throw Error('blocking database access'); });
+      try {
+        expect(await store.getTaskAsync(task.id)).toEqual(expected);
+        expect((await store.taskSummaryPage(project.id)).tasks[0]?.reviewers).toEqual(expected?.reviewers);
+        expect((await store.taskMetadataAsync(task.id))?.num).toBe(task.num);
+        expect(await store.taskPointerByNumAsync(project.id, task.num!)).toEqual({ id: task.id, num: task.num, projectId: project.id });
+        expect(await store.taskSnapshotAsync(task.id)).toEqual(expected?.lastView);
+      } finally { prepare.mockRestore(); }
+    } finally { store.close(); }
+  });
+
+  it('keeps timers and independent reads live while a task-table lock delays a detail read', async () => {
+    const store = new Store(url!);
+    const blocker = await admin!.connect();
+    try {
+      const project = store.createProject('Blocked read');
+      const task = store.createTask({ projectId: project.id, title: 'Lock fixture', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture' } });
+      store.kvSet('unrelated-read', 'ready');
+      await store.taskMetadataAsync(task.id); // establish the pool before timing the lock
+      await blocker.query('BEGIN');
+      await blocker.query('LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE');
+      // Server-side release also bounds this test if a regression blocks JS timers.
+      const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
+      let finished = false;
+      const read = store.taskMetadataAsync(task.id).then(value => { finished = true; return value; });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(finished).toBe(false);
+      expect(await store.kvGetAsync('unrelated-read')).toBe('ready');
+      expect(finished).toBe(false);
+      await unlock;
+      expect((await read)?.id).toBe(task.id);
+    } finally { await blocker.query('ROLLBACK'); blocker.release(); store.close(); }
   });
 
   it('looks up usage IDs in bounded batches and task ownership without loading views', () => {

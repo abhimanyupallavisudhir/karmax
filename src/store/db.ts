@@ -1,3 +1,4 @@
+import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
 import { decayVaultUsage, type VaultUsage } from '../util/vault-usage.js';
 import { canonicalAccountName } from '../domain/account-names.js';
 import { validGitBranch } from '../util/git-ref.js';
@@ -2966,7 +2967,9 @@ export class Store {
       const byId = new Map(tasks.map(task => [task.id, task]));
       for (const row of tags) (byId.get(row.taskId)!.tags ??= []).push(row.tagId);
       for (const row of subscribers) byId.get(row.taskId)!.subscribers!.push(JSON.parse(row.principal));
-      for (const task of tasks) if (task.confirmationPolicy) task.reviewers = this.reviewAudience(task);
+      const readAudience = this.audienceReader();
+      for (const task of tasks) if (task.confirmationPolicy)
+        task.reviewers = await runAudienceAsync(reviewAudience(task), readAudience);
     }
     return { tasks, total: Number(count?.total ?? 0), offset };
   }
@@ -3071,6 +3074,50 @@ export class Store {
     return row ? rowToTask(row) : undefined;
   }
 
+  async taskMetadataAsync(id: string): Promise<TaskRecord | undefined> {
+    const [row] = await this.readRows<any>(`SELECT t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
+      t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord, t.parentTaskId,
+      t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber,
+      t.notes, t.lastView, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+      LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id=?`, [id]);
+    return row ? rowToTask(row) : undefined;
+  }
+
+  async taskSnapshotAsync(id: string): Promise<TaskView | undefined> {
+    const [row] = await this.readRows<any>('SELECT lastView, conversation FROM tasks WHERE id=?', [id]);
+    return row ? rowToTaskView(row) : undefined;
+  }
+
+  async getTaskAsync(id: string): Promise<TaskRecord | undefined> {
+    const [row] = await this.readRows<any>(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+      LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id=?`, [id]);
+    if (!row) return undefined;
+    const task = rowToTask(row);
+    const tags = await this.readRows<{ tagId: string }>('SELECT tagId FROM task_tags WHERE taskId=?', [id]);
+    if (tags.length) task.tags = tags.map(tag => tag.tagId);
+    const subscribers = await this.readRows<{ principal: string }>(
+      'SELECT principal FROM task_subscribers WHERE taskId=? ORDER BY createdAt, rowid', [id]);
+    task.subscribers = subscribers.map(subscriber => JSON.parse(subscriber.principal));
+    if (task.confirmationPolicy) task.reviewers = await runAudienceAsync(reviewAudience(task), this.audienceReader());
+    return task;
+  }
+
+  async attemptCommitAsync(taskId: string): Promise<{ committedAttemptId?: string }> {
+    const [row] = await this.readRows<{ committedAttemptId: string | null }>(`SELECT i.committedAttemptId
+      FROM task_intents i JOIN tasks t ON t.intentId=i.id WHERE t.id=?`, [taskId]);
+    return { committedAttemptId: row?.committedAttemptId ?? undefined };
+  }
+
+  async kvGetAsync(key: string): Promise<string | undefined> {
+    const [row] = await this.readRows<{ v: string }>('SELECT v FROM kv WHERE k=?', [key]);
+    return row?.v;
+  }
+
+  async withPendingReviewInfoAsync(taskId: string, view: TaskView): Promise<TaskView> {
+    const raw = await this.kvGetAsync(`pending-review:${taskId}`);
+    return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
+  }
+
   getTask(id: string): TaskRecord | undefined {
     const r = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id = ?`).get(id) as any;
@@ -3084,6 +3131,14 @@ export class Store {
   }
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */
+  async taskPointerByNumAsync(projectId: string, num: number): Promise<Pick<TaskRecord, 'id' | 'num' | 'projectId'> | undefined> {
+    const [row] = await this.readRows<{ id: string; num: number; projectId: string }>(`SELECT t.id,
+      COALESCE(t.num, root.num) AS num, t.projectId FROM tasks root
+      JOIN task_intents i ON i.id=root.intentId JOIN tasks t ON t.id=i.principalAttemptId
+      WHERE root.projectId=? AND root.num=?`, [projectId, num]);
+    return row;
+  }
+
   getTaskByNum(projectId: string, num: number): TaskRecord | undefined {
     const r = this.db.prepare(`SELECT i.principalAttemptId AS id FROM tasks root
       JOIN task_intents i ON i.id=root.intentId WHERE root.projectId=? AND root.num=?`).get(projectId, num) as any;
@@ -3596,56 +3651,7 @@ export class Store {
 
   /** Resolve the audience declared by the workflow's current human wait. */
   humanAudience(taskId: string, requested?: string[]): string[] {
-    const task = this.getTaskShallow(taskId);
-    if (!task) return [];
-    const project = this.getProject(task.projectId);
-    if (!project?.organizationId) return [];
-    const audience = requested?.length ? requested : task.lastView?.waitingFor?.audience?.length
-      ? task.lastView.waitingFor.audience : ['@creator'];
-    const users = new Set<string>();
-    const addHumanCreator = (candidate: TaskRecord | undefined, visited = new Set<string>()): void => {
-      if (!candidate || visited.has(candidate.id)) return;
-      visited.add(candidate.id);
-      if (candidate.createdBy?.kind === 'user') users.add(candidate.createdBy.userId);
-      else if (candidate.createdBy?.kind === 'avatar') {
-        const ownerUserId = this.getAvatar(candidate.createdBy.avatarId)?.ownerUserId;
-        if (ownerUserId) users.add(ownerUserId);
-      }
-      else if (candidate.createdBy?.kind === 'task-agent')
-        addHumanCreator(this.getTaskShallow(candidate.createdBy.taskId), visited);
-    };
-    for (const selector of audience) {
-      if (selector === '@creator') {
-        // Agent-created subtasks route back through their parent chain to the
-        // human who initiated the work, rather than creating an impossible gate.
-        // A top-level task created by an automation has no human ancestor; its
-        // organization's owners are the deterministic escalation destination.
-        const before = users.size;
-        addHumanCreator(task);
-        if (users.size === before)
-          for (const member of this.listOrganizationMemberships(project.organizationId))
-            if (member.role === 'owner') users.add(member.userId);
-      } else if (selector === '@all') {
-        for (const member of this.listOrganizationMemberships(project.organizationId)) users.add(member.userId);
-      } else if (selector === '@owners') {
-        for (const member of this.listOrganizationMemberships(project.organizationId)) if (member.role === 'owner') users.add(member.userId);
-      } else if (selector === '@project') {
-        for (const member of this.listProjectMemberships(task.projectId))
-          for (const userId of this.expandPrincipal(member.principal, task.projectId)) users.add(userId);
-      } else if (selector.startsWith('user:')) {
-        const userId = selector.slice(5);
-        if (this.listOrganizationMemberships(project.organizationId).some((member) => member.userId === userId)) users.add(userId);
-      } else if (selector.startsWith('@team:')) {
-        const slug = selector.slice(6);
-        const team = this.teamByRoute(project.organizationId, task.projectId, slug);
-        if (team) for (const member of this.listTeamMemberships(team.id)) users.add(member.userId);
-      } else if (selector.startsWith('team:')) {
-        const team = this.getTeam(selector.slice(5));
-        if (team?.organizationId === project.organizationId)
-          for (const member of this.listTeamMemberships(team.id)) users.add(member.userId);
-      }
-    }
-    return [...users];
+    return runAudience(humanAudience(taskId, requested), (sql, params) => this.db.prepare(sql).all(...params));
   }
 
   humanMayAct(taskId: string, userId: string): boolean {
@@ -3653,24 +3659,17 @@ export class Store {
   }
 
   private reviewAudience(task: TaskRecord): string[] {
-    if (task.lastView?.waitingFor?.kind === 'human') return this.humanAudience(task.id, task.lastView.waitingFor.audience);
-    const users = new Set<string>();
-    for (const target of task.confirmationPolicy?.targets ?? []) {
-      if (target.kind === 'project-role') {
-        for (const member of this.listProjectMemberships(target.projectId)) {
-          if (member.role === target.role) for (const userId of this.expandPrincipal(member.principal, task.projectId)) users.add(userId);
-        }
-      } else for (const userId of this.expandPrincipal(target, task.projectId)) users.add(userId);
-    }
-    // Compatibility for legacy human confirmation: project administrators are
-    // an explicit, visible fallback rather than an installation-wide broadcast.
-    if (!users.size) {
-      for (const member of this.listProjectMemberships(task.projectId)) {
-        if (member.role === 'owner' || member.role === 'admin' || member.role === 'reviewer')
-          for (const userId of this.expandPrincipal(member.principal, task.projectId)) users.add(userId);
-      }
-    }
-    return [...users];
+    return runAudience(reviewAudience(task), (sql, params) => this.db.prepare(sql).all(...params));
+  }
+
+  private audienceReader() {
+    const cache = new Map<string, Promise<any[]>>();
+    return (sql: string, params: unknown[]) => {
+      const key = JSON.stringify([sql, params]);
+      let result = cache.get(key);
+      if (!result) { result = this.readRows<any>(sql, params); cache.set(key, result); }
+      return result;
+    };
   }
 
   /**
@@ -5348,6 +5347,18 @@ export class Store {
   }
 
   /** Ownership lookups do not need a task's potentially huge transcript. */
+  async taskProjectIdAsync(taskId: string): Promise<string | undefined> {
+    const [row] = await this.readRows<{ projectId: string }>('SELECT projectId FROM tasks WHERE id=?', [taskId]);
+    return row?.projectId;
+  }
+
+  async projectOrganizationAsync(projectId: string): Promise<string | undefined> {
+    const [row] = await this.readRows<{ organizationId: string | null }>('SELECT organizationId FROM projects WHERE id=?', [projectId]);
+    return row ? row.organizationId ?? 'org_personal' : undefined;
+  }
+
+  async checkDatabaseAsync(): Promise<void> { await this.readRows('SELECT 1'); }
+
   taskAttribution(taskId: string): { projectId: string; organizationId: string } | undefined {
     return this.db.prepare(`SELECT tasks.projectId, projects.organizationId FROM tasks
       JOIN projects ON projects.id=tasks.projectId WHERE tasks.id=?`).get(taskId) as
@@ -6618,6 +6629,10 @@ function rowToView(r: any): SavedView {
 function rowToList(r: any): TaskList {
   return { id: r.id, projectId: r.projectId, name: r.name, createdAt: r.createdAt, order: r.ord };
 }
+function rowToTaskView(row: { lastView?: string; conversation?: string }): TaskView | undefined {
+  return row.lastView ? { ...(row.conversation ? JSON.parse(row.conversation) : {}), ...JSON.parse(row.lastView) } : undefined;
+}
+
 function rowToTask(r: any): TaskRecord {
   return {
     id: r.id,
@@ -6640,7 +6655,7 @@ function rowToTask(r: any): TaskRecord {
     confirmationPolicy: parseJsonOptional<ConfirmationPolicy>(r.confirmationPolicy),
     subscribers: [],
     notes: r.notes ?? undefined,
-    lastView: r.lastView ? { ...(r.conversation ? JSON.parse(r.conversation) : {}), ...JSON.parse(r.lastView) } : undefined,
+    lastView: rowToTaskView(r),
   };
 }
 

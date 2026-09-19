@@ -344,8 +344,8 @@ export class KarmaxApi {
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
-  private workflowHandle(taskId: string): any {
-    const runId = this.deps.store.getTask(taskId)?.params?._workflowRunId;
+  private workflowHandle(taskId: string, metadata?: TaskRecord | null): any {
+    const runId = (metadata === undefined ? this.deps.store.taskMetadata(taskId) : metadata)?.params?._workflowRunId;
     return this.deps.client.workflow.getHandle(taskId,
       typeof runId === 'string' && runId ? runId : undefined);
   }
@@ -2232,15 +2232,15 @@ export class KarmaxApi {
     taskId: string,
     opts?: { live?: boolean },
   ): Promise<TaskView | undefined> {
-    const rec = this.deps.store.getTask(taskId);
+    const rec = await this.deps.store.taskMetadataAsync(taskId);
     this.require(token, 'get_task', { projectId: rec?.projectId, taskId });
-    const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
+    const snapshot = () => this.deps.store.taskSnapshotAsync(taskId);
     // Cosmetic notes and the queue-time effective agent snapshot live outside the
     // workflow history, so mirror both onto whichever view we return. Keeping the
     // agent snapshot platform-side avoids changing immutable workflow replay payloads.
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
-      view = this.deps.store.withPendingReviewInfo(taskId, view);
+      view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
       // Existing parked executions recorded only "account". Read the small
       // coordinator projection to explain that wait without replaying the task
       // or restarting its agent. New lease results already carry this detail.
@@ -2256,13 +2256,18 @@ export class KarmaxApi {
           } };
         } catch { /* A coordinator outage must not block reading the task. */ }
       }
-      const agents = this.readAgentSnapshot(taskId);
-      const task = this.deps.store.getTask(taskId);
+      const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
+      let agents: Record<string, AgentSpec> | undefined;
+      try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) agents = parsed;
+      } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
+      const task = await this.deps.store.taskMetadataAsync(taskId);
+      const group = await this.deps.store.attemptCommitAsync(taskId);
       return {
         ...view,
         notes: task?.notes,
         ...(agents ? { agents } : {}),
-        ...(task ? { stageTransitions: this.availableStageTransitions(task, view) } : {}),
+        ...(task ? { stageTransitions: this.availableStageTransitions(task, view, group) } : {}),
         ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
           : { actions: this.lifecycleActions(view) }),
@@ -2278,14 +2283,14 @@ export class KarmaxApi {
     // the authoritative query for the few callers that must not read a lagging snapshot
     // (post-`updateParams` responses, review-action resolution). We also fall through to
     // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
-    const snap = snapshot();
+    const snap = await snapshot();
     // softwareDev@1.0.0 could persist "waiting for account" immediately before
     // scheduling a turn, then clear it only in workflow memory after the grant.
     // It cannot add a publish at that point without breaking replay. Treat that
     // one legacy shape as stale-prone and query its authoritative live state;
     // current workflows carry agentTurn and remain snapshot-fast.
     const legacyAccountWait =
-      this.deps.store.getTask(taskId)?.workflowVersion === '1.0.0' &&
+      rec?.workflowVersion === '1.0.0' &&
       snap?.waitingFor?.kind === 'account' &&
       !snap.agentTurn;
     if (snap && !opts?.live && !legacyAccountWait) return enrich(snap);
@@ -2293,12 +2298,15 @@ export class KarmaxApi {
     // loop) makes a query hang without rejecting, which would otherwise freeze the
     // caller. Fall back fast to whatever snapshot we have.
     try {
-      const q = this.workflowHandle(taskId).query('view') as Promise<TaskView>;
+      // Async snapshot reads may overlap a lifecycle replacement. Resolve the
+      // currently pinned run immediately before querying, not the earlier record.
+      const current = await this.deps.store.taskMetadataAsync(taskId);
+      const q = this.workflowHandle(taskId, current ?? null).query('view') as Promise<TaskView>;
       q.catch(() => undefined); // swallow the late rejection if we time out first
       const view = await withTimeout(q, QUERY_TIMEOUT_MS);
-      return enrich((view as TaskView) ?? snapshot());
+      return enrich((view as TaskView) ?? await snapshot());
     } catch {
-      return enrich(snapshot());
+      return enrich(await snapshot());
     }
   }
 
@@ -2333,6 +2341,17 @@ export class KarmaxApi {
     this.require(token, 'get_task');
     const record = this.deps.store.getTask(taskId);
     if (!record?.params?.draft) return undefined;
+    return this.projectDraftView(record, group);
+  }
+
+  async getDraftViewAsync(token: string, taskId: string): Promise<TaskView | undefined> {
+    this.require(token, 'get_task');
+    const record = await this.deps.store.taskMetadataAsync(taskId);
+    this.require(token, 'get_task', { projectId: record?.projectId, taskId });
+    return record?.params?.draft ? this.projectDraftView(record, {}) : undefined;
+  }
+
+  private projectDraftView(record: TaskRecord, group?: { committedAttemptId?: string }): TaskView {
     const view: TaskView = {
       taskId: record.id,
       title: record.title,
@@ -3694,7 +3713,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Resolve the human-facing project-local number (#100) without guessing ids. */
   async findTask(token: string, projectId: string, num: number): Promise<TaskRecord | undefined> {
     this.require(token, 'find_task', { projectId });
-    return this.deps.store.getTaskByNum(projectId, num);
+    const pointer = await this.deps.store.taskPointerByNumAsync(projectId, num);
+    return pointer ? this.deps.store.getTaskAsync(pointer.id) : undefined;
   }
 
   /** Every durable agent conversation attached to a task, including sessions. */

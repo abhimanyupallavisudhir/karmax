@@ -1,3 +1,4 @@
+import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
 import { GatewayMetrics } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
@@ -1721,7 +1722,7 @@ export class Gateway {
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
     if (p === '/api/health/ready' && method === 'GET') {
       try {
-        this.deps.store.db.prepare('SELECT 1').get();
+        await withTimeout(this.deps.store.checkDatabaseAsync(), 2_000);
         await withTimeout(this.deps.client.workflowService.getSystemInfo({}), 2_000);
         return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ts: Date.now() });
       } catch {
@@ -1763,7 +1764,7 @@ export class Gateway {
     }
 
     // ── authenticated endpoints ──
-    const requestedScope = this.requestScope(p, url);
+    const requestedScope = await this.requestScope(p, url);
     const auditScope = requestedScope.projectId ? `project:${requestedScope.projectId}`
       : requestedScope.organizationId ? `organization:${requestedScope.organizationId}` : 'global';
     const session = await this.auth(req, requestedScope.projectId, requestedScope.organizationId);
@@ -2917,10 +2918,13 @@ export class Gateway {
       }
       if (p === '/api/metrics' && method === 'GET') {
         const pool = store.asyncReadStats;
+        const checkpoints = checkpointEncodingStats();
         const value = prometheusMetrics(store.operationalSnapshot()) + (this.operationalMetrics?.prometheus() ?? '')
           + `# TYPE karmax_database_pending gauge\nkarmax_database_pending ${pool.pending}\n`
           + `# TYPE karmax_database_connections gauge\nkarmax_database_connections ${pool.connections}\n`
-          + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`;
+          + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`
+          + `# TYPE karmax_checkpoint_encoders_active gauge\nkarmax_checkpoint_encoders_active ${checkpoints.active}\n`
+          + `# TYPE karmax_checkpoint_encoders_waiting gauge\nkarmax_checkpoint_encoders_waiting ${checkpoints.waiting}\n`;
         res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8',
           'content-length': String(Buffer.byteLength(value)), 'cache-control': 'no-store' });
         return void res.end(value);
@@ -4202,18 +4206,18 @@ export class Gateway {
       // isn't in the client's loaded list (e.g. an archived task).
       const byNumMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks\/by-num\/(\d+)$/);
       if (byNumMatch && method === 'GET') {
-        const rec = store.getTaskByNum(byNumMatch[1]!, Number(byNumMatch[2]!));
+        const rec = await store.taskPointerByNumAsync(byNumMatch[1]!, Number(byNumMatch[2]!));
         if (!rec) return this.json(res, 404, { error: 'no such task' });
         return this.json(res, 200, { id: rec.id, num: rec.num, projectId: rec.projectId });
       }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        const rec = store.getTask(viewMatch[1]!);
+        const rec = await store.taskMetadataAsync(viewMatch[1]!);
         // Draft attempts have no Temporal execution, but are still selectable in
         // the drawer. Keep that synthetic projection separate from getTaskView so
         // list snapshots continue to truthfully report no execution view.
         const view = rec?.params?.draft
-          ? api.getDraftView(token, viewMatch[1]!)
+          ? await api.getDraftViewAsync(token, viewMatch[1]!)
           : await api.getTaskView(token, viewMatch[1]!);
         if (!view) return this.json(res, 200, null);
         // Mirror the record's sequential number onto the view (the workflow only
@@ -8159,7 +8163,7 @@ export class Gateway {
     return `mailbox:${provider}:${organizationId}:auth`;
   }
 
-  private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
+  private async requestScope(pathname: string, url: URL): Promise<{ projectId?: string; taskId?: string; organizationId?: string }> {
     // Routes whose only identifier is a bare record id still belong to exactly
     // one project. Resolving that project here is what arms the tenant guard in
     // `TokenAuthority.check` — without it a `task:edit` token from any project
@@ -8179,11 +8183,11 @@ export class Gateway {
     const previewRecord = previewId ? this.deps.store.previewLease(previewId) : undefined;
     const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? artifactRecord?.taskId ?? previewRecord?.taskId
       ?? url.searchParams.get('taskId') ?? undefined;
-    const taskProject = taskId ? this.deps.store.getTask(taskId)?.projectId : undefined;
+    const taskProject = taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined;
     const resolvedProjectId = projectId ?? taskProject;
     const organizationId = pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1]
       ?? url.searchParams.get('organizationId')
-      ?? (resolvedProjectId ? this.deps.store.getProject(resolvedProjectId)?.organizationId : undefined);
+      ?? (resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined);
     return { projectId: resolvedProjectId, organizationId, ...(taskId ? { taskId } : {}) };
   }
   private async sendWebResponse(res: http.ServerResponse, response: Response) {

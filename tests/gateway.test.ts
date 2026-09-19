@@ -1962,6 +1962,25 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     } finally { hydrate.mockRestore(); }
   });
 
+  it('opens task details and numbered links without hydrating conversations for routing', async () => {
+    const project = h.store.createProject('Async detail');
+    const task = h.store.createTask({ projectId: project.id, title: 'Detail', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: 'fixture' } });
+    h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+      messages: [{ id: 'm', text: 'history', role: 'agent', ts: 1 }], actions: [], state: {}, updatedAt: 1 });
+    const hydrate = vi.spyOn(h.store, 'getTask');
+    const snapshot = vi.spyOn(h.store, 'taskSnapshotAsync');
+    try {
+      const response = await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ taskId: task.id, num: task.num, messages: [{ text: 'history' }] });
+      const numbered = await fetch(`${base}/api/projects/${project.id}/tasks/by-num/${task.num}`, { headers: auth() });
+      expect(await numbered.json()).toEqual({ id: task.id, num: task.num, projectId: project.id });
+      expect(hydrate.mock.calls.filter(([id]) => id === task.id)).toHaveLength(0);
+      expect(snapshot.mock.calls.filter(([id]) => id === task.id)).toHaveLength(1);
+    } finally { hydrate.mockRestore(); snapshot.mockRestore(); }
+  });
+
   it('serves bounded task pages and rejects invalid pagination', async () => {
     const project = h.store.createProject('Paged task list');
     for (let i = 0; i < 4; i++) h.store.createTask({ projectId: project.id, title: `Page ${i}`,
