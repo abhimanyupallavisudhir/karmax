@@ -57,9 +57,9 @@ export class DurableEventFanout {
         // Consume the oldest page after the cursor. allEventsSince(..., limit)
         // intentionally returns the newest page for activity/history views; using
         // it here would skip the middle of bursts larger than one page.
-        const rows = this.store.nextEventsSince(this.cursor, 500);
+        const rows = await this.store.nextEventsSince(this.cursor, 500);
         if (!rows.length) break;
-        const projects = this.store.taskProjectIds(rows.map(row => row.taskId));
+        const projects = await this.store.taskProjectIds(rows.map(row => row.taskId));
         for (const event of rows) {
           if (this.closed) break;
           this.cursor = Math.max(this.cursor, event.seq ?? 0);

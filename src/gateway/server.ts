@@ -1,3 +1,4 @@
+import { GatewayMetrics } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { TimingDelivery } from '../timing/delivery.js';
@@ -625,6 +626,7 @@ export class Gateway {
   }
 
   private timingListeners = new Set<(enabled: boolean) => void>();
+  private operationalMetrics?: GatewayMetrics;
   private timingPoll?: ReturnType<typeof setInterval>;
   private timingValue = false;
   private refreshTiming(): void {
@@ -989,7 +991,13 @@ export class Gateway {
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
-    const server = http.createServer((req, res) => this.handle(req, res).catch((e) => this.fail(res, e)));
+    this.operationalMetrics = new GatewayMetrics();
+    const server = http.createServer((req, res) => {
+      const finish = this.operationalMetrics!.begin(req.url ?? '/');
+      res.once('finish', () => finish(res.statusCode));
+      res.once('close', () => finish(res.writableFinished ? res.statusCode : 499));
+      void this.handle(req, res).catch((e) => this.fail(res, e));
+    });
     this.server = server;
 
     // Two WebSocket endpoints, routed by path on upgrade:
@@ -1070,6 +1078,7 @@ export class Gateway {
           this.gitPassAutoSyncTimer = undefined;
           this.reviewActions.stopAll();
           this.fanout.close();
+          this.operationalMetrics?.close();
           // `WebSocketServer.close()` does not terminate existing upgraded
           // sockets, and `http.Server.close()` waits for them forever. A stale
           // browser/test connection therefore used to wedge shutdown and leave
@@ -2907,7 +2916,11 @@ export class Gateway {
         });
       }
       if (p === '/api/metrics' && method === 'GET') {
-        const value = prometheusMetrics(store.operationalSnapshot());
+        const pool = store.asyncReadStats;
+        const value = prometheusMetrics(store.operationalSnapshot()) + (this.operationalMetrics?.prometheus() ?? '')
+          + `# TYPE karmax_database_pending gauge\nkarmax_database_pending ${pool.pending}\n`
+          + `# TYPE karmax_database_connections gauge\nkarmax_database_connections ${pool.connections}\n`
+          + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`;
         res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8',
           'content-length': String(Buffer.byteLength(value)), 'cache-control': 'no-store' });
         return void res.end(value);
@@ -4004,6 +4017,19 @@ export class Gateway {
       if (tasksMatch) {
         const projectId = tasksMatch[1]!;
         if (method === 'GET') {
+          if (url.searchParams.get('page') === '1') {
+            const limit = Number(url.searchParams.get('limit') ?? '200');
+            const offset = Number(url.searchParams.get('offset') ?? '0');
+            if (!Number.isInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0)
+              return this.json(res, 400, { error: 'limit must be 1–200 and offset a nonnegative integer' });
+            const result = await api.taskSummaryPage(token, projectId, {
+              includeArchived: url.searchParams.get('includeArchived') === '1', limit, offset,
+            });
+            const organizationId = store.getProject(projectId)?.organizationId;
+            const counts = organizationId ? this.approvalCounts(organizationId) : new Map<string, number>();
+            return this.json(res, 200, { ...result, tasks: result.tasks.map(task => ({ ...task,
+              lastView: this.withApprovalRequests(task.lastView, task.id, counts) })) });
+          }
           const all = await api.listTaskSummaries(token, projectId);
           // Archived tasks are hidden from the default list (SPEC §11 housekeeping).
           const includeArchived = url.searchParams.get('includeArchived') === '1';

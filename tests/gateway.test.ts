@@ -1962,6 +1962,20 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     } finally { hydrate.mockRestore(); }
   });
 
+  it('serves bounded task pages and rejects invalid pagination', async () => {
+    const project = h.store.createProject('Paged task list');
+    for (let i = 0; i < 4; i++) h.store.createTask({ projectId: project.id, title: `Page ${i}`,
+      workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'fixture', draft: true, archived: i === 0 } });
+    const route = `${base}/api/projects/${project.id}/tasks?page=1`;
+    const response = await fetch(`${route}&limit=2&offset=1`, { headers: auth() });
+    expect(response.status).toBe(200);
+    const page: any = await response.json();
+    expect(page.total).toBe(3);
+    expect(page.tasks.map((task: any) => task.title)).toEqual(['Page 2', 'Page 3']);
+    for (const query of ['limit=201', 'limit=NaN', 'offset=-1', 'offset=1.5'])
+      expect((await fetch(`${route}&${query}`, { headers: auth() })).status).toBe(400);
+  });
+
   it('projects credential approvals onto the task, notifies its human, and resumes it after resolution', async () => {
     const repo = await h.makeRepo('gw-credential-approval');
     const project: any = await (await fetch(`${base}/api/projects`, {

@@ -730,7 +730,7 @@ describe('Store', () => {
     expect(store.attemptsOf(original.id).every((attempt) => attempt.params.archived === false)).toBe(true);
   });
 
-  it('appends and reads events incrementally', () => {
+  it('appends and reads events incrementally', async () => {
     const p = store.createProject('Acme');
     const t = store.createTask({
       projectId: p.id,
@@ -747,7 +747,7 @@ describe('Store', () => {
     expect(store.eventBySeq(t.id, s2)?.payload.text).toBe('b');
     expect(store.eventsSince(t.id, 0, 2).map((e) => e.payload.text)).toEqual(['b', 'c']);
     expect(store.latestEventSeq()).toBe(s3);
-    expect(store.nextEventsSince(0, 2).map((e) => e.payload.text)).toEqual(['a', 'b']);
+    expect((await store.nextEventsSince(0, 2)).map((e) => e.payload.text)).toEqual(['a', 'b']);
     store.appendEvent({ type: 'conversation.explanation', taskId: t.id, ts: 4, payload: { text: 'plain language' } });
     expect(store.eventsOfType(t.id, 'conversation.explanation').map((e) => e.payload.text)).toEqual(['plain language']);
   });

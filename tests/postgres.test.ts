@@ -18,6 +18,25 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('uses native asynchronous pagination with compact views and archive filtering', async () => {
+    const store = new Store(url!);
+    try {
+      const project = store.createProject('Page');
+      for (let i = 0; i < 4; i++) store.createTask({ projectId: project.id, title: `Task ${i}`, workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'work', archived: i === 0 } });
+      const page = await store.taskSummaryPage(project.id, { limit: 2, offset: 1 });
+      expect(page.total).toBe(3);
+      expect(page.tasks.map(task => task.title)).toEqual(['Task 2', 'Task 3']);
+      expect((await store.taskSummaryPage(project.id, { includeArchived: true })).total).toBe(4);
+      const taskId = page.tasks[0]!.id;
+      const cursor = store.latestEventSeq();
+      store.appendEvent({ taskId, type: 'fixture', ts: 1, payload: { text: 'ordered' } });
+      const events = await store.nextEventsSince(cursor, 500);
+      expect(events.map(event => event.payload.text)).toEqual(['ordered']);
+      expect(await store.taskProjectIds(events.map(event => event.taskId))).toEqual(new Map([[taskId, project.id]]));
+    } finally { store.close(); }
+  });
+
   it('looks up usage IDs in bounded batches and task ownership without loading views', () => {
     const store = new Store(url!);
     try {

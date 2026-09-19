@@ -2361,6 +2361,11 @@ export class KarmaxApi {
     return this.deps.store.listTaskSummaries(projectId);
   }
 
+  async taskSummaryPage(token: string, projectId: string, options: { includeArchived?: boolean; limit?: number; offset?: number }) {
+    this.require(token, 'list_tasks', { projectId });
+    return this.deps.store.taskSummaryPage(projectId, options);
+  }
+
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
   async addAttempt(token: string, sourceTaskId: string): Promise<TaskRecord> {
     const source = this.deps.store.getTask(sourceTaskId);
@@ -3889,9 +3894,21 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // compact projection so routine list filtering never parses all transcripts.
     const needsConversation = q.filters?.some((clause) =>
       clause.field === 'conversation' || clause.field === 'says') ?? false;
-    const tasks = needsConversation
-      ? this.deps.store.listTasks(projectId)
-      : this.deps.store.listTaskSummaries(projectId);
+    // Preserve the evaluator's relational semantics: dependency fields need the
+    // full project index, including archived dependencies. Ordinary active-list
+    // searches can discard archived rows in SQL before reading any JSON.
+    const fields = [...(q.filters ?? []).map(c => c.field), ...(q.sort ?? []).map(c => c.field), q.group];
+    const activeOnly = !fields.some(field => field === 'dependsOn' || field === 'blocks')
+      && q.filters?.some(c => c.field === 'is' && c.negate && c.values.length === 1 && c.values[0] === 'archived');
+    const tasks: TaskRecord[] = [];
+    if (needsConversation) tasks.push(...this.deps.store.listTasks(projectId));
+    else {
+      for (let offset = 0; ; offset += 200) {
+        const page = await this.deps.store.taskSummaryPage(projectId, { includeArchived: !activeOnly, offset });
+        tasks.push(...page.tasks);
+        if (!page.tasks.length || tasks.length >= page.total) break;
+      }
+    }
     const tags = this.deps.store.listTags(projectId);
     const principal = principalRefOf(caller.principal);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });

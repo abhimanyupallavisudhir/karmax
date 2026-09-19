@@ -7,6 +7,8 @@ import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
+import { AsyncPostgres } from './async-sql.js';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
 import {
@@ -133,10 +135,11 @@ export const isReviewRequestEvent = (type: string): boolean =>
 export class Store {
   readonly db: SqlDatabase;
   readonly hosted: boolean;
+  private asyncDatabase?: AsyncPostgres;
   private userNames?: () => Array<{ id: string; name: string }>;
   private organizationEntitlementListeners = new Set<(organizationId: string) => void>();
 
-  constructor(dbPath = ':memory:', options: { hosted?: boolean } = {}) {
+  constructor(private readonly dbPath = ':memory:', options: { hosted?: boolean } = {}) {
     this.hosted = options.hosted === true;
     if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = openSqlDatabase(dbPath);
@@ -2924,6 +2927,50 @@ export class Store {
     return this.attachTags(projectId, rows.map(rowToTask));
   }
 
+  get asyncReadStats() { return this.asyncDatabase?.stats ?? { pending: 0, connections: 0, waiting: 0 }; }
+
+  private async readRows<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+    if (isPostgresTarget(this.dbPath)) {
+      this.asyncDatabase ??= new AsyncPostgres(this.dbPath);
+      return this.asyncDatabase.query(sql, params) as Promise<T[]>;
+    }
+    // Local SQLite reads are bounded by their SQL limit. Give sockets and
+    // heartbeat timers a turn between pages even on the single-user backend.
+    await yieldTurn();
+    return this.db.prepare(sql).all(...params) as T[];
+  }
+
+  async taskSummaryPage(projectId: string, options: { includeArchived?: boolean; limit?: number; offset?: number } = {}) {
+    const limit = options.limit ?? 200, offset = options.offset ?? 0;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0)
+      throw new Error('limit must be 1–200 and offset must be a non-negative integer');
+    const archived = options.includeArchived ? '' : this.db.dialect === 'postgres'
+      ? " AND COALESCE((t.params::jsonb ->> 'archived')::boolean, false)=false"
+      : " AND COALESCE(json_extract(t.params, '$.archived'), 0)=0";
+    const from = `FROM tasks t JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${archived}`;
+    const rows = await this.readRows<any>(`SELECT t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
+      t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord, t.parentTaskId,
+      t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
+      json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView,
+      COALESCE(t.num, root.num) AS resolvedNum ${from}
+      ORDER BY root.ord, root.createdAt, root.id LIMIT ? OFFSET ?`, [projectId, limit, offset]);
+    const [count] = await this.readRows<{ total: number }>(`SELECT COUNT(*) AS total ${from}`, [projectId]);
+    const tasks = rows.map(rowToTask);
+    if (tasks.length) {
+      const ids = tasks.map(task => task.id), placeholders = ids.map(() => '?').join(',');
+      const tags = await this.readRows<{ taskId: string; tagId: string }>(
+        `SELECT taskId, tagId FROM task_tags WHERE taskId IN (${placeholders})`, ids);
+      const subscribers = await this.readRows<{ taskId: string; principal: string }>(
+        `SELECT taskId, principal FROM task_subscribers WHERE taskId IN (${placeholders}) ORDER BY createdAt`, ids);
+      const byId = new Map(tasks.map(task => [task.id, task]));
+      for (const row of tags) (byId.get(row.taskId)!.tags ??= []).push(row.tagId);
+      for (const row of subscribers) byId.get(row.taskId)!.subscribers!.push(JSON.parse(row.principal));
+      for (const task of tasks) if (task.confirmationPolicy) task.reviewers = this.reviewAudience(task);
+    }
+    return { tasks, total: Number(count?.total ?? 0), offset };
+  }
+
   /** Project default is read at Review time, including for already-running tasks. */
   otherAttemptsDefault(taskId: string): 'ask' | 'keep' | 'cancel' {
     const task = this.getTask(taskId);
@@ -4518,21 +4565,19 @@ export class Store {
   }
 
   /** Oldest bounded page after a cursor, for lossless forward consumers. */
-  nextEventsSince(seq: number, limit: number): (KarmaxEvent & { seq: number })[] {
-    return (this.db
-      .prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?')
-      .all(seq, limit) as any[])
-      .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  async nextEventsSince(seq: number, limit: number): Promise<(KarmaxEvent & { seq: number })[]> {
+    const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?', [seq, limit]);
+    return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
-  taskProjectIds(taskIds: readonly string[]): Map<string, string> {
+  async taskProjectIds(taskIds: readonly string[]): Promise<Map<string, string>> {
     const result = new Map<string, string>();
     const ids = [...new Set(taskIds)];
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = this.db.prepare(`SELECT id, projectId FROM tasks WHERE id IN (${batch.map(() => '?').join(',')})`)
-        .all(...batch) as Array<{ id: string; projectId: string }>;
+      const rows = await this.readRows<{ id: string; projectId: string }>(
+        `SELECT id, projectId FROM tasks WHERE id IN (${batch.map(() => '?').join(',')})`, batch);
       for (const row of rows) result.set(row.id, row.projectId);
     }
     return result;
@@ -6112,6 +6157,7 @@ export class Store {
   }
 
   close() {
+    void this.asyncDatabase?.close().catch(error => console.error('[store] closing read pool:', error));
     this.organizationEntitlementListeners.clear();
     this.db.close();
   }

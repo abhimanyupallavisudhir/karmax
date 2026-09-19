@@ -251,7 +251,8 @@ function feedbackFetch(input, opts = {}) {
 // has one row per logical task. Page lookups must also consult the loaded group.
 function taskRecord(id) {
   return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
-    || (S.tasks || []).find((t) => t.id === id);
+    || (S.tasks || []).find((t) => t.id === id)
+    || (S.searchResult?.tasks || []).find((t) => t.id === id);
 }
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -3140,9 +3141,18 @@ async function loadTasks() {
   const projectId = S.projectId;
   if (!projectId) return false;
   const epoch = S.taskLoadEpoch = (S.taskLoadEpoch || 0) + 1;
-  // Always fetch the full set incl. archived; the task list decides visibility via the
-  // query (default -is:archived). S.tasks is the shared pool for the task page, counts, etc.
-  const fetched = await api(`/api/projects/${projectId}/tasks?includeArchived=1`);
+  // The live pool contains active tasks. Archived records are fetched by search
+  // when requested, and individual routes resolve their own task. Bound each
+  // read in SQL instead of repeatedly downloading the project's entire archive.
+  const fetched = [];
+  for (let offset = 0; ; offset += 200) {
+    const page = await api(`/api/projects/${projectId}/tasks?page=1&limit=200&offset=${offset}`);
+    if (S.taskLoadEpoch !== epoch || S.projectId !== projectId) return false;
+    // Compatibility with an older gateway during console/image transitions.
+    if (Array.isArray(page)) { fetched.push(...page); break; }
+    fetched.push(...page.tasks);
+    if (!page.tasks.length || fetched.length >= page.total) break;
+  }
   if (S.taskLoadEpoch !== epoch || S.projectId !== projectId) return false;
   // Drop any draft we just deleted: a list request issued before the DELETE landed
   // can still return it and clobber the optimistic removal. Once a fresh fetch no
@@ -5418,7 +5428,7 @@ function wireTasksView() {
   );
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
-    e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
+    e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, taskRecord(e.dataset.draft)); }),
   );
   $('#main').querySelectorAll('[data-queue]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Task started'); refreshTasks(); } catch (e) { showTaskError(e, taskRecord(b.dataset.queue)?.projectId); } }),
@@ -5427,7 +5437,7 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       // Deleting a draft is a hard delete with no undo, so confirm first.
-      const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
+      const title = taskRecord(b.dataset.deldraft)?.title || 'this draft';
       if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
       if (await deleteDraft(b.dataset.deldraft)) toast('Draft removed');
     }),
@@ -5440,7 +5450,7 @@ function wireTasksView() {
   );
   // Clicking a waiting task's body opens the same form as a draft — fully editable, triggers included.
   $('#main').querySelectorAll('[data-armed]').forEach((e) =>
-    e.addEventListener('click', (ev) => { if (!ev.target.dataset.runnow && !ev.target.dataset.canceltrig) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.armed)); }),
+    e.addEventListener('click', (ev) => { if (!ev.target.dataset.runnow && !ev.target.dataset.canceltrig) openTaskForm(undefined, taskRecord(e.dataset.armed)); }),
   );
   // Repeatable series: run again, expand/collapse its runs, edit (body click), delete.
   $('#main').querySelectorAll('[data-runagain]').forEach((b) =>
@@ -5454,7 +5464,7 @@ function wireTasksView() {
   );
   $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
-    const title = S.tasks.find((t) => t.id === id)?.title || 'task';
+    const title = taskRecord(id)?.title || 'task';
     try {
       await api(`/api/tasks/${id}/archive`, { method: 'POST', body: JSON.stringify({ archived }) });
       // Archiving only hides — offer an immediate one-click Undo so an accidental

@@ -27,7 +27,7 @@ it('routes a burst once per database page, irrespective of browser count, and yi
     .run(task.id, 'fixture', i, '{}').lastInsertRowid));
   bus.emit({ taskId: task.id, type: 'fixture', ts: 1, payload: {} });
   expect(received[0]).toHaveLength(0); // publisher never drains inline
-  await yieldTurn();
+  for (let turn = 0; turn < 20 && !received[0]!.length; turn++) await yieldTurn();
   expect(received[0]!.length).toBeGreaterThan(0);
   expect(received[0]!.length).toBeLessThan(1100);
   await vi.waitFor(() => expect(received[0]).toHaveLength(1100));
