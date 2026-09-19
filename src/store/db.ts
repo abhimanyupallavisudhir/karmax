@@ -4499,6 +4499,19 @@ export class Store {
   }
 
   setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+    if (workflow === 'vault') {
+      const grants = values.credentialGrants;
+      if (grants !== undefined && (!Array.isArray(grants) || grants.length > 500
+        || grants.some(grant => typeof grant !== 'string' || !/^use-credential:item:[a-zA-Z0-9_-]+$/.test(grant))
+        || new Set(grants).size !== grants.length)) throw new Error('Choose individual vault credentials for task defaults');
+      const policies = values.credentialPolicies;
+      if (policies !== undefined && (!policies || typeof policies !== 'object' || Array.isArray(policies)
+        || Object.entries(policies).some(([id, policy]) => !Array.isArray(grants) || !grants.includes(`use-credential:item:${id}`)
+          || !policy || typeof policy !== 'object' || Array.isArray(policy)
+          || Object.entries(policy).some(([key, value]) => key === 'use' ? !['auto', 'ask'].includes(value as string)
+            : key === 'reveal' ? !['auto', 'ask', 'never'].includes(value as string) : true))))
+        throw new Error('Invalid vault credential default policies');
+    }
     if (workflow === 'payments') {
       if (values.budget !== undefined && values.budget !== null && (!Number.isSafeInteger(values.budget) || Number(values.budget) < 0))
         throw new Error('Budget must be a non-negative amount in cents');

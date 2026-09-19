@@ -16,7 +16,7 @@ export const BUILTIN_MCPS = ['browser:chrome-devtools', 'browser:playwright'] as
 export function validateMcpSelection(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > 24 || value.some((v) => typeof v !== 'string'
-    || (!BUILTIN_MCPS.includes(v as any) && !/^mcp_[a-f0-9]{24}$/.test(v)))) throw new Error('Tools must be a list of MCP connection IDs');
+    || (!BUILTIN_MCPS.includes(v as any) && !/^mcp_[a-f0-9]{24}$/.test(v) && !/^composio:conn_[a-z0-9]+$/.test(v)))) throw new Error('Tools must be a list of MCP or app connection IDs');
   if (new Set(value).size !== value.length) throw new Error('Tools contains duplicate connections');
   return value;
 }
@@ -131,7 +131,7 @@ export class McpConnections {
     this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)); }
   selected(ids: string[], projectId: string): McpConnection[] {
     validateMcpSelection(ids);
-    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any)).map((id) => {
+    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any) && !id.startsWith('composio:')).map((id) => {
       const c = this.get(id, projectId);
       if (!c.enabled) throw new Error(`MCP connection “${c.label}” is disabled. Update the Agent tools selection.`);
       return c;

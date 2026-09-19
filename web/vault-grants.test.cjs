@@ -33,8 +33,8 @@ ok(taskForm.includes('id="tf-vault-open"'), 'task form renders one Vault credent
 ok(!taskForm.includes('id="tf-vault-grants"'), 'task form no longer renders the inline vault list');
 ok(!taskForm.includes('class="tf-vault-grant"'), 'task form no longer renders one checkbox per vault item');
 ok(taskForm.includes('const vaultGrantIds = new Set'), 'selected grants live in compact form-local state');
-ok(taskForm.includes('credentialGrants: [...vaultGrantIds]'), 'selected grants are included in task persistence');
-ok(taskForm.includes('credentialPolicies: vaultCredentialPolicies'), 'task-specific policies are included in task persistence');
+ok(taskForm.includes('credentialGrants: inheritedVault.error ? undefined : [...vaultGrantIds]'), 'selected grants are included in task persistence');
+ok(taskForm.includes('credentialPolicies: inheritedVault.error ? undefined : vaultCredentialPolicies'), 'task-specific policies are included in task persistence');
 
 ok(picker.includes('class="vault-grant-all"'), 'picker offers Select all');
 ok(picker.includes('class="vault-grant-pick"'), 'picker offers individual selection');

@@ -115,4 +115,17 @@ describe('connection gateway flow', () => {
     expect(await config.json()).toEqual({ configured: true, canConfigure: false });
     expect((await request('/api/connections/config', { token: agent, method: 'PUT', body: { apiKey: 'other-key' } })).status).toBe(403);
   });
+  it('includes project-shared accounts in human Tools search without exposing other private accounts', async () => {
+    const shared = await service.connect(org, 'bob', { toolkit: 'calendar' });
+    await service.share(org, shared.connection.id, 'bob', [project]);
+    const privateAccount = await service.connect(org, 'bob', { toolkit: 'drive' });
+    const response = await request(`/api/connections?organizationId=${org}&projectId=${project}`);
+    expect(response.status).toBe(200);
+    const rows = await response.json() as any[];
+    expect(rows.some(c => c.id === shared.connection.id)).toBe(true);
+    expect(rows.some(c => c.id === privateAccount.connection.id)).toBe(false);
+    expect((await request(`/api/connections?organizationId=${otherOrg}&projectId=${project}`)).status).toBe(403);
+    expect((await request(`/api/connections/${shared.connection.id}/disconnect?organizationId=${org}`, { method: 'POST', body: {} })).status).toBe(403);
+  });
+
 });

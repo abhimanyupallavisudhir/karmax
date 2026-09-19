@@ -5636,7 +5636,8 @@ export class Gateway {
           return this.json(res, 403, { error: 'Task access denied' });
         const ownerId = callerIdentity.humanSubject?.userId;
         const requireOwner = () => requireHumanSubject(callerIdentity).userId;
-        const projectId = task?.projectId;
+        const projectId = task?.projectId ?? url.searchParams.get('projectId') ?? undefined;
+        if (!task && projectId && (store.getProject(projectId)?.organizationId !== org || !this.deps.tokens.check(token, 'project:read', { projectId, organizationId: org }).ok)) return this.json(res, 403, { error: 'Project access denied' });
         const b = ['POST', 'PUT'].includes(method) ? await this.body(req) : {};
         try {
           if (p === '/api/connections/config') {

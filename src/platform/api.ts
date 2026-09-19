@@ -1058,9 +1058,13 @@ export class KarmaxApi {
     if (args.authorization && profileAttenuated
       && !(args.draft && args.allowAttenuation) && !args.acceptAttenuation)
       throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
-    this.applyCredentialGrants(authorization, args.credentialGrants, caller.caps);
+    const orgVault = this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault') ?? {};
+    const projectVault = this.deps.store.getSettings(project.id, 'vault') ?? {};
+    const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
+    const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
+    this.applyCredentialGrants(authorization, grants, caller.caps);
     const credentialPolicies = this.credentialPolicyOverrides(
-      project.organizationId ?? 'org_personal', args.credentialPolicies, caller.caps, authorization,
+      project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
     );
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
