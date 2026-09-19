@@ -15,12 +15,10 @@ import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
 import { sameRepository } from './repository-identity.js';
 
-const gzip = promisify(zlib.gzip);
+import { encodePortableDelta, type DeltaFile, type PortableDelta } from './checkpoint-encoding.js';
 const gunzip = promisify(zlib.gunzip);
 export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
-interface DeltaFile { repo: string; path: string; deleted?: boolean; data?: string }
-interface PortableDelta { version: 1; files: DeltaFile[] }
 
 /** How a restoring activity keeps its runner-lease wait alive and cancellable. */
 export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void }
@@ -78,7 +76,7 @@ export class WorldCheckpointService {
     const world = await this.worlds.open(handle);
     const linked = this.store.listProjectRepositories(projectId);
     const organizationRepositories = this.store.listRepositories(project.organizationId);
-    const files: DeltaFile[] = [];
+    const files: Array<{ repo: string; path: string; deleted?: boolean; readPath?: string }> = [];
     const repos: WorldCheckpoint['repos'] = [];
     const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
     const ignored = await this.resources?.ignoredInventory(handle.id).catch(() => undefined);
@@ -98,8 +96,7 @@ export class WorldCheckpointService {
           || resourcePaths.some((target) => relative === target || relative.startsWith(`${target}/`))) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
-          const data = await world.readFileBuffer(relative);
-          files.push({ repo: repo.name, path: change.path, data: data.toString('base64') });
+          files.push({ repo: repo.name, path: change.path, readPath: relative });
         }
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
@@ -120,11 +117,15 @@ export class WorldCheckpointService {
         if (!safeDeltaPath(file) || file === '.env' || file.startsWith('.karmax-injection/')
           || ephemeralPaths.has(file)
           || resourcePaths.some((target) => target === '.' || file === target || file.startsWith(`${target}/`))) continue;
-        files.push({ repo: '', path: file, data: (await world.readFileBuffer(file)).toString('base64') });
+        files.push({ repo: '', path: file, readPath: file });
       }
     }
-    const delta: PortableDelta = { version: 1, files };
-    const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
+    async function* contents(): AsyncGenerator<DeltaFile> {
+      for (const { readPath, ...file } of files) {
+        yield readPath === undefined ? file : { ...file, data: (await world.readFileBuffer(readPath)).toString('base64') };
+      }
+    }
+    const compressed = await encodePortableDelta(contents());
     const encrypted = this.encrypt(compressed);
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
