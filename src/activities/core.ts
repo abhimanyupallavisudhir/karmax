@@ -4611,11 +4611,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             throw ApplicationFailure.nonRetryable('Conversation publication reference was reused', 'view-publication');
           store.kvSet(key, json);
         }
-        const stored = store.kvGet(key);
-        if (!stored)
+        if (!store.kvHas(key))
           throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
-        const conversation: ViewConversation = JSON.parse(stored);
-        view = { ...publication, ...conversation };
+        // The store can reuse the immutable conversation directly in SQL. A
+        // status publication must never parse/rewrite the historical transcript.
+        view = { ...publication, messages: publication.messages ?? [] };
       } else {
         if (publication.messages === undefined)
           throw ApplicationFailure.nonRetryable('Full view publication requires messages', 'view-publication');
@@ -4651,7 +4651,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (timingEnabled(store)) {
         let workflowRunId: string | undefined;
         try { workflowRunId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
-        const previousView = store.getTask(taskId)?.lastView;
+        const previousView = store.taskMetadata(taskId)?.lastView;
         const accountBefore = previousView?.waitingFor?.kind === 'account';
         const accountAfter = view.waitingFor?.kind === 'account';
         if (accountBefore !== accountAfter) {
@@ -4666,7 +4666,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           trace.mark(`queue.observed.${after?.state ?? 'released'}`);
         }
       }
-      store.saveView(taskId, view);
+      store.saveView(taskId, view, conversationReference);
       // First Merge admission freezes whether sibling proposals remain eligible.
       // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {

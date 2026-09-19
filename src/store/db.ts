@@ -149,6 +149,7 @@ export class Store {
     this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.migrate();
     this.migrateData();
+    this.migrateConversations();
     this.paymentTransaction(() => {
       if (this.kvGet('migration:unique-card-names')) return;
       const rows = this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
@@ -166,6 +167,24 @@ export class Store {
       }
       this.kvSet('migration:unique-card-names', '1');
     });
+  }
+
+  /** Upgrade old snapshots in bounded pages before accepting traffic. The old
+   * fields remain readable during imports; every new write uses the split form. */
+  private migrateConversations(): void {
+    let cursor = '';
+    for (;;) {
+      const rows = this.db.prepare(`SELECT id, lastView FROM tasks
+        WHERE id > ? AND lastView IS NOT NULL AND conversation IS NULL ORDER BY id LIMIT 100`)
+        .all(cursor) as Array<{ id: string; lastView: string }>;
+      if (!rows.length) break;
+      for (const row of rows) {
+        cursor = row.id;
+        const { messages, transcripts, ...status } = JSON.parse(row.lastView);
+        this.db.prepare('UPDATE tasks SET lastView=?, conversation=? WHERE id=? AND conversation IS NULL')
+          .run(JSON.stringify(status), JSON.stringify({ messages: messages ?? [], transcripts }), row.id);
+      }
+    }
   }
 
   /** One-time data migrations (idempotent; run every boot). */
@@ -828,6 +847,8 @@ export class Store {
     // so no backfill pass is needed; the first drag densifies that organization.
     if (!projectCols.some((c) => c.name === 'ord')) this.db.exec('ALTER TABLE projects ADD COLUMN ord INTEGER NOT NULL DEFAULT 0');
     if (!projectCols.some((c) => c.name === 'folder')) this.db.exec('ALTER TABLE projects ADD COLUMN folder TEXT');
+    if (!cols.some((c) => c.name === 'conversation')) this.db.exec('ALTER TABLE tasks ADD COLUMN conversation TEXT');
+    if (!cols.some((c) => c.name === 'conversationRef')) this.db.exec('ALTER TABLE tasks ADD COLUMN conversationRef TEXT');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
     // Legacy rows become single-attempt intents. Alternate attempts already point
@@ -2995,6 +3016,14 @@ export class Store {
     for (const a of attempts) this.updateTaskParams(a.id, { ...a.params, [field]: confirmer });
   }
 
+  taskMetadata(id: string): TaskRecord | undefined {
+    const row = this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
+      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
+      notes, lastView FROM tasks WHERE id=?`).get(id) as any;
+    return row ? rowToTask(row) : undefined;
+  }
+
   getTask(id: string): TaskRecord | undefined {
     const r = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id = ?`).get(id) as any;
@@ -3082,7 +3111,7 @@ export class Store {
     const previous = this.kvGet(`pending-review:${taskId}`);
     const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
     this.kvSet(`pending-review:${taskId}`, JSON.stringify({ ...(previous ? JSON.parse(previous) : {}), ...supplied }));
-    const view = this.getTask(taskId)?.lastView;
+    const view = this.taskMetadata(taskId)?.lastView;
     if (view) this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?')
       .run(JSON.stringify(this.withPendingReviewInfo(taskId, view)), taskId);
   }
@@ -3092,7 +3121,7 @@ export class Store {
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
   }
 
-  saveView(taskId: string, view: TaskView) {
+  saveView(taskId: string, view: TaskView, conversationReference?: string) {
     const pending = this.kvGet(`pending-review:${taskId}`);
     if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
       JSON.stringify(view.reviewInfo?.[key as keyof ReviewInfo]) === JSON.stringify(value))) {
@@ -3108,8 +3137,22 @@ export class Store {
     // Fire only on the *transition* into that status (previous snapshot wasn't
     // already done/cancelled) so a later view re-save can't override a user who
     // deliberately un-archived a finished task.
-    const prev = this.getTask(taskId);
-    this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?').run(JSON.stringify(view), taskId);
+    const prev = this.taskMetadata(taskId);
+    const { messages, transcripts, ...status } = view;
+    if (conversationReference) {
+      const key = `view-conversation:${taskId}:${conversationReference}`;
+      if (!this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key)) throw new Error('Conversation publication snapshot is missing');
+      const current = this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId) as any;
+      if (current?.conversationRef === conversationReference) {
+        this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId);
+      } else {
+        this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
+          .run(JSON.stringify(status), key, conversationReference, taskId);
+      }
+    } else {
+      this.db.prepare('UPDATE tasks SET lastView=?, conversation=?, conversationRef=NULL WHERE id=?')
+        .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId);
+    }
     if (view.stage === 'review' && view.status === 'waiting'
       && (prev?.lastView?.stage !== 'review' || prev.lastView.status !== 'waiting') && prev?.confirmationPolicy) {
       this.beginConfirmationCycle(taskId, prev.confirmationPolicy);
@@ -3477,8 +3520,7 @@ export class Store {
   }
 
   private getTaskShallow(id: string): TaskRecord | undefined {
-    const r = this.db.prepare('SELECT * FROM tasks WHERE id=?').get(id) as any;
-    return r ? rowToTask(r) : undefined;
+    return this.taskMetadata(id);
   }
 
   /** Human whose Git identity should own development performed for this task.
@@ -4481,6 +4523,19 @@ export class Store {
       .prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?')
       .all(seq, limit) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
+  /** Event routing needs ownership, never a conversation or reviewer expansion. */
+  taskProjectIds(taskIds: readonly string[]): Map<string, string> {
+    const result = new Map<string, string>();
+    const ids = [...new Set(taskIds)];
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const batch = ids.slice(offset, offset + 500);
+      const rows = this.db.prepare(`SELECT id, projectId FROM tasks WHERE id IN (${batch.map(() => '?').join(',')})`)
+        .all(...batch) as Array<{ id: string; projectId: string }>;
+      for (const row of rows) result.set(row.id, row.projectId);
+    }
+    return result;
   }
 
   /** Retention: drop a task's high-volume live-output rows once it's done. The
@@ -5998,6 +6053,8 @@ export class Store {
     this.db.prepare('DELETE FROM github_webhook_deliveries WHERE deliveryId=?').run(deliveryId);
   }
 
+  kvHas(k: string): boolean { return !!this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(k); }
+
   kvGet(k: string): string | undefined {
     const r = this.db.prepare('SELECT v FROM kv WHERE k = ?').get(k) as any;
     return r?.v;
@@ -6063,6 +6120,7 @@ export class Store {
   finishLegacyImport(): void {
     this.migrate();
     this.migrateData();
+    this.migrateConversations();
   }
 }
 
@@ -6536,7 +6594,7 @@ function rowToTask(r: any): TaskRecord {
     confirmationPolicy: parseJsonOptional<ConfirmationPolicy>(r.confirmationPolicy),
     subscribers: [],
     notes: r.notes ?? undefined,
-    lastView: r.lastView ? JSON.parse(r.lastView) : undefined,
+    lastView: r.lastView ? { ...(r.conversation ? JSON.parse(r.conversation) : {}), ...JSON.parse(r.lastView) } : undefined,
   };
 }
 

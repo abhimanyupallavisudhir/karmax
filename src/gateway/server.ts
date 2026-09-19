@@ -666,9 +666,15 @@ export class Gateway {
       if (data.toString().length > 1024) return;
       try { delivery.acknowledge(JSON.parse(data.toString())); } catch { /* invalid observation */ }
     });
-    const off = this.fanout.on((ev) => {
+    const off = this.fanout.on((ev, projectId) => {
+      // Reconnect/backfill from durable state rather than allowing a slow
+      // browser's send queue to grow without bound.
+      if (ws.readyState !== WebSocketClient.OPEN) return;
+      if (ws.bufferedAmount > 2 * 1024 * 1024) {
+        ws.close(1013, 'Client fell behind; reconnect to refresh');
+        return;
+      }
       if (ev.type === 'timing' && !timingEnabled(this.deps.store)) return;
-      const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
       if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
         const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
