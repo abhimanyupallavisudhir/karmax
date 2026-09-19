@@ -36,7 +36,7 @@ ok(taskModal.includes('@openai/codex@') && taskModal.includes('--fork-session'),
 ok(taskModal.includes('localConversationHandoff(v,'), 'hosted task checkout renders agent handoffs');
 ok(projectModal.includes('/checkout`'), 'project action loads a server-generated checkout plan');
 ok(projectModal.includes('plan.cloneScript') && projectModal.includes('plan.updateScript'), 'project modal offers clone and update commands');
-ok(localModal.includes('localConversationHandoff(v, checkout.cwd)'), 'local materialization renders agent handoffs');
+ok(localModal.includes('localConversationHandoff(v, checkout.cwd,'), 'local materialization renders agent handoffs');
 
 // Execute the command builder against a bound snapshot, including shell metacharacters.
 const vm = require('node:vm');

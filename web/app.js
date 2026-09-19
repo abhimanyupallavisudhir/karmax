@@ -5244,7 +5244,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
         const attempts = group?.attempts?.length ? group.attempts : [task];
         return Promise.all(attempts.map(async (attempt) => ({
           task: attempt,
-          sessions: await api(`/api/tasks/${attempt.id}/sessions`),
+          sessions: await api(`/api/tasks/${attempt.id}/sessions?metadata=1`),
         })));
       })());
       el.setAttribute('aria-busy', 'true');
@@ -6960,7 +6960,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       // but opening a task should have a fixed memory and response-size budget.
       draft ? Promise.resolve([]) : refreshTaskHistory(taskId),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
-      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
       draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
@@ -7026,7 +7026,7 @@ async function refreshTask() {
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
-      api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+      api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
       api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
@@ -9379,11 +9379,11 @@ async function downloadNativeConversation(button) {
   } finally { button.disabled = false; }
 }
 
-function localConversationHandoff(v, cwd, portable = false) {
-  const errors = Object.entries(S.sessions || {}).filter(([, session]) => session?.exportError)
+function localConversationHandoff(v, cwd, portable = false, preparedSessions = S.sessions) {
+  const errors = Object.entries(preparedSessions || {}).filter(([, session]) => session?.exportError)
     .map(([role, session]) => `<p class="task-sub" role="alert">${esc(role)} conversation export: ${esc(session.exportError)}</p>`).join('');
   const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
-  const sessions = Object.entries(S.sessions || {})
+  const sessions = Object.entries(preparedSessions || {})
     .filter(([, session]) => session?.id && session?.downloadable && ['codex', 'claude'].includes(session.provider))
     .map(([role, session]) => {
       const installDownloaded = portable || !session.home || session.generated || session.provider === 'codex';
@@ -9419,8 +9419,13 @@ async function openLocalCheckout(v) {
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
   wireClose();
-  let plan;
-  try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
+  let plan, preparedSessions;
+  try {
+    [plan, preparedSessions] = await Promise.all([
+      api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
+      api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
+    ]);
+  }
   catch (error) { host.remove(); return toast(error.message, true); }
   if (!host.isConnected) return;
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
@@ -9429,7 +9434,7 @@ async function openLocalCheckout(v) {
     <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
-    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true)}
+    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
@@ -9487,9 +9492,10 @@ async function materializeLocalCheckout(v) {
   </div></div>`;
   host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
   host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  let checkout;
+  let checkout, preparedSessions;
   try {
     checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+    preparedSessions = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`);
   } catch (error) { host.remove(); toast(error.message, true); return null; }
   if (!host.isConnected) return null;
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
@@ -9497,7 +9503,7 @@ async function materializeLocalCheckout(v) {
     <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
-    ${localConversationHandoff(v, checkout.cwd)}
+    ${localConversationHandoff(v, checkout.cwd, false, preparedSessions)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
     <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
   </div></div>`;

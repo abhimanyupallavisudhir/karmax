@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { RunnerPoolService, WorldLifecycleManager } from '../src/world/runners.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -210,8 +210,14 @@ describe('runner capacity and world lifecycle', () => {
       } } as any);
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
 
+    const record = vi.spyOn(store, 'recordUsage');
+    const hydrate = vi.spyOn(store, 'getTask');
     await lifecycle.sweep(Date.UTC(2026, 6, 31, 10, 6));
-    await lifecycle.sweep(Date.UTC(2026, 6, 31, 10, 7));
+    // A process restart still recognizes durable execution IDs without redoing
+    // attribution, hydrating conversations, or issuing duplicate writes.
+    await new WorldLifecycleManager(store, worlds, {} as any).sweep(Date.UTC(2026, 6, 31, 10, 7));
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(hydrate).not.toHaveBeenCalled();
 
     // 5 minutes × (2 × $0.000014/vCPU/s + 0.5 × $0.0000045/GiB/s)
     expect(store.usageSummary(organization.id)).toEqual({
@@ -225,6 +231,40 @@ describe('runner capacity and world lifecycle', () => {
     expect(JSON.parse(store.kvGet(`usage-sync:${organization.id}:e2b`)!)).toMatchObject({
       status: 'ready', coverageFrom: Date.UTC(2026, 6, 24, 10, 6), retentionDays: 7,
     });
+  });
+
+  it('yields during usage catchup, coalesces sweeps, and imports late events without cross-tenant attribution', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Metered', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', {}, organization.id);
+    const task = createTask(store, project.id, 'Run');
+    const foreign = store.createProject('Foreign', {}, store.createOrganization({ name: 'Other', ownerUserId: 'other' }).id);
+    const foreignTask = createTask(store, foreign.id, 'Other run');
+    store.upsertWorldProviderConnection({ organizationId: organization.id, provider: 'e2b', credentialHandle: 'test:e2b', enabled: true });
+    const events = Array.from({ length: 550 }, (_, index) => ({ id: `execution-${index}`, sandboxId: `sandbox-${index}`,
+      taskId: index === 0 ? foreignTask.id : task.id, startedAt: 1000, endedAt: 2000, activeMs: 1000, cpu: 1, memoryMb: 512 }));
+    const listUsageEvents = vi.fn(async () => events);
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true, listUsageEvents } as any);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any);
+    const attribution = vi.spyOn(store, 'taskAttribution');
+    let recordsAtYield = -1;
+    const record = vi.spyOn(store, 'recordUsage');
+    const tick = new Promise<void>(resolve => setImmediate(() => { recordsAtYield = record.mock.calls.length; resolve(); }));
+    await Promise.all([lifecycle.sweep(), lifecycle.sweep(), tick]);
+    expect(listUsageEvents).toHaveBeenCalledTimes(1);
+    expect(recordsAtYield).toBeGreaterThan(0);
+    expect(recordsAtYield).toBeLessThan(events.length);
+    expect(attribution).toHaveBeenCalledTimes(2);
+    expect(record.mock.calls[0]![0]).not.toHaveProperty('taskId');
+    expect(record.mock.calls[1]![0]).toMatchObject({ taskId: task.id, projectId: project.id, organizationId: organization.id });
+    expect(store.recordedUsageEventIds(events.map(event => `usage:e2b:${event.id}`)).size).toBe(550);
+    expect(store.recordedUsageEventIds([]).size).toBe(0);
+    events.push({ ...events[1]!, id: 'late-execution', startedAt: 0, endedAt: 1000 });
+    await lifecycle.sweep();
+    expect(record).toHaveBeenCalledTimes(551);
+    expect(store.usageSummary(organization.id).events).toBe(551);
+    store.close();
   });
 
   it('fails impossible or provider-mismatched reservations instead of queueing forever', async () => {

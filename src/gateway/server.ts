@@ -29,6 +29,8 @@ import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
+import { localCodexFiles } from '../agent/codex-history-files.js';
+import { validCodexSessionId } from '../agent/codex-history.js';
 import { exportConversationWithPanagent } from '../agent/panagent.js';
 import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
@@ -360,7 +362,7 @@ function providerHomeFromSessionFile(provider: DownloadableProvider, filename: s
  * with legacy metadata that lacks its source home falls back to a generated
  * transcript export instead of sweeping the installation by opaque id. */
 function storedConversationSession(store: Store, taskId: string, intentId: string | undefined, role: string,
-  providerHint?: unknown): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
+  providerHint?: unknown, metadataOnly = false): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
   const sessionTaskId = role === 'confirm' ? (intentId ?? taskId) : taskId;
   const id = store.kvGet(`session:${sessionTaskId}:${role}`) || undefined;
   let home: string | undefined;
@@ -375,7 +377,11 @@ function storedConversationSession(store: Store, taskId: string, intentId: strin
   const candidates = [...new Set([hinted, metadataProvider, 'codex', 'claude'])]
     .filter((provider): provider is DownloadableProvider => provider === 'codex' || provider === 'claude');
   for (const provider of candidates) {
-    const source = findProviderSession({ provider, session: id, srcHome: home });
+    // Discovery for the task page only needs availability. Full copy/lineage
+    // validation belongs to the explicit export, which can read a large history.
+    const source = metadataOnly && provider === 'codex'
+      ? (home && validCodexSessionId(id) ? localCodexFiles(home).find(file => path.basename(file).endsWith(`${id}.jsonl`)) : undefined)
+      : findProviderSession({ provider, session: id, srcHome: home });
     if (source) return { id, provider, home: home ?? providerHomeFromSessionFile(provider, source), source };
   }
   return { id, provider: hinted ?? metadataProvider, home };
@@ -683,34 +689,32 @@ export class Gateway {
     }).finally(() => { this.connectionSweep = undefined; });
   }
 
-  private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
-    const task = this.deps.store.getTask(taskId);
-    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
-    if (!organizationId) return [];
-    return new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
-      .requests({ taskId, status: 'pending' });
+  /** Read each organization request ledger once per response, not once per row.
+   * Task list projections must never hydrate every task's transcript again. */
+  private approvalCounts(organizationId: string): Map<string, number> {
+    const counts = new Map<string, number>();
+    const add = (taskId: string | undefined) => {
+      if (taskId) counts.set(taskId, (counts.get(taskId) ?? 0) + 1);
+    };
+    for (const request of new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
+      .requests({ status: 'pending' })) add(request.taskId);
+    for (const request of new PermissionRequests(this.deps.store, organizationId).requests({ status: 'pending' }))
+      if (!request.dismissed) add(request.taskId);
+    for (const request of new AuthorizationRequests(this.deps.store, organizationId).requests({ status: 'pending' }))
+      if (!request.dismissed && request.target.kind === 'task') add(request.target.taskId);
+    for (const connection of this.connections()?.all() ?? [])
+      if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId);
+    return counts;
   }
 
-  private pendingPermissionRequests(taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
-    if (!organizationId) return [];
-    return new PermissionRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
-  }
-
-  private pendingAuthorizationRequests(taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
-    if (!organizationId) return [];
-    return new AuthorizationRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
-  }
-
-  private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
+  private withApprovalRequests(view: TaskView | undefined, taskId: string,
+    counts?: Map<string, number>): TaskView | undefined {
     if (!view) return view;
-    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length
-      + this.pendingAuthorizationRequests(taskId).length + (this.connections()?.pending(taskId).length ?? 0);
+    if (!counts) {
+      const organizationId = this.deps.store.taskAttribution(taskId)?.organizationId;
+      counts = organizationId ? this.approvalCounts(organizationId) : new Map();
+    }
+    const count = counts.get(taskId) ?? 0;
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -3988,9 +3992,11 @@ export class Gateway {
           // rows computed attempt/stage metadata independently and turned one list
           // request into thousands of synchronous SQLite reads. Drawer-only fields
           // (including stageTransitions) are resolved by the single-task endpoint.
+          const organizationId = store.getProject(projectId)?.organizationId;
+          const approvalCounts = organizationId ? this.approvalCounts(organizationId) : new Map<string, number>();
           const listed = page.map((t) => ({
             ...t,
-            lastView: trimListView(this.withApprovalRequests(t.lastView, t.id)),
+            lastView: trimListView(this.withApprovalRequests(t.lastView, t.id, approvalCounts)),
           }));
           if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
           return this.json(res, 200, listed);
@@ -5105,6 +5111,7 @@ export class Gateway {
       const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
+        const metadataOnly = url.searchParams.get('metadata') === '1';
         const t = store.getTask(id);
         // Include the exact effective agent selection captured at queue time (and
         // kept current after an accepted in-flight retune). Besides powering the
@@ -5136,7 +5143,7 @@ export class Gateway {
           }
           const spec = agents?.[role];
           try {
-            const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
+            const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider, metadataOnly);
             const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
             const transcript = role === 'do'
               ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
@@ -5146,7 +5153,7 @@ export class Gateway {
               ? stored.id
               : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
             let exportMetadata = {};
-            if (resolvedProvider === 'codex' && (exportId || (stored.id && stored.home))) {
+            if (!metadataOnly && resolvedProvider === 'codex' && (exportId || (stored.id && stored.home))) {
               const sessionId = stored.id ?? exportId!;
               const exported = await createCodexConversationExport(this.deps.objects ?? new LocalObjectStore(paths().objects),
                 id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
@@ -5165,7 +5172,7 @@ export class Gateway {
               ...(resolvedProvider ? { provider: resolvedProvider } : {}),
               ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
               ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
-              ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
+              ...(exportId ? { ...(!metadataOnly ? { exportId } : {}), downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
             };
           } catch (error) {
             if (s) out[role] = { id: s, provider: spec?.provider ?? provider, downloadable: false,
