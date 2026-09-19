@@ -15,7 +15,8 @@ import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
 import { sameRepository } from './repository-identity.js';
 
-import { encodePortableDelta, type DeltaFile, type PortableDelta } from './checkpoint-encoding.js';
+import type { PortableDelta } from './checkpoint-encoding.js';
+import { encodeEncryptedCheckpoint, type CheckpointFile } from './checkpoint-executor.js';
 const gunzip = promisify(zlib.gunzip);
 export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
@@ -120,13 +121,12 @@ export class WorldCheckpointService {
         files.push({ repo: '', path: file, readPath: file });
       }
     }
-    async function* contents(): AsyncGenerator<DeltaFile> {
+    async function* contents(): AsyncGenerator<CheckpointFile> {
       for (const { readPath, ...file } of files) {
-        yield readPath === undefined ? file : { ...file, data: (await world.readFileBuffer(readPath)).toString('base64') };
+        yield readPath === undefined ? file : { ...file, data: await world.readFileBuffer(readPath) };
       }
     }
-    const compressed = await encodePortableDelta(contents());
-    const encrypted = this.encrypt(compressed);
+    const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), this.key());
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
     const managedStorage = this.store.listStorageLocations(project.organizationId)
@@ -141,7 +141,7 @@ export class WorldCheckpointService {
     const checkpoint: WorldCheckpoint = {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
-      repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
+      repos, filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
       ...(resourceRefs.length ? { resources: resourceRefs } : {}),
       ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
       ...snapshotProjectRuntime(this.store, projectId),
@@ -335,13 +335,6 @@ export class WorldCheckpointService {
 
   private key(): Buffer {
     return Buffer.from(this.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
-  }
-
-  private encrypt(plain: Buffer): Buffer {
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', this.key(), iv);
-    const body = Buffer.concat([cipher.update(plain), cipher.final()]);
-    return Buffer.concat([Buffer.from('KMX1'), iv, cipher.getAuthTag(), body]);
   }
 
   private decrypt(blob: Buffer): Buffer {
