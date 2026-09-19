@@ -195,7 +195,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     emitActivity(activity) {
       outputObserved();
-      if (['tool', 'command', 'search', 'file', 'subagent'].includes(activity.kind)) {
+      if (trace?.enabled() && ['tool', 'command', 'search', 'file', 'subagent'].includes(activity.kind)) {
         if (activity.phase === 'started' && !observedTools.has(activity.id) && trace)
           observedTools.set(activity.id, trace.start('tool.provider-observed', { itemId: activity.id, operation: activity.kind }));
         if (activity.phase === 'completed' || activity.phase === 'failed') {

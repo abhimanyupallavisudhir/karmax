@@ -1598,9 +1598,10 @@ export class Store {
   }
 
   /** Complete, secret-redacted tenant export. The table-oriented envelope is
-   * intentionally stable and lossless: future import/migration tools can retain
+   * intentionally stable, apart from declared redactions: future import/migration tools can retain
    * records they do not yet understand without flattening the task model. */
   exportOrganization(organizationId: string): Record<string, unknown> {
+    const includeTiming = this.getSettings('global', 'timing')?.enabled === true;
     const organization = this.getOrganization(organizationId);
     if (!organization) throw new Error('organization not found');
     const projectIds = (this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
@@ -1648,7 +1649,7 @@ export class Store {
           ...rowsFor(this.db, 'collaboration_requests', 'targetTaskId', taskIds),
         ].map((row) => [String(row.id), row])).values(),
       ],
-      events: rowsFor(this.db, 'events', 'taskId', taskIds),
+      events: rowsFor(this.db, 'events', 'taskId', taskIds).filter(row => includeTiming || row.type !== 'timing'),
       tags: rowsFor(this.db, 'tags', 'projectId', projectIds),
       task_tags: rowsFor(this.db, 'task_tags', 'taskId', taskIds),
       saved_views: rowsFor(this.db, 'saved_views', 'projectId', projectIds),
@@ -1698,7 +1699,8 @@ export class Store {
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session and API tokens', 'OAuth tokens and state',
-          'credential values and handles', 'SCIM tokens', 'preview tokens'],
+          'credential values and handles', 'SCIM tokens', 'preview tokens',
+          ...(!includeTiming ? ['response timing (installation disabled)'] : [])],
       },
       organization,
       executionPolicy: this.getOrganizationExecutionPolicy(organizationId),
@@ -1713,6 +1715,7 @@ export class Store {
    * their tasks and notifications, and their own authorization history. It must
    * never become a shortcut for downloading every organization they belong to. */
   exportUserData(userId: string, email?: string): Record<string, unknown> {
+    const includeTiming = this.getSettings('global', 'timing')?.enabled === true;
     const principalId = `user:${userId}`;
     const memberships = selectRows(this.db, 'organization_memberships', 'userId=?', [userId]);
     const invitations = email
@@ -1794,7 +1797,7 @@ export class Store {
           .map((task) => ({
             project: projectById.get(task.projectId),
             task,
-            events: this.eventsSince(task.id, 0),
+            events: this.eventsSince(task.id, 0, undefined, !includeTiming),
             inbox: organizationInbox.filter((row) => row.taskId === task.id).map(rowToInbox),
             confirmationVotes: votes.filter((row) => row.taskId === task.id),
           })),
@@ -1824,7 +1827,8 @@ export class Store {
         .get(userId) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? this.defaultOrganization(userId)?.id ?? null },
       security: {
         secretsIncluded: false,
-        omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles'],
+        omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles',
+          ...(!includeTiming ? ['response timing (installation disabled)'] : [])],
       },
       organizations,
       authorization: {
@@ -4421,19 +4425,19 @@ export class Store {
     }
   }
 
-  eventsSince(taskId: string, seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
+  eventsSince(taskId: string, seq: number, limit?: number, excludeTiming = false): (KarmaxEvent & { seq: number })[] {
     // Initial task-page loads ask for the newest bounded window. Do the bound in
     // SQLite: materializing every historical event and slicing in JS is precisely
     // the allocation spike this API is meant to avoid. Incremental consumers omit
     // `limit` and retain the original "everything after cursor" contract.
     if (limit && limit > 0) {
       const rows = this.db
-        .prepare('SELECT * FROM events WHERE taskId = ? AND seq > ? ORDER BY seq DESC LIMIT ?')
+        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
         .all(taskId, seq, limit) as any[];
       rows.reverse();
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
     }
-    return (this.db.prepare('SELECT * FROM events WHERE taskId = ? AND seq > ? ORDER BY seq').all(taskId, seq) as any[])
+    return (this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(taskId, seq) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
@@ -4454,19 +4458,19 @@ export class Store {
     return Number((this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as any)?.seq ?? 0);
   }
 
-  allEventsSince(seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
+  allEventsSince(seq: number, limit?: number, excludeTiming = false): (KarmaxEvent & { seq: number })[] {
     // Bound the read in SQL. Callers that want "the last N" would otherwise
     // materialize the ENTIRE append-only table before slicing — the events table
     // is the largest in the DB, so that is the dominant read-path allocation.
     // Grab the newest N (DESC + LIMIT), then return ascending as before.
     if (limit && limit > 0) {
       const rows = this.db
-        .prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq DESC LIMIT ?')
+        .prepare(`SELECT * FROM events WHERE seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
         .all(seq, limit) as any[];
       rows.reverse();
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
     }
-    return (this.db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq').all(seq) as any[]).map(
+    return (this.db.prepare(`SELECT * FROM events WHERE seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(seq) as any[]).map(
       (r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }),
     );
   }
@@ -4499,6 +4503,8 @@ export class Store {
   }
 
   setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+    // A fresh epoch prevents an in-flight span crossing a rapid off/on cycle.
+    if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
     if (workflow === 'payments') {
       if (values.budget !== undefined && values.budget !== null && (!Number.isSafeInteger(values.budget) || Number(values.budget) < 0))
         throw new Error('Budget must be a non-negative amount in cents');

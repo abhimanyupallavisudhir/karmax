@@ -1,12 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, onTestFinished } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
 
 describe('conversation message events', () => {
-  it('journals and broadcasts a follow-up as soon as its workflow signal is accepted', async () => {
+  it.each([false, true])('journals and broadcasts a follow-up as soon as its workflow signal is accepted (timing enabled: %s)', async (enabled) => {
     const store = new Store(':memory:');
+    onTestFinished(() => store.close());
+    if (enabled) store.setSettings('global', 'timing', { enabled: true });
     const tokens = new TokenAuthority();
     const token = tokens.mint({
       taskId: 'operator',
@@ -49,11 +51,11 @@ describe('conversation message events', () => {
     const journal = store.eventsSince(task.id, 0);
     const events = journal.filter(event => event.type === 'conversation.message');
     const timing = journal.filter(event => event.type === 'timing').map(event => event.payload);
-    expect(timing).toEqual([
+    expect(timing).toEqual(enabled ? [
       expect.objectContaining({ name: 'request.received', phase: 'mark', requestIds: [`${task.id}:${message?.id}`] }),
       expect.objectContaining({ name: 'workflow.dispatch', phase: 'start' }),
       expect.objectContaining({ name: 'workflow.dispatch', phase: 'end', status: 'ok' }),
-    ]);
+    ] : []);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'conversation.message',

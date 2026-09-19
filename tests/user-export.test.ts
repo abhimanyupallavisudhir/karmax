@@ -23,7 +23,15 @@ describe('user data export', () => {
     store.setDeliveryPreferences({ userId: 'alice', organizationId: organization.id,
       browser: true, email: true, slack: false, routine: true });
 
+    store.appendEvent({taskId:mine.id,type:'timing',ts:Date.now(),payload:{name:'retained'}});
     const exported = store.exportUserData('alice', 'alice@example.com') as any;
+    expect(exported.organizations[0].tasks[0].events.some((e:any)=>e.type==='timing')).toBe(false);
+    expect(((store.exportOrganization(organization.id) as any).tables.events as any[]).some(e=>e.type==='timing')).toBe(false);
+    store.setSettings('global','timing',{enabled:true});
+    expect(((store.exportOrganization(organization.id) as any).tables.events as any[]).some(e=>e.type==='timing')).toBe(true);
+    const optedIn = store.exportUserData('alice', 'alice@example.com') as any;
+    expect(optedIn.organizations[0].tasks[0].events.some((e:any)=>e.type==='timing')).toBe(true);
+    expect(store.eventsOfType(mine.id,'timing')).toHaveLength(1);
 
     expect(exported.format).toBe('karmax-user-export');
     expect(exported.organizations).toHaveLength(1);

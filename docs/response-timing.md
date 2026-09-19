@@ -1,10 +1,11 @@
 # Agent response timing
 
-Karmax records sparse `timing` events alongside the existing task events. Open a
+When explicitly enabled in Installation settings, Karmax records sparse `timing`
+events alongside the existing task events. Open a
 task’s **Timing** tab, load measurements, and export JSON. The equivalent,
 permission-checked endpoint is `GET /api/tasks/:id/timing` (`task:event:read`).
 Historical turns have no retroactive measurements. No database migration or
-provider credentials are required to enable recording after deployment.
+provider credentials are required. Recording is off until an installation operator opts in.
 
 ## Reading a report
 
@@ -122,7 +123,7 @@ also accepts `.json.gz` exports.
 
 ## Production collection and fair comparisons
 
-1. Deploy the measurement change through the normal release process. Open the
+1. Deploy through the normal release process and explicitly opt in to timing. Prefer an isolated installation for benchmarks. Open the
    foreground Check-in tab before submitting a test if browser evidence matters.
 2. Collect separate sets for conversation, one authorized **read-only** service
    action, sequential actions, and parallel actions. Use equivalent prompts,
@@ -149,3 +150,55 @@ also accepts `.json.gz` exports.
 Grok Bot comparison requires equivalent measurements from Grok Bot itself. These
 fixtures and Karmax production traces cannot establish how fast Grok Bot is, or
 whether models, service orchestration, deployment or UI account for any gap.
+
+## Installation opt-in
+
+Response timing is **off by default**, including existing installations with
+historical measurements. An installation operator can enable **Installation →
+Host capacity → Response timing**. The equivalent authenticated operation is
+`PUT /api/settings/global/timing` with `{"values":{"enabled":true}}`; writes
+require `settings:write`, reads of that settings route require `settings:read`.
+Only the exact boolean `true` opts in. Organization/project workflow defaults do
+not override this installation setting. `/api/meta` exposes only its effective
+boolean so every client can hide the feature without installation authority.
+
+While off, the Timing tab and its load/export controls are absent, the timing
+report endpoint refuses access, and timing rows are excluded from task event
+responses, personal and organization data exports, the activity feed, and WebSocket delivery. This also applies to
+operators: opt in again to read historical reports. Existing task/event authority
+still applies when enabled. Stored observations are **retained**, never silently
+deleted; offline exports already downloaded are not revoked.
+
+Gateway and worker read the shared persistent setting at recording boundaries;
+there is no restart or process-local environment flag to synchronize. Disabled
+traces skip timing clocks, UUIDs, spans, async context, provider/tool timing and
+browser receipts. Usage accounting required for billing still runs. Active traces
+stop at their next boundary when disabled and stay stopped. Each settings save
+creates a recording epoch, so a rapid off/on cycle also invalidates old traces; interrupted spans
+remain incomplete. Enabling starts new traces at subsequent request/activity/
+service boundaries, not retroactively for an existing turn. Toggling during a
+turn can therefore produce partial measurements; exclude these from comparisons.
+All recording is best effort, including settings-read and sink failures.
+
+Open sockets receive the effective setting on connect and within one second of
+changes (recording and event visibility are checked at each boundary). Browsers remove the tab, clear cached
+reports and timing rows, and stop frame receipts when disabled. The existing
+60-second metadata refresh also reconciles clients after missed socket updates.
+A browser already offline cannot learn a change until it reconnects. Deploy both
+gateway and worker code through the normal release so old recording code is not
+left running beside the new gateway.
+
+The isolated fixture harness explicitly opts in within its temporary store. It
+never changes production installation settings. For bounded real-model collection,
+use `npx tsx benchmarks/latency.ts 20 /tmp/live-latency.json --live` after reading
+`benchmarks/live-adapter.ts` limits. It uses the production Messages/Responses
+adapters with a compact, equivalent benchmark prompt and only two managed-service
+tools. The workflow uses the harness fixture profile for credential/admission bookkeeping; adapter dispatch and model requests are real. Service accounts and responses remain local read-only fixtures. Usage is
+checkpointed separately; request limits and a conservative pricing-based budget
+are enforced before each real request. The estimated cost is not a billing invoice. Action-count validation distinguishes a completed model turn from a valid workload; skipped/failed reads must not enter comparable latency summaries.
+
+See [live model measurements](latency-live-results.md) for the September 18 isolated
+OpenAI/Anthropic collection, validation exclusions, usage, and bottleneck evidence.
+
+See [deployed E2B measurements](latency-e2b-results.md) for the September 19
+production tavya.io startup, follow-up, native-agent and browser observations.

@@ -1,7 +1,7 @@
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { TimingDelivery } from '../timing/delivery.js';
-import { TimingTrace, withTiming, toolFailed } from '../timing/index.js';
+import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
 import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
@@ -624,20 +624,50 @@ export class Gateway {
     });
   }
 
+  private timingListeners = new Set<(enabled: boolean) => void>();
+  private timingPoll?: ReturnType<typeof setInterval>;
+  private timingValue = false;
+  private refreshTiming(): void {
+    const enabled = timingEnabled(this.deps.store);
+    if (enabled === this.timingValue) return;
+    this.timingValue = enabled;
+    for (const listener of this.timingListeners) listener(enabled);
+  }
+  /** One poll per gateway, shared by all sockets; catches other gateway writes. */
+  private watchTiming(listener: (enabled: boolean) => void): () => void {
+    this.refreshTiming();
+    this.timingListeners.add(listener);
+    listener(this.timingValue);
+    this.timingPoll ??= setInterval(() => this.refreshTiming(), 1000);
+    return () => {
+      this.timingListeners.delete(listener);
+      if (!this.timingListeners.size) { clearInterval(this.timingPoll); this.timingPoll = undefined; }
+    };
+  }
+
   /** The live event stream (`/ws`): every durable event the caller may read. */
   private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
 
     const url = new URL(req.url ?? '/', 'http://localhost');
     const auth = await this.socketAuth(req, url);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
+    if (ws.readyState !== WebSocketClient.OPEN) return;
     const scoped = this.deps.tokens.verify(auth.apiToken);
     const delivery = new TimingDelivery(row => this.deps.store.appendEvent({ taskId: row.taskId,
-      type: 'timing', ts: row.wallMs, payload: { ...row } }));
+      type: 'timing', ts: row.wallMs, payload: { ...row } }), () => timingEnabled(this.deps.store),
+      (context, sink) => installationTiming(this.deps.store, context, sink));
+    const syncTiming = (enabled: boolean) => {
+      try { ws.send(JSON.stringify({ type: 'timing.setting', enabled })); } catch { /* disconnected */ }
+    };
+    const offTiming = this.watchTiming(syncTiming);
+    ws.on('close', offTiming);
+    ws.on('error', offTiming);
     ws.on('message', data => {
       if (data.toString().length > 1024) return;
       try { delivery.acknowledge(JSON.parse(data.toString())); } catch { /* invalid observation */ }
     });
     const off = this.fanout.on((ev) => {
+      if (ev.type === 'timing' && !timingEnabled(this.deps.store)) return;
       const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
       if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
@@ -1195,7 +1225,7 @@ export class Gateway {
 
   // ─── request handling ────────────────────────────────────────────────────────
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
-    const receivedAt = { monoMs: performance.now(), wallMs: Date.now() };
+    const receivedAt = req.method === 'POST' && timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
     const previewOrigin = configuredPreviewOrigin();
@@ -1235,7 +1265,7 @@ export class Gateway {
     return this.static(p, res, req);
   }
 
-  private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, receivedAt = { monoMs: performance.now(), wallMs: Date.now() }) {
+  private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, receivedAt?: { monoMs: number; wallMs: number }) {
     const p = url.pathname;
     const method = req.method ?? 'GET';
 
@@ -1652,6 +1682,7 @@ export class Gateway {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         ...(consoleRevision ? { consoleRevision } : {}),
+        timingEnabled: timingEnabled(this.deps.store),
         safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
@@ -5674,7 +5705,7 @@ export class Gateway {
             const c = service.get(org, id);
             if (action === 'tools' || action === 'execute') {
               if (!callerTaskId || !projectId) return this.json(res, 403, { error: 'A task-agent token is required' });
-              const trace = new TimingTrace({ taskId: callerTaskId, role: authRecord.role,
+              const trace = installationTiming(this.deps.store, { taskId: callerTaskId, role: authRecord.role,
                 turnId: authRecord.executionId, workflowRunId: authRecord.executionRunId, attempt: authRecord.executionAttempt }, row => {
                 store.appendEvent({ taskId: callerTaskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
               });
@@ -6919,9 +6950,10 @@ export class Gateway {
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
-        if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf));
+        if (method === 'GET') return this.json(res, 200, wf === 'timing' ? { enabled: timingEnabled(store) } : globalSettingsFor((s, w) => store.getSettings(s, w), wf));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (wf === 'timing' && typeof b.values?.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be a boolean' });
           if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
             return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
           }
@@ -6935,6 +6967,7 @@ export class Gateway {
           store.setSettings('global', wf, wf === 'appearance'
             ? { ...(store.getSettings('global', wf) ?? {}), ...values }
             : values);
+          if (wf === 'timing') this.refreshTiming();
           if (wf === 'agent-queue') await api.setAgentCapacity(token, Number(values.capacity));
           return this.json(res, 200, { ok: true });
         }
@@ -7021,7 +7054,7 @@ export class Gateway {
           if (!projectCache.has(id)) projectCache.set(id, store.getProject(id));
           return projectCache.get(id);
         };
-        const events = store.allEventsSince(since, 300).filter((e) => {
+        const events = store.allEventsSince(since, 300, !timingEnabled(store)).filter((e) => {
           const projectId = store.getTask(e.taskId)?.projectId;
           if (!projectId) return false;
           if (visibleProjects) return visibleProjects.has(projectId);
