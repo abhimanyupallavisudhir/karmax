@@ -13211,8 +13211,9 @@ function globalSettingsView(embedded = false) {
     ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
-      <p class="task-sub">Connect your accounts once. Choose which projects may use them. Service credentials are managed by Composio.</p>
-      <div id="service-connections">Loading connections…</div></div>
+      <p class="task-sub">Connect directly to a service’s MCP server. Search the registry or add its URL, then sign in when required. No Composio setup is needed.</p>
+      <div id="native-connections">Loading MCP connections…</div>
+      <details><summary>More apps through Composio (optional)</summary><p class="task-sub">Use this fallback when a service has no suitable MCP server. These accounts belong to you and require explicit project sharing.</p><div id="service-connections">Loading connections…</div></details></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
     ${agentMailCard()}
@@ -14402,6 +14403,41 @@ async function wireInstallationComposioCard() {
   } catch (error) { if (box.isConnected) paneError(box, error, wireInstallationComposioCard); }
 }
 
+async function hydrateNativeConnections(organizationId) {
+  const root = document.getElementById('native-connections'); if (!root) return;
+  const query = mcpScope(null, organizationId);
+  const refresh = () => hydrateNativeConnections(organizationId);
+  try {
+    const connections = await api(`/api/mcp${query}`);
+    if (!root.isConnected) return;
+    root.innerHTML = `<p class="task-sub">Connections added here are shared with this organization. Add a connection from a project’s Tools selector to limit it to that project. Select it in an agent’s Tools to use it.</p>
+      <form class="inline-form" data-native-search><input name="search" aria-label="Search MCP servers" placeholder="Search MCP servers" maxlength="160"><button class="btn sm">Search</button></form>
+      <div data-native-results></div><button type="button" class="btn sm primary" data-native-add>Add server URL or local process</button>
+      <div>${connections.map(c => `<div class="approval-request"><span>${esc(c.label)} <span class="chip">${!c.enabled ? 'disabled' : c.connected ? 'connected' : 'sign-in or credentials needed'}</span></span><button class="btn sm" data-native-edit="${esc(c.id)}">Manage</button></div>`).join('')}</div>`;
+    root.querySelector('[data-native-add]').onclick = () => openMcpEditor(query, refresh);
+    root.querySelectorAll('[data-native-edit]').forEach(button => { button.onclick = () => openMcpEditor(query, refresh, undefined, connections.find(c => c.id === button.dataset.nativeEdit)); });
+    let searchGeneration = 0;
+    root.querySelector('[data-native-search]').onsubmit = async event => {
+      event.preventDefault(); const form = event.currentTarget, box = root.querySelector('[data-native-results]');
+      const term = form.elements.search.value, generation = ++searchGeneration;
+      const current = () => root.isConnected && generation === searchGeneration && form.elements.search.value === term;
+      async function search(cursor = '', entries = []) {
+        box.textContent = 'Searching MCP registry…';
+        try {
+          const result = await api(`/api/mcp/registry${query}&search=${encodeURIComponent(term)}&cursor=${encodeURIComponent(cursor)}`);
+          if (!current()) return;
+          const servers = [...entries, ...result.servers];
+          box.innerHTML = (servers.length ? servers.map((entry, i) => `<button type="button" class="btn sm" data-native-result="${i}">Connect ${esc(entry.title)}</button>`).join(' ') : '<p class="task-sub">No matching MCP servers. Add a server URL or check the optional Composio catalog below.</p>')
+            + (result.nextCursor ? '<button type="button" class="btn sm" data-native-more>More results</button>' : '');
+          box.querySelectorAll('[data-native-result]').forEach(button => { button.onclick = () => openMcpEditor(query, refresh, servers[Number(button.dataset.nativeResult)]); });
+          box.querySelector('[data-native-more]')?.addEventListener('click', () => search(result.nextCursor, servers));
+        } catch (error) { if (current()) paneError(box, error, () => search(cursor, entries)); }
+      }
+      await search();
+    };
+  } catch (error) { if (root.isConnected) paneError(root, error, refresh); }
+}
+
 async function hydrateConnections(organizationId) {
   const root = document.getElementById('service-connections'); if (!root) return;
   const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
@@ -15321,6 +15357,7 @@ function wireGlobalSettings(organizationId) {
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
   wireVaultCards(organizationId);
+  hydrateNativeConnections(organizationId || S.organizationId);
   hydrateConnections(organizationId || S.organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
@@ -18449,16 +18486,21 @@ async function openMcpEditor(query, changed, entry, existing) {
   function editor(existing) {
     const box = dialog.querySelector('.mcp-editor'); box.hidden = false;
     box.innerHTML = `${entry ? `<p class="mcp-entry-description">${esc(entry.description)}</p>${entry.options.length > 1 ? `<label>Installation<select class="mcp-install-option">${entry.options.map((o, i) => `<option value="${i}">${esc(o.label)}</option>`).join('')}</select></label>` : ''}${!entry.options.length ? '<p>Enter the server details to install this MCP.</p>' : ''}` : ''}
+      <p class="task-sub">${query.includes('projectId=') ? 'This connection is shared with this project.' : 'This connection is shared with this organization.'} Signing in grants the selected account to tasks that use this connection.</p>
       <form class="mcp-connection-form"><label>Name<input class="mcp-label" required maxlength="120" placeholder="GitHub — work" value="${esc(existing?.label || '')}"></label>
       <label>Connection type<select class="mcp-type"><option value="http">Remote HTTPS</option><option value="sse">Remote HTTPS (SSE)</option><option value="stdio">Process in task environment</option></select></label>
       <label class="mcp-url-row">Server URL<input class="mcp-url" type="url" placeholder="https://example.com/mcp"></label>
       <div class="mcp-process" hidden><label>Command<input class="mcp-command" placeholder="npx"></label><label>Arguments (JSON array)<textarea class="mcp-args" rows="3" spellcheck="false">[]</textarea></label><label>Public environment values (JSON object)<textarea class="mcp-env" rows="2" spellcheck="false">{}</textarea></label><p class="task-sub">Runs with access to this task’s files. Use pinned package versions. The task environment must provide the command.</p></div>
       <label>Authentication<select class="mcp-auth"><option value="none">No authentication</option><option value="oauth">Sign in with OAuth</option><option value="secrets">API key / secret values</option></select></label>
+      <details class="mcp-oauth-client" hidden><summary>Advanced OAuth setup</summary><p class="task-sub">Leave automatic registration enabled unless the server requires a preregistered OAuth application. Register this callback URL: <code>Loading installation callback URL…</code></p>
+        <label>Client registration<select class="mcp-registration"><option value="automatic">Automatic (recommended)</option><option value="manual">Preregistered client</option></select></label>
+        <div class="mcp-manual-client" hidden><label>Client ID<input class="mcp-client-id" autocomplete="off"></label><label>Token authentication<select class="mcp-client-method"><option value="none">Public client (no secret)</option><option value="client_secret_basic">Client secret — HTTP Basic</option><option value="client_secret_post">Client secret — request body</option></select></label><label>Client secret<input class="mcp-client-secret" type="password" autocomplete="new-password" placeholder="Leave blank to keep an existing secret"></label></div></details>
       <div class="mcp-secrets" hidden><p class="task-sub">HTTP header names for remote servers; environment variable names for processes. Saved values are kept in the vault.</p><div class="mcp-secret-fields"></div><button type="button" class="btn sm mcp-secret-add">Add secret</button>${existing?.secretNames?.length ? '<p>Leave existing values blank to keep them.</p>' : ''}</div>
       <div class="mcp-registry-fields"></div>${existing ? `<label class="mcp-enabled"><input type="checkbox" ${existing.enabled !== false ? 'checked' : ''}> Enabled</label>` : ''}
       <div class="mcp-form-actions"><button class="btn primary" type="submit">${existing ? 'Save changes' : 'Save and add'}</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button>${existing ? '<button class="btn sm mcp-delete" type="button">Delete MCP</button>' : ''}</div></form>`;
     const form = box.querySelector('form'); let registry = existing?.registry; let fields = []; let secretDirty = false;
     const type = form.querySelector('.mcp-type'); const auth = form.querySelector('.mcp-auth');
+    let oauthClientDirty = false;
     function sync() {
       const process = type.value === 'stdio';
       form.querySelector('.mcp-url-row').hidden = process; form.querySelector('.mcp-url').required = !process;
@@ -18466,6 +18508,8 @@ async function openMcpEditor(query, changed, entry, existing) {
       auth.querySelector('[value="oauth"]').disabled = process;
       if (process && auth.value === 'oauth') auth.value = 'secrets';
       form.querySelector('.mcp-secrets').hidden = auth.value !== 'secrets';
+      form.querySelector('.mcp-oauth-client').hidden = auth.value !== 'oauth';
+      form.querySelector('.mcp-manual-client').hidden = form.querySelector('.mcp-registration').value !== 'manual';
     }
     function addSecret(name = '', value = '') {
       const row = document.createElement('div'); row.className = 'mcp-secret-row';
@@ -18480,7 +18524,15 @@ async function openMcpEditor(query, changed, entry, existing) {
       form.querySelector('.mcp-args').value = JSON.stringify(transport?.args || [], null, 2);
       form.querySelector('.mcp-env').value = JSON.stringify(transport?.env || {}, null, 2); sync();
     }
-    auth.value = existing?.auth || 'none'; fill(existing?.transport);
+    auth.value = existing?.auth || 'oauth';
+    if (existing?.oauthClient) {
+      form.querySelector('.mcp-registration').value = 'manual';
+      form.querySelector('.mcp-client-id').value = existing.oauthClient.clientId;
+      form.querySelector('.mcp-client-method').value = existing.oauthClient.tokenEndpointAuthMethod;
+    }
+    form.querySelector('.mcp-oauth-client').oninput = () => { oauthClientDirty = true; sync(); };
+    form.querySelector('.mcp-registration').onchange = () => { oauthClientDirty = true; sync(); };
+    fill(existing?.transport);
     for (const name of existing?.secretNames || []) addSecret(name);
     type.onchange = sync; auth.onchange = sync;
     form.querySelector('.mcp-secret-add').onclick = () => addSecret();
@@ -18518,8 +18570,13 @@ async function openMcpEditor(query, changed, entry, existing) {
           } else if (f.isSecret || transport.type !== 'stdio') secrets[f.name] = value;
           else transport.env[f.name] = value;
         }
-        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input')?.checked ?? true, registry,
+        const oauthClient = auth.value === 'oauth' && oauthClientDirty ? (form.querySelector('.mcp-registration').value === 'manual' ? {
+          clientId: form.querySelector('.mcp-client-id').value.trim(), tokenEndpointAuthMethod: form.querySelector('.mcp-client-method').value,
+          ...(form.querySelector('.mcp-client-secret').value ? { clientSecret: form.querySelector('.mcp-client-secret').value } : {}),
+        } : null) : undefined;
+        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ oauthClient, id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input')?.checked ?? true, registry,
           ...(Object.keys(secrets).length || secretDirty ? { secrets, mergeSecrets: !!existing, retainSecretNames: secretRows.map((row) => row.querySelector('.mcp-secret-name').value.trim()) } : {}) }) });
+        form.querySelector('.mcp-client-secret').value = ''; oauthClientDirty = false;
         existing = saved; // Retrying a failed refresh must update this MCP, not create a duplicate.
         await changed(saved);
         if (saved.auth === 'oauth') { message('Saved. Complete sign-in to use this MCP.'); box.hidden = true; await authorize(saved.id, oauthWindow); }
@@ -18529,6 +18586,9 @@ async function openMcpEditor(query, changed, entry, existing) {
     };
   }
   editor(existing);
+  api(`/api/mcp/oauth-info${query}`).then(info => {
+    if (dialog.isConnected) dialog.querySelector('.mcp-oauth-client code').textContent = info.redirectUri || 'Configure the installation public URL first';
+  }).catch(() => { if (dialog.isConnected) dialog.querySelector('.mcp-oauth-client code').textContent = 'Could not load the callback URL. Close and reopen this form to retry.'; });
   return closed;
 }
 async function finishMcpCallback() {

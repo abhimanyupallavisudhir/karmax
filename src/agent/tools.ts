@@ -241,7 +241,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: {} },
   },
   {
-    name: 'request_connection', description: 'Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in this task and it resumes automatically after authorization. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    name: 'request_connection', description: 'Use the optional Composio fallback when no suitable native MCP connection is available. Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in this task and it resumes automatically after authorization. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
     parameters: { type: 'object', properties: { toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['toolkit', 'why'] },
   },
   {
