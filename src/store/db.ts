@@ -5236,6 +5236,24 @@ export class Store {
       ORDER BY createdAt`).all() as any[];
   }
 
+  recordedUsageEventIds(ids: string[]): Set<string> {
+    const recorded = new Set<string>();
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const batch = ids.slice(offset, offset + 500);
+      const rows = this.db.prepare(`SELECT id FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
+        .all(...batch) as Array<{ id: string }>;
+      for (const row of rows) recorded.add(row.id);
+    }
+    return recorded;
+  }
+
+  /** Ownership lookups do not need a task's potentially huge transcript. */
+  taskAttribution(taskId: string): { projectId: string; organizationId: string } | undefined {
+    return this.db.prepare(`SELECT tasks.projectId, projects.organizationId FROM tasks
+      JOIN projects ON projects.id=tasks.projectId WHERE tasks.id=?`).get(taskId) as
+      { projectId: string; organizationId: string } | undefined;
+  }
+
   recordUsage(event: Omit<UsageEvent, 'id'> & { id?: string }): UsageEvent {
     const value: UsageEvent = { ...event, id: event.id ?? newId('usage') };
     this.db.prepare(`INSERT OR IGNORE INTO usage_events (id, organizationId, projectId, taskId, worldId, provider,

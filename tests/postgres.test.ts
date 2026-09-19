@@ -18,6 +18,22 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('looks up usage IDs in bounded batches and task ownership without loading views', () => {
+    const store = new Store(url!);
+    try {
+      const project = store.createProject('Usage attribution');
+      const task = store.createTask({ projectId: project.id, title: 'Run', workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'Run' } });
+      expect(store.taskAttribution(task.id)).toEqual({ projectId: project.id, organizationId: project.organizationId });
+      expect(store.taskAttribution('missing')).toBeUndefined();
+      store.recordUsage({ id: 'usage:e2b:known', organizationId: project.organizationId!, provider: 'e2b',
+        kind: 'world.active', quantity: 1, unit: 'second', costMicros: 14, startedAt: 1, endedAt: 1001 });
+      expect(store.recordedUsageEventIds([]).size).toBe(0);
+      const ids = Array.from({ length: 501 }, (_, i) => `missing-${i}`);
+      expect(store.recordedUsageEventIds([...ids, 'usage:e2b:known'])).toEqual(new Set(['usage:e2b:known']));
+    } finally { store.close(); }
+  });
+
   it('tracks transactions after multi-statement commits, comments and failed statements', () => {
     const db = openSqlDatabase(url!);
     try {
