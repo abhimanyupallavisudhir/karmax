@@ -104,7 +104,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     await runOrThrow(target, `mkdir -p ${quote(root)}`);
     return { root, repos: [], warnings, ephemeralPaths, ...(spec.scratch ? { workdir: root } : {}) };
   }
-  const multi = sources.length > 1 || spec.scratch;
+  const multi = sources.length > 1 || spec.scratch || spec.layout === 'nested';
   const allNames = uniqueNames([...(spec.scratch ? ['scratch'] : []), ...sources.map(remoteName)]);
   const scratchName = spec.scratch ? allNames[0]! : undefined;
   const names = spec.scratch ? allNames.slice(1) : allNames;

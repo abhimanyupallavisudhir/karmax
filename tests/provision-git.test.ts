@@ -37,6 +37,13 @@ describe('shared cloud world git provisioning', () => {
     expect(commands.some((command) => /\bgit\b/.test(command))).toBe(false);
   });
 
+  it('honors a nested layout for a single cloud repository so another branch can be added', async () => {
+    const { target } = fakeTarget((command) => command.includes('rev-parse') ? { stdout: 'a'.repeat(40) } : undefined);
+    const result = await provisionGitRepos(target, { taskId: 'nested', base: 'main',
+      repo: 'git@github.com:acme/app.git', layout: 'nested' }, OPTIONS);
+    expect(result.repos[0]?.root).toBe('/w/app');
+  });
+
   it('retries a transient clone failure after clearing the partial checkout', async () => {
     process.env.KARMAX_WORLD_CLONE_RETRY_MS = '0';
     let cloneAttempts = 0;
