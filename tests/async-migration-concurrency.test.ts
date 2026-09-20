@@ -11,10 +11,11 @@ let dir: string;
 let store: Store;
 let first: VaultItems;
 let second: VaultItems;
+let broker: CredentialBroker;
 beforeEach(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-async-concurrency-'));
   store = await Store.create();
-  const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+  broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
   first = new VaultItems(store, broker, path.join(dir, 'state'));
   second = new VaultItems(store, broker, path.join(dir, 'state'));
 });
@@ -92,4 +93,37 @@ it('does not lose simulated funds or authorize the same balance twice', async ()
   const results = await Promise.all([a.authorize(card.id, 80), b.authorize(card.id, 80)]);
   expect(results.filter(result => result.ok)).toHaveLength(1);
   expect((await a.getCard(card.id))?.available).toBe(20);
+});
+
+
+it('preserves independent connector settings and concurrent durable export retries', async () => {
+  const { Connectors } = await import('../src/autonomy/connectors.js');
+  const a = new Connectors(store, first, broker);
+  const b = new Connectors(store, second, broker);
+  const connector = {
+    name: 'source',
+    describe: async () => ({ name: 'source', label: 'source', available: true, detail: '', canPush: true }),
+    list: async () => [],
+    pull: async () => ({ items: [], failures: [] }),
+    push: async () => { throw new Error('test connector offline'); },
+  };
+  a.register(connector);
+  b.register(connector);
+  await Promise.all([
+    a.setConfig('source', { writeBack: true }),
+    b.setConfig('source', { lastSync: { at: 123, count: 2 } }),
+  ]);
+  expect(await a.config('source')).toMatchObject({ writeBack: true, lastSync: { at: 123, count: 2 } });
+  const items = await Promise.all([
+    first.save({ type: 'note', label: 'First export', secrets: { note: 'first-test-secret' } }),
+    second.save({ type: 'note', label: 'Second export', secrets: { note: 'second-test-secret' } }),
+  ]);
+  await Promise.all([a.writeBackCreated(items[0]!.id), b.writeBackCreated(items[1]!.id)]);
+  const pending = await a.pendingWrites();
+  expect(pending.map(write => write.itemId).sort()).toEqual(items.map(item => item.id).sort());
+  expect(pending.every(write => write.attempts === 1)).toBe(true);
+  expect(JSON.stringify(pending)).not.toContain('test-secret');
+  await Promise.all([a.discardWrites('source'), b.setConfig('source', { writeBack: false })]);
+  expect(await a.pendingWrites()).toEqual([]);
+  expect(await b.config('source')).toMatchObject({ writeBack: false, lastSync: { at: 123, count: 2 } });
 });

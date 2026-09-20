@@ -1516,9 +1516,11 @@ export class Connectors {
     }
   }
   async setConfig(name: string, patch: Partial<ConnectorConfig>): Promise<ConnectorConfig> {
+    return this.store.transaction(async () => {
     const next = { ...(await this.config(name)), ...patch };
     (await this.store.kvSet(kvConfig(this.organizationId, name), JSON.stringify(next)));
     return next;
+      });
   }
 
   /** Persist a selective refresh subscription. The server, not just the UI,
@@ -1807,6 +1809,7 @@ export class Connectors {
     return (await readConnectorWrites(this.store, this.organizationId));
   }
   private async saveWrite(write: PendingConnectorWrite, remove = false): Promise<void> {
+    return this.store.transaction(async () => {
     const current = (await this.pendingWrites());
     if (!current.some((entry) => entry.id === write.id)) return;
     if (
@@ -1824,6 +1827,7 @@ export class Connectors {
     (await this.store.kvSet(connectorOutboxKey(this.organizationId), JSON.stringify(pending)));
     if (remove && write.snapshotHandle && !pending.some((entry) => entry.snapshotHandle === write.snapshotHandle))
       this.broker?.deleteHandle(write.snapshotHandle);
+      });
   }
   private writeTarget(name: string): string {
     const secret = this.secretFor(name);
@@ -1835,6 +1839,7 @@ export class Connectors {
       .digest('hex');
   }
   private async queueWrite(name: string, itemId: string, externalId: string, field?: VaultFieldName): Promise<PendingConnectorWrite> {
+    return this.store.transaction(async () => {
     const existing = (await this.pendingWrites()).find(
       (entry) => entry.connector === name && entry.itemId === itemId && entry.field === field,
     );
@@ -1876,6 +1881,7 @@ export class Connectors {
     pending.push(write);
     (await this.store.kvSet(connectorOutboxKey(this.organizationId), JSON.stringify(pending)));
     return write;
+      });
   }
   private async executeWrite(write: PendingConnectorWrite): Promise<{ externalId: string } | undefined> {
     return serializeGitPass(`vault-outbox:${this.organizationId}:${write.connector}:${write.itemId}`, async () => {
@@ -1922,7 +1928,7 @@ export class Connectors {
           ) as ExternalSecretItem;
           const result = await connector.push(snapshot);
           externalId = result.externalId;
-          this.items.setExternalId(item.id, write.connector, externalId);
+          await this.items.setExternalId(item.id, write.connector, externalId);
           // Replaying the immutable creation snapshot makes a lost response
           // distinguishable from a collision. Reconcile any later rotation only
           // after that exact external entry has been acknowledged and bound.
@@ -1958,6 +1964,7 @@ export class Connectors {
     });
   }
   async discardWrites(name: string): Promise<number> {
+    return this.store.transaction(async () => {
     const pending = (await this.pendingWrites()).filter((write) => write.connector === name);
     for (const write of pending) (await this.saveWrite(write, true));
     let rotations = 0;
@@ -1968,6 +1975,7 @@ export class Connectors {
       }
     }
     return pending.length + rotations;
+      });
   }
 
   async retryWrites(
