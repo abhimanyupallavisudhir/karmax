@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
+import { replaceFileSync } from '../util/replace-file.js';
 import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
@@ -91,8 +92,7 @@ export class ConfigHomeManager {
 
   list(organizationId = 'org_personal'): { provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }[] {
     const root = this.organizationRoot(organizationId);
-    if (!fs.existsSync(root)) return [];
-    return fs.readdirSync(root, { withFileTypes: true })
+    return readHomesDirectory(root)
       .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && entry.name === 'organizations'))
       .filter((entry) => !fs.existsSync(path.join(root, entry.name, DISCONNECTED_HOME)))
       .map(({ name }) => {
@@ -111,7 +111,7 @@ export class ConfigHomeManager {
 
   /** Persist the vendor selected by an OpenCode subscription login. */
   setModelProvider(home: string, modelProvider: string): void {
-    fs.writeFileSync(path.join(home, KARMAX_LOGIN_META_FILE), JSON.stringify({ modelProvider }), { mode: 0o600 });
+    replaceFileSync(path.join(home, KARMAX_LOGIN_META_FILE), JSON.stringify({ modelProvider }));
   }
 
   /** Read Karmax metadata, falling back to a single provider in old auth.json files. */
@@ -154,7 +154,7 @@ export class ConfigHomeManager {
         ...(cur.mcpServers ?? {}),
         ...Object.fromEntries(Object.entries(servers).map(([name, server]) => [name, claudeMcpServer(server)])),
       };
-      fs.writeFileSync(file, JSON.stringify(cur, null, 2));
+      replaceFileSync(file, JSON.stringify(cur, null, 2));
     } else if (provider === 'codex') {
       // Minimal TOML for [mcp_servers.<name>] (command + args + env).
       const file = path.join(home, 'config.toml');
@@ -167,7 +167,7 @@ export class ConfigHomeManager {
         'mcp_servers.karmax',
       ]);
       const toml = Object.entries(servers).map(([name, server]) => codexMcpServer(name, server)).join('');
-      fs.writeFileSync(file, preserved.trimEnd() + toml);
+      replaceFileSync(file, preserved.trimEnd() + toml);
     }
     // ACP transports receive MCP servers in session/new and session/load.
     // Keeping them out of provider-specific files avoids duplicate servers.
@@ -199,7 +199,7 @@ export class ConfigHomeManager {
             .map(([name, server]) => [name, claudeMcpServer(server)]),
         );
         cur.mcpServers = { ...existing, ...refreshed, karmax: claudeMcpServer(platform) };
-        fs.writeFileSync(file, JSON.stringify(cur, null, 2));
+        replaceFileSync(file, JSON.stringify(cur, null, 2));
       } else if (provider === 'codex') {
         const file = path.join(home, 'config.toml');
         const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
@@ -210,7 +210,7 @@ export class ConfigHomeManager {
           ...selectedBrowsers.map(([name]) => `mcp_servers.${name}`),
         ]);
         const browserToml = selectedBrowsers.map(([name, server]) => codexMcpServer(name, server)).join('');
-        fs.writeFileSync(file, preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform));
+        replaceFileSync(file, preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform));
       }
     }
   }
@@ -229,10 +229,20 @@ export class ConfigHomeManager {
     const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
     const organizations = path.join(this.root, 'organizations');
     if (!fs.existsSync(organizations)) return homes;
-    for (const org of fs.readdirSync(organizations, { withFileTypes: true }).filter((entry) => entry.isDirectory())) {
+    for (const org of readHomesDirectory(organizations).filter((entry) => entry.isDirectory())) {
       for (const { provider, path: home } of this.list(org.name)) homes.push({ provider, path: home });
     }
     return homes;
+  }
+}
+
+function readHomesDirectory(directory: string) {
+  try { return fs.readdirSync(directory, { withFileTypes: true }); }
+  catch (error) {
+    // A primary may remove an organization while the execution process is
+    // discovering accounts. Missing homes mean no available credentials.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
   }
 }
 
