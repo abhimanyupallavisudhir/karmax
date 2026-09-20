@@ -24,7 +24,7 @@ import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { RemoteAccessController, remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
-import { duplicateInstanceMessage, registerAppInstance } from './util/instance.js';
+import { claimWorkerOwnership, duplicateInstanceMessage, registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
 import { siteNameOf } from './domain/brand.js';
@@ -94,6 +94,10 @@ async function main() {
     instance.release();
     throw new Error(duplicateInstanceMessage(p.home, instance.others));
   }
+  // The combined runtime participates in worker ownership too. A future split
+  // primary may have exited while its child is still being terminated; acquiring
+  // only app.lock would allow overlapping pollers during that transition.
+  const releaseWorker = process.platform === 'linux' ? await claimWorkerOwnership(p.home) : () => {};
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
   // One long-lived server, reused across restarts/reloads (see dev-server.ts):
   // spawning a fresh one per reload against the same SQLite file is what wedges
@@ -609,6 +613,7 @@ async function main() {
     shuttingDown = true;
     console.log(restart ? '\n  merged source changed; restarting…' : '\n  shutting down…');
     const exit = () => {
+      releaseWorker();
       instance.release(); // hold exclusive admission through worker shutdown
       if (restart && !replacementStarted) {
         replacementStarted = true;
