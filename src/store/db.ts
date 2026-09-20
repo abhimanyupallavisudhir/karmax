@@ -1,3 +1,4 @@
+import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
 import { decayVaultUsage, type VaultUsage } from '../util/vault-usage.js';
@@ -6381,6 +6382,7 @@ export class Store {
   }
 
   async appendExecutionFrame(id: string, data: string, stream: ExecutionFrame['stream'] = 'stdout'): Promise<ExecutionFrame> {
+    data = utf8Tail(data, 200_000);
     return this.db.transaction(async () => {
 
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -6396,7 +6398,7 @@ export class Store {
       const rows = (await this.db.prepare('SELECT seq, length(CAST(data AS BLOB)) bytes FROM execution_frames WHERE executionId=? ORDER BY seq DESC')
         .all(id)) as any[];
       let bytes = 0;
-      let keepFrom = 1;
+      let keepFrom = seq;
       for (const row of rows) {
         bytes += Number(row.bytes);
         if (bytes <= 200_000) keepFrom = Number(row.seq);

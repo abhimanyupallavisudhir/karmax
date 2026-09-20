@@ -1,3 +1,4 @@
+import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import type { WorldHandle, WorldProcess } from '../world/types.js';
@@ -61,6 +62,9 @@ export interface ActionStatus {
 export class ReviewActionRunner {
   private procs = new Map<string, RunningAction>();
   private commandPoll: AsyncInterval;
+  private output = new Map<string, ExecutionOutput>();
+  private endings = new Map<string, Promise<void>>();
+  private cancelled = new Set<string>();
 
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
     private access?: import('../world/access.js').WorldAccessService,
@@ -69,7 +73,7 @@ export class ReviewActionRunner {
       for (const rec of this.procs.values()) {
         if (!rec.running) continue;
         (await this.store.heartbeatExecution(rec.procId));
-        if ((await this.store.execution(rec.procId))?.state === 'stop-requested') void rec.process.kill('SIGTERM');
+        if ((await this.store.execution(rec.procId))?.state === 'stop-requested') await rec.process.kill('SIGTERM');
       }
     }, 1_000);
     this.commandPoll.unref();
@@ -141,26 +145,18 @@ export class ReviewActionRunner {
       previewLeaseIds,
       world: opts.world,
     };
-    const append = async (buf: unknown) => {
-      const s = String(buf);
-      rec.output = (rec.output + s).slice(-MAX_OUTPUT);
-      (await this.store.appendExecutionFrame(procId, s));
-      for (const l of rec.listeners) l(s, false, null);
-    };
-    process.onOutput(append);
-    process.onExit(async (code) => {
-      rec.running = false;
-      rec.exitCode = code;
-      (await this.store.finishExecution(procId, code));
-      (await this.releaseLease(rec, opts.world.kind));
-      (await this.revokePreviews(rec));
-      for (const l of rec.listeners) l('', true, rec.exitCode);
-      // The durable execution record (and its frames) now answers status/attach;
-      // keeping the in-memory buffer would grow the map by MAX_OUTPUT per run.
-      rec.listeners.clear();
-      this.procs.delete(procId);
-    });
+    const output = new ExecutionOutput(data => this.store.appendExecutionFrame(procId, data));
+    this.output.set(procId, output);
     this.procs.set(procId, rec);
+    process.onOutput(buf => {
+      const data = String(buf);
+      rec.output = (rec.output + data).slice(-MAX_OUTPUT);
+      output.append(data);
+      this.notify(rec, data, false);
+    });
+    process.onExit(code => {
+      void this.finishAction(rec, code).catch(error => console.error('[review] execution completion failed:', error));
+    });
     return rec;
   }
 
@@ -203,42 +199,82 @@ export class ReviewActionRunner {
       if (!execution || !['starting', 'running', 'stop-requested'].includes(execution.state)) {
         listener('', true, execution?.exitCode ?? null);
         stopped = true;
-        clearInterval(timer);
+        void timer.stop();
       }
     };
-    const timer = setInterval(poll, 500);
+    const timer = new AsyncInterval(poll, 500);
     timer.unref();
     (await poll());
-    return () => { stopped = true; clearInterval(timer); };
+    return () => { stopped = true; void timer.stop(); };
   }
 
   async stop(procId: string): Promise<boolean> {
     const requested = (await this.store.requestExecutionStop(procId));
     const rec = this.procs.get(procId);
     if (!rec || !rec.running) return requested;
-    void rec.process.kill('SIGTERM');
+    await rec.process.kill('SIGTERM');
     setTimeout(() => {
-      if (rec.running) void rec.process.kill('SIGKILL');
+      if (rec.running) void Promise.resolve(rec.process.kill('SIGKILL')).catch(error => console.error('[review] process stop failed:', error));
     }, KILL_GRACE_MS).unref?.();
     return requested;
   }
 
-  /** Kill everything — called on gateway shutdown so no dev server is orphaned. */
+  /** Kill everything and drain accepted output before closing the Store. */
   async stopAll(): Promise<void> {
     await this.commandPoll.stop();
-    for (const rec of this.procs.values()) if (rec.running) {
-      (await this.store.finishExecution(rec.procId, null, 'cancelled'));
-      void rec.process.kill('SIGKILL');
-      (await this.releaseLease(rec, rec.provider));
-      (await this.revokePreviews(rec));
+    for (const rec of [...this.procs.values()]) if (rec.running) {
+      this.cancelled.add(rec.procId);
+      await rec.process.kill('SIGKILL');
+      await this.finishAction(rec, null, 'cancelled');
     }
-    this.procs.clear();
+    await Promise.all([...this.endings.values()]);
+  }
+
+  private notify(rec: RunningAction, data: string, done: boolean): void {
+    for (const listener of rec.listeners) {
+      try { listener(data, done, done ? rec.exitCode : null); }
+      catch (error) { console.error('[review] output listener failed:', error); }
+    }
+  }
+
+  private finishAction(rec: RunningAction, code: number | null, state?: 'cancelled'): Promise<void> {
+    const previous = this.endings.get(rec.procId);
+    if (previous) return previous;
+    if (!this.procs.has(rec.procId)) return Promise.resolve();
+    rec.running = false;
+    rec.exitCode = code;
+    const work = (async () => {
+      let outputFailed = false;
+      try { await this.output.get(rec.procId)?.close(); }
+      catch {
+        outputFailed = true;
+        const notice = '\n[Output could not be saved for reconnect.]\n';
+        rec.output = (rec.output + notice).slice(-MAX_OUTPUT);
+        this.notify(rec, notice, false);
+      }
+      try { await this.store.finishExecution(rec.procId, code, outputFailed ? 'failed' : state ?? (this.cancelled.has(rec.procId) ? 'cancelled' : undefined)); }
+      finally {
+        // Publishing command completion must not wait for remote sandbox parking.
+        // Shutdown still awaits this ending promise, including lease cleanup.
+        this.procs.delete(rec.procId);
+        this.output.delete(rec.procId);
+        this.cancelled.delete(rec.procId);
+        this.notify(rec, '', true);
+        rec.listeners.clear();
+        try { await this.releaseLease(rec, rec.provider); }
+        finally { await this.revokePreviews(rec); }
+      }
+    })();
+    this.endings.set(rec.procId, work);
+    // Observe both branches without creating an unhandled rejected finally promise.
+    void work.then(() => this.endings.delete(rec.procId), () => this.endings.delete(rec.procId));
+    return work;
   }
 
   private async releaseLease(rec: RunningAction, provider: string): Promise<void> {
     if (!rec.runnerLeaseId || rec.leaseReleased) return;
     rec.leaseReleased = true;
-    if (this.access) void this.access.releaseLeaseAndParkIfIdle(rec.world, rec.runnerLeaseId);
+    if (this.access) await this.access.releaseLeaseAndParkIfIdle(rec.world, rec.runnerLeaseId);
     else (await this.runners?.release(rec.runnerLeaseId, provider));
   }
 

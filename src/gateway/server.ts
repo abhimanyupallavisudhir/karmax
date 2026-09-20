@@ -1,3 +1,4 @@
+import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
@@ -572,6 +573,9 @@ interface Session {
 
 export class Gateway {
   private sessions = new Map<string, Session>();
+  private closing = false;
+  private terminalStarts = new Set<Promise<void>>();
+  private terminalStops = new Set<() => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
@@ -1022,6 +1026,7 @@ export class Gateway {
     const wssAction = new WebSocketServer({ noServer: true });
     const wssPreview = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
+      if (this.closing) { socket.destroy(); return; }
       const { pathname } = new URL(req.url ?? '/', 'http://localhost');
       const isolatedPreview = Boolean(configuredPreviewOrigin());
       const onPreviewOrigin = isolatedPreview && this.requestIsPreviewOrigin(req);
@@ -1042,7 +1047,9 @@ export class Gateway {
     });
     wssTerm.on('connection', (ws, req) => {
       ws.on('error', () => {});
-      void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
+      const starting = this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
+      this.terminalStarts.add(starting);
+      void starting.then(() => this.terminalStarts.delete(starting));
     });
     wssAction.on('connection', (ws, req) => {
       ws.on('error', () => {});
@@ -1084,6 +1091,7 @@ export class Gateway {
       internalUrl,
       port,
       close: async () => {
+          this.closing = true;
           if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
@@ -1105,10 +1113,16 @@ export class Gateway {
           wssTerm.close();
           wssAction.close();
           wssPreview.close();
-          await new Promise<void>((resolve, reject) => {
-            server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
-            server.closeAllConnections();
-          });
+          await Promise.all([
+            new Promise<void>((resolve, reject) => {
+              server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
+              server.closeAllConnections();
+            }),
+            (async () => {
+              await Promise.all([...this.terminalStarts]);
+              await Promise.allSettled([...this.terminalStops].map(stop => stop()));
+            })(),
+          ]);
           }
         },
     };
@@ -1189,37 +1203,53 @@ export class Gateway {
           kill: async () => { try { void (await term.close()); } catch { /* already gone */ } },
         })
       : () => {};
-    let finalized = false;
+    let finalizing: Promise<void> | undefined;
     let clientClosed = false;
+    const output = new ExecutionOutput(data => this.deps.store.appendExecutionFrame(executionId, data));
     const heartbeat = new AsyncInterval(() => this.deps.store.heartbeatExecution(executionId), 30_000);
     heartbeat.unref();
-    const finish = async (code: number | null, cancelled = false) => {
-      if (finalized) return;
-      finalized = true;
-      await heartbeat.stop();
-      untrack();
-      (await this.deps.store.finishExecution(executionId, code, cancelled ? 'cancelled' : undefined));
-      if (worldLeaseId && this.deps.worldAccess) void this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
-      else if (worldLeaseId) (await this.deps.runners?.release(worldLeaseId, handle.kind));
+    const finish = (code: number | null, cancelled = false): Promise<void> => {
+      if (finalizing) return finalizing;
+      finalizing = (async () => {
+        await heartbeat.stop();
+        untrack();
+        let outputFailed = false;
+        try { await output.close(); } catch { outputFailed = true; }
+        try { await this.deps.store.finishExecution(executionId, code, outputFailed ? 'failed' : cancelled ? 'cancelled' : undefined); }
+        finally {
+          if (worldLeaseId && this.deps.worldAccess) await this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
+          else if (worldLeaseId) await this.deps.runners?.release(worldLeaseId, handle.kind);
+        }
+      })();
+      void finalizing.then(() => this.terminalStops.delete(stopTerminal), () => this.terminalStops.delete(stopTerminal));
+      return finalizing;
     };
-    term.onData(async (d: string) => {
-      (await this.deps.store.appendExecutionFrame(executionId, d));
-      try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {}
+    const failed = (error: unknown) => console.error('[terminal] execution failed:', error);
+    let stopping: Promise<void> | undefined;
+    const stopTerminal = (): Promise<void> => {
+      clientClosed = true;
+      return stopping ??= (async () => { try { await term.close(); } finally { await finish(null, true); } })();
+    };
+    this.terminalStops.add(stopTerminal);
+    term.onData((data: string) => {
+      output.append(data);
+      try { ws.send(JSON.stringify({ type: 'data', data })); } catch {}
     });
-    term.onExit(async (code) => { (await finish(code, clientClosed)); try { ws.close(); } catch {} });
-    ws.on('message', (raw) => {
+    term.onExit(code => {
+      void finish(code, clientClosed).catch(failed).finally(() => { try { ws.close(); } catch {} });
+    });
+    ws.on('message', raw => {
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (msg.type === 'input') term.write(msg.data);
-      else if (msg.type === 'resize') term.resize(msg.cols || 80, msg.rows || 24);
+      try {
+        if (msg.type === 'input') void Promise.resolve(term.write(msg.data)).catch(failed);
+        else if (msg.type === 'resize') void Promise.resolve(term.resize(msg.cols || 80, msg.rows || 24)).catch(failed);
+      } catch (error) { failed(error); }
     });
-    // The provider owns complete teardown (including descendants in a local PTY
-    // session, or the remote PTY lease in a cloud sandbox).
-    ws.on('close', async () => {
-      clientClosed = true;
-      (await finish(null, true));
-      void (await term.close());
-    });
+    // Close the provider stream first, then drain accepted output. Natural exit
+    // and socket close share one finalization promise and one lease release.
+    ws.on('close', () => { void stopTerminal().catch(failed); });
+    if (this.closing || ws.readyState !== 1) await stopTerminal();
   }
 
   /** Stream a running review action's output to the UI. `procId` names a process
