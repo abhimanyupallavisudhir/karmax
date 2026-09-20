@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DaytonaWorldProvider } from '../src/world/daytona.js';
-import { buildEnvironment } from '../src/world/environment-build.js';
+import { buildEnvironment, environmentArtifactName } from '../src/world/environment-build.js';
 
 const sdk = vi.hoisted(() => ({ constructors: [] as unknown[], list: vi.fn(), create: vi.fn(), dispose: vi.fn() }));
 vi.mock('@daytona/sdk', () => ({
@@ -16,6 +16,18 @@ vi.mock('@daytona/sdk', () => ({
 afterEach(() => { vi.clearAllMocks(); sdk.constructors.length = 0; });
 
 describe('Daytona SDK boundary', () => {
+  it('uses attempt-specific snapshots and disposes clients when recovery invalidates a build', async () => {
+    sdk.create.mockResolvedValueOnce(undefined);
+    const input = { provider: 'daytona', projectId: 'project', digest: 'recipe', buildId: 'first-attempt', spec: {} };
+    await expect(buildEnvironment(input)).resolves.toEqual({ ref: environmentArtifactName('project', 'recipe', 'first-attempt') });
+    expect(sdk.create).toHaveBeenCalledWith(expect.objectContaining({ name: environmentArtifactName('project', 'recipe', 'first-attempt') }), { timeout: 2700 });
+    expect(sdk.dispose).toHaveBeenCalledTimes(1);
+    const assertActive = vi.fn().mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw new Error('invalidated'); });
+    await expect(buildEnvironment({ ...input, buildId: 'replacement', assertActive })).rejects.toThrow('invalidated');
+    expect(sdk.create).toHaveBeenCalledTimes(1);
+    expect(sdk.dispose).toHaveBeenCalledTimes(2);
+  });
+
   it('explains missing snapshot permissions and disposes the build client', async () => {
     const { DaytonaAuthorizationError } = await import('@daytona/sdk');
     sdk.create.mockRejectedValueOnce(new DaytonaAuthorizationError('Access denied'));

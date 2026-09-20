@@ -4,6 +4,8 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectEnvironmentSpec } from '../domain/types.js';
+import { environmentArtifactName } from '../util/environment-artifact.js';
+export { environmentArtifactName } from '../util/environment-artifact.js';
 
 const pexec = promisify(execFile);
 const DOCKER_SETUP = 'command -v docker >/dev/null 2>&1 || (curl -fsSL https://get.docker.com | sh)';
@@ -15,11 +17,15 @@ export interface EnvironmentBuildInput {
   provider: string;
   projectId: string;
   digest: string;
+  buildId?: string;
+  onBuilderCreated?: (id: string) => void;
+  assertActive?: () => void;
   spec: ProjectEnvironmentSpec;
   connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
   createBuilderSandbox?: (base: string | undefined, options: { apiKey?: string }) => Promise<BuilderSandbox>;
 }
 export interface BuilderSandbox {
+  id?: string;
   run(command: string, options: { timeoutMs: number }): Promise<{ exitCode: number; stderr: string; stdout: string }>;
   createSnapshot(name: string): Promise<{ snapshotId: string }>;
   kill(): Promise<void>;
@@ -31,14 +37,12 @@ export function setupCommands(spec: ProjectEnvironmentSpec): string[] {
 export function bootCommands(spec: ProjectEnvironmentSpec): string[] {
   return [...(spec.includeDocker ? [DOCKER_BOOT] : []), ...(spec.boot ?? [])];
 }
-export function environmentArtifactName(projectId: string, digest: string): string {
-  return `karmax-env-${projectId.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${digest}`.toLowerCase();
-}
 export function environmentDockerfile(spec: ProjectEnvironmentSpec): string {
   return `${[`FROM ${spec.image ?? 'node:22-slim'}`, ...setupCommands(spec).map((command) => `RUN ${command}`)].join('\n')}\n`;
 }
 
 export async function buildEnvironment(input: EnvironmentBuildInput): Promise<EnvironmentBuildResult> {
+  input.assertActive?.();
   if (input.provider === 'worktree' || input.provider === 'memory') return { ref: 'host' };
   if (input.provider === 'container') return buildContainer(input);
   if (input.provider === 'e2b') return buildE2b(input);
@@ -47,7 +51,7 @@ export async function buildEnvironment(input: EnvironmentBuildInput): Promise<En
 }
 
 async function buildContainer(input: EnvironmentBuildInput): Promise<EnvironmentBuildResult> {
-  const tag = environmentArtifactName(input.projectId, input.digest);
+  const tag = environmentArtifactName(input.projectId, input.digest, input.buildId);
   const context = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-envbuild-'));
   try {
     fs.writeFileSync(path.join(context, 'Dockerfile'), environmentDockerfile(input.spec));
@@ -65,6 +69,7 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
       ? await (Sandbox as any).create(base, { ...options, timeoutMs: 45 * 60_000 })
       : await (Sandbox as any).create({ ...options, timeoutMs: 45 * 60_000 });
     return {
+      id: sandbox.sandboxId,
       async run(command: string, runOptions: { timeoutMs: number }) {
         const result = await sandbox.commands.run(`bash -lc ${quote(command)}`, runOptions);
         return { exitCode: result.exitCode ?? 0, stderr: result.stderr ?? '', stdout: result.stdout ?? '' };
@@ -81,11 +86,14 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
   const builder = await create(input.connection?.template,
     { ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}) });
   try {
+    if (builder.id) input.onBuilderCreated?.(builder.id);
     for (const command of setupCommands(input.spec)) {
+      input.assertActive?.();
       const result = await builder.run(command, { timeoutMs: 30 * 60_000 });
       if (result.exitCode !== 0) throw new Error(`setup "${command}" failed: ${(result.stderr || result.stdout).slice(-500)}`);
     }
-    return { ref: (await builder.createSnapshot(environmentArtifactName(input.projectId, input.digest))).snapshotId };
+    input.assertActive?.();
+    return { ref: (await builder.createSnapshot(environmentArtifactName(input.projectId, input.digest, input.buildId))).snapshotId };
   } finally { await builder.kill(); }
 }
 
@@ -100,7 +108,8 @@ async function buildDaytona(input: EnvironmentBuildInput): Promise<EnvironmentBu
     let image = Image.base(input.spec.image ?? 'ubuntu:22.04');
     const commands = setupCommands(input.spec);
     if (commands.length) image = image.runCommands(...commands);
-    const name = environmentArtifactName(input.projectId, input.digest);
+    const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
+    input.assertActive?.();
     await daytona.snapshot.create({ name, image }, { timeout: 45 * 60 });
     return { ref: name };
   } catch (error) {

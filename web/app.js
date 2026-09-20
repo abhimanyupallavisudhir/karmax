@@ -12492,12 +12492,13 @@ function settingsView(proj) {
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
-    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
-    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="card" data-settings-advanced hidden>
       <div class="section-h" data-settings-access="project" hidden>Project name</div>
-      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
-    </div></div></div></div>`;
+      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm" id="move-project" data-settings-access="projectTransfer" hidden>Move to organization…</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
+    </div>
+    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
+    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
+    </div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
   return `<div class="card">
@@ -12763,7 +12764,7 @@ async function hydrateProjectEnvironment(proj) {
   const box = $('#project-environment-box'); if (!box) return;
   try {
     const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
-    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div></div>`;
+    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
@@ -12781,6 +12782,26 @@ async function hydrateProjectEnvironment(proj) {
       </div>
       <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : ''}`;
+    box.querySelectorAll('[data-environment-recover]').forEach(button => button.addEventListener('click', async () => {
+      const record = builds.find(build => build.recoveryRevision === button.dataset.environmentRecover);
+      if (!record) return;
+      const artifact = record.artifactName || `karmax-env-${proj.id.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${record.digest}`.toLowerCase();
+      const cleanup = ['worktree', 'memory'].includes(record.provider)
+        ? 'Verify that the gateway which started this build has stopped working on it. No provider artifact needs removal.'
+        : `Stop the builder or build job in ${record.provider} first, and remove its image or snapshot named “${artifact}”.`
+          + (record.builderId ? ` Builder: ${record.builderId}.` : ' For older builds, locate the builder in the provider dashboard or on the build host.')
+          + (record.buildHost ? ` Build host: ${record.buildHost}.` : '');
+      const note = prompt(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
+      if (!note?.trim()) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${proj.id}/environment/build/recover`, { method: 'POST', body: JSON.stringify({
+          provider: record.provider, digest: record.digest, revision: record.recoveryRevision, cleanupConfirmed: true, cleanupNote: note.trim(),
+        }) });
+        toast('Build recovered. You can rebuild or move the project.');
+        await hydrateProjectEnvironment(proj);
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    }));
     $('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
@@ -13106,6 +13127,7 @@ function wireSettingsView(proj) {
   $('#project-name')?.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
   });
+  $('#move-project')?.addEventListener('click', () => moveProject(proj));
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -13129,6 +13151,110 @@ function wireSettingsView(proj) {
       renderRail();
       renderMain();
     } catch (e) { toast(e.message, true); }
+  });
+}
+
+function moveProject(project) {
+  const opener = document.activeElement;
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="move-project-title">
+    <div class="new-project-head"><b id="move-project-title">Move “${esc(project.name)}”</b><button class="icon-btn" type="button" data-close aria-label="Close">×</button></div>
+    <label class="form-row"><span>Destination</span><select data-destination aria-label="Destination organization" disabled><option value="">Loading…</option></select></label>
+    <div data-preview aria-live="polite"></div>
+    <div class="form-error" data-error role="alert" hidden></div>
+    <div class="new-project-actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit" disabled>Move project</button></div>
+  </form></div>`;
+  const select = host.querySelector('[data-destination]');
+  const previewBox = host.querySelector('[data-preview]');
+  const error = host.querySelector('[data-error]');
+  const submit = host.querySelector('[type="submit"]');
+  const controller = new AbortController();
+  let closed = false, moving = false, revision = 0, preview;
+  const close = () => {
+    if (closed || moving) return;
+    closed = true;
+    controller.abort();
+    document.removeEventListener('keydown', keydown);
+    host.remove();
+    opener?.focus?.();
+  };
+  const keydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); close(); }
+    if (event.key !== 'Tab') return;
+    const controls = [...host.querySelectorAll('button:not(:disabled), select:not(:disabled), summary')];
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  };
+  host.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', close));
+  host.querySelector('.modal-overlay').addEventListener('mousedown', event => { if (event.target === event.currentTarget) close(); });
+  const loadPreview = async () => {
+    const current = ++revision;
+    preview = undefined; submit.disabled = true; error.hidden = true;
+    previewBox.textContent = select.value ? 'Checking project…' : '';
+    if (!select.value) return;
+    try {
+      const value = await api(`/api/projects/${encodeURIComponent(project.id)}/transfer?destinationOrganizationId=${encodeURIComponent(select.value)}`, { signal: controller.signal });
+      if (closed || revision !== current) return;
+      preview = value;
+      previewBox.innerHTML = `<p class="task-sub">${value.taskCount} task${value.taskCount === 1 ? '' : 's'} · History preserved</p>
+        <details><summary>Access and settings will change</summary><ul>${value.changes.map(change => `<li>${esc(change)}</li>`).join('')}</ul></details>
+        ${value.blockers.length ? `<div class="form-error" role="alert"><ul>${value.blockers.map(blocker => `<li>${esc(blocker.message)}</li>`).join('')}</ul></div>` : ''}`;
+      submit.disabled = !!value.blockers.length;
+    } catch (cause) {
+      if (closed || revision !== current) return;
+      previewBox.textContent = ''; error.textContent = cause.message; error.hidden = false;
+    }
+  };
+  select.addEventListener('change', loadPreview);
+  host.querySelector('form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!preview || preview.blockers.length || moving) return;
+    moving = true; submit.disabled = true; select.disabled = true; submit.textContent = 'Moving…'; error.hidden = true;
+    host.querySelectorAll('[data-close]').forEach(button => { button.disabled = true; });
+    try {
+      const moved = await api(`/api/projects/${encodeURIComponent(project.id)}/transfer`, {
+        method: 'POST', body: JSON.stringify({ destinationOrganizationId: select.value, previewId: preview.id }),
+      });
+      moving = false; close();
+      // Reset the selection so the route reloads permissions and task state even
+      // though this project's stable ID has not changed.
+      S.projectId = null;
+      await loadProjects();
+      S.projectId = null; S.organizationId = project.organizationId;
+      await go(projectById(moved.id) ? projectRoute(moved.id, 'settings') : globalRoute('dashboard', organizationById(moved.organizationId)));
+      toast(`Moved “${moved.name}”`);
+    } catch (cause) {
+      moving = false;
+      if (closed) { toast(cause.message, true); return; }
+      error.textContent = cause.message; error.hidden = false;
+      select.disabled = false; submit.textContent = 'Move project';
+      // Keep the same preview on transport failures: the server stores the
+      // result, so retry cannot perform a second transfer. A conflict needs a
+      // fresh preview; selecting the destination again refreshes it.
+      submit.disabled = cause.status === 409 || cause.status === 403;
+      if (cause.status === 409) {
+        const retry = document.createElement('button');
+        retry.type = 'button'; retry.className = 'btn sm'; retry.textContent = 'Check again';
+        retry.addEventListener('click', () => { retry.remove(); loadPreview(); });
+        error.append(' ', retry);
+      }
+      host.querySelectorAll('[data-close]').forEach(button => { button.disabled = false; });
+    }
+  });
+  $('#modal-root').appendChild(host);
+  document.addEventListener('keydown', keydown);
+  host.querySelector('[data-close]').focus();
+  api(`/api/projects/${encodeURIComponent(project.id)}/transfer`, { signal: controller.signal }).then(value => {
+    if (closed) return;
+    select.innerHTML = `<option value="">${value.organizations.length ? 'Choose organization' : 'No eligible organizations'}</option>`
+      + value.organizations.map(org => `<option value="${esc(org.id)}">${esc(org.name)}</option>`).join('');
+    select.disabled = !value.organizations.length;
+    if (value.organizations.length) select.focus();
+  }).catch(cause => {
+    if (closed) return;
+    select.innerHTML = '<option value="">Unavailable</option>';
+    error.textContent = cause.message; error.hidden = false;
   });
 }
 

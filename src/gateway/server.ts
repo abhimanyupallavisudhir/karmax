@@ -19,6 +19,7 @@ import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js'
 import type { TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
 import { Store } from '../store/db.js';
+import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -276,6 +277,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/transfer$/.test(p)) return 'project:read';
   if (/^\/api\/projects\/[^/]+\/folder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/reorder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -569,6 +571,7 @@ interface Session {
 
 export class Gateway {
   private sessions = new Map<string, Session>();
+  private requestGuards = new WeakMap<http.IncomingMessage, () => void>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
@@ -1820,6 +1823,15 @@ export class Gateway {
         { path: p, ...identityAuditDetail(auditedIdentity) });
     }
 
+    if (required && requestedScope.projectId && !['GET', 'HEAD'].includes(method)) {
+      const originalOrganization = store.getProject(requestedScope.projectId)?.organizationId;
+      this.requestGuards.set(req, () => {
+        if (store.getProject(requestedScope.projectId!)?.organizationId !== originalOrganization)
+          throw new ProjectTransferError('Project moved while this request was being prepared. Reload and retry.');
+        const checked = this.deps.tokens.check(token, required, requestedScope);
+        if (!checked.ok) throw new CapabilityError(checked.reason ?? 'Access changed. Reload and retry.');
+      });
+    }
     try {
       const sharingSettings = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/conversation-sharing$/);
       if (sharingSettings) {
@@ -1995,6 +2007,8 @@ export class Gateway {
             ? allowed('organization:edit', { organizationId: requestedScope.organizationId }) : false,
           project: requestedScope.projectId
             ? allowed('project:edit', { projectId: requestedScope.projectId }) : false,
+          projectTransfer: requestedScope.projectId
+            ? allowed('project:transfer-out', { projectId: requestedScope.projectId, organizationId: requestedScope.organizationId }) : false,
           projectDelete: requestedScope.projectId
             ? allowed('project:delete', { projectId: requestedScope.projectId }) : false,
         });
@@ -2312,32 +2326,33 @@ export class Gateway {
 
         // External resources go first. These operations are idempotent, so an
         // outage never commits a deceptively successful partial deletion.
-        const resources = store.organizationResources(organizationId);
-        const projects = store.listProjects().filter((project) => project.organizationId === organizationId);
-        for (const project of projects) await this.removeProjectExternalResources(project.id, 'organization deleted');
-        for (const connection of store.listPaymentConnections(organizationId)) {
-          const provider = this.deps.paymentRegistry?.get(connection.provider) as any;
-          if (provider && typeof provider.disconnect === 'function') await provider.disconnect(organizationId);
-        }
-        await this.deps.githubApp?.disconnectOrganization(organizationId);
-        for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
-          this.deps.providerConnections?.delete(organizationId, connection.provider);
-        const storageLocations = this.deps.resources?.storageLocationService();
-        for (const location of storageLocations?.list(organizationId) ?? [])
-          if (location.kind === 's3') storageLocations!.delete(organizationId, location.id);
-        this.deps.resources?.deleteOrganizationKey(organizationId);
-        const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
-        for (const profile of gitProfiles.list()) gitProfiles.delete(profile.name);
-        const { agentAccountHandles } = await import('../platform/credential-sources.js');
-        for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
-          this.deps.broker?.deleteHandle(handle);
-        this.deps.configHomes?.removeOrganization(organizationId);
-        await this.deps.workflows?.removeOrganization(organizationId);
-        store.deleteOrganization(organizationId);
-        for (const attachmentId of resources.attachmentIds)
-          if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
-        return this.json(res, 200, { deleted: true, organizationId });
+        return this.withDeletionFence([], organizationId, async (projectIds) => {
+          const resources = store.organizationResources(organizationId);
+          for (const projectId of projectIds) await this.removeProjectExternalResources(projectId, 'organization deleted');
+          for (const connection of store.listPaymentConnections(organizationId)) {
+            const provider = this.deps.paymentRegistry?.get(connection.provider) as any;
+            if (provider && typeof provider.disconnect === 'function') await provider.disconnect(organizationId);
+          }
+          await this.deps.githubApp?.disconnectOrganization(organizationId);
+          for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
+            this.deps.providerConnections?.delete(organizationId, connection.provider);
+          const storageLocations = this.deps.resources?.storageLocationService();
+          for (const location of storageLocations?.list(organizationId) ?? [])
+            if (location.kind === 's3') storageLocations!.delete(organizationId, location.id);
+          this.deps.resources?.deleteOrganizationKey(organizationId);
+          const { GitProfiles } = await import('../autonomy/git-profiles.js');
+          const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
+          for (const profile of gitProfiles.list()) gitProfiles.delete(profile.name);
+          const { agentAccountHandles } = await import('../platform/credential-sources.js');
+          for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
+            this.deps.broker?.deleteHandle(handle);
+          this.deps.configHomes?.removeOrganization(organizationId);
+          await this.deps.workflows?.removeOrganization(organizationId);
+          store.deleteOrganization(organizationId);
+          for (const attachmentId of resources.attachmentIds)
+            if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+          return this.json(res, 200, { deleted: true, organizationId });
+        });
       }
       const identityPolicy = p.match(/^\/api\/organizations\/([^/]+)\/identity-policy$/);
       if (identityPolicy) {
@@ -3257,6 +3272,61 @@ export class Gateway {
         await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
+      const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
+      if (projectTransfer) {
+        if (!['GET', 'POST'].includes(method)) return this.json(res, 405, { error: 'Method not allowed.' });
+        const projectId = projectTransfer[1]!;
+        const project = store.getProject(projectId);
+        if (!project) return this.json(res, 404, { error: 'Project not found.' });
+        const body = method === 'POST' ? await this.body(req) : {};
+        const destination = method === 'POST' ? body.destinationOrganizationId : url.searchParams.get('destinationOrganizationId');
+        if (destination != null && (typeof destination !== 'string' || !destination || destination.length > 200))
+          return this.json(res, 400, { error: 'Choose a destination organization.' });
+        if (method === 'POST' && (typeof body.previewId !== 'string' || !destination))
+          return this.json(res, 400, { error: 'Preview the move before confirming it.' });
+        // Cookie sessions may independently authorize both orgs. Bearers always
+        // retain their exact minted scope; never reload a delegated human's grants.
+        const orgSessions = new Map<string, Session>();
+        const candidates = destination ? [destination, project.organizationId!] : store.listOrganizations().map(o => o.id);
+        if (method === 'POST') {
+          const saved = store.kvGet(`project-transfer:${body.previewId}`);
+          if (saved) candidates.push(JSON.parse(saved).sourceOrganizationId);
+        }
+        for (const org of new Set(candidates)) {
+          const orgSession = await this.auth(req, undefined, org);
+          if (orgSession) orgSessions.set(org, orgSession);
+        }
+        const authorize = (cap: string, org: string) => {
+          const scoped = orgSessions.get(org);
+          const checked = scoped && this.deps.tokens.check(scoped.apiToken, cap, { organizationId: org });
+          if (!checked?.ok || checked.record?.projectId || checked.record?.projectIds?.length)
+            throw new CapabilityError(`Missing organization permission ${cap}.`);
+          if (scoped?.userId && this.deps.identity && this.deps.authorization
+            && !allows(this.deps.authorization.capabilities(`user:${scoped.userId}`, undefined, org), cap))
+            throw new CapabilityError(`Missing organization permission ${cap}.`);
+        };
+        if (!destination) {
+          authorize('project:transfer-out', project.organizationId!);
+          return this.json(res, 200, { organizations: store.listOrganizations().filter(o => {
+            if (o.id === project.organizationId) return false;
+            try { authorize('project:transfer-in', o.id); return true; } catch { return false; }
+          }).map(o => ({ id: o.id, name: o.name })) });
+        }
+        const transfers = new ProjectTransfers(store, {
+          principal: actorPrincipal(callerIdentity.actor), authorize,
+          workflowClosed: async taskId => {
+            try {
+              const description = await withTimeout(this.deps.client.workflow.getHandle(taskId).describe(), 5_000);
+              return ['COMPLETED', 'FAILED', 'CANCELED', 'TERMINATED', 'TIMED_OUT'].includes(description.status.name);
+            } catch (error) {
+              if (isWorkflowGone(error)) return true;
+              throw new ProjectTransferError('Could not verify task workflows. Retry when the workflow service is available.', 503);
+            }
+          },
+        });
+        return this.json(res, 200, method === 'GET' ? transfers.preview(projectId, destination)
+          : await transfers.move(projectId, destination, body.previewId));
+      }
       const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
       if (projMatch) {
         const id = projMatch[1]!;
@@ -3294,11 +3364,14 @@ export class Gateway {
         }
         if (method === 'DELETE') {
           if (!store.getProject(id)) return this.json(res, 404, { error: 'project not found' });
-          const resources = await this.removeProjectExternalResources(id, 'project deleted');
-          store.deleteProject(id);
-          for (const attachmentId of resources.attachmentIds)
-            if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
-          return this.json(res, 200, { deleted: true, projectId: id });
+          return this.withDeletionFence([id], undefined, async () => {
+            this.requestGuards.get(req)?.();
+            const resources = await this.removeProjectExternalResources(id, 'project deleted');
+            store.deleteProject(id);
+            for (const attachmentId of resources.attachmentIds)
+              if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+            return this.json(res, 200, { deleted: true, projectId: id });
+          });
         }
       }
       // Folder headers are projections of project.folder, not separate records.
@@ -3436,18 +3509,23 @@ export class Gateway {
       }
 
       // Environment recipe, repo-derived proposal, and immutable provider build.
-      const projectEnvironment = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build))?$/);
+      const projectEnvironment = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build(?:\/recover)?))?$/);
       if (projectEnvironment && ['GET', 'PUT', 'POST'].includes(method)) {
         const project = store.getProject(projectEnvironment[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
-        const { ProjectEnvironment, proposeEnvironment } = await import('../store/project-environment.js');
+        const buildScope = { organizationId: project.organizationId,
+          transferGeneration: store.kvGet(`project-transfer-current:${project.id}`) ?? '' };
+        const { ProjectEnvironment, proposeEnvironment, beginEnvironmentBuild, finishEnvironmentBuild,
+          recoverEnvironmentBuild, environmentBuildRevision, environmentBuildIsActive, recordEnvironmentBuilder,
+        } = await import('../store/project-environment.js');
         const environments = new ProjectEnvironment(store);
         const sub = projectEnvironment[2];
         try {
           if (method === 'GET' && !sub) {
             const spec = environments.spec(project.id);
             return this.json(res, 200, { spec: spec ?? null,
-              digest: spec ? environments.digest(spec) : null, builds: environments.builds(project.id) });
+              digest: spec ? environments.digest(spec) : null, builds: environments.builds(project.id).map(build => ({ ...build,
+                recoveryRevision: environmentBuildRevision(build) })) });
           }
           if (method === 'PUT' && !sub) {
             const body = await this.body(req);
@@ -3465,6 +3543,13 @@ export class Gateway {
                 .some((service) => service.kind === 'per-world'),
             }));
           }
+          if (method === 'POST' && sub === 'build/recover') {
+            const body = await this.body(req);
+            if (typeof body.provider !== 'string' || typeof body.digest !== 'string' || typeof body.revision !== 'string'
+              || typeof body.cleanupNote !== 'string') return this.json(res, 400, { error: 'Inspect the build and confirm provider cleanup before recovering it.' });
+            recoverEnvironmentBuild(store, project.id, buildScope, body, actorPrincipal(callerIdentity.actor));
+            return this.json(res, 200, { recovered: true });
+          }
           if (method === 'POST' && sub === 'build') {
             const spec = environments.spec(project.id);
             if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
@@ -3473,16 +3558,17 @@ export class Gateway {
             const digest = environments.digest(spec);
             const connection = ['e2b', 'daytona'].includes(provider)
               ? this.deps.providerConnections?.resolve(project.organizationId, provider) : undefined;
-            environments.recordBuild(project.id, { provider, digest, status: 'building' });
             const { buildEnvironment } = await import('../world/environment-build.js');
-            void buildEnvironment({ provider, projectId: project.id, digest, spec,
+            const attempt = beginEnvironmentBuild(store, project.id, buildScope, provider, digest);
+            void buildEnvironment({ provider, projectId: project.id, digest, spec, buildId: attempt.buildId,
+              onBuilderCreated: id => recordEnvironmentBuilder(store, attempt, id),
+              assertActive: () => { if (!environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.'); },
               ...(connection ? { connection: { apiKey: connection.apiKey,
                 apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target,
                 template: (connection.config as any)?.template } } : {}) })
-              .then((result) => environments.recordBuild(project.id,
-                { provider, digest, ref: result.ref, status: 'ready' }))
-              .catch((error) => environments.recordBuild(project.id,
-                { provider, digest, status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }));
+              .then((result) => finishEnvironmentBuild(store, attempt, { ref: result.ref, status: 'ready' }),
+                (error) => finishEnvironmentBuild(store, attempt,
+                  { status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }));
             return this.json(res, 202, { building: { provider, digest } });
           }
         } catch (error) {
@@ -7855,6 +7941,34 @@ export class Gateway {
   }
 
   // ── helpers ──
+  /** External deletion and tenant transfer must never overlap. A deletion fence
+   * survives a gateway crash; retrying that same idempotent deletion replaces
+   * it. It cannot expire underneath an outstanding provider delete request. */
+  private async withDeletionFence<T>(projectIds: string[], organizationId: string | undefined, work: (projectIds: string[]) => Promise<T>): Promise<T> {
+    const store = this.deps.store;
+    const value = JSON.stringify({ id: crypto.randomUUID(), kind: 'delete', expiresAt: Number.MAX_SAFE_INTEGER });
+    const keys: string[] = [];
+    store.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (organizationId) {
+        if (store.db.dialect === 'postgres') store.db.prepare('SELECT id FROM organizations WHERE id=? FOR UPDATE').get(organizationId);
+        projectIds = store.listProjects().filter(p => p.organizationId === organizationId).map(p => p.id);
+        keys.push(`organization-deleting:${organizationId}`);
+      }
+      keys.push(...projectIds.map(id => `project-transfer-lock:${id}`));
+      for (const id of [...projectIds].sort()) {
+        if (store.db.dialect === 'postgres') store.db.prepare('SELECT id FROM projects WHERE id=? FOR UPDATE').get(id);
+        const current = JSON.parse(store.kvGet(`project-transfer-lock:${id}`) ?? '{}');
+        if (current.kind !== 'delete' && current.expiresAt > Date.now())
+          throw new ProjectTransferError('A project move is in progress. Retry deletion when it finishes.');
+      }
+      for (const key of keys) store.kvSet(key, value);
+      store.db.exec('COMMIT');
+    } catch (error) { store.db.exec('ROLLBACK'); throw error; }
+    try { return await work(projectIds); }
+    finally { for (const key of keys) store.db.prepare('DELETE FROM kv WHERE k=? AND v=?').run(key, value); }
+  }
+
   private async removeProjectExternalResources(projectId: string, reason: string) {
     const project = this.deps.store.getProject(projectId);
     if (!project) throw new Error('project not found');
@@ -8230,6 +8344,7 @@ export class Gateway {
       }
       if (!exceeded) chunks.push(c as Buffer);
     }
+    this.requestGuards.get(req)?.();
     if (exceeded) throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
     return Buffer.concat(chunks);
   }

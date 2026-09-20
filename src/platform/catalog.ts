@@ -70,6 +70,8 @@ export const PLATFORM_API_CATALOG = {
     // be created inside an organization". Leaving it undocumented meant an agent on
     // a hosted install had no discoverable way to create a project at all.
     'GET|POST /api/organizations/:organizationId/projects (on hosted, project-create MUST use this form)',
+    'GET /api/projects/:projectId/transfer (eligible destinations; add ?destinationOrganizationId=… for a preview)',
+    'POST /api/projects/:projectId/transfer (body {destinationOrganizationId, previewId}; requires project:transfer-out in source and project:transfer-in in destination; same API for agents and humans)',
     'PATCH /api/projects/:projectId/folder (body {folder, name} — atomically rename an implicit sidebar folder tree)',
     'POST /api/projects/:projectId/reorder (body {before?: projectId} — sidebar order)',
     'GET|POST /api/projects/:projectId/workflow-pins',
@@ -84,6 +86,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST|DELETE /api/projects/:projectId/services', 'GET /api/projects/:projectId/services/compose-import',
     'GET|PUT /api/projects/:projectId/environment', 'GET /api/projects/:projectId/environment/proposal',
     'POST /api/projects/:projectId/environment/build',
+    'POST /api/projects/:projectId/environment/build/recover — invalidate an abandoned attempt after stopping the builder and removing provider artifacts; requires provider, digest, revision from GET environment, cleanupConfirmed:true, cleanupNote',
     'GET|POST /api/projects/:projectId/members',
     'DELETE /api/projects/:projectId/members/user|team|organization/:principalId',
   ],
