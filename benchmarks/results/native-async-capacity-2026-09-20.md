@@ -157,3 +157,46 @@ production capacity result. Main still selects the combined runtime. Selecting t
 child requires gateway URL and subscriber startup ordering, shared world lifecycle
 review, and full application integration tests. No production deployment of this
 split has occurred.
+
+## Opt-in full application split and hibernation safety
+
+`3f7d879` wires `KARMAX_WORKER_MODE=process` into the real application, requiring
+Linux/PostgreSQL and retaining combined mode as the default. Gateway binding now
+precedes worker startup; API readiness and websocket admission wait for bootstrap
+and recovery. The child receives the actual bound internal URL. Foreign-event
+polling starts after subscribers are installed, from the cursor captured before
+worker startup. Worker failure shuts down the primary with a nonzero exit.
+
+Idle liveness checks run every ten seconds with a fifteen-second deadline, while
+start/refresh work uses its existing control deadline. The final supervisor file
+passed eleven tests, including a child that freezes after startup without any
+refresh request and a healthy idle child that answers probes.
+
+The gateway/readiness/supervisor/full-main/relay group passed **79 tests**. The
+full-main test uses a temporary home, unique PostgreSQL schema, private Temporal
+service and mock provider configuration. It creates a script task through HTTP,
+observes its output in Review, suspends the worker with SIGSTOP while task-page and
+liveness requests continue to succeed within their two-second request deadlines,
+resumes it, shuts down cleanly, restarts and reads the retained task, then SIGKILLs
+the child and observes primary exit code one. This establishes isolation and
+lifecycle behavior, not production load capacity. The first full-main fixture used
+the prompt without the explicit script command and failed its output assertion;
+passing runs supply the command explicitly.
+
+`e64ff41` fixes a destructive hibernation race discovered during the world audit.
+It holds transition ownership through checkpointing/destruction, rejects stale
+selection timestamps and generations, rechecks pins/leases/task state, and requires
+a checkpoint for the generation being destroyed. A transient provider failure no
+longer claims successful eviction; only an authoritative missing-sandbox probe does.
+The hibernation/runner/waiting-lifecycle/operation-lock/store group passed **98 tests**.
+Initial event assertions lacked a task record in their fixture; the fixture was
+corrected before the final passing run. PostgreSQL regressions passed **15 tests**.
+
+Typechecking passed with a 1280 MiB heap. The combined application at `e64ff41`
+passed isolated database/Temporal readiness and SIGTERM shutdown: exit zero, one
+persisted stop record, no active-runtime marker, and 0.068 seconds from signal to
+observed exit. This was idle shutdown, not an active-agent drain benchmark.
+
+Process mode remains experimental. Cancellation/handoff compound transitions and
+primary-written config files read by the child still require review before a
+production rollout. No production deployment or new complete-suite run is claimed.
