@@ -1981,7 +1981,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           .filter(Boolean)
           .join('\n');
         const wikiContext = store.getTask(args.taskId)?.params?.wikiContext;
-        wikiSnapshot = await projectWikiPromptSnapshot(world);
+        wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
         projectInstructions = buildWikiPromptContext({
           contentDir: deps.contentDir ?? paths().content,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
@@ -4711,31 +4711,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
       if ((view.status === 'waiting' || view.status === 'blocked')
         && !startingAgent && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
+        const parkingTrace = installationTiming(store, { taskId }, row => record(taskId, 'timing', { ...row }));
+        const parkingEnd = parkingTrace.start('lifecycle.waiting-publication');
         try {
-          const before = await worlds.status(waitingWorld);
+          const before = await parkingTrace.measure('lifecycle.status', () => worlds.status(waitingWorld));
           if (before === 'ready') {
             if (deps.checkpoints) {
               try {
                 // The branch is the portable checkpoint's committed layer. Push
                 // it through the trusted broker before capturing the dirty delta.
                 if (isRemote(waitingWorld.kind)) {
-                  const remoteWorld = await openWorld(waitingWorld, taskId);
+                  const remoteWorld = await parkingTrace.measure('lifecycle.open', () => withTiming(parkingTrace, () => openWorld(waitingWorld, taskId)));
                   const projectId = String(remoteWorld.handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
                   if (store.listProjectRepositories(projectId).length) {
-                    await enrollLiveProjectRepositories(remoteWorld, taskId);
-                    const pushed = await publishTaskBranch(remoteWorld, taskId);
+                    await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
+                    const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId)));
                     if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                     record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' });
                   }
                 }
-                const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
+                const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld));
                 record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
                   generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 });
               } catch (error) {
                 record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) });
               }
             }
-            await worlds.park(waitingWorld);
+            await parkingTrace.measure('lifecycle.park', () => withTiming(parkingTrace, () => worlds.park(waitingWorld)));
             if (await worlds.status(waitingWorld) === 'parked') {
               const current = (store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle;
               const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
@@ -4751,7 +4753,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Auto-pause remains the cost backstop; a transient park failure must
           // never roll back or retry the authoritative view update.
           record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` });
-        }
+        } finally { parkingEnd(); }
       }
     },
 

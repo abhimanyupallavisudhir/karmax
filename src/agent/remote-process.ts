@@ -1,3 +1,4 @@
+import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -52,12 +53,12 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
-  const runtimeBin = await ensureRemoteNode(world);
-  if (provider === 'codex') await quiesceRemoteCodexHome(world, absolute);
+  const runtimeBin = await timed('bootstrap.node', () => ensureRemoteNode(world));
+  if (provider === 'codex') await timed('bootstrap.quiesce', () => quiesceRemoteCodexHome(world, absolute));
   // A single-repo world's root is itself a checkout. Keep injected auth out of
   // `git add -A` without modifying the user's tracked .gitignore.
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
-  const existing = await remoteHomeFiles(world, absolute);
+  const existing = await timed('bootstrap.list-home', () => remoteHomeFiles(world, absolute));
   for (const file of configFiles(localHome, provider, session)) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
@@ -85,11 +86,11 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // been deleted. Repair prior duplicate copies here too, before Codex opens its
   // persistent index; live-world transfer is not guaranteed to run.
   if (provider === 'codex' && session)
-    await reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session);
+    await timed('bootstrap.reconcile-session', () => reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session));
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
-  const browserMcp = browser ? await ensureRemoteBrowser(world, browser, runtimeBin) : undefined;
-  if (provider === 'codex') await seedRemoteCodexConfig(world, localHome, home, browserMcp);
+  const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, runtimeBin)) : undefined;
+  if (provider === 'codex') await timed('bootstrap.config', () => seedRemoteCodexConfig(world, localHome, home, browserMcp));
   const permissions = await world.exec('bash', ['-lc',
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
   if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
@@ -768,12 +769,12 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`,
       `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`,
     ];
-    const install = await world.exec('bash', ['-lc', [
+    const install = await timed('bootstrap.browser.install', () => world.exec('bash', ['-lc', [
       ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
       `mkdir -p ${quote(absolute)} ${quote(browserCache)}`,
       `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
       `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
-    ].join(' && ')], { timeoutMs: 10 * 60_000 });
+    ].join(' && ')], { timeoutMs: 10 * 60_000 }));
     if (install.code !== 0) throw new Error(`remote browser installation failed: ${install.stderr || install.stdout}`);
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
@@ -858,14 +859,14 @@ export async function ensureRemoteNode(world: World): Promise<string> {
   const root = path.posix.join(world.handle.root, `${REMOTE_ROOT}/tools/node-${REMOTE_NODE_VERSION}`);
   const bin = path.posix.join(root, 'bin');
   const node = path.posix.join(bin, 'node');
-  const install = await world.exec('bash', ['-lc', [
+  const install = await timed('bootstrap.node.install-or-check', () => world.exec('bash', ['-lc', [
     `mkdir -p ${quote(bin)}`,
     `test -x ${quote(node)} || npm install --prefix ${quote(root)} --no-audit --no-fund --omit=dev node@${quote(REMOTE_NODE_VERSION)} npm@${quote(REMOTE_NPM_VERSION)}`,
     `ln -sfn ../node_modules/node/bin/node ${quote(node)}`,
     `ln -sfn ../node_modules/npm/bin/npm-cli.js ${quote(path.posix.join(bin, 'npm'))}`,
     `ln -sfn ../node_modules/npm/bin/npx-cli.js ${quote(path.posix.join(bin, 'npx'))}`,
     `${quote(node)} -e ${quote(acceptable)}`,
-  ].join(' && ')], { timeoutMs: 5 * 60_000 });
+  ].join(' && ')], { timeoutMs: 5 * 60_000 }));
   if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
   // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
   // at the standard sandbox location, including on resumed worlds.

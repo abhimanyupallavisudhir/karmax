@@ -406,14 +406,14 @@ export class CodexAdapter implements AgentAdapter {
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const remote = isRemoteAgentWorld(input.world);
     const remoteHome = remote
-      ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none')
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
       : undefined;
     const dynamicTools = codexDynamicTools(remote);
     // Resume/fork cannot override dynamicTools. Migrate into a new rollout
     // identity instead of changing bytes referenced by existing descendants.
     let preparedSession = input.session;
     if (remoteHome && input.session)
-      preparedSession = await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools) ?? input.session;
+      preparedSession = await timed('bootstrap.session-tools', () => ensureRemoteCodexSessionTools(input.world, remoteHome, input.session!, dynamicTools)) ?? input.session;
     else if (!remote && input.session && input.resolvedAuth?.configHome)
       preparedSession = await ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools) ?? input.session;
     let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
@@ -426,7 +426,7 @@ export class CodexAdapter implements AgentAdapter {
     const custody = remote ? undefined : createCustodyEnv(env);
     if (custody) env = custody.env;
 
-    const mcpFlags = await selectedCodexMcpFlags(input.world, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal);
+    const mcpFlags = await timed('bootstrap.mcp-config', () => selectedCodexMcpFlags(input.world, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal));
 
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const startupEnd = currentTiming()?.start('process.startup');
