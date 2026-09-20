@@ -2372,12 +2372,12 @@ export class KarmaxApi {
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listTasks(projectId);
+    return this.deps.store.listTasksAsync(projectId);
   }
 
   async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listTaskSummaries(projectId);
+    return this.deps.store.listTasksAsync(projectId, false);
   }
 
   async taskSummaryPage(token: string, projectId: string, options: { includeArchived?: boolean; limit?: number; offset?: number }) {
@@ -3899,8 +3899,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   // A *view* is a saved *query*: every list surface (including the default one) is the
   // result of evaluating a `TaskQuery` — free text + structured filters + sort + group —
   // against the project's tasks. The evaluator is pure (src/domain/search.ts); it runs
-  // in-memory over the store's `listTasks` (cheap at todo-list scale), whose records
-  // already carry the cached `lastView` (status/stage/pr) and hydrated `tags`.
+  // over asynchronously loaded pages carrying compact status and hydrated tags.
+  // Only explicit conversation filters request historical message payloads.
 
   /**
    * Evaluate a query against a project's tasks. `query` may be a raw query string
@@ -3921,15 +3921,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const activeOnly = !fields.some(field => field === 'dependsOn' || field === 'blocks')
       && q.filters?.some(c => c.field === 'is' && c.negate && c.values.length === 1 && c.values[0] === 'archived');
     const tasks: TaskRecord[] = [];
-    if (needsConversation) tasks.push(...this.deps.store.listTasks(projectId));
-    else {
-      for (let offset = 0; ; offset += 200) {
-        const page = await this.deps.store.taskSummaryPage(projectId, { includeArchived: !activeOnly, offset });
-        tasks.push(...page.tasks);
-        if (!page.tasks.length || tasks.length >= page.total) break;
-      }
-    }
-    const tags = this.deps.store.listTags(projectId);
+    for await (const page of this.deps.store.taskReadPages(projectId, {
+      includeArchived: !activeOnly, includeConversation: needsConversation,
+    })) tasks.push(...page);
+    const tags = await this.deps.store.listTagsAsync(projectId);
     const principal = principalRefOf(caller.principal);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
   }
@@ -3943,7 +3938,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   // ─── Tags ────────────────────────────────────────────────────────────────────
   async listTags(token: string, projectId: string): Promise<Tag[]> {
     this.require(token, 'list_tags', { projectId });
-    return this.deps.store.listTags(projectId);
+    return this.deps.store.listTagsAsync(projectId);
   }
 
   async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Promise<Tag> {

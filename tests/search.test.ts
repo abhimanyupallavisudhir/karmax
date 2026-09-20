@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import * as triggers from '../src/domain/triggers.js';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { parseQuery, stringifyQuery } from '../src/domain/query-language.js';
 import { evaluateQuery, fieldCatalogue, resolveTagValue, SearchTask } from '../src/domain/search.js';
@@ -632,4 +633,20 @@ describe('Store — saved views', () => {
     expect(store.listTags(pid)).toEqual([]);
     expect(store.listViews(pid)).toEqual([]);
   });
+});
+
+
+it('does not scan cron calendars for unrelated searches and caches requested next-run values', () => {
+  const tasks = [task({ title: 'scheduled', params: { prompt: 'work', triggers: [{ kind: 'schedule', cron: '0 9 * * *' }] } })];
+  const next = vi.spyOn(triggers, 'nextCronFire');
+  try {
+    for (const query of ['', 'status:armed', 'is:scheduled', 'schedule:9', 'group:trigger', 'sort:created-desc'])
+      evaluateQuery(tasks, parseQuery(query), { now: NOW });
+    expect(next).not.toHaveBeenCalled();
+    for (const query of ['sort:nextRun-asc', 'nextRun:>now', 'group:nextRun', 'next:>now']) {
+      next.mockClear();
+      evaluateQuery(tasks, parseQuery(query), { now: NOW });
+      expect(next).toHaveBeenCalledOnce();
+    }
+  } finally { next.mockRestore(); }
 });

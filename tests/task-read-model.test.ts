@@ -94,3 +94,63 @@ it('preserves the legacy personal-organization fallback in audience resolution',
   store.db.prepare('UPDATE projects SET organizationId=NULL WHERE id=?').run(project.id);
   expect(store.humanAudience(task.id, ['@owners'])).toEqual(['owner']);
 });
+
+it('scans multiple async pages without recounting and preserves full/compact list and search semantics', async () => {
+  store = new Store();
+  const project = store.createProject('Bulk reads');
+  const other = store.createProject('Other tenant');
+  const tag = store.createTag({ projectId: project.id, name: 'release' });
+  const records = Array.from({ length: 205 }, (_, i) => store.createTask({ projectId: project.id,
+    title: `Task ${i}`, workflow: 'just-do', workflowVersion: '1', params: { prompt: 'work', archived: i === 0 } }));
+  store.createTask({ projectId: other.id, title: 'Private', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'work' } });
+  for (const index of [0, 204]) {
+    const task = records[index]!;
+    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+      messages: [{ id: 'm', text: 'searchable history', role: 'agent', ts: 1 }], state: {}, actions: [], updatedAt: 1 });
+    store.setTaskTags(task.id, [tag.id]);
+  }
+  const expected = store.listTasks(project.id);
+  const compact = store.listTaskSummaries(project.id);
+  const tags = store.listTags(project.id);
+  const tokens = new TokenAuthority();
+  const token = tokens.mintPrincipal('user:owner', ['*'], project.id).token;
+  const api = new KarmaxApi({ store, tokens, client: {} as any, taskQueue: 'fixture' });
+  vi.spyOn(store, 'listTasks').mockImplementation(() => { throw Error('unbounded synchronous list'); });
+  vi.spyOn(store, 'listTaskSummaries').mockImplementation(() => { throw Error('synchronous summary list'); });
+  vi.spyOn(store, 'listTags').mockImplementation(() => { throw Error('synchronous tags'); });
+  const reads = vi.spyOn(store.db, 'prepare');
+  expect(await api.listTasks(token, project.id)).toEqual(expected);
+  expect(await api.listTaskSummaries(token, project.id)).toEqual(compact);
+  expect(await api.listTags(token, project.id)).toEqual(tags);
+  expect((await api.searchTasks(token, project.id, 'conversation:searchable')).tasks.map(t => t.id).sort())
+    .toEqual([records[0]!.id, records[204]!.id].sort());
+  expect((await api.searchTasks(token, project.id, 'says:searchable -is:archived')).tasks.map(t => t.id))
+    .toEqual([records[204]!.id]);
+  expect(reads.mock.calls.some(([sql]) => /COUNT\(\*\).*tasks/i.test(sql))).toBe(false);
+  const pages = reads.mock.calls.filter(([sql]) => sql.includes('JOIN task_intents') && !sql.startsWith('SELECT i.id'));
+  expect(pages.length).toBeGreaterThanOrEqual(8);
+  expect(pages.every(([sql]) => sql.includes('LIMIT ? OFFSET ?'))).toBe(true);
+  await expect(api.listTasks(token, other.id)).rejects.toThrow();
+});
+
+it('does not skip or duplicate logical tasks when order and principal attempts change between pages', async () => {
+  store = new Store();
+  const project = store.createProject('Concurrent scan');
+  const tasks = Array.from({ length: 201 }, (_, i) => store.createTask({ projectId: project.id,
+    title: `Task ${i}`, workflow: 'just-do', workflowVersion: '1', params: { prompt: 'work' } }));
+  const scan = store.taskReadPages(project.id);
+  const first = await scan.next();
+  if (first.done) throw Error('missing first page');
+  expect(first.value?.map(t => t.id)).toEqual(tasks.slice(0, 200).map(t => t.id));
+  store.reorderTask(tasks[200]!.id, -1);
+  store.reorderTask(tasks[0]!.id, 9999);
+  store.createTask({ projectId: project.id, title: 'Inserted during scan', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'work' } });
+  const alternate = store.createTask({ projectId: project.id, intentId: tasks[200]!.intentId,
+    title: 'New principal', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'work' } });
+  store.setPrincipalAttempt(alternate.id);
+  const last = await scan.next();
+  if (last.done) throw Error('missing last page');
+  expect(last.value?.map(t => t.id)).toEqual([alternate.id]);
+  expect(last.value?.[0]?.num).toBe(tasks[200]!.num);
+  expect((await scan.next()).done).toBe(true);
+});

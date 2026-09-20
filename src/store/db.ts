@@ -2942,21 +2942,61 @@ export class Store {
   }
 
   async taskSummaryPage(projectId: string, options: { includeArchived?: boolean; limit?: number; offset?: number } = {}) {
+    return this.readTaskPage(projectId, options, false, true);
+  }
+
+  /** Internal scans do not recount the entire project for every page. Full
+   * histories are opt-in; ordinary task lists/search retain compact projection. */
+  async *taskReadPages(projectId: string, options: { includeArchived?: boolean; includeConversation?: boolean } = {}): AsyncGenerator<TaskRecord[], void> {
+    // Freeze membership/order using only logical IDs. OFFSET against a changing
+    // list can duplicate/skip tasks; slicing this small ID index also avoids
+    // rescanning earlier rows on every page. Resolve the current principal when
+    // reading each intent, so switching attempts cannot duplicate a logical task.
+    const identities = await this.readRows<{ id: string }>(`SELECT i.id FROM tasks t
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived ?? true)}
+      ORDER BY root.ord, root.createdAt, root.id`, [projectId]);
+    for (let offset = 0; offset < identities.length; offset += 200) {
+      const ids = identities.slice(offset, offset + 200).map(row => row.id);
+      const page = await this.readTaskPage(projectId, { includeArchived: true },
+        options.includeConversation ?? false, false, ids);
+      const positions = new Map(ids.map((id, index) => [id, index]));
+      page.tasks.sort((a, b) => positions.get(a.intentId!)! - positions.get(b.intentId!)!);
+      if (page.tasks.length) yield page.tasks;
+    }
+  }
+
+  async listTasksAsync(projectId: string, includeConversation = true): Promise<TaskRecord[]> {
+    const tasks: TaskRecord[] = [];
+    for await (const page of this.taskReadPages(projectId, { includeConversation })) tasks.push(...page);
+    return tasks;
+  }
+
+  private taskArchivePredicate(includeArchived?: boolean): string {
+    return includeArchived ? '' : this.db.dialect === 'postgres'
+      ? " AND COALESCE((t.params::jsonb ->> 'archived')::boolean, false)=false"
+      : " AND COALESCE(json_extract(t.params, '$.archived'), 0)=0";
+  }
+
+  private async readTaskPage(projectId: string,
+    options: { includeArchived?: boolean; limit?: number; offset?: number },
+    includeConversation: boolean, includeTotal: boolean, intentIds?: string[]) {
     const limit = options.limit ?? 200, offset = options.offset ?? 0;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0)
       throw new Error('limit must be 1–200 and offset must be a non-negative integer');
-    const archived = options.includeArchived ? '' : this.db.dialect === 'postgres'
-      ? " AND COALESCE((t.params::jsonb ->> 'archived')::boolean, false)=false"
-      : " AND COALESCE(json_extract(t.params, '$.archived'), 0)=0";
+    const selection = intentIds ? ` AND i.id IN (${intentIds.map(() => '?').join(',')})` : '';
     const from = `FROM tasks t JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
-      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${archived}`;
-    const rows = await this.readRows<any>(`SELECT t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived)}${selection}`;
+    const params = [projectId, ...(intentIds ?? [])];
+    const projection = includeConversation ? 't.*' : `t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord, t.parentTaskId,
       t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
-      json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView,
+      json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView`;
+    const rows = await this.readRows<any>(`SELECT ${projection},
       COALESCE(t.num, root.num) AS resolvedNum ${from}
-      ORDER BY root.ord, root.createdAt, root.id LIMIT ? OFFSET ?`, [projectId, limit, offset]);
-    const [count] = await this.readRows<{ total: number }>(`SELECT COUNT(*) AS total ${from}`, [projectId]);
+      ORDER BY root.ord, root.createdAt, root.id LIMIT ? OFFSET ?`, [...params, limit, offset]);
+    const [count] = includeTotal
+      ? await this.readRows<{ total: number }>(`SELECT COUNT(*) AS total ${from}`, params) : [];
     const tasks = rows.map(rowToTask);
     if (tasks.length) {
       const ids = tasks.map(task => task.id), placeholders = ids.map(() => '?').join(',');
@@ -3915,6 +3955,10 @@ export class Store {
     return (
       this.db.prepare('SELECT * FROM tags WHERE projectId = ? ORDER BY name').all(projectId) as any[]
     ).map(rowToTag);
+  }
+
+  async listTagsAsync(projectId: string): Promise<Tag[]> {
+    return (await this.readRows<any>('SELECT * FROM tags WHERE projectId = ? ORDER BY name', [projectId])).map(rowToTag);
   }
 
   getTag(id: string): Tag | undefined {

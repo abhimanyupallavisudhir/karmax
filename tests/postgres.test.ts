@@ -52,6 +52,9 @@ integration('PostgreSQL cutover', () => {
       const prepare = vi.spyOn(store.db, 'prepare').mockImplementation(() => { throw Error('blocking database access'); });
       try {
         expect(await store.getTaskAsync(task.id)).toEqual(expected);
+        expect(await store.listTasksAsync(project.id)).toEqual([expected]);
+        expect((await store.listTasksAsync(project.id, false))[0]?.lastView?.messages).toBeUndefined();
+        expect(await store.listTagsAsync(project.id)).toEqual([]);
         expect((await store.taskSummaryPage(project.id)).tasks[0]?.reviewers).toEqual(expected?.reviewers);
         expect((await store.taskMetadataAsync(task.id))?.num).toBe(task.num);
         expect(await store.taskPointerByNumAsync(project.id, task.num!)).toEqual({ id: task.id, num: task.num, projectId: project.id });
@@ -60,7 +63,7 @@ integration('PostgreSQL cutover', () => {
     } finally { store.close(); }
   });
 
-  it('keeps timers and independent reads live while a task-table lock delays a detail read', async () => {
+  it('keeps timers and independent reads live while a task-table lock delays detail and full-list reads', async () => {
     const store = new Store(url!);
     const blocker = await admin!.connect();
     try {
@@ -74,7 +77,8 @@ integration('PostgreSQL cutover', () => {
       // Server-side release also bounds this test if a regression blocks JS timers.
       const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
       let finished = false;
-      const read = store.taskMetadataAsync(task.id).then(value => { finished = true; return value; });
+      const read = Promise.all([store.taskMetadataAsync(task.id), store.listTasksAsync(project.id)])
+        .then(([value, tasks]) => { expect(tasks.map(t => t.id)).toEqual([task.id]); finished = true; return value; });
       await new Promise(resolve => setTimeout(resolve, 20));
       expect(finished).toBe(false);
       expect(await store.kvGetAsync('unrelated-read')).toBe('ready');
