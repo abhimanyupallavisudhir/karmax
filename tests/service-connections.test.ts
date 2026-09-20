@@ -33,13 +33,30 @@ describe('service connections', () => {
   }
   it('deduplicates requests and links; never puts link secrets or session IDs in views', async () => {
     const request = (await service.request(org, 'gmail', 'task_a', 'do', 'Read mail'));
-    expect((await service.request(org, 'gmail', 'task_a', 'do', 'Read mail')).id).toBe(request.id);
+    const duplicates = await Promise.all([
+      service.request(org, 'gmail', 'task_a', 'do', 'Read mail'),
+      service.request(org, 'gmail', 'task_a', 'do', 'Read mail'),
+    ]);
+    expect(duplicates.map(value => value.id)).toEqual([request.id, request.id]);
     const [a, b] = await Promise.all([service.connect(org, 'alice', { id: request.id }), service.connect(org, 'alice', { id: request.id })]);
     expect(a.url).toBe(b.url); expect(backend.authorize).toHaveBeenCalledTimes(1);
     expect(JSON.stringify((await store.kvEntries('service-connection:')))).not.toContain('/link/secret');
     vi.mocked(backend.active).mockResolvedValue(true); await service.refresh(org, request.id);
     const view = JSON.stringify((await service.list(org, { taskId: 'task_a', projectId: project })));
     for (const value of ['project-key-private', 'session-private', 'ca_exact', '/link/secret']) expect(view).not.toContain(value);
+  });
+  it('shares one durable provider identity across concurrent connection requests', async () => {
+    const [gmail, slack] = await Promise.all([
+      service.request(org, 'gmail', 'task_a', 'do', 'Read mail'),
+      service.request(org, 'slack', 'task_a', 'do', 'Read chat'),
+    ]);
+    await Promise.all([
+      service.connect(org, 'alice', { id: gmail.id }),
+      service.connect(org, 'alice', { id: slack.id }),
+    ]);
+    const identities = vi.mocked(backend.authorize).mock.calls.map(call => call[0]);
+    expect(identities).toHaveLength(2);
+    expect(identities[0]).toBe(identities[1]);
   });
   it('replaces an invalid sign-in link immediately on explicit restart', async () => {
     const c = (await service.request(org, 'gmail', 'task_a', 'do', 'Read mail'));

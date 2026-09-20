@@ -56,7 +56,7 @@ describe('MCP across complete API agent turns', () => {
       const adapter = provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
       const timingRows: any[] = [];
       const trace = new TimingTrace({ taskId: 'turn', turnId: 'turn-1', attempt: 1 }, row => timingRows.push(row));
-      const turn = (await withTiming(trace, () => trace.measure('agent.attempt', () => adapter.runTurn({ profile: { id: 'test', name: 'test', role: 'do', provider, mcpConnections: [connection.id] }, world, agentMcp: servers,
+      const turn = (withTiming(trace, () => trace.measure('agent.attempt', () => adapter.runTurn({ profile: { id: 'test', name: 'test', role: 'do', provider, mcpConnections: [connection.id] }, world, agentMcp: servers,
         role: 'do', systemPrompt: 'Test only', messages: [{ id: 'one', ts: 0, role: 'user', text: 'Use MCP' }], resolvedAuth: { apiKey: 'test-model-key' }, maxTurns: 4 },
       { emit() {}, emitActivity() {} } as any))));
       if (failure) await expect(turn).rejects.toThrow(/500/);

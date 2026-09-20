@@ -1,10 +1,11 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, it, expect, afterEach } from 'vitest';
 import { defaultMailboxRegistry, SelfManagedDomainProvider, HostedMailboxProvider } from '../src/autonomy/mailbox.js';
 import { AgentMail, type AgentMailStore } from '../src/autonomy/agent-mail.js';
 
 function memStore(): AgentMailStore {
   const kv = new Map<string, string>();
-  return { kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v) };
+  return { transaction: memoryTransaction(kv), kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v) };
 }
 
 const savedEnv = { ...process.env };

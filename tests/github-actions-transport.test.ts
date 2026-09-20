@@ -59,9 +59,9 @@ describe('Actions evidence through agent transports and the real gateway', () =>
         view: 'log', job_id: 99, attempt: 1, tail_lines: 1, offset_lines: 1, max_chars: 256 }));
       expect(native.log.excerpt).toBe('readiness passed');
       expect(JSON.parse(await handlers.list_github_actions_workflows!({ repository: 'acme/app', page: 2, per_page: 1 })).page).toBe(2);
-      await expect((await ops.manageGithubActionsRun({ runId: 42, action: 'cancel' }))).rejects.toMatchObject({ status: 403 });
-      await expect((await httpOps(server.url, (await mint('github:actions:write'))).inspectGithubActionsRun({ runId: 42, view: 'jobs' }))).rejects.toMatchObject({ status: 403 });
-      await expect((await ops.inspectGithubActionsRun({ repository: 'acme/outside', runId: 42, view: 'jobs' }))).rejects.toMatchObject({ status: 404 });
+      await expect((ops.manageGithubActionsRun({ runId: 42, action: 'cancel' }))).rejects.toMatchObject({ status: 403 });
+      await expect((httpOps(server.url, (await mint('github:actions:write'))).inspectGithubActionsRun({ runId: 42, view: 'jobs' }))).rejects.toMatchObject({ status: 403 });
+      await expect((ops.inspectGithubActionsRun({ repository: 'acme/outside', runId: 42, view: 'jobs' }))).rejects.toMatchObject({ status: 404 });
       expect(JSON.stringify((await store.eventsSince(task.id, 0)))).not.toMatch(/Update complete|installation-secret|readiness passed/);
     } finally { await server.close(); (await store.close()); }
   });

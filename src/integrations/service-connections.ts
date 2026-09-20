@@ -112,8 +112,10 @@ export class ServiceConnections {
   }
   private async locked<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(key) ?? Promise.resolve();
-    const waitEnd = (await (await currentTiming())?.start('service.lock.wait'));
-    const work = previous.catch(() => {}).then(async () => { (await waitEnd?.()); return fn(); });
+    // Publish the lock before yielding for diagnostic settings; otherwise two
+    // callers can both observe the same predecessor and run concurrently.
+    const waitEnd = currentTiming().then(trace => trace?.start('service.lock.wait'));
+    const work = previous.catch(() => {}).then(async () => { await (await waitEnd)?.(); return fn(); });
     this.locks.set(key, work);
     try { return await work; } finally { if (this.locks.get(key) === work) this.locks.delete(key); }
   }
@@ -130,10 +132,12 @@ export class ServiceConnections {
     return { ...view, ...(c.status === 'disconnected' && accountId ? { disconnectPending: true } : {}) };
   }
   private async user(c: ServiceConnection) {
+    return this.store.transaction(async () => {
     if (!c.ownerId) throw new ConnectionError('Connection has no owner');
     let installation = (await this.store.kvGet('service-connections:installation'));
     if (!installation) { installation = crypto.randomUUID(); (await this.store.kvSet('service-connections:installation', installation)); }
     return 'karmax_' + crypto.createHash('sha256').update(JSON.stringify([installation, c.organizationId, c.ownerId])).digest('hex');
+      });
   }
   canUse(c: ServiceConnection, taskId: string, projectId: string) {
     return c.taskId === taskId || c.projectIds.includes(projectId);
@@ -145,11 +149,13 @@ export class ServiceConnections {
   async pending(taskId: string) { return (await this.all()).filter(c => c.taskId === taskId && ['requested', 'connecting'].includes(c.status)); }
   async catalog(search = '') { return this.remote(() => this.backend().catalog(search.slice(0, 200))); }
   async request(org: string, toolkit: string, taskId: string, role: string, why: string) {
+    return this.store.transaction(async () => {
     this.slug(toolkit);
     const existing = (await this.all()).find(c => c.organizationId === org && c.toolkit === toolkit && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status));
     if (existing) return existing;
     return (await this.save({ id: newId('conn'), organizationId: org, toolkit, label: toolkit,
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() }));
+      });
   }
   private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
   async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean }) {

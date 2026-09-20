@@ -1509,8 +1509,9 @@ export class Connectors {
   }
 
   async config(name: string): Promise<ConnectorConfig> {
+    const raw = await this.store.kvGet(kvConfig(this.organizationId, name));
     try {
-      return JSON.parse((await this.store.kvGet(kvConfig(this.organizationId, name))) ?? '{}');
+      return JSON.parse(raw ?? '{}');
     } catch {
       return {};
     }

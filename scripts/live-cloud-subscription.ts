@@ -25,10 +25,10 @@ async function main() {
     throw new Error('KARMAX_LIVE_AGENT_PROVIDER must be codex or claude');
   const testBrowser = process.env.KARMAX_LIVE_BROWSER !== '0';
 
-  const store = new Store(path.join(home, 'state', 'karmax.db'));
-  const task = store.getTask(taskId);
+  const store = await Store.create(path.join(home, 'state', 'karmax.db'));
+  const task = await store.getTask(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
-  const project = store.getProject(task.projectId);
+  const project = await store.getProject(task.projectId);
   if (!project?.organizationId) throw new Error('task project has no organization');
   const localHome = resolveSubscriptionHome(home, agentProvider);
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-live-${agentProvider}-home-`));
@@ -42,12 +42,12 @@ async function main() {
 
   const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
   const connections = new WorldProviderConnectionService(store, broker);
-  const connection = connections.get(project.organizationId, 'e2b');
+  const connection = await connections.get(project.organizationId, 'e2b');
   if (!connection?.enabled || !connection.credentialConfigured) throw new Error('E2B is not enabled and credentialed for this organization');
   const worldProvider = new E2BWorldProvider(undefined, undefined, undefined,
     (organizationId, kind) => connections.resolve(organizationId, kind));
   const tokens = new TokenAuthority(store);
-  const minted = tokens.mint({ taskId, profileId: 'live-cloud-smoke', principal: 'system:live-cloud-smoke',
+  const minted = await tokens.mint({ taskId, profileId: 'live-cloud-smoke', principal: 'system:live-cloud-smoke',
     projectId: task.projectId, organizationId: project.organizationId,
     ceiling: ['task:event:read'], grantorCaps: ['task:event:read'], ttlMs: 15 * 60_000 });
   let world: Awaited<ReturnType<E2BWorldProvider['create']>> | undefined;
@@ -79,7 +79,7 @@ async function main() {
       systemPrompt: 'You are a live integration test. Follow the user request exactly and keep the final response terse.',
       role: 'do', resolvedAuth: { configHome: isolatedHome }, extraEnv: { KARMAX_TOKEN: minted.token },
     }, context(turnTimeout, activities, async (method, requestPath) => {
-      const checked = tokens.check(minted.token, 'task:event:read', { projectId: task.projectId, taskId });
+      const checked = await tokens.check(minted.token, 'task:event:read', { projectId: task.projectId, taskId });
       if (!checked.ok) throw new Error(checked.reason);
       if (method !== 'GET' || !requestPath.startsWith(`/api/tasks/${encodeURIComponent(taskId)}/events`))
         throw new Error(`unexpected live platform request: ${method} ${requestPath}`);
@@ -106,7 +106,7 @@ async function main() {
       systemPrompt: 'You are a live integration test. Follow the user request exactly and keep the final response terse.',
       role: 'do', resolvedAuth: { configHome: isolatedHome },
     }, context(turnTimeout, resumedActivities, async (method, requestPath) => {
-      const checked = tokens.check(minted.token, 'task:event:read', { projectId: task.projectId, taskId });
+      const checked = await tokens.check(minted.token, 'task:event:read', { projectId: task.projectId, taskId });
       if (!checked.ok) throw new Error(checked.reason);
       if (method !== 'GET' || !requestPath.startsWith(`/api/tasks/${encodeURIComponent(taskId)}/events`))
         throw new Error(`unexpected resumed platform request: ${method} ${requestPath}`);
@@ -129,7 +129,7 @@ async function main() {
     }
     throw error;
   } finally {
-    tokens.revoke(minted.token);
+    await tokens.revoke(minted.token);
     if (process.env.KARMAX_LIVE_KEEP_SANDBOX === '1' && world)
       console.error(`[live-cloud] preserving diagnostic sandbox for ${world.handle.id}`);
     else if (world) {
@@ -141,7 +141,7 @@ async function main() {
       if (cleanupError) console.error(`[live-cloud] sandbox cleanup failed after three attempts: ${String(cleanupError)}`);
     }
     fs.rmSync(isolatedHome, { recursive: true, force: true });
-    store.db.close();
+    await store.close();
   }
 }
 
@@ -162,6 +162,8 @@ function context(signal: AbortSignal, activities: AgentActivity[],
   platformRequest: NonNullable<PlatformToolContext['platformRequest']>): PlatformToolContext {
   return {
     signalCompletion() {}, createReviewInfo() {}, createSubTask() {}, respondToSubTask() {}, raiseToParent() {},
+    openPr() { throw new Error('PR publication is unavailable in the live smoke test'); },
+    addCheckout() { throw new Error('checkout creation is unavailable in the live smoke test'); },
     waitForSubtasks() {}, saveSkill() {}, resolveDecision() {}, confirmDecision() {},
     async requestSpend() { return { status: 'denied' }; }, emit() {}, emitActivity(activity) {
       activities.push(activity);

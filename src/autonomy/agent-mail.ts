@@ -36,6 +36,7 @@ export interface AgentMessage {
 }
 
 export interface AgentMailStore {
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
 }
@@ -178,12 +179,14 @@ const kvSecretOwner = (secret: string) => `agent-mail:secret-owner:${crypto.crea
  *  installation-wide secret let any administrator who had seen their own
  *  webhook URL forge verification mail into every other organization's inbox. */
 export async function ingestSecret(store: AgentMailStore, organizationId: string): Promise<string> {
+    return store.transaction(async () => {
   const existing = (await store.kvGet(kvSecret(organizationId)));
   if (existing) return existing;
   const secret = crypto.randomBytes(18).toString('base64url');
   (await store.kvSet(kvSecret(organizationId), secret));
   (await store.kvSet(kvSecretOwner(secret), organizationId));
   return secret;
+    });
 }
 
 /** What a presented webhook secret unlocks: one organization, or — for the
@@ -275,6 +278,7 @@ export class AgentMail {
    * "just works" for organizations that already existed.
    */
   async address(organizationId: string): Promise<string> {
+    return this.store.transaction(async () => {
     const existing = (await this.store.kvGet(kvAddress(organizationId)));
     if (this.exactAddress) {
       const address = cleanAddress(this.exactAddress);
@@ -294,7 +298,8 @@ export class AgentMail {
     (await this.store.kvSet(kvOwner(local.toLowerCase()), organizationId));
     (await this.store.kvSet(kvOwner(token), organizationId)); // tag-only route survives providers that rewrite the base
     return address;
-  }
+      });
+}
 
   configured(): boolean {
     return !!(this.domain || this.exactAddress);
@@ -313,8 +318,9 @@ export class AgentMail {
   }
 
   private async all(organizationId: string): Promise<AgentMessage[]> {
+    const raw = await this.store.kvGet(kvMessages(organizationId));
     try {
-      return JSON.parse((await this.store.kvGet(kvMessages(organizationId))) ?? '[]');
+      return JSON.parse(raw ?? '[]');
     } catch {
       return [];
     }
@@ -327,6 +333,7 @@ export class AgentMail {
    * is mail whose webhook secret belongs to a different organization (`onlyFor`).
    */
   async ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number; sourceId?: string }, onlyFor?: string): Promise<{ delivered: boolean; message?: AgentMessage }> {
+    return this.store.transaction(async () => {
     const organizationId = (await this.ownerOf(msg.to));
     if (!organizationId || (onlyFor && organizationId !== onlyFor)) return { delivered: false };
     const id = msg.sourceId
@@ -348,7 +355,8 @@ export class AgentMail {
     const next = [...existing, record].slice(-MAX_MESSAGES);
     (await this.store.kvSet(kvMessages(organizationId), JSON.stringify(next)));
     return { delivered: true, message: record };
-  }
+      });
+}
 
   /** Recent messages for one organization, newest first. */
   async recent(organizationId: string, opts: { since?: number; limit?: number; match?: string } = {}): Promise<AgentMessage[]> {

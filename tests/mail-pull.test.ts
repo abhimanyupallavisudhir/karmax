@@ -1,12 +1,13 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, it, expect } from 'vitest';
 import { ImapPuller, AgentMailPuller, MailPoller, createPuller, type PullStore, type ImapConn } from '../src/autonomy/mail-pull.js';
 import { ImapMailboxProvider, AgentMailboxProvider, guessImapHost, type MailboxConfig } from '../src/autonomy/mailbox.js';
 import { AgentMail } from '../src/autonomy/agent-mail.js';
 
-function store(seed: Record<string, string> = {}): PullStore & { kv: Map<string, string>; orgs: { id: string }[] } {
+function store(seed: Record<string, string> = {}): PullStore & { transaction: ReturnType<typeof memoryTransaction>; kv: Map<string, string>; orgs: { id: string }[] } {
   const kv = new Map<string, string>(Object.entries(seed));
   const orgs: { id: string }[] = [];
-  return { kv, orgs, kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v), appendAudit: () => 0 };
+  return { transaction: memoryTransaction(kv), kv, orgs, kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v), appendAudit: () => 0 };
 }
 
 describe('mailbox pull providers: connect', () => {

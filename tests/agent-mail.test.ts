@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, it, expect } from 'vitest';
 import {
   AgentMail,
@@ -17,7 +18,7 @@ import {
 
 function memStore(): AgentMailStore {
   const kv = new Map<string, string>();
-  return { kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v) };
+  return { transaction: memoryTransaction(kv), kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v) };
 }
 
 describe('agent mail code/link extraction (§8)', () => {

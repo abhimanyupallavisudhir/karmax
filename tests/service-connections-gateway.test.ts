@@ -54,7 +54,7 @@ describe('connection gateway flow', () => {
         const user = headers.get('cookie')?.split('=')[1];
         return user ? { user: { id: user, name: user, email: `${user}@test.invalid` }, session: { id: user } } : undefined;
       } } as any,
-      authorization: { capabilities: (principal: string) => principal === 'user:alice' ? ['*'] : ['credential:read', 'task:read'], audit: () => {} } as any,
+      authorization: { capabilitiesAsync: async (principal: string) => principal === 'user:alice' ? ['*'] : ['credential:read', 'task:read'], audit: () => {} } as any,
     }));
     const running = await gateway.listen(await findFreePortFrom(49_300)); base = running.url; close = running.close;
   });

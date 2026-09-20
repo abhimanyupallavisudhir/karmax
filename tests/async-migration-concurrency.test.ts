@@ -1,4 +1,4 @@
-import { it, expect, beforeEach, afterEach } from 'vitest';
+import { it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -126,4 +126,37 @@ it('preserves independent connector settings and concurrent durable export retri
   await Promise.all([a.discardWrites('source'), b.setConfig('source', { writeBack: false })]);
   expect(await a.pendingWrites()).toEqual([]);
   expect(await b.config('source')).toMatchObject({ writeBack: false, lastSync: { at: 123, count: 2 } });
+});
+
+
+it('does not overwrite connector settings when their database read fails', async () => {
+  const { Connectors } = await import('../src/autonomy/connectors.js');
+  const service = new Connectors(store, first, broker);
+  await service.setConfig('source', { writeBack: true, lastSync: { at: 123, count: 2 } });
+  const read = vi.spyOn(store, 'kvGet').mockRejectedValueOnce(new Error('database unavailable'));
+  try {
+    await expect(service.setConfig('source', { writeBack: false })).rejects.toThrow('database unavailable');
+    expect(await service.config('source')).toMatchObject({ writeBack: true, lastSync: { at: 123, count: 2 } });
+  } finally { read.mockRestore(); }
+});
+
+
+it('mints one mailbox address and secret, and retains concurrent inbound messages exactly once', async () => {
+  const { AgentMail, ingestSecret, ingestScope } = await import('../src/autonomy/agent-mail.js');
+  const a = new AgentMail(store);
+  const b = new AgentMail(store);
+  const addresses = await Promise.all([a.address('org_personal'), b.address('org_personal')]);
+  expect(addresses[0]).toBe(addresses[1]);
+  const secrets = await Promise.all([ingestSecret(store, 'org_personal'), ingestSecret(store, 'org_personal')]);
+  expect(secrets[0]).toBe(secrets[1]);
+  expect(await ingestScope(store, secrets[0])).toEqual({ organizationId: 'org_personal' });
+  const msg = { from: 'test@example.test', to: addresses[0]!, text: 'verification code: 123456' };
+  const results = await Promise.all([
+    a.ingest({ ...msg, sourceId: 'first' }),
+    b.ingest({ ...msg, sourceId: 'second' }),
+    a.ingest({ ...msg, sourceId: 'first' }),
+  ]);
+  expect(results.filter(result => result.delivered)).toHaveLength(2);
+  expect(await a.recent('org_personal')).toHaveLength(2);
+  expect(await b.recent('other-organization')).toEqual([]);
 });
