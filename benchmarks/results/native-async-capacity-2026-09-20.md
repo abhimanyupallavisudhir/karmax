@@ -112,3 +112,48 @@ readiness and an isolated SIGTERM shutdown: exit zero, a persisted stop record,
 and no active-runtime marker. This checks single-process startup/shutdown; it is
 not evidence of a deployed split-process runtime. Supervised worker lifecycle and
 cross-process event/trigger delivery remain necessary before enabling that split.
+
+## Supervised execution prerequisites and application child
+
+`bab6a62` adds bounded foreign-process event delivery without replaying local
+publications. The relay/store/PostgreSQL/trigger group passed 137 tests; the final
+four-test relay run includes a real trigger firing once from a child publication.
+The cursor remains per running gateway; this is not a durable exactly-once
+subscription across gateway restarts.
+
+`adc036d` adds a bounded supervisor protocol and independent parent-lifetime
+guardian. Real Temporal tests resume a durable workflow in a second worker process.
+The supervisor/Temporal/install/refresh group passed 14 tests, and the final
+supervisor file passed nine tests, including frozen-child termination, parent death,
+shutdown during startup, and failed drain reporting. These runs overlap.
+
+`8590f0b` shares execution-service construction with the combined bootstrap while
+keeping profile/provider/storage bootstrap primary-only. The factory/checkpoint/
+provider/storage group passed 19 tests, typechecking passed, and the isolated
+combined application passed readiness and clean SIGTERM shutdown.
+
+`3250082` adds same-home worker ownership, shared by the combined runtime and
+supervised-child admission. Its admission/instance/supervisor group passed 33
+tests. Children need the live registered primary's identity and held application
+lock; a stale registration is insufficient. Tests cover graceful release, SIGKILL,
+and exclusion in both directions between combined and supervised ownership.
+
+`efc7149` adds the actual activity-worker child entrypoint. Against a unique test
+PostgreSQL schema and private Temporal service, a real application activity wrote
+an event that the parent relay delivered once. An injected construction failure
+after opening the database/client was followed by successful replacement. The
+application-child/Temporal/deployment group passed 16 tests. It uses mock provider
+configuration and does not contact a model or cloud sandbox. The final typecheck
+passed with a 1280 MiB heap. The default compiler heap had exhausted memory during
+the ownership check; a subsequent compiler run also caught a missing test-fixture
+prompt, which was repaired before the final passing run.
+The combined application at `efc7149` also passed an isolated database/Temporal
+readiness check and SIGTERM smoke test: exit zero, one persisted stop record,
+cleared active-runtime marker, and 0.067 seconds from signal to observed exit.
+That idle shutdown timing does not measure draining active agent work.
+
+These are targeted regression results, not a second complete-suite run or a
+production capacity result. Main still selects the combined runtime. Selecting the
+child requires gateway URL and subscriber startup ordering, shared world lifecycle
+review, and full application integration tests. No production deployment of this
+split has occurred.
