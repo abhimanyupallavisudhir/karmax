@@ -718,7 +718,7 @@ export class CodexAdapter implements AgentAdapter {
       client.notify('initialized');
       startupEnd?.();
       try {
-        await withTimeout(client.request('account/rateLimits/read', {}), 5_000);
+        await timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000));
         modelCredentialHealthy = true;
       } catch {
         // Older app-servers may not expose this endpoint. They retain the
@@ -727,33 +727,35 @@ export class CodexAdapter implements AgentAdapter {
       }
       const requiredMcp = input.profile.mcpConnections !== undefined ? (input.agentMcp ?? []).map((s) => s.name) : remote ? Object.keys(remoteHome?.browserMcp ?? {}) : [];
       if (requiredMcp.length) {
-        // Dynamic Karmax tools use this control channel and therefore need no
-        // sandbox startup probe. Browser MCPs really do launch remotely: ask
-        // app-server for its authoritative inventory and fail before the model
-        // turn when an explicitly provisioned browser did not load.
-        const required = requiredMcp;
-        let servers: any[] = [];
-        let missing = required;
-        const deadline = Date.now() + 30_000;
-        do {
-          const inventory = await client.request<any>('mcpServerStatus/list', {
-            cursor: null, limit: 100, detail: 'toolsAndAuthOnly', threadId: null,
-          });
-          servers = Array.isArray(inventory?.data) ? inventory.data : [];
-          missing = required.filter((name) => {
-            const server = servers.find((candidate) => candidate?.name === name);
-            if (!server) return true;
-            const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
-            return name === 'chrome-devtools' || name === 'playwright' ? tools.length === 0 : false;
-          });
-          if (!missing.length || Date.now() >= deadline) break;
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        } while (true);
-        if (missing.length) {
-          const observed = servers.map((server) => ({ name: server?.name,
-            tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
-          throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
-        }
+        await timed('provider.mcp-readiness', async () => {
+          // Dynamic Karmax tools use this control channel and therefore need no
+          // sandbox startup probe. Browser MCPs really do launch remotely: ask
+          // app-server for its authoritative inventory and fail before the model
+          // turn when an explicitly provisioned browser did not load.
+          const required = requiredMcp;
+          let servers: any[] = [];
+          let missing = required;
+          const deadline = Date.now() + 30_000;
+          do {
+            const inventory = await client.request<any>('mcpServerStatus/list', {
+              cursor: null, limit: 100, detail: 'toolsAndAuthOnly', threadId: null,
+            });
+            servers = Array.isArray(inventory?.data) ? inventory.data : [];
+            missing = required.filter((name) => {
+              const server = servers.find((candidate) => candidate?.name === name);
+              if (!server) return true;
+              const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
+              return name === 'chrome-devtools' || name === 'playwright' ? tools.length === 0 : false;
+            });
+            if (!missing.length || Date.now() >= deadline) break;
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          } while (true);
+          if (missing.length) {
+            const observed = servers.map((server) => ({ name: server?.name,
+              tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
+            throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
+          }
+        });
       }
 
       const sessionEnd = currentTiming()?.start('provider.session.prepare');

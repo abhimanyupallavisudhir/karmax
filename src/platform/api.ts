@@ -1734,6 +1734,7 @@ export class KarmaxApi {
 
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
+    const receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
@@ -1764,6 +1765,15 @@ export class KarmaxApi {
     const { startType, input } = await this.buildStart(task, false, caller);
     const hadNumber = task.num != null;
     this.deps.store.clearDraft(taskId);
+    const requestTiming = installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:m0`] }, row => {
+      this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
+    });
+    // Draft creation is not a request to run. Start the initial-request clock
+    // when it is queued; an idempotent queue retry must not restart that clock.
+    if (requestTiming.enabled() && task.params.draft && !task.params._workflowRunId
+      && !this.deps.store.eventsOfType(taskId, 'timing').some(event => event.payload?.name === 'request.received'))
+      requestTiming.mark('request.received', { requestId: `${taskId}:m0` }, receivedAt);
+    const dispatchEnd = requestTiming.start('workflow.dispatch');
     // Bounded + compensated: on a wedged engine, restore the draft and release a
     // number minted by this failed transition. Previously established permalinks
     // remain stable when already-numbered work is queued again.
@@ -1791,6 +1801,7 @@ export class KarmaxApi {
       // acceptance for this task's unique workflow ID, not a queue failure.
       // Keep the task queued and repair the stale draft metadata.
       if (!(e instanceof WorkflowExecutionAlreadyStartedError)) {
+        dispatchEnd('failed');
         this.deps.store.restoreDraft(taskId, !hadNumber);
         throw new Error(
           `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
@@ -1798,6 +1809,7 @@ export class KarmaxApi {
         );
       }
     }
+    dispatchEnd();
     const started = this.resolveStart(task.workflow, task.workflowVersion,
       this.deps.store.getProject(task.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
