@@ -12,10 +12,10 @@ import { FOUNDER_TASKS, PAID_LAUNCH_SETTINGS_KEY, PaidLaunchSettingsService,
 import { Store } from '../src/store/db.js';
 
 const dirs: string[] = [];
-const harness = () => {
+const harness = async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-paid-launch-'));
   dirs.push(dir);
-  const store = new Store(':memory:');
+  const store = (await Store.create(':memory:'));
   const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
   return { store, broker, service: new PaidLaunchSettingsService(store, broker, {}) };
 };
@@ -36,42 +36,41 @@ const complete = (enabled = true) => ({
 });
 
 describe('installation paid-launch settings', () => {
-  it('persists public configuration and checklist while keeping Stripe secrets in the vault', () => {
-    const { store, broker, service } = harness();
-    const result = service.configure(complete(), 'https://krmax.test');
+  it('persists public configuration and checklist while keeping Stripe secrets in the vault', async () => {
+    const { store, broker, service } = (await harness());
+    const result = (await service.configure(complete(), 'https://krmax.test'));
     expect(result).toMatchObject({ paidLaunch: true, ready: true, canEnable: true,
       founderReviewed: true, completedTasks: ['business-structure', 'stripe-account'],
       stripe: { configured: true, secretKeyConfigured: true, webhookSecretConfigured: true,
         webhookUrl: 'https://krmax.test/api/subscriptions/webhook', apiVersion: STRIPE_BILLING_API_VERSION,
         webhookEvents: STRIPE_BILLING_WEBHOOK_EVENTS } });
     expect(result.tasks).toHaveLength(FOUNDER_TASKS.length);
-    expect(store.kvGet(PAID_LAUNCH_SETTINGS_KEY)).not.toContain('sk_live_billing');
-    expect(store.kvGet(PAID_LAUNCH_SETTINGS_KEY)).not.toContain('whsec_billing');
+    expect((await store.kvGet(PAID_LAUNCH_SETTINGS_KEY))).not.toContain('sk_live_billing');
+    expect((await store.kvGet(PAID_LAUNCH_SETTINGS_KEY))).not.toContain('whsec_billing');
     expect(broker.hasHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE)).toBe(true);
     expect(broker.hasHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE)).toBe(true);
-    expect(service.publicLaunchInfo()).toMatchObject({ paidLaunch: true, ready: true,
+    expect((await service.publicLaunchInfo())).toMatchObject({ paidLaunch: true, ready: true,
       operator: { name: 'Krmax Labs Ltd', country: 'United Kingdom' } });
-    expect(service.stored().founderReviewedPolicyVersion).toBe(POLICY_VERSION);
-    store.close();
+    expect((await service.stored()).founderReviewedPolicyVersion).toBe(POLICY_VERSION);
+    (await store.close());
   });
 
-  it('saves an incomplete draft but refuses to enable checkout', () => {
-    const { store, service } = harness();
-    expect(() => service.configure({ paidLaunch: true, operatorName: 'Draft' }, 'https://krmax.test'))
-      .toThrow(/cannot be enabled.*Founder approval.*Stripe secret key/i);
-    expect(service.status('https://krmax.test')).toMatchObject({ paidLaunch: false, canEnable: false,
+  it('saves an incomplete draft but refuses to enable checkout', async () => {
+    const { store, service } = (await harness());
+    await expect((async () => (await service.configure({ paidLaunch: true, operatorName: 'Draft' }, 'https://krmax.test')))()).rejects.toThrow(/cannot be enabled.*Founder approval.*Stripe secret key/i);
+    expect((await service.status('https://krmax.test'))).toMatchObject({ paidLaunch: false, canEnable: false,
       operatorName: 'Draft' });
-    store.close();
+    (await store.close());
   });
 
-  it('updates a live Stripe provider immediately without a restart', () => {
-    const { store, service } = harness();
-    const provider = new StripeSubscriptionProvider(() => service.subscriptionConfig());
-    expect(provider.configured()).toBe(false);
-    service.configure(complete(false), 'https://krmax.test');
-    expect(provider.configured()).toBe(true);
-    expect(provider.catalog()).toEqual({ individualPriceId: 'price_individual', teamBasePriceId: 'price_team',
+  it('updates a live Stripe provider immediately without a restart', async () => {
+    const { store, service } = (await harness());
+    const provider = new StripeSubscriptionProvider(async () => (await service.subscriptionConfig()));
+    expect((await provider.configured())).toBe(false);
+    (await service.configure(complete(false), 'https://krmax.test'));
+    expect((await provider.configured())).toBe(true);
+    expect((await provider.catalog())).toEqual({ individualPriceId: 'price_individual', teamBasePriceId: 'price_team',
       teamSeatPriceId: 'price_seat', individualProductId: 'prod_individual', teamProductId: 'prod_team' });
-    store.close();
+    (await store.close());
   });
 });

@@ -27,19 +27,19 @@ describe('paid-launch policies', () => {
     expect(policyDocument('invented')).toBeUndefined();
   });
 
-  it('requires an affirmative click on every current applicable version and appends evidence', () => {
+  it('requires an affirmative click on every current applicable version and appends evidence', async () => {
     expect(ACCEPTANCE_POLICIES.signup).toEqual(['terms', 'acceptable-use', 'privacy']);
     expect(ACCEPTANCE_POLICIES.checkout).toEqual(['terms', 'privacy', 'billing']);
     expect(() => assertPolicyAcceptance('signup', false, policyVersions('signup'))).toThrow(/affirmative/);
     expect(() => assertPolicyAcceptance('signup', true, { ...policyVersions('signup'), terms: 'stale' })).toThrow(/current terms/);
     const versions = assertPolicyAcceptance('signup', true, policyVersions('signup'));
-    const store = new Store(':memory:');
-    store.recordPolicyAcceptance({ userId: 'u1', email: 'a@example.test', context: 'signup', versions, acceptedAt: 10 });
-    store.recordPolicyAcceptance({ userId: 'u1', email: 'a@example.test', organizationId: 'org_1', context: 'checkout',
+    const store = (await Store.create(':memory:'));
+    (await store.recordPolicyAcceptance({ userId: 'u1', email: 'a@example.test', context: 'signup', versions, acceptedAt: 10 }));
+    (await store.recordPolicyAcceptance({ userId: 'u1', email: 'a@example.test', organizationId: 'org_1', context: 'checkout',
       versions: policyVersions('checkout'), acceptedAt: 20, checkoutRequestReference: 'request_1',
       checkoutSessionReference: 'cs_1', commercialTerms: { planId: 'team', monthlyBasePriceCents: 1900,
-        monthlyAdditionalActiveUserPriceCents: 500, currency: 'usd', billingInterval: 'month', ...CHECKOUT_DISCLOSURES } });
-    expect(store.policyAcceptances('u1')).toMatchObject([
+        monthlyAdditionalActiveUserPriceCents: 500, currency: 'usd', billingInterval: 'month', ...CHECKOUT_DISCLOSURES } }));
+    expect((await store.policyAcceptances('u1'))).toMatchObject([
       { context: 'signup', versions, acceptedAt: 10 },
       { organizationId: 'org_1', context: 'checkout', versions: policyVersions('checkout'), acceptedAt: 20,
         checkoutRequestReference: 'request_1', checkoutSessionReference: 'cs_1', commercialTerms: {
@@ -47,7 +47,7 @@ describe('paid-launch policies', () => {
           currency: 'usd', billingInterval: 'month', autoRenews: true,
         } },
     ]);
-    store.close();
+    (await store.close());
   });
 
   it('keeps all unresolved entity, jurisdiction, and contact facts behind a fail-closed checklist', () => {

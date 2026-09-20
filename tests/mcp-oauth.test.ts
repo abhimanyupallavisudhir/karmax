@@ -13,9 +13,9 @@ afterEach(() => vi.restoreAllMocks());
 describe('MCP OAuth authorization', () => {
   it('uses discovery, registration and PKCE; binds single-use state to actor and connection; refreshes without releasing refresh tokens', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-oauth-'));
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const service = new McpConnections(store, new CredentialBroker(new Vault(dir)), 'org_personal');
-    const c = service.save({ label: 'OAuth', transport: { type: 'http', url: 'https://resource.example/mcp' }, auth: 'oauth' });
+    const c = (await service.save({ label: 'OAuth', transport: { type: 'http', url: 'https://resource.example/mcp' }, auth: 'oauth' }));
     const calls: { url: string; body: string }[] = [];
     vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
       const req = new Request(input, init); const body = await req.text(); calls.push({ url: req.url, body });
@@ -42,10 +42,10 @@ describe('MCP OAuth authorization', () => {
       await finishOAuth(service, c, 'user:alice', state, 'code');
       await expect(finishOAuth(service, c, 'user:alice', state, 'code')).rejects.toThrow(/expired/);
       expect(await connectionHeaders(service, c, 'task')).toEqual({ Authorization: 'Bearer access-secret' });
-      service.setSecret(c, { ...service.secret(c), expiresAt: 0 });
+      (await service.setSecret(c, { ...service.secret(c), expiresAt: 0 }));
       expect(await connectionHeaders(service, c, 'task')).toEqual({ Authorization: 'Bearer access-secret' });
       expect(calls.filter((r) => r.url.endsWith('/token'))).toHaveLength(2);
-      expect(JSON.stringify(service.list())).not.toContain('access-secret');
-    } finally { store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+      expect(JSON.stringify((await service.list()))).not.toContain('access-secret');
+    } finally { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

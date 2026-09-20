@@ -12,77 +12,77 @@ import type { AuthorizationSelection } from '../src/domain/types.js';
  * createTask path, so it can never hand a fork more than the caller could grant
  * a fresh task.
  */
-function fixture() {
-  const store = new Store(':memory:');
-  store.claimPersonalOrganization('owner');
-  store.setOrganizationMembership('org_personal', 'dev', 'member');
-  const project = store.createProject('Forks');
-  const authorization = new AuthorizationService(store);
-  authorization.grant('system:test', { principalId: 'user:owner', scopeKey: projectScope(project.id), profileId: 'maintainer' });
-  authorization.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
+async function fixture() {
+  const store = (await Store.create(':memory:'));
+  (await store.claimPersonalOrganization('owner'));
+  (await store.setOrganizationMembership('org_personal', 'dev', 'member'));
+  const project = (await store.createProject('Forks'));
+  const authorization = (await AuthorizationService.create(store));
+  (await authorization.grant('system:test', { principalId: 'user:owner', scopeKey: projectScope(project.id), profileId: 'maintainer' }));
+  (await authorization.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' }));
   const tokens = new TokenAuthority(store);
-  const tokenFor = (userId: string, extra: string[] = []) => tokens.mintPrincipal(
-    `user:${userId}`, [...authorization.capabilities(`user:${userId}`, project.id, 'org_personal'), ...extra],
+  const tokenFor = async (userId: string, extra: string[] = []) => (await tokens.mintPrincipal(
+    `user:${userId}`, [...(await authorization.capabilities(`user:${userId}`, project.id, 'org_personal')), ...extra],
     project.id, undefined, 'org_personal',
-  ).token;
+  )).token;
   const client = { workflow: { getHandle: () => ({ executeUpdate: async () => undefined }), start: async () => ({}) } } as any;
   const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization });
   const maintainer: AuthorizationSelection = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
   // A finished source task that a human elevated to maintainer mid-run and
   // approved one vault credential for.
-  const source = store.createTask({
+  const source = (await store.createTask({
     projectId: project.id, title: 'Source', workflow: 'software-dev', workflowVersion: '1.26.0',
     createdBy: { kind: 'user', userId: 'owner' },
     params: { prompt: 'source', _authorization: {
-      ...authorization.taskGrant('user:owner', project.id, maintainer),
-      capabilities: [...authorization.taskGrant('user:owner', project.id, maintainer).capabilities, 'use-credential:item:cred_safe'],
+      ...(await authorization.taskGrant('user:owner', project.id, maintainer)),
+      capabilities: [...(await authorization.taskGrant('user:owner', project.id, maintainer)).capabilities, 'use-credential:item:cred_safe'],
       principal: 'user:owner',
     } },
-  });
-  store.kvSet(`session:${source.id}:do`, 'source-session');
+  }));
+  (await store.kvSet(`session:${source.id}:do`, 'source-session'));
   return { store, project, api, tokenFor, source, maintainer };
 }
 
 describe('fork_agent reauthorize', () => {
   it('defaults to unpublished source work, permits a different base, and uses the landing target after completion', async () => {
-    const f = fixture();
-    const token = f.tokenFor('owner');
-    f.store.saveView(f.source.id, { taskId: f.source.id, status: 'cancelled',
-      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any);
+    const f = (await fixture());
+    const token = (await f.tokenFor('owner'));
+    (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'cancelled',
+      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any));
     const fork = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'continue' });
     expect(fork.params.base).toBe('karmax/source');
     expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'karmax/source', unpublished: true });
     const changed = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'fresh', base: 'main', target: 'release' });
     expect(changed.params.base).toBe('main');
     expect(changed.params.target).toBe('release');
-    f.store.saveView(f.source.id, { taskId: f.source.id, status: 'done',
-      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any);
+    (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'done',
+      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any));
     const landed = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'follow up' });
     expect(landed.params.base).toBe('release');
     expect(landed.params._forkWorld).toMatchObject({ unpublished: false });
-    f.store.close();
+    (await f.store.close());
   });
 
   it('ignores injected world provenance and honors an explicit default branch from the form', async () => {
-    const f = fixture();
-    f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
-      branch: 'karmax/source', targetBranch: 'main', messages: [], state: {} } as any);
-    const fork = await f.api.createTask(f.tokenFor('owner'), { projectId: f.project.id, draft: true,
+    const f = (await fixture());
+    (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
+      branch: 'karmax/source', targetBranch: 'main', messages: [], state: {} } as any));
+    const fork = await f.api.createTask((await f.tokenFor('owner')), { projectId: f.project.id, draft: true,
       params: { prompt: 'fresh', base: 'main', 'agent:do': { resumeFrom: { taskId: f.source.id } },
         _forkWorld: { taskId: 'another-project', base: 'main' } } });
     expect(fork.params.base).toBe('main');
     expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'karmax/source' });
-    const edited = await f.api.updateArmedParams(f.tokenFor('owner'), fork.id, { base: 'release' }, { keepArmed: false });
+    const edited = await f.api.updateArmedParams((await f.tokenFor('owner')), fork.id, { base: 'release' }, { keepArmed: false });
     expect(edited.params._forkWorld).toEqual(fork.params._forkWorld);
-    const cleared = await f.api.updateArmedParams(f.tokenFor('owner'), fork.id,
+    const cleared = await f.api.updateArmedParams((await f.tokenFor('owner')), fork.id,
       { prompt: 'ordinary task', base: 'main' }, { replace: true, keepArmed: false });
     expect(cleared.params._forkWorld).toBeUndefined();
-    f.store.close();
+    (await f.store.close());
   });
 
-  it('reads the grants a task ended with in task-creation shape', () => {
-    const f = fixture();
-    expect(previousTaskGrants(f.store.getTask(f.source.id)!)).toEqual({
+  it('reads the grants a task ended with in task-creation shape', async () => {
+    const f = (await fixture());
+    expect(previousTaskGrants((await f.store.getTask(f.source.id))!)).toEqual({
       authorization: f.maintainer,
       credentialGrants: ['use-credential:item:cred_safe'],
       credentialPolicies: {},
@@ -93,12 +93,12 @@ describe('fork_agent reauthorize', () => {
     expect(previousTaskGrants({ projectId: 'p', params: { _authorization: { level: 'administrator', scope: 'organization' } } } as any).authorization)
       .toEqual({ level: 'administrator', scope: 'organization' });
     expect(previousTaskGrants({ projectId: 'p', params: {} } as any)).toEqual({ credentialGrants: [], credentialPolicies: {} });
-    f.store.close();
+    (await f.store.close());
   });
 
   it('starts the fork from the source grants only when asked', async () => {
-    const f = fixture();
-    const token = f.tokenFor('owner', ['use-credential:item:cred_safe']);
+    const f = (await fixture());
+    const token = (await f.tokenFor('owner', ['use-credential:item:cred_safe']));
     const plain = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'continue' });
     expect(plain.params._authorization).toMatchObject({ level: 'developer' });
     expect((plain.params._authorization as any).capabilities).not.toContain('use-credential:item:cred_safe');
@@ -110,23 +110,23 @@ describe('fork_agent reauthorize', () => {
     });
     expect((reauthorized.params._authorization as any).capabilities).toContain('use-credential:item:cred_safe');
     // The source is never touched.
-    expect(f.store.getTask(f.source.id)?.params._authorization).toEqual(f.source.params._authorization);
-    f.store.close();
+    expect((await f.store.getTask(f.source.id))?.params._authorization).toEqual(f.source.params._authorization);
+    (await f.store.close());
   });
 
   it('lets an explicit profile override the source level while credentials still carry over', async () => {
-    const f = fixture();
-    const fork = await f.api.forkTaskAgent(f.tokenFor('owner', ['use-credential:item:cred_safe']),
+    const f = (await fixture());
+    const fork = await f.api.forkTaskAgent((await f.tokenFor('owner', ['use-credential:item:cred_safe'])),
       { taskId: f.source.id, message: 'continue', reauthorize: true, authorizationProfile: 'developer' });
     expect(fork.params._authorization).toMatchObject({ level: 'developer' });
     expect((fork.params._authorization as any).capabilities).toContain('use-credential:item:cred_safe');
-    f.store.close();
+    (await f.store.close());
   });
 
   it('refuses to re-authorize beyond the forking caller’s own authority', async () => {
-    const f = fixture();
-    await expect(f.api.forkTaskAgent(f.tokenFor('dev'), { taskId: f.source.id, message: 'continue', reauthorize: true }))
+    const f = (await fixture());
+    await expect(f.api.forkTaskAgent((await f.tokenFor('dev')), { taskId: f.source.id, message: 'continue', reauthorize: true }))
       .rejects.toThrow(/cannot grant/i);
-    f.store.close();
+    (await f.store.close());
   });
 });

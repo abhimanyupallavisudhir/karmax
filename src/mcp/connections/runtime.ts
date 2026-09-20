@@ -22,7 +22,7 @@ export async function prepareConnections(service: McpConnections | undefined, wo
   if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote) throw new Error('Hosted MCP connections require a remote execution environment');
   if (!ids.length) return [];
   if (!service && ids.some(id => !BUILTIN_MCPS.includes(id as any))) throw new Error('MCP connections require the credential vault');
-  const selected = service?.selected(ids, projectId) ?? [];
+  const selected = (await service?.selected(ids, projectId)) ?? [];
   const container = world.handle.kind === 'container';
   const root = container ? '/work' : world.handle.root;
   const bin = remote ? await ensureRemoteNode(world) : container ? '/usr/local/bin' : path.dirname(process.execPath);
@@ -80,7 +80,7 @@ export async function prepareConnections(service: McpConnections | undefined, wo
       for (const { connection: c, file, transport } of projections) {
         let value: unknown = { revoked: true };
         try {
-          const current = service.get(c.id, projectId);
+          const current = (await service.get(c.id, projectId));
           if (current.enabled && current.revision === c.revision)
             value = { transport, secrets: await connectionHeaders(service, current, taskId), leaseExpiresAt: Date.now() + 120_000 };
         } catch { /* removed/revoked credentials close the connection */ }

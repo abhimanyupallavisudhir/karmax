@@ -15,17 +15,17 @@ describe('failed software-dev recovery', () => {
   afterEach(() => dirs.splice(0).forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
 
   it('offers Retry while a live infrastructure backoff can be woken early', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const tokens = new TokenAuthority();
-    const token = tokens.mint({
+    const token = (await tokens.mint({
       taskId: 'operator', profileId: 'do', principal: 'user:test',
       ceiling: ['read-task', 'signal-task'], grantorCaps: ['read-task', 'signal-task'],
-    }).token;
-    const project = store.createProject('Infrastructure recovery');
-    const task = store.createTask({
+    })).token;
+    const project = (await store.createProject('Infrastructure recovery'));
+    const task = (await store.createTask({
       projectId: project.id, title: 'Transient outage', workflow: 'software-dev',
       workflowVersion: bundledVersion('software-dev'), params: { prompt: 'keep going' },
-    });
+    }));
     const actions = [
       {
         name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true,
@@ -38,7 +38,7 @@ describe('failed software-dev recovery', () => {
       messages: [], actions, state: {}, updatedAt: 1,
       error: 'infrastructure: E2B request handshake timed out — retrying do in 30s (1/5)',
     } as any;
-    store.saveView(task.id, backoff);
+    (await store.saveView(task.id, backoff));
 
     const signals: string[] = [];
     const client = { workflow: { getHandle: () => ({ signal: async (name: string) => void signals.push(name) }) } } as any;
@@ -51,7 +51,7 @@ describe('failed software-dev recovery', () => {
 
     // Retry is a control for the workflow's parked timer, not a generic Do
     // action: an ordinary running/error snapshot must retain its original set.
-    store.saveView(task.id, { ...backoff, error: 'ordinary agent failure', updatedAt: 2 });
+    (await store.saveView(task.id, { ...backoff, error: 'ordinary agent failure', updatedAt: 2 }));
     const ordinary = await api.getTaskView(token, task.id);
     expect(ordinary?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
   });
@@ -64,28 +64,28 @@ describe('failed software-dev recovery', () => {
    * also caught a software-dev task switched to Goal in flight.
    */
   it('offers the same recovery to a failed Goal task (it delegates to software-dev)', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const tokens = new TokenAuthority();
-    const token = tokens.mint({
+    const token = (await tokens.mint({
       taskId: 'operator', profileId: 'do', principal: 'user:test',
       ceiling: ['read-task', 'signal-task'], grantorCaps: ['read-task', 'signal-task'],
-    }).token;
+    })).token;
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-goal-recovery-repo-'));
     const world = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-goal-recovery-world-'));
     dirs.push(repo, world);
-    const project = store.createProject('Goal recovery', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
-    const task = store.createTask({
+    const project = (await store.createProject('Goal recovery', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+    const task = (await store.createTask({
       projectId: project.id, title: 'Autonomous work', workflow: 'goal',
       workflowVersion: bundledVersion('goal'),
       params: { prompt: 'keep going', base: 'main', target: 'main' },
-    });
-    store.saveView(task.id, {
+    }));
+    (await store.saveView(task.id, {
       taskId: task.id, title: task.title, workflow: 'goal', stage: 'failed', status: 'failed',
       messages: [{ id: 'm0', role: 'user', text: 'keep going', ts: 0 }],
       transcripts: [], actions: [], state: {},
       branch: `karmax/${task.id}`, base: 'main', targetBranch: 'main', worldPath: world,
       error: 'provider transport died', updatedAt: 1,
-    } as any);
+    } as any));
 
     const starts: [string, any][] = [];
     const client = {
@@ -105,28 +105,28 @@ describe('failed software-dev recovery', () => {
   });
 
   it('offers escalation controls and restarts from the existing dirty world', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const tokens = new TokenAuthority();
-    const token = tokens.mint({
+    const token = (await tokens.mint({
       taskId: 'operator',
       profileId: 'do',
       principal: 'user:test',
       ceiling: ['read-task', 'signal-task'],
       grantorCaps: ['read-task', 'signal-task'],
-    }).token;
+    })).token;
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-recovery-repo-'));
     const world = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-recovery-world-'));
     dirs.push(repo, world);
     fs.writeFileSync(path.join(world, 'dirty-work.txt'), 'must survive');
-    const project = store.createProject('Recovery', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
-    const task = store.createTask({
+    const project = (await store.createProject('Recovery', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+    const task = (await store.createTask({
       projectId: project.id,
       title: 'Interrupted work',
       workflow: 'software-dev',
       workflowVersion: '1.0.0',
       params: { prompt: 'finish it', base: 'main', target: 'main' },
-    });
-    store.saveView(task.id, {
+    }));
+    (await store.saveView(task.id, {
       taskId: task.id,
       title: task.title,
       workflow: 'software-dev',
@@ -145,9 +145,9 @@ describe('failed software-dev recovery', () => {
       worldPath: world,
       error: 'Resolve agent failed',
       updatedAt: 1,
-    });
-    store.kvSet(`session:${task.id}:do`, 'session-123');
-    store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: '' }));
+    }));
+    (await store.kvSet(`session:${task.id}:do`, 'session-123'));
+    (await store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: '' })));
 
     const starts: any[] = [];
     const client = { workflow: { start: async (...args: any[]) => void starts.push(args), getHandle: () => { throw new Error('closed workflow must not be signalled'); } } } as any;
@@ -173,28 +173,28 @@ describe('failed software-dev recovery', () => {
       expect.arrayContaining(['Also keep the compatibility layer.', expect.stringMatching(/recovered this task/i)]),
     );
     expect(fs.readFileSync(path.join(world, 'dirty-work.txt'), 'utf8')).toBe('must survive');
-    expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'do', status: 'active' });
-    expect(store.getTask(task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
+    expect((await store.getTask(task.id))?.lastView).toMatchObject({ stage: 'do', status: 'active' });
+    expect((await store.getTask(task.id))?.workflowVersion).toBe(bundledVersion('software-dev'));
   });
 
   it('queries through a stale v1 account-wait snapshot but keeps current snapshots fast', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const tokens = new TokenAuthority();
-    const token = tokens.mint({
+    const token = (await tokens.mint({
       taskId: 'operator',
       profileId: 'do',
       principal: 'user:test',
       ceiling: ['read-task'],
       grantorCaps: ['read-task'],
-    }).token;
-    const project = store.createProject('Legacy view');
-    const task = store.createTask({
+    })).token;
+    const project = (await store.createProject('Legacy view'));
+    const task = (await store.createTask({
       projectId: project.id,
       title: 'Old run',
       workflow: 'software-dev',
       workflowVersion: '1.0.0',
       params: { prompt: 'continue' },
-    });
+    }));
     const stale = {
       taskId: task.id,
       title: task.title,
@@ -207,7 +207,7 @@ describe('failed software-dev recovery', () => {
       state: {},
       updatedAt: 1,
     };
-    store.saveView(task.id, stale);
+    (await store.saveView(task.id, stale));
     let queries = 0;
     const live = { ...stale, status: 'active' as const, waitingFor: undefined, updatedAt: 2 };
     const client = {
@@ -220,8 +220,8 @@ describe('failed software-dev recovery', () => {
     expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'active', updatedAt: 2 });
     expect(queries).toBe(1);
 
-    store.setTaskWorkflowVersion(task.id, '1.1.0');
-    store.saveView(task.id, stale);
+    (await store.setTaskWorkflowVersion(task.id, '1.1.0'));
+    (await store.saveView(task.id, stale));
     expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'waiting', updatedAt: 1,
       waitingFor: { kind: 'account', earliestResetAt: 123_000, detail: 'Provider usage limit reached' } });
     expect(queries).toBe(1);

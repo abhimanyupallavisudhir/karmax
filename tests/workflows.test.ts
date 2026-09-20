@@ -32,9 +32,9 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
   });
 
   it('software-dev: cancelling Setup aborts provider provisioning and settles promptly', async () => {
-    const project = h.store.createProject('Blocked setup', { worldProvider: 'blocked-setup' as any });
-    const task = h.store.createTask({ projectId: project.id, title: 'Cancel setup', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'a' } });
+    const project = (await h.store.createProject('Blocked setup', { worldProvider: 'blocked-setup' as any }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Cancel setup', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'a' } }));
     let started = false;
     let aborted = false;
     let release!: (error: Error) => void;
@@ -528,10 +528,10 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       // wiki companion checkout alongside the development repo, and the wiki pins
       // its own target branch — precisely the case the old single ad-hoc domain
       // key merged unserialized.
-      const project = h.store.createProject('MergeOnly domains',
-        { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
-      const task = h.store.createTask({ projectId: project.id, title: 'merge feature',
-        workflow: 'merge-only', workflowVersion: '1.5.0', params: { prompt: '' } as any });
+      const project = (await h.store.createProject('MergeOnly domains',
+        { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+      const task = (await h.store.createTask({ projectId: project.id, title: 'merge feature',
+        workflow: 'merge-only', workflowVersion: '1.5.0', params: { prompt: '' } as any }));
       const taskId = task.id;
       const handle = await h.client.workflow.start('mergeOnly@1.6.0', {
         taskQueue: TASK_QUEUE,
@@ -702,28 +702,28 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     const { agentQueueId } = await import('../src/coordinators/names.js');
     const scenarios = [
       { name: 'free member removal', plan: 'free' as const, expectedCapacity: 5,
-        recover: (store: Store, organizationId: string) => {
-          store.removeOrganizationMembership(organizationId, 'second');
-          store.removeOrganizationMembership(organizationId, 'third');
+        recover: async (store: Store, organizationId: string) => {
+          (await store.removeOrganizationMembership(organizationId, 'second'));
+          (await store.removeOrganizationMembership(organizationId, 'third'));
         } },
       { name: 'individual member removal', plan: 'individual' as const, expectedCapacity: 10,
-        recover: (store: Store, organizationId: string) => {
-          store.removeOrganizationMembership(organizationId, 'second');
-          store.removeOrganizationMembership(organizationId, 'third');
+        recover: async (store: Store, organizationId: string) => {
+          (await store.removeOrganizationMembership(organizationId, 'second'));
+          (await store.removeOrganizationMembership(organizationId, 'third'));
         } },
       { name: 'Team plan restoration', plan: 'free' as const, expectedCapacity: 30,
-        recover: (store: Store, organizationId: string) => {
-          store.setOrganizationPlan(organizationId, 'team');
+        recover: async (store: Store, organizationId: string) => {
+          (await store.setOrganizationPlan(organizationId, 'team'));
         } },
     ];
 
     for (const scenario of scenarios) {
-      const store = new Store(':memory:', { hosted: true });
-      const organization = store.createOrganization({ name: scenario.name, ownerUserId: 'owner' });
-      store.setOrganizationPlan(organization.id, 'team');
-      store.setOrganizationMembership(organization.id, 'second', 'member');
-      store.setOrganizationMembership(organization.id, 'third', 'member');
-      store.setOrganizationPlan(organization.id, scenario.plan);
+      const store = (await Store.create(':memory:', { hosted: true }));
+      const organization = (await store.createOrganization({ name: scenario.name, ownerUserId: 'owner' }));
+      (await store.setOrganizationPlan(organization.id, 'team'));
+      (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+      (await store.setOrganizationMembership(organization.id, 'third', 'member'));
+      (await store.setOrganizationPlan(organization.id, scenario.plan));
       const waiting = Array.from({ length: 35 }, (_, index) => ({
         taskId: `${scenario.name}-${index}`,
         turnId: `${scenario.name}-${index}#0`,
@@ -736,12 +736,12 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       });
       const reconciler = new EntitlementQueueReconciler({ store, client: h.client, intervalMs: 0 });
       try {
-        reconciler.start();
+        (await reconciler.start());
         await expect.poll(async () => (await wf.query('agentQueue') as any).capacity, { timeout: 10_000 }).toBe(0);
 
         // No admission, release, cancel, or other queue mutation follows this
         // entitlement recovery. The store notification must refresh the queue.
-        scenario.recover(store, organization.id);
+        (await scenario.recover(store, organization.id));
         await expect.poll(async () => {
           const view = await wf.query('agentQueue') as any;
           return [view.capacity, view.current.length, view.queue.length];
@@ -753,7 +753,7 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       } finally {
         await reconciler.stop();
         await wf.terminate('test done');
-        store.close();
+        (await store.close());
       }
     }
   });

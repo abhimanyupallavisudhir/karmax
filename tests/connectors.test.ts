@@ -373,16 +373,16 @@ describe('Connectors sync into the vault (§9)', () => {
 
     const first = await connectors.sync('bitwarden', ['bw1']);
     expect(first.count).toBe(1);
-    const vi = items.get(first.itemIds[0]!)!;
+    const vi = (await items.get(first.itemIds[0]!))!;
     expect(vi.type).toBe('login');
     expect(vi.provenance.source).toBe('connector:bitwarden');
     expect(vi.provenance.externalId).toBe('bw1');
-    expect(items.resolveField(vi, 'password', { mode: 'reveal' })).toBe('p1');
-    expect(connectors.config('bitwarden').lastSync?.count).toBe(1);
+    expect((await items.resolveField(vi, 'password', { mode: 'reveal' }))).toBe('p1');
+    expect((await connectors.config('bitwarden')).lastSync?.count).toBe(1);
 
     const second = await connectors.sync('bitwarden', ['bw1']);
     expect(second.itemIds).toEqual(first.itemIds); // same item id, updated in place
-    expect(items.list().filter((i) => i.provenance.externalId === 'bw1')).toHaveLength(1);
+    expect((await items.list()).filter((i) => i.provenance.externalId === 'bw1')).toHaveLength(1);
   });
 
   it('keeps a selective subscription and broadens import-new to the whole store', async () => {
@@ -410,24 +410,24 @@ describe('Connectors sync into the vault (§9)', () => {
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector);
 
-    connectors.setAutoSync('test', { keepUpdated: true, externalIds: ['one'],
-      policy: { use: 'ask', reveal: 'never' } });
+    (await connectors.setAutoSync('test', { keepUpdated: true, externalIds: ['one'],
+      policy: { use: 'ask', reveal: 'never' } }));
     await connectors.autoSync('test', 'backstop');
     expect(pulled).toEqual([['one']]);
-    expect(items.list().map((item) => item.provenance.externalId)).toEqual(['one']);
-    expect(items.list()[0]!.policy).toEqual({ use: 'ask', reveal: 'never' });
+    expect((await items.list()).map((item) => item.provenance.externalId)).toEqual(['one']);
+    expect((await items.list())[0]!.policy).toEqual({ use: 'ask', reveal: 'never' });
 
     revision++;
     records.set('three', { password: 'three-v1' });
-    connectors.setAutoSync('test', { importNew: true, externalIds: ['one'] });
-    expect(connectors.config('test').autoSync).toMatchObject({ enabled: true, importNew: true });
+    (await connectors.setAutoSync('test', { importNew: true, externalIds: ['one'] }));
+    expect((await connectors.config('test')).autoSync).toMatchObject({ enabled: true, importNew: true });
     await connectors.autoSync('test', 'github-push', 'commit-2');
-    expect(new Set(items.list().map((item) => item.provenance.externalId))).toEqual(new Set(['one', 'two', 'three']));
-    expect(connectors.config('test').autoSync?.externalIds).toEqual(['one', 'two', 'three']);
-    expect(connectors.config('test').lastAutoSync).toMatchObject({ reason: 'github-push', revision: 'commit-2' });
+    expect(new Set((await items.list()).map((item) => item.provenance.externalId))).toEqual(new Set(['one', 'two', 'three']));
+    expect((await connectors.config('test')).autoSync?.externalIds).toEqual(['one', 'two', 'three']);
+    expect((await connectors.config('test')).lastAutoSync).toMatchObject({ reason: 'github-push', revision: 'commit-2' });
 
-    connectors.setAutoSync('test', { keepUpdated: false, importNew: false, externalIds: ['one'] });
-    expect(connectors.config('test').autoSync).toEqual({
+    (await connectors.setAutoSync('test', { keepUpdated: false, importNew: false, externalIds: ['one'] }));
+    expect((await connectors.config('test')).autoSync).toEqual({
       enabled: false, importNew: false, externalIds: ['one'],
     });
     pulled.length = 0;
@@ -456,17 +456,17 @@ describe('Connectors sync into the vault (§9)', () => {
     connectors.register(connector);
 
     const imported = await connectors.sync('test', ['existing']);
-    expect(connectors.config('test').autoSync).toBeUndefined();
+    expect((await connectors.config('test')).autoSync).toBeUndefined();
     password = 'rotated';
     revision = Date.now() + 5_000;
 
     await connectors.autoSync('test', 'backstop');
 
     expect(pulled).toEqual([['existing'], ['existing']]);
-    expect(connectors.config('test').autoSync).toEqual({
+    expect((await connectors.config('test')).autoSync).toEqual({
       enabled: true, importNew: false, externalIds: ['existing'],
     });
-    expect(items.resolveField(items.get(imported.itemIds[0]!)!, 'password', { mode: 'reveal' }))
+    expect((await items.resolveField((await items.get(imported.itemIds[0]!))!, 'password', { mode: 'reveal' })))
       .toBe('rotated');
   });
 
@@ -483,15 +483,15 @@ describe('Connectors sync into the vault (§9)', () => {
     };
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector);
-    const created = items.save({ type: 'login', label: 'Created', secrets: { password: 'generated' },
-      provenance: { source: 'task:signup', taskId: 'signup' } });
+    const created = (await items.save({ type: 'login', label: 'Created', secrets: { password: 'generated' },
+      provenance: { source: 'task:signup', taskId: 'signup' } }));
     items.setExternalId(created.id, 'test', 'karmax/created');
-    connectors.setAutoSync('test', { importNew: true });
+    (await connectors.setAutoSync('test', { importNew: true }));
 
     const result = await connectors.autoSync('test', 'github-push');
     expect(result).toMatchObject({ count: 0, skipped: 1 });
-    expect(items.list()).toHaveLength(1);
-    expect(items.get(created.id)?.provenance.externalIds).toEqual({ test: 'karmax/created' });
+    expect((await items.list())).toHaveLength(1);
+    expect((await items.get(created.id))?.provenance.externalIds).toEqual({ test: 'karmax/created' });
   });
 
   /** A `pass` store on disk + an exec that "decrypts" by reading the file, so
@@ -536,16 +536,16 @@ describe('Connectors sync into the vault (§9)', () => {
     const second = await connectors.sync('pass', ['sites/a.com', 'sites/b.com', 'sites/c.com']);
     expect(shown).toEqual(['sites/c.com']);
     expect(second).toMatchObject({ count: 1, skipped: 2 });
-    expect(items.list()).toHaveLength(3);
-    expect(connectors.config('pass').lastSync?.count).toBe(3); // the running total, not this batch
-    expect(items.resolveField(items.list().find((i) => i.provenance.externalId === 'sites/c.com')!, 'password', { mode: 'reveal' })).toBe('pw-c');
+    expect((await items.list())).toHaveLength(3);
+    expect((await connectors.config('pass')).lastSync?.count).toBe(3); // the running total, not this batch
+    expect((await items.resolveField((await items.list()).find((i) => i.provenance.externalId === 'sites/c.com')!, 'password', { mode: 'reveal' }))).toBe('pw-c');
 
     // …but an entry edited in `pass` afterwards is pulled again.
     shown.length = 0;
     write('sites/a.com', 'pw-a2', Date.now() + 5_000);
     await connectors.sync('pass', ['sites/a.com', 'sites/b.com', 'sites/c.com']);
     expect(shown).toEqual(['sites/a.com']);
-    expect(items.resolveField(items.list().find((i) => i.provenance.externalId === 'sites/a.com')!, 'password', { mode: 'reveal' })).toBe('pw-a2');
+    expect((await items.resolveField((await items.list()).find((i) => i.provenance.externalId === 'sites/a.com')!, 'password', { mode: 'reveal' }))).toBe('pw-a2');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -566,7 +566,7 @@ describe('Connectors sync into the vault (§9)', () => {
 
     // Reproduce that race deterministically rather than hoping for the timing:
     // put the file's mtime inside the very millisecond the mirror clock names.
-    const syncedAt = items.list()[0]!.provenance.syncedAt!;
+    const syncedAt = (await items.list())[0]!.provenance.syncedAt!;
     const withinSameMs = (syncedAt + 0.5) / 1000;
     fs.utimesSync(path.join(dir, 'sites/a.com.gpg'), withinSameMs, withinSameMs);
     expect(fs.statSync(path.join(dir, 'sites/a.com.gpg')).mtimeMs).toBeGreaterThan(syncedAt);
@@ -612,10 +612,10 @@ describe('Connectors sync into the vault (§9)', () => {
     const { items, store, broker } = makeVault();
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector);
-    const old = items.save({ type: 'login', label: 'Legacy', secrets: { password: 'old' },
-      provenance: { source: 'connector:pass', externalId: 'sites/a.com', passNotesVersion: 1, syncedAt: Date.now() } });
+    const old = (await items.save({ type: 'login', label: 'Legacy', secrets: { password: 'old' },
+      provenance: { source: 'connector:pass', externalId: 'sites/a.com', passNotesVersion: 1, syncedAt: Date.now() } }));
     expect(await connectors.sync('pass', ['sites/a.com'])).toMatchObject({ count: 1, skipped: 0 });
-    expect(items.get(old.id)!.provenance.sourceRevision).toMatch(/^[a-f0-9]{64}$/);
+    expect((await items.get(old.id))!.provenance.sourceRevision).toMatch(/^[a-f0-9]{64}$/);
     expect(await connectors.sync('pass', ['sites/a.com'])).toMatchObject({ count: 0, skipped: 1 });
     expect(shown).toEqual(['sites/a.com']);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -629,11 +629,11 @@ describe('Connectors sync into the vault (§9)', () => {
     connectors.register(connector);
     const { itemIds } = await connectors.sync('pass', ['sites/a.com']);
     write('sites/a.com', 'pw-a2', Date.now() + 5_000);
-    items.setPolicy(itemIds[0]!, { use: 'ask' }); // bumps updatedAt, NOT the mirror clock
+    (await items.setPolicy(itemIds[0]!, { use: 'ask' })); // bumps updatedAt, NOT the mirror clock
     shown.length = 0;
     await connectors.sync('pass', ['sites/a.com']);
     expect(shown).toEqual(['sites/a.com']);
-    expect(items.resolveField(items.get(itemIds[0]!)!, 'password', { mode: 'reveal' })).toBe('pw-a2');
+    expect((await items.resolveField((await items.get(itemIds[0]!))!, 'password', { mode: 'reveal' }))).toBe('pw-a2');
   });
 
   it('backfills notes for imports older than the mirror clock once', async () => {
@@ -643,8 +643,8 @@ describe('Connectors sync into the vault (§9)', () => {
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector);
     // A pre-upgrade import: provenance carries no syncedAt.
-    items.save({ type: 'login', label: 'sites/a.com', secrets: { password: 'pw-a' },
-      provenance: { source: 'connector:pass', externalId: 'sites/a.com' } });
+    (await items.save({ type: 'login', label: 'sites/a.com', secrets: { password: 'pw-a' },
+      provenance: { source: 'connector:pass', externalId: 'sites/a.com' } }));
 
     const result = await connectors.sync('pass', ['sites/a.com']);
     expect(shown).toEqual(['sites/a.com']);
@@ -667,7 +667,7 @@ describe('Connectors sync into the vault (§9)', () => {
     const result = await connectors.sync('pass', ['sites/a.com', 'sites/b.com', 'sites/c.com']);
     expect(result.count).toBe(2);
     expect(result.failures.map((f) => f.externalId)).toEqual(['sites/b.com']);
-    expect(items.list().map((i) => i.provenance.externalId)).toEqual(['sites/a.com', 'sites/c.com']);
+    expect((await items.list()).map((i) => i.provenance.externalId)).toEqual(['sites/a.com', 'sites/c.com']);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -687,13 +687,13 @@ describe('Connectors sync into the vault (§9)', () => {
     const connectors = new Connectors(store, items, broker);
     connectors.register(new BitwardenConnector(() => 'sess', exec));
     const { itemIds } = await connectors.sync('bitwarden', ['bw1'], { policy: { use: 'ask', reveal: 'never' }, writeBack: true });
-    const vi = items.get(itemIds[0]!)!;
+    const vi = (await items.get(itemIds[0]!))!;
     expect(vi.policy).toEqual({ use: 'ask', reveal: 'never' });
-    expect(connectors.config('bitwarden').writeBack).toBe(true);
+    expect((await connectors.config('bitwarden')).writeBack).toBe(true);
     // the user later relaxes the policy; a re-sync must NOT clobber it back
-    items.setPolicy(vi.id, { use: 'auto' });
+    (await items.setPolicy(vi.id, { use: 'auto' }));
     await connectors.sync('bitwarden', ['bw1'], { policy: { use: 'ask', reveal: 'never' } });
-    expect(items.get(vi.id)!.policy.use).toBe('auto');
+    expect((await items.get(vi.id))!.policy.use).toBe('auto');
   });
 
   it('updateSecret is field-level: pass rewrites only line 1, keeping notes', async () => {
@@ -743,15 +743,15 @@ describe('Connectors sync into the vault (§9)', () => {
     connectors.register(new BitwardenConnector(() => 'sess', exec));
     const { itemIds } = await connectors.sync('bitwarden', ['bw1']);
     // rotate the vault secret, then propagate
-    items.save({ id: itemIds[0], type: 'login', secrets: { password: 'rotated' } });
+    (await items.save({ id: itemIds[0], type: 'login', secrets: { password: 'rotated' } }));
     // write-back off → no push
     expect(await connectors.propagate(itemIds[0]!, ['password'])).toBeUndefined();
-    connectors.setConfig('bitwarden', { writeBack: true });
+    (await connectors.setConfig('bitwarden', { writeBack: true }));
     const result = await connectors.propagate(itemIds[0]!, ['password']);
     expect(result).toEqual({ connector: 'bitwarden', fields: ['password'] });
     expect(updates[0].login.password).toBe('rotated');
     // agent-created (non-connector) items are not propagate's business
-    const own = items.save({ type: 'login', label: 'mine', secrets: { password: 'x' } });
+    const own = (await items.save({ type: 'login', label: 'mine', secrets: { password: 'x' } }));
     expect(await connectors.propagate(own.id, ['password'])).toBeUndefined();
   });
 
@@ -763,16 +763,16 @@ describe('Connectors sync into the vault (§9)', () => {
     (c as any).push = async (item: any) => { pushed.push(item); return { externalId: 'karmax/new' }; };
     const connectors = new Connectors(store, items, broker);
     connectors.register(c);
-    const created = items.save({ type: 'login', label: 'made by agent', secrets: { password: 'genpw' }, provenance: { source: 'task:t1', taskId: 't1' } });
+    const created = (await items.save({ type: 'login', label: 'made by agent', secrets: { password: 'genpw' }, provenance: { source: 'task:t1', taskId: 't1' } }));
 
     // disabled by default → skipped
     expect(await connectors.writeBack('pass', created.id)).toBeUndefined();
-    connectors.setConfig('pass', { writeBack: true });
+    (await connectors.setConfig('pass', { writeBack: true }));
     const result = await connectors.writeBack('pass', created.id);
     expect(result?.externalId).toBe('karmax/new');
     expect(pushed[0].secrets.password).toBe('genpw');
-    expect(items.get(created.id)!.provenance.externalId).toBe('karmax/new');
-    expect(items.get(created.id)!.provenance.externalIds).toEqual({ pass: 'karmax/new' });
+    expect((await items.get(created.id))!.provenance.externalId).toBe('karmax/new');
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ pass: 'karmax/new' });
   });
 
   it('automatically applies enabled connector write-back and propagates later rotations', async () => {
@@ -789,20 +789,20 @@ describe('Connectors sync into the vault (§9)', () => {
     };
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector);
-    connectors.setConfig('pass', { writeBack: true });
-    const created = items.save({
+    (await connectors.setConfig('pass', { writeBack: true }));
+    const created = (await items.save({
       type: 'login', label: 'automatic', secrets: { password: 'generated' },
       provenance: { source: 'task:t1', taskId: 't1' },
-    });
+    }));
 
     expect(await connectors.writeBackCreated(created.id)).toEqual([
       { connector: 'pass', externalId: 'karmax/automatic' },
     ]);
     expect(pushed).toHaveLength(1);
     expect(pushed[0].secrets.password).toBe('generated');
-    expect(items.get(created.id)!.provenance.externalIds).toEqual({ pass: 'karmax/automatic' });
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ pass: 'karmax/automatic' });
 
-    items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } });
+    (await items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } }));
     expect(await connectors.propagate(created.id, ['password'])).toEqual({
       connector: 'pass',
       fields: ['password'],
@@ -829,23 +829,23 @@ describe('Connectors sync into the vault (§9)', () => {
     const connectors = new Connectors(store, items, broker);
     connectors.register(fake('alpha', 'alpha/item') as any);
     connectors.register(fake('beta', 'beta/item') as any);
-    connectors.setConfig('alpha', { writeBack: true });
-    connectors.setConfig('beta', { writeBack: true });
-    const created = items.save({
+    (await connectors.setConfig('alpha', { writeBack: true }));
+    (await connectors.setConfig('beta', { writeBack: true }));
+    const created = (await items.save({
       type: 'login', label: 'multi', secrets: { password: 'generated' },
       provenance: { source: 'task:t1', taskId: 't1' },
-    });
+    }));
 
     expect(await connectors.writeBackCreated(created.id)).toEqual([
       { connector: 'alpha', externalId: 'alpha/item' },
       { connector: 'beta', externalId: 'beta/item' },
     ]);
-    expect(items.get(created.id)!.provenance.externalIds).toEqual({
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({
       alpha: 'alpha/item',
       beta: 'beta/item',
     });
 
-    items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } });
+    (await items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } }));
     expect(await connectors.propagate(created.id, ['password'])).toEqual({
       connector: 'alpha, beta',
       fields: ['password'],
@@ -872,12 +872,12 @@ describe('Connectors sync into the vault (§9)', () => {
     const connectors = new Connectors(store, items, broker);
     connectors.register(fake('alpha') as any);
     connectors.register(fake('beta') as any);
-    const created = items.save({
+    const created = (await items.save({
       type: 'login', label: 'legacy', secrets: { password: 'rotated' },
       provenance: { source: 'task:t1', taskId: 't1' },
-    });
+    }));
     items.setExternalId(created.id, 'legacy/item');
-    connectors.setConfig('alpha', { writeBack: true });
+    (await connectors.setConfig('alpha', { writeBack: true }));
 
     expect(await connectors.propagate(created.id, ['password'])).toEqual({
       connector: 'alpha',
@@ -887,7 +887,7 @@ describe('Connectors sync into the vault (§9)', () => {
       { connector: 'alpha', externalId: 'legacy/item', field: 'password', value: 'rotated' },
     ]);
 
-    connectors.setConfig('beta', { writeBack: true });
+    (await connectors.setConfig('beta', { writeBack: true }));
     await expect(connectors.propagate(created.id, ['password'])).rejects.toThrow(
       /legacy write-back binding is ambiguous across enabled connectors: alpha, beta/,
     );
@@ -907,11 +907,11 @@ describe('Connectors sync into the vault (§9)', () => {
     };
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector as any);
-    connectors.setConfig('alpha', { writeBack: true });
-    const imported = items.save({
+    (await connectors.setConfig('alpha', { writeBack: true }));
+    const imported = (await items.save({
       type: 'login', label: 'from a file', secrets: { password: 'rotated' },
       provenance: { source: 'import:bitwarden', externalId: 'bitwarden-item-id' },
-    });
+    }));
 
     expect(await connectors.propagate(imported.id, ['password'])).toBeUndefined();
     await expect(connectors.writeBack('alpha', imported.id)).rejects.toThrow(/one-way file import/i);
@@ -943,10 +943,10 @@ describe('pass notes preservation and migration', () => {
 
   it.each([false, true])('backfills unchanged entries once, including written-back=%s', async (writtenBack) => {
     const { items, store, broker } = makeVault();
-    const item = items.save({ type: 'login', label: 'VPS', secrets: { password: 'pw' },
+    const item = (await items.save({ type: 'login', label: 'VPS', secrets: { password: 'pw' },
       policy: { reveal: 'never' }, provenance: writtenBack
         ? { source: 'task:signup', taskId: 'signup' }
-        : { source: 'connector:pass-git', externalId: 'vps', syncedAt: Date.now() } });
+        : { source: 'connector:pass-git', externalId: 'vps', syncedAt: Date.now() } }));
     if (writtenBack) items.setExternalId(item.id, 'pass-git', 'vps');
     let note = 'Username: administrator\n';
     let changedAt = 1;
@@ -962,16 +962,16 @@ describe('pass notes preservation and migration', () => {
       },
     });
     await connectors.sync('pass-git', ['vps']);
-    expect(items.list()).toHaveLength(1);
-    expect(items.readSecret(items.get(item.id)!, 'note')).toBe(note);
-    expect(items.get(item.id)!.policy.reveal).toBe('never');
-    expect(items.get(item.id)!.provenance.source).toBe(item.provenance.source);
+    expect((await items.list())).toHaveLength(1);
+    expect(items.readSecret((await items.get(item.id))!, 'note')).toBe(note);
+    expect((await items.get(item.id))!.policy.reveal).toBe('never');
+    expect((await items.get(item.id))!.provenance.source).toBe(item.provenance.source);
     await connectors.sync('pass-git', ['vps']);
     expect(pulls).toEqual([['vps']]);
     note = '';
     changedAt = Date.now() + 10000;
     await connectors.sync('pass-git', ['vps']);
-    expect(items.readSecret(items.get(item.id)!, 'note')).toBe('');
+    expect(items.readSecret((await items.get(item.id))!, 'note')).toBe('');
   });
 });
 
@@ -979,8 +979,8 @@ describe('pass TOTP import migration', () => {
   it('repairs an unchanged OTP-only mirror and removes its old password field', async () => {
     const { items, store, broker } = makeVault();
     const uri = 'otpauth://totp/x?secret=JBSWY3DPEHPK3PXP';
-    const old = items.save({ type: 'login', label: 'OTP', secrets: { password: uri },
-      provenance: { source: 'connector:pass-git', externalId: 'otp', sourceRevision: 'same', passNotesVersion: 1 } });
+    const old = (await items.save({ type: 'login', label: 'OTP', secrets: { password: uri },
+      provenance: { source: 'connector:pass-git', externalId: 'otp', sourceRevision: 'same', passNotesVersion: 1 } }));
     const connectors = new Connectors(store, items, broker);
     connectors.register({ name: 'pass-git',
       describe: async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: '' }),
@@ -988,10 +988,10 @@ describe('pass TOTP import migration', () => {
       pull: async () => ({ items: [{ externalId: 'otp', type: 'login', label: 'OTP', fields: ['totp', 'note'], revision: 'same', secrets: { totp: uri, note: '' } }], failures: [] }),
     });
     expect((await connectors.sync('pass-git', ['otp'])).count).toBe(1);
-    const updated = items.get(old.id)!;
+    const updated = (await items.get(old.id))!;
     expect(updated.fields).toEqual(['totp', 'note']);
     expect(items.readSecret(updated, 'password')).toBeUndefined();
-    expect(items.totp(updated, {})).toMatch(/^\d{6}$/);
+    expect((await items.totp(updated, {}))).toMatch(/^\d{6}$/);
     expect((await connectors.sync('pass-git', ['otp'])).skipped).toBe(1);
   });
 });
@@ -1007,13 +1007,13 @@ describe('Git password-store reconfiguration', () => {
     const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
       mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
     await service.connect('pass-git', JSON.stringify(config));
-    service.setConfig('pass-git', { writeBack: true });
-    service.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] });
+    (await service.setConfig('pass-git', { writeBack: true }));
+    (await service.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] }));
     await service.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' }));
-    expect(service.config('pass-git').writeBack).toBe(true);
+    expect((await service.config('pass-git')).writeBack).toBe(true);
     await service.connect('pass-git', JSON.stringify({ ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] }));
-    expect(service.config('pass-git').writeBack).toBeUndefined();
-    expect(service.config('pass-git').autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
+    expect((await service.config('pass-git')).writeBack).toBeUndefined();
+    expect((await service.config('pass-git')).autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
   });
 });
 
@@ -1058,8 +1058,8 @@ describe('connector export and propagation regressions', () => {
     const { store, items, broker } = makeVault();
     const connectors = new Connectors(store, items, broker);
     connectors.register(new BitwardenConnector(() => undefined));
-    connectors.setConfig('bitwarden', { writeBack: true });
-    const item = items.save({ type: 'note', label: 'note', secrets: { note: 'synthetic' } });
+    (await connectors.setConfig('bitwarden', { writeBack: true }));
+    const item = (await items.save({ type: 'note', label: 'note', secrets: { note: 'synthetic' } }));
     expect(await connectors.writeBackCreated(item.id)).toEqual([
       expect.objectContaining({ connector: 'bitwarden', error: expect.any(String) }),
     ]);
@@ -1107,21 +1107,21 @@ describe('connector export and propagation regressions', () => {
           if (name === 'a' && field === 'password' && fail) throw new Error('offline');
         },
       });
-      connectors.setConfig(name, { writeBack: true });
+      (await connectors.setConfig(name, { writeBack: true }));
     }
-    const item = items.save({ type: 'login', label: 'login', secrets: { password: 'pw', note: 'note' } });
+    const item = (await items.save({ type: 'login', label: 'login', secrets: { password: 'pw', note: 'note' } }));
     await connectors.writeBackCreated(item.id);
     const result = await connectors.propagate(item.id, ['password', 'note']);
     expect(calls).toEqual(['a:password', 'a:note', 'b:password', 'b:note']);
     expect(result?.error).toBeTruthy();
-    expect(connectors.pendingWrites()).toHaveLength(1);
+    expect((await connectors.pendingWrites())).toHaveLength(1);
     const fresh = new Connectors(store, items, broker);
     for (const name of ['a', 'b']) fresh.register(connectors.get(name)!);
     fail = false;
     calls.length = 0;
     await fresh.retryWrites();
     expect(calls).toEqual(['a:password']);
-    expect(fresh.pendingWrites()).toEqual([]);
+    expect((await fresh.pendingWrites())).toEqual([]);
   });
 });
 
@@ -1148,19 +1148,19 @@ describe('durable connector outbox', () => {
     });
     const imported = await service.sync('source', ['id'], { writeBack: true });
     const id = imported.itemIds[0]!;
-    items.save({ id, type: 'login', secrets: { password: 'new-secret' } });
+    (await items.save({ id, type: 'login', secrets: { password: 'new-secret' } }));
     expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
-    expect(JSON.stringify(service.pendingWrites())).not.toContain('new-secret');
+    expect(JSON.stringify((await service.pendingWrites()))).not.toContain('new-secret');
     expect((await service.sync('source', ['id'])).count).toBe(0);
-    expect(items.readSecret(items.get(id)!, 'password')).toBe('new-secret');
-    service.setConfig('source', { writeBack: false });
+    expect(items.readSecret((await items.get(id))!, 'password')).toBe('new-secret');
+    (await service.setConfig('source', { writeBack: false }));
     fail = false;
     await service.retryWrites();
     expect(value).toBe('old');
-    service.setConfig('source', { writeBack: true });
+    (await service.setConfig('source', { writeBack: true }));
     await service.retryWrites();
     expect(value).toBe('new-secret');
-    expect(service.pendingWrites()).toEqual([]);
+    expect((await service.pendingWrites())).toEqual([]);
   });
   it('does not lose a newer rotation while an older write is in flight', async () => {
     const { store, items, broker } = makeVault();
@@ -1184,17 +1184,17 @@ describe('durable connector outbox', () => {
         }
       },
     });
-    service.setConfig('source', { writeBack: true });
-    const item = items.save({ type: 'login', label: 'login', secrets: { password: 'first' } });
+    (await service.setConfig('source', { writeBack: true }));
+    const item = (await items.save({ type: 'login', label: 'login', secrets: { password: 'first' } }));
     await service.writeBackCreated(item.id);
     const first = service.propagate(item.id, ['password']);
     await started;
-    items.save({ id: item.id, type: 'login', secrets: { password: 'second' } });
+    (await items.save({ id: item.id, type: 'login', secrets: { password: 'second' } }));
     const second = service.propagate(item.id, ['password']);
     release();
     await Promise.all([first, second]);
     expect(values).toEqual(['first', 'second']);
-    expect(service.pendingWrites()).toEqual([]);
+    expect((await service.pendingWrites())).toEqual([]);
   });
   it('cannot send queued writes to a replacement connection', async () => {
     const { store, items, broker } = makeVault();
@@ -1211,8 +1211,8 @@ describe('durable connector outbox', () => {
       },
     });
     await service.connect('source', 'first-account');
-    service.setConfig('source', { writeBack: true });
-    const item = items.save({ type: 'note', label: 'note', secrets: { note: 'sensitive' } });
+    (await service.setConfig('source', { writeBack: true }));
+    const item = (await items.save({ type: 'note', label: 'note', secrets: { note: 'sensitive' } }));
     await service.writeBackCreated(item.id);
     await service.connect('source', 'second-account');
     expect((await service.retryWrites())[0]?.error).toMatch(/store changed/);
@@ -1289,14 +1289,14 @@ it('does not let an in-flight stale import undo a completed rotation', async () 
   wait = true;
   const syncing = service.sync('source', ['id']);
   await reading;
-  const oldVersion = items.get(id)!.updatedAt;
-  items.save({ id, type: 'login', secrets: { password: 'new' } });
-  expect(items.get(id)!.updatedAt).toBeGreaterThan(oldVersion);
+  const oldVersion = (await items.get(id))!.updatedAt;
+  (await items.save({ id, type: 'login', secrets: { password: 'new' } }));
+  expect((await items.get(id))!.updatedAt).toBeGreaterThan(oldVersion);
   await service.propagate(id, ['password']);
-  expect(service.pendingWrites()).toEqual([]);
+  expect((await service.pendingWrites())).toEqual([]);
   release();
   expect((await syncing).skipped).toBe(1);
-  expect(items.readSecret(items.get(id)!, 'password')).toBe('new');
+  expect(items.readSecret((await items.get(id))!, 'password')).toBe('new');
 });
 
 it('does not resurrect a dismissed write when an in-flight attempt fails', async () => {
@@ -1317,33 +1317,33 @@ it('does not resurrect a dismissed write when an in-flight attempt fails', async
       throw new Error('offline');
     },
   });
-  service.setConfig('source', { writeBack: true });
-  const item = items.save({ type: 'note', label: 'note', secrets: { note: 'secret' } });
+  (await service.setConfig('source', { writeBack: true }));
+  const item = (await items.save({ type: 'note', label: 'note', secrets: { note: 'secret' } }));
   const attempt = service.writeBackCreated(item.id);
   await writing;
-  const handle = service.pendingWrites()[0]!.snapshotHandle!;
-  expect(service.discardWrites('source')).toBe(1);
+  const handle = (await service.pendingWrites())[0]!.snapshotHandle!;
+  expect((await service.discardWrites('source'))).toBe(1);
   release();
   await attempt;
-  expect(service.pendingWrites()).toEqual([]);
+  expect((await service.pendingWrites())).toEqual([]);
   expect(broker.hasHandle(handle)).toBe(false);
-  expect(items.readSecret(items.get(item.id)!, 'note')).toBe('secret');
+  expect(items.readSecret((await items.get(item.id))!, 'note')).toBe('secret');
 });
 
 it('deletes pending export snapshots with the vault item even while retries are disabled', async () => {
   const {store,items,broker}=makeVault();const service=new Connectors(store,items,broker);
   service.register({name:'source',describe:async()=>({name:'source',label:'source',available:true,detail:'',canPush:true}),list:async()=>[],pull:async()=>({items:[],failures:[]}),push:async()=>{throw new Error('offline');}});
-  service.setConfig('source',{writeBack:true});
-  const item=items.save({type:'note',label:'note',secrets:{note:'secret'}});
+  (await service.setConfig('source',{writeBack:true}));
+  const item=(await items.save({type:'note',label:'note',secrets:{note:'secret'}}));
   await service.writeBackCreated(item.id);
-  const handle=service.pendingWrites()[0]!.snapshotHandle!;
+  const handle=(await service.pendingWrites())[0]!.snapshotHandle!;
   expect(broker.hasHandle(handle)).toBe(true);
   const status=(await service.describe())[0]!.pendingWrites[0]!;
   expect(status).not.toHaveProperty('snapshotHandle');
   expect(status).not.toHaveProperty('target');
-  service.setConfig('source',{writeBack:false});
-  items.delete(item.id);
-  expect(service.pendingWrites()).toEqual([]);
+  (await service.setConfig('source',{writeBack:false}));
+  (await items.delete(item.id));
+  expect((await service.pendingWrites())).toEqual([]);
   expect(broker.hasHandle(handle)).toBe(false);
 });
 
@@ -1354,21 +1354,21 @@ it('queues Git rotations before remote revision lookup and respects dismissal du
   connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
   service.register(connector);
   await service.connect('pass-git', JSON.stringify({ repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test' }));
-  service.setConfig('pass-git', { writeBack: true });
-  const item = items.save({ type: 'login', label: 'Entry', secrets: { password: 'local' },
-    provenance: { source: 'connector:pass-git', externalId: 'entry' } });
+  (await service.setConfig('pass-git', { writeBack: true }));
+  const item = (await items.save({ type: 'login', label: 'Entry', secrets: { password: 'local' },
+    provenance: { source: 'connector:pass-git', externalId: 'entry' } }));
   connector.catalog = async () => { throw new Error('transport unavailable'); };
   expect((await service.propagate(item.id, ['password']))?.error).toBeTruthy();
-  expect(service.discardWrites('pass-git')).toBe(1);
+  expect((await service.discardWrites('pass-git'))).toBe(1);
   let updates = 0;
   connector.updateSecrets = async () => { updates++; };
   connector.catalog = async () => {
-    expect(service.discardWrites('pass-git')).toBe(1);
+    expect((await service.discardWrites('pass-git'))).toBe(1);
     return { items: [{ externalId: 'entry', type: 'login', label: 'Entry', fields: ['password'], revision: 'rev' }], failures: [] };
   };
   await service.propagate(item.id, ['password']);
   expect(updates).toBe(0);
-  expect(service.discardWrites('pass-git')).toBe(0);
+  expect((await service.discardWrites('pass-git'))).toBe(0);
 });
 
 describe.each(['LOGIN', 'SECURE_NOTE'])('1Password CLI %s notes', (category) => {
@@ -1396,8 +1396,8 @@ describe.each(['LOGIN', 'SECURE_NOTE'])('1Password CLI %s notes', (category) => 
     const type = category === 'LOGIN' ? 'login' : 'note';
     const password = type === 'login' ? { password: 'synthetic-password' } : {};
     const original = 'first line\r\nsecond line\n';
-    const item = items.save({ type, label: 'Entry', secrets: { ...password, note: original },
-      provenance: { source: 'connector:1password', externalId: 'entry' } });
+    const item = (await items.save({ type, label: 'Entry', secrets: { ...password, note: original },
+      provenance: { source: 'connector:1password', externalId: 'entry' } }));
     let value: string | undefined = original;
     let present = true;
     service.register(new OnePasswordConnector(() => 'token', async (_command, args) => JSON.stringify(
@@ -1413,16 +1413,16 @@ describe.each(['LOGIN', 'SECURE_NOTE'])('1Password CLI %s notes', (category) => 
       value = next;
       const result = await service.sync('1password', ['entry']);
       expect(result).toMatchObject({ count: 1, itemIds: [item.id], failures: [] });
-      const saved = items.get(item.id)!;
+      const saved = (await items.get(item.id))!;
       expect(items.readSecret(saved, 'note')).toBe(next);
       expect(saved.fields.includes('note')).toBe(next !== undefined);
       if (type === 'login') expect(items.readSecret(saved, 'password')).toBe(password.password);
     }
     // Removing the source field entirely must also remove an existing mirror value.
-    items.save({ id: item.id, type, secrets: { note: 'local old note' } });
+    (await items.save({ id: item.id, type, secrets: { note: 'local old note' } }));
     present = false;
     expect((await service.sync('1password', ['entry'])).count).toBe(1);
-    expect(items.get(item.id)!.fields).not.toContain('note');
-    expect(items.readSecret(items.get(item.id)!, 'note')).toBeUndefined();
+    expect((await items.get(item.id))!.fields).not.toContain('note');
+    expect(items.readSecret((await items.get(item.id))!, 'note')).toBeUndefined();
   });
 });

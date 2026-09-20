@@ -40,9 +40,9 @@ describe('installation-wide settings report who may manage them', () => {
   beforeAll(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-instsettings-'));
     fs.copyFileSync(new URL('../web/index.html', import.meta.url), path.join(home, 'index.html'));
-    store = new Store(':memory:');
+    store = (await Store.create(':memory:'));
     tokens = new TokenAuthority();
-    const gateway = new Gateway({
+    const gateway = (await Gateway.create({
       store,
       bus: new KarmaxBus(),
       tokens,
@@ -54,13 +54,13 @@ describe('installation-wide settings report who may manage them', () => {
       staticDir: home,
       agentInfo: { provider: 'mock', reason: 'installation settings test' },
       worlds: new WorldRegistry(),
-    } as any);
+    } as any));
     const running = await gateway.listen(await findFreePortFrom(48_400));
     base = running.url;
     close = running.close;
-    operator = tokens.mintPrincipal('user:op', ['safe-mode:write', 'settings:write', 'settings:read']).token;
+    operator = (await tokens.mintPrincipal('user:op', ['safe-mode:write', 'settings:write', 'settings:read'])).token;
     // An organization member with ordinary project authority and nothing installation-wide.
-    tenant = tokens.mintPrincipal('user:tenant', ['project:read', 'project:settings:write', 'task:*']).token;
+    tenant = (await tokens.mintPrincipal('user:tenant', ['project:read', 'project:settings:write', 'task:*'])).token;
   }, 30_000);
 
   afterAll(async () => {
@@ -92,7 +92,7 @@ describe('installation-wide settings report who may manage them', () => {
       method: 'POST', headers: as(tenant), body: JSON.stringify({ enabled: true }),
     });
     expect(refused.status).toBe(403);
-    expect(store.kvGet('safe-mode')).toBeFalsy();
+    expect((await store.kvGet('safe-mode'))).toBeFalsy();
   });
 
   it('reports the same for outbound email, which has no env path to fall back on', async () => {
@@ -116,13 +116,13 @@ describe('installation-wide settings report who may manage them', () => {
   });
 
   it('changes the public installation name without clobbering its icon', async () => {
-    store.setSettings('global', 'appearance', { icon: 'knot' });
+    (await store.setSettings('global', 'appearance', { icon: 'knot' }));
     const changed = await fetch(`${base}/api/settings/installation`, {
       method: 'PUT', headers: as(operator), body: JSON.stringify({ siteName: '  tavya  ' }),
     });
     expect(changed.status).toBe(200);
     expect(await changed.json()).toMatchObject({ ok: true, siteName: 'tavya' });
-    expect(store.getSettings('global', 'appearance')).toEqual({ icon: 'knot', siteName: 'tavya' });
+    expect((await store.getSettings('global', 'appearance'))).toEqual({ icon: 'knot', siteName: 'tavya' });
 
     const meta = await (await fetch(`${base}/api/meta`)).json() as any;
     expect(meta.siteName).toBe('tavya');
@@ -150,6 +150,6 @@ describe('installation-wide settings report who may manage them', () => {
       method: 'PUT', headers: as(tenant), body: JSON.stringify({ siteName: 'not-allowed' }),
     });
     expect(refused.status).toBe(403);
-    expect(store.getSettings('global', 'appearance')?.siteName).toBe('tavya');
+    expect((await store.getSettings('global', 'appearance'))?.siteName).toBe('tavya');
   });
 });

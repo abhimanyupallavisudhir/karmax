@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { Capability, CAPABILITIES, DEVELOPER_WORKSPACE_CAPABILITIES, allows, attenuate } from './capabilities.js';
 import type { AuthorizationSelection, ProjectMembership } from '../domain/types.js';
@@ -169,77 +170,87 @@ function* capabilityProfile(id: string, projectId?: string, organizationId?: str
 
 export class AuthorizationService {
   constructor(private store: Store) {
-    this.seed();
   }
 
-  seed(): void {
+  static async create(store: Store) {
+    const instance = new AuthorizationService(store);
+    await instance.initialize(store);
+    return instance;
+  }
+
+  private async initialize(store: Store) {
+
+    (await this.seed());
+  }
+
+  async seed(): Promise<void> {
     for (const profile of DEFAULT_AUTHORIZATION_PROFILES) {
-      const stored = this.store.getAuthorizationProfile('global', profile.id) as AuthorizationProfile | undefined;
+      const stored = (await this.store.getAuthorizationProfile('global', profile.id)) as AuthorizationProfile | undefined;
       if (!stored) {
-        this.store.setAuthorizationProfile('global', profile as any);
+        (await this.store.setAuthorizationProfile('global', profile as any));
         continue;
       }
       const historical = LEGACY_BUILTIN_CAPABILITIES[profile.id] ?? [];
       if (stored.builtin && stored.name === profile.name && stored.description === profile.description
         && historical.some((caps) => sameCapabilities(stored.capabilities, caps))) {
-        this.store.setAuthorizationProfile('global', profile as any);
+        (await this.store.setAuthorizationProfile('global', profile as any));
       }
     }
-    this.migrateLegacyGrants();
-    if (!this.store.kvGet('authz:default:global')) this.store.kvSet('authz:default:global', 'developer');
-    this.migrateLegacyDefaults();
+    (await this.migrateLegacyGrants());
+    if (!(await this.store.kvGet('authz:default:global'))) (await this.store.kvSet('authz:default:global', 'developer'));
+    (await this.migrateLegacyDefaults());
   }
 
-  private migrateLegacyDefaults(): void {
+  private async migrateLegacyDefaults(): Promise<void> {
     const keys = ['authz:default:global',
-      ...this.store.listProjects().map((project) => `authz:default:project:${project.id}`)];
+      ...(await this.store.listProjects()).map((project) => `authz:default:project:${project.id}`)];
     for (const key of keys) {
-      const level = this.store.kvGet(key);
-      if (level && !CANONICAL_AUTHORIZATION_LEVELS.includes(level as any)) this.store.kvSet(key, 'developer');
+      const level = (await this.store.kvGet(key));
+      if (level && !CANONICAL_AUTHORIZATION_LEVELS.includes(level as any)) (await this.store.kvSet(key, 'developer'));
     }
   }
 
-  private migrateLegacyGrants(): void {
-    for (const grant of this.store.listPrincipalGrants() as PrincipalGrant[]) {
+  private async migrateLegacyGrants(): Promise<void> {
+    for (const grant of (await this.store.listPrincipalGrants()) as PrincipalGrant[]) {
       let profileId = grant.profileId;
       if (grant.scopeKey === 'global' && (profileId === 'operator' || profileId === 'administrator')) profileId = 'god';
       else if (grant.scopeKey.startsWith('organization:') && profileId === 'operator') profileId = 'administrator';
       else if (grant.scopeKey.startsWith('project:') && (profileId === 'operator' || profileId === 'administrator')) profileId = 'maintainer';
 
       if (grant.scopeKey === 'global' && (profileId === 'developer' || profileId === 'maintainer' || profileId === 'viewer')) {
-        for (const organization of this.store.listOrganizations()) {
+        for (const organization of (await this.store.listOrganizations())) {
           const scopeKey = organizationScope(organization.id);
-          this.store.setPrincipalGrant(grant.principalId, scopeKey, { ...grant, scopeKey, profileId });
+          (await this.store.setPrincipalGrant(grant.principalId, scopeKey, { ...grant, scopeKey, profileId }));
         }
-        this.store.deletePrincipalGrant(grant.principalId, grant.scopeKey);
+        (await this.store.deletePrincipalGrant(grant.principalId, grant.scopeKey));
       } else if (profileId !== grant.profileId) {
-        this.store.setPrincipalGrant(grant.principalId, grant.scopeKey, { ...grant, profileId });
+        (await this.store.setPrincipalGrant(grant.principalId, grant.scopeKey, { ...grant, profileId }));
       }
     }
   }
 
-  profiles(projectId?: string, organizationId?: string): AuthorizationProfile[] {
+  async profiles(projectId?: string, organizationId?: string): Promise<AuthorizationProfile[]> {
     const global = new Map<string, AuthorizationProfile>(
-      this.store.listAuthorizationProfiles('global').filter((p) => p.id !== 'operator').map((p) => [p.id, p]),
+      (await this.store.listAuthorizationProfiles('global')).filter((p) => p.id !== 'operator').map((p) => [p.id, p]),
     );
-    const org = organizationId ?? (projectId ? this.store.getProject(projectId)?.organizationId : undefined);
-    if (org) for (const p of this.store.listAuthorizationProfiles(organizationScope(org))) global.set(p.id, p);
+    const org = organizationId ?? (projectId ? (await this.store.getProject(projectId))?.organizationId : undefined);
+    if (org) for (const p of (await this.store.listAuthorizationProfiles(organizationScope(org)))) global.set(p.id, p);
     if (projectId) {
-      for (const p of this.store.listAuthorizationProfiles(projectScope(projectId))) {
+      for (const p of (await this.store.listAuthorizationProfiles(projectScope(projectId)))) {
         if (p.id !== 'operator') global.set(p.id, p);
       }
     }
     return [...global.values()];
   }
 
-  profile(id: string, projectId?: string, organizationId?: string): AuthorizationProfile | undefined {
-    const org = organizationId ?? (projectId ? this.store.getProject(projectId)?.organizationId : undefined);
-    return (projectId ? this.store.getAuthorizationProfile(projectScope(projectId), id) : undefined)
-      ?? (org ? this.store.getAuthorizationProfile(organizationScope(org), id) : undefined)
-      ?? this.store.getAuthorizationProfile('global', id);
+  async profile(id: string, projectId?: string, organizationId?: string): Promise<AuthorizationProfile | undefined> {
+    const org = organizationId ?? (projectId ? (await this.store.getProject(projectId))?.organizationId : undefined);
+    return (projectId ? (await this.store.getAuthorizationProfile(projectScope(projectId), id)) : undefined)
+      ?? (org ? (await this.store.getAuthorizationProfile(organizationScope(org), id)) : undefined)
+      ?? (await this.store.getAuthorizationProfile('global', id));
   }
 
-  saveProfile(actor: string, scopeKey: AuthorizationScope, profile: AuthorizationProfile): AuthorizationProfile {
+  async saveProfile(actor: string, scopeKey: AuthorizationScope, profile: AuthorizationProfile): Promise<AuthorizationProfile> {
     if (!profile.id.trim() || !profile.name.trim()) throw new Error('authorization profile needs an id and name');
     if (!profile.capabilities.length) throw new Error('authorization profile needs at least one capability');
     for (const cap of profile.capabilities) {
@@ -251,12 +262,12 @@ export class AuthorizationService {
     }
     const { scopeKey: _claimedScope, ...clean } = profile;
     const saved = { ...clean, id: profile.id.trim(), name: profile.name.trim() };
-    this.store.setAuthorizationProfile(scopeKey, saved);
-    this.audit(actor, 'authorization.profile.saved', scopeKey, { profileId: saved.id, capabilities: saved.capabilities });
+    (await this.store.setAuthorizationProfile(scopeKey, saved));
+    (await this.audit(actor, 'authorization.profile.saved', scopeKey, { profileId: saved.id, capabilities: saved.capabilities }));
     return { ...saved, scopeKey };
   }
 
-  createOrganizationRole(actor: string, organizationId: string, input: AuthorizationProfile, actorCaps: Capability[]): AuthorizationProfile {
+  async createOrganizationRole(actor: string, organizationId: string, input: AuthorizationProfile, actorCaps: Capability[]): Promise<AuthorizationProfile> {
     if (!input || typeof input.name !== 'string' || !input.name.trim()
       || typeof input.description !== 'string' || !input.description.trim() || input.name.length > 80 || input.description.length > 240 || !Array.isArray(input.capabilities)
       || !input.capabilities.length || input.capabilities.some((cap) => typeof cap !== 'string' || !CAPABILITIES.includes(cap as any)))
@@ -264,63 +275,63 @@ export class AuthorizationService {
     if (input.capabilities.some((cap) => !allows(ORGANIZATION_GRANT_CEILING, cap) || !allows(actorCaps, cap)))
       throw new AuthorizationGrantError('You cannot grant these capabilities in this organization');
     const name = input.name.trim();
-    if (this.profiles(undefined, organizationId).some((role) => role.name.toLowerCase() === name.toLowerCase()))
+    if ((await this.profiles(undefined, organizationId)).some((role) => role.name.toLowerCase() === name.toLowerCase()))
       throw new Error('A role with this name already exists');
-    return this.saveProfile(actor, organizationScope(organizationId), {
+    return (await this.saveProfile(actor, organizationScope(organizationId), {
       id: `role_${crypto.randomUUID()}`, name, description: input.description.trim(),
       capabilities: [...new Set(input.capabilities)], builtin: false,
-    });
+    }));
   }
 
-  deleteProfile(actor: string, scopeKey: AuthorizationScope, id: string): void {
+  async deleteProfile(actor: string, scopeKey: AuthorizationScope, id: string): Promise<void> {
     if (scopeKey === 'global' && DEFAULT_AUTHORIZATION_PROFILES.some((p) => p.id === id))
       throw new Error('built-in global profiles can be customized but not deleted');
-    this.store.deleteAuthorizationProfile(scopeKey, id);
-    this.audit(actor, 'authorization.profile.deleted', scopeKey, { profileId: id });
+    (await this.store.deleteAuthorizationProfile(scopeKey, id));
+    (await this.audit(actor, 'authorization.profile.deleted', scopeKey, { profileId: id }));
   }
 
-  defaultProfile(projectId?: string): string {
-    const level = (projectId && this.store.kvGet(`authz:default:project:${projectId}`))
-      || this.store.kvGet('authz:default:global') || 'developer';
+  async defaultProfile(projectId?: string): Promise<string> {
+    const level = (projectId && (await this.store.kvGet(`authz:default:project:${projectId}`)))
+      || (await this.store.kvGet('authz:default:global')) || 'developer';
     return CANONICAL_AUTHORIZATION_LEVELS.includes(level as any) ? level : 'developer';
   }
 
-  setDefault(actor: string, profileId: string, projectId?: string): void {
+  async setDefault(actor: string, profileId: string, projectId?: string): Promise<void> {
     if (!CANONICAL_AUTHORIZATION_LEVELS.includes(profileId as any))
       throw new Error(`unknown authorization level ${profileId}`);
     const key = projectId ? `authz:default:project:${projectId}` : 'authz:default:global';
-    this.store.kvSet(key, profileId);
-    this.audit(actor, 'authorization.default.changed', projectId ? projectScope(projectId) : 'global', { profileId });
+    (await this.store.kvSet(key, profileId));
+    (await this.audit(actor, 'authorization.default.changed', projectId ? projectScope(projectId) : 'global', { profileId }));
   }
 
-  grants(principalId?: string): PrincipalGrant[] {
-    return this.store.listPrincipalGrants(principalId);
+  async grants(principalId?: string): Promise<PrincipalGrant[]> {
+    return (await this.store.listPrincipalGrants(principalId));
   }
 
-  grant(actor: string, input: Omit<PrincipalGrant, 'grantedBy' | 'grantedAt'>): PrincipalGrant {
+  async grant(actor: string, input: Omit<PrincipalGrant, 'grantedBy' | 'grantedAt'>): Promise<PrincipalGrant> {
     const projectId = input.scopeKey.startsWith('project:') ? input.scopeKey.slice(8) : undefined;
-    const profile = this.profile(input.profileId, projectId, input.scopeKey.startsWith('organization:') ? input.scopeKey.slice(13) : undefined);
+    const profile = (await this.profile(input.profileId, projectId, input.scopeKey.startsWith('organization:') ? input.scopeKey.slice(13) : undefined));
     if (!profile) throw new Error(`unknown authorization profile ${input.profileId}`);
     const grant: PrincipalGrant = { ...input, grantedBy: actor, grantedAt: Date.now() };
     if (grant.capabilities && grant.capabilities.some((cap) => !allows(profile.capabilities, cap)))
       throw new Error('an explicit grant may narrow but not widen its authorization profile');
-    this.store.setPrincipalGrant(grant.principalId, grant.scopeKey, grant as any);
-    this.audit(actor, 'authorization.grant.saved', grant.scopeKey, { principalId: grant.principalId, profileId: grant.profileId });
+    (await this.store.setPrincipalGrant(grant.principalId, grant.scopeKey, grant as any));
+    (await this.audit(actor, 'authorization.grant.saved', grant.scopeKey, { principalId: grant.principalId, profileId: grant.profileId }));
     return grant;
   }
 
-  revoke(actor: string, principalId: string, scopeKey: AuthorizationScope): void {
-    this.store.deletePrincipalGrant(principalId, scopeKey);
-    this.audit(actor, 'authorization.grant.revoked', scopeKey, { principalId });
+  async revoke(actor: string, principalId: string, scopeKey: AuthorizationScope): Promise<void> {
+    (await this.store.deletePrincipalGrant(principalId, scopeKey));
+    (await this.audit(actor, 'authorization.grant.revoked', scopeKey, { principalId }));
   }
 
-  capabilities(principalId: string, projectId?: string, organizationId?: string): Capability[] {
+  async capabilities(principalId: string, projectId?: string, organizationId?: string): Promise<Capability[]> {
     const policy = this.capabilityPolicy(principalId, projectId, organizationId);
     const cache = new Map<string, unknown>();
     let step = policy.next();
     while (!step.done) {
       const request = step.value, key = JSON.stringify(request);
-      if (!cache.has(key)) cache.set(key, this.readCapability(request));
+      if (!cache.has(key)) cache.set(key, (await this.readCapability(request)));
       step = policy.next(cache.get(key));
     }
     return step.value;
@@ -340,14 +351,14 @@ export class AuthorizationService {
     return step.value;
   }
 
-  private readCapability({ kind, args: [a, b] }: CapabilityRead): unknown {
+  private async readCapability({ kind, args: [a, b] }: CapabilityRead): Promise<unknown> {
     switch (kind) {
-      case 'organization': return this.store.getProject(a!)?.organizationId;
-      case 'grants': return this.store.listPrincipalGrants(a!);
-      case 'profile': return this.store.getAuthorizationProfile(a!, b!);
-      case 'projectMembers': return this.store.listProjectMemberships(a!);
-      case 'teamMember': return this.store.listTeamMemberships(a!).some(member => member.userId === b);
-      case 'orgMember': return Boolean(this.store.organizationMembership(a!, b!));
+      case 'organization': return (await this.store.getProject(a!))?.organizationId;
+      case 'grants': return (await this.store.listPrincipalGrants(a!));
+      case 'profile': return (await this.store.getAuthorizationProfile(a!, b!));
+      case 'projectMembers': return (await this.store.listProjectMemberships(a!));
+      case 'teamMember': return (await this.store.listTeamMemberships(a!)).some(member => member.userId === b);
+      case 'orgMember': return Boolean((await this.store.organizationMembership(a!, b!)));
     }
   }
 
@@ -402,55 +413,55 @@ export class AuthorizationService {
   }
 
   /** Workflow grant = selected task profile capped by the creator's effective set. */
-  taskGrant(
+  async taskGrant(
     principalId: string,
     projectId: string,
     requestedProfileId?: string | AuthorizationSelection,
     grantorCaps?: Capability[],
-  ): EffectiveAuthorization {
-    const requested = requestedProfileId ?? this.defaultProfile(projectId);
-    return this.scopedTaskGrant(principalId, projectId, requested, grantorCaps);
+  ): Promise<EffectiveAuthorization> {
+    const requested = requestedProfileId ?? (await this.defaultProfile(projectId));
+    return (await this.scopedTaskGrant(principalId, projectId, requested, grantorCaps));
   }
 
   /** The complete package represented by a selection, before it is attenuated
    * against any grantor. Used for gap explanations and recipient eligibility. */
-  requestedCapabilities(projectId: string, requested: AuthorizationSelection): Capability[] {
-    return this.scopedTaskGrant('system:authorization-preview', projectId, requested, ['*']).capabilities;
+  async requestedCapabilities(projectId: string, requested: AuthorizationSelection): Promise<Capability[]> {
+    return (await this.scopedTaskGrant('system:authorization-preview', projectId, requested, ['*'])).capabilities;
   }
 
-  missingCapabilities(
+  async missingCapabilities(
     principalId: string,
     projectId: string,
     requested: AuthorizationSelection,
     grantorCaps?: Capability[],
-  ): Capability[] {
-    const full = this.requestedCapabilities(projectId, requested);
-    const held = this.scopedTaskGrant(principalId, projectId, requested, grantorCaps).capabilities;
+  ): Promise<Capability[]> {
+    const full = (await this.requestedCapabilities(projectId, requested));
+    const held = (await this.scopedTaskGrant(principalId, projectId, requested, grantorCaps)).capabilities;
     return full.filter((capability) => !allows(held, capability));
   }
 
-  canGrantSelection(principalId: string, projectId: string, requested: AuthorizationSelection): boolean {
-    return !this.scopedTaskGrant(principalId, projectId, requested).attenuated;
+  async canGrantSelection(principalId: string, projectId: string, requested: AuthorizationSelection): Promise<boolean> {
+    return !(await this.scopedTaskGrant(principalId, projectId, requested)).attenuated;
   }
 
-  scopedTaskGrant(
+  async scopedTaskGrant(
     principalId: string,
     taskProjectId: string,
     requested: AuthorizationSelection | string,
     grantorCaps?: Capability[],
-  ): EffectiveAuthorization {
-    const taskProject = this.store.getProject(taskProjectId);
+  ): Promise<EffectiveAuthorization> {
+    const taskProject = (await this.store.getProject(taskProjectId));
     if (!taskProject) throw new Error(`no project ${taskProjectId}`);
     const organizationId = taskProject.organizationId ?? 'org_personal';
     const legacy = typeof requested === 'string';
     const level = (requested === 'operator' ? 'god' : typeof requested === 'string' ? requested : requested.level)
-      || this.defaultProfile(taskProjectId);
+      || (await this.defaultProfile(taskProjectId));
     const selection: AuthorizationSelection = typeof requested === 'string'
       ? { level, scope: level === 'god' ? 'global' : 'projects', projectIds: level === 'god' ? undefined : [taskProjectId] }
       : { ...requested, level };
-    const normalized = this.normalizeSelection(selection, organizationId, legacy);
-    const profile = this.profile(normalized.level,
-      normalized.scope === 'projects' ? normalized.projectIds?.[0] : undefined, organizationId);
+    const normalized = (await this.normalizeSelection(selection, organizationId, legacy));
+    const profile = (await this.profile(normalized.level,
+      normalized.scope === 'projects' ? normalized.projectIds?.[0] : undefined, organizationId));
     if (!profile) throw new Error(`unknown authorization level ${normalized.level}`);
     const ceiling = normalized.scope === 'projects'
       ? attenuate(profile.capabilities, PROJECT_GRANT_CEILING)
@@ -463,12 +474,12 @@ export class AuthorizationService {
       // Re-loading the named human would be a confused-deputy escalation.
       principal = grantorCaps;
     } else if (normalized.scope === 'projects') {
-      const projectCaps = normalized.projectIds!.map((id) => this.capabilities(principalId, id, organizationId));
+      const projectCaps = (await __asyncCollections.map(normalized.projectIds!, async (id) => (await this.capabilities(principalId, id, organizationId))));
       principal = projectCaps.slice(1).reduce((common, caps) => attenuate(common, caps), projectCaps[0] ?? []);
     } else if (normalized.scope === 'organization') {
-      principal = this.capabilities(principalId, undefined, organizationId);
+      principal = (await this.capabilities(principalId, undefined, organizationId));
     } else {
-      principal = this.capabilities(principalId);
+      principal = (await this.capabilities(principalId));
     }
     const capabilities = attenuate(ceiling, principal);
     return {
@@ -480,13 +491,13 @@ export class AuthorizationService {
     };
   }
 
-  private normalizeSelection(
+  private async normalizeSelection(
     input: AuthorizationSelection,
     organizationId: string,
     allowLegacyAdministratorProject = false,
-  ): AuthorizationSelection {
+  ): Promise<AuthorizationSelection> {
     const level = String(input.level || '').trim();
-    if (!CANONICAL_AUTHORIZATION_LEVELS.includes(level as any) && !this.store.getAuthorizationProfile(organizationScope(organizationId), level))
+    if (!CANONICAL_AUTHORIZATION_LEVELS.includes(level as any) && !(await this.store.getAuthorizationProfile(organizationScope(organizationId), level)))
       throw new Error(`unknown authorization level ${level}`);
     if (level === 'administrator' && input.scope !== 'organization' && !allowLegacyAdministratorProject)
       throw new Error('Administrator requires organization scope');
@@ -497,7 +508,7 @@ export class AuthorizationService {
       const projectIds = [...new Set((input.projectIds ?? []).map(String).filter(Boolean))];
       if (!projectIds.length) throw new Error('choose at least one project or @organization');
       for (const projectId of projectIds) {
-        if (this.store.getProject(projectId)?.organizationId !== organizationId)
+        if ((await this.store.getProject(projectId))?.organizationId !== organizationId)
           throw new Error('authorization projects must belong to the same organization');
       }
       return { level, scope: 'projects', projectIds };
@@ -505,94 +516,94 @@ export class AuthorizationService {
     return { level, scope: input.scope };
   }
 
-  replacePrincipalAuthorization(
+  async replacePrincipalAuthorization(
     actor: string,
     principalId: string,
     organizationId: string,
     selection: AuthorizationSelection,
     grantorCaps?: Capability[],
-  ): AuthorizationSelection {
-    const normalized = this.normalizeSelection(selection, organizationId);
-    this.assertCanGrantSelection(actor, organizationId, normalized, grantorCaps);
+  ): Promise<AuthorizationSelection> {
+    const normalized = (await this.normalizeSelection(selection, organizationId));
+    (await this.assertCanGrantSelection(actor, organizationId, normalized, grantorCaps));
 
-    for (const grant of this.grants(principalId)) {
+    for (const grant of (await this.grants(principalId))) {
       const projectId = grant.scopeKey.startsWith('project:') ? grant.scopeKey.slice(8) : undefined;
       const belongs = grant.scopeKey === organizationScope(organizationId)
-        || (projectId && this.store.getProject(projectId)?.organizationId === organizationId)
+        || (projectId && (await this.store.getProject(projectId))?.organizationId === organizationId)
         || (grant.scopeKey === 'global' && ['god', 'administrator', 'operator'].includes(grant.profileId));
-      if (belongs) this.revoke(actor, principalId, grant.scopeKey);
+      if (belongs) (await this.revoke(actor, principalId, grant.scopeKey));
     }
     const scopes: AuthorizationScope[] = normalized.scope === 'global' ? ['global']
       : normalized.scope === 'organization' ? [organizationScope(organizationId)]
         : normalized.projectIds!.map(projectScope);
-    for (const scopeKey of scopes) this.grant(actor, { principalId, scopeKey, profileId: normalized.level });
+    for (const scopeKey of scopes) (await this.grant(actor, { principalId, scopeKey, profileId: normalized.level }));
     return normalized;
   }
 
-  assertCanGrantSelection(
+  async assertCanGrantSelection(
     actor: string,
     organizationId: string,
     selection: AuthorizationSelection,
     grantorCaps?: Capability[],
-  ): AuthorizationSelection {
-    const normalized = this.normalizeSelection(selection, organizationId);
-    const project = this.store.listProjects().find((candidate) => candidate.organizationId === organizationId);
+  ): Promise<AuthorizationSelection> {
+    const normalized = (await this.normalizeSelection(selection, organizationId));
+    const project = (await this.store.listProjects()).find((candidate) => candidate.organizationId === organizationId);
     const effective = project
-      ? this.scopedTaskGrant(actor, project.id, normalized, grantorCaps)
-      : this.effectiveWithoutProject(actor, organizationId, normalized, grantorCaps);
+      ? (await this.scopedTaskGrant(actor, project.id, normalized, grantorCaps))
+      : (await this.effectiveWithoutProject(actor, organizationId, normalized, grantorCaps));
     if (effective.attenuated)
       throw new AuthorizationGrantError('you cannot grant an authorization level you do not hold for the selected scope');
     return normalized;
   }
 
-  private effectiveWithoutProject(
+  private async effectiveWithoutProject(
     actor: string,
     organizationId: string,
     selection: AuthorizationSelection,
     grantorCaps?: Capability[],
-  ): EffectiveAuthorization {
+  ): Promise<EffectiveAuthorization> {
     if (selection.scope === 'projects') throw new Error('this organization has no projects to authorize');
-    const profile = this.profile(selection.level, undefined, organizationId);
+    const profile = (await this.profile(selection.level, undefined, organizationId));
     if (!profile) throw new Error(`unknown authorization level ${selection.level}`);
     const ceiling = selection.scope === 'organization'
       ? attenuate(profile.capabilities, ORGANIZATION_GRANT_CEILING) : profile.capabilities;
-    const principal = grantorCaps ?? this.capabilities(actor, undefined,
-      selection.scope === 'organization' ? organizationId : undefined);
+    const principal = grantorCaps ?? (await this.capabilities(actor, undefined,
+      selection.scope === 'organization' ? organizationId : undefined));
     const capabilities = attenuate(ceiling, principal);
     return { ...selection, profileId: selection.level,
       ...(selection.scope === 'organization' ? { organizationId } : {}), capabilities,
       attenuated: ceiling.some((capability) => !allows(capabilities, capability)) };
   }
 
-  selectionForPrincipal(principalId: string, organizationId: string): AuthorizationSelection | undefined {
-    const grants = this.grants(principalId);
+  async selectionForPrincipal(principalId: string, organizationId: string): Promise<AuthorizationSelection | undefined> {
+    const grants = (await this.grants(principalId));
     const global = grants.find((grant) => grant.scopeKey === 'global' && grant.profileId === 'god');
     if (global) return { level: 'god', scope: 'global' };
     const organization = grants.find((grant) => grant.scopeKey === organizationScope(organizationId));
-    if (organization && organization.profileId !== 'god' && this.profile(organization.profileId, undefined, organizationId))
+    if (organization && organization.profileId !== 'god' && (await this.profile(organization.profileId, undefined, organizationId)))
       return { level: organization.profileId, scope: 'organization' };
-    const projects = grants.filter((grant) => grant.scopeKey.startsWith('project:')
-      && this.store.getProject(grant.scopeKey.slice(8))?.organizationId === organizationId
+    const projects = (await __asyncCollections.filter(grants, async (grant) => grant.scopeKey.startsWith('project:')
+      && (await this.store.getProject(grant.scopeKey.slice(8)))?.organizationId === organizationId
       && !['administrator', 'god'].includes(grant.profileId)
-      && this.profile(grant.profileId, grant.scopeKey.slice(8), organizationId));
+      && (await this.profile(grant.profileId, grant.scopeKey.slice(8), organizationId))));
     if (!projects.length) return undefined;
     const level = projects[0]!.profileId;
     if (projects.some((grant) => grant.profileId !== level)) return undefined;
-    const projectIds = projects.map((grant) => grant.scopeKey.slice(8)).sort((a, b) =>
-      (this.store.getProject(a)?.name ?? a).localeCompare(this.store.getProject(b)?.name ?? b));
+    const projectIds = (await __asyncCollections.sort(projects.map((grant) => grant.scopeKey.slice(8)), async (a, b) =>
+      ((await this.store.getProject(a))?.name ?? a).localeCompare((await this.store.getProject(b))?.name ?? b)));
     return { level, scope: 'projects', projectIds };
   }
 
-  bootstrapAdministrator(userId: string): void {
-    if (this.store.listPrincipalGrants().length) return;
-    this.grant('system:bootstrap', { principalId: `user:${userId}`, scopeKey: 'global', profileId: 'god' });
+  async bootstrapAdministrator(userId: string): Promise<void> {
+    if ((await this.store.listPrincipalGrants()).length) return;
+    (await this.grant('system:bootstrap', { principalId: `user:${userId}`, scopeKey: 'global', profileId: 'god' }));
   }
 
-  bootstrapOrganizationOwner(actor: string, userId: string, organizationId: string): void {
-    this.grant(actor, { principalId: `user:${userId}`, scopeKey: organizationScope(organizationId), profileId: 'administrator' });
+  async bootstrapOrganizationOwner(actor: string, userId: string, organizationId: string): Promise<void> {
+    (await this.grant(actor, { principalId: `user:${userId}`, scopeKey: organizationScope(organizationId), profileId: 'administrator' }));
   }
 
-  audit(principalId: string, action: string, scopeKey: AuthorizationScope | string = 'global', detail: Record<string, unknown> = {}): number {
-    return this.store.appendAudit({ principalId, action, scopeKey, detail });
+  async audit(principalId: string, action: string, scopeKey: AuthorizationScope | string = 'global', detail: Record<string, unknown> = {}): Promise<number> {
+    return (await this.store.appendAudit({ principalId, action, scopeKey, detail }));
   }
 }

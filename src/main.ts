@@ -1,3 +1,4 @@
+import * as __asyncCollections from './util/async-collections.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -124,8 +125,8 @@ async function main() {
   const { client, close: closeClient } = await makeClient(conn);
 
   // ── Core services ──
-  const openedStore = openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
-    { hosted: deployment.hosted });
+  const openedStore = (await openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
+    { hosted: deployment.hosted }));
   const store = openedStore.store;
   if (process.env.KARMAX_DATABASE_URL) {
     const migrated = openedStore.migration?.imported
@@ -133,8 +134,8 @@ async function main() {
       : '';
     console.log(`  • PostgreSQL application database${migrated}`);
   }
-  const authorization = new AuthorizationService(store);
-  const runtime = beginRuntimeLifecycle(store, {
+  const authorization = (await AuthorizationService.create(store));
+  const runtime = (await beginRuntimeLifecycle(store, {
     runtimeId: `runtime-${Date.now()}-${process.pid}`,
     startedAt: Date.now(),
     pid: process.pid,
@@ -145,7 +146,7 @@ async function main() {
       ? { buildRevision: [process.env.KARMAX_BUILD_REVISION, process.env.GITHUB_SHA, process.env.SOURCE_VERSION]
         .map((value) => value?.trim()).find(Boolean)! }
       : {}),
-  });
+  }));
   const broker = new CredentialBroker(new Vault(p.vault));
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
@@ -158,9 +159,9 @@ async function main() {
   // One deployment App owns repository installations and user OAuth. Environment
   // values remain an upgrade/enterprise bootstrap path; the normal path is the
   // browser manifest, whose converted client credentials persist in Store/Vault.
-  const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
+  const githubApp = (await GitHubAppService.create(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
     appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
-    publicApp: deployment.hosted });
+    publicApp: deployment.hosted }));
   const sharedGithubOauth = githubApp.oauthCredentials();
   // A separately managed OAuth App remains a compatibility fallback only. Once
   // the deployment GitHub App exists, it is the single OAuth client.
@@ -198,7 +199,7 @@ async function main() {
       allowedHosts: authHosts,
       fallback: publicUrl ?? `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
     },
-    siteName: () => siteNameOf(store.getSettings('global', 'appearance')),
+    siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
     ...(process.env.KARMAX_OIDC_DISCOVERY_URL && process.env.KARMAX_OIDC_CLIENT_ID && process.env.KARMAX_OIDC_CLIENT_SECRET
       ? { oidc: { providerId: process.env.KARMAX_OIDC_PROVIDER_ID ?? 'enterprise',
           discoveryUrl: process.env.KARMAX_OIDC_DISCOVERY_URL, issuer: process.env.KARMAX_OIDC_ISSUER,
@@ -212,41 +213,41 @@ async function main() {
     ...(sharedGithubOauth ? { github: { ...sharedGithubOauth, app: true,
       onAuthorization: async (authorization: GitHubAuthorization) => {
         const githubIdentity = await githubApp.adoptUserAuthorization(authorization.userId, authorization.accountId, authorization);
-        new GitProfiles(store, broker, p.state, userGitScope(authorization.userId)).saveGithubIdentity(githubIdentity);
-        inheritPersonalGithubProfile(store, broker, authorization.userId);
+        (await new GitProfiles(store, broker, p.state, userGitScope(authorization.userId)).saveGithubIdentity(githubIdentity));
+        (await inheritPersonalGithubProfile(store, broker, authorization.userId));
       } } } : legacyGithubOauth ? { github: legacyGithubOauth } : {}),
   });
   if (identity.migration?.imported)
     console.log(`  • Imported ${identity.migration.rows} identity rows from SQLite`);
-  identity.connectOrganizationNames(() => store.organizationNameReservations());
-  store.connectUserNames(() => identity.listUsers());
-  store.migrateLegacyAccountNameCollisions(identity.listUsers());
-  const installationOwner = identity.listUsers()[0];
-  if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
-  store.migratePersonalOrganizationNames(identity.listUsers());
+  identity.connectOrganizationNames(async () => (await store.organizationNameReservations()));
+  store.connectUserNames(async () => (await identity.listUsers()));
+  (await store.migrateLegacyAccountNameCollisions((await identity.listUsers())));
+  const installationOwner = (await identity.listUsers())[0];
+  if (installationOwner) (await store.claimPersonalOrganization(installationOwner.id, installationOwner.name));
+  (await store.migratePersonalOrganizationNames((await identity.listUsers())));
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();
   const profiles = new ProfileResolver(store, provider);
-  seedProfiles(store, provider);
+  (await seedProfiles(store, provider));
   const bus = new KarmaxBus();
   const tokens = new TokenAuthority(store);
   // Installation-wide outbound email (account confirmation, password reset, org
   // invites). Reads its live config + vaulted secret on each send, so connecting
   // a provider in Settings takes effect without a restart. Handed to identity so
   // Better Auth's reset/verify hooks can send.
-  const emailConfig = (): OutboundEmailConfig => {
-    try { return JSON.parse(store.kvGet('email:outbound') ?? '{}'); } catch { return {}; }
+  const emailConfig = async (): Promise<OutboundEmailConfig> => {
+    try { return JSON.parse((await store.kvGet('email:outbound')) ?? '{}'); } catch { return {}; }
   };
   const emailService = new EmailService(emailConfig,
     (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined));
   identity.mailer = emailService;
   const providerConnections = new WorldProviderConnectionService(store, broker);
-  providerConnections.importEnvironment();
+  (await providerConnections.importEnvironment());
   worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
-    (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
+    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind))));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
-    (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
+    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind))));
   const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
     ? new S3ObjectStore({
         endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),
@@ -260,7 +261,7 @@ async function main() {
     : Number(configuredStorageQuota) > 0 ? Math.floor(Number(configuredStorageQuota)) : undefined;
   const storageLocations = new StorageLocationService(store, objectStore, broker, managedStorageQuotaBytes,
     !deployment.hosted);
-  for (const organization of store.listOrganizations()) storageLocations.ensureManaged(organization.id);
+  for (const organization of (await store.listOrganizations())) (await storageLocations.ensureManaged(organization.id));
   const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker, storageLocations);
   const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
     { client, taskQueue: TASK_QUEUE }, storageLocations);
@@ -273,11 +274,11 @@ async function main() {
     browser: new BrowserDeliveryAdapter(),
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
     ...(process.env.KARMAX_SLACK_DELIVERY_URL ? { slack: new WebhookDeliveryAdapter(process.env.KARMAX_SLACK_DELIVERY_URL, 'slack') } : {}),
-  }, (id) => {
-    const user = identity.listUsers().find((candidate) => candidate.id === id);
+  }, async (id) => {
+    const user = (await identity.listUsers()).find((candidate) => candidate.id === id);
     return user ? { id: user.id, name: user.name, email: user.email } : undefined;
   });
-  worlds.setHandleResolver((handle) => store.currentWorld(handle.id) as import('./world/types.js').WorldHandle | undefined);
+  worlds.setHandleResolver(async (handle) => (await store.currentWorld(handle.id)) as import('./world/types.js').WorldHandle | undefined);
   // Rebuild a world from its last checkpoint ONLY when the provider has genuinely
   // lost the sandbox. Restoring replays just the dirty delta captured at the last
   // park, so doing it after a *transient* control-plane error (a 5xx, a rate limit,
@@ -286,12 +287,12 @@ async function main() {
   // activities/core.ts (recoverVanishedWorld). Providers with no probe (the local
   // worktree) return undefined and are therefore never rolled back.
   worlds.setRecoveryHandler(async (handle) => {
-    if (store.worldState(handle.id) === 'released') return undefined;
-    const checkpoint = store.latestWorldCheckpoint(handle.id);
+    if ((await store.worldState(handle.id)) === 'released') return undefined;
+    const checkpoint = (await store.latestWorldCheckpoint(handle.id));
     if (!checkpoint) return undefined;
     const state = await worlds.probe(handle).catch(() => undefined);
     if (state !== 'missing') return undefined; // transient/parked → keep the original error
-    store.setWorldState((store.currentWorld(handle.id) ?? handle) as import('./world/types.js').WorldHandle, 'degraded');
+    (await store.setWorldState(((await store.currentWorld(handle.id)) ?? handle) as import('./world/types.js').WorldHandle, 'degraded'));
     return checkpoints.restore(checkpoint.id, handle.kind);
   });
   const { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
@@ -307,7 +308,7 @@ async function main() {
   // status calls can report "unmetered", but it never contacts Stripe there.
   const { StripeSubscriptionProvider, SubscriptionBillingService } = await import('./billing/subscriptions.js');
   const subscriptionBilling = new SubscriptionBillingService(store,
-    new StripeSubscriptionProvider(() => paidLaunchSettings.subscriptionConfig(), fetch), deployment.hosted);
+    new StripeSubscriptionProvider(async () => (await paidLaunchSettings.subscriptionConfig()), fetch), deployment.hosted);
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
   const configHomes = new ConfigHomeManager();
@@ -358,7 +359,7 @@ async function main() {
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
   if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live krmax instance untouched`);
-  const serviceOrphans = await sweepOrphanedServiceContainers((taskId) => store.worldState(taskId)).catch(() => 0);
+  const serviceOrphans = await sweepOrphanedServiceContainers(async (taskId) => (await store.worldState(taskId))).catch(() => 0);
   if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
   // A concurrently running dogfooding instance can die after this app has
   // already booted. Sweep periodically so its detached agent/tool descendants
@@ -373,38 +374,38 @@ async function main() {
   // without bound otherwise. `Store.retentionSweep` existed and was tested but had
   // no caller, so neither table was ever purged on a running install. Hourly, and
   // once at boot so a long-stopped install catches up immediately.
-  const sweepRetention = () => {
-    const swept = store.retentionSweep();
+  const sweepRetention = async () => {
+    const swept = (await store.retentionSweep());
     if (swept.scopedTokens || swept.githubDeliveries)
       console.log(`  • Purged ${swept.scopedTokens} expired token(s) and ${swept.githubDeliveries} aged webhook delivery id(s)`);
   };
-  sweepRetention();
+  (await sweepRetention());
   const retentionTimer = setInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
 
   // Re-derive effective plans from the last signed provider state at boot and
   // throughout the process lifetime. In particular, this closes past-due grace
   // even when Stripe sends no later event.
-  const reconcileSubscriptionEntitlements = () => {
-    try { subscriptionBilling.reconcileEntitlements(); }
+  const reconcileSubscriptionEntitlements = async () => {
+    try { (await subscriptionBilling.reconcileEntitlements()); }
     catch (error) {
       console.warn('  • Subscription entitlement reconciliation failed:',
         error instanceof Error ? error.message : String(error));
     }
   };
-  reconcileSubscriptionEntitlements();
+  (await reconcileSubscriptionEntitlements());
   const subscriptionEntitlementTimer = setInterval(reconcileSubscriptionEntitlements, 60_000);
   subscriptionEntitlementTimer.unref();
 
   // Membership hooks submit seat changes immediately; this bounded sweep makes
   // provider quantity reconciliation eventual after an outage or process crash.
-  const syncSubscriptionSeats = () => {
-    for (const organization of store.listOrganizations())
+  const syncSubscriptionSeats = async () => {
+    for (const organization of (await store.listOrganizations()))
       void subscriptionBilling.syncSeats(organization.id).catch((error) =>
         console.warn(`  • Subscription seat sync failed for ${organization.id}:`,
           error instanceof Error ? error.message : String(error)));
   };
-  syncSubscriptionSeats();
+  (await syncSubscriptionSeats());
   const subscriptionSeatTimer = setInterval(syncSubscriptionSeats, 5 * 60_000);
   subscriptionSeatTimer.unref();
 
@@ -429,7 +430,7 @@ async function main() {
     intervalMs: RECONCILE_INTERVAL_MS,
     log: (message) => console.warn(`  • ${message}`),
   });
-  entitlementQueues.start();
+  (await entitlementQueues.start());
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
@@ -459,11 +460,11 @@ async function main() {
   // so the coordinator can lease/track any of them (SPEC §6.2/§7).
   const { gatherCredentialSources, concurrencyFor } = await import('./platform/credential-sources.js');
   const { enumerateCredentials } = await import('./platform/credentials.js');
-  const creds = store.listOrganizations().flatMap((organization) =>
+  const creds = (await store.listOrganizations()).flatMap((organization) =>
     enumerateCredentials(gatherCredentialSources({ configHomes, broker, organizationId: organization.id })),
   );
-  const pool = creds.map((c) => {
-    const maxConcurrent = concurrencyFor((k) => store.kvGet(k), c.key);
+  const pool = (await __asyncCollections.map(creds, async (c) => {
+    const maxConcurrent = (await concurrencyFor(async (k) => (await store.kvGet(k)), c.key));
     const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
     return {
       id: c.key,
@@ -474,7 +475,7 @@ async function main() {
       ...(credentialProvider ? { credentialProvider } : {}),
       ...(maxConcurrent != null ? { maxConcurrent } : {}),
     };
-  });
+  }));
   if (pool.length) {
     await coordClient.registerAccounts(pool).catch((e) => console.warn('  • credential pool register failed', String(e)));
     console.log(`  • Registered ${pool.length} credential(s) into the account pool`);
@@ -485,10 +486,10 @@ async function main() {
     new WorkflowRepoLoader(p.workflows),
     undefined,
     p.workflows,
-    (organizationId) => {
+    async (organizationId) => {
       const profiles = new GitProfiles(store, broker, p.state, organizationId);
-      const profile = profiles.resolve(undefined);
-      return profile ? profiles.env(profile, {}) : {};
+      const profile = (await profiles.resolve(undefined));
+      return profile ? (await profiles.env(profile, {})) : {};
     },
     deployment.hosted,
   );
@@ -519,7 +520,7 @@ async function main() {
     log: (m) => console.log('  • ' + m),
   });
   api.setTriggerArmer(triggerScheduler);
-  triggerScheduler.start();
+  (await triggerScheduler.start());
   worldLifecycle.start();
   delivery.start();
 
@@ -528,22 +529,22 @@ async function main() {
   // locally-hosted install with no public URL. Inert until a pull provider is set.
   const { MailPoller } = await import('./autonomy/mail-pull.js');
   const { AgentMail } = await import('./autonomy/agent-mail.js');
-  const readMailboxConfig = (organizationId: string) => {
-    try { return JSON.parse(store.kvGet(`agent-mail:provider:${organizationId}`) ?? '{}'); }
+  const readMailboxConfig = async (organizationId: string) => {
+    try { return JSON.parse((await store.kvGet(`agent-mail:provider:${organizationId}`)) ?? '{}'); }
     catch { return {}; }
   };
   const mailPoller = new MailPoller({
     store,
-    readConfigs: () => store.listOrganizations().map(({ id: organizationId }) => ({
+    readConfigs: async () => (await __asyncCollections.map((await store.listOrganizations()), async ({ id: organizationId }) => ({
       organizationId,
-      config: readMailboxConfig(organizationId),
-    })),
+      config: (await readMailboxConfig(organizationId)),
+    }))),
     resolveSecret: (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
     makeIngest: (_organizationId, config) => {
       const domain = config.domain || config.hostedDomain || config.agentmailDomain || config.fixedAddress?.split('@')[1];
       const fixedLocal = config.fixedAddress?.split('@')[0];
       const mail = new AgentMail(store, domain, fixedLocal, config.agentmailAddress);
-      return (msg) => mail.ingest(msg);
+      return async (msg) => (await mail.ingest(msg));
     },
   });
   mailPoller.start();
@@ -557,20 +558,20 @@ async function main() {
   // config so branches inherit from global settings (or the repo's real default
   // branch) instead of baking a project-scope "main" override that would shadow
   // a global default like "master".
-  if (store.listProjects().length === 0) {
-    store.createProject('My project');
+  if ((await store.listProjects()).length === 0) {
+    (await store.createProject('My project'));
   }
   if (installationOwner) {
-    for (const project of store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
-      if (!store.userIsProjectMember(project.id, installationOwner.id))
-        store.setProjectMembership(project.id, { kind: 'user', userId: installationOwner.id }, 'owner');
+    for (const project of (await store.listProjects()).filter((candidate) => candidate.organizationId === 'org_personal')) {
+      if (!(await store.userIsProjectMember(project.id, installationOwner.id)))
+        (await store.setProjectMembership(project.id, { kind: 'user', userId: installationOwner.id }, 'owner'));
     }
   }
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));
   let gatewayPort = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : 4505;
   const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
-  const gateway = new Gateway({
+  const gateway = (await Gateway.create({
     api,
     store,
     bus,
@@ -613,7 +614,7 @@ async function main() {
       ...(process.env.KARMAX_SLACK_DELIVERY_URL ? ['slack'] : []),
     ],
     remoteAccess,
-  });
+  }));
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
   const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
   gatewayPort = port;
@@ -641,7 +642,7 @@ async function main() {
     try {
       for (const finding of await deploymentMonitor.reconcile()) {
         await gateway.dispatchGithubRecoveryEvents(finding.events);
-        deploymentMonitor.markReported(finding);
+        (await deploymentMonitor.markReported(finding));
       }
     } catch (error) {
       console.warn('  • GitHub deployment monitor failed:', error instanceof Error ? error.message : error);
@@ -654,10 +655,10 @@ async function main() {
   deploymentSweep.unref();
 
   console.log(`\n  ✓ krmax is running:  ${url}\n`);
-  if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
+  if (!(await identity.hasUsers())) console.log('  (first run — create the initial administrator in the browser)');
   try {
     if (deployment.hostLocal) {
-      const remote = await remoteAccessPlan(port, { hasPassword: !!process.env.KARMAX_PASSWORD || identity.hasUsers() });
+      const remote = await remoteAccessPlan(port, { hasPassword: !!process.env.KARMAX_PASSWORD || (await identity.hasUsers()) });
       console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
     }
   } catch {
@@ -701,8 +702,8 @@ async function main() {
     await step(workerManager.stop());
     await step(closeClient());
     await step(identity.close());
-    endRuntimeLifecycle(store, runtime, { stoppedAt: Date.now(), reason, restart });
-    store.close();
+    (await endRuntimeLifecycle(store, runtime, { stoppedAt: Date.now(), reason, restart }));
+    (await store.close());
     if (server) {
       await step(server.stop()); // no-op for the shared server — it persists for a fast restart
       console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');
@@ -717,15 +718,15 @@ async function main() {
   // Node invocation after the task has had time to settle in Temporal. Dev mode
   // already has tsx's watcher and must not spawn a second successor.
   let sourceRestartScheduled = false;
-  bus.onAny((event) => {
+  bus.onAny(async (event) => {
     if (sourceRestartScheduled || process.env.npm_lifecycle_event === 'dev'
       || event.type !== 'view.updated'
       || (event.payload as { status?: string } | undefined)?.status !== 'done') return;
-    const landed = store.eventsSince(event.taskId, 0).some((candidate) => candidate.type === 'merge.result'
+    const landed = (await store.eventsSince(event.taskId, 0)).some((candidate) => candidate.type === 'merge.result'
       && (candidate.payload as { merged?: boolean } | undefined)?.merged === true);
     if (!landed) return; // manual Done and no-merge workflows changed no live source
-    const task = store.getTask(event.taskId);
-    const handle = (store.currentWorld(event.taskId) ?? task?.lastView?.world) as WorldHandle | undefined;
+    const task = (await store.getTask(event.taskId));
+    const handle = ((await store.currentWorld(event.taskId)) ?? task?.lastView?.world) as WorldHandle | undefined;
     if (!worldLandedInCheckout(handle, process.cwd())) return;
     sourceRestartScheduled = true;
     console.log(`  • Task ${event.taskId} updated the live checkout; scheduling a graceful restart`);

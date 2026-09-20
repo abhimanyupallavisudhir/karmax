@@ -152,13 +152,13 @@ export function connectOutboundEmail(input: ConnectOutboundInput): ConnectOutbou
  */
 export class EmailService {
   constructor(
-    private readConfig: () => OutboundEmailConfig,
+    private readConfig: () => OutboundEmailConfig | Promise<OutboundEmailConfig>,
     private readSecret: (handle: string) => string | undefined,
   ) {}
 
   /** True when a provider is fully connected (config + resolvable secret). */
-  configured(): boolean {
-    const c = this.readConfig();
+  async configured(): Promise<boolean> {
+    const c = (await this.readConfig());
     if (!c.from || !fromAddress(c.from)) return false;
     if (c.provider === 'smtp') return !!(c.host && c.secretHandle && this.readSecret(c.secretHandle));
     if (c.provider === 'resend') return !!(c.secretHandle && this.readSecret(c.secretHandle));
@@ -166,8 +166,8 @@ export class EmailService {
   }
 
   async send(msg: EmailMessage): Promise<void> {
-    const c = this.readConfig();
-    if (!this.configured()) throw new Error('outbound email is not configured');
+    const c = (await this.readConfig());
+    if (!(await this.configured())) throw new Error('outbound email is not configured');
     const secret = c.secretHandle ? this.readSecret(c.secretHandle) : undefined;
     if (!secret) throw new Error('outbound email secret is missing');
     if (c.provider === 'resend') return this.sendResend(c, secret, msg);

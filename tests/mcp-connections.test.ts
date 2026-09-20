@@ -17,64 +17,64 @@ import { applyAgentSpec, organizationProfileId, projectProfileId, roleDefaultPro
 
 describe('MCP connections', () => {
   let dir: string, store: Store, broker: CredentialBroker, service: McpConnections, project: string;
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcp-'));
-    store = new Store(':memory:'); broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
-    service = new McpConnections(store, broker, 'org_personal'); project = store.createProject('Project').id;
+    store = (await Store.create(':memory:')); broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    service = new McpConnections(store, broker, 'org_personal'); project = (await store.createProject('Project')).id;
   });
-  afterEach(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  afterEach(async () => { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
   const definition = { label: 'Work tools', transport: { type: 'http', url: 'https://example.com/mcp' }, auth: 'secrets', secrets: { Authorization: 'Bearer private' } };
 
-  it('keeps credentials out of metadata, merges rotations, and revokes them on endpoint change', () => {
-    const c = service.save(definition, project);
-    expect(JSON.stringify(service.list(project))).not.toContain('Bearer private');
+  it('keeps credentials out of metadata, merges rotations, and revokes them on endpoint change', async () => {
+    const c = (await service.save(definition, project));
+    expect(JSON.stringify((await service.list(project)))).not.toContain('Bearer private');
     expect(service.secret(c)).toEqual({ Authorization: 'Bearer private' });
-    const rotated = service.save({ ...c, secrets: { 'X-API-Key': 'second' }, mergeSecrets: true }, project);
+    const rotated = (await service.save({ ...c, secrets: { 'X-API-Key': 'second' }, mergeSecrets: true }, project));
     expect(service.secret(rotated)).toEqual({ Authorization: 'Bearer private', 'X-API-Key': 'second' });
-    const changed = service.save({ ...rotated, transport: { type: 'http', url: 'https://other.example/mcp' } }, project);
+    const changed = (await service.save({ ...rotated, transport: { type: 'http', url: 'https://other.example/mcp' } }, project));
     expect(service.secret(changed)).toEqual({});
-    expect(() => service.setSecret(c, { token: 'stale' })).toThrow(/changed/);
-    service.remove(c.id, project);
+    await expect((async () => (await service.setSecret(c, { token: 'stale' })))()).rejects.toThrow(/changed/);
+    (await service.remove(c.id, project));
     expect(broker.listHandles()).toEqual([]);
   });
-  it('enforces tenant, project, and owning-scope boundaries independently of IDs', () => {
-    const org = store.createOrganization({ name: 'Other' });
+  it('enforces tenant, project, and owning-scope boundaries independently of IDs', async () => {
+    const org = (await store.createOrganization({ name: 'Other' }));
     const other = new McpConnections(store, broker, org.id);
-    const c = service.save(definition, project);
-    expect(() => other.get(c.id, project)).toThrow(/not found/);
-    expect(() => other.save(definition, project)).toThrow(/does not belong/);
-    expect(() => service.get(c.id, store.createProject('Sibling').id)).toThrow(/not found/);
-    const shared = service.save(definition);
-    expect(service.selected([shared.id], project)).toHaveLength(1);
-    expect(() => service.remove(shared.id, project)).toThrow(/owning/);
-    service.save({ ...c, enabled: false }, project);
-    expect(() => service.selected([c.id], project)).toThrow(/disabled/);
+    const c = (await service.save(definition, project));
+    await expect((async () => (await other.get(c.id, project)))()).rejects.toThrow(/not found/);
+    await expect((async () => (await other.save(definition, project)))()).rejects.toThrow(/does not belong/);
+    await expect((async () => (await service.get(c.id, (await store.createProject('Sibling')).id)))()).rejects.toThrow(/not found/);
+    const shared = (await service.save(definition));
+    expect((await service.selected([shared.id], project))).toHaveLength(1);
+    await expect((async () => (await service.remove(shared.id, project)))()).rejects.toThrow(/owning/);
+    (await service.save({ ...c, enabled: false }, project));
+    await expect((async () => (await service.selected([c.id], project)))()).rejects.toThrow(/disabled/);
   });
-  it('validates selections and preserves explicit empty sets across provider/default changes', () => {
+  it('validates selections and preserves explicit empty sets across provider/default changes', async () => {
     expect(validateMcpSelection([])).toEqual([]);
     expect(() => validateMcpSelection(['karmax'])).toThrow();
     expect(validateMcpSelection(['browser:playwright', 'browser:chrome-devtools'])).toEqual(['browser:playwright', 'browser:chrome-devtools']);
     const base = { id: 'do-default', name: 'Agent', role: 'do', provider: 'claude' as const, mcpConnections: ['browser:playwright'] };
-    store.upsertProfile(base);
-    store.upsertProfile({ ...base, id: organizationProfileId('org_personal', 'do') });
-    store.upsertProfile({ id: projectProfileId(project, 'do'), name: 'Agent', role: 'do', provider: 'codex' });
-    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual(['browser:playwright']);
+    (await store.upsertProfile(base));
+    (await store.upsertProfile({ ...base, id: organizationProfileId('org_personal', 'do') }));
+    (await store.upsertProfile({ id: projectProfileId(project, 'do'), name: 'Agent', role: 'do', provider: 'codex' }));
+    expect((await roleDefaultProfile(store, 'do', project))?.mcpConnections).toEqual(['browser:playwright']);
     expect(applyAgentSpec(base, { provider: 'codex', mcpConnections: [] }).mcpConnections).toEqual([]);
     expect(codexMcpFlags([], true)).toEqual(['-c', 'mcp_servers={}']);
     expect(codexMcpFlags([{ name: 'test-mcp', command: 'node', env: { TEST_KEY: 'value' } }])).toContain('mcp_servers.test-mcp.command="node"');
     expect(codexMcpFlags([{ name: 'test-mcp', command: 'node', env: { TEST_KEY: 'value' } }])).toContain('mcp_servers.test-mcp.env.TEST_KEY="value"');
     expect(() => codexMcpFlags([{ name: 'bad.name', command: 'node' }])).toThrow(/Invalid/);
   });
-  it('defaults to Chrome DevTools through organization and project layers, including legacy profiles', () => {
-    store.upsertProfile({ id: organizationProfileId('org_personal', 'do'), name: 'Agent', role: 'do', provider: 'codex' });
-    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual(['browser:chrome-devtools']);
-    store.upsertProfile({ id: 'do-default', name: 'Agent', role: 'do', provider: 'codex' });
-    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual(['browser:chrome-devtools']);
-    store.upsertProfile({ id: organizationProfileId('org_personal', 'do'), name: 'Agent', role: 'do', provider: 'codex', mcpConnections: [] });
-    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual([]);
-    store.upsertProfile({ id: projectProfileId(project, 'do'), name: 'Agent', role: 'do', provider: 'codex' });
-    expect(roleDefaultProfile(store, 'do', project)?.mcpConnections).toEqual([]);
-    expect(applyAgentSpec(roleDefaultProfile(store, 'do', project)!, { provider: 'codex', mcpConnections: ['browser:playwright'] }).mcpConnections).toEqual(['browser:playwright']);
+  it('defaults to Chrome DevTools through organization and project layers, including legacy profiles', async () => {
+    (await store.upsertProfile({ id: organizationProfileId('org_personal', 'do'), name: 'Agent', role: 'do', provider: 'codex' }));
+    expect((await roleDefaultProfile(store, 'do', project))?.mcpConnections).toEqual(['browser:chrome-devtools']);
+    (await store.upsertProfile({ id: 'do-default', name: 'Agent', role: 'do', provider: 'codex' }));
+    expect((await roleDefaultProfile(store, 'do', project))?.mcpConnections).toEqual(['browser:chrome-devtools']);
+    (await store.upsertProfile({ id: organizationProfileId('org_personal', 'do'), name: 'Agent', role: 'do', provider: 'codex', mcpConnections: [] }));
+    expect((await roleDefaultProfile(store, 'do', project))?.mcpConnections).toEqual([]);
+    (await store.upsertProfile({ id: projectProfileId(project, 'do'), name: 'Agent', role: 'do', provider: 'codex' }));
+    expect((await roleDefaultProfile(store, 'do', project))?.mcpConnections).toEqual([]);
+    expect(applyAgentSpec((await roleDefaultProfile(store, 'do', project))!, { provider: 'codex', mcpConnections: ['browser:playwright'] }).mcpConnections).toEqual(['browser:playwright']);
   });
   it('prepares both selected browser MCPs', async () => {
     const servers = await prepareConnections(service, { handle: { kind: 'worktree', root: dir } } as any,
@@ -120,7 +120,7 @@ describe('MCP connections', () => {
   it('rejects SSRF URLs before network access and forbids privileged headers', async () => {
     for (const url of ['http://example.com', 'https://localhost', 'https://127.1', 'https://[::ffff:127.0.0.1]', 'https://user:pass@example.com', 'https://example.com:4505']) expect(() => publicUrl(url)).toThrow();
     await expect(publicFetch('https://127.0.0.1')).rejects.toThrow();
-    expect(() => service.save({ ...definition, secrets: { Host: 'internal' } })).toThrow(/Reserved/);
+    await expect((async () => (await service.save({ ...definition, secrets: { Host: 'internal' } })))()).rejects.toThrow(/Reserved/);
     expect(() => validateTransport({ type: 'stdio', command: 'node', args: 'shell text' })).toThrow();
   });
   it('imports pinned official package metadata without accepting registry or command injection', () => {
@@ -130,7 +130,7 @@ describe('MCP connections', () => {
     for (const patch of [{ identifier: '--eval=malicious' }, { version: 'latest' }, { registryBaseUrl: 'https://attacker.example' }, { runtimeArguments: [{ value: '--eval=bad' }] }]) expect(registryEntry({ ...raw, packages: [{ ...raw.packages[0], ...patch }] }).options).toEqual([]);
   });
   it('wraps container connections in docker exec and revokes credential projections after edits', async () => {
-    const c = service.save({ label: 'Container tool', transport: { type: 'stdio', command: 'example', args: [] } }, project);
+    const c = (await service.save({ label: 'Container tool', transport: { type: 'stdio', command: 'example', args: [] } }, project));
     const files = new Map<string, string>(); const commands: string[][] = [];
     const world = { handle: { kind: 'container', root: '/host/task', meta: { container: 'karmax-test' } },
       async exec(command: string, args: string[]) { commands.push([command, ...args]); return { code: 0, stdout: '', stderr: '' }; },
@@ -142,7 +142,7 @@ describe('MCP connections', () => {
       const servers = await prepareConnections(service, world, [c.id], project, 'task', (fn) => { cleanup = fn; });
       expect(servers[0]).toMatchObject({ command: 'docker', args: ['exec', '-i', '-w', '/work', 'karmax-test', '/usr/local/bin/node', expect.stringMatching(/^\/work\//), expect.stringMatching(/^\/work\//)] });
       expect(commands.some((args) => args.some((arg) => arg.includes('/host/task')))).toBe(false);
-      service.save({ ...c, enabled: false }, project);
+      (await service.save({ ...c, enabled: false }, project));
       await vi.advanceTimersByTimeAsync(30_000);
       expect([...files.entries()].find(([name]) => name.endsWith('.next'))?.[1]).toBe('{"revoked":true}');
     } finally { await cleanup?.(); vi.useRealTimers(); }
@@ -157,8 +157,8 @@ describe('MCP connections', () => {
   });
   it('runs a real stdio server, preserves session state and resources, withholds platform credentials, and cleans private files', async () => {
     const world = await new WorktreeProvider(path.join(dir, 'worlds')).create({ taskId: 'fixture', base: 'main' });
-    const c = service.save({ label: 'Fixture', transport: { type: 'stdio', command: process.execPath,
-      args: [path.resolve('tests/fixtures/mcp-connection.mjs'), '{{FIXTURE_SECRET}}'] }, auth: 'secrets', secrets: { FIXTURE_SECRET: 'scoped-value' } }, project);
+    const c = (await service.save({ label: 'Fixture', transport: { type: 'stdio', command: process.execPath,
+      args: [path.resolve('tests/fixtures/mcp-connection.mjs'), '{{FIXTURE_SECRET}}'] }, auth: 'secrets', secrets: { FIXTURE_SECRET: 'scoped-value' } }, project));
     let cleanup: (() => Promise<void>) | undefined;
     const old = process.env.KARMAX_TOKEN; process.env.KARMAX_TOKEN = 'must-not-leak';
     try {

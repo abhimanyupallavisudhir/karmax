@@ -30,20 +30,20 @@ describe('project wiki remote provisioning', () => {
   });
 
   it('re-wires an existing wiki with an installation token, not the user OAuth token', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(home));
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Widgets', {}, organization.id);
-    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
-      installationId: '42', accountLogin: 'owner-login', accountType: 'User' });
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Widgets', {}, organization.id));
+    const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'owner-login', accountType: 'User' }));
 
     // A previous run fully provisioned the wiki; no repository deploy-key row
     // is required for the fast path.
-    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github',
+    const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github',
       providerId: '999', owner: 'owner-login', name: 'widgets-wiki-deadbeef',
       sshUrl: 'git@github.com:owner-login/widgets-wiki-deadbeef.git', defaultBranch: 'main',
-      private: true, gitConnectionId: connection.id });
-    store.setProjectWikiRepository(project.id, repository.id);
+      private: true, gitConnectionId: connection.id }));
+    (await store.setProjectWikiRepository(project.id, repository.id));
 
     // Point the repository's GitHub SSH URL at a local bare repo so the real
     // push stays entirely offline while exercising the real Git operation.
@@ -67,10 +67,10 @@ describe('project wiki remote provisioning', () => {
       return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
     };
     broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'expired-token' }));
-    const githubApp = new GitHubAppService(store, broker,
-      { appId: '123', clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+    const githubApp = (await GitHubAppService.create(store, broker,
+      { appId: '123', clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
 
-    const gateway = new Gateway({ store, githubApp } as any);
+    const gateway = (await Gateway.create({ store, githubApp } as any));
     await (gateway as any).ensureProjectWiki(project);
     // The remote wiring is scheduled fire-and-forget; wait for it to settle.
     for (let i = 0; i < 100 && !(gateway as any).wikiRemotesReady.has(project.id); i++)
@@ -83,17 +83,17 @@ describe('project wiki remote provisioning', () => {
       .toMatch(/^[0-9a-f]{40}$/);
 
     (gateway as any).fanout.close();
-    store.close();
+    (await store.close());
   });
 
   it('publishes canonical interface saves and deletes before acknowledging them', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Widgets', {}, organization.id);
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Widgets', {}, organization.id));
     const bare = path.join(home, 'interface-saves.git');
     execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
     const sshUrl = 'git@github.com:acme/widgets-wiki.git';
-    const repository = store.upsertRepository({
+    const repository = (await store.upsertRepository({
       organizationId: organization.id,
       provider: 'github',
       providerId: 'interface-saves',
@@ -102,8 +102,8 @@ describe('project wiki remote provisioning', () => {
       sshUrl,
       defaultBranch: 'main',
       private: true,
-    });
-    store.setProjectWikiRepository(project.id, repository.id);
+    }));
+    (await store.setProjectWikiRepository(project.id, repository.id));
     const root = ensureProjectWikiRepository(paths().content, project.id);
     execFileSync('git', ['-C', root, 'config', `url.${bare}.insteadOf`, sshUrl]);
     const credentialRequests: string[] = [];
@@ -114,8 +114,8 @@ describe('project wiki remote provisioning', () => {
       },
     };
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('user:owner', ['project:read', 'skill:write'],
-      project.id, 60_000, organization.id).token;
+    const token = (await tokens.mintPrincipal('user:owner', ['project:read', 'skill:write'],
+      project.id, 60_000, organization.id)).token;
     const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens,
       contentDir: paths().content, githubApp } as any);
 
@@ -149,7 +149,7 @@ describe('project wiki remote provisioning', () => {
         repository.id, repository.id, repository.id, repository.id,
       ]);
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { Pool, types, type PoolClient, type QueryResultRow } from 'pg';
+import { Pool, types, type PoolClient, type QueryResult, type QueryResultRow } from 'pg';
 import { splitStatements, translate } from './postgres-sql.mjs';
 
 export class DatabaseCapacityError extends Error {
@@ -41,6 +41,10 @@ export class AsyncPostgres {
   }
 
   async query<T extends QueryResultRow = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+    return (await this.result<T>(sql, params)).rows;
+  }
+
+  async result<T extends QueryResultRow = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<Pick<QueryResult<T>, 'rows' | 'rowCount'>> {
     const scope = this.transactionScope.getStore();
     if (scope && !scope.active) throw new Error('transaction is already closed');
     const statements = splitStatements(sql);
@@ -49,11 +53,11 @@ export class AsyncPostgres {
     if (/^(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION|END|ABORT|PREPARE\s+TRANSACTION)\b/i.test(command))
       throw new Error('use transaction() for transaction control');
     const translated = translate(sql);
-    if (translated.skip) return [];
+    if (translated.skip) return { rows: [], rowCount: 0 };
     const execute = async () => {
       try {
         const result = await (scope?.client ?? this.pool).query<T>(translated.sql!, translated.forcedParams ?? params);
-        return result.rows;
+        return result;
       } catch (error) {
         // PostgreSQL aborts the transaction after any statement error, even if
         // application code catches it. Never report a silently rolled-back

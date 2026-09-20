@@ -62,7 +62,7 @@ describe.skipIf(!LIVE)('live agent (real model, real git)', () => {
     expect(out).toBe('5');
 
     // the stored session is the REAL OpenAI Responses conversation id (SPEC §10.5)
-    const session = h.store.kvGet(`session:${taskId}:do`);
+    const session = (await h.store.kvGet(`session:${taskId}:do`));
     expect(session).toMatch(/^resp_/);
   }, 180_000);
 });

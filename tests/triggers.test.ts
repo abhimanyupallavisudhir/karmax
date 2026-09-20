@@ -78,13 +78,13 @@ describe('cron parsing + next-fire (UTC)', () => {
     expect(new Date(century!).toISOString()).toBe('2104-02-29T00:00:00.000Z');
   });
 
-  it('rejects a parseable but impossible cron rather than arming a dead task', () => {
+  it('rejects a parseable but impossible cron rather than arming a dead task', async () => {
     // Feb 30 never occurs. It used to validate fine and then never fire.
     expect(nextCronFire('0 0 30 2 *', at('2026-01-01T00:00:00Z'))).toBeUndefined();
-    expect(validateTriggers([{ kind: 'schedule', cron: '0 0 30 2 *' } as TaskTrigger]))
+    expect((await validateTriggers([{ kind: 'schedule', cron: '0 0 30 2 *' } as TaskTrigger])))
       .toEqual([expect.stringContaining('never occurs')]);
     // A far-future-but-real schedule must still validate.
-    expect(validateTriggers([{ kind: 'schedule', cron: '0 0 29 2 *' } as TaskTrigger])).toEqual([]);
+    expect((await validateTriggers([{ kind: 'schedule', cron: '0 0 29 2 *' } as TaskTrigger]))).toEqual([]);
   });
 
   it('rejects malformed ranges instead of reading them as 0-N', () => {
@@ -143,55 +143,55 @@ describe('event catalog', () => {
 // ─── Pure: matching + helpers ────────────────────────────────────────────────
 
 describe('trigger helpers', () => {
-  it('validates each kind', () => {
-    expect(validateTriggers([{ kind: 'dependency', tasks: [] }])).toHaveLength(1);
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['task_1'] }])).toHaveLength(0);
-    expect(validateTriggers([{ kind: 'schedule' }])).toHaveLength(1);
-    expect(validateTriggers([{ kind: 'schedule', cron: 'nope' }])).toHaveLength(1);
-    expect(validateTriggers([{ kind: 'schedule', cron: '0 9 * * *' }])).toHaveLength(0);
-    expect(validateTriggers([{ kind: 'event', type: '' }])).toHaveLength(1);
-    expect(validateTriggers([{ kind: 'event', type: 'x.y' }])).toHaveLength(0);
+  it('validates each kind', async () => {
+    expect((await validateTriggers([{ kind: 'dependency', tasks: [] }]))).toHaveLength(1);
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['task_1'] }]))).toHaveLength(0);
+    expect((await validateTriggers([{ kind: 'schedule' }]))).toHaveLength(1);
+    expect((await validateTriggers([{ kind: 'schedule', cron: 'nope' }]))).toHaveLength(1);
+    expect((await validateTriggers([{ kind: 'schedule', cron: '0 9 * * *' }]))).toHaveLength(0);
+    expect((await validateTriggers([{ kind: 'event', type: '' }]))).toHaveLength(1);
+    expect((await validateTriggers([{ kind: 'event', type: 'x.y' }]))).toHaveLength(0);
   });
 
-  it('rejects the two zombie schedule shapes', () => {
+  it('rejects the two zombie schedule shapes', async () => {
     // `at` + recurring: armSchedule sets one timer and fireFor never disarms a
     // repeatable entry, so it fires once and then sits armed forever with no timer.
-    expect(validateTriggers([{ kind: 'schedule', at: 1_000, recurring: true }]))
+    expect((await validateTriggers([{ kind: 'schedule', at: 1_000, recurring: true }])))
       .toEqual([expect.stringContaining('cannot be recurring')]);
-    expect(validateTriggers([{ kind: 'schedule', at: 1_000 }])).toHaveLength(0);
+    expect((await validateTriggers([{ kind: 'schedule', at: 1_000 }]))).toHaveLength(0);
     // cron + at: armSchedule checks `at` first and silently drops the cron.
-    expect(validateTriggers([{ kind: 'schedule', cron: '0 9 * * *', at: 1_000 }]))
+    expect((await validateTriggers([{ kind: 'schedule', cron: '0 9 * * *', at: 1_000 }])))
       .toEqual([expect.stringContaining('not both')]);
   });
 
-  it('rejects self-reference, dangling deps, and cycles in the dependency graph', () => {
+  it('rejects self-reference, dangling deps, and cycles in the dependency graph', async () => {
     // Graph-shaped errors are invisible at runtime: the dispatcher simply never
     // fires, so the task sits `armed` forever with no signal.
     const graph: Record<string, string[]> = { a: [], b: ['a'], c: ['b'] };
     const dependenciesOf = (id: string) => graph[id];
 
     // self-reference (the web picker's exclusion is client-side only)
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['me'] }], { taskId: 'me' }))
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['me'] }], { taskId: 'me' })))
       .toEqual([expect.stringContaining('cannot depend on itself')]);
 
     // dangling / deleted dep id
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['gone'] }], { taskId: 'me', dependenciesOf }))
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['gone'] }], { taskId: 'me', dependenciesOf })))
       .toEqual([expect.stringContaining('does not exist')]);
 
     // A→B→A cycle: `a` would depend on `c`, but c→b→a already reaches a.
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['c'] }], { taskId: 'a', dependenciesOf }))
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['c'] }], { taskId: 'a', dependenciesOf })))
       .toEqual([expect.stringContaining('cycle')]);
 
     // A legal edge in the same graph still validates.
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['c'] }], { taskId: 'd', dependenciesOf })).toEqual([]);
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['c'] }], { taskId: 'd', dependenciesOf }))).toEqual([]);
     // Without a resolver, only self-reference is checkable (back-compat).
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['gone'] }])).toEqual([]);
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['gone'] }]))).toEqual([]);
   });
 
-  it('terminates on a pre-existing cycle elsewhere in the graph', () => {
+  it('terminates on a pre-existing cycle elsewhere in the graph', async () => {
     const graph: Record<string, string[]> = { x: ['y'], y: ['x'], z: ['x'] };
-    expect(validateTriggers([{ kind: 'dependency', tasks: ['z'] }],
-      { taskId: 'new', dependenciesOf: (id) => graph[id] })).toEqual([]);
+    expect((await validateTriggers([{ kind: 'dependency', tasks: ['z'] }],
+      { taskId: 'new', dependenciesOf: (id) => graph[id] }))).toEqual([]);
   });
 
   it('normalizes a single trigger or a list, dropping junk', () => {
@@ -248,7 +248,7 @@ it('authorizes trigger starts after days of uptime and releases each operation t
   const fire = createTriggerFire({
     fireTriggeredTask: async (token, taskId) => {
       issued.push(token);
-      const check = tokens.check(token, 'create_task');
+      const check = (await tokens.check(token, 'create_task'));
       expect(check.ok).toBe(true);
       expect(check.record?.principal).toBe('system:triggers');
       expect(check.record!.expiresAt - now).toBe(10 * 60_000);
@@ -262,7 +262,7 @@ it('authorizes trigger starts after days of uptime and releases each operation t
     await fire('later', 'clone');
     await expect(fire('failed', 'self')).rejects.toThrow('engine unavailable');
     expect(new Set(issued).size).toBe(3);
-    for (const token of issued) expect(tokens.verify(token)).toBeUndefined();
+    for (const token of issued) expect((await tokens.verify(token))).toBeUndefined();
   } finally {
     date.mockRestore();
   }
@@ -305,23 +305,23 @@ describe('TriggerScheduler (dispatcher)', () => {
    *  event carries the id of the task it happened to, and that task's
    *  organization is the tenant the event belongs to. */
   let sourceId: string | undefined;
-  const sourceTask = () => (sourceId ??= store.createTask({ projectId, title: 'source', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 's' } }).id);
+  const sourceTask = async () => (sourceId ??= (await store.createTask({ projectId, title: 'source', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 's' } })).id);
 
-  beforeEach(() => {
-    store = new Store(':memory:');
+  beforeEach(async () => {
+    store = (await Store.create(':memory:'));
     bus = new KarmaxBus();
     fired = [];
     clock = new FakeClock();
-    projectId = store.createProject('P').id;
+    projectId = (await store.createProject('P')).id;
     sourceId = undefined;
   });
 
-  const armedTask = (triggers: TaskTrigger[]): TaskRecord => {
+  const armedTask = async (triggers: TaskTrigger[]): Promise<TaskRecord> => {
     // Mirror createTask: a cron/recurring trigger forces the repeatable series flag.
     const repeatable = forcesRepeatable(triggers) || undefined;
-    const t = store.createTask({ projectId, title: 't', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', triggers, ...(repeatable ? { repeatable: true } : {}) } });
-    store.updateTaskParams(t.id, { ...t.params, triggerState: 'armed' });
-    return store.getTask(t.id)!;
+    const t = (await store.createTask({ projectId, title: 't', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', triggers, ...(repeatable ? { repeatable: true } : {}) } }));
+    (await store.updateTaskParams(t.id, { ...t.params, triggerState: 'armed' }));
+    return (await store.getTask(t.id))!;
   };
 
   const makeScheduler = () =>
@@ -340,14 +340,14 @@ describe('TriggerScheduler (dispatcher)', () => {
     bus.emit({ type: 'view.updated', taskId, ts: 0, payload: { status } } as KarmaxEvent);
 
   it.each(['dependency', 'event', 'schedule', 'cron'] as const)('backs off failed %s starts while other tasks remain responsive', async (kind) => {
-    const dep = sourceTask();
-    store.saveView(dep, { status: 'done' } as any);
+    const dep = (await sourceTask());
+    (await store.saveView(dep, { status: 'done' } as any));
     const triggers: TaskTrigger[] = kind === 'dependency' ? [{ kind: 'dependency', tasks: [dep] }]
       : kind === 'event' ? [{ kind: 'event', type: 'release' }]
       : kind === 'cron' ? [{ kind: 'schedule', cron: '* * * * *' }]
       : [{ kind: 'schedule', at: 0 }];
-    const task = armedTask(triggers);
-    const other = armedTask([{ kind: 'event', type: 'other' }]);
+    const task = (await armedTask(triggers));
+    const other = (await armedTask([{ kind: 'event', type: 'other' }]));
     const attempts: number[] = [];
     const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
       fire: async (id, mode) => {
@@ -360,13 +360,13 @@ describe('TriggerScheduler (dispatcher)', () => {
         fired.push([id, mode]);
       },
     });
-    scheduler.start();
+    (await scheduler.start());
     if (kind === 'event') bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
     clock.advance(kind === 'cron' ? 60_000 : 0);
     const due = clock.time;
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(attempts).toEqual([due]);
-    if (kind !== 'dependency') expect(store.getTask(task.id)!.params.triggerPending).toBe(true);
+    if (kind !== 'dependency') expect((await store.getTask(task.id))!.params.triggerPending).toBe(true);
     bus.emit({ type: 'other', taskId: dep, ts: 0, payload: {} });
     expect(fired).toContainEqual([other.id, 'self']);
     // Matching events cannot bypass the retry cooldown.
@@ -382,24 +382,24 @@ describe('TriggerScheduler (dispatcher)', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(attempts).toEqual([due, due + 1000, due + 3000]);
     expect(fired).toContainEqual([task.id, kind === 'cron' ? 'clone' : 'self']);
-    expect(store.getTask(task.id)!.params.triggerPending).toBeUndefined();
+    expect((await store.getTask(task.id))!.params.triggerPending).toBeUndefined();
     scheduler.stop();
   });
 
   it.each(['stop', 'disarm', 'edit'] as const)('does not resurrect a failed start after %s', async (action) => {
-    const task = armedTask([{ kind: 'schedule', at: 0 }]);
+    const task = (await armedTask([{ kind: 'schedule', at: 0 }]));
     let reject!: (error: Error) => void;
     let attempts = 0;
     const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
       fire: () => { attempts++; return new Promise((_, fail) => { reject = fail; }); },
     });
-    scheduler.start();
+    (await scheduler.start());
     clock.advance(0);
     if (action === 'stop') scheduler.stop();
     else if (action === 'disarm') scheduler.disarm(task.id);
     else {
-      store.updateTaskParams(task.id, { ...task.params, triggers: [{ kind: 'event', type: 'edited' }], triggerPending: false });
-      scheduler.arm(store.getTask(task.id)!);
+      (await store.updateTaskParams(task.id, { ...task.params, triggers: [{ kind: 'event', type: 'edited' }], triggerPending: false }));
+      (await scheduler.arm((await store.getTask(task.id))!));
     }
     reject(new Error('engine unavailable'));
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -410,12 +410,12 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('cancels scheduled retries on disarm', async () => {
-    const task = armedTask([{ kind: 'schedule', at: 0 }]);
+    const task = (await armedTask([{ kind: 'schedule', at: 0 }]));
     let attempts = 0;
     const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
       fire: async () => { if (++attempts < 3) throw new Error('engine unavailable'); },
     });
-    scheduler.start();
+    (await scheduler.start());
     clock.advance(0);
     await new Promise<void>((resolve) => setImmediate(resolve));
     scheduler.disarm(task.id);
@@ -425,9 +425,9 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('caps persistent failures at one retry per minute and rechecks dependencies', async () => {
-    const dep = sourceTask();
-    store.saveView(dep, { status: 'done' } as any);
-    armedTask([{ kind: 'dependency', tasks: [dep] }]);
+    const dep = (await sourceTask());
+    (await store.saveView(dep, { status: 'done' } as any));
+    (await armedTask([{ kind: 'dependency', tasks: [dep] }]));
     const attempts: number[] = [];
     const scheduler = new TriggerScheduler({ store, bus, now: clock.now, setTimer: clock.set, clearTimer: clock.clear,
       fire: async () => {
@@ -435,7 +435,7 @@ describe('TriggerScheduler (dispatcher)', () => {
         if (attempts.length < 20) throw new Error('engine unavailable');
       },
     });
-    scheduler.start();
+    (await scheduler.start());
     await new Promise<void>((resolve) => setImmediate(resolve));
     const delays = [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000];
     let expected = 0;
@@ -448,26 +448,26 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(attempts).toHaveLength(delays.length + 1);
     // A dependency can cease to be satisfied while a start is in flight, when
     // one-shot event routing is suppressed. Retry must read the live state.
-    store.saveView(dep, { status: 'running' } as any);
+    (await store.saveView(dep, { status: 'running' } as any));
     clock.advance(60_000);
     expect(attempts).toHaveLength(delays.length + 1);
     scheduler.stop();
   });
 
-  it('re-arms stored armed tasks on start()', () => {
-    armedTask([{ kind: 'event', type: 'x.y' }]);
+  it('re-arms stored armed tasks on start()', async () => {
+    (await armedTask([{ kind: 'event', type: 'x.y' }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     expect(s.size).toBe(1);
     s.stop();
     expect(s.size).toBe(0);
   });
 
-  it('fires a dependency trigger when the dep completes (one-shot, self)', () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const b = armedTask([{ kind: 'dependency', tasks: [dep.id] }]);
+  it('fires a dependency trigger when the dep completes (one-shot, self)', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const b = (await armedTask([{ kind: 'dependency', tasks: [dep.id] }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     emitDone(dep.id, 'failed'); // wrong outcome for default `success` → no fire
     expect(fired).toHaveLength(0);
     emitDone(dep.id, 'done');
@@ -475,12 +475,12 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(s.size).toBe(0); // disarmed after firing
   });
 
-  it('does not re-fire a repeatable dependency series on duplicate lifecycle events', () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const series = store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } });
-    store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
+  it('does not re-fire a repeatable dependency series on duplicate lifecycle events', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const series = (await store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } }));
+    (await store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' }));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     // A finishing task emits several terminal `view.updated` events; a repeatable
     // series never disarms, so only the first (newly-satisfied) one may fire.
     emitDone(dep.id, 'done');
@@ -490,24 +490,24 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('dispatches dependencies and events without loading task or sibling histories', async () => {
-    const dep = sourceTask();
-    const dependent = armedTask([{ kind: 'dependency', tasks: [dep] }]);
-    const eventTask = armedTask([{ kind: 'event', type: 'release' }]);
+    const dep = (await sourceTask());
+    const dependent = (await armedTask([{ kind: 'dependency', tasks: [dep] }]));
+    const eventTask = (await armedTask([{ kind: 'event', type: 'release' }]));
     // A malformed history is a sentinel: these decisions must never decode it.
-    store.db.prepare("UPDATE tasks SET lastView=?, conversation=?")
-      .run(JSON.stringify({ status: 'active' }), 'history must not be read');
+    (await store.db.prepare("UPDATE tasks SET lastView=?, conversation=?")
+      .run(JSON.stringify({ status: 'active' }), 'history must not be read'));
     const fullRead = vi.spyOn(store, 'getTask').mockImplementation(() => { throw Error('full task read'); });
     const groupRead = vi.spyOn(store, 'attemptGroup').mockImplementation(() => { throw Error('full sibling read'); });
     const scheduler = makeScheduler();
     try {
-      scheduler.start();
+      (await scheduler.start());
       expect(scheduler.size).toBe(2);
-      store.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify({ status: 'done' }), dep);
+      (await store.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify({ status: 'done' }), dep));
       emitDone(dep);
       bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(fired).toEqual([[dependent.id, 'self'], [eventTask.id, 'self']]);
-      expect(store.taskMetadata(eventTask.id)?.params.triggerPending).toBeUndefined();
+      expect((await store.taskMetadata(eventTask.id))?.params.triggerPending).toBeUndefined();
       expect(fullRead).not.toHaveBeenCalled();
       expect(groupRead).not.toHaveBeenCalled();
     } finally {
@@ -517,95 +517,95 @@ describe('TriggerScheduler (dispatcher)', () => {
     }
   });
 
-  it('binds dependencies to the logical task, not a cancelled attempt', () => {
-    const first = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'first' } });
-    const second = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'second', draft: true }, intentId: first.intentId });
-    const dependent = armedTask([{ kind: 'dependency', tasks: [first.id], on: 'settled' }]);
+  it('binds dependencies to the logical task, not a cancelled attempt', async () => {
+    const first = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'first' } }));
+    const second = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'second', draft: true }, intentId: first.intentId }));
+    const dependent = (await armedTask([{ kind: 'dependency', tasks: [first.id], on: 'settled' }]));
     const s = makeScheduler();
-    s.start();
-    store.saveView(first.id, { taskId: first.id, title: 'dep', workflow: 'just-do', stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: {}, updatedAt: 1 });
+    (await s.start());
+    (await store.saveView(first.id, { taskId: first.id, title: 'dep', workflow: 'just-do', stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: {}, updatedAt: 1 }));
     emitDone(first.id, 'cancelled');
     expect(fired).toHaveLength(0); // second is now principal and still eligible
-    store.saveView(second.id, { taskId: second.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 2 });
+    (await store.saveView(second.id, { taskId: second.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 2 }));
     emitDone(second.id, 'done');
     expect(fired).toEqual([[dependent.id, 'self']]);
   });
 
-  it('waits for all deps (mode all) but fires on the first for mode any', () => {
-    const a = store.createTask({ projectId, title: 'a', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'a' } });
-    const c = store.createTask({ projectId, title: 'c', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'c' } });
-    const all = armedTask([{ kind: 'dependency', tasks: [a.id, c.id], mode: 'all' }]);
-    const any = armedTask([{ kind: 'dependency', tasks: [a.id, c.id], mode: 'any' }]);
+  it('waits for all deps (mode all) but fires on the first for mode any', async () => {
+    const a = (await store.createTask({ projectId, title: 'a', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'a' } }));
+    const c = (await store.createTask({ projectId, title: 'c', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'c' } }));
+    const all = (await armedTask([{ kind: 'dependency', tasks: [a.id, c.id], mode: 'all' }]));
+    const any = (await armedTask([{ kind: 'dependency', tasks: [a.id, c.id], mode: 'any' }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     emitDone(a.id);
     expect(fired).toEqual([[any.id, 'self']]); // any fired; all still waiting
     emitDone(c.id);
     expect(fired).toContainEqual([all.id, 'self']);
   });
 
-  it('fires immediately at arm time if a dependency already completed', () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    store.saveView(dep.id, { taskId: dep.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 0 });
-    const b = armedTask([{ kind: 'dependency', tasks: [dep.id] }]);
+  it('fires immediately at arm time if a dependency already completed', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    (await store.saveView(dep.id, { taskId: dep.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 0 }));
+    const b = (await armedTask([{ kind: 'dependency', tasks: [dep.id] }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     expect(fired).toEqual([[b.id, 'self']]);
   });
 
-  it('fires an event trigger on a matching event only', () => {
-    const t = armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]);
+  it('fires an event trigger on a matching event only', async () => {
+    const t = (await armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]));
     const s = makeScheduler();
-    s.start();
-    bus.emit({ type: 'github.pr-merged', taskId: sourceTask(), ts: 0, payload: { branch: 'dev' } } as KarmaxEvent);
+    (await s.start());
+    bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'dev' } } as KarmaxEvent);
     expect(fired).toHaveLength(0);
-    bus.emit({ type: 'github.pr-merged', taskId: sourceTask(), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
     expect(fired).toEqual([[t.id, 'self']]);
   });
 
-  it('never fires on an event from another organization', () => {
-    const t = armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]);
-    const other = store.createOrganization({ name: 'Other' });
-    const otherProject = store.createProject('Q', {}, other.id);
-    const foreign = store.createTask({ projectId: otherProject.id, title: 'f', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'f' } });
+  it('never fires on an event from another organization', async () => {
+    const t = (await armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]));
+    const other = (await store.createOrganization({ name: 'Other' }));
+    const otherProject = (await store.createProject('Q', {}, other.id));
+    const foreign = (await store.createTask({ projectId: otherProject.id, title: 'f', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'f' } }));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     bus.emit({ type: 'github.pr-merged', taskId: foreign.id, ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
     expect(fired).toHaveLength(0);
     // An event whose task no longer exists has no tenant and reaches nobody.
     bus.emit({ type: 'github.pr-merged', taskId: 'task_gone', ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
     expect(fired).toHaveLength(0);
-    bus.emit({ type: 'github.pr-merged', taskId: sourceTask(), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
     expect(fired).toEqual([[t.id, 'self']]);
   });
 
   it('holds an event activation across a restart until dependencies finish', async () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const t = armedTask([
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const t = (await armedTask([
       { kind: 'dependency', tasks: [dep.id] },
       { kind: 'event', type: 'release.approved' },
-    ]);
+    ]));
     const first = makeScheduler();
-    first.start();
+    (await first.start());
 
-    bus.emit({ type: 'release.approved', taskId: sourceTask(), ts: 0, payload: {} } as KarmaxEvent);
+    bus.emit({ type: 'release.approved', taskId: (await sourceTask()), ts: 0, payload: {} } as KarmaxEvent);
     expect(fired).toHaveLength(0);
-    expect(store.getTask(t.id)!.params.triggerPending).toBe(true);
+    expect((await store.getTask(t.id))!.params.triggerPending).toBe(true);
 
     first.stop();
     const restarted = makeScheduler();
-    restarted.start();
+    (await restarted.start());
     emitDone(dep.id);
     expect(fired).toEqual([[t.id, 'self']]);
     await new Promise((r) => setTimeout(r, 0));
-    expect(store.getTask(t.id)!.params.triggerPending).toBeUndefined();
+    expect((await store.getTask(t.id))!.params.triggerPending).toBeUndefined();
     restarted.stop();
   });
 
-  it('fires a one-shot `at` schedule when the clock reaches it', () => {
-    const t = armedTask([{ kind: 'schedule', at: 5000 }]);
+  it('fires a one-shot `at` schedule when the clock reaches it', async () => {
+    const t = (await armedTask([{ kind: 'schedule', at: 5000 }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     clock.advance(4000);
     expect(fired).toHaveLength(0);
     clock.advance(2000);
@@ -613,14 +613,14 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(s.size).toBe(0);
   });
 
-  it('waits for dependencies when a one-shot schedule becomes due first', () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const t = armedTask([
+  it('waits for dependencies when a one-shot schedule becomes due first', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const t = (await armedTask([
       { kind: 'dependency', tasks: [dep.id] },
       { kind: 'schedule', at: 5000 },
-    ]);
+    ]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
 
     clock.advance(5000);
     expect(fired).toHaveLength(0); // due, but its prerequisite is still running
@@ -631,14 +631,14 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(s.size).toBe(0);
   });
 
-  it('waits for the one-shot schedule when dependencies finish first', () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const t = armedTask([
+  it('waits for the one-shot schedule when dependencies finish first', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const t = (await armedTask([
       { kind: 'dependency', tasks: [dep.id] },
       { kind: 'schedule', at: 5000 },
-    ]);
+    ]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
 
     emitDone(dep.id);
     expect(fired).toHaveLength(0); // prerequisite met, but the earliest start is still ahead
@@ -650,9 +650,9 @@ describe('TriggerScheduler (dispatcher)', () => {
 
   it('fires a cron schedule as a recurring clone and stays armed', async () => {
     // every minute; clock starts at 0 → next fire at 60_000.
-    const t = armedTask([{ kind: 'schedule', cron: '* * * * *' }]);
+    const t = (await armedTask([{ kind: 'schedule', cron: '* * * * *' }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     clock.advance(60_000);
     expect(fired).toEqual([[t.id, 'clone']]);
     await new Promise((r) => setTimeout(r, 0));
@@ -666,16 +666,16 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('routes real bus events end-to-end through KarmaxApi arming', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }); // satisfy the repo guard
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] })); // satisfy the repo guard
     // A fake Temporal client that just records started workflow ids.
     const started: string[] = [];
     const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
     const scheduler = new TriggerScheduler({ store, bus, fire: (id, mode) => api.fireTriggeredTask(token, id, mode) });
     api.setTriggerArmer(scheduler);
-    scheduler.start();
+    (await scheduler.start());
 
     // A dependency task, and a task armed to run after it succeeds.
     const dep = await api.createTask(token, { projectId, workflow: 'just-do', params: { prompt: 'd' } });
@@ -692,11 +692,11 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('queuing a triggered draft arms it instead of starting now', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }); // satisfy the repo guard
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] })); // satisfy the repo guard
     const started: string[] = [];
     const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
     const armed = new Set<string>();
     api.setTriggerArmer({ arm: (t) => armed.add(t.id), disarm: (id) => armed.delete(id) });
@@ -722,38 +722,38 @@ describe('TriggerScheduler (dispatcher)', () => {
    * armed has nothing to catch up on.
    */
   it('re-queuing a paused cron task does not fire a catch-up run', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
     api.setTriggerArmer({ arm: () => {}, disarm: () => {} });
 
     const t = await api.createTask(token, { projectId, workflow: 'just-do',
       params: { prompt: 'p', triggers: [{ kind: 'schedule', cron: '0 9 * * *' }] } });
     // It has fired before, a week ago — the mark a real armed cron carries.
-    store.updateTaskParams(t.id, {
-      ...store.getTask(t.id)!.params, triggerLastFiredAt: Date.parse('2026-01-01T09:00:00Z'),
-    });
+    (await store.updateTaskParams(t.id, {
+      ...(await store.getTask(t.id))!.params, triggerLastFiredAt: Date.parse('2026-01-01T09:00:00Z'),
+    }));
 
     await api.cancelTrigger(token, t.id); // pause it
     // The stale mark must not survive the pause, or the re-queue below catches up.
-    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBeUndefined();
+    expect((await store.getTask(t.id))!.params.triggerLastFiredAt).toBeUndefined();
 
     await api.queueTask(token, t.id); // re-queue, days later
     const fired: [string, string][] = [];
     const s = new TriggerScheduler({ store, bus, fire: async (id, mode) => void fired.push([id, mode]),
       now: () => Date.parse('2026-01-08T10:00:00Z'), setTimer: clock.set, clearTimer: clock.clear });
-    s.start();
+    (await s.start());
     expect(fired).toHaveLength(0); // no phantom run for the week it was paused
     s.stop();
   });
 
   it('rejects an invalid trigger graph BEFORE marking the task armed', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
     // A real armer rejects a self-dependency — the graph half of validation, which
     // only the armer can do because it needs the store to resolve dependency ids.
@@ -771,17 +771,17 @@ describe('TriggerScheduler (dispatcher)', () => {
     // after clearDraft + `triggerState: armed` were already persisted, so a task the
     // dispatcher had refused sat marked `armed` but unregistered — waiting forever,
     // indistinguishable from one that is legitimately still waiting.
-    const after = store.getTask(draft.id)!;
+    const after = (await store.getTask(draft.id))!;
     expect(after.params.triggerState).not.toBe('armed');
     expect(after.params.draft).toBe(true);
   });
 
   it('edits a waiting (armed) task in place, re-arming with new triggers', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const started: string[] = [];
     const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
     const armCalls: string[] = [];
     const disarmCalls: string[] = [];
@@ -808,18 +808,18 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('a triggerless repeatable task is a series that spawns run #1 on create', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const started: string[] = [];
     const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
 
     const series = await api.createTask(token, { projectId, workflow: 'just-do', params: { prompt: 'p', repeatable: true } });
     expect(series.params.repeatable).toBe(true);
     // The series itself never starts; run #1 did.
     expect(started).not.toContain(series.id);
-    const runs = store.runsOf(series.id);
+    const runs = (await store.runsOf(series.id));
     expect(runs).toHaveLength(1);
     expect(started).toContain(runs[0]!.id);
     expect(runs[0]!.params.runOf).toBe(series.id);
@@ -827,62 +827,62 @@ describe('TriggerScheduler (dispatcher)', () => {
 
     // "Run again" spawns another run, series stays put.
     await api.runAgain(token, series.id);
-    expect(store.runsOf(series.id)).toHaveLength(2);
+    expect((await store.runsOf(series.id))).toHaveLength(2);
   });
 
   it('a cron trigger forces repeatable, and each fire spawns a run (series stays armed)', async () => {
-    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const started: string[] = [];
     const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = tokens.mintPrincipal('u', ['*']).token;
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
     const scheduler = new TriggerScheduler({ store, bus, fire: (id, mode) => api.fireTriggeredTask(token, id, mode), now: clock.now, setTimer: clock.set, clearTimer: clock.clear });
     api.setTriggerArmer(scheduler);
-    scheduler.start();
+    (await scheduler.start());
 
     // cron every minute; clock starts at 0.
     const series = await api.createTask(token, { projectId, workflow: 'just-do', params: { prompt: 'p', triggers: [{ kind: 'schedule', cron: '* * * * *' }] } });
     expect(series.params.repeatable).toBe(true); // forced by the cron trigger
     expect(series.params.triggerState).toBe('armed');
-    expect(store.runsOf(series.id)).toHaveLength(0); // waits for the first fire
+    expect((await store.runsOf(series.id))).toHaveLength(0); // waits for the first fire
 
     clock.advance(60_000);
     await new Promise((r) => setTimeout(r, 0));
-    expect(store.runsOf(series.id)).toHaveLength(1);
+    expect((await store.runsOf(series.id))).toHaveLength(1);
     expect(scheduler.size).toBe(1); // series stays armed for the next occurrence
     clock.advance(60_000);
     await new Promise((r) => setTimeout(r, 0));
-    expect(store.runsOf(series.id)).toHaveLength(2);
+    expect((await store.runsOf(series.id))).toHaveLength(2);
   });
 
-  it('does not double-fire a cron occurrence when the clock steps backwards', () => {
+  it('does not double-fire a cron occurrence when the clock steps backwards', async () => {
     // The timer callback used to re-arm from `this.now()`, and nextCronFire floors
     // to the whole minute — so a clock reading even 1 ms BEFORE the instant that
     // just fired (backward NTP step, VM resume, early libuv timer) returned that
     // same instant and fired it a second time. Nothing dedupes it: a repeatable
     // entry never sets `fired`.
     const lagging = () => Math.max(0, clock.now() - 1);
-    const t = armedTask([{ kind: 'schedule', cron: '* * * * *' }]);
+    const t = (await armedTask([{ kind: 'schedule', cron: '* * * * *' }]));
     const s = new TriggerScheduler({ store, bus, fire: async (id, mode) => void fired.push([id, mode]),
       now: lagging, setTimer: clock.set, clearTimer: clock.clear });
-    s.start();
+    (await s.start());
     clock.advance(60_100);
     expect(fired).toEqual([[t.id, 'clone']]); // exactly one fire for the 60s occurrence
     s.stop();
   });
 
-  it('catches up on a cron occurrence missed while karmax was down (exactly once)', () => {
+  it('catches up on a cron occurrence missed while karmax was down (exactly once)', async () => {
     const nine = (day: string) => Date.parse(`2026-01-${day}T09:00:00Z`);
-    const t = armedTask([{ kind: 'schedule', cron: '0 9 * * *' }]);
+    const t = (await armedTask([{ kind: 'schedule', cron: '0 9 * * *' }]));
     // Pretend it last fired on Jan 1 and karmax was then down for a week.
-    store.updateTaskParams(t.id, { ...store.getTask(t.id)!.params, triggerLastFiredAt: nine('01') });
+    (await store.updateTaskParams(t.id, { ...(await store.getTask(t.id))!.params, triggerLastFiredAt: nine('01') }));
     clock.time = Date.parse('2026-01-08T10:00:00Z');
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     // One catch-up run — not seven, one per missed day.
     expect(fired).toEqual([[t.id, 'clone']]);
-    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBe(nine('08'));
+    expect((await store.getTask(t.id))!.params.triggerLastFiredAt).toBe(nine('08'));
     // ...and it is still armed for tomorrow, not re-firing today's.
     expect(s.size).toBe(1);
     clock.advance(3600_000);
@@ -891,27 +891,27 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('durably holds a due cron occurrence until its dependencies finish', async () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const series = armedTask([
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const series = (await armedTask([
       { kind: 'dependency', tasks: [dep.id] },
       { kind: 'schedule', cron: '* * * * *' },
-    ]);
+    ]));
     const first = makeScheduler();
-    first.start();
+    (await first.start());
 
     clock.advance(120_000); // two blocked occurrences coalesce into one pending run
     expect(fired).toHaveLength(0);
-    expect(store.getTask(series.id)!.params.triggerPending).toBe(true);
+    expect((await store.getTask(series.id))!.params.triggerPending).toBe(true);
 
     first.stop();
     const restarted = makeScheduler();
-    restarted.start();
+    (await restarted.start());
     expect(fired).toHaveLength(0);
 
     emitDone(dep.id);
     expect(fired).toEqual([[series.id, 'clone']]);
     await new Promise((r) => setTimeout(r, 0));
-    expect(store.getTask(series.id)!.params.triggerPending).toBeUndefined();
+    expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined();
 
     clock.advance(60_000);
     expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]);
@@ -919,7 +919,7 @@ describe('TriggerScheduler (dispatcher)', () => {
   });
 
   it('keeps a claimed cron occurrence pending when its run fails to start', async () => {
-    const series = armedTask([{ kind: 'schedule', cron: '* * * * *' }]);
+    const series = (await armedTask([{ kind: 'schedule', cron: '* * * * *' }]));
     let failedAttempts = 0;
     const first = new TriggerScheduler({
       store,
@@ -932,42 +932,42 @@ describe('TriggerScheduler (dispatcher)', () => {
       setTimer: clock.set,
       clearTimer: clock.clear,
     });
-    first.start();
+    (await first.start());
     clock.advance(60_000);
     await new Promise((r) => setTimeout(r, 0));
     expect(failedAttempts).toBe(1);
-    expect(store.getTask(series.id)!.params.triggerPending).toBe(true);
+    expect((await store.getTask(series.id))!.params.triggerPending).toBe(true);
 
     first.stop();
     const restarted = makeScheduler();
-    restarted.start();
+    (await restarted.start());
     await new Promise((r) => setTimeout(r, 0));
     expect(fired).toEqual([[series.id, 'clone']]);
-    expect(store.getTask(series.id)!.params.triggerPending).toBeUndefined();
+    expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined();
     restarted.stop();
   });
 
-  it('seeds the catch-up mark on first arm rather than firing retroactively', () => {
+  it('seeds the catch-up mark on first arm rather than firing retroactively', async () => {
     clock.time = Date.parse('2026-01-08T10:00:00Z');
-    const t = armedTask([{ kind: 'schedule', cron: '0 9 * * *' }]);
+    const t = (await armedTask([{ kind: 'schedule', cron: '0 9 * * *' }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     expect(fired).toHaveLength(0); // never fired before ⇒ nothing to catch up on
-    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBe(clock.time);
+    expect((await store.getTask(t.id))!.params.triggerLastFiredAt).toBe(clock.time);
     // A mark with no elapsed occurrence is likewise inert across a restart.
     s.stop();
     const again = makeScheduler();
-    again.start();
+    (await again.start());
     expect(fired).toHaveLength(0);
     again.stop();
   });
 
-  it('re-fires a repeatable dependency series each time the dep completes again', () => {
-    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
-    const series = store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } });
-    store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
+  it('re-fires a repeatable dependency series each time the dep completes again', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const series = (await store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } }));
+    (await store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' }));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     emitDone(dep.id, 'done');
     expect(fired).toHaveLength(1);
     // The dep genuinely runs again: it reports a non-terminal status first, which
@@ -982,45 +982,45 @@ describe('TriggerScheduler (dispatcher)', () => {
     s.stop();
   });
 
-  it('fires a repeatable series once per event, not once per matching trigger', () => {
-    const series = store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0',
+  it('fires a repeatable series once per event, not once per matching trigger', async () => {
+    const series = (await store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0',
       params: { prompt: 'p', repeatable: true, triggers: [
         { kind: 'event', type: 'x.y', recurring: true },
         { kind: 'event', type: 'x.y', where: { a: 1 }, recurring: true },
-      ] } });
-    store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
+      ] } }));
+    (await store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' }));
     const s = makeScheduler();
-    s.start();
-    bus.emit({ type: 'x.y', taskId: sourceTask(), ts: 0, payload: { a: 1 } } as KarmaxEvent);
+    (await s.start());
+    bus.emit({ type: 'x.y', taskId: (await sourceTask()), ts: 0, payload: { a: 1 } } as KarmaxEvent);
     expect(fired).toEqual([[series.id, 'clone']]); // both triggers matched; one run
     s.stop();
   });
 
-  it('refuses to arm an unsatisfiable dependency graph instead of waiting forever', () => {
-    const t = store.createTask({ projectId, title: 'self', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
-    store.updateTaskParams(t.id, { triggers: [{ kind: 'dependency', tasks: [t.id] }], triggerState: 'armed' } as any);
+  it('refuses to arm an unsatisfiable dependency graph instead of waiting forever', async () => {
+    const t = (await store.createTask({ projectId, title: 'self', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } }));
+    (await store.updateTaskParams(t.id, { triggers: [{ kind: 'dependency', tasks: [t.id] }], triggerState: 'armed' } as any));
     const s = makeScheduler();
-    expect(() => s.arm(store.getTask(t.id)!)).toThrow(/itself/);
+    await expect((async () => (await s.arm((await store.getTask(t.id))!)))()).rejects.toThrow(/itself/);
 
-    const dangling = armedTask([{ kind: 'dependency', tasks: ['task_deleted'] }]);
-    expect(() => s.arm(store.getTask(dangling.id)!)).toThrow(/does not exist/);
+    const dangling = (await armedTask([{ kind: 'dependency', tasks: ['task_deleted'] }]));
+    await expect((async () => (await s.arm((await store.getTask(dangling.id))!)))()).rejects.toThrow(/does not exist/);
 
     // Boot must survive a stored row that has gone bad: it logs and arms the rest.
     const logs: string[] = [];
     const booted = new TriggerScheduler({ store, bus, fire: async () => {}, now: clock.now,
       setTimer: clock.set, clearTimer: clock.clear, log: (m) => logs.push(m) });
-    const ok = armedTask([{ kind: 'event', type: 'a.b' }]);
-    booted.start();
+    const ok = (await armedTask([{ kind: 'event', type: 'a.b' }]));
+    (await booted.start());
     expect(logs.some((l) => l.includes('refusing to arm'))).toBe(true);
     expect(booted.size).toBe(1);
-    expect(store.getTask(ok.id)).toBeTruthy();
+    expect((await store.getTask(ok.id))).toBeTruthy();
     booted.stop();
   });
 
-  it('disarm() cancels timers and event routing', () => {
-    const t = armedTask([{ kind: 'schedule', at: 5000 }]);
+  it('disarm() cancels timers and event routing', async () => {
+    const t = (await armedTask([{ kind: 'schedule', at: 5000 }]));
     const s = makeScheduler();
-    s.start();
+    (await s.start());
     s.disarm(t.id);
     clock.advance(10_000);
     expect(fired).toHaveLength(0);

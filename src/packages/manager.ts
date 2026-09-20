@@ -51,7 +51,7 @@ export class WorkflowManager {
     /** Directory for the persisted install registry; omit to disable persistence (tests). */
     private cacheHome?: string,
     /** Organization Git-profile credentials, resolved only for the install fetch. */
-    private gitEnvironment?: (organizationId: string) => Record<string, string>,
+    private gitEnvironment?: (organizationId: string) => Record<string, string> | Promise<Record<string, string>>,
     /** External code shares the control-plane worker; never enable it for SaaS tenants. */
     private hosted = false,
   ) {
@@ -130,7 +130,7 @@ export class WorkflowManager {
     // Load + validate WITHOUT registering yet — a rejected package must not touch state.
     const pkg = await this.loader.load(spec, undefined, organizationId, {
       ...(organizationId === 'org_personal' ? {} : isolatedGitEnvironment()),
-      ...(this.gitEnvironment?.(organizationId) ?? {}),
+      ...((await this.gitEnvironment?.(organizationId)) ?? {}),
     });
     if (isBuiltInWorkflowName(pkg.manifest.name)) throw new Error(`"${pkg.manifest.name}" is a built-in workflow; built-ins change only with a platform release`);
     if (!pkg.workflowEntry) throw new Error(`package "${pkg.manifest.name}" ships no workflow module (workflow.ts|js|mjs)`);

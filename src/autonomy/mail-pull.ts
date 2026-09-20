@@ -19,9 +19,9 @@ export interface PulledMessage { to: string; from: string; subject?: string; tex
  */
 
 export interface PullStore {
-  kvGet(k: string): string | undefined;
-  kvSet(k: string, v: string): void;
-  appendAudit?(e: { principalId: string; action: string; detail?: Record<string, unknown> }): number;
+  kvGet(k: string): (string | undefined) | Promise<string | undefined>;
+  kvSet(k: string, v: string): (void) | Promise<void>;
+  appendAudit?(e: { principalId: string; action: string; detail?: Record<string, unknown> }): (number) | Promise<number>;
 }
 
 export interface PullDeps {
@@ -31,7 +31,7 @@ export interface PullDeps {
   /** Resolve a vault handle to its secret (IMAP password / AgentMail key). */
   resolveSecret(handle: string): string | undefined;
   /** Inject a fetched message into the per-org inbox (routes by recipient). */
-  ingest(msg: PulledMessage): { delivered: boolean };
+  ingest(msg: PulledMessage): { delivered: boolean } | Promise<{ delivered: boolean }>;
   /** Override the network clients in tests. */
   fetchFn?: typeof fetch;
   openImap?: (opts: ImapOpts) => Promise<ImapConn>;
@@ -63,17 +63,17 @@ export class ImapPuller implements Puller {
     const conn = await open({ host: imap.host, port: imap.port, secure: imap.secure, user: imap.user, pass });
     let delivered = 0;
     const uidKey = `agent-mail:imap-uid:${this.deps.organizationId ?? 'legacy'}`;
-    let maxUid = Number(this.deps.store.kvGet(uidKey) ?? 0);
+    let maxUid = Number((await this.deps.store.kvGet(uidKey)) ?? 0);
     try {
       const messages = await conn.fetchSince(maxUid);
       for (const m of messages.sort((a, b) => a.uid - b.uid)) {
         const to = firstDeliveredTo(m.source) ?? firstHeader(m.source, 'to');
         const from = firstHeader(m.source, 'from');
         if (to) {
-          const { delivered: ok } = this.deps.ingest({
+          const { delivered: ok } = (await this.deps.ingest({
             to: cleanAddress(to), from: cleanAddress(from ?? 'unknown@unknown'),
             subject: firstHeader(m.source, 'subject'), text: extractMimeText(m.source),
-          });
+          }));
           if (ok) delivered++;
         }
         if (m.uid > maxUid) maxUid = m.uid;
@@ -81,7 +81,7 @@ export class ImapPuller implements Puller {
     } finally {
       await conn.close().catch(() => undefined);
     }
-    this.deps.store.kvSet(uidKey, String(maxUid));
+    (await this.deps.store.kvSet(uidKey, String(maxUid)));
     return delivered;
   }
 }
@@ -156,7 +156,7 @@ export class AgentMailPuller implements Puller {
     const address = this.config.agentmailAddress;
     if (!this.key() || !address) return 0;
     let delivered = 0;
-    const cursor = this.deps.store.kvGet(amCursorKey(address));
+    const cursor = (await this.deps.store.kvGet(amCursorKey(address)));
     const list = await this.api(`/inboxes/${encodeURIComponent(address)}/messages?limit=50&ascending=true${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
     if (!list) throw new Error(`AgentMail inbox ${address} was not found`);
     const messages: any[] = list?.messages ?? list?.data ?? (Array.isArray(list) ? list : []);
@@ -169,17 +169,17 @@ export class AgentMailPuller implements Puller {
       const to = Array.isArray(m.to) ? m.to[0] : (m.to ?? address);
       const from = m.from ?? m.sender ?? 'unknown@unknown';
       const text = m.text ?? m.extracted_text ?? m.plain ?? m.preview ?? (m.html ? htmlToText(m.html) : '');
-      const { delivered: ok } = this.deps.ingest({
+      const { delivered: ok } = (await this.deps.ingest({
         ...(messageId ? { sourceId: `agentmail:${address}:${messageId}` } : {}),
         to: cleanAddress(to),
         from: cleanAddress(from),
         subject: m.subject,
         text: String(text),
-      });
+      }));
       if (ok) delivered++;
       newest = m.timestamp ?? m.created_at ?? newest;
     }
-    if (newest && newest !== cursor) this.deps.store.kvSet(amCursorKey(address), String(newest));
+    if (newest && newest !== cursor) (await this.deps.store.kvSet(amCursorKey(address), String(newest)));
     return delivered;
   }
 }
@@ -199,10 +199,10 @@ export class MailPoller {
   private running = false;
   constructor(
     private deps: {
-      readConfigs(): { organizationId: string; config: MailboxConfig }[];
+      readConfigs(): { organizationId: string; config: MailboxConfig }[] | Promise<{ organizationId: string; config: MailboxConfig }[]>;
       resolveSecret(handle: string): string | undefined;
       store: PullStore;
-      makeIngest(organizationId: string, config: MailboxConfig): (msg: PulledMessage) => { delivered: boolean };
+      makeIngest(organizationId: string, config: MailboxConfig): (msg: PulledMessage) => { delivered: boolean } | Promise<{ delivered: boolean }>;
     },
     private intervalMs = Number(process.env.KARMAX_MAIL_POLL_MS) || 30_000,
   ) {}
@@ -224,7 +224,7 @@ export class MailPoller {
     this.running = true;
     try {
       let delivered = 0;
-      for (const { organizationId, config } of this.deps.readConfigs()) {
+      for (const { organizationId, config } of (await this.deps.readConfigs())) {
         try {
           const puller = createPuller(config, {
             store: this.deps.store,
@@ -234,11 +234,11 @@ export class MailPoller {
           });
           if (puller) delivered += await puller.poll();
         } catch (e) {
-          this.deps.store.appendAudit?.({
+          (await this.deps.store.appendAudit?.({
             principalId: 'system:mail-poller',
             action: 'agent-mail.poll.failed',
             detail: { organizationId, error: e instanceof Error ? e.message : String(e) },
-          });
+          }));
         }
       }
       return delivered;

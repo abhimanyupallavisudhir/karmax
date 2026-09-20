@@ -20,10 +20,10 @@ import { WorldRegistry } from '../src/world/registry.js';
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
-function fixture(quotaBytes?: number) {
+async function fixture(quotaBytes?: number) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-storage-')); dirs.push(dir);
-  const store = new Store(':memory:');
-  const project = store.createProject('Storage');
+  const store = (await Store.create(':memory:'));
+  const project = (await store.createProject('Storage'));
   const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
   const managed = new LocalObjectStore(path.join(dir, 'objects'));
   const locations = new StorageLocationService(store, managed, broker, quotaBytes);
@@ -34,7 +34,7 @@ function fixture(quotaBytes?: number) {
 
 describe('organization storage locations', () => {
   it('rejects private server-side S3 endpoints in hosted mode', async () => {
-    const f = fixture(1024);
+    const f = (await fixture(1024));
     const hosted = new StorageLocationService(f.store, new LocalObjectStore(path.join(dirs[dirs.length - 1]!, 'hosted')),
       f.broker, 1024, false);
     await expect(hosted.connectS3(f.project.organizationId!, { name: 'Metadata service',
@@ -44,7 +44,7 @@ describe('organization storage locations', () => {
 
   it.each(['read failure', 'read mismatch', 'read and cleanup failure', 'cleanup failure'])(
     'fails the connection and cleans up its probe after %s', async (failure) => {
-      const f = fixture();
+      const f = (await fixture());
       const calls: string[] = [];
       vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: RequestInit) => {
         const method = init?.method ?? 'GET';
@@ -64,47 +64,44 @@ describe('organization storage locations', () => {
         : failure === 'cleanup failure' ? /delete denied/ : /read denied/;
       await expect(f.locations.test(f.project.organizationId!, location.id)).rejects.toThrow(expected);
       expect(calls).toEqual(['PUT', 'GET', 'DELETE']);
-      expect(f.locations.view(f.project.organizationId!, location.id).status).toBe('error');
-      expect(() => f.locations.setDefault(f.project.organizationId!, location.id)).toThrow(/unavailable/);
+      expect((await f.locations.view(f.project.organizationId!, location.id)).status).toBe('error');
+      await expect((async () => (await f.locations.setDefault(f.project.organizationId!, location.id)))()).rejects.toThrow(/unavailable/);
     });
 
   it('enforces the managed physical-byte quota before retaining snapshot chunks', async () => {
-    const f = fixture(1024);
-    const managed = f.locations.defaultLocation(f.project.organizationId!);
-    const attachment = f.store.createResourceAttachment({ organizationId: f.project.organizationId!,
+    const f = (await fixture(1024));
+    const managed = (await f.locations.defaultLocation(f.project.organizationId!));
+    const attachment = (await f.store.createResourceAttachment({ organizationId: f.project.organizationId!,
       projectId: f.project.id, name: 'Large model', driver: 'volume@1', target: { kind: 'path', path: 'model' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [], storageLocationId: managed.id,
-      publish: 'discard' });
+      publish: 'discard' }));
 
     await expect(f.resources.importFiles(attachment.id,
       [{ path: 'model.bin', data: Buffer.alloc(2048, 7) }])).rejects.toThrow(/storage quota exceeded/i);
-    expect(f.locations.list(f.project.organizationId!)[0]!.usage.retainedBytes).toBe(0);
-    expect(f.store.listResourceRevisions(attachment.id)).toHaveLength(0);
+    expect((await f.locations.list(f.project.organizationId!))[0]!.usage.retainedBytes).toBe(0);
+    expect((await f.store.listResourceRevisions(attachment.id))).toHaveLength(0);
 
-    f.locations.reserveUpload('upload-a', f.project.organizationId!, managed.id, 700, Date.now() + 60_000);
-    expect(() => f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 400, Date.now() + 60_000))
-      .toThrow(/upload quota exceeded/i);
-    f.locations.releaseUpload('upload-a');
-    expect(() => f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 400, Date.now() + 60_000))
-      .not.toThrow();
+    (await f.locations.reserveUpload('upload-a', f.project.organizationId!, managed.id, 700, Date.now() + 60_000));
+    await expect((async () => (await f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 400, Date.now() + 60_000)))()).rejects.toThrow(/upload quota exceeded/i);
+    (await f.locations.releaseUpload('upload-a'));
+    await (async () => (await f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 400, Date.now() + 60_000)))();
   });
 
-  it('counts promoted artifacts against the same managed organization quota', () => {
-    const f = fixture(1024);
-    const managed = f.locations.defaultLocation(f.project.organizationId!);
-    const task = f.store.createTask({ projectId: f.project.id, title: 'Artifact', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'artifact' } as any });
-    f.store.savePromotedArtifact({ id: 'artifact-1', organizationId: f.project.organizationId!,
+  it('counts promoted artifacts against the same managed organization quota', async () => {
+    const f = (await fixture(1024));
+    const managed = (await f.locations.defaultLocation(f.project.organizationId!));
+    const task = (await f.store.createTask({ projectId: f.project.id, title: 'Artifact', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'artifact' } as any }));
+    (await f.store.savePromotedArtifact({ id: 'artifact-1', organizationId: f.project.organizationId!,
       projectId: f.project.id, taskId: task.id, objectKey: 'artifact-1', sha256: 'abc', bytes: 800,
-      mediaType: 'application/octet-stream', name: 'artifact.bin', createdAt: Date.now() });
+      mediaType: 'application/octet-stream', name: 'artifact.bin', createdAt: Date.now() }));
 
-    expect(f.locations.view(f.project.organizationId!, managed.id).usage.retainedBytes).toBe(800);
-    expect(() => f.locations.reserveUpload('artifact-2', f.project.organizationId!, managed.id, 300, Date.now() + 60_000))
-      .toThrow(/upload quota exceeded/i);
+    expect((await f.locations.view(f.project.organizationId!, managed.id)).usage.retainedBytes).toBe(800);
+    await expect((async () => (await f.locations.reserveUpload('artifact-2', f.project.organizationId!, managed.id, 300, Date.now() + 60_000)))()).rejects.toThrow(/upload quota exceeded/i);
   });
 
   it('keeps customer S3 secrets vaulted and pins revisions to the tested location', async () => {
-    const f = fixture(1024);
+    const f = (await fixture(1024));
     const objects = new Map<string, Buffer>();
     const httpFetch = globalThis.fetch;
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -118,9 +115,9 @@ describe('organization storage locations', () => {
       endpoint: 'https://objects.example', bucket: 'tenant-data', region: 'eu-west-1', prefix: 'krmax/acme',
       accessKeyId: 'AKIA_TEST', secretAccessKey: 'super-secret' });
     const ready = await f.locations.test(f.project.organizationId!, location.id);
-    f.locations.setDefault(f.project.organizationId!, ready.id);
+    (await f.locations.setDefault(f.project.organizationId!, ready.id));
 
-    const visible = f.locations.list(f.project.organizationId!);
+    const visible = (await f.locations.list(f.project.organizationId!));
     expect(JSON.stringify(visible)).not.toContain('AKIA_TEST');
     expect(JSON.stringify(visible)).not.toContain('super-secret');
     expect(visible.find((candidate) => candidate.id === ready.id)).toMatchObject({
@@ -129,19 +126,19 @@ describe('organization storage locations', () => {
 
     // Reproduce #201 through the authenticated HTTP route: an agent from one
     // project attaches a data item in another, using an explicit S3 location.
-    const origin = f.store.createProject('Agent origin');
-    const task = f.store.createTask({ projectId: origin.id, title: 'Configure data', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'configure data' } });
+    const origin = (await f.store.createProject('Agent origin'));
+    const task = (await f.store.createTask({ projectId: origin.id, title: 'Configure data', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'configure data' } }));
     const tokens = new TokenAuthority();
     const caps = ['project:settings:write'];
-    const agent = tokens.mint({ taskId: task.id, profileId: 'maintainer', principal: `task:${task.id}`,
-      organizationId: f.project.organizationId, ceiling: caps, grantorCaps: caps });
+    const agent = (await tokens.mint({ taskId: task.id, profileId: 'maintainer', principal: `task:${task.id}`,
+      organizationId: f.project.organizationId, ceiling: caps, grantorCaps: caps }));
     const client = { workflow: { getHandle: () => ({}) } } as any;
     const worlds = new WorldRegistry();
     const api = new KarmaxApi({ store: f.store, tokens, client, worlds, taskQueue: 'test', resources: f.resources });
-    const gateway = new Gateway({ api, store: f.store, tokens, client, worlds, taskQueue: 'test',
+    const gateway = (await Gateway.create({ api, store: f.store, tokens, client, worlds, taskQueue: 'test',
       resources: f.resources, broker: f.broker, bus: new KarmaxBus(), contributions: new ContributionRegistry(),
-      overlays: new Overlays(), staticDir: 'web', agentInfo: { provider: 'mock', reason: 'S3 agent authorization test' } });
+      overlays: new Overlays(), staticDir: 'web', agentInfo: { provider: 'mock', reason: 'S3 agent authorization test' } }));
     const server = await gateway.listen(await findFreePortFrom(49_800));
     let revision: any;
     try {
@@ -153,27 +150,27 @@ describe('organization storage locations', () => {
       expect(response.status).toBe(200);
       const attachment = await response.json() as any;
       expect(attachment.storageLocationId).toBe(ready.id);
-      revision = f.store.getResourceRevision(attachment.revision.id);
+      revision = (await f.store.getResourceRevision(attachment.revision.id));
     } finally { await server.close(); }
     expect(revision.storageLocationId).toBe(ready.id);
     expect([...objects.keys()].some((key) => key.includes('/tenant-data/krmax/acme/resources/'))).toBe(true);
-    expect(f.locations.list(f.project.organizationId!).find((candidate) => candidate.id === ready.id)?.usage.retainedBytes).toBe(4);
-    expect(() => f.locations.delete(f.project.organizationId!, ready.id)).toThrow(/still used/i);
+    expect((await f.locations.list(f.project.organizationId!)).find((candidate) => candidate.id === ready.id)?.usage.retainedBytes).toBe(4);
+    await expect((async () => (await f.locations.delete(f.project.organizationId!, ready.id)))()).rejects.toThrow(/still used/i);
     // Verification uses immutable revision placement even after the head moves to managed storage.
-    const managed = f.locations.ensureManaged(f.project.organizationId!);
-    f.store.updateResourceAttachment(revision.attachmentId, { storageLocationId: managed.id });
+    const managed = (await f.locations.ensureManaged(f.project.organizationId!));
+    (await f.store.updateResourceAttachment(revision.attachmentId, { storageLocationId: managed.id }));
     const head = await f.resources.importFiles(revision.attachmentId, [{ path: 'new', data: Buffer.from('new') }]);
     const evidence = await f.resources.verifyRevision(f.project.id, revision.attachmentId, revision.id);
     expect(evidence).toMatchObject({ status: 'complete', storageLocationId: ready.id, verifiedBytes: 4 });
     expect(JSON.stringify(evidence)).not.toMatch(/AKIA_TEST|super-secret|objects.example|sealedRef|credential/);
-    expect(f.store.getResourceAttachment(revision.attachmentId)?.currentRevisionId).toBe(head.id);
+    expect((await f.store.getResourceAttachment(revision.attachmentId))?.currentRevisionId).toBe(head.id);
 
     // Even an internally inconsistent revision cannot route reads to another tenant's location.
-    const foreign = f.store.createOrganization({ name: 'Foreign storage' });
-    const foreignLocation = f.locations.ensureManaged(foreign.id);
+    const foreign = (await f.store.createOrganization({ name: 'Foreign storage' }));
+    const foreignLocation = (await f.locations.ensureManaged(foreign.id));
     const ref = JSON.parse(revision.sealedRef);
-    const invalid = f.store.saveResourceRevision({ ...revision, id: undefined,
-      storageLocationId: foreignLocation.id, sealedRef: JSON.stringify({ ...ref, storageLocationId: foreignLocation.id }) });
+    const invalid = (await f.store.saveResourceRevision({ ...revision, id: undefined,
+      storageLocationId: foreignLocation.id, sealedRef: JSON.stringify({ ...ref, storageLocationId: foreignLocation.id }) }));
     await expect(f.resources.verifyRevision(f.project.id, revision.attachmentId, invalid.id))
       .rejects.toThrow('resource revision storage is unavailable');
 

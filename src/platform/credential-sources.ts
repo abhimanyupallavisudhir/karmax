@@ -90,8 +90,8 @@ export const concurrencyKey = (credKey: string) => `concurrency:${credKey}`;
 
 /** The user-set concurrency cap for a credential, or undefined to use the coordinator's
  *  default. A stored value of `UNLIMITED_CONCURRENCY` means unbounded. */
-export function concurrencyFor(get: (k: string) => string | undefined, credKey: string): number | undefined {
-  const n = Number(get(concurrencyKey(credKey)));
+export async function concurrencyFor(get: (k: string) => string | undefined | Promise<string | undefined>, credKey: string): Promise<number | undefined> {
+  const n = Number((await get(concurrencyKey(credKey))));
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
@@ -126,15 +126,15 @@ export function remapCredentialPolicy(
 }
 
 /** Read the resolved policy layers for a task from a kv getter. */
-export function readPolicyLayers(
-  get: (k: string) => string | undefined,
+export async function readPolicyLayers(
+  get: (k: string) => string | undefined | Promise<string | undefined>,
   scope: { organizationId?: string; projectId?: string; taskId?: string },
-): { global?: CredPolicy; project?: CredPolicy; task?: CredPolicy } {
+): Promise<{ global?: CredPolicy; project?: CredPolicy; task?: CredPolicy }> {
   const organizationId = scope.organizationId ?? 'org_personal';
   return {
-    global: parsePolicy(get(credPolicyKey.organization(organizationId)))
-      ?? (organizationId === 'org_personal' ? parsePolicy(get(credPolicyKey.global())) : undefined),
-    project: scope.projectId ? parsePolicy(get(credPolicyKey.project(scope.projectId))) : undefined,
-    task: scope.taskId ? parsePolicy(get(credPolicyKey.task(scope.taskId))) : undefined,
+    global: parsePolicy((await get(credPolicyKey.organization(organizationId))))
+      ?? (organizationId === 'org_personal' ? parsePolicy((await get(credPolicyKey.global()))) : undefined),
+    project: scope.projectId ? parsePolicy((await get(credPolicyKey.project(scope.projectId)))) : undefined,
+    task: scope.taskId ? parsePolicy((await get(credPolicyKey.task(scope.taskId)))) : undefined,
   };
 }

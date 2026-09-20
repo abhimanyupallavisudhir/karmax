@@ -13,16 +13,16 @@ function memoryKv() {
 }
 
 describe('project environment proposals and builds', () => {
-  it('stores build-relevant recipes and tracks immutable provider artifacts', () => {
+  it('stores build-relevant recipes and tracks immutable provider artifacts', async () => {
     const environment = new ProjectEnvironment(memoryKv());
-    const spec = environment.setSpec('p', { image: 'node:22', setup: ['npm ci', ''], boot: ['echo boot'] });
+    const spec = (await environment.setSpec('p', { image: 'node:22', setup: ['npm ci', ''], boot: ['echo boot'] }));
     const digest = environment.digest(spec);
     expect(environment.digest({ ...spec, boot: ['changed'] })).toBe(digest);
     expect(environment.digest({ ...spec, setup: ['changed'] })).not.toBe(digest);
-    environment.recordBuild('p', { provider: 'container', digest, status: 'building' });
-    expect(environment.readyBuild('p', 'container', digest)).toBeUndefined();
-    environment.recordBuild('p', { provider: 'container', digest, status: 'ready', ref: 'image:tag' });
-    expect(environment.readyBuild('p', 'container', digest)?.ref).toBe('image:tag');
+    (await environment.recordBuild('p', { provider: 'container', digest, status: 'building' }));
+    expect((await environment.readyBuild('p', 'container', digest))).toBeUndefined();
+    (await environment.recordBuild('p', { provider: 'container', digest, status: 'ready', ref: 'image:tag' }));
+    expect((await environment.readyBuild('p', 'container', digest))?.ref).toBe('image:tag');
   });
 
   it('parses JSONC devcontainers and proposes setup from tracked declarations', () => {
@@ -91,17 +91,15 @@ describe('project environment proposals and builds', () => {
 });
 
 describe('service proposals', () => {
-  it('validates external connections and per-world service shapes', () => {
+  it('validates external connections and per-world service shapes', async () => {
     const services = new ProjectServices(memoryKv());
-    expect(() => services.save('p', { name: 'bad name', kind: 'per-world', image: 'postgres:16' }))
-      .toThrow(/alphanumeric/);
-    expect(() => services.save('p', { name: 'external', kind: 'external' }))
-      .toThrow(/secret resource/);
-    expect(() => services.save('p', { name: 'seed', kind: 'per-world', image: 'postgres:16',
-      seedResourceId: 'resource-1' })).toThrow(/container path/);
+    await expect((async () => (await services.save('p', { name: 'bad name', kind: 'per-world', image: 'postgres:16' })))()).rejects.toThrow(/alphanumeric/);
+    await expect((async () => (await services.save('p', { name: 'external', kind: 'external' })))()).rejects.toThrow(/secret resource/);
+    await expect((async () => (await services.save('p', { name: 'seed', kind: 'per-world', image: 'postgres:16',
+      seedResourceId: 'resource-1' })))()).rejects.toThrow(/container path/);
   });
 
-  it('derives isolated service recipes from Compose and stores typed resource references', () => {
+  it('derives isolated service recipes from Compose and stores typed resource references', async () => {
     const proposals = composeServiceProposals(`
 services:
   postgres:
@@ -119,8 +117,8 @@ services:
       urlTemplate: 'postgres://app:secret@{host}:{port}/app',
     })]);
     const services = new ProjectServices(memoryKv());
-    expect(services.save('p', { ...proposals[0]!, seedResourceId: 'resource-1',
-      seedContainerPath: '/docker-entrypoint-initdb.d/seed.sql' }).seedResourceId).toBe('resource-1');
+    expect((await services.save('p', { ...proposals[0]!, seedResourceId: 'resource-1',
+      seedContainerPath: '/docker-entrypoint-initdb.d/seed.sql' })).seedResourceId).toBe('resource-1');
     expect(composeServiceProposals('metadata: only')).toEqual([]);
     expect(() => composeServiceProposals('services: {db: {image: [}')).toThrow(/parse/);
   });

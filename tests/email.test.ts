@@ -51,16 +51,16 @@ describe('fromAddress + host guessing', () => {
 });
 
 describe('EmailService.configured', () => {
-  it('is false until config + resolvable secret exist', () => {
+  it('is false until config + resolvable secret exist', async () => {
     const cfg = { provider: 'resend' as const, from: 'a@b.dev', secretHandle: 'h' };
-    expect(new EmailService(() => cfg, () => 're_key').configured()).toBe(true);
-    expect(new EmailService(() => cfg, () => undefined).configured()).toBe(false); // secret gone
-    expect(new EmailService(() => ({ provider: 'resend', from: 'a@b.dev' }), () => 're_key').configured()).toBe(false); // no handle
-    expect(new EmailService(() => ({}), () => 're_key').configured()).toBe(false);
+    expect((await new EmailService(() => cfg, () => 're_key').configured())).toBe(true);
+    expect((await new EmailService(() => cfg, () => undefined).configured())).toBe(false); // secret gone
+    expect((await new EmailService(() => ({ provider: 'resend', from: 'a@b.dev' }), () => 're_key').configured())).toBe(false); // no handle
+    expect((await new EmailService(() => ({}), () => 're_key').configured())).toBe(false);
   });
-  it('smtp needs a host too', () => {
-    expect(new EmailService(() => ({ provider: 'smtp', from: 'a@b.dev', secretHandle: 'h', host: 'smtp.b.dev' }), () => 'pw').configured()).toBe(true);
-    expect(new EmailService(() => ({ provider: 'smtp', from: 'a@b.dev', secretHandle: 'h' }), () => 'pw').configured()).toBe(false); // no host
+  it('smtp needs a host too', async () => {
+    expect((await new EmailService(() => ({ provider: 'smtp', from: 'a@b.dev', secretHandle: 'h', host: 'smtp.b.dev' }), () => 'pw').configured())).toBe(true);
+    expect((await new EmailService(() => ({ provider: 'smtp', from: 'a@b.dev', secretHandle: 'h' }), () => 'pw').configured())).toBe(false); // no host
   });
   it('refuses to send when unconfigured', async () => {
     await expect(new EmailService(() => ({}), () => undefined).send({ to: 'x@y.dev', subject: 's', text: 't' }))

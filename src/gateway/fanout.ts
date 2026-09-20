@@ -11,18 +11,28 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
  */
 export class DurableEventFanout {
   private listeners = new Set<(event: KarmaxEvent & { seq?: number }, projectId?: string) => void>();
-  private cursor: number;
-  private timer: NodeJS.Timeout;
+  private cursor!: number;
+  private timer!: NodeJS.Timeout;
   private offBus?: () => void;
   private draining = false;
   private closed = false;
   private scheduled?: NodeJS.Immediate;
 
   constructor(private store: Store, bus?: KarmaxBus, intervalMs = 500) {
+  }
+
+  static async create(store: Store, bus?: KarmaxBus, intervalMs = 500) {
+    const instance = new DurableEventFanout(store, bus, intervalMs);
+    await instance.initialize(store, bus, intervalMs);
+    return instance;
+  }
+
+  private async initialize(store: Store, bus?: KarmaxBus, intervalMs = 500) {
+
     // This used to call allEventsSince(0).at(-1), parsing the entire append-only
     // event log just to learn one integer. On a real karmax home that is tens of
     // MiB of JSON and hundreds of MiB of short-lived objects at every boot.
-    this.cursor = store.latestEventSeq();
+    this.cursor = (await store.latestEventSeq());
     this.timer = setInterval(() => this.schedule(), intervalMs);
     this.timer.unref();
     this.offBus = bus?.onAny(() => this.schedule());

@@ -3,17 +3,17 @@ import type { ProjectService } from '../domain/types.js';
 
 const KV_PREFIX = 'project-services:';
 export interface ProjectServicesStore {
-  kvGet(key: string): string | undefined;
-  kvSet(key: string, value: string): void;
+  kvGet(key: string): (string | undefined) | Promise<string | undefined>;
+  kvSet(key: string, value: string): (void) | Promise<void>;
 }
 
 export class ProjectServices {
   constructor(private store: ProjectServicesStore) {}
-  list(projectId: string): ProjectService[] {
-    try { return JSON.parse(this.store.kvGet(KV_PREFIX + projectId) ?? '[]') as ProjectService[]; }
+  async list(projectId: string): Promise<ProjectService[]> {
+    try { return JSON.parse((await this.store.kvGet(KV_PREFIX + projectId)) ?? '[]') as ProjectService[]; }
     catch { return []; }
   }
-  save(projectId: string, service: ProjectService): ProjectService {
+  async save(projectId: string, service: ProjectService): Promise<ProjectService> {
     const name = service.name?.trim();
     if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name ?? '')) throw new Error('service name must be alphanumeric with - or _');
     if (service.kind === 'external' && !service.connectionResourceId)
@@ -26,14 +26,14 @@ export class ProjectServices {
       if (service.seedResourceId && !service.seedContainerPath) throw new Error('a seed resource needs a container path');
     }
     const record = { ...service, name };
-    this.store.kvSet(KV_PREFIX + projectId, JSON.stringify([
-      ...this.list(projectId).filter((candidate) => candidate.name !== name), record,
-    ]));
+    (await this.store.kvSet(KV_PREFIX + projectId, JSON.stringify([
+      ...(await this.list(projectId)).filter((candidate) => candidate.name !== name), record,
+    ])));
     return record;
   }
-  delete(projectId: string, name: string): void {
-    this.store.kvSet(KV_PREFIX + projectId, JSON.stringify(
-      this.list(projectId).filter((candidate) => candidate.name !== name)));
+  async delete(projectId: string, name: string): Promise<void> {
+    (await this.store.kvSet(KV_PREFIX + projectId, JSON.stringify(
+      (await this.list(projectId)).filter((candidate) => candidate.name !== name))));
   }
 }
 

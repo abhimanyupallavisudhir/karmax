@@ -19,14 +19,14 @@ function provider(service: McpConnections, connection: McpConnection, data: any,
     clientMetadata: { client_name: 'Tavya', redirect_uris: [redirect], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' },
     state: () => data.pending.state,
     clientInformation: () => data.client,
-    saveClientInformation: (client) => { data.client = client; service.setSecret(connection, data); },
+    saveClientInformation: async (client) => { data.client = client; (await service.setSecret(connection, data)); },
     tokens: () => data.tokens,
-    saveTokens: (tokens) => { data.tokens = { ...tokens, refresh_token: tokens.refresh_token ?? data.tokens?.refresh_token }; data.expiresAt = Date.now() + (tokens.expires_in ?? 3600) * 1000; service.setSecret(connection, data); },
+    saveTokens: async (tokens) => { data.tokens = { ...tokens, refresh_token: tokens.refresh_token ?? data.tokens?.refresh_token }; data.expiresAt = Date.now() + (tokens.expires_in ?? 3600) * 1000; (await service.setSecret(connection, data)); },
     redirectToAuthorization: (url) => { onRedirect(publicUrl(url.href).href); },
-    saveCodeVerifier: (verifier) => { data.pending.verifier = verifier; service.setSecret(connection, data); },
+    saveCodeVerifier: async (verifier) => { data.pending.verifier = verifier; (await service.setSecret(connection, data)); },
     codeVerifier: () => data.pending?.verifier ?? '',
     discoveryState: () => data.discovery,
-    saveDiscoveryState: (state) => { data.discovery = state; service.setSecret(connection, data); },
+    saveDiscoveryState: async (state) => { data.discovery = state; (await service.setSecret(connection, data)); },
   };
 }
 export async function beginOAuth(service: McpConnections, c: McpConnection, actor: string, redirect: string) {
@@ -36,7 +36,7 @@ export async function beginOAuth(service: McpConnections, c: McpConnection, acto
     data.tokens = undefined;
     data.pending = { state: crypto.randomBytes(32).toString('hex'), actor, expires: Date.now() + 600_000, revision: c.revision };
     data.redirect = redirect;
-    service.setSecret(c, data);
+    (await service.setSecret(c, data));
     let authorizationUrl = '';
     await auth(provider(service, c, data, redirect, (url) => { authorizationUrl = url; }), { serverUrl: (c.transport as any).url, fetchFn: publicFetch });
     if (!authorizationUrl) throw new Error('Server did not provide an authorization URL');
@@ -51,11 +51,11 @@ export async function finishOAuth(service: McpConnections, c: McpConnection, act
       || typeof state !== 'string' || !/^[a-f0-9]{64}$/.test(state) || !crypto.timingSafeEqual(Buffer.from(state), Buffer.from(pending.state))) throw new Error('Authorization expired or belongs to another session. Connect again.');
     if (typeof code !== 'string' || !code || code.length > 4096) throw new Error('Invalid authorization code');
     // Consume before exchanging. Preserve verifier only inside this invocation.
-    service.setSecret(c, { ...data, pending: undefined });
+    (await service.setSecret(c, { ...data, pending: undefined }));
     const p = provider(service, c, data, data.redirect, () => { throw new Error('Authorization must be restarted'); });
     try {
       await auth(p, { serverUrl: (c.transport as any).url, authorizationCode: code, fetchFn: publicFetch });
-    } finally { delete data.pending; service.setSecret(c, data); }
+    } finally { delete data.pending; (await service.setSecret(c, data)); }
   });
 }
 export async function connectionHeaders(service: McpConnections, c: McpConnection, taskId?: string): Promise<Record<string, string>> {

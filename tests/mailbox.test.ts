@@ -46,19 +46,19 @@ describe('mailbox providers (§8: connect once, not an env var)', () => {
 });
 
 describe('AgentMail address upgrades when a domain is connected later', () => {
-  it('a placeholder @agent.local address upgrades to the real domain, same local part', () => {
+  it('a placeholder @agent.local address upgrades to the real domain, same local part', async () => {
     const store = memStore();
     // org first reads its address before any provider is connected
-    const before = new AgentMail(store, undefined).address('org_a');
+    const before = (await new AgentMail(store, undefined).address('org_a'));
     expect(before).toMatch(/@agent\.local$/);
     const local = before.split('@')[0];
     // operator connects a domain; the same org now sees the upgraded address
-    const after = new AgentMail(store, 'agents.myco.com').address('org_a');
+    const after = (await new AgentMail(store, 'agents.myco.com').address('org_a'));
     expect(after).toBe(`${local}@agents.myco.com`);
     // reverse route still points at the org (so inbound mail still lands)
     const mail = new AgentMail(store, 'agents.myco.com');
-    expect(mail.ownerOf(after)).toBe('org_a');
+    expect((await mail.ownerOf(after))).toBe('org_a');
     // a real domain is never downgraded back to the placeholder
-    expect(new AgentMail(store, undefined).address('org_a')).toBe(after);
+    expect((await new AgentMail(store, undefined).address('org_a'))).toBe(after);
   });
 });

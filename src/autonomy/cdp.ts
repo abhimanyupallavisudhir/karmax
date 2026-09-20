@@ -22,7 +22,7 @@ export interface CdpTarget {
 
 export interface CdpSession {
   call(method: string, params?: Record<string, unknown>): Promise<any>;
-  close(): void;
+  close(): (void) | Promise<void>;
 }
 
 export function assertLoopback(cdpUrl: string): URL {
@@ -129,7 +129,7 @@ export async function openPage(cdpUrl: string, opts: { expectDomains?: string[];
     }
     return { session, origin };
   } catch (e) {
-    session.close();
+    (await session.close());
     throw e;
   }
 }

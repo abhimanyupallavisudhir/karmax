@@ -35,11 +35,11 @@ export async function retryCredentials(
   task: { id: string; projectId: string },
   provider: string,
 ): Promise<void> {
-  const organizationId = deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
+  const organizationId = (await deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
   const all = enumerateCredentials(gatherCredentialSources({ ...deps, organizationId }));
-  const layers = readPolicyLayers((key) => deps.store.kvGet(key), {
+  const layers = (await readPolicyLayers(async (key) => (await deps.store.kvGet(key)), {
     organizationId, projectId: task.projectId, taskId: task.id,
-  });
+  }));
   const aliases = credentialAliases(provider);
   const eligible = resolveCredentials(all, layers).filter((credential) =>
     aliases.includes(credential.provider)
@@ -81,7 +81,7 @@ export async function refreshCredentialHealth(
         ? probeCodexUsage({ configHome })
         : probeClaudeUsage({ configHome }))
         .then(async (snapshot) => {
-          deps.store.kvSet(`usage:${credential.key}`, JSON.stringify(snapshot));
+          (await deps.store.kvSet(`usage:${credential.key}`, JSON.stringify(snapshot)));
           if (usageProvesAvailable(snapshot)) {
             // Clear only an automatic quarantine. The compare guard runs inside
             // the coordinator, so a racing user disable cannot be overwritten.

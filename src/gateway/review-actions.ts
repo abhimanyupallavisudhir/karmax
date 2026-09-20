@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../util/async-collections.js';
 import type { WorldHandle, WorldProcess } from '../world/types.js';
 import { WorldRegistry } from '../world/registry.js';
 import type { Store } from '../store/db.js';
@@ -63,11 +64,11 @@ export class ReviewActionRunner {
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
     private access?: import('../world/access.js').WorldAccessService,
     private resources?: import('../world/resources.js').ProjectResourceService) {
-    this.commandPoll = setInterval(() => {
+    this.commandPoll = setInterval(async () => {
       for (const rec of this.procs.values()) {
         if (!rec.running) continue;
-        this.store.heartbeatExecution(rec.procId);
-        if (this.store.execution(rec.procId)?.state === 'stop-requested') void rec.process.kill('SIGTERM');
+        (await this.store.heartbeatExecution(rec.procId));
+        if ((await this.store.execution(rec.procId))?.state === 'stop-requested') void rec.process.kill('SIGTERM');
       }
     }, 1_000);
     this.commandPoll.unref();
@@ -82,8 +83,8 @@ export class ReviewActionRunner {
     openUrls?: string[];
   }): Promise<RunningAction> {
     const procId = newId('execution');
-    const task = this.store.getTask(opts.taskId);
-    const project = task ? this.store.getProject(task.projectId) : undefined;
+    const task = (await this.store.getTask(opts.taskId));
+    const project = task ? (await this.store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) throw new Error('review execution has no owning project');
     let runnerLeaseId: string | undefined;
     if (this.worlds.get(opts.world.kind).capabilities?.remote && this.runners) {
@@ -93,18 +94,18 @@ export class ReviewActionRunner {
     const previewLeaseIds: string[] = [];
     let openUrls: string[];
     try {
-      openUrls = (opts.openUrls ?? []).map((url) => reviewUrl(
+      openUrls = (await __asyncCollections.map((opts.openUrls ?? []), async (url) => (await reviewUrl(
         this.store, opts.taskId, opts.world, url, previewLeaseIds,
-      ));
+      ))));
       const durableOpenUrls = openUrls.map(redactPreviewToken);
-      this.store.createExecution({ id: procId, organizationId: project.organizationId, projectId: project.id,
+      (await this.store.createExecution({ id: procId, organizationId: project.organizationId, projectId: project.id,
         taskId: opts.taskId, worldId: opts.world.id, generation: opts.world.generation ?? 1,
         kind: 'review-action', label: opts.label, command: opts.command, server: !!opts.server,
-        openUrls: durableOpenUrls, runnerLeaseId });
+        openUrls: durableOpenUrls, runnerLeaseId }));
     } catch (error) {
       if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
-      else if (runnerLeaseId) this.runners?.release(runnerLeaseId, opts.world.kind);
-      for (const id of previewLeaseIds) this.store.revokePreviewLease(id);
+      else if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, opts.world.kind));
+      for (const id of previewLeaseIds) (await this.store.revokePreviewLease(id));
       throw error;
     }
     let process: WorldProcess;
@@ -113,14 +114,14 @@ export class ReviewActionRunner {
       const world = this.resources ? await this.resources.prepare(opened) : opened;
       process = await world.startProcess({ command: opts.command });
     } catch (error) {
-      this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system');
-      this.store.finishExecution(procId, null, 'failed');
+      (await this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system'));
+      (await this.store.finishExecution(procId, null, 'failed'));
       if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
-      else if (runnerLeaseId) this.runners?.release(runnerLeaseId, opts.world.kind);
-      for (const id of previewLeaseIds) this.store.revokePreviewLease(id);
+      else if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, opts.world.kind));
+      for (const id of previewLeaseIds) (await this.store.revokePreviewLease(id));
       throw error;
     }
-    this.store.setExecutionRunning(procId);
+    (await this.store.setExecutionRunning(procId));
     const rec: RunningAction = {
       procId,
       taskId: opts.taskId,
@@ -139,19 +140,19 @@ export class ReviewActionRunner {
       previewLeaseIds,
       world: opts.world,
     };
-    const append = (buf: unknown) => {
+    const append = async (buf: unknown) => {
       const s = String(buf);
       rec.output = (rec.output + s).slice(-MAX_OUTPUT);
-      this.store.appendExecutionFrame(procId, s);
+      (await this.store.appendExecutionFrame(procId, s));
       for (const l of rec.listeners) l(s, false, null);
     };
     process.onOutput(append);
-    process.onExit((code) => {
+    process.onExit(async (code) => {
       rec.running = false;
       rec.exitCode = code;
-      this.store.finishExecution(procId, code);
-      this.releaseLease(rec, opts.world.kind);
-      this.revokePreviews(rec);
+      (await this.store.finishExecution(procId, code));
+      (await this.releaseLease(rec, opts.world.kind));
+      (await this.revokePreviews(rec));
       for (const l of rec.listeners) l('', true, rec.exitCode);
       // The durable execution record (and its frames) now answers status/attach;
       // keeping the in-memory buffer would grow the map by MAX_OUTPUT per run.
@@ -166,39 +167,38 @@ export class ReviewActionRunner {
     return this.procs.get(procId);
   }
 
-  status(procId: string): ActionStatus | undefined {
+  async status(procId: string): Promise<ActionStatus | undefined> {
     const r = this.procs.get(procId);
     if (r) return toStatus(r);
-    const durable = this.store.execution(procId);
+    const durable = (await this.store.execution(procId));
     if (!durable) return undefined;
     return {
       procId: durable.id, taskId: durable.taskId, label: durable.label, command: durable.command ?? '',
       server: durable.server, openUrls: durable.openUrls, startedAt: durable.startedAt,
-      output: this.store.executionFrames(procId).map((frame) => frame.data).join('').slice(-MAX_OUTPUT),
+      output: (await this.store.executionFrames(procId)).map((frame) => frame.data).join('').slice(-MAX_OUTPUT),
       exitCode: durable.exitCode ?? null,
       running: ['starting', 'running', 'stop-requested'].includes(durable.state),
     };
   }
 
-  listFor(taskId: string): ActionStatus[] {
-    return this.store.listExecutions(taskId).filter((execution) => execution.kind === 'review-action')
-      .map((execution) => this.status(execution.id)!).filter(Boolean);
+  async listFor(taskId: string): Promise<ActionStatus[]> {
+    return (await __asyncCollections.map((await this.store.listExecutions(taskId)).filter((execution) => execution.kind === 'review-action'), async (execution) => (await this.status(execution.id))!)).filter(Boolean);
   }
 
   /** Subscribe to live output; returns an unsubscribe fn. Emits nothing historical
    *  — the caller sends `rec.output` first, then attaches for the live tail. */
-  attach(procId: string, listener: ActionListener): () => void {
+  async attach(procId: string, listener: ActionListener): Promise<() => void> {
     const rec = this.procs.get(procId);
     if (rec) {
       rec.listeners.add(listener);
       return () => rec.listeners.delete(listener);
     }
-    let seq = this.store.executionFrames(procId).at(-1)?.seq ?? 0;
+    let seq = (await this.store.executionFrames(procId)).at(-1)?.seq ?? 0;
     let stopped = false;
-    const poll = () => {
+    const poll = async () => {
       if (stopped) return;
-      for (const frame of this.store.executionFrames(procId, seq)) { seq = frame.seq; listener(frame.data, false, null); }
-      const execution = this.store.execution(procId);
+      for (const frame of (await this.store.executionFrames(procId, seq))) { seq = frame.seq; listener(frame.data, false, null); }
+      const execution = (await this.store.execution(procId));
       if (!execution || !['starting', 'running', 'stop-requested'].includes(execution.state)) {
         listener('', true, execution?.exitCode ?? null);
         stopped = true;
@@ -207,12 +207,12 @@ export class ReviewActionRunner {
     };
     const timer = setInterval(poll, 500);
     timer.unref();
-    poll();
+    (await poll());
     return () => { stopped = true; clearInterval(timer); };
   }
 
-  stop(procId: string): boolean {
-    const requested = this.store.requestExecutionStop(procId);
+  async stop(procId: string): Promise<boolean> {
+    const requested = (await this.store.requestExecutionStop(procId));
     const rec = this.procs.get(procId);
     if (!rec || !rec.running) return requested;
     void rec.process.kill('SIGTERM');
@@ -223,47 +223,47 @@ export class ReviewActionRunner {
   }
 
   /** Kill everything — called on gateway shutdown so no dev server is orphaned. */
-  stopAll(): void {
+  async stopAll(): Promise<void> {
     clearInterval(this.commandPoll);
     for (const rec of this.procs.values()) if (rec.running) {
-      this.store.finishExecution(rec.procId, null, 'cancelled');
+      (await this.store.finishExecution(rec.procId, null, 'cancelled'));
       void rec.process.kill('SIGKILL');
-      this.releaseLease(rec, rec.provider);
-      this.revokePreviews(rec);
+      (await this.releaseLease(rec, rec.provider));
+      (await this.revokePreviews(rec));
     }
     this.procs.clear();
   }
 
-  private releaseLease(rec: RunningAction, provider: string): void {
+  private async releaseLease(rec: RunningAction, provider: string): Promise<void> {
     if (!rec.runnerLeaseId || rec.leaseReleased) return;
     rec.leaseReleased = true;
     if (this.access) void this.access.releaseLeaseAndParkIfIdle(rec.world, rec.runnerLeaseId);
-    else this.runners?.release(rec.runnerLeaseId, provider);
+    else (await this.runners?.release(rec.runnerLeaseId, provider));
   }
 
-  private revokePreviews(rec: RunningAction): void {
-    for (const id of rec.previewLeaseIds.splice(0)) this.store.revokePreviewLease(id);
+  private async revokePreviews(rec: RunningAction): Promise<void> {
+    for (const id of rec.previewLeaseIds.splice(0)) (await this.store.revokePreviewLease(id));
   }
 }
 
 /** Localhost in a cloud world means that world's loopback, not the browser's.
  * Route it through karmax's authenticated preview proxy. */
-function reviewUrl(store: Store, taskId: string, world: WorldHandle, value: string, leases: string[]): string {
+async function reviewUrl(store: Store, taskId: string, world: WorldHandle, value: string, leases: string[]): Promise<string> {
   if (['worktree', 'container', 'memory'].includes(world.kind)) return value;
   try {
     const url = new URL(value);
     if (!['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(url.hostname)) return value;
     const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
     if (!Number.isInteger(port) || port < 1 || port > 65_535) return value;
-    const task = store.getTask(taskId);
-    const project = task ? store.getProject(task.projectId) : undefined;
+    const task = (await store.getTask(taskId));
+    const project = task ? (await store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) return value;
     const token = newPreviewToken();
-    const lease = store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
+    const lease = (await store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
       projectId: project.id, taskId, worldId: world.id, generation: world.generation ?? 1, port,
       public: false, tokenHash: hashPreviewToken(token), provider: world.kind,
       createdBy: 'system:review-action', createdAt: Date.now(),
-      expiresAt: Date.now() + reviewPreviewTtlMs() });
+      expiresAt: Date.now() + reviewPreviewTtlMs() }));
     leases.push(lease.id);
     return previewLeaseUrl(lease.id, `${url.pathname}${url.search}`, token);
   } catch {

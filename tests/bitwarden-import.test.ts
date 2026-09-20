@@ -101,7 +101,7 @@ describe('Bitwarden JSON export import', () => {
     ]);
   });
 
-  it('imports into encrypted vault storage and re-imports by Bitwarden id', () => {
+  it('imports into encrypted vault storage and re-imports by Bitwarden id', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-bw-import-'));
     const kv = new Map<string, string>();
     const store: VaultItemStore = {
@@ -112,10 +112,10 @@ describe('Bitwarden JSON export import', () => {
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const vault = new VaultItems(store, broker, path.join(dir, 'state'));
 
-    const first = importBitwardenExport(vault, exported, { use: 'ask', reveal: 'never' });
+    const first = (await importBitwardenExport(vault, exported, { use: 'ask', reveal: 'never' }));
     expect(first).toMatchObject({ count: 3, created: 3, updated: 0 });
-    expect(vault.list()).toHaveLength(3);
-    expect(vault.findByExternal('import:bitwarden', 'login-1')).toMatchObject({
+    expect((await vault.list())).toHaveLength(3);
+    expect((await vault.findByExternal('import:bitwarden', 'login-1'))).toMatchObject({
       label: 'GitHub',
       tags: ['Bitwarden/Work'],
       policy: { use: 'ask', reveal: 'never' },
@@ -123,11 +123,11 @@ describe('Bitwarden JSON export import', () => {
 
     const changed = structuredClone(exported);
     changed.items[0]!.login!.password = 'rotated';
-    const second = importBitwardenExport(vault, changed);
+    const second = (await importBitwardenExport(vault, changed));
     expect(second).toMatchObject({ count: 3, created: 0, updated: 3 });
-    expect(vault.list()).toHaveLength(3);
-    const login = vault.findByExternal('import:bitwarden', 'login-1')!;
-    expect(vault.resolveField(login, 'password', { mode: 'reveal' })).toBe('rotated');
+    expect((await vault.list())).toHaveLength(3);
+    const login = (await vault.findByExternal('import:bitwarden', 'login-1'))!;
+    expect((await vault.resolveField(login, 'password', { mode: 'reveal' }))).toBe('rotated');
     // Re-import updates secrets without resetting a policy the user selected.
     expect(login.policy).toEqual({ use: 'ask', reveal: 'never' });
   });

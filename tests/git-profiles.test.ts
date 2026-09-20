@@ -44,164 +44,164 @@ async function makeRepo(name: string): Promise<string> {
 }
 
 describe('GitProfiles registry (PLAN-git-config §3)', () => {
-  it('assigns the legacy flat registry only to org_personal', () => {
+  it('assigns the legacy flat registry only to org_personal', async () => {
     kv.set('git:profiles', JSON.stringify([{ name: 'legacy', userName: 'Old', userEmail: 'old@example.test' }]));
-    expect(profiles.get('legacy')?.userName).toBe('Old');
-    expect(new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_other').list()).toEqual([]);
+    expect((await profiles.get('legacy'))?.userName).toBe('Old');
+    expect((await new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_other').list())).toEqual([]);
   });
 
-  it('saves, lists, defaults and deletes profiles; secrets live in the vault as flags', () => {
-    profiles.save({ name: 'personal', userName: 'Jane', userEmail: 'jane@example.com', githubToken: 'ghp_secret' });
-    profiles.save({ name: 'work', userName: 'Jane W', userEmail: 'jane@corp.com' });
-    expect(profiles.list().map((p) => p.name).sort()).toEqual(['personal', 'work']);
-    const p = profiles.get('personal')!;
+  it('saves, lists, defaults and deletes profiles; secrets live in the vault as flags', async () => {
+    (await profiles.save({ name: 'personal', userName: 'Jane', userEmail: 'jane@example.com', githubToken: 'ghp_secret' }));
+    (await profiles.save({ name: 'work', userName: 'Jane W', userEmail: 'jane@corp.com' }));
+    expect((await profiles.list()).map((p) => p.name).sort()).toEqual(['personal', 'work']);
+    const p = (await profiles.get('personal'))!;
     expect(p.githubToken).toBe(true); // a flag — never the secret
     expect(p.sshKey).toBeUndefined();
     expect(broker.hasHandle(gitHandle('personal', 'token'))).toBe(true);
     expect(JSON.stringify([...kv.entries()])).not.toContain('ghp_secret'); // registry carries no secret
 
     // default: none → set → cleared on delete
-    expect(profiles.resolve({})).toBeUndefined();
-    profiles.setDefault('personal');
-    expect(profiles.resolve({})?.name).toBe('personal');
-    expect(profiles.resolve({ gitProfile: 'work' })?.name).toBe('work'); // project selection wins
-    profiles.delete('personal');
-    expect(profiles.get('personal')).toBeUndefined();
+    expect((await profiles.resolve({}))).toBeUndefined();
+    (await profiles.setDefault('personal'));
+    expect((await profiles.resolve({}))?.name).toBe('personal');
+    expect((await profiles.resolve({ gitProfile: 'work' }))?.name).toBe('work'); // project selection wins
+    (await profiles.delete('personal'));
+    expect((await profiles.get('personal'))).toBeUndefined();
     expect(broker.hasHandle(gitHandle('personal', 'token'))).toBe(false);
-    expect(profiles.resolve({})).toBeUndefined();
+    expect((await profiles.resolve({}))).toBeUndefined();
   });
 
-  it('re-saving with a blank secret keeps the stored one; a new value replaces it', () => {
-    profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', githubToken: 'tok-1' });
-    profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com' }); // no token supplied
-    expect(profiles.get('p')!.userName).toBe('J2');
-    expect(profiles.get('p')!.githubToken).toBe(true);
-    expect(profiles.env(profiles.get('p')!, {}).GH_TOKEN).toBe('tok-1');
-    profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com', githubToken: 'tok-2' });
-    expect(profiles.env(profiles.get('p')!, {}).GH_TOKEN).toBe('tok-2');
+  it('re-saving with a blank secret keeps the stored one; a new value replaces it', async () => {
+    (await profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', githubToken: 'tok-1' }));
+    (await profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com' })); // no token supplied
+    expect((await profiles.get('p'))!.userName).toBe('J2');
+    expect((await profiles.get('p'))!.githubToken).toBe(true);
+    expect((await profiles.env((await profiles.get('p'))!, {})).GH_TOKEN).toBe('tok-1');
+    (await profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com', githubToken: 'tok-2' }));
+    expect((await profiles.env((await profiles.get('p'))!, {})).GH_TOKEN).toBe('tok-2');
   });
 
   it('isolates same-named profiles and vault handles between organizations', async () => {
     const acme = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
     const beta = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_beta');
-    acme.save({ name: 'work', userName: 'Acme Bot', userEmail: 'bot@acme.test', githubToken: 'acme-token' });
-    beta.save({ name: 'work', userName: 'Beta Bot', userEmail: 'bot@beta.test', githubToken: 'beta-token' });
-    acme.setDefault('work');
+    (await acme.save({ name: 'work', userName: 'Acme Bot', userEmail: 'bot@acme.test', githubToken: 'acme-token' }));
+    (await beta.save({ name: 'work', userName: 'Beta Bot', userEmail: 'bot@beta.test', githubToken: 'beta-token' }));
+    (await acme.setDefault('work'));
 
-    expect(acme.resolve({})?.userEmail).toBe('bot@acme.test');
-    expect(beta.resolve({})).toBeUndefined();
-    expect(acme.env(acme.get('work')!, {}).GH_TOKEN).toBe('acme-token');
-    expect(beta.env(beta.get('work')!, {}).GH_TOKEN).toBe('beta-token');
+    expect((await acme.resolve({}))?.userEmail).toBe('bot@acme.test');
+    expect((await beta.resolve({}))).toBeUndefined();
+    expect((await acme.env((await acme.get('work'))!, {})).GH_TOKEN).toBe('acme-token');
+    expect((await beta.env((await beta.get('work'))!, {})).GH_TOKEN).toBe('beta-token');
     expect(gitHandle('work', 'token', 'org_acme')).not.toBe(gitHandle('work', 'token', 'org_beta'));
 
-    acme.delete('work');
-    expect(beta.get('work')?.userEmail).toBe('bot@beta.test');
+    (await acme.delete('work'));
+    expect((await beta.get('work'))?.userEmail).toBe('bot@beta.test');
     expect(broker.hasHandle(gitHandle('work', 'token', 'org_beta'))).toBe(true);
     expect((await acme.preflight({})).tier).toBe('unconfigured');
   });
 
-  it('stores each user’s development identity outside every organization registry', () => {
+  it('stores each user’s development identity outside every organization registry', async () => {
     const jane = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
     const sam = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_sam'));
-    jane.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' });
-    jane.setDefault('main');
-    sam.save({ name: 'main', userName: 'Sam Dev', userEmail: 'sam@example.test', githubToken: 'sam-token' });
-    sam.setDefault('main');
+    (await jane.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' }));
+    (await jane.setDefault('main'));
+    (await sam.save({ name: 'main', userName: 'Sam Dev', userEmail: 'sam@example.test', githubToken: 'sam-token' }));
+    (await sam.setDefault('main'));
 
-    expect(jane.resolve({})?.userEmail).toBe('jane@example.test');
-    expect(sam.resolve({})?.userEmail).toBe('sam@example.test');
-    expect(profiles.list()).toEqual([]);
-    expect(jane.env(jane.get('main')!, {}).GH_TOKEN).toBe('jane-token');
-    expect(sam.env(sam.get('main')!, {}).GH_TOKEN).toBe('sam-token');
+    expect((await jane.resolve({}))?.userEmail).toBe('jane@example.test');
+    expect((await sam.resolve({}))?.userEmail).toBe('sam@example.test');
+    expect((await profiles.list())).toEqual([]);
+    expect((await jane.env((await jane.get('main'))!, {})).GH_TOKEN).toBe('jane-token');
+    expect((await sam.env((await sam.get('main'))!, {})).GH_TOKEN).toBe('sam-token');
   });
 
-  it('infers the default commit identity from GitHub and keeps signing optional', () => {
+  it('infers the default commit identity from GitHub and keeps signing optional', async () => {
     const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
-    expect(user.saveGithubIdentity({ id: 12345, login: 'jane-dev', name: 'Jane Developer' })).toMatchObject({
+    expect((await user.saveGithubIdentity({ id: 12345, login: 'jane-dev', name: 'Jane Developer' }))).toMatchObject({
       name: 'github', userName: 'Jane Developer', userEmail: '12345+jane-dev@users.noreply.github.com',
       github: { id: '12345', login: 'jane-dev' },
     });
-    expect(user.defaultProfile()).toBe('github');
-    expect(user.saveGithubSigningKey('PRIVATE SIGNING KEY')).toMatchObject({ signingKey: true });
+    expect((await user.defaultProfile())).toBe('github');
+    expect((await user.saveGithubSigningKey('PRIVATE SIGNING KEY'))).toMatchObject({ signingKey: true });
     expect(broker.hasHandle(gitHandle('github', 'signing', userGitScope('user_jane')))).toBe(true);
     // Reconnecting refreshes public identity without dropping the signing key.
-    expect(user.saveGithubIdentity({ id: '12345', login: 'jane-renamed' })).toMatchObject({
+    expect((await user.saveGithubIdentity({ id: '12345', login: 'jane-renamed' }))).toMatchObject({
       userName: 'jane-renamed', userEmail: '12345+jane-renamed@users.noreply.github.com', signingKey: true,
     });
   });
 
-  it('keeps per-account custom identities separate and supports an organization automation identity', () => {
+  it('keeps per-account custom identities separate and supports an organization automation identity', async () => {
     const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
-    user.saveGithubIdentity({ id: '1', login: 'first', name: 'First Person' });
-    user.saveGithubIdentity({ id: '2', login: 'second' });
-    user.saveGithubCustomIdentity('2', { userName: 'Release Author', userEmail: 'release@example.test', signingKey: 'SIGN' });
-    expect(user.githubProfile('1')).toMatchObject({ name: 'github', userName: 'First Person' });
-    expect(user.githubProfile('2')).toMatchObject({ name: 'github-2', userName: 'Release Author',
+    (await user.saveGithubIdentity({ id: '1', login: 'first', name: 'First Person' }));
+    (await user.saveGithubIdentity({ id: '2', login: 'second' }));
+    (await user.saveGithubCustomIdentity('2', { userName: 'Release Author', userEmail: 'release@example.test', signingKey: 'SIGN' }));
+    expect((await user.githubProfile('1'))).toMatchObject({ name: 'github', userName: 'First Person' });
+    expect((await user.githubProfile('2'))).toMatchObject({ name: 'github-2', userName: 'Release Author',
       userEmail: 'release@example.test', customIdentity: { userName: 'Release Author', userEmail: 'release@example.test' }, signingKey: true });
-    expect(user.setActiveGithub('2').name).toBe('github-2');
+    expect((await user.setActiveGithub('2')).name).toBe('github-2');
 
     const organization = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
-    expect(organization.saveAutomationIdentity({ userName: 'Acme Bot' })).toMatchObject({
+    expect((await organization.saveAutomationIdentity({ userName: 'Acme Bot' }))).toMatchObject({
       userName: 'Acme Bot', userEmail: 'krmax+org-acme@localhost', customIdentity: { userName: 'Acme Bot' },
     });
-    expect(organization.saveAutomationIdentity({})).toMatchObject({ userName: 'krmax' });
+    expect((await organization.saveAutomationIdentity({}))).toMatchObject({ userName: 'krmax' });
   });
 
-  it('lets an empty organization link its default to an authorized user profile without copying secrets', () => {
+  it('lets an empty organization link its default to an authorized user profile without copying secrets', async () => {
     const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
-    user.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' });
-    user.setDefault('main');
+    (await user.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' }));
+    (await user.setDefault('main'));
     const organization = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
 
-    const linked = organization.reuseUserProfile(user);
+    const linked = (await organization.reuseUserProfile(user));
     expect(linked.source).toEqual({ kind: 'user', userId: 'user_jane', profile: 'main' });
-    expect(organization.defaultProfile()).toBe('main');
-    expect(organization.env(linked, {}).GH_TOKEN).toBe('jane-token');
-    user.save({ name: 'main', userName: 'Jane Updated', userEmail: 'new@example.test', githubToken: 'rotated-token' });
-    expect(organization.get('main')).toMatchObject({ userName: 'Jane Updated', userEmail: 'new@example.test' });
-    expect(organization.env(organization.get('main')!, {}).GH_TOKEN).toBe('rotated-token');
+    expect((await organization.defaultProfile())).toBe('main');
+    expect((await organization.env(linked, {})).GH_TOKEN).toBe('jane-token');
+    (await user.save({ name: 'main', userName: 'Jane Updated', userEmail: 'new@example.test', githubToken: 'rotated-token' }));
+    expect((await organization.get('main'))).toMatchObject({ userName: 'Jane Updated', userEmail: 'new@example.test' });
+    expect((await organization.env((await organization.get('main'))!, {})).GH_TOKEN).toBe('rotated-token');
     expect(broker.hasHandle(gitHandle('main', 'token', 'org_acme'))).toBe(false);
-    expect(() => organization.reuseUserProfile(user)).toThrow(/already configured/i);
+    await expect((async () => (await organization.reuseUserProfile(user)))()).rejects.toThrow(/already configured/i);
   });
 
-  it('inherits a GitHub profile when the user connects before their personal workspace exists', () => {
-    const db = new Store(':memory:');
+  it('inherits a GitHub profile when the user connects before their personal workspace exists', async () => {
+    const db = (await Store.create(':memory:'));
     const user = new GitProfiles(db, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
-    user.saveGithubIdentity({ id: '12345', login: 'jane-dev', name: 'Jane Developer' });
-    const personal = db.createOrganization({ name: "Jane's workspace", kind: 'personal', ownerUserId: 'user_jane' });
+    (await user.saveGithubIdentity({ id: '12345', login: 'jane-dev', name: 'Jane Developer' }));
+    const personal = (await db.createOrganization({ name: "Jane's workspace", kind: 'personal', ownerUserId: 'user_jane' }));
 
-    expect(inheritPersonalGithubProfile(db, broker, 'user_jane')).toMatchObject({
+    expect((await inheritPersonalGithubProfile(db, broker, 'user_jane'))).toMatchObject({
       github: { id: '12345', login: 'jane-dev' },
       source: { kind: 'user', userId: 'user_jane', profile: 'github' },
     });
-    expect(new GitProfiles(db, broker, path.join(tmp, 'state'), personal.id).resolve(undefined)).toMatchObject({
+    expect((await new GitProfiles(db, broker, path.join(tmp, 'state'), personal.id).resolve(undefined))).toMatchObject({
       userName: 'Jane Developer',
       source: { kind: 'user', userId: 'user_jane', profile: 'github' },
     });
-    db.close();
+    (await db.close());
   });
 
-  it('inherits after workspace creation but never replaces organization GitHub configuration', () => {
-    const db = new Store(':memory:');
-    const inherited = db.createOrganization({ name: "Jane's workspace", kind: 'personal', ownerUserId: 'user_jane' });
-    const configured = db.createOrganization({ name: "Pat's workspace", kind: 'personal', ownerUserId: 'user_pat' });
+  it('inherits after workspace creation but never replaces organization GitHub configuration', async () => {
+    const db = (await Store.create(':memory:'));
+    const inherited = (await db.createOrganization({ name: "Jane's workspace", kind: 'personal', ownerUserId: 'user_jane' }));
+    const configured = (await db.createOrganization({ name: "Pat's workspace", kind: 'personal', ownerUserId: 'user_pat' }));
     const jane = new GitProfiles(db, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
     const pat = new GitProfiles(db, broker, path.join(tmp, 'state'), userGitScope('user_pat'));
-    jane.saveGithubIdentity({ id: '1', login: 'jane' });
-    pat.saveGithubIdentity({ id: '2', login: 'pat' });
-    db.upsertGitConnection({ organizationId: configured.id, provider: 'github', installationId: '99',
-      accountLogin: 'pat', accountType: 'User' });
+    (await jane.saveGithubIdentity({ id: '1', login: 'jane' }));
+    (await pat.saveGithubIdentity({ id: '2', login: 'pat' }));
+    (await db.upsertGitConnection({ organizationId: configured.id, provider: 'github', installationId: '99',
+      accountLogin: 'pat', accountType: 'User' }));
 
-    expect(inheritPersonalGithubProfile(db, broker, 'user_jane')?.source?.userId).toBe('user_jane');
-    expect(new GitProfiles(db, broker, path.join(tmp, 'state'), inherited.id).defaultProfile()).toBe('github');
-    expect(inheritPersonalGithubProfile(db, broker, 'user_pat')).toBeUndefined();
-    expect(new GitProfiles(db, broker, path.join(tmp, 'state'), configured.id).list()).toEqual([]);
-    db.close();
+    expect((await inheritPersonalGithubProfile(db, broker, 'user_jane'))?.source?.userId).toBe('user_jane');
+    expect((await new GitProfiles(db, broker, path.join(tmp, 'state'), inherited.id).defaultProfile())).toBe('github');
+    expect((await inheritPersonalGithubProfile(db, broker, 'user_pat'))).toBeUndefined();
+    expect((await new GitProfiles(db, broker, path.join(tmp, 'state'), configured.id).list())).toEqual([]);
+    (await db.close());
   });
 
-  it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', () => {
-    profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', sshKey: 'FAKE-KEY-MATERIAL', githubToken: 'tok' });
-    const env = profiles.env(profiles.get('p')!, {});
+  it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', async () => {
+    (await profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', sshKey: 'FAKE-KEY-MATERIAL', githubToken: 'tok' }));
+    const env = (await profiles.env((await profiles.get('p'))!, {}));
     expect(env.GIT_SSH_COMMAND).toMatch(/^ssh -i .* -o IdentitiesOnly=yes -o UserKnownHostsFile=.* -o StrictHostKeyChecking=accept-new$/);
     const keyPath = env.GIT_SSH_COMMAND!.match(/^ssh -i (\S+)/)![1]!;
     const knownHostsPath = env.GIT_SSH_COMMAND!.match(/UserKnownHostsFile=(\S+)/)![1]!;
@@ -261,8 +261,8 @@ describe('worktree-scoped identity (PLAN-git-config §4A)', () => {
     } catch {
       return; // no ssh-keygen on this host — skip
     }
-    profiles.save({ name: 'signer', userName: 'Alice', userEmail: 'alice@x.com', signingKey: fs.readFileSync(keyFile, 'utf8') });
-    const identity = profiles.identity(profiles.get('signer')!, {});
+    (await profiles.save({ name: 'signer', userName: 'Alice', userEmail: 'alice@x.com', signingKey: fs.readFileSync(keyFile, 'utf8') }));
+    const identity = (await profiles.identity((await profiles.get('signer'))!, {}));
     expect(identity.signingKeyPath).toBeTruthy();
     // git signs with the private key; it needs the .pub alongside for ssh signing
     fs.writeFileSync(`${identity.signingKeyPath}.pub`, `${pub}\n`);
@@ -302,7 +302,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
     const { WorldRegistry } = await import('../src/world/registry.js');
     const { ProfileResolver } = await import('../src/agent/profiles.js');
     const { makeCoreActivities } = await import('../src/activities/core.js');
-    const store2 = new Store(':memory:');
+    const store2 = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
     const core = makeCoreActivities({ store: store2, worlds, adapters: new Map(), profiles: new ProfileResolver(store2, 'mock'), broker });
@@ -327,7 +327,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
     const { WorldRegistry } = await import('../src/world/registry.js');
     const { ProfileResolver } = await import('../src/agent/profiles.js');
     const { makeCoreActivities } = await import('../src/activities/core.js');
-    const store2 = new Store(':memory:');
+    const store2 = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
     const core = makeCoreActivities({ store: store2, worlds, adapters: new Map(), profiles: new ProfileResolver(store2, 'mock'), broker });
@@ -346,10 +346,10 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const { WorldRegistry } = await import('../src/world/registry.js');
       const { ProfileResolver } = await import('../src/agent/profiles.js');
       const { makeCoreActivities } = await import('../src/activities/core.js');
-      const store2 = new Store(':memory:');
+      const store2 = (await Store.create(':memory:'));
       // register the profile in THIS store (the activities read the same kv table)
       const gp = new GitProfiles(store2, broker);
-      gp.save({ name: 'personal', userName: 'Jane', userEmail: 'jane@example.com' });
+      (await gp.save({ name: 'personal', userName: 'Jane', userEmail: 'jane@example.com' }));
       const worlds = new WorldRegistry();
       worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
       const core = makeCoreActivities({ store: store2, worlds, adapters: new Map(), profiles: new ProfileResolver(store2, 'mock'), broker });
@@ -379,23 +379,23 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const { WorldRegistry } = await import('../src/world/registry.js');
       const { ProfileResolver } = await import('../src/agent/profiles.js');
       const { makeCoreActivities } = await import('../src/activities/core.js');
-      const store2 = new Store(':memory:');
-      const organization = store2.createOrganization({ name: 'Acme', ownerUserId: 'jane' });
-      const project = store2.createProject('Product', { repos: [repo] }, organization.id);
+      const store2 = (await Store.create(':memory:'));
+      const organization = (await store2.createOrganization({ name: 'Acme', ownerUserId: 'jane' }));
+      const project = (await store2.createProject('Product', { repos: [repo] }, organization.id));
       const orgProfiles = new GitProfiles(store2, broker, undefined, organization.id);
-      orgProfiles.save({ name: 'shared', userName: 'Acme Bot', userEmail: 'bot@acme.test' });
-      orgProfiles.setDefault('shared');
+      (await orgProfiles.save({ name: 'shared', userName: 'Acme Bot', userEmail: 'bot@acme.test' }));
+      (await orgProfiles.setDefault('shared'));
       const userProfiles = new GitProfiles(store2, broker, undefined, userGitScope('jane'));
-      userProfiles.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test' });
-      userProfiles.setDefault('main');
-      const task = store2.createTask({
+      (await userProfiles.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test' }));
+      (await userProfiles.setDefault('main'));
+      const task = (await store2.createTask({
         projectId: project.id,
         title: 'Change product',
         workflow: 'software-dev',
         workflowVersion: '1.0.0',
         params: { prompt: 'change it' },
         createdBy: { kind: 'user', userId: 'jane' },
-      });
+      }));
       const worlds = new WorldRegistry();
       worlds.register(new WorktreeProvider(path.join(tmp, 'creator-worlds')));
       const core = makeCoreActivities({ store: store2, worlds, adapters: new Map(), profiles: new ProfileResolver(store2, 'mock'), broker });
@@ -423,9 +423,9 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const { WorldRegistry } = await import('../src/world/registry.js');
       const { ProfileResolver } = await import('../src/agent/profiles.js');
       const { makeCoreActivities } = await import('../src/activities/core.js');
-      const store2 = new Store(':memory:');
-      const organization = store2.createOrganization({ name: 'Acme' });
-      const project = store2.createProject('Acme project', {}, organization.id);
+      const store2 = (await Store.create(':memory:'));
+      const organization = (await store2.createOrganization({ name: 'Acme' }));
+      const project = (await store2.createProject('Acme project', {}, organization.id));
       broker.registerHandle('claude:personal-key', 'must-not-leak');
       const worlds = new WorldRegistry();
       worlds.register(new WorktreeProvider(path.join(tmp, 'tenant-worlds')));
@@ -447,7 +447,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
 
       const organizationHandle = `claude:${organization.id}:work`;
       broker.registerHandle(organizationHandle, 'tenant-key');
-      store2.upsertProfile({
+      (await store2.upsertProfile({
         id: 'do-default',
         name: 'Do',
         role: 'do',
@@ -456,7 +456,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
         // A historical profile restriction is ignored; the scoped Credentials
         // policy is the only routing authority.
         allowedAccounts: ['key:claude:personal-key'],
-      });
+      }));
       expect(await core.resolveCredentialOrder({
         taskId: 'tenant-task',
         projectId: project.id,

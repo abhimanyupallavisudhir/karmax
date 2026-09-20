@@ -31,7 +31,7 @@ const promoted = results.map((result) => (result instanceof Error
   ? { error: true }
   : { email: result.user.email, role: result.user.role }));
 // Whoever the store actually marked admin, cross-checked against the claims above.
-const admins = raced.listUsers().filter((user) => user.role === 'admin').map((user) => user.email).sort();
+const admins = (await raced.listUsers()).filter((user) => user.role === 'admin').map((user) => user.email).sort();
 // Every response that claimed administrator must name an account that IS one.
 const claimsHonest = promoted.every((claim) => 'error' in claim || admins.includes(claim.email!));
 

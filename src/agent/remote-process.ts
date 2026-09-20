@@ -443,7 +443,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
   kill(_signal: NodeJS.Signals = 'SIGTERM'): boolean {
     if (this.killed) return false;
     this.killed = true;
-    void this.ready.then((pty) => pty.close()).catch(() => undefined);
+    void this.ready.then(async (pty) => (await pty.close())).catch(() => undefined);
     return true;
   }
 

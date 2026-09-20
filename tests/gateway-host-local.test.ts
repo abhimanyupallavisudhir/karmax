@@ -42,15 +42,15 @@ describe('host-filesystem endpoints follow hostLocal, not hosted', () => {
     fs.mkdirSync(hostSecrets);
     fs.writeFileSync(path.join(hostSecrets, 'id_rsa'), 'PRIVATE-KEY-BYTES');
 
-    store = new Store(':memory:');
-    projectId = store.createProject('Acme', { repos: [home] } as any).id;
+    store = (await Store.create(':memory:'));
+    projectId = (await store.createProject('Acme', { repos: [home] } as any)).id;
     // A resource the import routes can target.
-    store.createResourceAttachment({ id: 'res_1', organizationId: 'org_personal', projectId,
+    (await store.createResourceAttachment({ id: 'res_1', organizationId: 'org_personal', projectId,
       name: 'Secrets', driver: 'volume@1', target: { kind: 'path', path: '.secrets' } as any,
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' } as any);
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' } as any));
 
     const imported: string[] = [];
-    const gateway = new Gateway({
+    const gateway = (await Gateway.create({
       store,
       bus: new KarmaxBus(),
       tokens: new TokenAuthority(),
@@ -70,7 +70,7 @@ describe('host-filesystem endpoints follow hostLocal, not hosted', () => {
         importDirectory: async (_id: string, dir: string) => { imported.push(dir); return { id: 'rev_1', files: [] }; },
         importFiles: async () => ({ id: 'rev_2', files: [] }),
       } as any,
-    } as any);
+    } as any));
     (globalThis as any).__imported = imported;
     const running = await gateway.listen(await findFreePortFrom(48_300));
     base = running.url;

@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { CredentialBroker } from '../autonomy/broker.js';
@@ -18,45 +19,45 @@ export class StorageLocationService {
   constructor(private store: Store, private managed: ObjectStore, private broker: CredentialBroker,
     private managedQuotaBytes?: number, private allowPrivateEndpoints = true) {}
 
-  ensureManaged(organizationId: string): StorageLocation {
+  async ensureManaged(organizationId: string): Promise<StorageLocation> {
     const id = managedStorageLocationId(organizationId);
-    const existing = this.store.getStorageLocation(id);
+    const existing = (await this.store.getStorageLocation(id));
     if (existing) {
-      this.store.backfillManagedStorageLocation(organizationId, id);
+      (await this.store.backfillManagedStorageLocation(organizationId, id));
       if (existing.quotaBytes !== this.managedQuotaBytes)
-        return this.store.saveStorageLocation({ ...existing, quotaBytes: this.managedQuotaBytes, updatedAt: Date.now() });
+        return (await this.store.saveStorageLocation({ ...existing, quotaBytes: this.managedQuotaBytes, updatedAt: Date.now() }));
       return existing;
     }
-    const created = this.store.saveStorageLocation({ id, organizationId, name: 'Managed storage', kind: 'managed',
-      config: {}, isDefault: this.store.listStorageLocations(organizationId).length === 0,
-      status: 'ready', quotaBytes: this.managedQuotaBytes, createdAt: Date.now(), updatedAt: Date.now() });
-    this.store.backfillManagedStorageLocation(organizationId, id);
+    const created = (await this.store.saveStorageLocation({ id, organizationId, name: 'Managed storage', kind: 'managed',
+      config: {}, isDefault: (await this.store.listStorageLocations(organizationId)).length === 0,
+      status: 'ready', quotaBytes: this.managedQuotaBytes, createdAt: Date.now(), updatedAt: Date.now() }));
+    (await this.store.backfillManagedStorageLocation(organizationId, id));
     return created;
   }
 
-  list(organizationId: string): Array<Omit<StorageLocation, 'credentialHandle'> & { credentialConfigured: boolean; usage: StorageLocationUsage }> {
-    this.ensureManaged(organizationId);
-    return this.store.listStorageLocations(organizationId).map(({ credentialHandle, ...location }) => ({
+  async list(organizationId: string): Promise<Array<Omit<StorageLocation, 'credentialHandle'> & { credentialConfigured: boolean; usage: StorageLocationUsage }>> {
+    (await this.ensureManaged(organizationId));
+    return (await __asyncCollections.map((await this.store.listStorageLocations(organizationId)), async ({ credentialHandle, ...location }) => ({
       ...location, credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)),
-      usage: this.store.storageLocationUsage(location.id),
-    }));
+      usage: (await this.store.storageLocationUsage(location.id)),
+    })));
   }
 
-  view(organizationId: string, id: string): Omit<StorageLocation, 'credentialHandle'>
-    & { credentialConfigured: boolean; usage: StorageLocationUsage } {
-    const { credentialHandle, ...location } = this.ownedLocation(organizationId, id);
+  async view(organizationId: string, id: string): Promise<Omit<StorageLocation, 'credentialHandle'>
+    & { credentialConfigured: boolean; usage: StorageLocationUsage }> {
+    const { credentialHandle, ...location } = (await this.ownedLocation(organizationId, id));
     return { ...location, credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)),
-      usage: this.store.storageLocationUsage(id) };
+      usage: (await this.store.storageLocationUsage(id)) };
   }
 
-  defaultLocation(organizationId: string): StorageLocation {
-    this.ensureManaged(organizationId);
-    return this.store.listStorageLocations(organizationId).find((candidate) => candidate.isDefault)
-      ?? this.ensureManaged(organizationId);
+  async defaultLocation(organizationId: string): Promise<StorageLocation> {
+    (await this.ensureManaged(organizationId));
+    return (await this.store.listStorageLocations(organizationId)).find((candidate) => candidate.isDefault)
+      ?? (await this.ensureManaged(organizationId));
   }
 
-  requireForOrganization(organizationId: string, id?: string): StorageLocation {
-    const location = this.ownedLocation(organizationId, id);
+  async requireForOrganization(organizationId: string, id?: string): Promise<StorageLocation> {
+    const location = (await this.ownedLocation(organizationId, id));
     if (location.kind === 's3' && location.status !== 'ready')
       throw new Error(location.status === 'error'
         ? `storage location is unavailable: ${location.lastError ?? 'connection failed'}`
@@ -67,12 +68,12 @@ export class StorageLocationService {
   async connectS3(organizationId: string, input: { id?: string; name: string; endpoint: string; bucket: string;
     region?: string; prefix?: string; accessKeyId?: string; secretAccessKey?: string; sessionToken?: string;
   }): Promise<StorageLocation> {
-    this.ensureManaged(organizationId);
+    (await this.ensureManaged(organizationId));
     const endpoint = normalizedEndpoint(input.endpoint, this.allowPrivateEndpoints);
     const bucket = input.bucket.trim();
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,254}$/.test(bucket)) throw new Error('invalid S3 bucket');
     const prefix = normalizedPrefix(input.prefix ?? `karmax/${organizationId}`);
-    const existing = input.id ? this.store.getStorageLocation(input.id) : undefined;
+    const existing = input.id ? (await this.store.getStorageLocation(input.id)) : undefined;
     if (existing && (existing.organizationId !== organizationId || existing.kind !== 's3'))
       throw new Error('storage location does not belong to organization');
     const id = existing?.id ?? newId('storage');
@@ -82,29 +83,29 @@ export class StorageLocationService {
       this.broker.registerHandle(handle, JSON.stringify({ accessKeyId: input.accessKeyId,
         secretAccessKey: input.secretAccessKey, sessionToken: input.sessionToken }));
     } else if (!this.broker.hasHandle(handle)) throw new Error('S3 access key is required');
-    const value = this.store.saveStorageLocation({ id, organizationId, name: input.name.trim() || 'Customer S3', kind: 's3',
+    const value = (await this.store.saveStorageLocation({ id, organizationId, name: input.name.trim() || 'Customer S3', kind: 's3',
       config: { endpoint, bucket, region: input.region?.trim() || 'us-east-1', prefix }, credentialHandle: handle,
       // A customer bucket cannot become a data-plane default until the explicit
       // write/read/delete probe succeeds. Preserve an existing default while it
       // is being rotated, but runtime use pauses until the re-test passes.
       isDefault: existing?.isDefault ?? false, status: 'untested',
-      createdAt: existing?.createdAt ?? Date.now(), updatedAt: Date.now() });
+      createdAt: existing?.createdAt ?? Date.now(), updatedAt: Date.now() }));
     this.stores.delete(id);
     return value;
   }
 
-  setDefault(organizationId: string, id: string): StorageLocation {
-    const location = this.requireForOrganization(organizationId, id);
+  async setDefault(organizationId: string, id: string): Promise<StorageLocation> {
+    const location = (await this.requireForOrganization(organizationId, id));
     if (location.status !== 'ready') throw new Error('test the storage location before making it the default');
-    return this.store.saveStorageLocation({ ...location, isDefault: true, updatedAt: Date.now() });
+    return (await this.store.saveStorageLocation({ ...location, isDefault: true, updatedAt: Date.now() }));
   }
 
   async test(organizationId: string, id: string): Promise<StorageLocation> {
-    const location = this.ownedLocation(organizationId, id);
+    const location = (await this.ownedLocation(organizationId, id));
     if (location.kind === 'managed') return location;
     const key = `.karmax-connection-test/${crypto.randomBytes(12).toString('hex')}`;
     try {
-      const objects = this.objectStore(location.id);
+      const objects = (await this.objectStore(location.id));
       const expected = Buffer.from('karmax storage connection test');
       await objects.put(key, expected);
       try {
@@ -117,26 +118,26 @@ export class StorageLocationService {
         throw error;
       }
       await objects.delete(key);
-      return this.store.saveStorageLocation({ ...location, status: 'ready', lastCheckedAt: Date.now(),
-        lastError: undefined, updatedAt: Date.now() });
+      return (await this.store.saveStorageLocation({ ...location, status: 'ready', lastCheckedAt: Date.now(),
+        lastError: undefined, updatedAt: Date.now() }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.store.saveStorageLocation({ ...location, status: 'error', lastCheckedAt: Date.now(),
-        lastError: message.slice(0, 500), updatedAt: Date.now() });
+      (await this.store.saveStorageLocation({ ...location, status: 'error', lastCheckedAt: Date.now(),
+        lastError: message.slice(0, 500), updatedAt: Date.now() }));
       throw new Error(`could not use customer S3 storage: ${message}`);
     }
   }
 
-  delete(organizationId: string, id: string): void {
-    const location = this.ownedLocation(organizationId, id);
+  async delete(organizationId: string, id: string): Promise<void> {
+    const location = (await this.ownedLocation(organizationId, id));
     if (location.kind === 'managed') throw new Error('managed storage cannot be removed');
-    this.store.deleteStorageLocation(id);
+    (await this.store.deleteStorageLocation(id));
     if (location.credentialHandle) this.broker.deleteHandle(location.credentialHandle);
     this.stores.delete(id);
   }
 
-  objectStore(id: string): ObjectStore {
-    const location = this.store.getStorageLocation(id);
+  async objectStore(id: string): Promise<ObjectStore> {
+    const location = (await this.store.getStorageLocation(id));
     if (!location) throw new Error('storage location not found');
     if (location.kind === 'managed') return this.managed;
     const cached = this.stores.get(id);
@@ -151,15 +152,15 @@ export class StorageLocationService {
     return objects;
   }
 
-  reserveUpload(uploadId: string, organizationId: string, locationId: string, bytes: number, expiresAt: number): void {
-    this.ownedLocation(organizationId, locationId);
-    this.store.reserveStorageUpload(uploadId, organizationId, locationId, bytes, expiresAt);
+  async reserveUpload(uploadId: string, organizationId: string, locationId: string, bytes: number, expiresAt: number): Promise<void> {
+    (await this.ownedLocation(organizationId, locationId));
+    (await this.store.reserveStorageUpload(uploadId, organizationId, locationId, bytes, expiresAt));
   }
 
-  releaseUpload(uploadId: string): void { this.store.releaseStorageUpload(uploadId); }
+  async releaseUpload(uploadId: string): Promise<void> { (await this.store.releaseStorageUpload(uploadId)); }
 
-  private ownedLocation(organizationId: string, id?: string): StorageLocation {
-    const location = id ? this.store.getStorageLocation(id) : this.defaultLocation(organizationId);
+  private async ownedLocation(organizationId: string, id?: string): Promise<StorageLocation> {
+    const location = id ? (await this.store.getStorageLocation(id)) : (await this.defaultLocation(organizationId));
     if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
     return location;
   }

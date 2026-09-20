@@ -7,15 +7,15 @@ const KV_SPEC = 'project-environment:';
 const KV_BUILDS = 'project-environment-builds:';
 
 export interface ProjectEnvironmentStore {
-  kvGet(key: string): string | undefined;
-  kvSet(key: string, value: string): void;
+  kvGet(key: string): (string | undefined) | Promise<string | undefined>;
+  kvSet(key: string, value: string): (void) | Promise<void>;
 }
 
 export class ProjectEnvironment {
   constructor(private store: ProjectEnvironmentStore) {}
 
-  spec(projectId: string): ProjectEnvironmentSpec | undefined {
-    const raw = this.store.kvGet(KV_SPEC + projectId);
+  async spec(projectId: string): Promise<ProjectEnvironmentSpec | undefined> {
+    const raw = (await this.store.kvGet(KV_SPEC + projectId));
     if (!raw) return undefined;
     try {
       const parsed = JSON.parse(raw) as ProjectEnvironmentSpec;
@@ -23,14 +23,14 @@ export class ProjectEnvironment {
     } catch { return undefined; }
   }
 
-  setSpec(projectId: string, spec: ProjectEnvironmentSpec): ProjectEnvironmentSpec {
+  async setSpec(projectId: string, spec: ProjectEnvironmentSpec): Promise<ProjectEnvironmentSpec> {
     const clean: ProjectEnvironmentSpec = {
       ...(spec.image?.trim() ? { image: spec.image.trim() } : {}),
       ...(spec.setup?.length ? { setup: spec.setup.map((value) => value.trim()).filter(Boolean) } : {}),
       ...(spec.boot?.length ? { boot: spec.boot.map((value) => value.trim()).filter(Boolean) } : {}),
       ...(spec.includeDocker ? { includeDocker: true } : {}),
     };
-    this.store.kvSet(KV_SPEC + projectId, JSON.stringify(clean));
+    (await this.store.kvSet(KV_SPEC + projectId, JSON.stringify(clean)));
     return clean;
   }
 
@@ -40,23 +40,23 @@ export class ProjectEnvironment {
     })).digest('hex').slice(0, 16);
   }
 
-  builds(projectId: string): EnvironmentBuildRecord[] {
-    try { return JSON.parse(this.store.kvGet(KV_BUILDS + projectId) ?? '[]') as EnvironmentBuildRecord[]; }
+  async builds(projectId: string): Promise<EnvironmentBuildRecord[]> {
+    try { return JSON.parse((await this.store.kvGet(KV_BUILDS + projectId)) ?? '[]') as EnvironmentBuildRecord[]; }
     catch { return []; }
   }
 
-  recordBuild(projectId: string, value: Omit<EnvironmentBuildRecord, 'createdAt' | 'updatedAt'>): EnvironmentBuildRecord {
-    const builds = this.builds(projectId);
+  async recordBuild(projectId: string, value: Omit<EnvironmentBuildRecord, 'createdAt' | 'updatedAt'>): Promise<EnvironmentBuildRecord> {
+    const builds = (await this.builds(projectId));
     const prior = builds.find((candidate) => candidate.provider === value.provider && candidate.digest === value.digest);
     const next = { ...value, createdAt: prior?.createdAt ?? Date.now(), updatedAt: Date.now() };
-    this.store.kvSet(KV_BUILDS + projectId, JSON.stringify([
+    (await this.store.kvSet(KV_BUILDS + projectId, JSON.stringify([
       ...builds.filter((candidate) => candidate.provider !== value.provider || candidate.digest !== value.digest), next,
-    ]));
+    ])));
     return next;
   }
 
-  readyBuild(projectId: string, provider: string, digest: string): EnvironmentBuildRecord | undefined {
-    const record = this.builds(projectId).find((candidate) =>
+  async readyBuild(projectId: string, provider: string, digest: string): Promise<EnvironmentBuildRecord | undefined> {
+    const record = (await this.builds(projectId)).find((candidate) =>
       candidate.provider === provider && candidate.digest === digest);
     return record?.status === 'ready' && record.ref ? record : undefined;
   }

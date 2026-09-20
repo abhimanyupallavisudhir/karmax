@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import net from 'node:net';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -337,8 +338,8 @@ function retryDelayMs(response: Response, attempt = 0, method = 'GET'): number |
 /** Organization-owned GitHub App integration. Durable App secrets live only in
  * the credential broker. Git transport uses short-lived installation tokens. */
 export class GitHubAppService {
-  private fetcher: typeof fetch;
-  private apiBase: string;
+  private fetcher!: typeof fetch;
+  private apiBase!: string;
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
@@ -350,11 +351,21 @@ export class GitHubAppService {
   private tokenInvalidatedAt = new Map<string, number>();
 
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
+  }
+
+  static async create(store: Store, broker: CredentialBroker, options: GitHubAppOptions = {}) {
+    const instance = new GitHubAppService(store, broker, options);
+    await instance.initialize(store, broker, options);
+    return instance;
+  }
+
+  private async initialize(store: Store, broker: CredentialBroker, options: GitHubAppOptions = {}) {
+
     this.options = {
       ...options,
-      appId: options.appId?.trim() || store.kvGet(GITHUB_APP_ID_KEY),
-      appSlug: options.appSlug?.trim() || store.kvGet(GITHUB_APP_SLUG_KEY),
-      clientId: options.clientId?.trim() || store.kvGet(GITHUB_APP_CLIENT_ID_KEY),
+      appId: options.appId?.trim() || (await store.kvGet(GITHUB_APP_ID_KEY)),
+      appSlug: options.appSlug?.trim() || (await store.kvGet(GITHUB_APP_SLUG_KEY)),
+      clientId: options.clientId?.trim() || (await store.kvGet(GITHUB_APP_CLIENT_ID_KEY)),
     };
     this.fetcher = options.fetch ?? fetch;
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
@@ -373,15 +384,15 @@ export class GitHubAppService {
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] }) };
   }
 
-  status(userId?: string): { configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
+  async status(userId?: string): Promise<{ configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
     webhookConfigured: boolean; syncMode: 'webhook' | 'on-demand'; userAuthorized: boolean;
-    lastAuthorizationFailure?: GitHubUserAuthorizationFailure } {
+    lastAuthorizationFailure?: GitHubUserAuthorizationFailure }> {
     let syncMode: 'webhook' | 'on-demand' = 'on-demand';
     try {
-      const publicUrl = this.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY);
+      const publicUrl = (await this.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY));
       if (publicUrl && publicWebhookOrigin(new URL(publicUrl))) syncMode = 'webhook';
     } catch {}
-    const lastAuthorizationFailure = userId ? this.lastUserAuthorizationFailure(userId) : undefined;
+    const lastAuthorizationFailure = userId ? (await this.lastUserAuthorizationFailure(userId)) : undefined;
     return {
       configured: this.configured(),
       ...(this.options.appId ? { appId: this.options.appId } : {}),
@@ -389,7 +400,7 @@ export class GitHubAppService {
       oauthConfigured: Boolean(this.options.clientId && this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)),
       webhookConfigured: this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE),
       syncMode,
-      userAuthorized: Boolean(userId && (this.userAccounts(userId).some((account) =>
+      userAuthorized: Boolean(userId && ((await this.userAccounts(userId)).some((account) =>
         this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
         || this.broker.hasHandle(legacyGithubUserTokenHandle(userId)))),
       ...(lastAuthorizationFailure ? { lastAuthorizationFailure } : {}),
@@ -399,14 +410,14 @@ export class GitHubAppService {
   /** GitHub changes an App's URL slug when its display name is renamed. Keep
    * the locally cached slug aligned with the authenticated `/app` response so
    * later installation links do not keep pointing at the retired brand URL. */
-  private rememberAppSlug(slug: string): void {
+  private async rememberAppSlug(slug: string): Promise<void> {
     if (slug === this.options.appSlug) return;
     this.options.appSlug = slug;
-    this.store.kvSet(GITHUB_APP_SLUG_KEY, slug);
+    (await this.store.kvSet(GITHUB_APP_SLUG_KEY, slug));
   }
 
-  configure(input: { appId: string | number; appSlug: string; privateKey: string; webhookSecret?: string;
-    clientId?: string; clientSecret?: string }): ReturnType<GitHubAppService['status']> {
+  async configure(input: { appId: string | number; appSlug: string; privateKey: string; webhookSecret?: string;
+    clientId?: string; clientSecret?: string }): Promise<ReturnType<GitHubAppService['status']>> {
     const appId = String(input.appId).trim();
     const appSlug = input.appSlug.trim();
     if (!/^\d+$/.test(appId)) throw new Error('GitHub App id must be numeric');
@@ -416,14 +427,14 @@ export class GitHubAppService {
     this.options.appId = appId;
     this.options.appSlug = appSlug;
     this.options.clientId = input.clientId?.trim() || this.options.clientId;
-    this.store.kvSet(GITHUB_APP_ID_KEY, appId);
-    this.store.kvSet(GITHUB_APP_SLUG_KEY, appSlug);
-    if (this.options.clientId) this.store.kvSet(GITHUB_APP_CLIENT_ID_KEY, this.options.clientId);
+    (await this.store.kvSet(GITHUB_APP_ID_KEY, appId));
+    (await this.store.kvSet(GITHUB_APP_SLUG_KEY, appSlug));
+    if (this.options.clientId) (await this.store.kvSet(GITHUB_APP_CLIENT_ID_KEY, this.options.clientId));
     this.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, input.privateKey);
     if (input.webhookSecret) this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret);
     if (input.clientSecret) this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret);
     this.tokenCache.clear();
-    return this.status();
+    return (await this.status());
   }
 
   /** Payload for GitHub's App Manifest flow. The browser posts this directly to
@@ -476,8 +487,8 @@ export class GitHubAppService {
     });
     if (!response.ok) throw new Error(`GitHub manifest conversion failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
     const value = await response.json() as any;
-    return this.configure({ appId: value.id, appSlug: value.slug, privateKey: value.pem,
-      webhookSecret: value.webhook_secret, clientId: value.client_id, clientSecret: value.client_secret });
+    return (await this.configure({ appId: value.id, appSlug: value.slug, privateKey: value.pem,
+      webhookSecret: value.webhook_secret, clientId: value.client_id, clientSecret: value.client_secret }));
   }
 
   userAuthorizationUrl(state: string, publicUrl: string, options: { login?: string; selectAccount?: boolean } = {}): string {
@@ -504,9 +515,9 @@ export class GitHubAppService {
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
     this.saveUserToken(userId, identity.id, value);
-    this.clearUserAuthorizationFailure(userId, identity.id);
-    this.clearUserAuthorizationFailure(userId);
-    this.saveUserIdentity(userId, identity, options.makeActive);
+    (await this.clearUserAuthorizationFailure(userId, identity.id));
+    (await this.clearUserAuthorizationFailure(userId));
+    (await this.saveUserIdentity(userId, identity, options.makeActive));
     return identity;
   }
 
@@ -527,19 +538,19 @@ export class GitHubAppService {
       ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
       ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
     }));
-    this.clearUserAuthorizationFailure(userId, identity.id);
-    this.clearUserAuthorizationFailure(userId);
-    this.saveUserIdentity(userId, identity, false);
+    (await this.clearUserAuthorizationFailure(userId, identity.id));
+    (await this.clearUserAuthorizationFailure(userId));
+    (await this.saveUserIdentity(userId, identity, false));
     return identity;
   }
 
-  private saveUserIdentity(userId: string, identity: GitHubUserIdentity, makeActive = false): void {
-    const accounts = this.userAccounts(userId);
+  private async saveUserIdentity(userId: string, identity: GitHubUserIdentity, makeActive = false): Promise<void> {
+    const accounts = (await this.userAccounts(userId));
     const prior = accounts.find((account) => account.id === identity.id);
     const next = [...accounts.filter((account) => account.id !== identity.id), { ...prior, ...identity }];
-    this.saveUserAccounts(userId, next);
-    if (makeActive || !this.activeUserAccountId(userId))
-      this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
+    (await this.saveUserAccounts(userId, next));
+    if (makeActive || !(await this.activeUserAccountId(userId)))
+      (await this.store.kvSet(githubUserActiveAccountKey(userId), identity.id));
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply
@@ -562,76 +573,76 @@ export class GitHubAppService {
     return { id, login, ...(value.name?.trim() ? { name: value.name.trim() } : {}) };
   }
 
-  private userAccounts(userId: string): GitHubUserIdentity[] {
+  private async userAccounts(userId: string): Promise<GitHubUserIdentity[]> {
     try {
-      const value = JSON.parse(this.store.kvGet(githubUserAccountsKey(userId)) ?? '[]');
+      const value = JSON.parse((await this.store.kvGet(githubUserAccountsKey(userId))) ?? '[]');
       return Array.isArray(value) ? value.filter((account): account is GitHubUserIdentity =>
         /^\d+$/.test(String(account?.id ?? '')) && /^[A-Za-z0-9-]+$/.test(String(account?.login ?? ''))) : [];
     } catch { return []; }
   }
 
-  private saveUserAccounts(userId: string, accounts: GitHubUserIdentity[]): void {
-    this.store.kvSet(githubUserAccountsKey(userId), JSON.stringify(accounts));
+  private async saveUserAccounts(userId: string, accounts: GitHubUserIdentity[]): Promise<void> {
+    (await this.store.kvSet(githubUserAccountsKey(userId), JSON.stringify(accounts)));
   }
 
-  private userAuthorizationFailure(userId: string, accountId?: string): GitHubUserAuthorizationFailure | undefined {
+  private async userAuthorizationFailure(userId: string, accountId?: string): Promise<GitHubUserAuthorizationFailure | undefined> {
     try {
-      const value = JSON.parse(this.store.kvGet(githubUserAuthorizationFailureKey(userId, accountId)) ?? 'null');
+      const value = JSON.parse((await this.store.kvGet(githubUserAuthorizationFailureKey(userId, accountId))) ?? 'null');
       if (!value || typeof value !== 'object' || !Number.isFinite(value.occurredAt)
         || typeof value.code !== 'string' || typeof value.summary !== 'string') return undefined;
       return value as GitHubUserAuthorizationFailure;
     } catch { return undefined; }
   }
 
-  private lastUserAuthorizationFailure(userId: string): GitHubUserAuthorizationFailure | undefined {
-    const failures = [this.userAuthorizationFailure(userId),
-      ...this.userAccounts(userId).map((account) => this.userAuthorizationFailure(userId, account.id))]
+  private async lastUserAuthorizationFailure(userId: string): Promise<GitHubUserAuthorizationFailure | undefined> {
+    const failures = [(await this.userAuthorizationFailure(userId)),
+      ...(await __asyncCollections.map((await this.userAccounts(userId)), async (account) => (await this.userAuthorizationFailure(userId, account.id))))]
       .filter((failure): failure is GitHubUserAuthorizationFailure => Boolean(failure));
     return failures.sort((left, right) => right.occurredAt - left.occurredAt)[0];
   }
 
-  private clearUserAuthorizationFailure(userId: string, accountId?: string): void {
-    this.store.kvDelete(githubUserAuthorizationFailureKey(userId, accountId));
+  private async clearUserAuthorizationFailure(userId: string, accountId?: string): Promise<void> {
+    (await this.store.kvDelete(githubUserAuthorizationFailureKey(userId, accountId)));
   }
 
-  private recordUserAuthorizationFailure(userId: string, accountId: string | undefined,
-    failure: Omit<GitHubUserAuthorizationFailure, 'occurredAt' | 'accountId'>): GitHubUserAuthorizationFailure {
+  private async recordUserAuthorizationFailure(userId: string, accountId: string | undefined,
+    failure: Omit<GitHubUserAuthorizationFailure, 'occurredAt' | 'accountId'>): Promise<GitHubUserAuthorizationFailure> {
     const recorded: GitHubUserAuthorizationFailure = {
       ...failure,
       occurredAt: Date.now(),
       ...(accountId ? { accountId } : {}),
     };
-    this.store.kvSet(githubUserAuthorizationFailureKey(userId, accountId), JSON.stringify(recorded));
-    this.store.appendAudit({
+    (await this.store.kvSet(githubUserAuthorizationFailureKey(userId, accountId), JSON.stringify(recorded)));
+    (await this.store.appendAudit({
       principalId: `user:${userId}`,
       action: 'github.user-authorization.refresh-failed',
       scopeKey: `user:${userId}`,
       detail: { ...recorded },
-    });
+    }));
     return recorded;
   }
 
-  private recordRefreshContentionRecovery(userId: string, accountId: string | undefined,
-    providerError?: string): void {
-    this.store.appendAudit({
+  private async recordRefreshContentionRecovery(userId: string, accountId: string | undefined,
+    providerError?: string): Promise<void> {
+    (await this.store.appendAudit({
       principalId: `user:${userId}`,
       action: 'github.user-authorization.refresh-contention-recovered',
       scopeKey: `user:${userId}`,
       detail: { ...(accountId ? { accountId } : {}), ...(providerError ? { providerError } : {}) },
-    });
+    }));
   }
 
-  activeUserAccountId(userId: string): string | undefined {
-    const configured = this.userAccounts(userId).filter((account) =>
+  async activeUserAccountId(userId: string): Promise<string | undefined> {
+    const configured = (await this.userAccounts(userId)).filter((account) =>
       this.broker.hasHandle(githubUserTokenHandle(userId, account.id)));
-    const active = this.store.kvGet(githubUserActiveAccountKey(userId));
+    const active = (await this.store.kvGet(githubUserActiveAccountKey(userId)));
     return configured.some((account) => account.id === active) ? active : configured[0]?.id;
   }
 
   async listUserAccounts(userId: string): Promise<GitHubUserAccount[]> {
     await this.migrateLegacyUserAuthorization(userId);
-    const active = this.activeUserAccountId(userId);
-    return this.userAccounts(userId)
+    const active = (await this.activeUserAccountId(userId));
+    return (await this.userAccounts(userId))
       .filter((account) => this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
       .map((account) => ({ ...account, active: account.id === active }));
   }
@@ -682,7 +693,7 @@ export class GitHubAppService {
   async setActiveUserAccount(userId: string, accountId: string): Promise<void> {
     const accounts = await this.listUserAccounts(userId);
     if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
-    this.store.kvSet(githubUserActiveAccountKey(userId), accountId);
+    (await this.store.kvSet(githubUserActiveAccountKey(userId), accountId));
   }
 
   async removeUserAccount(userId: string, accountId: string): Promise<string> {
@@ -690,11 +701,11 @@ export class GitHubAppService {
     if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
     if (accounts.length <= 1) throw new Error('Connect a new GitHub account first');
     this.broker.deleteHandle(githubUserTokenHandle(userId, accountId));
-    this.clearUserAuthorizationFailure(userId, accountId);
+    (await this.clearUserAuthorizationFailure(userId, accountId));
     const remaining = accounts.filter((account) => account.id !== accountId);
-    this.saveUserAccounts(userId, remaining);
-    const active = this.activeUserAccountId(userId) ?? remaining[0]!.id;
-    this.store.kvSet(githubUserActiveAccountKey(userId), active);
+    (await this.saveUserAccounts(userId, remaining));
+    const active = (await this.activeUserAccountId(userId)) ?? remaining[0]!.id;
+    (await this.store.kvSet(githubUserActiveAccountKey(userId), active));
     return active;
   }
 
@@ -716,7 +727,7 @@ export class GitHubAppService {
     const app = await this.appRequest<GitHubAppPayload>('/app');
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
-    this.rememberAppSlug(slug);
+    (await this.rememberAppSlug(slug));
     const owner = String(app.owner?.login ?? '').trim();
     const appSettingsUrl = app.owner?.type === 'Organization' && owner
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
@@ -749,7 +760,7 @@ export class GitHubAppService {
     const app = await this.appRequest<GitHubAppPayload>('/app');
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
-    this.rememberAppSlug(slug);
+    (await this.rememberAppSlug(slug));
     const owner = String(app.owner?.login ?? '').trim();
     const appSettingsUrl = app.owner?.type === 'Organization' && owner
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
@@ -799,7 +810,7 @@ export class GitHubAppService {
   /** Human-readable recovery for Git's remote-rejection message. */
   async workflowPermissionGuidance(repository: Repository): Promise<string> {
     const connection = repository.gitConnectionId
-      ? this.store.getGitConnection(repository.gitConnectionId)
+      ? (await this.store.getGitConnection(repository.gitConnectionId))
       : undefined;
     if (!connection) return 'Reconnect this repository through the GitHub App, then retry the task.';
     const observed = await this.workflowPermissionStatus(connection);
@@ -824,16 +835,16 @@ export class GitHubAppService {
 
   async connectInstallation(organizationId: string, installationId: string): Promise<{ connection: GitConnection; repositories: Repository[] }> {
     const installation = await this.appRequest<GitHubInstallationPayload>(`/app/installations/${encodeURIComponent(installationId)}`);
-    const connection = this.store.upsertGitConnection({ organizationId, provider: 'github',
+    const connection = (await this.store.upsertGitConnection({ organizationId, provider: 'github',
       installationId: String(installation.id), accountLogin: installation.account.login,
-      accountType: installation.account.type, suspendedAt: installation.suspended_at ? Date.parse(installation.suspended_at) : undefined });
+      accountType: installation.account.type, suspendedAt: installation.suspended_at ? Date.parse(installation.suspended_at) : undefined }));
     return { connection, repositories: await this.reconcile(connection) };
   }
 
-  disconnectInstallation(connectionId: string): void {
+  async disconnectInstallation(connectionId: string): Promise<void> {
     this.tokenCache.delete(connectionId);
     this.tokenMints.delete(connectionId);
-    this.store.deleteGitConnection(connectionId);
+    (await this.store.deleteGitConnection(connectionId));
   }
 
   async reconcile(connection: GitConnection): Promise<Repository[]> {
@@ -856,14 +867,14 @@ export class GitHubAppService {
     const active = new Set<string>();
     const repositories: Repository[] = [];
     for (const item of remote.filter((repo) => !repo.archived)) {
-      const repository = this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
+      const repository = (await this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
         providerId: String(item.id), owner: item.owner.login, name: item.name, sshUrl: item.ssh_url,
-        defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id });
+        defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id }));
       active.add(repository.id);
       await this.removeLegacyDeployKeys(repository, token);
       repositories.push(repository);
     }
-    for (const repository of this.store.listRepositories(connection.organizationId)) {
+    for (const repository of (await this.store.listRepositories(connection.organizationId))) {
       if (repository.gitConnectionId === connection.id && !active.has(repository.id)) await this.removeRepository(repository, token);
     }
     return repositories;
@@ -878,14 +889,14 @@ export class GitHubAppService {
     // used to be permanent — the exception became a gateway error, GitHub
     // redelivered, and the redelivery short-circuited as a duplicate, losing the
     // reconcile forever.
-    if (!this.store.recordGithubDelivery(deliveryId, event)) return { accepted: false };
+    if (!(await this.store.recordGithubDelivery(deliveryId, event))) return { accepted: false };
     try {
       // Bounded retry budget: this call is inside GitHub's ~10 s delivery
       // timeout, so a long backoff must fail fast and let GitHub redeliver
       // rather than hold the response open (see WEBHOOK_RETRY_BUDGET_MS).
       return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw));
     } catch (error) {
-      this.store.releaseGithubDelivery(deliveryId);
+      (await this.store.releaseGithubDelivery(deliveryId));
       throw error;
     }
   }
@@ -895,12 +906,12 @@ export class GitHubAppService {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
-    const connection = this.store.db.prepare('SELECT * FROM git_connections WHERE provider=? AND installationId=?')
-      .get('github', installationId) as any;
+    const connection = (await this.store.db.prepare('SELECT * FROM git_connections WHERE provider=? AND installationId=?')
+      .get('github', installationId)) as any;
     if (!connection) return { accepted: true };
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {
-      const saved = this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
-        accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() });
+      const saved = (await this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
+        accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() }));
       this.tokenCache.delete(saved.id);
       return { accepted: true, reconciled: 0 };
     }
@@ -911,17 +922,17 @@ export class GitHubAppService {
     // stayed dead until someone reinstalled the App by hand. `created` is here for
     // the same reason — a reinstall of a previously-suspended installation.
     if (event === 'installation' && (payload.action === 'unsuspend' || payload.action === 'created')) {
-      const saved = this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
+      const saved = (await this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
         accountLogin: payload.installation?.account?.login ?? connection.accountLogin,
         accountType: payload.installation?.account?.type ?? connection.accountType ?? undefined,
-        suspendedAt: undefined });
+        suspendedAt: undefined }));
       this.tokenCache.delete(saved.id);
       const repositories = await this.reconcile(saved);
       return { accepted: true, reconciled: repositories.length };
     }
     if (event === 'push' && payload.deleted !== true) {
       const repositoryPayload = payload.repository;
-      const repository = this.store.listRepositories(connection.organizationId).find((candidate) =>
+      const repository = (await this.store.listRepositories(connection.organizationId)).find((candidate) =>
         (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
         || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
       if (repository && payload.ref === `refs/heads/${repository.defaultBranch}`) {
@@ -930,13 +941,13 @@ export class GitHubAppService {
       }
       return { accepted: true };
     }
-    const projectEvents = this.failedDefaultBranchWorkflowEvents(event, payload, connection.organizationId);
+    const projectEvents = (await this.failedDefaultBranchWorkflowEvents(event, payload, connection.organizationId));
     if (event === 'workflow_run') {
       const repositoryPayload = payload.repository;
-      const repository = this.store.listRepositories(connection.organizationId).find((candidate) =>
+      const repository = (await this.store.listRepositories(connection.organizationId)).find((candidate) =>
         (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
         || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
-      if (repository) observeDeploymentWorkflowRun(this.store, repository, payload.workflow_run);
+      if (repository) (await observeDeploymentWorkflowRun(this.store, repository, payload.workflow_run));
       return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
     }
     if (event === 'pull_request' || event === 'pull_request_review' || event === 'check_run') {
@@ -946,17 +957,17 @@ export class GitHubAppService {
       // the tenant that installed this App, or a `karmax/<id>` branch pushed to
       // any repo would inject events into someone else's task.
       const prEvent = pullRequestWebhookEvent(event, payload);
-      if (!prEvent || !this.ownsTask(connection.organizationId, prEvent.taskId))
+      if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
         return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
-      const view = this.store.getTask(prEvent.taskId)?.lastView;
+      const view = (await this.store.getTask(prEvent.taskId))?.lastView;
       if (view) {
         const reconciled = reconcilePullRequestView(view, prEvent.payload);
-        if (reconciled !== view) this.store.saveView(prEvent.taskId, reconciled);
+        if (reconciled !== view) (await this.store.saveView(prEvent.taskId, reconciled));
       }
       const observation = githubPrWebhookObservationKey(prEvent);
       if (observation) {
         const digest = crypto.createHash('sha256').update(observation).digest('hex');
-        if (!this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId))
+        if (!(await this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId)))
           return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       }
       return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
@@ -972,11 +983,11 @@ export class GitHubAppService {
    * therefore fans out to the projects that actually attach this repository;
    * the gateway turns each event into a new recovery task. check_run is a
    * compatibility path for Apps that have not yet accepted workflow_run. */
-  private failedDefaultBranchWorkflowEvents(event: string, payload: any,
-    organizationId: string): GithubProjectWebhookEvent[] {
+  private async failedDefaultBranchWorkflowEvents(event: string, payload: any,
+    organizationId: string): Promise<GithubProjectWebhookEvent[]> {
     if (!['workflow_run', 'check_run'].includes(event) || payload.action !== 'completed') return [];
     const repositoryPayload = payload.repository;
-    const repository = this.store.listRepositories(organizationId).find((candidate) =>
+    const repository = (await this.store.listRepositories(organizationId)).find((candidate) =>
       (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
       || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
     if (!repository) return [];
@@ -1009,15 +1020,15 @@ export class GitHubAppService {
       source: event as 'workflow_run' | 'check_run',
       ...(originatingTaskId ? { originatingTaskId } : {}),
     };
-    return this.store.projectIdsForRepository(repository.id).map((projectId) => ({
+    return (await this.store.projectIdsForRepository(repository.id)).map((projectId) => ({
       projectId, type: 'github.workflow.failed' as const, payload: base,
     }));
   }
 
   /** Is `taskId` a live task of the organization that installed the App? */
-  private ownsTask(organizationId: string, taskId: string): boolean {
-    const task = this.store.getTask(taskId);
-    const project = task ? this.store.getProject(task.projectId) : undefined;
+  private async ownsTask(organizationId: string, taskId: string): Promise<boolean> {
+    const task = (await this.store.getTask(taskId));
+    const project = task ? (await this.store.getProject(task.projectId)) : undefined;
     return project?.organizationId === organizationId;
   }
 
@@ -1069,7 +1080,7 @@ export class GitHubAppService {
 
   async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
-    const connection = this.store.getGitConnection(repository.gitConnectionId);
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
     if (!connection) throw new Error('repository GitHub App connection is missing');
     const token = await this.installationToken(connection);
     return { httpsToken: token, env: { GH_TOKEN: token } };
@@ -1077,9 +1088,9 @@ export class GitHubAppService {
 
   /** Repository-bound Actions client. Tokens remain inside this service and a
    * 401 forces the cached installation token to be minted again once. */
-  actions(repository: Repository): GithubActionsApi {
+  async actions(repository: Repository): Promise<GithubActionsApi> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
-    const connection = this.store.getGitConnection(repository.gitConnectionId);
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
     if (!connection) throw new Error('repository GitHub App connection is missing');
     return new GithubActionsApi(async (options) => {
       if (options?.forceRefresh) {
@@ -1103,7 +1114,7 @@ export class GitHubAppService {
    * never receives the installation-wide token used by trusted host services. */
   private async repositoryToken(repository: Repository): Promise<string> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
-    const connection = this.store.getGitConnection(repository.gitConnectionId);
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
     if (!connection) throw new Error('repository GitHub App connection is missing');
     if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
     if (!/^\d+$/.test(repository.providerId ?? ''))
@@ -1124,7 +1135,7 @@ export class GitHubAppService {
   async createRepository(connectionId: string, userId: string, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
   }, options: { accountId?: string } = {}): Promise<Repository> {
-    const connection = this.store.getGitConnection(connectionId);
+    const connection = (await this.store.getGitConnection(connectionId));
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
     const pathname = connection.accountType === 'Organization'
@@ -1145,7 +1156,7 @@ export class GitHubAppService {
   async ensureRepository(connectionId: string, userId: string, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
   }): Promise<Repository> {
-    const connection = this.store.getGitConnection(connectionId);
+    const connection = (await this.store.getGitConnection(connectionId));
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
     let repository: GitHubRepositoryPayload;
@@ -1199,10 +1210,10 @@ export class GitHubAppService {
     }
     this.tokenCache.delete(connection.id);
     const installationToken = await this.installationToken(connection);
-    const repository = this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
+    const repository = (await this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
       providerId: String(created.id), owner: created.owner.login, name: created.name, sshUrl: created.ssh_url,
       defaultBranch: defaultBranch?.trim() || created.default_branch || 'main', private: created.private,
-      gitConnectionId: connection.id });
+      gitConnectionId: connection.id }));
     await this.removeLegacyDeployKeys(repository, installationToken);
     return repository;
   }
@@ -1219,12 +1230,12 @@ export class GitHubAppService {
    * so its deploy keys are inert; skip the remote deletes and still clean up the
    * local broker handles, which are the part karmax actually owns. */
   async disconnectOrganization(organizationId: string): Promise<void> {
-    for (const connection of this.store.listGitConnections(organizationId)) {
-      const repositories = this.store.listRepositories(organizationId).filter((repo) => repo.gitConnectionId === connection.id);
-      const hasLegacyKeys = repositories.some((repository) => this.store.repositoryDeployKeys(repository.id));
+    for (const connection of (await this.store.listGitConnections(organizationId))) {
+      const repositories = (await this.store.listRepositories(organizationId)).filter((repo) => repo.gitConnectionId === connection.id);
+      const hasLegacyKeys = (await __asyncCollections.some(repositories, async (repository) => (await this.store.repositoryDeployKeys(repository.id))));
       const token = hasLegacyKeys && !connection.suspendedAt ? await this.installationToken(connection) : undefined;
       for (const repository of repositories) {
-        const keys = this.store.repositoryDeployKeys(repository.id);
+        const keys = (await this.store.repositoryDeployKeys(repository.id));
         if (!keys) continue;
         if (token) {
           await this.deleteDeployKey(repository, keys.cloneKeyId, token);
@@ -1232,7 +1243,7 @@ export class GitHubAppService {
         }
         this.broker.deleteHandle(keys.cloneHandle);
         this.broker.deleteHandle(keys.writeHandle);
-        this.store.clearRepositoryDeployKeys(repository.id);
+        (await this.store.clearRepositoryDeployKeys(repository.id));
       }
       this.tokenCache.delete(connection.id);
     }
@@ -1242,17 +1253,17 @@ export class GitHubAppService {
    * connections never create these records; a refresh removes old remote keys,
    * deletes their private material, and clears the compatibility row. */
   private async removeLegacyDeployKeys(repository: Repository, installationToken: string): Promise<void> {
-    const keys = this.store.repositoryDeployKeys(repository.id);
+    const keys = (await this.store.repositoryDeployKeys(repository.id));
     if (!keys) return;
     await this.deleteDeployKey(repository, keys.cloneKeyId, installationToken);
     await this.deleteDeployKey(repository, keys.writeKeyId, installationToken);
     this.broker.deleteHandle(keys.cloneHandle);
     this.broker.deleteHandle(keys.writeHandle);
-    this.store.clearRepositoryDeployKeys(repository.id);
+    (await this.store.clearRepositoryDeployKeys(repository.id));
   }
 
   private async removeRepository(repository: Repository, installationToken: string): Promise<void> {
-    const keys = this.store.repositoryDeployKeys(repository.id);
+    const keys = (await this.store.repositoryDeployKeys(repository.id));
     if (keys) {
       await Promise.all([
         this.deleteDeployKey(repository, keys.cloneKeyId, installationToken),
@@ -1260,9 +1271,9 @@ export class GitHubAppService {
       ].map((promise) => promise.catch(() => undefined)));
       this.broker.deleteHandle(keys.cloneHandle);
       this.broker.deleteHandle(keys.writeHandle);
-      this.store.clearRepositoryDeployKeys(repository.id);
+      (await this.store.clearRepositoryDeployKeys(repository.id));
     }
-    this.store.deleteRepository(repository.id);
+    (await this.store.deleteRepository(repository.id));
   }
 
   private async deleteDeployKey(repository: Repository, keyId: string, token: string): Promise<void> {
@@ -1294,7 +1305,7 @@ export class GitHubAppService {
     | { status: 'unreadable'; error: string }> {
     try {
       if (!repository.gitConnectionId) return { status: 'unreadable', error: 'repository has no GitHub App connection' };
-      const connection = this.store.getGitConnection(repository.gitConnectionId);
+      const connection = (await this.store.getGitConnection(repository.gitConnectionId));
       if (!connection) return { status: 'unreadable', error: 'repository GitHub App connection is missing' };
       const token = await this.installationToken(connection);
       const value = await this.request<{ content?: string; encoding?: string }>(
@@ -1433,22 +1444,22 @@ export class GitHubAppService {
     if (unusable) {
       const replacement = this.replacementUserToken(handle, observed);
       if (replacement) {
-        this.recordRefreshContentionRecovery(userId, accountId);
+        (await this.recordRefreshContentionRecovery(userId, accountId));
         return replacement;
       }
       const deleted = this.deleteUserTokenIfUnchanged(handle, observed);
       if (!deleted) {
         const raced = this.replacementUserToken(handle, observed);
         if (raced) {
-          this.recordRefreshContentionRecovery(userId, accountId);
+          (await this.recordRefreshContentionRecovery(userId, accountId));
           return raced;
         }
       }
-      const failure = this.recordUserAuthorizationFailure(userId, accountId, {
+      const failure = (await this.recordUserAuthorizationFailure(userId, accountId, {
         code: unusable,
         summary: this.refreshFailureSummary(unusable),
         disconnected: deleted || !this.broker.hasHandle(handle),
-      });
+      }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
 
@@ -1462,45 +1473,45 @@ export class GitHubAppService {
     } catch (error) {
       const status = error instanceof Error ? error.message.match(/GitHub OAuth failed \((\d{3})\)/)?.[1] : undefined;
       const providerError = status ? `http_${status}` : 'request_failed';
-      const failure = this.recordUserAuthorizationFailure(userId, accountId, {
+      const failure = (await this.recordUserAuthorizationFailure(userId, accountId, {
         code: 'refresh_request_failed',
         summary: this.refreshFailureSummary('refresh_request_failed', providerError),
         disconnected: false,
         providerError,
-      });
+      }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
     if (!value.access_token) {
       const providerError = this.safeOauthError(value.error);
       const replacement = this.replacementUserToken(handle, observed);
       if (replacement) {
-        this.recordRefreshContentionRecovery(userId, accountId, providerError);
+        (await this.recordRefreshContentionRecovery(userId, accountId, providerError));
         return replacement;
       }
       const deleted = this.deleteUserTokenIfUnchanged(handle, observed);
       if (!deleted) {
         const raced = this.replacementUserToken(handle, observed);
         if (raced) {
-          this.recordRefreshContentionRecovery(userId, accountId, providerError);
+          (await this.recordRefreshContentionRecovery(userId, accountId, providerError));
           return raced;
         }
       }
-      const failure = this.recordUserAuthorizationFailure(userId, accountId, {
+      const failure = (await this.recordUserAuthorizationFailure(userId, accountId, {
         code: 'refresh_rejected',
         summary: this.refreshFailureSummary('refresh_rejected', providerError),
         disconnected: deleted || !this.broker.hasHandle(handle),
         ...(providerError ? { providerError } : {}),
-      });
+      }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
     this.saveTokenHandle(handle, value);
-    this.clearUserAuthorizationFailure(userId, accountId);
-    this.store.appendAudit({
+    (await this.clearUserAuthorizationFailure(userId, accountId));
+    (await this.store.appendAudit({
       principalId: `user:${userId}`,
       action: 'github.user-authorization.refreshed',
       scopeKey: `user:${userId}`,
       detail: { ...(accountId ? { accountId } : {}) },
-    });
+    }));
     return String(value.access_token);
   }
 
@@ -1510,7 +1521,7 @@ export class GitHubAppService {
    * made with this token as the person, not as the organization App. Concurrent
    * callers share one refresh because GitHub refresh tokens are single-use. */
   async userAccessToken(userId: string, opts: { forceRefresh?: boolean; accountId?: string } = {}): Promise<string> {
-    const accountId = opts.accountId ?? this.activeUserAccountId(userId);
+    const accountId = opts.accountId ?? (await this.activeUserAccountId(userId));
     const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
     const resolved = this.resolvedUserToken(handle);
     if (!resolved) throw new Error('Connect GitHub on your profile, then try again.');
@@ -1545,9 +1556,9 @@ export class GitHubAppService {
     const identity = await this.userIdentity(userId);
     const stored = this.broker.resolve(legacy, { caps: [`use-credential:${legacy}`] });
     this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored);
-    const accounts = this.userAccounts(userId);
-    this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), identity]);
-    if (!this.store.kvGet(githubUserActiveAccountKey(userId))) this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
+    const accounts = (await this.userAccounts(userId));
+    (await this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), identity]));
+    if (!(await this.store.kvGet(githubUserActiveAccountKey(userId)))) (await this.store.kvSet(githubUserActiveAccountKey(userId), identity.id));
     this.broker.deleteHandle(legacy);
   }
 

@@ -66,7 +66,7 @@ describe('profile + account management settings backend', () => {
     expect(edited.handles).toContain('openrouter:explain-new');
     expect(edited.handles).not.toContain('openrouter:explain-old');
     expect(h.broker.resolve('openrouter:explain-new', { caps: ['use-credential:*'] })).toBe('new-secret');
-    expect(JSON.parse(h.store.kvGet('credpolicy:organization:org_personal')!)).toMatchObject({
+    expect(JSON.parse((await h.store.kvGet('credpolicy:organization:org_personal'))!)).toMatchObject({
       order: [nextKey], explainerOnly: [nextKey],
     });
     const credentials = await fetch(`${base}/api/credentials`, { headers: auth() }).then(J);
@@ -79,14 +79,14 @@ describe('profile + account management settings backend', () => {
     const deleted = await fetch(`${base}/api/accounts/keys/openrouter/explain-new`, { method: 'DELETE', headers: auth() });
     expect(deleted.status).toBe(200);
     expect(h.broker.hasHandle('openrouter:explain-new')).toBe(false);
-    expect(JSON.parse(h.store.kvGet('credpolicy:organization:org_personal')!)).toMatchObject({
+    expect(JSON.parse((await h.store.kvGet('credpolicy:organization:org_personal'))!)).toMatchObject({
       order: [], explainerOnly: [],
     });
   });
 
   it('does not list or reuse agent credentials across organizations', async () => {
-    const acme = h.store.createOrganization({ name: 'Acme' });
-    const beta = h.store.createOrganization({ name: 'Beta' });
+    const acme = (await h.store.createOrganization({ name: 'Acme' }));
+    const beta = (await h.store.createOrganization({ name: 'Beta' }));
     const acmeBase = `${base}/api/organizations/${acme.id}`;
     const betaBase = `${base}/api/organizations/${beta.id}`;
 
@@ -127,7 +127,7 @@ describe('profile + account management settings backend', () => {
       }),
     });
     expect(crossScope.status).toBe(400);
-    expect(h.store.kvGet(`credpolicy:project:${betaProject.id}`)).toBeUndefined();
+    expect((await h.store.kvGet(`credpolicy:project:${betaProject.id}`))).toBeUndefined();
   });
 
   it('rejects a profile without a role', async () => {
@@ -156,7 +156,7 @@ describe('profile + account management settings backend', () => {
     expect(saved.allowedAccounts).toBeUndefined();
     expect(saved.auth).toBeUndefined();
     expect(saved.capabilities).toBeUndefined();
-    expect(h.store.getProfile('do-default')!.capabilities).toBeUndefined();
+    expect((await h.store.getProfile('do-default'))!.capabilities).toBeUndefined();
     const list = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
     expect(list.every((p: any) => p.capabilities === undefined)).toBe(true);
   });
@@ -204,10 +204,10 @@ describe('profile + account management settings backend', () => {
   });
 
   it('isolates organization profile defaults and resolves projects through their organization', async () => {
-    const acme = h.store.createOrganization({ name: 'Profiles Acme' });
-    const beta = h.store.createOrganization({ name: 'Profiles Beta' });
-    const acmeProject = h.store.createProject('Acme agents', {}, acme.id);
-    const betaProject = h.store.createProject('Beta agents', {}, beta.id);
+    const acme = (await h.store.createOrganization({ name: 'Profiles Acme' }));
+    const beta = (await h.store.createOrganization({ name: 'Profiles Beta' }));
+    const acmeProject = (await h.store.createProject('Acme agents', {}, acme.id));
+    const betaProject = (await h.store.createProject('Beta agents', {}, beta.id));
 
     await fetch(`${base}/api/profiles?organizationId=${acme.id}`, {
       method: 'PUT', headers: auth(),
@@ -229,8 +229,8 @@ describe('profile + account management settings backend', () => {
     expect(acmeProjectProfiles.find((p: any) => p.role === 'do')).toMatchObject({ model: 'gpt-acme', scope: 'inherited' });
     expect(betaProjectProfiles.find((p: any) => p.role === 'do')).toMatchObject({ model: 'claude-beta', scope: 'inherited' });
     const resolver = new ProfileResolver(h.store, 'mock');
-    expect(resolver.resolve('do', undefined, undefined, acmeProject.id)).toMatchObject({ model: 'gpt-acme' });
-    expect(resolver.resolve('do', undefined, undefined, betaProject.id)).toMatchObject({ model: 'claude-beta' });
+    expect((await resolver.resolve('do', undefined, undefined, acmeProject.id))).toMatchObject({ model: 'gpt-acme' });
+    expect((await resolver.resolve('do', undefined, undefined, betaProject.id))).toMatchObject({ model: 'claude-beta' });
   });
 
   it('exposes payment providers + a connect flow (1g)', async () => {

@@ -44,11 +44,11 @@ describe('Untrusted MCP processes', () => {
     expect(second.tools.map((t) => t.name)).toEqual(api.tools.map((t) => t.name));
   });
   it.each(['revoked', 'expired', 'deleted'])('the sandbox relay stops when its credential lease is %s', async (reason) => {
-    const store = new Store(':memory:'); let cleanup: (() => Promise<void>) | undefined;
+    const store = (await Store.create(':memory:')); let cleanup: (() => Promise<void>) | undefined;
     try {
       const service = new McpConnections(store, new CredentialBroker(new Vault(path.join(dir, 'vault'))), 'org_personal');
-      const project = store.createProject('Test');
-      const connection = service.save({ label: 'Fixture', transport: { type: 'stdio', command: process.execPath, args: server().args } }, project.id);
+      const project = (await store.createProject('Test'));
+      const connection = (await service.save({ label: 'Fixture', transport: { type: 'stdio', command: process.execPath, args: server().args } }, project.id));
       const taskWorld = await new WorktreeProvider(path.join(dir, 'worlds')).create({ taskId: 'lease', base: 'main' });
       const specs = await prepareConnections(service, taskWorld, [connection.id], project.id, 'lease', (fn) => { cleanup = fn; });
       const client = await connectWorldMcp(taskWorld, specs[0]!); clients.push(client);
@@ -58,6 +58,6 @@ describe('Untrusted MCP processes', () => {
       else { const value = JSON.parse(fs.readFileSync(config, 'utf8')); if (reason === 'revoked') value.revoked = true; else value.leaseExpiresAt = 0; fs.writeFileSync(config, JSON.stringify(value)); }
       await closed;
       await expect(client.listTools()).rejects.toThrow();
-    } finally { await cleanup?.(); store.close(); }
+    } finally { await cleanup?.(); (await store.close()); }
   }, 7000);
 });

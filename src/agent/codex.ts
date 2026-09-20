@@ -223,7 +223,7 @@ export class CodexAdapter implements AgentAdapter {
     if (!apiKey) throw new Error('CodexAdapter: OPENAI_API_KEY not set');
     const baseUrl = process.env.KARMAX_OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
     const model = input.profile.model ?? 'gpt-5.5';
-    currentTiming()?.mark('provider.selected', { provider: 'codex', model });
+    (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
     const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
@@ -291,12 +291,12 @@ export class CodexAdapter implements AgentAdapter {
         throw providerErrorFromMessage('codex', message, 'structured');
       }
       const data = (await res.json()) as any;
-      currentTiming()?.markOnce('first.output');
+      (await (await currentTiming())?.markOnce('first.output'));
       return data;
       });
       // Usage accounting is required even when timing collection is absent.
       const roundUsage = reportedUsage.add(data.usage, 'codex');
-      currentTiming()?.mark('provider.usage', roundUsage);
+      (await (await currentTiming())?.mark('provider.usage', roundUsage));
       respId = data.id ?? respId;
       // Checkpoint the session as soon as we have one. This is the sole writer of
       // the crash-resume record: without it a worker restart or heartbeat timeout
@@ -399,7 +399,7 @@ export class CodexAdapter implements AgentAdapter {
   private async runCodexAppServer(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? undefined;
-    currentTiming()?.mark('provider.selected', { provider: 'codex', model });
+    (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
     const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
     const cwd = worldWorkingDirectory(input.world.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
@@ -429,7 +429,7 @@ export class CodexAdapter implements AgentAdapter {
     const mcpFlags = await selectedCodexMcpFlags(input.world, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal);
 
     // Detached group is the fallback; the inherited custody marker crosses groups.
-    const startupEnd = currentTiming()?.start('process.startup');
+    const startupEnd = (await (await currentTiming())?.start('process.startup'));
     const child: any = remote
       ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
       : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
@@ -567,8 +567,8 @@ export class CodexAdapter implements AgentAdapter {
       };
     };
 
-    client.onNotification((method, params) => {
-      currentTiming()?.markOnce('provider.first-event');
+    client.onNotification(async (method, params) => {
+      (await (await currentTiming())?.markOnce('provider.first-event'));
       switch (method) {
         case 'turn/started':
           currentTurnId = params?.turn?.id ?? currentTurnId;
@@ -716,7 +716,7 @@ export class CodexAdapter implements AgentAdapter {
       await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
-      startupEnd?.();
+      (await startupEnd?.());
       try {
         await withTimeout(client.request('account/rateLimits/read', {}), 5_000);
         modelCredentialHealthy = true;
@@ -756,7 +756,7 @@ export class CodexAdapter implements AgentAdapter {
         }
       }
 
-      const sessionEnd = currentTiming()?.start('provider.session.prepare');
+      const sessionEnd = (await (await currentTiming())?.start('provider.session.prepare'));
       // ── Thread: resume the prior one, or start fresh (systemPrompt → developer
       //    instructions; the thread carries them so resumes don't re-send them). ──
       const resuming = !!input.session;
@@ -804,7 +804,7 @@ export class CodexAdapter implements AgentAdapter {
       const initialText = conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions.');
       let nextInput: any[] = [{ type: 'text', text: initialText, text_elements: [] }, ...await imageItems(convo)];
 
-      sessionEnd?.();
+      (await sessionEnd?.());
       // ── Turn loop (Model-B): run a turn; follow-ups arriving DURING it are steered
       //    in-flight; any that land after it start a follow-on turn in this same
       //    activity, until the agent is idle with nothing pending. ──
@@ -814,7 +814,7 @@ export class CodexAdapter implements AgentAdapter {
         terminalStatus = undefined;
         terminalReason = undefined;
         const settled = awaitTurnSettled();
-        const providerRoundEnd = currentTiming()?.start('provider.cli-roundtrip.opaque');
+        const providerRoundEnd = (await (await currentTiming())?.start('provider.cli-roundtrip.opaque'));
         const started = await client.request<any>('turn/start', {
           threadId,
           input: nextInput,
@@ -827,7 +827,7 @@ export class CodexAdapter implements AgentAdapter {
         });
         currentTurnId = started?.turn?.id ?? currentTurnId;
         await settled;
-        providerRoundEnd?.(ctx.signal?.aborted ? 'cancelled' : turnError || terminalStatus !== 'completed' ? 'failed' : 'ok');
+        (await providerRoundEnd?.(ctx.signal?.aborted ? 'cancelled' : turnError || terminalStatus !== 'completed' ? 'failed' : 'ok'));
         if (ctx.signal?.aborted) break;
         if (limit) break; // usage limit → throw below so the workflow rotates the login
         if (turnError) break;
@@ -904,7 +904,7 @@ export class CodexAdapter implements AgentAdapter {
     }
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? 'gpt-5.5';
-    currentTiming()?.mark('provider.selected', { provider: 'codex', model });
+    (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
     const effort = codexReasoningEffort(model, input.profile.effort);
     const cwd = worldWorkingDirectory(input.world.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
@@ -963,7 +963,7 @@ export class CodexAdapter implements AgentAdapter {
     // Keep a detached root group as fallback, while the inherited custody marker
     // covers descendants that create their own groups/sessions.
     const custody = createCustodyEnv(env);
-    currentTiming()?.mark('process.spawn.requested');
+    (await (await currentTiming())?.mark('process.spawn.requested'));
     const child = spawn(cmd, args, { cwd, env: custody.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
 
     // Process-tree custody (src/agent/custody.ts): record the root pid so a
@@ -1079,7 +1079,7 @@ export class CodexAdapter implements AgentAdapter {
     });
     if (buf.trim()) handleLine(buf); // flush a trailing partial line
     if (hb) clearInterval(hb);
-    control?.close(); // the control socket must not outlive the turn it mutates
+    (await control?.close()); // the control socket must not outlive the turn it mutates
     cleanupImages(); // remove the temp image files now the child has consumed them
     await releaseAgent(child.pid, custody.custodyId); // settle marked background tools, then clear custody
     untrack();

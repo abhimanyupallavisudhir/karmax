@@ -17,13 +17,13 @@ export interface ProjectEnvironmentSelection {
 /** Resolve one accepted recipe to the provider artifact that should create a
  * world. The recipe may be checkpoint-pinned; provider images/snapshots remain
  * disposable accelerators selected by its stable digest. */
-export function selectProjectEnvironment(store: Store, projectId: string, provider: string,
-  base: ProjectConfig['environment'], pinnedSpec?: ProjectEnvironmentSpec): ProjectEnvironmentSelection {
+export async function selectProjectEnvironment(store: Store, projectId: string, provider: string,
+  base: ProjectConfig['environment'], pinnedSpec?: ProjectEnvironmentSpec): Promise<ProjectEnvironmentSelection> {
   const environments = new ProjectEnvironment(store);
-  const spec = pinnedSpec ?? environments.spec(projectId);
+  const spec = pinnedSpec ?? (await environments.spec(projectId));
   if (!spec) return { built: false, environment: base };
   const digest = environments.digest(spec);
-  const build = environments.readyBuild(projectId, provider, digest);
+  const build = (await environments.readyBuild(projectId, provider, digest));
   if (build?.ref && build.ref !== 'host') return {
     spec, digest, built: true,
     environment: { ...base, ...(provider === 'container' ? { image: build.ref } : { snapshot: build.ref }) },
@@ -35,12 +35,12 @@ export function selectProjectEnvironment(store: Store, projectId: string, provid
   return { spec, digest, built: false, environment: image ? { ...base, image } : base };
 }
 
-export function snapshotProjectRuntime(store: Store, projectId: string): {
+export async function snapshotProjectRuntime(store: Store, projectId: string): Promise<{
   environment?: ProjectEnvironmentSpec;
   services?: ProjectService[];
-} {
-  const environment = new ProjectEnvironment(store).spec(projectId);
-  const services = new ProjectServices(store).list(projectId);
+}> {
+  const environment = (await new ProjectEnvironment(store).spec(projectId));
+  const services = (await new ProjectServices(store).list(projectId));
   return {
     ...(environment ? { environment } : {}),
     ...(services.length ? { services } : {}),
@@ -73,10 +73,10 @@ export async function activateProjectRuntime(args: {
     }
   }
 
-  const declarations = args.services ?? new ProjectServices(args.store).list(args.projectId);
+  const declarations = args.services ?? (await new ProjectServices(args.store).list(args.projectId));
   const perWorld = declarations.filter((service) => service.kind === 'per-world');
   if (perWorld.length) {
-    const resources = new Map(args.store.listResourceAttachments(args.projectId)
+    const resources = new Map((await args.store.listResourceAttachments(args.projectId))
       .map((resource) => [resource.id, resource]));
     const launched = await launchWorldServices(world, args.taskId, perWorld, resources);
     warnings.push(...launched.warnings);

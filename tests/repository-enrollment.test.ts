@@ -16,9 +16,9 @@ describe('live project repository enrollment', () => {
   it('atomically attaches into the parent world, publishes every checkout, and imports it in a child', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-live-enrollment-'));
     cleanups.push(root);
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Enrollment test' });
-    const project = store.createProject('Dynamic repository project', {}, organization.id);
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Enrollment test' }));
+    const project = (await store.createProject('Dynamic repository project', {}, organization.id));
     const makeSource = async (name: string) => {
       const source = path.join(root, name);
       fs.mkdirSync(source);
@@ -33,23 +33,23 @@ describe('live project repository enrollment', () => {
     const empty = path.join(root, 'empty.git');
     await gitOrThrow(root, ['init', '-q', '--bare', empty]);
     const sshUrl = 'git@github.com:example/empty.git';
-    const repository = store.upsertRepository({
+    const repository = (await store.upsertRepository({
       organizationId: organization.id, provider: 'github', providerId: '77', owner: 'example', name: 'empty',
       sshUrl, defaultBranch: 'main', private: true, gitConnectionId: 'connection',
-    });
-    const parentTask = store.createTask({
+    }));
+    const parentTask = (await store.createTask({
       projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1.0.0',
       params: { prompt: 'create and attach a repository' },
-    });
-    const childTask = store.createTask({
+    }));
+    const childTask = (await store.createTask({
       projectId: project.id, title: 'Child', workflow: 'software-dev', workflowVersion: '1.0.0',
       parentTaskId: parentTask.id, params: { prompt: 'implement in the repository' },
-    });
+    }));
     const provider = new WorktreeProvider(path.join(root, 'worlds'));
     const parent = await provider.create({ taskId: parentTask.id, repos: [first, second], base: 'main' });
     const child = await provider.create({ taskId: childTask.id, repos: [first, second], base: 'main' });
-    parent.handle = store.registerWorld(parent.handle, project.id) as typeof parent.handle;
-    child.handle = store.registerWorld(child.handle, project.id) as typeof child.handle;
+    parent.handle = (await store.registerWorld(parent.handle, project.id)) as typeof parent.handle;
+    child.handle = (await store.registerWorld(child.handle, project.id)) as typeof child.handle;
 
     const worlds = new Map<string, World>([[parentTask.id, parent], [childTask.id, child]]);
     const worldAccess = {
@@ -67,12 +67,12 @@ describe('live project repository enrollment', () => {
     };
     const githubApp = { brokerCredentials: async () => ({ env: credentialEnv }) } as any;
     const tokens = new TokenAuthority(store);
-    const mint = (taskId: string, caps: string[]) => tokens.mint({
+    const mint = async (taskId: string, caps: string[]) => (await tokens.mint({
       taskId, projectId: project.id, organizationId: organization.id, profileId: 'do', role: 'do',
       principal: `task-agent:${taskId}:do`, ceiling: caps, grantorCaps: caps,
-    }).token;
-    const parentToken = mint(parentTask.id, ['repository:write', 'task:git:publish']);
-    const childToken = mint(childTask.id, ['task:git:import']);
+    })).token;
+    const parentToken = (await mint(parentTask.id, ['repository:write', 'task:git:publish']));
+    const childToken = (await mint(childTask.id, ['task:git:import']));
     const api = new KarmaxApi({
       store, tokens, client: {} as any, taskQueue: 'test', worldAccess, githubApp,
     });
@@ -102,7 +102,7 @@ describe('live project repository enrollment', () => {
     const amendedHead = (await git(parentRepo.root, ['rev-parse', 'HEAD'])).stdout.trim();
     expect((await api.publishTaskBranch(parentToken)).pushed).toEqual(published.pushed);
     expect((await git(empty, ['rev-parse', `refs/heads/${parent.handle.branch}`])).stdout.trim()).toBe(amendedHead);
-    expect(store.eventsOfType(parentTask.id, 'push.head').at(-1)?.payload.headSha).toBe(amendedHead);
+    expect((await store.eventsOfType(parentTask.id, 'push.head')).at(-1)?.payload.headSha).toBe(amendedHead);
 
     const imported = await api.importTaskBranch(childToken, parentTask.id);
     expect(imported.refs).toEqual(expect.arrayContaining([
@@ -111,40 +111,40 @@ describe('live project repository enrollment', () => {
     const childRepo = child.handle.repos!.find((candidate) => candidate.name === 'empty')!;
     expect((await git(childRepo.root, ['show', `refs/karmax/tasks/${parentTask.id}/empty:implementation.txt`])).stdout)
       .toContain('from parent');
-    expect(store.eventsSince(parentTask.id, 0).find((event) => event.type === 'push.branch')?.payload)
+    expect((await store.eventsSince(parentTask.id, 0)).find((event) => event.type === 'push.branch')?.payload)
       .toMatchObject({ repos: ['first', 'second', 'empty'] });
-    store.close();
+    (await store.close());
   });
 
   it('rolls back attachment metadata when a running world cannot be dynamically enrolled', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Enrollment rollback' });
-    const project = store.createProject('Flat world', {}, organization.id);
-    const repository = store.upsertRepository({
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Enrollment rollback' }));
+    const project = (await store.createProject('Flat world', {}, organization.id));
+    const repository = (await store.upsertRepository({
       organizationId: organization.id, provider: 'github', providerId: '88', owner: 'example', name: 'new',
       sshUrl: 'git@github.com:example/new.git', defaultBranch: 'main', private: true, gitConnectionId: 'connection',
-    });
-    const task = store.createTask({
+    }));
+    const task = (await store.createTask({
       projectId: project.id, title: 'Running', workflow: 'software-dev', workflowVersion: '1.0.0',
       params: { prompt: 'attach it' },
-    });
+    }));
     const flat = { kind: 'e2b', id: task.id, root: '/workspace', branch: `karmax/${task.id}`, base: 'main',
       repos: [{ name: 'existing', repo: 'git@github.com:example/existing.git', root: '/workspace',
         branch: `karmax/${task.id}`, base: 'main' }] } as any;
-    store.registerWorld(flat, project.id);
+    (await store.registerWorld(flat, project.id));
     const world = { handle: flat, exec: async () => ({ code: 1, stdout: '', stderr: '' }) } as any;
     const tokens = new TokenAuthority(store);
-    const token = tokens.mint({
+    const token = (await tokens.mint({
       taskId: task.id, projectId: project.id, organizationId: organization.id, profileId: 'do', role: 'do',
       principal: `task-agent:${task.id}:do`, ceiling: ['repository:write'], grantorCaps: ['repository:write'],
-    }).token;
+    })).token;
     const api = new KarmaxApi({
       store, tokens, client: {} as any, taskQueue: 'test', githubApp: { brokerCredentials: async () => ({ env: {} }) } as any,
       worldAccess: { open: async () => ({ world, handle: flat, release: async () => {} }) } as any,
     });
     await expect(api.attachProjectRepository(token, { projectId: project.id, repositoryId: repository.id }))
       .rejects.toThrow(/rolled back.*flat repository layout.*retry the task/i);
-    expect(store.listProjectRepositories(project.id)).toEqual([]);
-    store.close();
+    expect((await store.listProjectRepositories(project.id))).toEqual([]);
+    (await store.close());
   });
 });

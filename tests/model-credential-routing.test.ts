@@ -16,19 +16,19 @@ describe('model-agnostic harness credential routing', () => {
   let dir: string;
   let store: Store;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-model-routing-'));
-    store = new Store(':memory:');
+    store = (await Store.create(':memory:'));
   });
 
-  afterEach(() => {
-    store.close();
+  afterEach(async () => {
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('uses model prefixes when clear and Credentials precedence when ambiguous', async () => {
-    const organization = store.createOrganization({ name: 'Design' });
-    const project = store.createProject('Site', {}, organization.id);
+    const organization = (await store.createOrganization({ name: 'Design' }));
+    const project = (await store.createProject('Site', {}, organization.id));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const googleHandle = `google:${organization.id}:primary`;
     const kimiHandle = `kimi:${organization.id}:design`;
@@ -40,10 +40,10 @@ describe('model-agnostic harness credential routing', () => {
     fs.mkdirSync(path.join(grokHome, 'data', 'opencode'), { recursive: true });
     fs.writeFileSync(path.join(grokHome, 'data', 'opencode', 'auth.json'), JSON.stringify({ xai: { type: 'oauth' } }));
     const grokLogin = `login:${organization.id}:opencode:grok-subscription`;
-    store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({
+    (await store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({
       order: [grokLogin, `key:handle:${googleHandle}`, `key:handle:${kimiHandle}`],
-    }));
-    store.upsertProfile({
+    })));
+    (await store.upsertProfile({
       id: 'do-default',
       name: 'Do',
       role: 'do',
@@ -51,7 +51,7 @@ describe('model-agnostic harness credential routing', () => {
       model: 'custom-design-model',
       modelProvider: 'xai', // historical duplicate must not affect routing
       capabilities: [],
-    });
+    }));
 
     const core = makeCoreActivities({
       store,
@@ -85,12 +85,12 @@ describe('model-agnostic harness credential routing', () => {
   });
 
   it('passes the exact leased environment-key provider to the OpenCode turn', async () => {
-    const project = store.createProject('Personal design');
-    const runtimeTask = store.createTask({ projectId: project.id, title: 'Design', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'design it' } as any });
+    const project = (await store.createProject('Personal design'));
+    const runtimeTask = (await store.createTask({ projectId: project.id, title: 'Design', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'design it' } as any }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault-runtime')));
     broker.registerHandle('xai:legacy', 'must-not-be-resolved');
-    store.upsertProfile({
+    (await store.upsertProfile({
       id: 'do-default',
       name: 'Do',
       role: 'do',
@@ -98,7 +98,7 @@ describe('model-agnostic harness credential routing', () => {
       model: 'custom-design-model',
       auth: { kind: 'apiKeyHandle', handle: 'xai:legacy' },
       capabilities: [],
-    });
+    }));
     let captured: any;
     const adapters = new Map<any, any>([['opencode', {
       provider: 'opencode',
@@ -144,22 +144,22 @@ describe('model-agnostic harness credential routing', () => {
   });
 
   it('does not bypass a Credentials policy that disables every compatible source', async () => {
-    const organization = store.createOrganization({ name: 'Disabled' });
-    const project = store.createProject('Disabled credentials', {}, organization.id);
+    const organization = (await store.createOrganization({ name: 'Disabled' }));
+    const project = (await store.createProject('Disabled credentials', {}, organization.id));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault-disabled')));
     const handle = `google:${organization.id}:disabled`;
     broker.registerHandle(handle, 'disabled-secret');
-    store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({
+    (await store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({
       off: [`key:handle:${handle}`],
-    }));
-    store.upsertProfile({
+    })));
+    (await store.upsertProfile({
       id: 'do-default',
       name: 'Do',
       role: 'do',
       provider: 'opencode',
       model: 'google/gemini-2.5-pro',
       capabilities: [],
-    });
+    }));
     const core = makeCoreActivities({
       store,
       worlds: new WorldRegistry(),

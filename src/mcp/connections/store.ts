@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../../util/async-collections.js';
 import crypto from 'node:crypto';
 import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
@@ -46,19 +47,19 @@ export function validateSecrets(input: unknown, environment = false): Record<str
 export class McpConnections {
   constructor(private store: Store, private broker: CredentialBroker, readonly organizationId: string) {}
   private key() { return `mcp-connections:${this.organizationId}`; }
-  private all(): McpConnection[] { return this.store.getSettings(this.key(), 'mcp')?.connections as McpConnection[] ?? []; }
-  list(projectId?: string): McpConnection[] { return this.all().filter((c) => !c.projectId || c.projectId === projectId); }
-  get(id: string, projectId?: string): McpConnection {
-    const c = this.list(projectId).find((v) => v.id === id);
+  private async all(): Promise<McpConnection[]> { return (await this.store.getSettings(this.key(), 'mcp'))?.connections as McpConnection[] ?? []; }
+  async list(projectId?: string): Promise<McpConnection[]> { return (await this.all()).filter((c) => !c.projectId || c.projectId === projectId); }
+  async get(id: string, projectId?: string): Promise<McpConnection> {
+    const c = (await this.list(projectId)).find((v) => v.id === id);
     if (!c) throw new Error('MCP connection not found in this scope');
     return c;
   }
   private handle(id: string) { return `mcp:${this.organizationId}:${id}`; }
-  save(input: any, projectId?: string): McpConnection {
-    if (projectId && this.store.getProject(projectId)?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
-    const prior = input.id ? this.get(input.id, projectId) : undefined;
+  async save(input: any, projectId?: string): Promise<McpConnection> {
+    if (projectId && (await this.store.getProject(projectId))?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
+    const prior = input.id ? (await this.get(input.id, projectId)) : undefined;
     if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
-    if (!prior && this.all().length >= 200) throw new Error('Connection limit reached (200 per organization)');
+    if (!prior && (await this.all()).length >= 200) throw new Error('Connection limit reached (200 per organization)');
     const transport = validateTransport(input.transport);
     const auth = input.auth ?? 'none';
     if (!['none', 'secrets', 'oauth'].includes(auth) || (auth === 'oauth' && transport.type === 'stdio')) throw new Error('Invalid authentication method');
@@ -84,15 +85,15 @@ export class McpConnections {
       this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets));
       connection.secretNames = Object.keys(secrets);
     }
-    const connections = this.all().filter((c) => c.id !== connection.id);
+    const connections = (await this.all()).filter((c) => c.id !== connection.id);
     if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization)');
-    this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] });
+    (await this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] }));
     return connection;
   }
-  remove(id: string, projectId?: string) {
-    const c = this.get(id, projectId);
+  async remove(id: string, projectId?: string) {
+    const c = (await this.get(id, projectId));
     if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
-    this.store.setSettings(this.key(), 'mcp', { connections: this.all().filter((v) => v.id !== id) });
+    (await this.store.setSettings(this.key(), 'mcp', { connections: (await this.all()).filter((v) => v.id !== id) }));
     this.broker.deleteHandle(this.handle(id));
   }
   secret(c: McpConnection, taskId?: string): any {
@@ -100,15 +101,15 @@ export class McpConnections {
     if (!this.broker.hasHandle(handle)) return {};
     return JSON.parse(this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
   }
-  setSecret(c: McpConnection, value: unknown) {
-    if (this.get(c.id, c.projectId).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
+  async setSecret(c: McpConnection, value: unknown) {
+    if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
     this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)); }
-  selected(ids: string[], projectId: string): McpConnection[] {
+  async selected(ids: string[], projectId: string): Promise<McpConnection[]> {
     validateMcpSelection(ids);
-    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any)).map((id) => {
-      const c = this.get(id, projectId);
+    return (await __asyncCollections.map(ids.filter((id) => !BUILTIN_MCPS.includes(id as any)), async (id) => {
+      const c = (await this.get(id, projectId));
       if (!c.enabled) throw new Error(`MCP connection “${c.label}” is disabled. Update the Agent tools selection.`);
       return c;
-    });
+    }));
   }
 }

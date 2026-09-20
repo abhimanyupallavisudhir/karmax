@@ -66,13 +66,13 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     client = c.client;
     closeClient = c.close;
 
-    store = new Store(':memory:');
-    store.claimPersonalOrganization('a');
+    store = (await Store.create(':memory:'));
+    (await store.claimPersonalOrganization('a'));
     const tokens = new TokenAuthority();
     workflows = new WorkflowManager(mgr, new WorkflowRepoLoader(cacheHome), PackageStore.withBundled());
     api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, workflows });
-    projectId = store.createProject('P', { defaultBase: 'main', defaultTarget: 'main' }).id;
-    token = tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:a', ceiling: ['create-task', 'edit-workflow', 'read-task'], grantorCaps: ['create-task', 'edit-workflow', 'read-task'] }).token;
+    projectId = (await store.createProject('P', { defaultBase: 'main', defaultTarget: 'main' })).id;
+    token = (await tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:a', ceiling: ['create-task', 'edit-workflow', 'read-task'], grantorCaps: ['create-task', 'edit-workflow', 'read-task'] })).token;
   }, 120_000);
 
   afterAll(async () => {
@@ -87,10 +87,10 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     const installed = await api.installWorkflow(token, { url: repo });
     expect(installed).toEqual({ name: 'note', version: '1.0.0' });
 
-    const listed = api.listWorkflows(token).find((w) => w.name === 'note');
+    const listed = (await api.listWorkflows(token)).find((w) => w.name === 'note');
     expect(listed).toMatchObject({ name: 'note', latest: '1.0.0', source: 'external' });
     // built-ins are still listed alongside it
-    expect(api.listWorkflows(token).some((w) => w.name === 'software-dev' && w.source === 'bundled')).toBe(true);
+    expect((await api.listWorkflows(token)).some((w) => w.name === 'software-dev' && w.source === 'bundled')).toBe(true);
 
     // Create a task on the installed workflow through the normal path; it runs.
     const task = await api.createTask(token, { projectId, workflow: 'note', prompt: 'hello' });
@@ -100,9 +100,9 @@ describe('install a workflow from git and run a task on it (real dev server)', (
   });
 
   it('makes external workflow availability and Temporal types organization-owned', async () => {
-    const beta = store.createOrganization({ name: 'Beta' });
-    const betaProject = store.createProject('Beta project', {}, beta.id);
-    expect(api.listWorkflows(token, beta.id).some((workflow) => workflow.name === 'note')).toBe(false);
+    const beta = (await store.createOrganization({ name: 'Beta' }));
+    const betaProject = (await store.createProject('Beta project', {}, beta.id));
+    expect((await api.listWorkflows(token, beta.id)).some((workflow) => workflow.name === 'note')).toBe(false);
     await expect(api.createTask(token, { projectId: betaProject.id, workflow: 'note', prompt: 'blocked' }))
       .rejects.toThrow(/unknown workflow/);
 
@@ -115,7 +115,7 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'beta variant at v1']);
     await api.installWorkflow(token, { url: repo }, beta.id);
-    expect(api.listWorkflows(token, beta.id).some((workflow) => workflow.name === 'note')).toBe(true);
+    expect((await api.listWorkflows(token, beta.id)).some((workflow) => workflow.name === 'note')).toBe(true);
     const personalType = workflows.resolveStart('note', '1.0.0', 'org_personal')!.startType;
     const betaType = workflows.resolveStart('note', '1.0.0', beta.id)!.startType;
     expect(betaType).not.toBe(personalType);
@@ -150,15 +150,15 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'v1.1.0']);
     expect(await api.installWorkflow(token, { url: repo, ref: 'main' })).toEqual({ name: 'note', version: '1.1.0' });
-    expect(api.listWorkflows(token).find((w) => w.name === 'note')!.latest).toBe('1.1.0');
+    expect((await api.listWorkflows(token)).find((w) => w.name === 'note')!.latest).toBe('1.1.0');
 
     // No pin → a new task runs the latest (1.1.0).
     const latest = await api.createTask(token, { projectId, workflow: 'note', prompt: 'hi' });
     expect((await client.workflow.getHandle(latest.id).result()).v).toBe('1.1.0');
 
     // Pin the project to 1.0.0 → a new task runs the OLD version's code (still bundled).
-    expect(api.pinWorkflow(token, { projectId, workflow: 'note', version: '1.0.0' })).toEqual({ workflow: 'note', version: '1.0.0' });
-    expect(api.workflowPins(token, projectId).note).toBe('1.0.0');
+    expect((await api.pinWorkflow(token, { projectId, workflow: 'note', version: '1.0.0' }))).toEqual({ workflow: 'note', version: '1.0.0' });
+    expect((await api.workflowPins(token, projectId)).note).toBe('1.0.0');
     const pinned = await api.createTask(token, { projectId, workflow: 'note', prompt: 'hi' });
     expect(pinned.workflowVersion).toBe('1.0.0');
     const r = await client.workflow.getHandle(pinned.id).result();

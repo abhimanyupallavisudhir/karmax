@@ -124,10 +124,10 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
       }
     };
     for (const name of names) {
-      const item = items.list().find(i => i.provenance.externalId === name)!;
+      const item = (await items.list()).find(i => i.provenance.externalId === name)!;
       if (name === 'standalone') expect(item.fields).not.toContain('password');
       const token = items.readSecret(item, 'totp')!;
-      expect(items.totp(item, {})).toHaveLength(token.startsWith('otpauth://') ? Number(new URL(token).searchParams.get('digits') || 6) : 6);
+      expect((await items.totp(item, {}))).toHaveLength(token.startsWith('otpauth://') ? Number(new URL(token).searchParams.get('digits') || 6) : 6);
       compareCodes(name, token);
     }
     const newSeed = 'JBSWY3DPEHPK3PXP';
@@ -138,8 +138,8 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     expect((await connectors.sync('pass-git', names)).count).toBe(names.length);
     expect((await connectors.sync('pass-git', names)).skipped).toBe(names.length);
 
-    const created = items.save({ type: 'login', label: 'new-otp', secrets: { totp: uri, note: 'retain me\n' }, provenance: { source: 'task:test' } });
-    connectors.setConfig('pass-git', { writeBack: true });
+    const created = (await items.save({ type: 'login', label: 'new-otp', secrets: { totp: uri, note: 'retain me\n' }, provenance: { source: 'task:test' } }));
+    (await connectors.setConfig('pass-git', { writeBack: true }));
     const written = await connectors.writeBack('pass-git', created.id);
     run('git', ['pull', '--ff-only'], undefined, store);
     compareCodes(written!.externalId, uri);
@@ -170,7 +170,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
       'org_personal', () => ({}), path.join(root, 'connector'), { allowLocalRepository: true });
     connectors.register(mounted);
     expect((await connectors.sync('pass-git', ['work/otp'])).count).toBe(1);
-    const mountedItem = items.list().find(item => item.provenance.externalId === 'work/otp')!;
+    const mountedItem = (await items.list()).find(item => item.provenance.externalId === 'work/otp')!;
     expect(items.readSecret(mountedItem, 'totp')).toBe(uri);
     await mounted.updateSecret('work/otp', 'totp', newSeed);
     run('git', ['pull', '--ff-only'], undefined, ageStore);
@@ -178,7 +178,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     const ageCode = run('gopass', ['otp', '-o', 'work/otp']).trim();
     expect([totpCode(newSeed, beforeAge), totpCode(newSeed, Date.now())]).toContain(ageCode);
     expect((await connectors.sync('pass-git', ['work/otp'])).count).toBe(1);
-    expect(items.readSecret(items.get(mountedItem.id)!, 'totp')).toContain(newSeed);
+    expect(items.readSecret((await items.get(mountedItem.id))!, 'totp')).toContain(newSeed);
   } finally {
     run('gpgconf', ['--kill', 'gpg-agent']);
     fs.rmSync(root, { recursive: true, force: true });

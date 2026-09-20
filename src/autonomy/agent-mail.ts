@@ -36,8 +36,8 @@ export interface AgentMessage {
 }
 
 export interface AgentMailStore {
-  kvGet(k: string): string | undefined;
-  kvSet(k: string, v: string): void;
+  kvGet(k: string): (string | undefined) | Promise<string | undefined>;
+  kvSet(k: string, v: string): (void) | Promise<void>;
 }
 
 const kvMessages = (organizationId: string) => `agent-mail:messages:${organizationId}`;
@@ -177,12 +177,12 @@ const kvSecretOwner = (secret: string) => `agent-mail:secret-owner:${crypto.crea
  *  the forwarding service AND names the one tenant its mail may reach: an
  *  installation-wide secret let any administrator who had seen their own
  *  webhook URL forge verification mail into every other organization's inbox. */
-export function ingestSecret(store: AgentMailStore, organizationId: string): string {
-  const existing = store.kvGet(kvSecret(organizationId));
+export async function ingestSecret(store: AgentMailStore, organizationId: string): Promise<string> {
+  const existing = (await store.kvGet(kvSecret(organizationId)));
   if (existing) return existing;
   const secret = crypto.randomBytes(18).toString('base64url');
-  store.kvSet(kvSecret(organizationId), secret);
-  store.kvSet(kvSecretOwner(secret), organizationId);
+  (await store.kvSet(kvSecret(organizationId), secret));
+  (await store.kvSet(kvSecretOwner(secret), organizationId));
   return secret;
 }
 
@@ -190,11 +190,11 @@ export function ingestSecret(store: AgentMailStore, organizationId: string): str
  *  installation-wide secret earlier releases minted (and the legacy env var),
  *  kept so already-configured forwarders keep delivering — every organization
  *  (`organizationId` undefined). `undefined` means the secret is not accepted. */
-export function ingestScope(store: AgentMailStore, presented: string | undefined, legacyEnvSecret?: string): { organizationId?: string } | undefined {
+export async function ingestScope(store: AgentMailStore, presented: string | undefined, legacyEnvSecret?: string): Promise<{ organizationId?: string } | undefined> {
   if (!presented) return undefined;
-  const owner = store.kvGet(kvSecretOwner(presented));
-  if (owner && timingSafeEqualStr(store.kvGet(kvSecret(owner)) ?? '', presented)) return { organizationId: owner };
-  const legacy = store.kvGet('agent-mail:secret');
+  const owner = (await store.kvGet(kvSecretOwner(presented)));
+  if (owner && timingSafeEqualStr((await store.kvGet(kvSecret(owner))) ?? '', presented)) return { organizationId: owner };
+  const legacy = (await store.kvGet('agent-mail:secret'));
   if ((legacy && timingSafeEqualStr(presented, legacy)) || (legacyEnvSecret && timingSafeEqualStr(presented, legacyEnvSecret))) return {};
   return undefined;
 }
@@ -274,13 +274,13 @@ export class AgentMail {
    * preserved, so inbound routing keeps working) — connecting a provider
    * "just works" for organizations that already existed.
    */
-  address(organizationId: string): string {
-    const existing = this.store.kvGet(kvAddress(organizationId));
+  async address(organizationId: string): Promise<string> {
+    const existing = (await this.store.kvGet(kvAddress(organizationId)));
     if (this.exactAddress) {
       const address = cleanAddress(this.exactAddress);
       const local = address.split('@')[0]!;
-      this.store.kvSet(kvAddress(organizationId), address);
-      this.store.kvSet(kvOwner(local), organizationId);
+      (await this.store.kvSet(kvAddress(organizationId), address));
+      (await this.store.kvSet(kvOwner(local), organizationId));
       return address;
     }
     if (existing && !this.domain) return existing; // never downgrade to the placeholder
@@ -290,9 +290,9 @@ export class AgentMail {
     if (existing === address) return existing;
     // First mint, placeholder upgrade, or provider switch: the org's random
     // token is preserved and old reverse-routes stay in kv, so nothing breaks.
-    this.store.kvSet(kvAddress(organizationId), address);
-    this.store.kvSet(kvOwner(local.toLowerCase()), organizationId);
-    this.store.kvSet(kvOwner(token), organizationId); // tag-only route survives providers that rewrite the base
+    (await this.store.kvSet(kvAddress(organizationId), address));
+    (await this.store.kvSet(kvOwner(local.toLowerCase()), organizationId));
+    (await this.store.kvSet(kvOwner(token), organizationId)); // tag-only route survives providers that rewrite the base
     return address;
   }
 
@@ -303,18 +303,18 @@ export class AgentMail {
   /** Which organization owns a recipient address. Tries the exact local part
    *  (covers fixed-address `base+agent-x` mailboxes), then the plus-tag alone,
    *  then the base local with tags stripped (`agent-ab12+github@…`). */
-  ownerOf(to: string): string | undefined {
+  async ownerOf(to: string): Promise<string | undefined> {
     const local = to.split('@')[0]?.trim().toLowerCase();
     if (!local) return undefined;
     const [base, tag] = local.split('+', 2);
-    return this.store.kvGet(kvOwner(local))
-      ?? (tag ? this.store.kvGet(kvOwner(tag)) : undefined)
-      ?? (base ? this.store.kvGet(kvOwner(base)) : undefined);
+    return (await this.store.kvGet(kvOwner(local)))
+      ?? (tag ? (await this.store.kvGet(kvOwner(tag))) : undefined)
+      ?? (base ? (await this.store.kvGet(kvOwner(base))) : undefined);
   }
 
-  private all(organizationId: string): AgentMessage[] {
+  private async all(organizationId: string): Promise<AgentMessage[]> {
     try {
-      return JSON.parse(this.store.kvGet(kvMessages(organizationId)) ?? '[]');
+      return JSON.parse((await this.store.kvGet(kvMessages(organizationId))) ?? '[]');
     } catch {
       return [];
     }
@@ -326,13 +326,13 @@ export class AgentMail {
    * a catch-all domain forwards everything, including strangers' typos — and so
    * is mail whose webhook secret belongs to a different organization (`onlyFor`).
    */
-  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number; sourceId?: string }, onlyFor?: string): { delivered: boolean; message?: AgentMessage } {
-    const organizationId = this.ownerOf(msg.to);
+  async ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number; sourceId?: string }, onlyFor?: string): Promise<{ delivered: boolean; message?: AgentMessage }> {
+    const organizationId = (await this.ownerOf(msg.to));
     if (!organizationId || (onlyFor && organizationId !== onlyFor)) return { delivered: false };
     const id = msg.sourceId
       ? `msg_${crypto.createHash('sha256').update(`${organizationId}\0${msg.sourceId}`).digest('hex')}`
       : `msg_${crypto.randomBytes(8).toString('hex')}`;
-    const existing = this.all(organizationId);
+    const existing = (await this.all(organizationId));
     // Polling may replay a boundary message; keep its original arrival time.
     if (existing.some((message) => message.id === id)) return { delivered: false };
     const record: AgentMessage = {
@@ -346,13 +346,13 @@ export class AgentMail {
       receivedAt: msg.receivedAt ?? Date.now(),
     };
     const next = [...existing, record].slice(-MAX_MESSAGES);
-    this.store.kvSet(kvMessages(organizationId), JSON.stringify(next));
+    (await this.store.kvSet(kvMessages(organizationId), JSON.stringify(next)));
     return { delivered: true, message: record };
   }
 
   /** Recent messages for one organization, newest first. */
-  recent(organizationId: string, opts: { since?: number; limit?: number; match?: string } = {}): AgentMessage[] {
-    let msgs = this.all(organizationId).filter((m) => (opts.since ? m.receivedAt > opts.since : true));
+  async recent(organizationId: string, opts: { since?: number; limit?: number; match?: string } = {}): Promise<AgentMessage[]> {
+    let msgs = (await this.all(organizationId)).filter((m) => (opts.since ? m.receivedAt > opts.since : true));
     if (opts.match) {
       const needle = opts.match.toLowerCase();
       msgs = msgs.filter((m) => `${m.subject ?? ''} ${m.from} ${m.text}`.toLowerCase().includes(needle));

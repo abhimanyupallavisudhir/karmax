@@ -602,97 +602,95 @@ describe('buildWikiPromptContext', () => {
 });
 
 describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', () => {
-  const harness = () => {
+  const harness = async () => {
     const contentDir = tmp();
     const tokens = new TokenAuthority();
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme' });
-    const project = store.createProject('web', {}, organization.id);
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme' }));
+    const project = (await store.createProject('web', {}, organization.id));
     const k = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir } as any);
-    const mint = (caps: string[]) =>
-      tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:a', projectId: project.id, organizationId: organization.id, ceiling: caps, grantorCaps: caps }).token;
+    const mint = async (caps: string[]) =>
+      (await tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:a', projectId: project.id, organizationId: organization.id, ceiling: caps, grantorCaps: caps })).token;
     return { k, contentDir, organization, project, mint };
   };
 
-  it('round-trips pages, exposes the read-only built-in, and enforces create/rename guards', () => {
-    const { k, contentDir, organization, project, mint } = harness();
+  it('round-trips pages, exposes the read-only built-in, and enforces create/rename guards', async () => {
+    const { k, contentDir, organization, project, mint } = (await harness());
     try {
-      const rw = mint(['project:read', 'organization:read', 'skill:write']);
-      k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it.', kind: 'skill', create: true });
+      const rw = (await mint(['project:read', 'organization:read', 'skill:write']));
+      (await k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it.', kind: 'skill', create: true }));
       const projectRoot = wikiRoot(contentDir, 'project', project.id);
       expect(fs.existsSync(path.join(projectRoot, '.git'))).toBe(true);
       expect(execFileSync('git', ['-C', projectRoot, 'log', '-1', '--format=%s'], { encoding: 'utf8' })).toContain('wiki: update guides/deploys');
       // Creating again at the same path is refused; a plain update is fine.
-      expect(() => k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: 'x', create: true })).toThrow(/already exists/);
-      k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it now.' });
+      await expect((async () => (await k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: 'x', create: true })))()).rejects.toThrow(/already exists/);
+      (await k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it now.' }));
       // Rename via prevPath moves the folder.
-      k.saveWikiPage(rw, 'project', project.id, { path: 'guides/shipping', content: '---\ndescription: how\n---\nShip it now.', prevPath: 'guides/deploys' });
-      const page = k.readWiki(rw, 'project', project.id, 'guides/shipping') as any;
+      (await k.saveWikiPage(rw, 'project', project.id, { path: 'guides/shipping', content: '---\ndescription: how\n---\nShip it now.', prevPath: 'guides/deploys' }));
+      const page = (await k.readWiki(rw, 'project', project.id, 'guides/shipping')) as any;
       expect(page.page.content).toContain('Ship it now.');
-      expect((k.readWiki(rw, 'project', project.id, 'guides/deploys') as any).page).toBeUndefined();
+      expect(((await k.readWiki(rw, 'project', project.id, 'guides/deploys')) as any).page).toBeUndefined();
       // The organization tree carries the built-in (delivered unconditionally),
       // and the Index response carries the agent-exact TOC text.
-      const org = k.readWiki(rw, 'organization', organization.id) as any;
+      const org = (await k.readWiki(rw, 'organization', organization.id)) as any;
       expect(org.toc.children[0]).toMatchObject({ path: BUILTIN_WIKI_ENTRIES[0]!.path, builtin: true, labels: ['default'] });
       expect(org.unconditional[0].body).toBe(GLOBAL_INSTRUCTIONS);
       expect(org.tocText).toBeDefined();
-      const proj = k.readWiki(rw, 'project', project.id) as any;
+      const proj = (await k.readWiki(rw, 'project', project.id)) as any;
       expect(proj.tocText).toContain('how'); // the same rendering agents receive
-      const builtinPage = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
+      const builtinPage = (await k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)) as any;
       expect(builtinPage.page.builtin).toBe(true);
       // Editing a built-in writes its override; deleting the override restores the default.
       // Built-in and `default`-labelled organization pages reach every prompt in the
       // organization, so `skill:write` alone (every Do agent) is refused: it takes
       // an organization administrator.
-      expect(() => k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' }))
-        .toThrow(/organization:edit/);
-      expect(() => k.saveWikiPage(rw, 'organization', organization.id, { path: 'rules/everywhere', content: '---\nlabels: default\n---\nEverywhere.', create: true }))
-        .toThrow(/organization:edit/);
-      const admin = mint(['project:read', 'organization:read', 'skill:write', 'organization:edit']);
-      k.saveWikiPage(admin, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' });
-      expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[0])
+      await expect((async () => (await k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' })))()).rejects.toThrow(/organization:edit/);
+      await expect((async () => (await k.saveWikiPage(rw, 'organization', organization.id, { path: 'rules/everywhere', content: '---\nlabels: default\n---\nEverywhere.', create: true })))()).rejects.toThrow(/organization:edit/);
+      const admin = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:edit']));
+      (await k.saveWikiPage(admin, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' }));
+      expect((await k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).versions[0])
         .toMatchObject({ version: 2, operation: 'write', content: expect.stringContaining('Our own rules.') });
-      expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[1])
+      expect((await k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).versions[1])
         .toMatchObject({ version: 1, operation: 'baseline', content: expect.stringContaining('# How to work') });
-      const edited = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
+      const edited = (await k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)) as any;
       expect(edited.page).toMatchObject({ builtin: true, overridden: true });
-      expect(() => k.deleteWikiPage(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).toThrow(/organization:edit/);
-      expect(k.deleteWikiPage(admin, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).deleted).toBe(true);
-      expect((k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any).page.overridden).toBeUndefined();
-      k.saveWikiPage(rw, 'organization', organization.id, {
+      await expect((async () => (await k.deleteWikiPage(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)))()).rejects.toThrow(/organization:edit/);
+      expect((await k.deleteWikiPage(admin, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).deleted).toBe(true);
+      expect(((await k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)) as any).page.overridden).toBeUndefined();
+      (await k.saveWikiPage(rw, 'organization', organization.id, {
         path: 'rules/original',
         content: 'Original rules.',
         create: true,
-      });
-      k.saveWikiPage(rw, 'organization', organization.id, {
+      }));
+      (await k.saveWikiPage(rw, 'organization', organization.id, {
         path: 'rules/renamed',
         prevPath: 'rules/original',
         content: 'Renamed rules.',
-      });
-      expect(k.organizationWikiHistory(rw, organization.id, 'rules/original').versions[0])
+      }));
+      expect((await k.organizationWikiHistory(rw, organization.id, 'rules/original')).versions[0])
         .toMatchObject({ operation: 'move', path: 'rules/renamed', previousPath: 'rules/original' });
       // A page that predates the version-history feature is captured before its
       // first overwrite, so the prior state remains recoverable.
       const organizationRoot = wikiRoot(contentDir, 'organization', organization.id);
       writeWikiPage(organizationRoot, 'legacy/page', 'Before history.', 'memory', { create: true });
-      k.saveWikiPage(rw, 'organization', organization.id, {
+      (await k.saveWikiPage(rw, 'organization', organization.id, {
         path: 'legacy/page',
         content: 'After history.',
         kind: 'memory',
-      });
-      expect(k.organizationWikiHistory(rw, organization.id, 'legacy/page').versions)
+      }));
+      expect((await k.organizationWikiHistory(rw, organization.id, 'legacy/page')).versions)
         .toMatchObject([
           { version: 2, operation: 'write', content: 'After history.' },
           { version: 1, operation: 'baseline', content: 'Before history.' },
         ]);
-      expect(k.searchWiki(rw, 'project', project.id, 'ship').hits.length).toBeGreaterThan(0);
-      expect(k.deleteWikiPage(rw, 'project', project.id, 'guides/shipping').deleted).toBe(true);
+      expect((await k.searchWiki(rw, 'project', project.id, 'ship')).hits.length).toBeGreaterThan(0);
+      expect((await k.deleteWikiPage(rw, 'project', project.id, 'guides/shipping')).deleted).toBe(true);
       // Read-only token: reads fine, writes denied.
-      const ro = mint(['project:read', 'organization:read']);
-      expect(() => k.readWiki(ro, 'project', project.id)).not.toThrow();
-      expect(() => k.saveWikiPage(ro, 'project', project.id, { path: 'x', content: 'y' })).toThrow(/skill:write/);
+      const ro = (await mint(['project:read', 'organization:read']));
+      await (async () => (await k.readWiki(ro, 'project', project.id)))();
+      await expect((async () => (await k.saveWikiPage(ro, 'project', project.id, { path: 'x', content: 'y' })))()).rejects.toThrow(/skill:write/);
       // Unknown project refuses rather than minting a stray directory.
-      expect(() => k.readWiki(rw, 'project', 'nope')).toThrow(/no project/);
+      await expect((async () => (await k.readWiki(rw, 'project', 'nope')))()).rejects.toThrow(/no project/);
       expect(fs.existsSync(path.join(contentDir, 'wiki', 'project', project.id))).toBe(true);
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
@@ -803,16 +801,16 @@ describe('existing project wiki remote backfill', () => {
     process.env.GIT_CONFIG_KEY_0 = `url.file://${remotes}/.insteadOf`;
     process.env.GIT_CONFIG_VALUE_0 = 'git@github.com:acme/';
 
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Backfill org', ownerUserId: 'owner' });
-    const project = store.createProject('Existing project', {}, organization.id);
-    const connection = store.upsertGitConnection({
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Backfill org', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Existing project', {}, organization.id));
+    const connection = (await store.upsertGitConnection({
       organizationId: organization.id,
       provider: 'github',
       installationId: '42',
       accountLogin: 'acme',
       accountType: 'Organization',
-    });
+    }));
     const actors: string[] = [];
     const inputs: Array<{ name: string; private?: boolean }> = [];
     const githubApp = {
@@ -821,7 +819,7 @@ describe('existing project wiki remote backfill', () => {
         actors.push(userId);
         inputs.push(input);
         execFileSync('git', ['init', '-q', '--bare', path.join(remotes, `${input.name}.git`)]);
-        return store.upsertRepository({
+        return (await store.upsertRepository({
           organizationId: organization.id,
           provider: 'github',
           providerId: '77',
@@ -831,25 +829,25 @@ describe('existing project wiki remote backfill', () => {
           defaultBranch: 'main',
           private: true,
           gitConnectionId: connection.id,
-        });
+        }));
       },
       brokerCredentials: async () => ({ httpsToken: 'unused-for-file-transport' }),
     };
     const worlds = new WorldRegistry();
-    const gateway = new Gateway({
+    const gateway = (await Gateway.create({
       store,
       worlds,
       githubApp,
       bus: new KarmaxBus(),
       tokens: new TokenAuthority(),
       staticDir: fs.mkdtempSync(path.join(home, 'static-')),
-    } as any);
+    } as any));
     try {
       const listening = await gateway.listen(49_000);
       expect(actors).toEqual(['owner']);
       expect(inputs).toMatchObject([{ private: true }]);
-      await expect.poll(() => store.projectWiki(project.id)?.repository, { timeout: 5_000 }).toBeTruthy();
-      const linked = store.projectWiki(project.id)!.repository;
+      await expect.poll(async () => (await store.projectWiki(project.id))?.repository, { timeout: 5_000 }).toBeTruthy();
+      const linked = (await store.projectWiki(project.id))!.repository;
       expect(linked).toMatchObject({ private: true, gitConnectionId: connection.id });
       await expect.poll(() => {
         try {
@@ -861,7 +859,7 @@ describe('existing project wiki remote backfill', () => {
       }, { timeout: 5_000 }).toMatch(/^[0-9a-f]{40}$/);
       await listening.close();
     } finally {
-      store.close();
+      (await store.close());
       if (previousHome === undefined) delete process.env.KARMAX_HOME;
       else process.env.KARMAX_HOME = previousHome;
       if (previousGit.count === undefined) delete process.env.GIT_CONFIG_COUNT;
@@ -878,21 +876,21 @@ describe('existing project wiki remote backfill', () => {
 describe('remote task wiki views', () => {
   it('reads and edits the live provider checkout rather than the global wiki', async () => {
     const contentDir = tmp();
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Remote org' });
-    const project = store.createProject('Remote project', {}, organization.id);
-    const wikiRepository = store.upsertRepository({ organizationId: organization.id, provider: 'github',
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Remote org' }));
+    const project = (await store.createProject('Remote project', {}, organization.id));
+    const wikiRepository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github',
       providerId: 'remote-task-wiki', owner: 'acme', name: 'wiki',
-      sshUrl: 'git@github.com:acme/wiki.git', defaultBranch: 'main', private: true });
-    store.setProjectWikiRepository(project.id, wikiRepository.id);
-    const task = store.createTask({ projectId: project.id, title: 'Cloud task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x' } });
+      sshUrl: 'git@github.com:acme/wiki.git', defaultBranch: 'main', private: true }));
+    (await store.setProjectWikiRepository(project.id, wikiRepository.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Cloud task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } }));
     const root = '/remote/world';
     const repoRoot = `${root}/project-wiki`;
     const handle: any = { kind: 'fake-remote', id: task.id, root, branch: `karmax/${task.id}`, base: 'main',
       repos: [{ name: 'project-wiki', role: 'project-wiki', repo: 'git@github.com:acme/wiki.git',
         root: repoRoot, branch: `karmax/${task.id}`, base: 'main', target: 'main' }] };
-    store.registerWorld(handle, project.id);
+    (await store.registerWorld(handle, project.id));
     const files = new Map<string, Buffer>([['project-wiki/notes/live/SKILL.md', Buffer.from('Live branch.')]]);
     const commits: string[] = [];
     const world: any = {
@@ -912,9 +910,9 @@ describe('remote task wiki views', () => {
     worlds.register({ kind: 'fake-remote', parkable: false, capabilities: { remote: true },
       create: async () => world, open: async () => world } as any);
     const tokens = new TokenAuthority();
-    const token = tokens.mint({ taskId: task.id, profileId: 'do', principal: `task-agent:${task.id}:do`,
+    const token = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: `task-agent:${task.id}:do`,
       projectId: project.id, organizationId: organization.id,
-      ceiling: ['project:read', 'skill:write'], grantorCaps: ['project:read', 'skill:write'] }).token;
+      ceiling: ['project:read', 'skill:write'], grantorCaps: ['project:read', 'skill:write'] })).token;
     let canonicalPublishAttempts = 0;
     const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir, worlds,
       githubApp: { brokerCredentials: async () => { canonicalPublishAttempts++; return { env: {} }; } } } as any);
@@ -960,7 +958,7 @@ describe('remote task wiki views', () => {
       });
       expect(systemPrompt).toContain('Instructions from the remote task branch.');
     } finally {
-      store.close();
+      (await store.close());
       fs.rmSync(contentDir, { recursive: true, force: true });
     }
   });

@@ -54,39 +54,39 @@ describe('project resources', () => {
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
 
-    const store = new Store(':memory:');
-    const project = store.createProject('Models', { repos: [repo] });
-    const task = store.createTask({ projectId: project.id, title: 'Tune', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'tune' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Models', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Tune', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'tune' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
 
-    const volume = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const volume = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' }, access: 'write',
-      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
     const initial = await resources.importFiles(volume.id, [{ path: 'model.bin', data: Buffer.from('base-model') }]);
     const secretHandle = `resource:test:token`;
     broker.registerHandle(secretHandle, 'secret-token');
-    store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Training token', driver: 'secret@1', target: { kind: 'environment', name: 'TRAINING_TOKEN' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: [secretHandle], publish: 'discard' });
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [secretHandle], publish: 'discard' }));
 
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = await resources.materialize(project.id, task.id, world, 1);
     world.handle = resources.registerServiceEnvironment(world.handle,
       { DATABASE_URL: 'postgres://private-per-world-endpoint' });
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     expect(await world.readFile('resources/model/model.bin')).toBe('base-model');
-    const leasesBeforeVerification = store.listResourceLeases(world.handle.id);
+    const leasesBeforeVerification = (await store.listResourceLeases(world.handle.id));
     expect(leasesBeforeVerification.length).toBeGreaterThan(0);
     expect((await resources.verifyRevision(project.id, volume.id, initial.id)).status).toBe('complete');
-    expect(store.listResourceLeases(world.handle.id)).toEqual(leasesBeforeVerification);
+    expect((await store.listResourceLeases(world.handle.id))).toEqual(leasesBeforeVerification);
 
     expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
-    const wrapped = resources.withEnvironment(world);
+    const wrapped = (await resources.withEnvironment(world));
     expect((await wrapped.exec('bash', ['-lc', 'printf %s "$TRAINING_TOKEN"'])).stdout).toBe('secret-token');
     expect((await wrapped.exec('bash', ['-lc', 'printf %s "$DATABASE_URL"'])).stdout)
       .toBe('postgres://private-per-world-endpoint');
@@ -101,13 +101,13 @@ describe('project resources', () => {
     expect(summary).toMatchObject({ added: 0, modified: 1, deleted: 0 });
     const promoted = await resources.promote(task.id, volume.id);
     expect(promoted.revision.parentRevisionId).toBe(initial.id);
-    expect(store.getResourceAttachment(volume.id)?.currentRevisionId).toBe(promoted.revision.id);
+    expect((await store.getResourceAttachment(volume.id))?.currentRevisionId).toBe(promoted.revision.id);
 
-    const consumer = store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'evaluate' } });
+    const consumer = (await store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'evaluate' } }));
     const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });
     consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
-    consumerWorld.handle = store.registerWorld(consumerWorld.handle, project.id) as typeof consumerWorld.handle;
+    consumerWorld.handle = (await store.registerWorld(consumerWorld.handle, project.id)) as typeof consumerWorld.handle;
     expect(await consumerWorld.readFileBuffer('resources/model/model.bin')).toEqual(tunedBytes);
 
     // This generation is still pinned to its original lease. A second publish
@@ -123,20 +123,20 @@ describe('project resources', () => {
     await world.destroy();
     await resources.deleteAttachment(volume.id);
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
-    store.close();
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('validates unsafe targets and shared-write publication', () => {
-    const store = new Store(':memory:');
-    const project = store.createProject('Safety');
-    expect(() => store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+  it('validates unsafe targets and shared-write publication', async () => {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Safety'));
+    await expect((async () => (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Escape', driver: 'volume@1', target: { kind: 'path', path: '../outside' }, access: 'read',
-      isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' })).toThrow(/world-relative/);
-    expect(() => store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' })))()).rejects.toThrow(/world-relative/);
+    await expect((async () => (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Prod', driver: 'database@1', target: { kind: 'service', name: 'DATABASE_URL' }, access: 'write',
-      isolation: 'shared', source: {}, credentialHandles: ['db'], publish: 'review' })).toThrow(/cannot be promoted/);
-    store.close();
+      isolation: 'shared', source: {}, credentialHandles: ['db'], publish: 'review' })))()).rejects.toThrow(/cannot be promoted/);
+    (await store.close());
   });
 
   it('uses an online backup for SQLite volume revisions', async () => {
@@ -147,19 +147,19 @@ describe('project resources', () => {
     await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
     const database = path.join(dir, 'state.db');
     const db = new DatabaseSync(database); db.exec('CREATE TABLE values_(value TEXT); INSERT INTO values_ VALUES (\'before\')'); db.close();
-    const store = new Store(':memory:'); const project = store.createProject('SQLite', { repos: [repo] });
-    const task = store.createTask({ projectId: project.id, title: 'Edit DB', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'edit' } });
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('SQLite', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Edit DB', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'edit' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    const attachment = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const attachment = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'SQLite', driver: 'volume@1', target: { kind: 'path', path: 'resources/db' }, access: 'write',
-      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
     await resources.importDirectory(attachment.id, database);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = await resources.materialize(project.id, task.id, world, 1);
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     const update = await world.exec('python3', ['-c',
       "import sqlite3; d=sqlite3.connect('resources/db/state.db'); d.execute(\"INSERT INTO values_ VALUES ('after')\"); d.commit(); d.close()"]);
     expect(update.code).toBe(0);
@@ -167,32 +167,32 @@ describe('project resources', () => {
     const check = await world.exec('python3', ['-c',
       "import sqlite3; print(','.join(x[0] for x in sqlite3.connect('resources/db/state.db').execute('select value from values_ order by rowid')))"]);
     expect(check.stdout.trim()).toBe('before,after');
-    await resources.release(world.handle); await world.destroy(); store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    await resources.release(world.handle); await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('streams snapshots larger than one storage chunk', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-stream-'));
-    const store = new Store(':memory:'); const project = store.createProject('Stream');
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Stream'));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     const engine = new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker);
     const resources = new ProjectResourceService(store, worlds, engine, broker);
-    const attachment = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const attachment = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Weights', driver: 'volume@1', target: { kind: 'path', path: 'weights' }, access: 'read',
-      isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
     const bytes = Buffer.alloc(9 * 1024 * 1024 + 19, 0x71);
     const captured = await engine.capture(attachment, (async function* () {
       yield { path: 'model.bin', data: (async function* () {
         for (let offset = 0; offset < bytes.length; offset += 700_000) yield bytes.subarray(offset, offset + 700_000);
       })() };
     })());
-    const revision = store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...captured, metadata: {} });
+    const revision = (await store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...captured, metadata: {} }));
     const restored: Buffer[] = [];
     await engine.restore(revision, async (_path, chunk) => { restored.push(chunk); });
     expect(crypto.createHash('sha256').update(Buffer.concat(restored)).digest('hex'))
       .toBe(crypto.createHash('sha256').update(bytes).digest('hex'));
     await resources.deleteAttachment(attachment.id);
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
-    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('stages a task-created ignored dataset and adopts it after the world is gone', async () => {
@@ -202,15 +202,15 @@ describe('project resources', () => {
     fs.writeFileSync(path.join(repo, '.gitignore'), 'downloads/\n');
     fs.writeFileSync(path.join(repo, 'README.md'), 'base\n');
     await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
-    const store = new Store(':memory:'); const project = store.createProject('Candidates', { repos: [repo] });
-    const task = store.createTask({ projectId: project.id, title: 'Download model', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'download it' } });
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Candidates', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Download model', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'download it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.exec('mkdir', ['-p', 'downloads']);
     await world.writeFileBuffer!('downloads/model.bin', Buffer.from('agent-created-model'));
 
@@ -228,13 +228,13 @@ describe('project resources', () => {
     const adopted = await resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
     expect(adopted.attachment.enabled).toBe(true);
     expect(adopted.candidate).toMatchObject({ state: 'adopted', resolvedBy: 'user:reviewer' });
-    const consumer = store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'use it' } });
+    const consumer = (await store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'use it' } }));
     const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });
     consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
     expect(await consumerWorld.readFileBuffer('models/downloaded/model.bin')).toEqual(Buffer.from('agent-created-model'));
     await resources.release(consumerWorld.handle); await consumerWorld.destroy();
-    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('discards staged candidates, preserves vault items, and inventories undeclared ignored paths without content', async () => {
@@ -243,15 +243,15 @@ describe('project resources', () => {
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
     fs.writeFileSync(path.join(repo, '.gitignore'), 'generated/\n.env.local\nscratch.bin\n');
     await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
-    const store = new Store(':memory:'); const project = store.createProject('Candidates', { repos: [repo] });
-    const task = store.createTask({ projectId: project.id, title: 'Generate', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'generate' } });
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Candidates', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Generate', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'generate' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.exec('mkdir', ['-p', 'generated']); await world.writeFile('generated/data.bin', 'candidate bytes');
     await world.writeFile('.env.local', 'API_KEY=must-not-be-read'); await world.writeFile('scratch.bin', 'scratch-content');
     const staged = await resources.proposePath(task.id, { path: 'generated', name: 'Generated data',
@@ -267,8 +267,8 @@ describe('project resources', () => {
     expect(JSON.stringify(inventory)).not.toContain('scratch-content');
 
     await resources.discardCandidate(task.id, staged.candidate.id, 'user:reviewer');
-    expect(store.getResourceCandidate(staged.candidate.id)).toMatchObject({ state: 'discarded' });
-    expect(store.getResourceAttachment(staged.attachment.id)).toBeUndefined();
+    expect((await store.getResourceCandidate(staged.candidate.id))).toMatchObject({ state: 'discarded' });
+    expect((await store.getResourceAttachment(staged.attachment.id))).toBeUndefined();
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
 
     const handle = itemHandle('vi_generated', 'secret');
@@ -279,7 +279,7 @@ describe('project resources', () => {
     });
     await resources.discardCandidate(task.id, credential.candidate.id, 'user:reviewer');
     expect(broker.hasHandle(handle)).toBe(true);
-    await world.destroy(); store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('adopts an agent-created vault item as a secret attachment without revealing it', async () => {
@@ -288,15 +288,15 @@ describe('project resources', () => {
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
     fs.writeFileSync(path.join(repo, 'README.md'), 'base\n'); await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
-    const store = new Store(':memory:'); const project = store.createProject('Credentials', { repos: [repo] });
-    const task = store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
-      workflowVersion: '1.19.0', params: { prompt: 'create it' } });
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Credentials', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
+      workflowVersion: '1.19.0', params: { prompt: 'create it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     const handle = itemHandle('vi_agent_key', 'secret'); broker.registerHandle(handle, 'sk-agent-created');
     const proposed = await resources.proposeCredential(task.id, {
       itemId: 'vi_agent_key', field: 'secret', credentialHandle: handle, name: 'Agent API key', driver: 'secret@1',
@@ -306,15 +306,15 @@ describe('project resources', () => {
     const adopted = await resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
     expect(adopted.attachment.source).toMatchObject({ adoptedFromCandidate: proposed.candidate.id });
     expect(adopted.attachment.source.candidate).toBeUndefined();
-    const consumer = store.createTask({ projectId: project.id, title: 'Consume', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'consume' } });
+    const consumer = (await store.createTask({ projectId: project.id, title: 'Consume', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'consume' } }));
     const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });
     consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
-    const wrapped = resources.withEnvironment(consumerWorld);
+    const wrapped = (await resources.withEnvironment(consumerWorld));
     expect((await wrapped.exec('bash', ['-lc', 'printf %s "$AGENT_API_KEY"'])).stdout).toBe('sk-agent-created');
     expect(JSON.stringify(consumerWorld.handle)).not.toContain('sk-agent-created');
     await resources.release(consumerWorld.handle); await consumerWorld.destroy(); await world.destroy();
-    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('allows resource proposals only for workflow versions with the Review gate', async () => {
@@ -323,7 +323,7 @@ describe('project resources', () => {
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
     fs.writeFileSync(path.join(repo, 'README.md'), 'base\n'); await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
-    const store = new Store(':memory:'); const project = store.createProject('Version gate', { repos: [repo] });
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Version gate', { repos: [repo] }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
@@ -340,16 +340,16 @@ describe('project resources', () => {
     ] as const;
     try {
       for (const [index, value] of cases.entries()) {
-        const task = store.createTask({ projectId: project.id, title: `${value.workflow} ${value.version}`,
-          workflow: value.workflow, workflowVersion: value.version, params: { prompt: 'create data' } });
+        const task = (await store.createTask({ projectId: project.id, title: `${value.workflow} ${value.version}`,
+          workflow: value.workflow, workflowVersion: value.version, params: { prompt: 'create data' } }));
         const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
-        world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+        world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
         activeWorlds.push(world);
         await world.writeFile('generated.bin', `${value.workflow}-${value.version}`);
-        const token = tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do',
+        const token = (await tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do',
           principal: 'user:creator', projectId: project.id, organizationId: project.organizationId,
           ceiling: ['task:review:write'], grantorCaps: ['task:review:write'],
-          worldGeneration: world.handle.generation ?? 1 }).token;
+          worldGeneration: world.handle.generation ?? 1 })).token;
         const proposal = api.proposeProjectResource(token, {
           source: { kind: 'path', path: 'generated.bin' }, name: 'Generated data', driver: 'volume@1',
           target: { kind: 'path', path: `data/generated-${index}.bin` }, access: 'read',
@@ -364,7 +364,7 @@ describe('project resources', () => {
       }
     } finally {
       for (const world of activeWorlds.reverse()) await world.destroy();
-      store.close(); fs.rmSync(dir, { recursive: true, force: true });
+      (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -374,24 +374,24 @@ describe('project resources', () => {
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
     fs.writeFileSync(path.join(repo, 'README.md'), 'base\n'); await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
-    const store = new Store(':memory:'); const project = store.createProject('Authorization', { repos: [repo] });
-    const task = store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
-      workflowVersion: '1.19.0', params: { prompt: 'create it' } });
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Authorization', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
+      workflowVersion: '1.19.0', params: { prompt: 'create it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     const vault = new VaultItems(store, broker, path.join(dir, 'state'), project.organizationId!);
-    const own = vault.save({ type: 'api-key', label: 'Own', secrets: { secret: 'own-secret' },
-      provenance: { source: `task:${task.id}`, taskId: task.id } });
-    const foreign = vault.save({ type: 'api-key', label: 'Foreign', secrets: { secret: 'foreign-secret' },
-      provenance: { source: 'manual' } });
+    const own = (await vault.save({ type: 'api-key', label: 'Own', secrets: { secret: 'own-secret' },
+      provenance: { source: `task:${task.id}`, taskId: task.id } }));
+    const foreign = (await vault.save({ type: 'api-key', label: 'Foreign', secrets: { secret: 'foreign-secret' },
+      provenance: { source: 'manual' } }));
     const tokens = new TokenAuthority();
-    const mint = (generation: number) => tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do',
+    const mint = async (generation: number) => (await tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do',
       principal: 'user:creator', projectId: project.id, organizationId: project.organizationId,
-      ceiling: ['task:review:write'], grantorCaps: ['task:review:write'], worldGeneration: generation }).token;
+      ceiling: ['task:review:write'], grantorCaps: ['task:review:write'], worldGeneration: generation })).token;
     const signals: Array<{ taskId: string; signal: string }> = [];
     const client = { workflow: { getHandle: (taskId: string) => ({
       signal: async (signal: string) => { signals.push({ taskId, signal }); },
@@ -401,42 +401,42 @@ describe('project resources', () => {
       source: { kind: 'vault-item', itemId }, name, driver: 'secret@1',
       target: { kind: 'environment', name: 'API_KEY' }, access: 'read',
     });
-    await expect(proposal(mint((world.handle.generation ?? 1) + 1), own.id)).rejects.toBeInstanceOf(CapabilityError);
-    await expect(proposal(mint(world.handle.generation ?? 1), foreign.id)).rejects.toBeInstanceOf(CapabilityError);
-    const ownProposal = await proposal(mint(world.handle.generation ?? 1), own.id);
+    await expect(proposal((await mint((world.handle.generation ?? 1) + 1)), own.id)).rejects.toBeInstanceOf(CapabilityError);
+    await expect(proposal((await mint(world.handle.generation ?? 1)), foreign.id)).rejects.toBeInstanceOf(CapabilityError);
+    const ownProposal = await proposal((await mint(world.handle.generation ?? 1)), own.id);
     expect(ownProposal).toMatchObject({
       candidate: { taskId: task.id, vaultItemId: own.id, state: 'pending' },
     });
-    const agentReviewer = tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
+    const agentReviewer = (await tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
       principal: 'user:reviewer', projectId: project.id, organizationId: project.organizationId,
-      ceiling: ['task:review:execute'], grantorCaps: ['task:review:execute'] }).token;
-    await expect(api.adoptProjectResource(mint(world.handle.generation ?? 1), task.id, ownProposal.candidate.id))
+      ceiling: ['task:review:execute'], grantorCaps: ['task:review:execute'] })).token;
+    await expect(api.adoptProjectResource((await mint(world.handle.generation ?? 1)), task.id, ownProposal.candidate.id))
       .rejects.toBeInstanceOf(CapabilityError);
     await api.adoptProjectResource(agentReviewer, task.id, ownProposal.candidate.id);
-    const reviewer = tokens.mintPrincipal('user:reviewer', ['task:review:execute'], project.id,
-      undefined, project.organizationId).token;
+    const reviewer = (await tokens.mintPrincipal('user:reviewer', ['task:review:execute'], project.id,
+      undefined, project.organizationId)).token;
     await api.adoptProjectResource(reviewer, task.id, ownProposal.candidate.id);
     expect(signals).toContainEqual({ taskId: task.id, signal: 'resourceResolved' });
-    const discardable = await proposal(mint(world.handle.generation ?? 1), own.id, 'Discardable');
-    await expect(api.discardProjectResource(mint(world.handle.generation ?? 1), task.id, discardable.candidate.id))
+    const discardable = await proposal((await mint(world.handle.generation ?? 1)), own.id, 'Discardable');
+    await expect(api.discardProjectResource((await mint(world.handle.generation ?? 1)), task.id, discardable.candidate.id))
       .rejects.toBeInstanceOf(CapabilityError);
     await api.discardProjectResource(agentReviewer, task.id, discardable.candidate.id);
-    expect(store.listResourceCandidates(task.id).find((candidate) => candidate.id === discardable.candidate.id)?.state).toBe('discarded');
+    expect((await store.listResourceCandidates(task.id)).find((candidate) => candidate.id === discardable.candidate.id)?.state).toBe('discarded');
 
-    await expect(api.proposeProjectResource(mint(world.handle.generation ?? 1), {
+    await expect(api.proposeProjectResource((await mint(world.handle.generation ?? 1)), {
       source: { kind: 'vault-item', itemId: own.id }, name: 'Writable database', driver: 'database@1',
       target: { kind: 'service', name: 'DATABASE_URL' }, access: 'write',
     })).rejects.toBeInstanceOf(CapabilityError);
-    const sharedWrite = tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
+    const sharedWrite = (await tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
       principal: 'user:creator', projectId: project.id, organizationId: project.organizationId,
       ceiling: ['task:review:write', 'project:resource:shared-write'],
       grantorCaps: ['task:review:write', 'project:resource:shared-write'],
-      worldGeneration: world.handle.generation ?? 1 }).token;
+      worldGeneration: world.handle.generation ?? 1 })).token;
     await expect(api.proposeProjectResource(sharedWrite, {
       source: { kind: 'vault-item', itemId: own.id }, name: 'Writable database', driver: 'database@1',
       target: { kind: 'service', name: 'DATABASE_URL' }, access: 'write',
     })).resolves.toMatchObject({ attachment: { access: 'write', isolation: 'shared' } });
-    await world.destroy(); store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 

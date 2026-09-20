@@ -26,10 +26,10 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 describe('human and agent authorization-level parity', () => {
   it.each(DEFAULT_AUTHORIZATION_PROFILES)('$name has the same HTTP authority for both actors', async (profile) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-parity-'));
-    const store = new Store(':memory:');
-    store.claimPersonalOrganization('me');
-    const project = store.createProject('Parity');
-    store.kvSet(`avatars:project:${project.id}`, 'enabled');
+    const store = (await Store.create(':memory:'));
+    (await store.claimPersonalOrganization('me'));
+    const project = (await store.createProject('Parity'));
+    (await store.kvSet(`avatars:project:${project.id}`, 'enabled'));
     const tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
@@ -37,29 +37,29 @@ describe('human and agent authorization-level parity', () => {
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
     const client = { workflow: { getHandle: () => ({}) } } as any;
     const api = new KarmaxApi({ store, tokens, client, worlds, resources, broker, taskQueue: 'test' });
-    const gateway = new Gateway({ api, store, tokens, client, worlds, resources, broker, objects,
+    const gateway = (await Gateway.create({ api, store, tokens, client, worlds, resources, broker, objects,
       taskQueue: 'test', staticDir: 'web', bus: new KarmaxBus(), contributions: new ContributionRegistry(),
-      overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'authorization parity test' } });
+      overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'authorization parity test' } }));
     const server = await gateway.listen(await findFreePortFrom(nextPort += 10));
-    cleanups.push(async () => { await server.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+    cleanups.push(async () => { await server.close(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
 
     // Use an actual gateway browser session, then give both actors exactly the
     // same canonical level and scope. Delegation supplies identity, not power.
     const session = await (await fetch(`${server.url}/api/session`)).json() as { token: string };
     const humanToken = (gateway as any).sessions.get(session.token).apiToken as string;
-    const human = tokens.verify(humanToken)!;
+    const human = (await tokens.verify(humanToken))!;
     human.caps = [...profile.capabilities];
     human.organizationId = profile.id === 'god' ? undefined : project.organizationId;
     human.projectId = ['administrator', 'god'].includes(profile.id) ? undefined : project.id;
-    const delegation = tokens.delegateHuman(humanToken, { taskId: 'parity-agent',
-      projectId: human.projectId, organizationId: human.organizationId })!;
-    const agent = tokens.mint({ taskId: 'parity-agent', principal: 'task:parity-agent', profileId: profile.id,
+    const delegation = (await tokens.delegateHuman(humanToken, { taskId: 'parity-agent',
+      projectId: human.projectId, organizationId: human.organizationId }))!;
+    const agent = (await tokens.mint({ taskId: 'parity-agent', principal: 'task:parity-agent', profileId: profile.id,
       projectId: human.projectId, organizationId: human.organizationId, delegationId: delegation.id,
-      ceiling: roleCeiling('do'), grantorCaps: [...profile.capabilities] });
+      ceiling: roleCeiling('do'), grantorCaps: [...profile.capabilities] }));
     for (const role of ['do', 'confirm', 'resolve', 'merge']) {
-      const roleToken = tokens.mint({ taskId: `${role}-parity`, principal: `task:${role}-parity`,
+      const roleToken = (await tokens.mint({ taskId: `${role}-parity`, principal: `task:${role}-parity`,
         profileId: profile.id, role, projectId: human.projectId, organizationId: human.organizationId,
-        ceiling: roleCeiling(role), grantorCaps: [...profile.capabilities] });
+        ceiling: roleCeiling(role), grantorCaps: [...profile.capabilities] }));
       for (const capability of [...CAPABILITIES, '*']) {
         expect(allows(roleToken.record.caps, capability), `${profile.id}/${role}: ${capability}`)
           .toBe(allows(human.caps, capability));
@@ -73,9 +73,9 @@ describe('human and agent authorization-level parity', () => {
       const call = async (method: string, route: string, body?: unknown) => fetch(`${server.url}${route}`, {
         method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
-      const existing = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      const existing = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
         name: `Existing ${kind}`, driver: 'volume@1', target: { kind: 'path', path: `existing-${kind}` },
-        access: 'read', isolation: 'fork', publish: 'discard', source: {}, credentialHandles: [] });
+        access: 'read', isolation: 'fork', publish: 'discard', source: {}, credentialHandles: [] }));
       const checks: Array<[Response, number]> = [
         [await call('GET', `/api/projects/${project.id}/resources`), 200],
         [await call('POST', `/api/projects/${project.id}/resources`, { name: `Data ${kind}`,
@@ -102,8 +102,8 @@ describe('human and agent authorization-level parity', () => {
     }
     expect(statuses[0]).toEqual(statuses[1]);
     if (profile.id === 'god') {
-      const autonomous = tokens.mint({ taskId: 'autonomous-admin', principal: 'task:autonomous-admin',
-        profileId: 'god', ceiling: ['*'], grantorCaps: ['*'] });
+      const autonomous = (await tokens.mint({ taskId: 'autonomous-admin', principal: 'task:autonomous-admin',
+        profileId: 'god', ceiling: ['*'], grantorCaps: ['*'] }));
       const response = await fetch(`${server.url}/api/users`, {
         method: 'POST', headers: { authorization: `Bearer ${autonomous.token}`, 'content-type': 'application/json' },
         body: JSON.stringify({ name: 'New account' }),

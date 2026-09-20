@@ -82,21 +82,21 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   constructor(private objects: ObjectStore, private broker: CredentialBroker,
     private storageLocations?: StorageLocationService) {}
 
-  objectStoreForAttachment(attachment: ResourceAttachment): ObjectStore {
-    const id = this.storageLocations?.requireForOrganization(attachment.organizationId, attachment.storageLocationId).id
+  async objectStoreForAttachment(attachment: ResourceAttachment): Promise<ObjectStore> {
+    const id = (await this.storageLocations?.requireForOrganization(attachment.organizationId, attachment.storageLocationId))?.id
       ?? attachment.storageLocationId;
-    return id && this.storageLocations ? this.storageLocations.objectStore(id) : this.objects;
+    return id && this.storageLocations ? (await this.storageLocations.objectStore(id)) : this.objects;
   }
 
   async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>) {
     const key = this.key(attachment.organizationId);
     const storageLocationId = this.storageLocations
-      ? this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId).id
+      ? (await this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId)).id
       : attachment.storageLocationId;
     const chunkNamespace = storageLocationId && this.storageLocations
-      && this.storageLocations.requireForOrganization(attachment.organizationId, storageLocationId).kind === 's3'
+      && (await this.storageLocations.requireForOrganization(attachment.organizationId, storageLocationId)).kind === 's3'
       ? storageLocationId : undefined;
-    const objects = storageLocationId && this.storageLocations ? this.storageLocations.objectStore(storageLocationId) : this.objects;
+    const objects = storageLocationId && this.storageLocations ? (await this.storageLocations.objectStore(storageLocationId)) : this.objects;
     const manifestFiles: SnapshotFile[] = [];
     const retained = new Map<string, number>();
     let total = 0;
@@ -134,7 +134,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
       return { sealedRef: JSON.stringify({ objectKey, sha256: sha256(encrypted), storageLocationId } satisfies SnapshotRef),
         rootDigest, bytes: total, files: manifestFiles.length, storageLocationId };
     } catch (error) {
-      const zero = this.chunkAccounting?.release(attachment.organizationId, [...retained.keys()]) ?? [];
+      const zero = (await this.chunkAccounting?.release(attachment.organizationId, [...retained.keys()])) ?? [];
       await Promise.allSettled(zero.map((chunkId) => objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`)));
       throw error;
     }
@@ -153,9 +153,9 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
 
   /** One shared streaming integrity check for restore and verification. */
   private async *readFile(revision: ResourceRevision, file: SnapshotFile): AsyncIterable<Buffer> {
-    const attachment = this.attachmentFor(revision);
+    const attachment = (await this.attachmentFor(revision));
     const key = this.key(attachment.organizationId, false);
-    const objects = this.objectsForRevision(revision);
+    const objects = (await this.objectsForRevision(revision));
     const digest = crypto.createHash('sha256');
     let bytes = 0;
     for (const chunkId of file.chunks) {
@@ -202,13 +202,13 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   async manifest(revision: ResourceRevision): Promise<SnapshotManifest> {
-    const attachment = this.attachmentFor(revision);
+    const attachment = (await this.attachmentFor(revision));
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
     if (typeof ref.objectKey !== 'string'
       || !ref.objectKey.startsWith(`resources/${attachment.organizationId}/manifests/${attachment.id}/`)
       || ref.objectKey.includes('..') || (ref.storageLocationId && ref.storageLocationId !== revision.storageLocationId))
       throw new Error('resource reference does not match revision');
-    const encrypted = await this.objectsForRevision(revision, ref).get(ref.objectKey);
+    const encrypted = await (await this.objectsForRevision(revision, ref)).get(ref.objectKey);
     if (sha256(encrypted) !== ref.sha256) throw new Error('resource manifest integrity mismatch');
     const manifest = JSON.parse(openRandom(this.key(attachment.organizationId, false), encrypted).toString('utf8')) as SnapshotManifest;
     if (manifest.version !== 1 || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
@@ -234,34 +234,34 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   async delete(revision: ResourceRevision): Promise<void> {
-    const attachment = this.attachmentFor(revision);
+    const attachment = (await this.attachmentFor(revision));
     const manifest = await this.manifest(revision);
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
-    const objects = this.objectsForRevision(revision, ref);
+    const objects = (await this.objectsForRevision(revision, ref));
     await objects.delete(ref.objectKey);
-    const zero = this.chunkAccounting?.release(attachment.organizationId,
-      [...new Set(manifest.files.flatMap((file) => file.chunks))]) ?? [];
+    const zero = (await this.chunkAccounting?.release(attachment.organizationId,
+      [...new Set(manifest.files.flatMap((file) => file.chunks))])) ?? [];
     for (const chunkId of zero) await objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
   }
 
-  private attachmentFor(revision: ResourceRevision): ResourceAttachment {
-    const attachment = this.attachmentResolver?.(revision.attachmentId);
+  private async attachmentFor(revision: ResourceRevision): Promise<ResourceAttachment> {
+    const attachment = (await this.attachmentResolver?.(revision.attachmentId));
     if (!attachment) throw new Error('resource attachment no longer exists');
     return attachment;
   }
-  private attachmentResolver?: (id: string) => ResourceAttachment | undefined;
-  setAttachmentResolver(resolve: (id: string) => ResourceAttachment | undefined): void { this.attachmentResolver = resolve; }
+  private attachmentResolver?: (id: string) => ResourceAttachment | undefined | Promise<ResourceAttachment | undefined>;
+  setAttachmentResolver(resolve: (id: string) => ResourceAttachment | undefined | Promise<ResourceAttachment | undefined>): void { this.attachmentResolver = resolve; }
   private chunkAccounting?: {
     retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void;
-    release(organizationId: string, chunkIds: string[]): string[];
+    release(organizationId: string, chunkIds: string[]): string[] | Promise<string[]>;
   };
   setChunkAccounting(value: NonNullable<ObjectSnapshotEngine['chunkAccounting']>): void { this.chunkAccounting = value; }
 
-  private objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef): ObjectStore {
+  private async objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef): Promise<ObjectStore> {
     const locationId = ref?.storageLocationId ?? revision.storageLocationId;
     if (locationId && this.storageLocations)
-      this.storageLocations.requireForOrganization(this.attachmentFor(revision).organizationId, locationId);
-    return locationId && this.storageLocations ? this.storageLocations.objectStore(locationId) : this.objects;
+      (await this.storageLocations.requireForOrganization((await this.attachmentFor(revision)).organizationId, locationId));
+    return locationId && this.storageLocations ? (await this.storageLocations.objectStore(locationId)) : this.objects;
   }
 
   private key(organizationId: string, create = true): Buffer {
@@ -281,18 +281,18 @@ export class ProjectResourceService {
   constructor(private store: Store, private worlds: WorldRegistry, private engine: SnapshotEngine,
     private broker: CredentialBroker, private coordinator?: { client: Client; taskQueue: string },
     private storageLocations?: StorageLocationService) {
-    if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver((id) => store.getResourceAttachment(id));
+    if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver(async (id) => (await store.getResourceAttachment(id)));
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({
-      retain: (organizationId, chunks, storageLocationId) => store.retainResourceChunks(organizationId, chunks, storageLocationId),
-      release: (organizationId, chunks) => store.releaseResourceChunks(organizationId, chunks),
+      retain: async (organizationId, chunks, storageLocationId) => (await store.retainResourceChunks(organizationId, chunks, storageLocationId)),
+      release: async (organizationId, chunks) => (await store.releaseResourceChunks(organizationId, chunks)),
     });
   }
 
   /** Caller must authorize project:settings:read for this exact project before calling. */
   async verifyRevision(projectId: string, attachmentId: string, revisionId: string, offset = 0, limit = 100) {
-    const project = this.store.getProject(projectId);
-    const attachment = this.store.getResourceAttachment(attachmentId);
-    const revision = this.store.getResourceRevision(revisionId);
+    const project = (await this.store.getProject(projectId));
+    const attachment = (await this.store.getResourceAttachment(attachmentId));
+    const revision = (await this.store.getResourceRevision(revisionId));
     if (!project || !attachment || attachment.projectId !== project.id
       || attachment.organizationId !== project.organizationId || !revision || revision.attachmentId !== attachment.id)
       throw new Error('resource revision not found');
@@ -301,7 +301,7 @@ export class ProjectResourceService {
     if (!isSnapshotDriver(attachment.driver) || revision.engine !== this.engine.id || !this.engine.verify)
       throw new Error('resource revision verification is unsupported');
     if (revision.storageLocationId && this.storageLocations) {
-      try { this.storageLocations.requireForOrganization(attachment.organizationId, revision.storageLocationId); }
+      try { (await this.storageLocations.requireForOrganization(attachment.organizationId, revision.storageLocationId)); }
       catch { throw new Error('resource revision storage is unavailable'); }
     }
     return { projectId, resourceId: attachment.id, revisionId: revision.id,
@@ -309,15 +309,15 @@ export class ProjectResourceService {
       ...await this.engine.verify(revision, offset, limit) };
   }
 
-  storageLocationFor(organizationId: string, requested?: string): string | undefined {
-    return this.storageLocations?.requireForOrganization(organizationId, requested).id ?? requested;
+  async storageLocationFor(organizationId: string, requested?: string): Promise<string | undefined> {
+    return (await this.storageLocations?.requireForOrganization(organizationId, requested))?.id ?? requested;
   }
 
   storageLocationService(): StorageLocationService | undefined { return this.storageLocations; }
 
-  objectStoreFor(attachment: ResourceAttachment): ObjectStore {
+  async objectStoreFor(attachment: ResourceAttachment): Promise<ObjectStore> {
     if (!(this.engine instanceof ObjectSnapshotEngine)) throw new Error('resource uploads require an object-backed snapshot engine');
-    return this.engine.objectStoreForAttachment(attachment);
+    return (await this.engine.objectStoreForAttachment(attachment));
   }
 
   /** Materialize all enabled project defaults into a newly-created generation.
@@ -327,11 +327,11 @@ export class ProjectResourceService {
     const ephemeralPaths = new Set<string>(Array.isArray(world.handle.meta?.ephemeralPaths)
       ? world.handle.meta!.ephemeralPaths as string[] : []);
     const projections: Record<string, { target: string; revisionId?: string; access: string }> = {};
-    for (const attachment of this.store.listResourceAttachments(projectId)) {
+    for (const attachment of (await this.store.listResourceAttachments(projectId))) {
       const revisionId = Object.prototype.hasOwnProperty.call(revisions, attachment.id)
         ? revisions[attachment.id] : attachment.currentRevisionId;
-      const lease = this.store.createResourceLease({ attachmentId: attachment.id, revisionId,
-        taskId, worldId: world.handle.id, worldGeneration: generation, access: attachment.access });
+      const lease = (await this.store.createResourceLease({ attachmentId: attachment.id, revisionId,
+        taskId, worldId: world.handle.id, worldGeneration: generation, access: attachment.access }));
       try {
         if (isSecretLike(attachment)) {
           if (!attachment.credentialHandles[0]) throw new Error(`resource "${attachment.name}" has no configured credential`);
@@ -350,7 +350,7 @@ export class ProjectResourceService {
           if (!target) throw new Error(`resource "${attachment.name}" requires a path target`);
           if (target !== '.') await ensureWorldExcluded(world, target);
           if (revisionId) {
-            const revision = this.store.getResourceRevision(revisionId);
+            const revision = (await this.store.getResourceRevision(revisionId));
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
             await this.engine.restore(revision, async (file, data, offset) => {
               const relative = fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
@@ -372,12 +372,12 @@ export class ProjectResourceService {
             await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`], { cwd: world.handle.root });
           projections[attachment.id] = { target, revisionId, access: attachment.access };
         } else throw new Error(`no resource driver registered for ${attachment.driver}`);
-        this.store.updateResourceLease(lease.id, 'active', JSON.stringify({ driver: attachment.driver }));
-        this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:lease',
+        (await this.store.updateResourceLease(lease.id, 'active', JSON.stringify({ driver: attachment.driver })));
+        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:lease',
           scopeKey: `project:${projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id,
-            revisionId, access: attachment.access, worldGeneration: generation } });
+            revisionId, access: attachment.access, worldGeneration: generation } }));
       } catch (error) {
-        this.store.updateResourceLease(lease.id, 'failed');
+        (await this.store.updateResourceLease(lease.id, 'failed'));
         throw error;
       }
     }
@@ -389,7 +389,7 @@ export class ProjectResourceService {
 
   /** Resolve environment/service projections each time a world is opened. Raw
    * values live only in this wrapper and disappear with the activity. */
-  environmentFor(handle: WorldHandle): Record<string, string> {
+  async environmentFor(handle: WorldHandle): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object') {
@@ -401,9 +401,9 @@ export class ProjectResourceService {
         });
       }
     }
-    for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
+    for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
-      const attachment = this.store.getResourceAttachment(lease.attachmentId);
+      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment?.enabled || !isSecretLike(attachment)) continue;
       if (attachment.target.kind === 'environment' || attachment.target.kind === 'service')
         env[attachment.target.name] = this.resolveSecret(attachment, lease.taskId);
@@ -413,8 +413,8 @@ export class ProjectResourceService {
 
   /** Resolve environment/service projections each time a world is opened. Raw
    * values live only in this wrapper and disappear with the activity. */
-  withEnvironment(world: World): World {
-    const env = this.environmentFor(world.handle);
+  async withEnvironment(world: World): Promise<World> {
+    const env = (await this.environmentFor(world.handle));
     return Object.keys(env).length ? new EnvironmentWorld(world, env) : world;
   }
 
@@ -434,52 +434,52 @@ export class ProjectResourceService {
   /** Environment defaults apply at the next open/turn boundary, including worlds
    * created before the attachment. Never rematerialize snapshots or overwrite
    * files here, and never revive a previously released/failed lease. */
-  private refreshEnvironmentLeases(handle: WorldHandle): void {
-    const task = this.store.getTask(handle.id);
-    const current = this.store.currentWorld(handle.id);
+  private async refreshEnvironmentLeases(handle: WorldHandle): Promise<void> {
+    const task = (await this.store.getTask(handle.id));
+    const current = (await this.store.currentWorld(handle.id));
     const generation = handle.generation ?? 1;
     if (!task || !current || (current.generation ?? 1) !== generation
-      || this.store.worldState(handle.id) === 'released'
+      || (await this.store.worldState(handle.id)) === 'released'
       || current.meta?.projectId !== task.projectId || handle.meta?.projectId !== task.projectId) return;
-    const project = this.store.getProject(task.projectId);
+    const project = (await this.store.getProject(task.projectId));
     if (!project) return;
-    const existing = new Set(this.store.listResourceLeases(handle.id, generation).map((lease) => lease.attachmentId));
-    for (const attachment of this.store.listResourceAttachments(project.id)) {
+    const existing = new Set((await this.store.listResourceLeases(handle.id, generation)).map((lease) => lease.attachmentId));
+    for (const attachment of (await this.store.listResourceAttachments(project.id))) {
       if (attachment.organizationId !== project.organizationId || !isSecretLike(attachment)
         || attachment.target.kind === 'path' || existing.has(attachment.id)) continue;
       // Resolve before recording the lease: a transient broker failure must
       // fail this open, but remain retryable on the next one.
       this.resolveSecret(attachment, task.id);
-      const lease = this.store.createResourceLease({ attachmentId: attachment.id, taskId: task.id,
+      const lease = (await this.store.createResourceLease({ attachmentId: attachment.id, taskId: task.id,
         worldId: handle.id, worldGeneration: generation, access: attachment.access, state: 'active',
-        sealedDriverRef: JSON.stringify({ driver: attachment.driver }) });
-      this.store.appendAudit({ principalId: `task:${task.id}`, action: 'resource:lease',
+        sealedDriverRef: JSON.stringify({ driver: attachment.driver }) }));
+      (await this.store.appendAudit({ principalId: `task:${task.id}`, action: 'resource:lease',
         scopeKey: `project:${project.id}`, detail: { attachmentId: attachment.id, leaseId: lease.id,
-          access: attachment.access, worldGeneration: generation } });
+          access: attachment.access, worldGeneration: generation } }));
     }
   }
 
   /** Rehydrate path credentials after a park/resume and wrap environment
    * credentials for this one access. Provider snapshots are scrubbed first. */
   async prepare(world: World): Promise<World> {
-    this.refreshEnvironmentLeases(world.handle);
-    for (const lease of this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1)) {
+    (await this.refreshEnvironmentLeases(world.handle));
+    for (const lease of (await this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
-      const attachment = this.store.getResourceAttachment(lease.attachmentId);
+      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment?.enabled || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
       const target = resourcePath(world.handle, attachment);
       await world.writeFile(target, this.resolveSecret(attachment, lease.taskId));
       await world.exec('chmod', ['600', target], { cwd: world.handle.root });
       await ensureWorldExcluded(world, target);
     }
-    return this.withEnvironment(world);
+    return (await this.withEnvironment(world));
   }
 
   async scrubSecrets(handle: WorldHandle): Promise<void> {
     const world = await this.worlds.open(handle).catch(() => undefined);
     if (!world) return;
-    for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
-      const attachment = this.store.getResourceAttachment(lease.attachmentId);
+    for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
+      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (attachment?.target.kind === 'path' && isSecretLike(attachment))
         await world.exec('rm', ['-f', resourcePath(handle, attachment)], { cwd: handle.root }).catch(() => undefined);
     }
@@ -492,31 +492,31 @@ export class ProjectResourceService {
     if (serviceHandles && typeof serviceHandles === 'object')
       for (const value of Object.values(serviceHandles as Record<string, unknown>))
         if (typeof value === 'string') this.broker.deleteHandle(value);
-    for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
-      const attachment = this.store.getResourceAttachment(lease.attachmentId);
+    for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
+      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       // Read-only projections remove write permission recursively. Restore owner
       // write permission before a local/provider cleanup tries to unlink them;
       // otherwise a perfectly released resource can make world destruction fail.
       if (world && attachment?.access === 'read' && attachment.target.kind === 'path')
         await world.exec('chmod', ['-R', 'u+w', resourcePath(handle, attachment)], { cwd: handle.root }).catch(() => undefined);
-      this.store.updateResourceLease(lease.id, 'released');
-      if (attachment) this.store.appendAudit({ principalId: `task:${lease.taskId}`, action: 'resource:release',
-        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id } });
+      (await this.store.updateResourceLease(lease.id, 'released'));
+      if (attachment) (await this.store.appendAudit({ principalId: `task:${lease.taskId}`, action: 'resource:release',
+        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id } }));
     }
   }
 
   async importFiles(attachmentId: string, files: Iterable<SnapshotInputFile> | AsyncIterable<SnapshotInputFile>, createdByTaskId?: string): Promise<ResourceRevision> {
-    const attachment = this.requiredAttachment(attachmentId);
+    const attachment = (await this.requiredAttachment(attachmentId));
     if (!isSnapshotDriver(attachment.driver)) throw new Error('only snapshot-backed resources accept files');
     const captured = await this.engine.capture(attachment, asAsync(files));
-    const revision = this.store.saveResourceRevision({ attachmentId, parentRevisionId: attachment.currentRevisionId,
-      engine: this.engine.id, ...captured, metadata: { imported: true }, createdByTaskId });
-    this.store.promoteResourceRevision(attachmentId, revision.id, attachment.currentRevisionId);
-    this.store.recordUsage({ organizationId: attachment.organizationId, projectId: attachment.projectId,
+    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: attachment.currentRevisionId,
+      engine: this.engine.id, ...captured, metadata: { imported: true }, createdByTaskId }));
+    (await this.store.promoteResourceRevision(attachmentId, revision.id, attachment.currentRevisionId));
+    (await this.store.recordUsage({ organizationId: attachment.organizationId, projectId: attachment.projectId,
       taskId: createdByTaskId, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes,
-      unit: 'byte', costMicros: 0, fundingSource: this.store.getStorageLocation(captured.storageLocationId ?? '')?.kind === 's3' ? 'byok' : 'managed',
+      unit: 'byte', costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
       startedAt: revision.createdAt, endedAt: revision.createdAt,
-      metadata: { attachmentId, revisionId: revision.id, files: captured.files } });
+      metadata: { attachmentId, revisionId: revision.id, files: captured.files } }));
     return revision;
   }
 
@@ -567,40 +567,40 @@ export class ProjectResourceService {
             const env = data && /^\.env(?:\.|$)/i.test(entry.name) ? parseCopyEnv(data.toString('utf8')) : [];
             if (env.length) {
               for (const value of env) {
-                const existing = this.store.listResourceAttachments(project.id, true).find((attachment) =>
+                const existing = (await this.store.listResourceAttachments(project.id, true)).find((attachment) =>
                   attachment.driver === 'secret@1' && attachment.target.kind === 'environment'
                   && attachment.target.name === value.name);
                 if (existing) { result.reused.push(value.name); continue; }
                 const id = newId('resource'), handle = `resource:${id}:credential`;
                 this.broker.registerHandle(handle, value.value);
                 try {
-                  this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
+                  (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                     projectId: project.id, name: value.name, driver: 'secret@1',
                     target: { kind: 'environment', name: value.name }, access: 'read', isolation: 'fork',
-                    source: sourceRecord, credentialHandles: [handle], publish: 'discard' });
+                    source: sourceRecord, credentialHandles: [handle], publish: 'discard' }));
                 } catch (error) { this.broker.deleteHandle(handle); throw error; }
                 created.push(id); result.environmentSecrets.push(value.name);
               }
               continue;
             }
-            const existing = this.store.listResourceAttachments(project.id, true).find((attachment) =>
+            const existing = (await this.store.listResourceAttachments(project.id, true)).find((attachment) =>
               attachment.target.kind === 'path' && attachment.target.path === target);
             if (existing) { result.reused.push(target); continue; }
             if (data && !data.includes(0)) {
               const id = newId('resource'), handle = `resource:${id}:credential`;
               this.broker.registerHandle(handle, data.toString('utf8'));
               try {
-                this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
+                (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                   projectId: project.id, name: copyGlobSecretName(entry.name), driver: 'secret@1',
                   target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
-                  source: sourceRecord, credentialHandles: [handle], publish: 'discard' });
+                  source: sourceRecord, credentialHandles: [handle], publish: 'discard' }));
               } catch (error) { this.broker.deleteHandle(handle); throw error; }
               created.push(id); result.fileSecrets.push(target);
             } else {
-              const attachment = this.store.createResourceAttachment({ organizationId: project.organizationId!,
+              const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!,
                 projectId: project.id, name: `Imported ${entry.name}`, driver: 'volume@1',
                 target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
-                source: { ...sourceRecord, shape: 'file' }, credentialHandles: [], publish: 'discard' });
+                source: { ...sourceRecord, shape: 'file' }, credentialHandles: [], publish: 'discard' }));
               created.push(attachment.id);
               const stat = await fs.promises.stat(absolute);
               await this.importFiles(attachment.id,
@@ -611,12 +611,12 @@ export class ProjectResourceService {
           }
         }
       }
-      this.store.updateProjectConfig(project.id, { copyGlobs: [] });
-      this.store.appendAudit({ principalId: 'system:copyglobs-migration', action: 'resource:migrate-copyglobs',
+      (await this.store.updateProjectConfig(project.id, { copyGlobs: [] }));
+      (await this.store.appendAudit({ principalId: 'system:copyglobs-migration', action: 'resource:migrate-copyglobs',
         scopeKey: `project:${project.id}`, detail: {
           environmentSecrets: result.environmentSecrets, fileSecrets: result.fileSecrets,
           data: result.data, reused: result.reused, skipped: result.skipped,
-        } });
+        } }));
       return result;
     } catch (error) {
       for (const id of created.reverse()) await this.deleteAttachment(id).catch(() => undefined);
@@ -627,22 +627,22 @@ export class ProjectResourceService {
   /** Remove control-plane records, credentials, and revision manifests. Shared
    * content chunks are left for the snapshot engine's mark-and-sweep policy. */
   async deleteAttachment(attachmentId: string): Promise<void> {
-    const attachment = this.store.getResourceAttachment(attachmentId);
+    const attachment = (await this.store.getResourceAttachment(attachmentId));
     if (!attachment) return;
-    for (const revision of this.store.listResourceRevisions(attachmentId)) await this.engine.delete?.(revision);
+    for (const revision of (await this.store.listResourceRevisions(attachmentId))) await this.engine.delete?.(revision);
     // An attachment may project a first-class vault item. Removing the
     // projection must not destroy the underlying credential, which may already
     // control a live external account or be used by another project.
     if (typeof attachment.source.vaultItemId !== 'string')
       for (const handle of attachment.credentialHandles) this.broker.deleteHandle(handle);
-    this.store.deleteResourceAttachment(attachmentId);
+    (await this.store.deleteResourceAttachment(attachmentId));
   }
 
   async deleteProject(projectId: string): Promise<void> {
-    for (const attachment of this.store.listResourceAttachments(projectId, true)) await this.deleteAttachment(attachment.id);
-    this.store.kvDelete(`project-environment:${projectId}`);
-    this.store.kvDelete(`project-environment-builds:${projectId}`);
-    this.store.kvDelete(`project-services:${projectId}`);
+    for (const attachment of (await this.store.listResourceAttachments(projectId, true))) await this.deleteAttachment(attachment.id);
+    (await this.store.kvDelete(`project-environment:${projectId}`));
+    (await this.store.kvDelete(`project-environment-builds:${projectId}`));
+    (await this.store.kvDelete(`project-services:${projectId}`));
   }
 
   deleteOrganizationKey(organizationId: string): void {
@@ -663,7 +663,7 @@ export class ProjectResourceService {
     if (projections.some((projection) => projection.target
       && pathsOverlap(projection.target, worldWorkingRelativePath(handle, sourcePath))))
       throw new Error('path already belongs to an attached resource; promote that resource instead');
-    if (this.store.listResourceCandidates(taskId, false).some((candidate) => candidate.sourcePath
+    if ((await this.store.listResourceCandidates(taskId, false)).some((candidate) => candidate.sourcePath
       && pathsOverlap(candidate.sourcePath, sourcePath)))
       throw new Error('path is already staged as a resource candidate');
     const kind = await world.exec('bash', ['-lc', `if test -f ${quote(sourcePath)}; then printf file; elif test -d ${quote(sourcePath)}; then printf directory; else exit 1; fi`]);
@@ -673,30 +673,30 @@ export class ProjectResourceService {
     if (links.code !== 0) throw new Error('candidate paths cannot contain symbolic links');
     const access = input.access ?? 'read';
     const publish = access === 'write' ? (input.publish ?? 'review') : 'discard';
-    const attachment = this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: input.name, driver: input.driver ?? 'volume@1', target: input.target, access, isolation: 'fork',
       source: { candidate: true, createdByTaskId: task.id, sourcePath, shape: kind.stdout === 'file' ? 'file' : 'directory' },
-      credentialHandles: [], publish, enabled: false });
+      credentialHandles: [], publish, enabled: false }));
     // Create the task/world-generation ownership record before the potentially
     // long snapshot. If the control plane stops mid-stream, Review can still
     // see and discard the incomplete attachment instead of leaking an orphan.
-    const candidate = this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+    const candidate = (await this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
       taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1, attachmentId: attachment.id,
-      sourceKind: 'path', sourcePath });
+      sourceKind: 'path', sourcePath }));
     try {
       const captured = await this.engine.capture(attachment, filesFromWorld(world, sourcePath, attachment));
-      const revision = this.store.saveResourceRevision({ attachmentId: attachment.id, engine: this.engine.id,
-        ...captured, metadata: { candidate: true, sourcePath }, createdByTaskId: task.id });
-      this.store.promoteResourceRevision(attachment.id, revision.id);
-      this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
+      const revision = (await this.store.saveResourceRevision({ attachmentId: attachment.id, engine: this.engine.id,
+        ...captured, metadata: { candidate: true, sourcePath }, createdByTaskId: task.id }));
+      (await this.store.promoteResourceRevision(attachment.id, revision.id));
+      (await this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
         worldId: handle.id, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes, unit: 'byte',
-        costMicros: 0, fundingSource: this.store.getStorageLocation(captured.storageLocationId ?? '')?.kind === 's3' ? 'byok' : 'managed',
+        costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
         startedAt: candidate.createdAt, endedAt: candidate.createdAt,
-        metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } });
-      this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
+        metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } }));
+      (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
         scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
-          sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.bytes, files: captured.files } });
-      return { candidate, attachment: this.store.getResourceAttachment(attachment.id)!, revision };
+          sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.bytes, files: captured.files } }));
+      return { candidate, attachment: (await this.store.getResourceAttachment(attachment.id))!, revision };
     } catch (error) {
       await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed').catch(() => undefined);
       throw error;
@@ -711,58 +711,58 @@ export class ProjectResourceService {
     const { task, project, handle } = await this.currentTaskWorld(taskId);
     if (!this.broker.hasHandle(input.credentialHandle)) throw new Error('vault item field is not stored');
     const shared = input.driver === 'service@1' || input.driver === 'database@1';
-    const attachment = this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: input.name, driver: input.driver, target: input.target, access: input.access ?? 'read',
       isolation: shared ? 'shared' : 'fork', source: { ...input.source, candidate: true,
         createdByTaskId: task.id, vaultItemId: input.itemId, vaultField: input.field },
-      credentialHandles: [input.credentialHandle], publish: 'discard', enabled: false });
+      credentialHandles: [input.credentialHandle], publish: 'discard', enabled: false }));
     try {
-      const candidate = this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+      const candidate = (await this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
         taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1, attachmentId: attachment.id,
-        sourceKind: 'vault-item', vaultItemId: input.itemId, vaultField: input.field });
-      this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
+        sourceKind: 'vault-item', vaultItemId: input.itemId, vaultField: input.field }));
+      (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
         scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
-          vaultItemId: input.itemId, vaultField: input.field, worldGeneration: candidate.worldGeneration } });
+          vaultItemId: input.itemId, vaultField: input.field, worldGeneration: candidate.worldGeneration } }));
       return { candidate, attachment };
     } catch (error) {
-      this.store.deleteResourceAttachment(attachment.id);
+      (await this.store.deleteResourceAttachment(attachment.id));
       throw error;
     }
   }
 
-  adoptCandidate(taskId: string, candidateId: string, resolvedBy: string): ProposedResourceCandidate {
-    const candidate = this.requiredCandidate(taskId, candidateId);
+  async adoptCandidate(taskId: string, candidateId: string, resolvedBy: string): Promise<ProposedResourceCandidate> {
+    const candidate = (await this.requiredCandidate(taskId, candidateId));
     if (candidate.state === 'adopted') {
-      const attachment = this.store.getResourceAttachment(candidate.attachmentId);
+      const attachment = (await this.store.getResourceAttachment(candidate.attachmentId));
       if (!attachment?.enabled) throw new Error('adopted resource candidate attachment is unavailable');
       const revision = attachment.currentRevisionId
-        ? this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+        ? (await this.store.getResourceRevision(attachment.currentRevisionId)) : undefined;
       return { candidate, attachment, revision };
     }
-    const adopted = this.store.adoptResourceCandidate(candidate.id, taskId, resolvedBy);
+    const adopted = (await this.store.adoptResourceCandidate(candidate.id, taskId, resolvedBy));
     const revision = adopted.attachment.currentRevisionId
-      ? this.store.getResourceRevision(adopted.attachment.currentRevisionId) : undefined;
-    this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-adopt',
+      ? (await this.store.getResourceRevision(adopted.attachment.currentRevisionId)) : undefined;
+    (await this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-adopt',
       scopeKey: `project:${candidate.projectId}`, detail: { candidateId, attachmentId: candidate.attachmentId,
-        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } });
+        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } }));
     return { ...adopted, revision };
   }
 
   async discardCandidate(taskId: string, candidateId: string, resolvedBy: string): Promise<ResourceCandidate> {
-    const existing = this.store.getResourceCandidate(candidateId);
+    const existing = (await this.store.getResourceCandidate(candidateId));
     if (!existing || existing.taskId !== taskId) throw new Error('resource candidate does not belong to task');
     if (existing.state === 'discarded') return existing;
-    const candidate = this.store.beginDiscardResourceCandidate(candidateId, taskId);
+    const candidate = (await this.store.beginDiscardResourceCandidate(candidateId, taskId));
     await this.deleteAttachment(candidate.attachmentId);
-    const discarded = this.store.resolveResourceCandidate(candidate.id, 'discarded', resolvedBy);
-    this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-discard',
+    const discarded = (await this.store.resolveResourceCandidate(candidate.id, 'discarded', resolvedBy));
+    (await this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-discard',
       scopeKey: `project:${candidate.projectId}`, detail: { candidateId, attachmentId: candidate.attachmentId,
-        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } });
+        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } }));
     return discarded;
   }
 
   async discardTaskCandidates(taskId: string, resolvedBy: string): Promise<void> {
-    for (const candidate of this.store.listResourceCandidates(taskId)
+    for (const candidate of (await this.store.listResourceCandidates(taskId))
       .filter((value) => value.state === 'pending' || value.state === 'discarding'))
       await this.discardCandidate(taskId, candidate.id, resolvedBy);
   }
@@ -775,7 +775,7 @@ export class ProjectResourceService {
     const excluded = [
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
         .map((projection) => projection.target).filter((value): value is string => Boolean(value)),
-      ...this.store.listResourceCandidates(taskId, false).map((candidate) => candidate.sourcePath)
+      ...(await this.store.listResourceCandidates(taskId, false)).map((candidate) => candidate.sourcePath)
         .filter((value): value is string => Boolean(value)).map((value) => worldWorkingRelativePath(handle, value)),
     ];
     const found: IgnoredResourceInventory['entries'] = [];
@@ -800,29 +800,29 @@ export class ProjectResourceService {
   }
 
   private async currentTaskWorld(taskId: string) {
-    const task = this.store.getTask(taskId);
+    const task = (await this.store.getTask(taskId));
     if (!task) throw new Error('calling task not found');
-    const project = this.store.getProject(task.projectId);
+    const project = (await this.store.getProject(task.projectId));
     if (!project?.organizationId) throw new Error('calling task project is unavailable');
-    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('calling task has no active world');
-    this.store.assertCurrentWorld(handle);
+    (await this.store.assertCurrentWorld(handle));
     return { task, project, handle, world: await this.worlds.open(handle) };
   }
 
-  private requiredCandidate(taskId: string, candidateId: string): ResourceCandidate {
-    const candidate = this.store.getResourceCandidate(candidateId);
+  private async requiredCandidate(taskId: string, candidateId: string): Promise<ResourceCandidate> {
+    const candidate = (await this.store.getResourceCandidate(candidateId));
     if (!candidate || candidate.taskId !== taskId) throw new Error('resource candidate does not belong to task');
     return candidate;
   }
 
   async summarize(taskId: string, attachmentId: string): Promise<ResourceChangeSummary> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
-    const base = lease.revisionId ? await this.engine.manifest(this.store.getResourceRevision(lease.revisionId)!) : emptyManifest(attachment.id);
+    const base = lease.revisionId ? await this.engine.manifest((await this.store.getResourceRevision(lease.revisionId))!) : emptyManifest(attachment.id);
     const current = await manifestFromWorld(attachment, world, target);
     const summary = compareManifests(attachment.id, lease.revisionId, base, current);
-    this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:inspect',
-      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, summary } });
+    (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:inspect',
+      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, summary } }));
     return summary;
   }
 
@@ -831,9 +831,9 @@ export class ProjectResourceService {
   async checkpoint(handle: WorldHandle): Promise<Array<{ attachmentId: string; revisionId: string }>> {
     const world = await this.worlds.open(handle);
     const refs: Array<{ attachmentId: string; revisionId: string }> = [];
-    for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
+    for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
-      const attachment = this.store.getResourceAttachment(lease.attachmentId);
+      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path') continue;
       if (attachment.access === 'read' && lease.revisionId) {
         refs.push({ attachmentId: attachment.id, revisionId: lease.revisionId });
@@ -841,8 +841,8 @@ export class ProjectResourceService {
       }
       const captured = await this.engine.capture(attachment,
         filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment));
-      const revision = this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
-        engine: this.engine.id, ...captured, metadata: { checkpoint: true }, createdByTaskId: lease.taskId });
+      const revision = (await this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
+        engine: this.engine.id, ...captured, metadata: { checkpoint: true }, createdByTaskId: lease.taskId }));
       refs.push({ attachmentId: attachment.id, revisionId: revision.id });
     }
     return refs;
@@ -857,39 +857,39 @@ export class ProjectResourceService {
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB model
     // upload cannot block another publication merely while bytes are moving.
     const captured = await this.engine.capture(attachment, filesFromWorld(world, target, attachment));
-    const revision = this.store.saveResourceRevision({ attachmentId, parentRevisionId: lease.revisionId,
-      engine: this.engine.id, ...captured, metadata: { summary }, createdByTaskId: taskId });
+    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: lease.revisionId,
+      engine: this.engine.id, ...captured, metadata: { summary }, createdByTaskId: taskId }));
     return this.serializePublish(attachmentId, taskId, async () => {
-      const promoted = this.store.promoteResourceRevision(attachmentId, revision.id, lease.revisionId);
-      this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
-        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: lease.revisionId, to: revision.id, summary } });
+      const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, lease.revisionId));
+      (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
+        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: lease.revisionId, to: revision.id, summary } }));
       return { attachment: promoted, revision, summary };
     });
   }
 
   async discard(taskId: string, attachmentId: string): Promise<void> {
     const { attachment, lease } = await this.worldResource(taskId, attachmentId);
-    this.store.updateResourceLease(lease.id, 'released');
-    this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:discard',
-      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, revisionId: lease.revisionId, leaseId: lease.id } });
+    (await this.store.updateResourceLease(lease.id, 'released'));
+    (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:discard',
+      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, revisionId: lease.revisionId, leaseId: lease.id } }));
   }
 
   private async worldResource(taskId: string, attachmentId: string) {
-    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no active world');
-    this.store.assertCurrentWorld(handle);
-    const attachment = this.requiredAttachment(attachmentId);
-    const task = this.store.getTask(taskId);
+    (await this.store.assertCurrentWorld(handle));
+    const attachment = (await this.requiredAttachment(attachmentId));
+    const task = (await this.store.getTask(taskId));
     if (!task || task.projectId !== attachment.projectId) throw new Error('resource does not belong to task project');
-    const lease = this.store.listResourceLeases(handle.id, handle.generation ?? 1)
+    const lease = (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))
       .find((candidate) => candidate.attachmentId === attachmentId && candidate.state === 'active');
     if (!lease) throw new Error('task has no active lease for resource');
     if (attachment.target.kind !== 'path') throw new Error('resource has no filesystem state to publish');
     return { attachment, lease, target: resourceAbsolutePath(handle, attachment), world: await this.worlds.open(handle) };
   }
 
-  private requiredAttachment(id: string): ResourceAttachment {
-    const value = this.store.getResourceAttachment(id);
+  private async requiredAttachment(id: string): Promise<ResourceAttachment> {
+    const value = (await this.store.getResourceAttachment(id));
     if (!value) throw new Error('resource attachment not found');
     return value;
   }

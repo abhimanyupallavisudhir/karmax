@@ -59,8 +59,8 @@ describe('credential Retry end to end', () => {
 
   it('retries an unpollable login, quarantines a persistent failure, then reaches Review after recovery', async () => {
     const repo = await h.makeRepo('recovered');
-    const project = h.store.createProject('Retry', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false });
-    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    const project = (await h.store.createProject('Retry', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
     const task = await h.api.createTask(token, { projectId: project.id, title: 'Recovered task',
       prompt: '@write recovered.txt :: RECOVERED\n@run git add recovered.txt && git commit -m recovered\n@review Recovered credential',
       params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
@@ -77,8 +77,8 @@ describe('credential Retry end to end', () => {
     expect(await usage.json()).toMatchObject({ usage: { [accountId]: { ok: false, reason: 'setup-token' } } });
     expect(await status(accountId)).toBe('needs-attention');
 
-    await expect.poll(() => h.store.getTask(task.id)?.lastView?.status, { timeout: 5000 }).toBe('blocked');
-    expect(h.store.getTask(task.id)?.lastView?.error).toMatch(/No usable claude credential/);
+    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.status, { timeout: 5000 }).toBe('blocked');
+    expect((await h.store.getTask(task.id))?.lastView?.error).toMatch(/No usable claude credential/);
     const retry = () => fetch(`${base}/api/tasks/${task.id}/signal`, {
       method: 'POST', headers, body: JSON.stringify({ signal: 'retry' }),
     });
@@ -87,13 +87,13 @@ describe('credential Retry end to end', () => {
     await expect.poll(async () => (await view()).error, { timeout: 20_000 }).toMatch(/No usable claude credential/);
     expect(await status(accountId)).toBe('needs-attention');
 
-    await expect.poll(() => h.store.getTask(task.id)?.lastView?.status, { timeout: 5000 }).toBe('blocked');
+    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.status, { timeout: 5000 }).toBe('blocked');
     healthy = true; // provider quota/login now works; usage remains unpollable
     expect((await retry()).status).toBe(200);
     await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
     expect(turns).toBe(3);
     expect(await status(accountId)).toBe('available');
-    const world = h.store.currentWorld(task.id)!;
+    const world = (await h.store.currentWorld(task.id))!;
     expect(fs.readFileSync(path.join(world.workdir ?? world.root, 'recovered.txt'), 'utf8')).toContain('RECOVERED');
     await h.api.signalTask(token, task.id, 'cancel');
   }, 90_000);
@@ -114,9 +114,9 @@ describe('credential Retry end to end', () => {
     for (const [account, provider, state] of entries) await coordinator.setAccountAvailability({
       accountId: `login:${provider}:${account}`, status: state, resetAt: Date.now() + 3600_000,
     });
-    const project = h.store.createProject('Policy');
-    const task = h.store.createTask({ projectId: project.id, title: 'Policy', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'Policy', draft: true } });
-    h.store.kvSet(credPolicyKey.task(task.id), JSON.stringify({ off: ['login:claude:policy-off'] }));
+    const project = (await h.store.createProject('Policy'));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Policy', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'Policy', draft: true } }));
+    (await h.store.kvSet(credPolicyKey.task(task.id), JSON.stringify({ off: ['login:claude:policy-off'] })));
     await retryCredentials({ store: h.store, client: h.client, taskQueue: TASK_QUEUE, configHomes: homes }, task, 'claude');
     for (const [account, provider, state] of entries) expect(await status(`login:${provider}:${account}`)).toBe(state);
   });
@@ -130,10 +130,10 @@ describe('credential Retry end to end', () => {
     });
     await coordinator.registerAccounts(rows);
     for (const row of rows) await coordinator.setAccountAvailability({ accountId: row.id, status: 'needs-attention' });
-    const project = h.store.createProject('Key retry');
-    const task = h.store.createTask({ projectId: project.id, title: 'Key retry', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: { prompt: 'Key retry', draft: true } });
-    h.store.kvSet(credPolicyKey.task(task.id), JSON.stringify({ on: rows.map(row => row.id) }));
+    const project = (await h.store.createProject('Key retry'));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Key retry', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'Key retry', draft: true } }));
+    (await h.store.kvSet(credPolicyKey.task(task.id), JSON.stringify({ on: rows.map(row => row.id) })));
     for (const row of rows) {
       expect(await status(row.id)).toBe('needs-attention');
       await retryCredentials({ store: h.store, client: h.client, taskQueue: TASK_QUEUE,

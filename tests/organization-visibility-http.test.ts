@@ -25,10 +25,10 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 describe('organization name visibility HTTP API', () => {
   it('restricts visibility changes and exposes only public names while preserving resource permissions', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-parity-'));
-    const store = new Store(':memory:');
-    store.claimPersonalOrganization('me');
-    const project = store.createProject('Parity');
-    store.kvSet(`avatars:project:${project.id}`, 'enabled');
+    const store = (await Store.create(':memory:'));
+    (await store.claimPersonalOrganization('me'));
+    const project = (await store.createProject('Parity'));
+    (await store.kvSet(`avatars:project:${project.id}`, 'enabled'));
     const tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
@@ -36,30 +36,30 @@ describe('organization name visibility HTTP API', () => {
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
     const client = { workflow: { getHandle: () => ({}) } } as any;
     const api = new KarmaxApi({ store, tokens, client, worlds, resources, broker, taskQueue: 'test' });
-    const authorization = new AuthorizationService(store);
-    const gateway = new Gateway({ authorization, api, store, tokens, client, worlds, resources, broker, objects,
+    const authorization = (await AuthorizationService.create(store));
+    const gateway = (await Gateway.create({ authorization, api, store, tokens, client, worlds, resources, broker, objects,
       taskQueue: 'test', staticDir: 'web', bus: new KarmaxBus(), contributions: new ContributionRegistry(),
-      overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'authorization parity test' } });
+      overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'authorization parity test' } }));
     const server = await gateway.listen(await findFreePortFrom(nextPort += 10));
-    cleanups.push(async () => { await server.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+    cleanups.push(async () => { await server.close(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
 
 
     const session = await (await fetch(`${server.url}/api/session`)).json() as { token: string };
     const humanToken = (gateway as any).sessions.get(session.token).apiToken as string;
-    const principal = tokens.verify(humanToken)!;
+    const principal = (await tokens.verify(humanToken))!;
     principal.organizationId = project.organizationId;
     const call = (method: string, route: string, body?: unknown) => fetch(`${server.url}${route}`, {
       method, headers: { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
-    const foreign = store.createOrganization({ name: 'Hidden team', ownerUserId: 'someone-else' });
+    const foreign = (await store.createOrganization({ name: 'Hidden team', ownerUserId: 'someone-else' }));
     const ownUrl = `/api/organizations/${project.organizationId}`;
     const foreignUrl = `/api/organizations/${foreign.id}`;
     principal.caps = [...DEFAULT_AUTHORIZATION_PROFILES.find((p) => p.id === 'administrator')!.capabilities];
     expect((await call('PATCH', ownUrl, { nameVisibility: 'public' })).status).toBe(200);
-    expect(store.getOrganization(project.organizationId!)?.nameVisibility).toBe('public');
+    expect((await store.getOrganization(project.organizationId!))?.nameVisibility).toBe('public');
     expect((await call('PATCH', ownUrl, { nameVisibility: 'invalid', name: 'Must not rename' })).status).toBe(400);
-    expect(store.getOrganization(project.organizationId!)?.name).not.toBe('Must not rename');
+    expect((await store.getOrganization(project.organizationId!))?.name).not.toBe('Must not rename');
     expect((await call('PATCH', foreignUrl, { nameVisibility: 'public' })).status).toBe(403);
     principal.caps = ['organization:read'];
     expect((await call('PATCH', ownUrl, { nameVisibility: 'members' })).status).toBe(403);
@@ -70,12 +70,12 @@ describe('organization name visibility HTTP API', () => {
       return body as any[];
     };
     expect((await directory()).map((o) => o.id)).not.toContain(foreign.id);
-    store.setOrganizationNameVisibility(foreign.id, 'public');
+    (await store.setOrganizationNameVisibility(foreign.id, 'public'));
     expect(await directory()).toContainEqual({ id: foreign.id, name: foreign.name, accessible: false });
     expect((await call('GET', foreignUrl)).status).toBe(403);
     expect((await call('PUT', '/api/user/default-organization', { organizationId: foreign.id })).status).toBe(400);
     expect((await (await call('GET', '/api/organizations')).json() as any[]).map((o) => o.id)).not.toContain(foreign.id);
-    store.setOrganizationNameVisibility(foreign.id, 'members');
+    (await store.setOrganizationNameVisibility(foreign.id, 'members'));
     expect((await directory()).map((o) => o.id)).not.toContain(foreign.id);
     principal.caps = ['*'];
     principal.organizationId = undefined;

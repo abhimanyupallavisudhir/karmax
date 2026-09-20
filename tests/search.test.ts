@@ -514,78 +514,78 @@ describe('evaluateQuery — workflow params (param.<key>)', () => {
 describe('Store — tags', () => {
   let store: Store;
   let pid: string;
-  beforeEach(() => {
-    store = new Store(':memory:');
-    pid = store.createProject('Acme').id;
+  beforeEach(async () => {
+    store = (await Store.create(':memory:'));
+    pid = (await store.createProject('Acme')).id;
   });
 
-  const mkTask = (title: string): TaskRecord =>
-    store.createTask({ projectId: pid, title, workflow: 'softwareDev', workflowVersion: '1.0.0', params: { prompt: title } });
+  const mkTask = async (title: string): Promise<TaskRecord> =>
+    (await store.createTask({ projectId: pid, title, workflow: 'softwareDev', workflowVersion: '1.0.0', params: { prompt: title } }));
 
-  it('creates, dedups by name, and lists tags', () => {
-    const a = store.createTag({ projectId: pid, name: 'bug', kind: 'type', description: 'Defects to fix.' });
-    const b = store.createTag({ projectId: pid, name: 'BUG', kind: 'type' }); // case-insensitive dup
+  it('creates, dedups by name, and lists tags', async () => {
+    const a = (await store.createTag({ projectId: pid, name: 'bug', kind: 'type', description: 'Defects to fix.' }));
+    const b = (await store.createTag({ projectId: pid, name: 'BUG', kind: 'type' })); // case-insensitive dup
     expect(b.id).toBe(a.id);
-    expect(store.listTags(pid)).toMatchObject([{ name: 'bug', description: 'Defects to fix.' }]);
+    expect((await store.listTags(pid))).toMatchObject([{ name: 'bug', description: 'Defects to fix.' }]);
   });
 
-  it('creates a hierarchy from a slash path, reusing existing ancestors', () => {
-    const leaf = store.createTag({ projectId: pid, name: 'frontend/web/checkout', kind: 'topic', color: '#f00' });
+  it('creates a hierarchy from a slash path, reusing existing ancestors', async () => {
+    const leaf = (await store.createTag({ projectId: pid, name: 'frontend/web/checkout', kind: 'topic', color: '#f00' }));
     expect(leaf.name).toBe('checkout');
     expect(leaf.color).toBe('#f00'); // color applies to the leaf only
-    const names = store.listTags(pid).map((t) => t.name).sort();
+    const names = (await store.listTags(pid)).map((t) => t.name).sort();
     expect(names).toEqual(['checkout', 'frontend', 'web']);
     // A second path reuses frontend + web rather than duplicating them.
-    const other = store.createTag({ projectId: pid, name: 'frontend/web/cart' });
-    expect(store.getTag(other.parentId!)!.name).toBe('web');
-    expect(store.listTags(pid).filter((t) => t.name === 'web')).toHaveLength(1);
+    const other = (await store.createTag({ projectId: pid, name: 'frontend/web/cart' }));
+    expect((await store.getTag(other.parentId!))!.name).toBe('web');
+    expect((await store.listTags(pid)).filter((t) => t.name === 'web')).toHaveLength(1);
     // The path resolves the full chain.
-    const byId = new Map(store.listTags(pid).map((t) => [t.id, t]));
+    const byId = new Map((await store.listTags(pid)).map((t) => [t.id, t]));
     const path = (id: string) => { const p: string[] = []; let c = byId.get(id); while (c) { p.unshift(c.name); c = c.parentId ? byId.get(c.parentId) : undefined; } return p.join('/'); };
     expect(path(leaf.id)).toBe('frontend/web/checkout');
   });
 
-  it('assigns tags to a task and hydrates them on read', () => {
-    const t = mkTask('x');
-    const bug = store.createTag({ projectId: pid, name: 'bug' });
-    const fe = store.createTag({ projectId: pid, name: 'frontend' });
-    store.setTaskTags(t.id, [bug.id, fe.id]);
-    expect(store.getTask(t.id)!.tags!.sort()).toEqual([bug.id, fe.id].sort());
-    expect(store.listTasks(pid)[0]!.tags!.length).toBe(2);
+  it('assigns tags to a task and hydrates them on read', async () => {
+    const t = (await mkTask('x'));
+    const bug = (await store.createTag({ projectId: pid, name: 'bug' }));
+    const fe = (await store.createTag({ projectId: pid, name: 'frontend' }));
+    (await store.setTaskTags(t.id, [bug.id, fe.id]));
+    expect((await store.getTask(t.id))!.tags!.sort()).toEqual([bug.id, fe.id].sort());
+    expect((await store.listTasks(pid))[0]!.tags!.length).toBe(2);
   });
 
-  it('ignores foreign/unknown tag ids on assignment', () => {
-    const t = mkTask('x');
-    store.setTaskTags(t.id, ['tag_does_not_exist']);
-    expect(store.getTask(t.id)!.tags ?? []).toEqual([]);
+  it('ignores foreign/unknown tag ids on assignment', async () => {
+    const t = (await mkTask('x'));
+    (await store.setTaskTags(t.id, ['tag_does_not_exist']));
+    expect((await store.getTask(t.id))!.tags ?? []).toEqual([]);
   });
 
-  it('deleting a tag promotes children to its parent and drops assignments', () => {
-    const parent = store.createTag({ projectId: pid, name: 'frontend' });
-    const child = store.createTag({ projectId: pid, name: 'web', parentId: parent.id });
-    const t = mkTask('x');
-    store.setTaskTags(t.id, [parent.id]);
-    store.deleteTag(parent.id);
-    expect(store.getTag(child.id)!.parentId).toBeUndefined(); // promoted to root
-    expect(store.getTask(t.id)!.tags ?? []).toEqual([]); // assignment dropped
+  it('deleting a tag promotes children to its parent and drops assignments', async () => {
+    const parent = (await store.createTag({ projectId: pid, name: 'frontend' }));
+    const child = (await store.createTag({ projectId: pid, name: 'web', parentId: parent.id }));
+    const t = (await mkTask('x'));
+    (await store.setTaskTags(t.id, [parent.id]));
+    (await store.deleteTag(parent.id));
+    expect((await store.getTag(child.id))!.parentId).toBeUndefined(); // promoted to root
+    expect((await store.getTask(t.id))!.tags ?? []).toEqual([]); // assignment dropped
   });
 
-  it('refuses to reparent a tag under its own descendant', () => {
-    const a = store.createTag({ projectId: pid, name: 'a' });
-    const b = store.createTag({ projectId: pid, name: 'b', parentId: a.id });
-    expect(() => store.updateTag(a.id, { parentId: b.id })).toThrow(/ancestor/);
+  it('refuses to reparent a tag under its own descendant', async () => {
+    const a = (await store.createTag({ projectId: pid, name: 'a' }));
+    const b = (await store.createTag({ projectId: pid, name: 'b', parentId: a.id }));
+    await expect((async () => (await store.updateTag(a.id, { parentId: b.id })))()).rejects.toThrow(/ancestor/);
   });
 
-  it('edits all tag metadata and prevents duplicate siblings', () => {
-    const parent = store.createTag({ projectId: pid, name: 'product' });
-    const tag = store.createTag({ projectId: pid, name: 'web' });
-    const updated = store.updateTag(tag.id, {
+  it('edits all tag metadata and prevents duplicate siblings', async () => {
+    const parent = (await store.createTag({ projectId: pid, name: 'product' }));
+    const tag = (await store.createTag({ projectId: pid, name: 'web' }));
+    const updated = (await store.updateTag(tag.id, {
       name: 'browser',
       parentId: parent.id,
       kind: 'topic',
       color: '#123456',
       description: 'Customer-facing browser work.',
-    });
+    }));
     expect(updated).toMatchObject({
       name: 'browser',
       parentId: parent.id,
@@ -593,45 +593,45 @@ describe('Store — tags', () => {
       color: '#123456',
       description: 'Customer-facing browser work.',
     });
-    store.createTag({ projectId: pid, name: 'mobile', parentId: parent.id });
-    expect(() => store.updateTag(tag.id, { name: 'mobile' })).toThrow(/sibling tag/);
-    expect(store.updateTag(tag.id, { description: null })?.description).toBeUndefined();
+    (await store.createTag({ projectId: pid, name: 'mobile', parentId: parent.id }));
+    await expect((async () => (await store.updateTag(tag.id, { name: 'mobile' })))()).rejects.toThrow(/sibling tag/);
+    expect((await store.updateTag(tag.id, { description: null }))?.description).toBeUndefined();
   });
 });
 
 describe('Store — saved views', () => {
   let store: Store;
   let pid: string;
-  beforeEach(() => {
-    store = new Store(':memory:');
-    pid = store.createProject('Acme').id;
+  beforeEach(async () => {
+    store = (await Store.create(':memory:'));
+    pid = (await store.createProject('Acme')).id;
   });
 
-  it('creates views with increasing order and round-trips the query', () => {
+  it('creates views with increasing order and round-trips the query', async () => {
     const q = parseQuery('status:active priority:>=2 sort:created-desc');
-    const v1 = store.createView({ projectId: pid, name: 'Active', query: q });
-    const v2 = store.createView({ projectId: pid, name: 'Second', query: {} });
+    const v1 = (await store.createView({ projectId: pid, name: 'Active', query: q }));
+    const v2 = (await store.createView({ projectId: pid, name: 'Second', query: {} }));
     expect(v1.order).toBe(0);
     expect(v2.order).toBe(1);
-    expect(store.getView(v1.id)!.query).toEqual(q);
-    expect(store.listViews(pid).map((v) => v.name)).toEqual(['Active', 'Second']);
+    expect((await store.getView(v1.id))!.query).toEqual(q);
+    expect((await store.listViews(pid)).map((v) => v.name)).toEqual(['Active', 'Second']);
   });
 
-  it('updates and deletes a view', () => {
-    const v = store.createView({ projectId: pid, name: 'V', query: {} });
-    store.updateView(v.id, { name: 'Renamed', query: parseQuery('is:open') });
-    expect(store.getView(v.id)!.name).toBe('Renamed');
-    expect(store.getView(v.id)!.query.filters?.[0]?.field).toBe('is');
-    store.deleteView(v.id);
-    expect(store.getView(v.id)).toBeUndefined();
+  it('updates and deletes a view', async () => {
+    const v = (await store.createView({ projectId: pid, name: 'V', query: {} }));
+    (await store.updateView(v.id, { name: 'Renamed', query: parseQuery('is:open') }));
+    expect((await store.getView(v.id))!.name).toBe('Renamed');
+    expect((await store.getView(v.id))!.query.filters?.[0]?.field).toBe('is');
+    (await store.deleteView(v.id));
+    expect((await store.getView(v.id))).toBeUndefined();
   });
 
-  it('drops a project’s tags and views when the project is deleted', () => {
-    store.createTag({ projectId: pid, name: 'bug' });
-    store.createView({ projectId: pid, name: 'V', query: {} });
-    store.deleteProject(pid);
-    expect(store.listTags(pid)).toEqual([]);
-    expect(store.listViews(pid)).toEqual([]);
+  it('drops a project’s tags and views when the project is deleted', async () => {
+    (await store.createTag({ projectId: pid, name: 'bug' }));
+    (await store.createView({ projectId: pid, name: 'V', query: {} }));
+    (await store.deleteProject(pid));
+    expect((await store.listTags(pid))).toEqual([]);
+    expect((await store.listViews(pid))).toEqual([]);
   });
 });
 

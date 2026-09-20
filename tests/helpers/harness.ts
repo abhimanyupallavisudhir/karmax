@@ -89,14 +89,14 @@ export async function bootHarness(
   const c = await makeClient(conn);
   const client = c.client;
 
-  const store = new Store(':memory:');
+  const store = (await Store.create(':memory:'));
   // Direct API tests use this stable human principal. Production establishes
   // the same membership during first-account setup or invitation acceptance.
-  store.claimPersonalOrganization('a');
+  (await store.claimPersonalOrganization('a'));
   // Production seeds role profiles before constructing the API. Do the same in
   // the harness so API-created tasks honor the requested hermetic provider and
   // never auto-detect a developer's real Claude/Codex login.
-  seedProfiles(store, provider);
+  (await seedProfiles(store, provider));
   const worldsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-worlds-'));
   const worlds = new WorldRegistry();
   // Point the worktree provider at a temp worlds home.
@@ -115,7 +115,7 @@ export async function bootHarness(
     { client, taskQueue: TASK_QUEUE });
 
   const tokens = new TokenAuthority(store);
-  const authorization = new AuthorizationService(store);
+  const authorization = (await AuthorizationService.create(store));
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
@@ -183,7 +183,7 @@ export async function bootHarness(
       // actual behavior instead of returning the optional-dependency 503.
       const handoffs = new WorldHandoffService(store, worlds, {} as any, undefined, undefined,
         path.join(worldsHome, 'local-checkouts'), resources);
-      const gw = new Gateway({
+      const gw = (await Gateway.create({
         api,
         store,
         bus,
@@ -211,7 +211,7 @@ export async function bootHarness(
         objects,
         resources,
         handoffs,
-      });
+      }));
       const started = await gw.listen(opts?.port);
       gateways.push(started.close);
       return started;

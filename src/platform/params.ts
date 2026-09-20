@@ -18,13 +18,13 @@ export type ValueMap = Record<string, unknown>;
  * settings; the merge keeps historical per-workflow rows working. */
 export const COMMON_SETTINGS_WORKFLOW = '__common__';
 
-function withCommon(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+async function withCommon(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
   scopeKey: string,
   workflow: string,
-): ValueMap | undefined {
-  const common = getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW);
-  const specific = getSettings(scopeKey, workflow);
+): Promise<ValueMap | undefined> {
+  const common = (await getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW));
+  const specific = (await getSettings(scopeKey, workflow));
   if (common === specific) return specific;
   return common || specific ? { ...(common ?? {}), ...(specific ?? {}) } : undefined;
 }
@@ -259,12 +259,12 @@ function expandList(name: string, list: string[]): string[] {
  * from the project's legacy ProjectConfig (lazy back-compat — no destructive
  * migration). Saving the project-settings form writes the row going forward.
  */
-export function projectSettingsFor(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+export async function projectSettingsFor(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
   project: Project,
   workflow: string,
-): ValueMap {
-  const stored = withCommon(getSettings, project.id, workflow);
+): Promise<ValueMap> {
+  const stored = (await withCommon(getSettings, project.id, workflow));
   if (stored) return stored;
   const c = project.config ?? {};
   const derived: ValueMap = {};
@@ -279,20 +279,20 @@ export function projectSettingsFor(
   return derived;
 }
 
-export function globalSettingsFor(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+export async function globalSettingsFor(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
   workflow: string,
   organizationId?: string,
-): ValueMap {
+): Promise<ValueMap> {
   if (organizationId) {
-    return withCommon(getSettings, `organization:${organizationId}`, workflow)
+    return (await withCommon(getSettings, `organization:${organizationId}`, workflow))
       // Only the migration-created personal tenant may read historical global
       // rows. A newly-created organization must never inherit another tenant's
       // old installation settings.
-      ?? (organizationId === 'org_personal' ? withCommon(getSettings, 'global', workflow) : undefined)
+      ?? (organizationId === 'org_personal' ? (await withCommon(getSettings, 'global', workflow)) : undefined)
       ?? {};
   }
-  return withCommon(getSettings, 'global', workflow) ?? {};
+  return (await withCommon(getSettings, 'global', workflow)) ?? {};
 }
 
 /**
@@ -316,32 +316,32 @@ function quickAgentsOnly(values: ValueMap | undefined): ValueMap | undefined {
   return Object.fromEntries(Object.entries(values).filter(([name]) => name === '_enabled' || name === 'separateAgents' || name.startsWith('agent:')));
 }
 
-export function quickGlobalSettingsFor(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+export async function quickGlobalSettingsFor(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
   workflow: string,
   organizationId?: string,
-): ValueMap {
+): Promise<ValueMap> {
   if (organizationId) {
     const key = `quick:organization:${organizationId}`;
-    const common = getSettings(key, COMMON_SETTINGS_WORKFLOW);
+    const common = (await getSettings(key, COMMON_SETTINGS_WORKFLOW));
     if (common?._enabled === false) return {};
-    return quickAgentsOnly(withCommon(getSettings, key, workflow)
-      ?? (organizationId === 'org_personal' ? withCommon(getSettings, quickScopeKey('global'), workflow) : undefined))
+    return quickAgentsOnly((await withCommon(getSettings, key, workflow))
+      ?? (organizationId === 'org_personal' ? (await withCommon(getSettings, quickScopeKey('global'), workflow)) : undefined))
       ?? {};
   }
   const key = quickScopeKey('global');
-  if (getSettings(key, COMMON_SETTINGS_WORKFLOW)?._enabled === false) return {};
-  return quickAgentsOnly(withCommon(getSettings, key, workflow)) ?? {};
+  if ((await getSettings(key, COMMON_SETTINGS_WORKFLOW))?._enabled === false) return {};
+  return quickAgentsOnly((await withCommon(getSettings, key, workflow))) ?? {};
 }
 
-export function quickProjectSettingsFor(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+export async function quickProjectSettingsFor(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
   projectId: string,
   workflow: string,
-): ValueMap {
+): Promise<ValueMap> {
   const key = quickScopeKey(projectId);
-  if (getSettings(key, COMMON_SETTINGS_WORKFLOW)?._enabled === false) return {};
-  return quickAgentsOnly(withCommon(getSettings, key, workflow)) ?? {};
+  if ((await getSettings(key, COMMON_SETTINGS_WORKFLOW))?._enabled === false) return {};
+  return quickAgentsOnly((await withCommon(getSettings, key, workflow))) ?? {};
 }
 
 /** When project settings are saved, mirror bound-project fields into ProjectConfig (back-compat). */

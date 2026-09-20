@@ -83,7 +83,7 @@ export class WorldHandoffService {
    * return a pasteable editor command. Remote worlds cross the normal Git
    * handoff boundary first; local worktrees already are the host checkout. */
   async openFile(taskId: string, view: TaskView, requestedPath: string, line?: number): Promise<LocalFileOpen> {
-    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no recoverable world');
     const repositories = worldRepos(handle);
     const { absolute, repoIndex, relative } = resolveWorldFile(handle, requestedPath);
@@ -111,16 +111,16 @@ export class WorldHandoffService {
    * gateway can write to a browser user's filesystem. The returned shell script
    * crosses the same published Git boundary and is safe to run repeatedly: it
    * only fast-forwards a clean checkout. */
-  fileCheckout(taskId: string, view: TaskView, requestedPath: string, line?: number): PortableFileCheckout {
+  async fileCheckout(taskId: string, view: TaskView, requestedPath: string, line?: number): Promise<PortableFileCheckout> {
     if (view.agentTurn || view.status === 'active')
       throw new Error('wait for the agent to reach a checkpoint before materializing its branch locally');
-    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no recoverable world');
     const repositories = worldRepos(handle);
     const { repoIndex, relative } = resolveWorldFile(handle, requestedPath);
     if (!repositories.length) throw new Error('task world has no Git repository to check out');
     if (repoIndex < 0) throw new Error('file path is outside the task repositories');
-    const plan = this.checkout(taskId);
+    const plan = (await this.checkout(taskId));
     const sourceRepo = repositories[repoIndex]!;
     const destinationRepo = plan.repositories.find((repo) => repo.name === sourceRepo.name);
     if (!destinationRepo) throw new Error('local checkout does not contain the requested repository');
@@ -147,12 +147,12 @@ export class WorldHandoffService {
    * separate world: local testing and native CLI forks can never mutate the live
    * cloud sandbox behind the workflow's back. */
   async materialize(taskId: string, view: TaskView): Promise<MaterializedLocalCheckout> {
-    const task = this.store.getTask(taskId);
-    const project = task ? this.store.getProject(task.projectId) : undefined;
+    const task = (await this.store.getTask(taskId));
+    const project = task ? (await this.store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) throw new Error('task project is unavailable');
     if (view.agentTurn || view.status === 'active')
       throw new Error('wait for the agent to reach a checkpoint before materializing its branch locally');
-    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no recoverable world');
     if (!this.worlds.get(handle.kind).capabilities?.remote)
       return this.existingLocal(handle);
@@ -162,7 +162,7 @@ export class WorldHandoffService {
     const source = materializationSource(handle, view);
     const cached = await cachedMaterialization(taskId, root, handle.branch, worldRepositories, source);
     if (cached) return cached;
-    const linked = this.store.listProjectRepositories(project.id);
+    const linked = (await this.store.listProjectRepositories(project.id));
     const auth: GitBrokerAuth = async (repo) => {
       if (repo.localPath) return {};
       const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
@@ -170,12 +170,12 @@ export class WorldHandoffService {
       return this.githubApp.brokerCredentials(repository);
     };
 
-    const released = this.store.worldState(taskId) === 'released';
+    const released = (await this.store.worldState(taskId)) === 'released';
     if (released) {
       // Completion deliberately destroys provider compute after checkpointing
       // and publishing the task branch. Reopening that provider can never work;
       // the published branch is now the durable materialization source.
-      const published = this.store.eventsSince(taskId, 0).some((event) => event.type === 'push.branch'
+      const published = (await this.store.eventsSince(taskId, 0)).some((event) => event.type === 'push.branch'
         && (event.payload as { branch?: string } | undefined)?.branch === handle.branch);
       if (!published) throw new Error('the released task world has no published branch to materialize');
     } else {
@@ -183,11 +183,11 @@ export class WorldHandoffService {
       const world = access?.world ?? await this.worlds.open(handle);
       try {
         const published = await brokerPublishBranch(world, auth,
-          expectedTaskRemoteHeads(this.store, taskId), recordTaskPublication(this.store, taskId));
+          (await expectedTaskRemoteHeads(this.store, taskId)), recordTaskPublication(this.store, taskId));
         if (published.skipped.length) throw new Error(`could not publish committed cloud branch for: ${describePublishFailures(published)}`);
-        this.store.appendEvent({ taskId, type: 'push.branch', ts: Date.now(), payload: {
+        (await this.store.appendEvent({ taskId, type: 'push.branch', ts: Date.now(), payload: {
           branch: handle.branch, repos: published.pushed, reason: 'local-materialization',
-        } });
+        } }));
       } finally {
         await access?.release(true);
       }
@@ -234,20 +234,20 @@ export class WorldHandoffService {
     return { taskId: handle.id, root: handle.root, cwd: worldWorkingDirectory(handle), branch: handle.branch, repositories };
   }
 
-  checkout(taskId: string): LocalCheckoutPlan {
-    const task = this.store.getTask(taskId);
+  async checkout(taskId: string): Promise<LocalCheckoutPlan> {
+    const task = (await this.store.getTask(taskId));
     if (!task) throw new Error('task not found');
-    const project = this.store.getProject(task.projectId);
+    const project = (await this.store.getProject(task.projectId));
     if (!project) throw new Error('project not found');
-    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     const branch = handle?.branch ?? task.lastView?.branch;
     if (!branch) throw new Error('task does not have a branch yet');
     if (handle && this.worlds.get(handle.kind).capabilities?.remote) {
-      const published = this.store.eventsSince(taskId, 0).some((event) => event.type === 'push.branch'
+      const published = (await this.store.eventsSince(taskId, 0)).some((event) => event.type === 'push.branch'
         && (event.payload as { branch?: string } | undefined)?.branch === branch);
       if (!published) throw new Error('the task branch has not reached GitHub yet; wait for the next human checkpoint');
     }
-    const linked = this.store.listProjectRepositories(project.id);
+    const linked = (await this.store.listProjectRepositories(project.id));
     if (!linked.length) throw new Error('project has no GitHub repositories');
     const handleRepos = worldRepos(handle ?? ({ id: taskId, kind: 'unknown', root: '.', branch,
       base: task.lastView?.base ?? 'main' } as WorldHandle));
@@ -276,10 +276,10 @@ export class WorldHandoffService {
    * repositories. Unlike a task handoff this intentionally follows each
    * repository's default branch: it is the clean starting point for local work,
    * not a way to enter or mutate a live task world. */
-  projectCheckout(projectId: string): ProjectCheckoutPlan {
-    const project = this.store.getProject(projectId);
+  async projectCheckout(projectId: string): Promise<ProjectCheckoutPlan> {
+    const project = (await this.store.getProject(projectId));
     if (!project) throw new Error('project not found');
-    const linked = this.store.listProjectRepositories(projectId);
+    const linked = (await this.store.listProjectRepositories(projectId));
     if (!linked.length) throw new Error('project has no GitHub repositories');
     const repositories = linked.map(({ repository }) => ({
       id: repository.id,
@@ -303,33 +303,33 @@ export class WorldHandoffService {
 
   async refresh(taskId: string, view: TaskView): Promise<{ updated: Array<{ repo: string; branch: string; sha: string }>;
     parked: boolean; warning?: string }> {
-    const task = this.store.getTask(taskId);
-    const project = task ? this.store.getProject(task.projectId) : undefined;
+    const task = (await this.store.getTask(taskId));
+    const project = task ? (await this.store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) throw new Error('task project is unavailable');
     if (view.status !== 'waiting' || view.agentTurn)
       throw new Error('local changes can only be imported while the task is waiting and no agent turn is running');
     if (!['human', 'confirm'].includes(view.waitingFor?.kind ?? ''))
       throw new Error('task must be waiting for human review before importing local changes');
-    if (this.store.listExecutions(taskId).some((execution) => ['starting', 'running', 'stop-requested'].includes(execution.state)))
+    if ((await this.store.listExecutions(taskId)).some((execution) => ['starting', 'running', 'stop-requested'].includes(execution.state)))
       throw new Error('close task terminals and review processes before importing local changes');
-    let handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    let handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no recoverable world');
     if (!this.worlds.get(handle.kind).capabilities?.remote) throw new Error('local projects already use their on-disk world directly');
-    const linked = this.store.listProjectRepositories(project.id);
+    const linked = (await this.store.listProjectRepositories(project.id));
     if (!linked.length) throw new Error('project has no GitHub repositories');
     const auth: GitBrokerAuth = async (repo) => {
       const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       return this.githubApp.brokerCredentials(repository);
     };
-    const existingLease = typeof handle.meta?.worldLeaseId === 'string' ? this.store.worldLease(handle.meta.worldLeaseId) : undefined;
+    const existingLease = typeof handle.meta?.worldLeaseId === 'string' ? (await this.store.worldLease(handle.meta.worldLeaseId)) : undefined;
     let acquiredLeaseId: string | undefined;
     if (existingLease?.state !== 'active' && this.runners) {
       const lease = await this.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
         priority: Number(task.params.priority ?? 0) });
       acquiredLeaseId = lease.leaseId;
-      handle = this.store.updateWorldMeta(handle, { worldLeaseId: lease.leaseId, runnerPoolId: lease.runnerPoolId }) as WorldHandle;
-      this.store.setWorldState(handle, 'ready');
+      handle = (await this.store.updateWorldMeta(handle, { worldLeaseId: lease.leaseId, runnerPoolId: lease.runnerPoolId })) as WorldHandle;
+      (await this.store.setWorldState(handle, 'ready'));
     }
     let world: Awaited<ReturnType<WorldRegistry['open']>> | undefined;
     let result: Awaited<ReturnType<typeof brokerRefreshBranch>> | undefined;
@@ -339,10 +339,10 @@ export class WorldHandoffService {
     try {
       world = await this.worlds.open(handle);
       result = await brokerRefreshBranch(world, auth);
-      this.store.appendEvent({ taskId, type: 'world.local-handoff-imported', ts: Date.now(), payload: {
+      (await this.store.appendEvent({ taskId, type: 'world.local-handoff-imported', ts: Date.now(), payload: {
         provider: handle.kind, generation: world.handle.generation ?? handle.generation ?? 1,
         repositories: result.updated.map((entry) => ({ repo: entry.repo, branch: entry.branch, sha: entry.sha })),
-      } });
+      } }));
     } catch (error) {
       operationError = error;
     }
@@ -360,11 +360,11 @@ export class WorldHandoffService {
         warning = `the world could not be parked: ${error instanceof Error ? error.message : String(error)}`;
       }
       if (parked) {
-        const current = (this.store.currentWorld(taskId) ?? handle) as WorldHandle;
+        const current = ((await this.store.currentWorld(taskId)) ?? handle) as WorldHandle;
         const leaseId = acquiredLeaseId ?? (existingLease?.state === 'active' ? existingLease.id : undefined);
-        if (leaseId) this.runners?.release(leaseId, handle.kind);
-        this.store.updateWorldMeta(current, { worldLeaseId: null });
-        this.store.setWorldState((this.store.currentWorld(taskId) ?? current) as WorldHandle, 'parked');
+        if (leaseId) (await this.runners?.release(leaseId, handle.kind));
+        (await this.store.updateWorldMeta(current, { worldLeaseId: null }));
+        (await this.store.setWorldState(((await this.store.currentWorld(taskId)) ?? current) as WorldHandle, 'parked'));
       }
     }
     // If opening failed before a provider world existed, there is nothing useful
@@ -372,9 +372,9 @@ export class WorldHandoffService {
     // its lease attached so billing/admission remains honest until lifecycle
     // recovery handles it.
     if (!world && acquiredLeaseId) {
-      this.runners?.release(acquiredLeaseId, handle.kind);
-      const current = this.store.currentWorld(taskId) as WorldHandle | undefined;
-      if (current) this.store.updateWorldMeta(current, { worldLeaseId: null });
+      (await this.runners?.release(acquiredLeaseId, handle.kind));
+      const current = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+      if (current) (await this.store.updateWorldMeta(current, { worldLeaseId: null }));
     }
     if (operationError) {
       const primary = operationError instanceof Error ? operationError.message : String(operationError);

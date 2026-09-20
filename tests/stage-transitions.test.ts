@@ -15,12 +15,12 @@ import { sameProposalIdentity } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { RunnerPoolService } from '../src/world/runners.js';
 
-function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorization = false) {
-  const store = new Store(':memory:');
-  store.claimPersonalOrganization('test');
-  const project = store.createProject('Transitions', { repos: ['/tmp'], defaultBase: 'main', defaultTarget: 'main' });
+async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorization = false) {
+  const store = (await Store.create(':memory:'));
+  (await store.claimPersonalOrganization('test'));
+  const project = (await store.createProject('Transitions', { repos: ['/tmp'], defaultBase: 'main', defaultTarget: 'main' }));
   const tokens = new TokenAuthority();
-  const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;
+  const token = (await tokens.mintPrincipal('user:test', ['*'], project.id)).token;
   const starts: Array<{ type: string; options: any }> = [];
   const terminated: string[] = [];
   const signalled: Array<{ id: string; signal: string; args: unknown[]; runId?: string }> = [];
@@ -38,7 +38,7 @@ function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorizatio
           },
           async query(name: string) {
             if (name === 'view') {
-              const live = liveViewOverride ?? store.getTask(task.id)?.lastView;
+              const live = liveViewOverride ?? (await store.getTask(task.id))?.lastView;
               if (!live) throw new Error('no live view');
               return live;
             }
@@ -61,16 +61,16 @@ function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorizatio
     },
   } as any;
   const runners = new RunnerPoolService(store);
-  const authorization = withAuthorization ? new AuthorizationService(store) : undefined;
+  const authorization = withAuthorization ? (await AuthorizationService.create(store)) : undefined;
   const api = new KarmaxApi({ store, client, authorization, taskQueue: 'test', tokens, runners,
     refreshCredentialHealth } as any);
-  const task = store.createTask({
+  const task = (await store.createTask({
     projectId: project.id,
     title: 'Move me',
     workflow: 'software-dev',
     workflowVersion: '1.4.0',
     params: { prompt: 'work', base: 'main', target: 'main' },
-  });
+  }));
   const view: TaskView = {
     taskId: task.id,
     title: task.title,
@@ -84,7 +84,7 @@ function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorizatio
     targetBranch: 'main',
     updatedAt: 1,
   };
-  store.saveView(task.id, view);
+  (await store.saveView(task.id, view));
   return {
     store, project, tokens, token, api, task, view, starts, terminated, signalled, runners, client, authorization,
     setLiveView(view?: TaskView) { liveViewOverride = view; },
@@ -94,12 +94,12 @@ function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorizatio
 
 describe('task stage transitions', () => {
   it('keeps the winning run reachable when an overlapping resume finishes preparing too late', async () => {
-    const f = fixture();
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' });
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.saveView(f.task.id, {
       ...f.view, status: 'waiting', waitingFor: { kind: 'human' },
       state: { ...f.view.state, humanPauseOrigin: 'do' },
-    });
+    }));
     let release!: () => void;
     let entered!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
@@ -121,12 +121,12 @@ describe('task stage transitions', () => {
     const rejected = expect(loser).rejects.toThrow('already running');
     await preparing;
     await f.api.signalTask(f.token, f.task.id, 'followUp', 'Second resume');
-    expect(f.store.getTask(f.task.id)?.params._workflowRunId).toBe('new-run');
+    expect((await f.store.getTask(f.task.id))?.params._workflowRunId).toBe('new-run');
     release();
     await rejected;
 
     // The losing preparation must not restore old-run before its start fails.
-    expect(f.store.getTask(f.task.id)?.params._workflowRunId).toBe('new-run');
+    expect((await f.store.getTask(f.task.id))?.params._workflowRunId).toBe('new-run');
     await f.api.signalTask(f.token, f.task.id, 'followUp', 'Done');
     expect(await f.api.resumeAfterCredentialDecision(f.task.id, 'Access granted')).toMatchObject({ resumed: true });
     expect(f.signalled.slice(-2)).toEqual([
@@ -136,26 +136,26 @@ describe('task stage transitions', () => {
   });
 
   it('preserves parameter edits accepted while a replacement start is awaiting acknowledgement', async () => {
-    const f = fixture();
+    const f = (await fixture());
     vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
-      const current = f.store.getTask(f.task.id)!;
-      f.store.updateTaskParams(f.task.id, {
+      const current = (await f.store.getTask(f.task.id))!;
+      (await f.store.updateTaskParams(f.task.id, {
         ...current.params, priority: 4, _authorization: { profileId: 'updated-grant' },
-      });
+      }));
       return { firstExecutionRunId: 'new-run' };
     });
     await f.api.moveTaskStage(f.token, f.task.id, 'human');
-    expect(f.store.getTask(f.task.id)?.params).toMatchObject({
+    expect((await f.store.getTask(f.task.id))?.params).toMatchObject({
       priority: 4, _authorization: { profileId: 'updated-grant' }, _workflowRunId: 'new-run',
     });
   });
 
   it('does not roll back a run reference when an authorization update completes late', async () => {
-    const f = fixture();
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' });
+    const f = (await fixture());
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
     vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({
       async executeUpdate() {
-        f.store.patchTaskParams(f.task.id, { _workflowRunId: 'new-run', priority: 4 });
+        (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'new-run', priority: 4 }));
         return { applied: true };
       },
     });
@@ -166,14 +166,14 @@ describe('task stage transitions', () => {
 
   it('rechecks credential health before retrying a credential escalation', async () => {
     const order: string[] = [];
-    const f = fixture(async () => { order.push('health'); });
-    f.store.saveView(f.task.id, {
+    const f = (await fixture(async () => { order.push('health'); }));
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'escalated',
       status: 'blocked',
       error: 'No usable codex credential — every allowed login/key needs attention.',
       actions: [{ name: 'retry', kind: 'signal', label: 'Retry', enabled: true }],
-    });
+    }));
     const originalSignal = f.signalled;
 
     await f.api.signalTask(f.token, f.task.id, 'retry');
@@ -183,24 +183,24 @@ describe('task stage transitions', () => {
   });
 
   it('does not signal Retry when rearming the credential fails', async () => {
-    const f = fixture(async () => { throw new Error('coordinator unavailable'); });
-    f.store.saveView(f.task.id, { ...f.view, stage: 'escalated', status: 'blocked',
-      error: 'No usable claude credential — every allowed login/key needs attention.' });
+    const f = (await fixture(async () => { throw new Error('coordinator unavailable'); }));
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'escalated', status: 'blocked',
+      error: 'No usable claude credential — every allowed login/key needs attention.' }));
     await expect(f.api.signalTask(f.token, f.task.id, 'retry')).rejects.toThrow('coordinator unavailable');
     expect(f.signalled).toEqual([]);
   });
 
   it('force-stops a wedged Setup cancellation and releases its runner capacity', async () => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, '1.25.0');
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, '1.25.0'));
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'setup',
       status: 'active',
       state: {},
       actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
-    });
-    f.store.createRunnerPool({
+    }));
+    (await f.store.createRunnerPool({
       id: 'setup-capacity',
       organizationId: f.project.organizationId!,
       name: 'Setup capacity',
@@ -208,23 +208,23 @@ describe('task stage transitions', () => {
       mode: 'managed',
       capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 },
       enabled: true,
-    });
-    const lease = f.store.requestWorldLease({
+    }));
+    const lease = (await f.store.requestWorldLease({
       runnerPoolId: 'setup-capacity',
       organizationId: f.project.organizationId!,
       projectId: f.project.id,
       taskId: f.task.id,
       worldId: f.task.id,
-    });
+    }));
     f.setGracefulResult(async () => { throw new Error('setup did not acknowledge cancellation'); });
 
     await f.api.signalTask(f.token, f.task.id, 'cancel');
 
     expect(f.terminated).toEqual([expect.stringContaining('Setup cancellation did not stop')]);
-    expect(f.store.getTask(f.task.id)?.lastView).toMatchObject({
+    expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject({
       stage: 'cancelled', status: 'cancelled', state: { cancelled: true },
     });
-    expect(f.store.worldLease(lease.id)?.state).toBe('released');
+    expect((await f.store.worldLease(lease.id))?.state).toBe('released');
   });
 
   it('binds restored approval to every multi-repository PR identity and head', () => {
@@ -239,7 +239,7 @@ describe('task stage transitions', () => {
   });
 
   it('uses the authoritative live stage when the persisted projection lags', async () => {
-    const f = fixture();
+    const f = (await fixture());
     f.setLiveView({
       ...f.view,
       stage: 'merge',
@@ -253,30 +253,30 @@ describe('task stage transitions', () => {
   });
 
   it('normalizes internal cancellation frames and manual completion to a safe Do recovery', async () => {
-    const f = fixture();
+    const f = (await fixture());
     for (const origin of ['resolve', 'escalated'] as const) {
-      f.store.saveView(f.task.id, {
+      (await f.store.saveView(f.task.id, {
         ...f.view,
         stage: 'cancelled', status: 'cancelled',
         state: { cancelled: true, cancelledFrom: origin },
-      });
+      }));
       const cancelled = await f.api.getTaskView(f.token, f.task.id);
       expect(cancelled?.stageTransitions?.map((move) => move.target)).toContain('do');
       await f.api.moveTaskStage(f.token, f.task.id, 'do');
       expect(f.starts.at(-1)!.options.args[0].recovery.resumeStage).toBe('do');
     }
 
-    f.store.saveView(f.task.id, {
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'done', status: 'done',
       state: { manuallyDoneFrom: 'resolve' },
-    });
+    }));
     expect((await f.api.getTaskView(f.token, f.task.id))?.stageTransitions).toMatchObject([{ target: 'do' }]);
   });
 
   it('offers PR-to-Do but refuses lifecycle replacement during or after atomic landing', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, { ...f.view, stage: 'pr' });
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'pr' }));
     expect((await f.api.getTaskView(f.token, f.task.id))?.stageTransitions?.map((move) => move.target))
       .toContain('do');
 
@@ -284,23 +284,23 @@ describe('task stage transitions', () => {
       { lifecycleTransitionBlocked: true },
       {},
     ]) {
-      f.store.saveView(f.task.id, {
+      (await f.store.saveView(f.task.id, {
         ...f.view,
         stage: 'merge',
         status: 'active',
         state,
         pointOfNoReturnPassed: !state.lifecycleTransitionBlocked,
-      });
+      }));
       expect((await f.api.getTaskView(f.token, f.task.id))?.stageTransitions).toEqual([]);
     }
   });
 
   it('preserves the exact human route and question across a lifecycle replacement', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'review', status: 'active',
-    });
+    }));
     const held = await f.api.escalateToHuman(f.token, {
       taskId: f.task.id,
       audience: ['@creator'],
@@ -315,12 +315,12 @@ describe('task stage transitions', () => {
   });
 
   it('interlocks a graceful old-run shutdown until its replacement is durable', async () => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' });
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev')));
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
     let markedRun: string | undefined;
     f.setGracefulResult(async () => {
-      const raw = f.store.kvGet(lifecycleReplacementKey(f.task.id));
+      const raw = (await f.store.kvGet(lifecycleReplacementKey(f.task.id)));
       markedRun = raw ? JSON.parse(raw).runId : undefined;
       return { stage: 'cancelled' };
     });
@@ -332,7 +332,7 @@ describe('task stage transitions', () => {
     });
 
     expect(markedRun).toBe('old-run');
-    expect(f.store.kvGet(lifecycleReplacementKey(f.task.id))).toBeUndefined();
+    expect((await f.store.kvGet(lifecycleReplacementKey(f.task.id)))).toBeUndefined();
     expect(f.terminated).toEqual([]);
     expect(f.signalled).toContainEqual(expect.objectContaining({
       id: f.task.id,
@@ -341,17 +341,17 @@ describe('task stage transitions', () => {
   });
 
   it('advertises human hold, destructive Draft, and reversible Done before Jayadratha', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const view = await f.api.getTaskView(f.token, f.task.id);
     expect(view?.stageTransitions?.map((move) => move.target)).toEqual(['human', 'draft', 'done']);
 
-    f.store.claimAttempt(f.task.id);
+    (await f.store.claimAttempt(f.task.id));
     const committed = await f.api.getTaskView(f.token, f.task.id);
     expect(committed?.stageTransitions?.map((move) => move.target)).toEqual(['human', 'done']);
   });
 
   it('stops activity for manual Done and restores the exact origin on the latest workflow', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const done = await f.api.moveTaskStage(f.token, f.task.id, 'done');
     expect(done).toMatchObject({
       stage: 'done',
@@ -369,13 +369,13 @@ describe('task stage transitions', () => {
   });
 
   it('restores cancellation to its remembered stage and supports a cross-cutting human hold', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'cancelled',
       status: 'cancelled',
       state: { ...f.view.state, cancelled: true, cancelledFrom: 'review' },
-    });
+    }));
     const cancelled = await f.api.getTaskView(f.token, f.task.id);
     expect(cancelled?.stageTransitions?.map((move) => move.target)).toEqual(['review', 'draft', 'done']);
 
@@ -385,11 +385,11 @@ describe('task stage transitions', () => {
 
     // The replacement honestly advertises PR while it reconstructs the proposal;
     // emulate its next published state before testing a Review-origin hold.
-    f.store.saveView(f.task.id, {
+    (await f.store.saveView(f.task.id, {
       ...restored,
       stage: 'review',
       state: { ...restored.state, restoringTo: undefined },
-    });
+    }));
     const held = await f.api.moveTaskStage(f.token, f.task.id, 'human');
     expect(held).toMatchObject({
       stage: 'review',
@@ -408,14 +408,14 @@ describe('task stage transitions', () => {
   });
 
   it('lets an agent escalate its own task to a chosen human team and notifies only that audience', async () => {
-    const f = fixture();
+    const f = (await fixture());
     for (const userId of ['designer', 'developer'])
-      f.store.setOrganizationMembership('org_personal', userId, 'member');
-    const design = f.store.createTeam({ organizationId: 'org_personal', name: 'Design' });
-    f.store.setTeamMembership(design.id, 'designer');
-    f.store.setProjectMembership(f.project.id, { kind: 'team', teamId: design.id }, 'member');
-    f.store.setProjectMembership(f.project.id, { kind: 'user', userId: 'developer' }, 'member');
-    const agentToken = f.tokens.mint({
+      (await f.store.setOrganizationMembership('org_personal', userId, 'member'));
+    const design = (await f.store.createTeam({ organizationId: 'org_personal', name: 'Design' }));
+    (await f.store.setTeamMembership(design.id, 'designer'));
+    (await f.store.setProjectMembership(f.project.id, { kind: 'team', teamId: design.id }, 'member'));
+    (await f.store.setProjectMembership(f.project.id, { kind: 'user', userId: 'developer' }, 'member'));
+    const agentToken = (await f.tokens.mint({
       taskId: f.task.id,
       profileId: 'do',
       role: 'do',
@@ -423,9 +423,9 @@ describe('task stage transitions', () => {
       projectId: f.project.id,
       ceiling: ['task:escalate'],
       grantorCaps: ['task:escalate'],
-    }).token;
+    })).token;
 
-    expect(f.api.humanEscalationTargets(agentToken)).toMatchObject({
+    expect((await f.api.humanEscalationTargets(agentToken))).toMatchObject({
       taskId: f.task.id,
       users: expect.arrayContaining([{ id: 'designer', selector: 'user:designer' }]),
       teams: [expect.objectContaining({ id: design.id, name: 'Design', selector: '@team:design' })],
@@ -446,7 +446,7 @@ describe('task stage transitions', () => {
       state: { humanPauseOrigin: 'do' },
     });
     expect(f.terminated.at(-1)).toContain('Escalated to @team:design');
-    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+    expect((await f.store.eventsSince(f.task.id, 0))).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'task.escalated',
         payload: expect.objectContaining({
@@ -456,15 +456,15 @@ describe('task stage transitions', () => {
         }),
       }),
     ]));
-    expect(f.store.listInbox('designer', 'org_personal')).toEqual([
+    expect((await f.store.listInbox('designer', 'org_personal'))).toEqual([
       expect.objectContaining({ taskId: f.task.id, kind: 'escalated', actionable: true, unread: true }),
     ]);
-    expect(f.store.listInbox('developer', 'org_personal')).toEqual([]);
+    expect((await f.store.listInbox('developer', 'org_personal'))).toEqual([]);
   });
 
   it('rejects an escalation to a missing audience and prevents an agent escalating another task', async () => {
-    const f = fixture();
-    const agentToken = f.tokens.mint({
+    const f = (await fixture());
+    const agentToken = (await f.tokens.mint({
       taskId: f.task.id,
       profileId: 'do',
       role: 'do',
@@ -472,21 +472,21 @@ describe('task stage transitions', () => {
       projectId: f.project.id,
       ceiling: ['task:escalate'],
       grantorCaps: ['task:escalate'],
-    }).token;
+    })).token;
 
     await expect(f.api.escalateToHuman(agentToken, {
       audience: ['@team:missing'],
       message: 'I need a decision.',
     })).rejects.toThrow(/does not resolve to a human/i);
 
-    const other = f.store.createTask({
+    const other = (await f.store.createTask({
       projectId: f.project.id,
       title: 'Other',
       workflow: 'software-dev',
       workflowVersion: '1.9.0',
       params: { prompt: 'other' },
-    });
-    f.store.saveView(other.id, { ...f.view, taskId: other.id, title: other.title });
+    }));
+    (await f.store.saveView(other.id, { ...f.view, taskId: other.id, title: other.title }));
     await expect(f.api.escalateToHuman(agentToken, {
       taskId: other.id,
       audience: ['@creator'],
@@ -495,15 +495,15 @@ describe('task stage transitions', () => {
   });
 
   it('dismisses a permission ask without signaling and still allows a later decision', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const service = new PermissionRequests(f.store, 'org_personal');
-    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+    const request = (await service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
       capabilities: ['settings:read'], audience: ['@owners'], recipients: ['test'],
-      reason: 'Inspect settings', requestedBy: 'agent' });
-    f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
-      payload: { requestId: request.id, recipients: ['test'] } });
-    expect(f.store.listInbox('test', 'org_personal')).toHaveLength(1);
-    const outsider = f.tokens.mintPrincipal('user:outsider', ['*'], f.project.id).token;
+      reason: 'Inspect settings', requestedBy: 'agent' }));
+    (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
+      payload: { requestId: request.id, recipients: ['test'] } }));
+    expect((await f.store.listInbox('test', 'org_personal'))).toHaveLength(1);
+    const outsider = (await f.tokens.mintPrincipal('user:outsider', ['*'], f.project.id)).token;
     await expect(f.api.resolvePermissionRequest(outsider, { organizationId: 'org_personal',
       requestId: request.id, action: 'dismiss' })).rejects.toThrow(/not routed/);
     const result = await f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal',
@@ -511,22 +511,22 @@ describe('task stage transitions', () => {
     expect(result).toMatchObject({ status: 'pending', dismissed: { by: 'user:test' } });
     expect(f.signalled).toEqual([]);
     expect(f.starts).toEqual([]);
-    expect(service.extensionCaps(f.task.id)).toEqual([]);
-    expect(f.store.listInbox('test', 'org_personal')).toEqual([]);
-    expect(service.requests({ taskId: f.task.id })).toHaveLength(1);
+    expect((await service.extensionCaps(f.task.id))).toEqual([]);
+    expect((await f.store.listInbox('test', 'org_personal'))).toEqual([]);
+    expect((await service.requests({ taskId: f.task.id }))).toHaveLength(1);
     await expect(f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal',
       requestId: request.id, action: 'approve' })).resolves.toMatchObject({ status: 'granted' });
   });
 
   it('automatically resolves covered permission requests after authorization changes', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const service = new PermissionRequests(f.store, 'org_personal');
-    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+    const request = (await service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
       capabilities: ['settings:read'], audience: ['@owners'], recipients: ['test'],
-      reason: 'Inspect settings', requestedBy: 'agent' });
+      reason: 'Inspect settings', requestedBy: 'agent' }));
     await f.api.setTaskAuthorization(f.token, f.task.id, 'developer');
-    expect(service.requests()[0]).toMatchObject({ id: request.id, status: 'granted' });
-    expect(service.extensionCaps(f.task.id)).toEqual([]);
+    expect((await service.requests())[0]).toMatchObject({ id: request.id, status: 'granted' });
+    expect((await service.extensionCaps(f.task.id))).toEqual([]);
     expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, args: [expect.any(Object), 'do'] });
     const signals = f.signalled.length;
     await f.api.setTaskAuthorization(f.token, f.task.id, 'developer');
@@ -534,43 +534,43 @@ describe('task stage transitions', () => {
   });
 
   it('leaves requests pending until both scope and capabilities are covered', async () => {
-    const f = fixture(undefined, true);
-    const other = f.store.createProject('Additional project');
-    for (const projectId of [f.project.id, other.id]) f.authorization!.grant('system:test', {
+    const f = (await fixture(undefined, true));
+    const other = (await f.store.createProject('Additional project'));
+    for (const projectId of [f.project.id, other.id]) (await f.authorization!.grant('system:test', {
       principalId: 'user:test', scopeKey: projectScope(projectId), profileId: 'maintainer',
-    });
+    }));
     const base = { level: 'developer', scope: 'projects' as const, projectIds: [f.project.id] };
     const service = new PermissionRequests(f.store, 'org_personal');
-    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+    const request = (await service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
       capabilities: ['github:actions:write'], projectIds: [other.id], baseAuthorization: base,
-      audience: ['@owners'], recipients: ['test'], reason: 'Configure project', requestedBy: 'agent' });
+      audience: ['@owners'], recipients: ['test'], reason: 'Configure project', requestedBy: 'agent' }));
     await f.api.setTaskAuthorization(f.token, f.task.id, base);
-    expect(service.requests()[0]!.status).toBe('pending');
+    expect((await service.requests())[0]!.status).toBe('pending');
     await f.api.setTaskAuthorization(f.token, f.task.id, { ...base, projectIds: [f.project.id, other.id] });
-    expect(service.requests()[0]!.status).toBe('pending');
+    expect((await service.requests())[0]!.status).toBe('pending');
     expect(f.signalled).toEqual([]);
     await f.api.setTaskAuthorization(f.token, f.task.id, { ...base, level: 'maintainer', projectIds: [f.project.id, other.id] });
-    expect(service.requests()[0]).toMatchObject({ id: request.id, status: 'granted' });
+    expect((await service.requests())[0]).toMatchObject({ id: request.id, status: 'granted' });
   });
 
   it('recognizes an already-satisfied project request despite a changed selection', async () => {
-    const f = fixture(undefined, true);
-    const other = f.store.createProject('Additional project');
+    const f = (await fixture(undefined, true));
+    const other = (await f.store.createProject('Additional project'));
     const base = { level: 'developer', scope: 'projects' as const, projectIds: [f.project.id] };
     const service = new PermissionRequests(f.store, 'org_personal');
-    const request = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
+    const request = (await service.request({ taskId: f.task.id, projectId: f.project.id, role: 'do',
       capabilities: [], projectIds: [other.id], baseAuthorization: base,
-      audience: ['@owners'], recipients: ['test'], reason: 'Read additional project', requestedBy: 'agent' });
-    f.store.patchTaskParams(f.task.id, { _authorization: { ...base,
-      projectIds: [f.project.id, other.id], capabilities: ['*'] } });
+      audience: ['@owners'], recipients: ['test'], reason: 'Read additional project', requestedBy: 'agent' }));
+    (await f.store.patchTaskParams(f.task.id, { _authorization: { ...base,
+      projectIds: [f.project.id, other.id], capabilities: ['*'] } }));
     await expect(f.api.resolvePermissionRequest(f.token, { organizationId: 'org_personal',
       requestId: request.id, action: 'approve' })).resolves.toMatchObject({ status: 'granted' });
   });
 
   it('routes an exact permission elevation to selected humans and only a capable recipient may approve', async () => {
-    const f = fixture();
-    f.store.setOrganizationMembership('org_personal', 'outsider', 'member');
-    const agentToken = f.tokens.mint({
+    const f = (await fixture());
+    (await f.store.setOrganizationMembership('org_personal', 'outsider', 'member'));
+    const agentToken = (await f.tokens.mint({
       taskId: f.task.id,
       profileId: 'do',
       role: 'do',
@@ -579,7 +579,7 @@ describe('task stage transitions', () => {
       organizationId: 'org_personal',
       ceiling: ['task:escalate'],
       grantorCaps: ['task:escalate'],
-    }).token;
+    })).token;
 
     const requested = await f.api.requestPermission(agentToken, {
       capabilities: ['settings:read'],
@@ -596,23 +596,23 @@ describe('task stage transitions', () => {
       resumeStage: 'do',
       pausedForHuman: true,
     });
-    expect(f.store.getTask(f.task.id)!.lastView).toMatchObject({
+    expect((await f.store.getTask(f.task.id))!.lastView).toMatchObject({
       stage: 'do',
       status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@owners'] },
     });
-    expect(f.store.listInbox('test', 'org_personal')).toEqual([
+    expect((await f.store.listInbox('test', 'org_personal'))).toEqual([
       expect.objectContaining({ taskId: f.task.id, kind: 'approval-requested', actionable: true }),
     ]);
-    expect(f.store.listInbox('outsider', 'org_personal')).toEqual([]);
+    expect((await f.store.listInbox('outsider', 'org_personal'))).toEqual([]);
 
-    const outsider = f.tokens.mintPrincipal(
+    const outsider = (await f.tokens.mintPrincipal(
       'user:outsider',
       ['task:read', 'settings:read'],
       f.project.id,
       undefined,
       'org_personal',
-    ).token;
+    )).token;
     await expect(f.api.resolvePermissionRequest(outsider, {
       organizationId: 'org_personal',
       requestId: requested.requestId!,
@@ -626,26 +626,26 @@ describe('task stage transitions', () => {
     });
     expect(resolved).toMatchObject({ status: 'granted', resume: { resumed: true } });
     expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, args: [expect.any(Object), 'do'] });
-    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'do'))
+    expect((await new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'do')))
       .toEqual(['settings:read']);
-    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge'))
+    expect((await new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge')))
       .toEqual([]);
     // The approval was answered, so it stops being an ask sitting in the inbox.
-    expect(f.store.listInbox('test', 'org_personal')).toEqual([]);
+    expect((await f.store.listInbox('test', 'org_personal'))).toEqual([]);
 
-    f.store.setOrganizationMembership('org_personal', 'reviewer', 'member');
+    (await f.store.setOrganizationMembership('org_personal', 'reviewer', 'member'));
     const second = await f.api.requestPermission(agentToken, {
       capabilities: ['settings:write'],
       audience: ['user:reviewer'],
       reason: 'Configure outbound email.',
     });
-    const reviewer = f.tokens.mintPrincipal(
+    const reviewer = (await f.tokens.mintPrincipal(
       'user:reviewer',
       ['task:read'],
       f.project.id,
       undefined,
       'org_personal',
-    ).token;
+    )).token;
     await expect(f.api.resolvePermissionRequest(reviewer, {
       organizationId: 'org_personal',
       requestId: second.requestId!,
@@ -659,35 +659,35 @@ describe('task stage transitions', () => {
   });
 
   it.each(['human', 'delegated-agent'])('%s approves additive scope and mints usable fresh delegation', async (kind) => {
-    const f = fixture(undefined, true);
-    const second = f.store.createProject('Second');
-    for (const projectId of [f.project.id, second.id]) f.authorization!.grant('system:test', {
+    const f = (await fixture(undefined, true));
+    const second = (await f.store.createProject('Second'));
+    for (const projectId of [f.project.id, second.id]) (await f.authorization!.grant('system:test', {
       principalId: 'user:test', scopeKey: projectScope(projectId), profileId: 'maintainer',
-    });
-    const initial = { ...f.authorization!.taskGrant('user:test', f.project.id, {
+    }));
+    const initial = { ...(await f.authorization!.taskGrant('user:test', f.project.id, {
       level: 'developer', scope: 'projects', projectIds: [f.project.id],
-    }), principal: 'user:test' };
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial });
-    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
+    })), principal: 'user:test' };
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial }));
+    const agent = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
       principal: `task-agent:${f.task.id}:do`, projectIds: [f.project.id], organizationId: 'org_personal',
-      ceiling: ['task:escalate', 'task:read'], grantorCaps: ['task:escalate', 'task:read'] });
-    expect(f.tokens.check(agent.token, 'task:read', { projectId: second.id }).ok).toBe(false);
+      ceiling: ['task:escalate', 'task:read'], grantorCaps: ['task:escalate', 'task:read'] }));
+    expect((await f.tokens.check(agent.token, 'task:read', { projectId: second.id })).ok).toBe(false);
     // task:read is already held; it must still ask because scope is missing.
     const requested = await f.api.requestPermission(agent.token, {
       capabilities: ['task:read'], projectIds: [second.id, second.id, f.project.id],
       audience: ['@owners'], reason: 'Read the phase task in the second project.',
     });
     expect(requested).toMatchObject({ status: 'needs_approval', projectIds: [second.id] });
-    expect(f.store.getTask(f.task.id)!.params._authorization).toEqual(initial);
-    expect(f.store.getTask(f.task.id)!.lastView?.status).toBe('waiting');
+    expect((await f.store.getTask(f.task.id))!.params._authorization).toEqual(initial);
+    expect((await f.store.getTask(f.task.id))!.lastView?.status).toBe('waiting');
     let approver = f.token;
     if (kind === 'delegated-agent') {
-      const human = f.tokens.mintPrincipal('user:test', ['*'], undefined, undefined, 'org_personal').token;
-      const delegation = f.tokens.delegateHuman(human, { taskId: 'approver-task',
-        projectIds: [f.project.id, second.id], organizationId: 'org_personal' })!;
-      approver = f.tokens.mint({ taskId: 'approver-task', profileId: 'do', principal: 'user:test',
+      const human = (await f.tokens.mintPrincipal('user:test', ['*'], undefined, undefined, 'org_personal')).token;
+      const delegation = (await f.tokens.delegateHuman(human, { taskId: 'approver-task',
+        projectIds: [f.project.id, second.id], organizationId: 'org_personal' }))!;
+      approver = (await f.tokens.mint({ taskId: 'approver-task', profileId: 'do', principal: 'user:test',
         projectIds: [f.project.id, second.id], organizationId: 'org_personal',
-        ceiling: ['*'], grantorCaps: ['*'], delegationId: delegation.id }).token;
+        ceiling: ['*'], grantorCaps: ['*'], delegationId: delegation.id })).token;
     }
     const approval = f.api.resolvePermissionRequest(approver, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
@@ -696,90 +696,90 @@ describe('task stage transitions', () => {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
     })).rejects.toThrow(/decision is already in progress/);
     await expect(approval).resolves.toMatchObject({ status: 'granted', resume: { resumed: true } });
-    const expanded = f.store.getTask(f.task.id)!.params._authorization as any;
+    const expanded = (await f.store.getTask(f.task.id))!.params._authorization as any;
     expect(expanded.projectIds).toEqual([f.project.id, second.id]);
     expect(expanded.level).toBe('developer');
     expect(expanded.delegationId).toMatch(/^dlg_/);
-    const fresh = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'user:test',
+    const fresh = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'user:test',
       projectIds: expanded.projectIds, organizationId: 'org_personal', delegationId: expanded.delegationId,
-      ceiling: expanded.capabilities, grantorCaps: expanded.capabilities });
+      ceiling: expanded.capabilities, grantorCaps: expanded.capabilities }));
     for (const projectId of [f.project.id, second.id])
-      expect(f.tokens.check(fresh.token, 'task:read', { projectId, organizationId: 'org_personal' }).ok).toBe(true);
-    expect(f.tokens.check(agent.token, 'task:read', { projectId: second.id }).ok).toBe(false);
+      expect((await f.tokens.check(fresh.token, 'task:read', { projectId, organizationId: 'org_personal' })).ok).toBe(true);
+    expect((await f.tokens.check(agent.token, 'task:read', { projectId: second.id })).ok).toBe(false);
     await expect(f.api.resolvePermissionRequest(f.token, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
     })).rejects.toThrow(/already granted/);
   });
 
   it('checks target-project authority, rejects foreign projects, and leaves scope unchanged on denial', async () => {
-    const f = fixture(undefined, true);
-    const second = f.store.createProject('Second');
-    f.store.setOrganizationMembership('org_personal', 'limited', 'member');
-    f.authorization!.grant('system:test', {
+    const f = (await fixture(undefined, true));
+    const second = (await f.store.createProject('Second'));
+    (await f.store.setOrganizationMembership('org_personal', 'limited', 'member'));
+    (await f.authorization!.grant('system:test', {
       principalId: 'user:limited', scopeKey: projectScope(f.project.id), profileId: 'maintainer',
-    });
+    }));
     const initial = { level: 'developer', scope: 'projects', projectIds: [f.project.id],
       capabilities: ['task:read'], principal: 'user:test' };
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial });
-    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial }));
+    const agent = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
       principal: 'task-agent:test', projectId: f.project.id, organizationId: 'org_personal',
-      ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+      ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
     await expect(f.api.requestPermission(agent, { capabilities: [], projectIds: ['foreign-or-missing'],
       audience: ['@owners'], reason: 'Read foreign work.' })).rejects.toThrow(/task organization/);
     const requested = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
       audience: ['user:limited'], reason: 'Expand project scope only.' });
-    const limited = f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal').token;
+    const limited = (await f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal')).token;
     await expect(f.api.resolvePermissionRequest(limited, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'approve',
     })).rejects.toThrow(/cannot grant.*project/);
-    expect(f.store.getTask(f.task.id)!.params._authorization).toEqual(initial);
+    expect((await f.store.getTask(f.task.id))!.params._authorization).toEqual(initial);
     await expect(f.api.resolvePermissionRequest(limited, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
     })).resolves.toMatchObject({ status: 'denied', resume: { resumed: true } });
-    expect(f.store.getTask(f.task.id)!.params._authorization).toEqual(initial);
+    expect((await f.store.getTask(f.task.id))!.params._authorization).toEqual(initial);
   });
 
   it('requires authority for earlier permission grants belonging to other roles before expanding scope', async () => {
-    const f = fixture(undefined, true);
-    const second = f.store.createProject('Second');
-    f.store.setOrganizationMembership('org_personal', 'limited', 'member');
-    for (const projectId of [f.project.id, second.id]) f.authorization!.grant('system:test', {
+    const f = (await fixture(undefined, true));
+    const second = (await f.store.createProject('Second'));
+    (await f.store.setOrganizationMembership('org_personal', 'limited', 'member'));
+    for (const projectId of [f.project.id, second.id]) (await f.authorization!.grant('system:test', {
       principalId: 'user:limited', scopeKey: projectScope(projectId), profileId: 'maintainer',
-    });
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: {
+    }));
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: {
       level: 'developer', scope: 'projects', projectIds: [f.project.id], capabilities: ['task:read'],
-    } });
+    } }));
     const service = new PermissionRequests(f.store, 'org_personal');
-    const prior = service.request({ taskId: f.task.id, projectId: f.project.id, role: 'merge',
+    const prior = (await service.request({ taskId: f.task.id, projectId: f.project.id, role: 'merge',
       capabilities: ['settings:write'], audience: ['@owners'], recipients: ['test'],
-      reason: 'Configure the platform.', requestedBy: 'task-agent:test' });
-    service.resolve(prior.id, { action: 'approve', by: 'user:test' });
-    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
-      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+      reason: 'Configure the platform.', requestedBy: 'task-agent:test' }));
+    (await service.resolve(prior.id, { action: 'approve', by: 'user:test' }));
+    const agent = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
+      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
     const requested = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
       audience: ['user:limited'], reason: 'Read phase work.' });
-    const limited = f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal').token;
+    const limited = (await f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal')).token;
     await expect(f.api.resolvePermissionRequest(limited, { organizationId: 'org_personal',
       requestId: requested.requestId!, action: 'approve' })).rejects.toThrow(/cannot grant settings:write/);
-    expect((f.store.getTask(f.task.id)!.params._authorization as any).projectIds).toEqual([f.project.id]);
+    expect(((await f.store.getTask(f.task.id))!.params._authorization as any).projectIds).toEqual([f.project.id]);
   });
 
   it('rejects stale scope requests and checks subsequent capability grants across all selected projects', async () => {
-    const f = fixture(undefined, true);
-    const second = f.store.createProject('Second');
-    f.store.setOrganizationMembership('org_personal', 'limited', 'member');
-    f.authorization!.grant('system:test', { principalId: 'user:limited',
-      scopeKey: projectScope(f.project.id), profileId: 'maintainer' });
+    const f = (await fixture(undefined, true));
+    const second = (await f.store.createProject('Second'));
+    (await f.store.setOrganizationMembership('org_personal', 'limited', 'member'));
+    (await f.authorization!.grant('system:test', { principalId: 'user:limited',
+      scopeKey: projectScope(f.project.id), profileId: 'maintainer' }));
     const initial = { level: 'developer', scope: 'projects', projectIds: [f.project.id],
       capabilities: ['task:read'], principal: 'user:test' };
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial });
-    const agent = f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
-      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: initial }));
+    const agent = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do', principal: 'task-agent:test',
+      projectId: f.project.id, organizationId: 'org_personal', ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
     const request = await f.api.requestPermission(agent, { capabilities: [], projectIds: [second.id],
       audience: ['user:limited'], reason: 'Read phase work.' });
     const expanded = { ...initial, projectIds: [f.project.id, second.id] };
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: expanded });
-    const limited = f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal').token;
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _authorization: expanded }));
+    const limited = (await f.tokens.mintPrincipal('user:limited', ['*'], f.project.id, undefined, 'org_personal')).token;
     await expect(f.api.resolvePermissionRequest(limited, {
       organizationId: 'org_personal', requestId: request.requestId!, action: 'approve',
     })).rejects.toThrow(/authorization changed/);
@@ -788,13 +788,13 @@ describe('task stage transitions', () => {
     await expect(f.api.resolvePermissionRequest(limited, {
       organizationId: 'org_personal', requestId: capabilityRequest.requestId!, action: 'approve',
     })).rejects.toThrow(/cannot grant task:edit/);
-    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id)).toEqual([]);
+    expect((await new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id))).toEqual([]);
   });
 
   it('parks and resumes the requesting Merge role so the next turn receives the grant', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, { ...f.view, stage: 'merge' });
-    const agentToken = f.tokens.mint({
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'merge' }));
+    const agentToken = (await f.tokens.mint({
       taskId: f.task.id,
       profileId: 'merge-default',
       role: 'merge',
@@ -803,7 +803,7 @@ describe('task stage transitions', () => {
       organizationId: 'org_personal',
       ceiling: ['task:escalate'],
       grantorCaps: ['task:escalate'],
-    }).token;
+    })).token;
 
     const requested = await f.api.requestPermission(agentToken, {
       capabilities: ['task:git:import'],
@@ -820,21 +820,21 @@ describe('task stage transitions', () => {
       requestId: requested.requestId!,
       action: 'approve',
     })).resolves.toMatchObject({ status: 'granted', role: 'merge', resume: { resumed: true } });
-    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge'))
+    expect((await new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge')))
       .toEqual(['task:git:import']);
     expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, args: [expect.any(Object), 'merge'] });
   });
 
   it('treats follow-up and Confirm as input that releases a human hold', async () => {
-    const follow = fixture();
-    follow.store.saveView(follow.task.id, {
+    const follow = (await fixture());
+    (await follow.store.saveView(follow.task.id, {
       ...follow.view,
       status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] },
       actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }],
       state: { ...follow.view.state, humanPauseOrigin: 'review' },
       stage: 'review',
-    });
+    }));
 
     const message = await follow.api.signalTask(follow.token, follow.task.id, 'followUp', 'Please revise this.', 'do');
     expect(message?.text).toBe('Please revise this.');
@@ -845,46 +845,46 @@ describe('task stage transitions', () => {
       expect.objectContaining({ id: expect.stringContaining('account-coordinator'), signal: 'cancelAccountLease', args: [{ taskId: follow.task.id, turnId: 'hidden-account-turn' }] }),
     ]));
 
-    const confirm = fixture();
-    confirm.store.saveView(confirm.task.id, {
+    const confirm = (await fixture());
+    (await confirm.store.saveView(confirm.task.id, {
       ...confirm.view,
       status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] },
       actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true }],
       state: { ...confirm.view.state, humanPauseOrigin: 'review' },
       stage: 'review',
-    });
+    }));
     await confirm.api.signalTask(confirm.token, confirm.task.id, 'confirm');
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
   it('lets an agent confirm a Review gate only with review:approve (maintainer and above)', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view, stage: 'review', status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] },
       actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true }],
-    });
-    const agent = (caps: string[]) => f.tokens.mint({
+    }));
+    const agent = async (caps: string[]) => (await f.tokens.mint({
       taskId: f.task.id, profileId: 'do', role: 'do', principal: `task-agent:${f.task.id}:do`,
       projectId: f.project.id, ceiling: caps, grantorCaps: caps,
-    }).token;
+    })).token;
     // A developer-level agent holds task:* (so task:signal) but not review:approve.
-    await expect(f.api.signalTask(agent(['task:*']), f.task.id, 'confirm')).rejects.toThrow(/review:approve/);
+    await expect(f.api.signalTask((await agent(['task:*'])), f.task.id, 'confirm')).rejects.toThrow(/review:approve/);
     expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(0);
     // The same agent under a maintainer-level authorization stands in for the reviewer.
-    await f.api.signalTask(agent(['task:*', 'review:approve']), f.task.id, 'confirm');
+    await f.api.signalTask((await agent(['task:*', 'review:approve'])), f.task.id, 'confirm');
     expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(1);
-    expect(f.store.eventsSince(f.task.id, 0).filter((e) => e.type === 'task.confirmation-voted').at(-1)?.payload)
+    expect((await f.store.eventsSince(f.task.id, 0)).filter((e) => e.type === 'task.confirmation-voted').at(-1)?.payload)
       .toMatchObject({ userId: `task-agent:${f.task.id}:do`, satisfied: true });
     // Re-routing who reviews follows the same rule.
-    await expect(f.api.updateParams(agent(['task:*']), f.task.id, { confirm: { layers: [] } })).rejects.toThrow(/review:approve/);
+    await expect(f.api.updateParams((await agent(['task:*'])), f.task.id, { confirm: { layers: [] } })).rejects.toThrow(/review:approve/);
   });
 
   it('consumes a current Review-hold confirmation once instead of restoring the hold again', async () => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev')));
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'review', status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Approve this exact proposal' },
@@ -898,7 +898,7 @@ describe('task stage transitions', () => {
           humanWait: { audience: ['@creator'], detail: 'Approve this exact proposal' },
         },
       },
-    });
+    }));
 
     await f.api.signalTask(f.token, f.task.id, 'confirm');
     const recovery = f.starts.at(-1)!.options.args[0].recovery;
@@ -907,18 +907,18 @@ describe('task stage transitions', () => {
   });
 
   it('records manual confirmation of an escalated reviewer as GitHub merge authorization', async () => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev')));
+    (await f.store.saveView(f.task.id, {
       ...f.view, stage: 'escalated', status: 'blocked',
       prs: [{ repo: 'repo', slug: 'owner/repo', number: 52, url: 'https://github.test/owner/repo/pull/52', state: 'open', headSha: 'abc123' }],
       waitingFor: { kind: 'human', audience: ['@creator'] },
       actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true }],
-    });
+    }));
     await f.api.signalTask(f.token, f.task.id, 'confirm');
     expect(f.signalled).toContainEqual({ id: f.task.id, signal: 'confirm', args: [] });
     expect(f.starts).toHaveLength(0);
-    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+    expect((await f.store.eventsSince(f.task.id, 0))).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'task.confirmation-voted', payload: expect.objectContaining({
         githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
         githubPrHeads: [{ slug: 'owner/repo', number: 52, headSha: 'abc123' }],
@@ -927,16 +927,16 @@ describe('task stage transitions', () => {
   });
 
   it.each(['1.16.0', '1.17.0', '1.18.0', '1.19.0', '1.20.0'])('upgrades a %s task at its successful Review boundary into participant Landing', async (version) => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, version);
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, version));
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'review',
       status: 'waiting',
       prs: [{ repo: 'repo', slug: 'owner/repo', number: 52, url: 'https://github.test/owner/repo/pull/52', state: 'open', headSha: 'abc123' }],
       waitingFor: { kind: 'human', audience: ['@creator'] },
       actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true }],
-    });
+    }));
 
     await f.api.signalTask(f.token, f.task.id, 'confirm');
 
@@ -946,8 +946,8 @@ describe('task stage transitions', () => {
       resumeStage: 'merge',
       prs: [{ slug: 'owner/repo', number: 52, headSha: 'abc123' }],
     });
-    expect(f.store.getTask(f.task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
-    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+    expect((await f.store.getTask(f.task.id))?.workflowVersion).toBe(bundledVersion('software-dev'));
+    expect((await f.store.eventsSince(f.task.id, 0))).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'task.confirmation-voted',
         payload: expect.objectContaining({ githubMergeIntentAuthorized: true }),
@@ -957,11 +957,11 @@ describe('task stage transitions', () => {
   });
 
   it.each(['1.16.0', '1.17.0', '1.18.0', '1.19.0', '1.20.0'])('upgrades a blocked authorized %s Landing retry and resumes its Do session', async (version) => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, version);
-    f.store.kvSet(`session:${f.task.id}:do`, 'codex-session-existing');
-    f.store.kvSet(`sessionmeta:${f.task.id}:do`, JSON.stringify({ home: '/profiles/codex' }));
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, version));
+    (await f.store.kvSet(`session:${f.task.id}:do`, 'codex-session-existing'));
+    (await f.store.kvSet(`sessionmeta:${f.task.id}:do`, JSON.stringify({ home: '/profiles/codex' })));
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'escalated',
       status: 'blocked',
@@ -973,7 +973,7 @@ describe('task stage transitions', () => {
         provider: 'ejected',
         authorizedHeads: { 'owner/repo#52': 'reviewed-head' },
       },
-    });
+    }));
 
     const message = await f.api.signalTask(f.token, f.task.id, 'retry');
 
@@ -993,14 +993,14 @@ describe('task stage transitions', () => {
       },
       prs: [{ number: 52, headSha: 'reviewed-head' }],
     });
-    expect(f.store.getTask(f.task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
+    expect((await f.store.getTask(f.task.id))?.workflowVersion).toBe(bundledVersion('software-dev'));
   });
 
   it.each(['1.16.0', '1.17.0', '1.18.0', '1.19.0', '1.20.0'])('upgrades a %s exceptional Landing confirmation into participant Landing', async (version) => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, version);
-    f.store.kvSet(`session:${f.task.id}:do`, 'codex-session-existing');
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, version));
+    (await f.store.kvSet(`session:${f.task.id}:do`, 'codex-session-existing'));
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'merge',
       status: 'waiting',
@@ -1014,7 +1014,7 @@ describe('task stage transitions', () => {
         repairAttempts: 5,
         authorizedHeads: { 'owner/repo#52': 'reviewed-head' },
       },
-    });
+    }));
 
     await f.api.signalTask(f.token, f.task.id, 'confirm');
 
@@ -1030,61 +1030,61 @@ describe('task stage transitions', () => {
         authorizedHeads: { 'owner/repo#52': 'reviewed-head' },
       },
     });
-    expect(f.store.getTask(f.task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
+    expect((await f.store.getTask(f.task.id))?.workflowVersion).toBe(bundledVersion('software-dev'));
     expect(f.signalled.some((item) => item.id === f.task.id && item.signal === 'confirm')).toBe(false);
   });
 
   it('lets the selected human open a PR from a Do-stage input wait', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] },
       actions: [{ name: 'openPr', kind: 'signal', label: 'Open PR', enabled: true }],
       state: { ...f.view.state, humanPauseOrigin: 'do' },
       stage: 'do',
-    });
+    }));
 
     await f.api.signalTask(f.token, f.task.id, 'openPr');
     expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr', args: [{ userId: 'test' }] });
   });
 
   it('does not turn a delegated agent PR request into a human confirmation', async () => {
-    const f = fixture();
-    const agentToken = f.tokens.mint({
+    const f = (await fixture());
+    const agentToken = (await f.tokens.mint({
       taskId: f.task.id, profileId: 'do', role: 'do', principal: 'user:test',
       projectId: f.project.id, ceiling: ['task:signal'], grantorCaps: ['task:signal'],
-    }).token;
+    })).token;
 
     await f.api.signalTask(agentToken, f.task.id, 'openPr');
 
     expect(f.signalled.at(-1)).toEqual({ id: f.task.id, signal: 'openPr', args: [] });
-    expect(f.store.eventsSince(f.task.id, 0).filter((e) => e.type === 'task.confirmation-voted')).toEqual([]);
-    f.store.close();
+    expect((await f.store.eventsSince(f.task.id, 0)).filter((e) => e.type === 'task.confirmation-voted')).toEqual([]);
+    (await f.store.close());
   });
 
   it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] },
       workflowOptions: ['software-dev', 'goal'],
       workflowSwitchable: true,
       state: { ...f.view.state, humanPauseOrigin: 'do' },
-    });
+    }));
 
     await f.api.changeWorkflow(f.token, f.task.id, 'goal');
 
     expect(f.starts.at(-1)!.type).toBe(`goal@${bundledVersion('goal')}`);
     expect(f.starts.at(-1)!.options.args[0]).toMatchObject({ recovery: { resumeStage: 'do' } });
     expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1).text).toMatch(/continue autonomously/i);
-    expect(f.store.getTask(f.task.id)?.workflow).toBe('goal');
+    expect((await f.store.getTask(f.task.id))?.workflow).toBe('goal');
   });
 
   it('offers held Merge input only on the Merge conversation', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'merge',
       status: 'waiting',
@@ -1095,7 +1095,7 @@ describe('task stage transitions', () => {
       ],
       actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true }],
       state: { ...f.view.state, humanPauseOrigin: 'merge' },
-    });
+    }));
 
     const held = await f.api.getTaskView(f.token, f.task.id);
     expect(held?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
@@ -1111,8 +1111,8 @@ describe('task stage transitions', () => {
     // spliced back, leaving a task with 13 hours of Do context and no way to say
     // anything to it — Cancel was the only action. Do always exists once a task
     // has worked, and it owns the context the follow-up is about.
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'merge',
       status: 'waiting',
@@ -1120,7 +1120,7 @@ describe('task stage transitions', () => {
       transcripts: [{ role: 'do', label: 'Do agent', messages: f.view.messages }],
       actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true }],
       state: { ...f.view.state, humanPauseOrigin: 'merge' },
-    });
+    }));
 
     const held = await f.api.getTaskView(f.token, f.task.id);
     expect(held?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
@@ -1131,10 +1131,10 @@ describe('task stage transitions', () => {
   });
 
   it('offers an explicit Merge-to-Do repair transition and preserves the PR checkpoint', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const prs = [{ repo: 'app', slug: 'acme/app', number: 7, url: 'https://github.test/acme/app/pull/7',
       state: 'open' as const, headSha: 'reviewed-head' }];
-    f.store.saveView(f.task.id, {
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'merge',
       status: 'waiting',
@@ -1146,7 +1146,7 @@ describe('task stage transitions', () => {
         provider: 'queued',
         authorizedHeads: { 'acme/app#7': 'reviewed-head' },
       },
-    });
+    }));
 
     const merge = await f.api.getTaskView(f.token, f.task.id);
     expect(merge?.stageTransitions?.map((move) => move.target)).toEqual(['human', 'do', 'draft', 'done']);
@@ -1165,8 +1165,8 @@ describe('task stage transitions', () => {
   });
 
   it('does not advertise a lossy human hold from the internal Resolve frame', async () => {
-    const f = fixture();
-    f.store.saveView(f.task.id, {
+    const f = (await fixture());
+    (await f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'resolve',
       status: 'active',
@@ -1174,32 +1174,32 @@ describe('task stage transitions', () => {
         { role: 'do', label: 'Do agent', messages: f.view.messages },
         { role: 'resolve', label: 'Resolve agent', messages: [{ id: 'resolve-1', role: 'agent', text: 'repairing', ts: 1 }] },
       ],
-    });
+    }));
 
     const resolving = await f.api.getTaskView(f.token, f.task.id);
     expect(resolving?.stageTransitions?.map((move) => move.target)).toEqual(['draft', 'done']);
   });
 
   it('moves a draft to Done and back without starting an execution', async () => {
-    const f = fixture();
-    f.store.updateTaskParams(f.task.id, { ...f.task.params, draft: true });
+    const f = (await fixture());
+    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, draft: true }));
     const done = await f.api.moveTaskStage(f.token, f.task.id, 'done');
     expect(done.state.manuallyDoneFrom).toBe('draft');
     expect(f.starts).toHaveLength(0);
 
     const draft = await f.api.moveTaskStage(f.token, f.task.id, 'draft');
     expect(draft).toMatchObject({ stage: 'setup', state: { draft: true } });
-    expect(f.store.getTask(f.task.id)?.params.draft).toBe(true);
+    expect((await f.store.getTask(f.task.id))?.params.draft).toBe(true);
   });
 
   it('makes destructive Draft reset a one-shot input to the next Setup', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const draft = await f.api.moveTaskStage(f.token, f.task.id, 'draft');
     expect(draft.state.draft).toBe(true);
-    expect(f.store.getTask(f.task.id)?.params._discardProgress).toBe(true);
+    expect((await f.store.getTask(f.task.id))?.params._discardProgress).toBe(true);
 
     await f.api.moveTaskStage(f.token, f.task.id, 'do');
     expect(f.starts[0]!.options.args[0].discardProgress).toBe(true);
-    expect(f.store.getTask(f.task.id)?.params._discardProgress).toBeUndefined();
+    expect((await f.store.getTask(f.task.id))?.params._discardProgress).toBeUndefined();
   });
 });

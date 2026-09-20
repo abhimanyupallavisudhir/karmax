@@ -95,7 +95,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(done.workflow).toBe('goal');
     // The searchable mode changes, while replay accounting retains the actual
     // Temporal definition that started this run.
-    expect(h.store.getTask(task.id)).toMatchObject({
+    expect((await h.store.getTask(task.id))).toMatchObject({
       workflow: 'goal',
       executionWorkflow: 'software-dev',
       workflowVersion: bundledVersion('software-dev'),
@@ -351,7 +351,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
       provider: 'mock', model: 'destination-model', effort: 'low',
     });
     await poll(forked.id, 'review');
-    expect(h.store.getTask(forked.id)?.params['agent:do']).toMatchObject({
+    expect((await h.store.getTask(forked.id))?.params['agent:do']).toMatchObject({
       provider: 'mock', model: 'destination-model', effort: 'low', resumeFrom: { taskId: a.id, role: 'do' },
     });
     const events = await get(`/api/tasks/${forked.id}/events?since=0`);
@@ -365,7 +365,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
       role: 'do', title: 'Tool fork defaults', message: '@write tool-fork-defaults.txt :: done\n@review tool fork defaults',
     });
     await poll(inherited.id, 'review');
-    expect(h.store.getTask(inherited.id)?.params['agent:do']).toMatchObject({
+    expect((await h.store.getTask(inherited.id))?.params['agent:do']).toMatchObject({
       resumeFrom: { taskId: a.id, role: 'do' },
     });
     await post(`/api/tasks/${inherited.id}/signal`, { signal: 'confirm' });

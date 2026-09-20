@@ -19,58 +19,58 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
-  it('reads dependency principals without hydrating any attempt history', () => {
-    const store = new Store(url!);
+  it('reads dependency principals without hydrating any attempt history', async () => {
+    const store = (await Store.create(url!));
     try {
-      const project = store.createProject('Dependencies', {});
-      const first = store.createTask({ projectId: project.id, title: 'First', workflow: 'just-do',
-        workflowVersion: '1', params: { prompt: 'work' } });
-      const second = store.createTask({ projectId: project.id, title: 'Second', workflow: 'just-do',
-        workflowVersion: '1', intentId: first.intentId, params: { prompt: 'work', draft: true } });
-      store.db.prepare('UPDATE tasks SET lastView=?, conversation=?').run(
-        JSON.stringify({ status: 'done' }), 'must not decode history');
-      expect(store.attemptPrincipalState(second.id)).toEqual({ principalAttemptId: first.id, status: 'done' });
-      store.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(second.id, first.intentId!);
-      store.db.prepare('UPDATE tasks SET lastView=NULL WHERE id=?').run(second.id);
-      expect(store.attemptPrincipalState(first.id)).toEqual({ principalAttemptId: second.id, status: undefined });
-      expect(store.attemptPrincipalState('missing')).toBeUndefined();
-    } finally { store.close(); }
+      const project = (await store.createProject('Dependencies', {}));
+      const first = (await store.createTask({ projectId: project.id, title: 'First', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'work' } }));
+      const second = (await store.createTask({ projectId: project.id, title: 'Second', workflow: 'just-do',
+        workflowVersion: '1', intentId: first.intentId, params: { prompt: 'work', draft: true } }));
+      (await store.db.prepare('UPDATE tasks SET lastView=?, conversation=?').run(
+        JSON.stringify({ status: 'done' }), 'must not decode history'));
+      expect((await store.attemptPrincipalState(second.id))).toEqual({ principalAttemptId: first.id, status: 'done' });
+      (await store.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(second.id, first.intentId!));
+      (await store.db.prepare('UPDATE tasks SET lastView=NULL WHERE id=?').run(second.id));
+      expect((await store.attemptPrincipalState(first.id))).toEqual({ principalAttemptId: second.id, status: undefined });
+      expect((await store.attemptPrincipalState('missing'))).toBeUndefined();
+    } finally { (await store.close()); }
   });
 
   it('uses native asynchronous pagination with compact views and archive filtering', async () => {
-    const store = new Store(url!);
+    const store = (await Store.create(url!));
     try {
-      const project = store.createProject('Page');
-      for (let i = 0; i < 4; i++) store.createTask({ projectId: project.id, title: `Task ${i}`, workflow: 'just-do',
-        workflowVersion: '1.0.0', params: { prompt: 'work', archived: i === 0 } });
+      const project = (await store.createProject('Page'));
+      for (let i = 0; i < 4; i++) (await store.createTask({ projectId: project.id, title: `Task ${i}`, workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'work', archived: i === 0 } }));
       const page = await store.taskSummaryPage(project.id, { limit: 2, offset: 1 });
       expect(page.total).toBe(3);
       expect(page.tasks.map(task => task.title)).toEqual(['Task 2', 'Task 3']);
       expect((await store.taskSummaryPage(project.id, { includeArchived: true })).total).toBe(4);
       const taskId = page.tasks[0]!.id;
-      const cursor = store.latestEventSeq();
-      store.appendEvent({ taskId, type: 'fixture', ts: 1, payload: { text: 'ordered' } });
+      const cursor = (await store.latestEventSeq());
+      (await store.appendEvent({ taskId, type: 'fixture', ts: 1, payload: { text: 'ordered' } }));
       const events = await store.nextEventsSince(cursor, 500);
       expect(events.map(event => event.payload.text)).toEqual(['ordered']);
       expect(await store.taskProjectIds(events.map(event => event.taskId))).toEqual(new Map([[taskId, project.id]]));
-    } finally { store.close(); }
+    } finally { (await store.close()); }
   });
 
   it('reads task details and review audiences without the synchronous PostgreSQL bridge', async () => {
-    const store = new Store(url!);
-    const authorization = new AuthorizationService(store);
+    const store = (await Store.create(url!));
+    const authorization = (await AuthorizationService.create(store));
     try {
-      const org = store.createOrganization({ name: 'Async audience', ownerUserId: 'owner' });
-      const project = store.createProject('Detail', {}, org.id);
-      const task = store.createTask({ projectId: project.id, title: 'Review', workflow: 'just-do', workflowVersion: '1',
+      const org = (await store.createOrganization({ name: 'Async audience', ownerUserId: 'owner' }));
+      const project = (await store.createProject('Detail', {}, org.id));
+      const task = (await store.createTask({ projectId: project.id, title: 'Review', workflow: 'just-do', workflowVersion: '1',
         params: { prompt: 'fixture' }, confirmationPolicy: {
           rule: 'any', targets: [{ kind: 'project-role', projectId: project.id, role: 'owner' }],
-        } });
-      store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
-        messages: [{ id: 'm', text: 'history', role: 'agent', ts: 1 }], state: {}, actions: [], updatedAt: 1 });
-      const expected = store.getTask(task.id);
-      const expectedCaps = authorization.capabilities('user:owner', project.id);
-      const prepare = vi.spyOn(store.db, 'prepare').mockImplementation(() => { throw Error('blocking database access'); });
+        } }));
+      (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+        messages: [{ id: 'm', text: 'history', role: 'agent', ts: 1 }], state: {}, actions: [], updatedAt: 1 }));
+      const expected = (await store.getTask(task.id));
+      const expectedCaps = (await authorization.capabilities('user:owner', project.id));
+      const prepare = vi.spyOn(Atomics, 'wait').mockImplementation(() => { throw Error('blocking database access'); });
       try {
         expect(await authorization.capabilitiesAsync('user:owner', project.id)).toEqual(expectedCaps);
         expect(await store.getOrganizationIdentityPolicyAsync(org.id)).toMatchObject({ enforceSso: false });
@@ -84,16 +84,16 @@ integration('PostgreSQL cutover', () => {
         expect(await store.taskPointerByNumAsync(project.id, task.num!)).toEqual({ id: task.id, num: task.num, projectId: project.id });
         expect(await store.taskSnapshotAsync(task.id)).toEqual(expected?.lastView);
       } finally { prepare.mockRestore(); }
-    } finally { store.close(); }
+    } finally { (await store.close()); }
   });
 
   it('keeps the event loop live while a native permission lookup waits for the database', async () => {
-    const store = new Store(url!);
+    const store = (await Store.create(url!));
     const blocker = await admin!.connect();
     try {
-      const authorization = new AuthorizationService(store);
-      authorization.grant('root', { principalId: 'user:reader', scopeKey: 'global', profileId: 'god' });
-      store.kvSet('permission-probe', 'ready');
+      const authorization = (await AuthorizationService.create(store));
+      (await authorization.grant('root', { principalId: 'user:reader', scopeKey: 'global', profileId: 'god' }));
+      (await store.kvSet('permission-probe', 'ready'));
       await authorization.capabilitiesAsync('user:reader');
       await blocker.query('BEGIN');
       await blocker.query('LOCK TABLE authorization_profiles IN ACCESS EXCLUSIVE MODE');
@@ -106,17 +106,17 @@ integration('PostgreSQL cutover', () => {
       expect(complete).toBe(false);
       await unlock;
       expect(await reading).toEqual(['*']);
-    } finally { await blocker.query('ROLLBACK'); blocker.release(); store.close(); }
+    } finally { await blocker.query('ROLLBACK'); blocker.release(); (await store.close()); }
   });
 
   it('keeps timers and independent reads live while a task-table lock delays detail and full-list reads', async () => {
-    const store = new Store(url!);
+    const store = (await Store.create(url!));
     const blocker = await admin!.connect();
     try {
-      const project = store.createProject('Blocked read');
-      const task = store.createTask({ projectId: project.id, title: 'Lock fixture', workflow: 'just-do',
-        workflowVersion: '1', params: { prompt: 'fixture' } });
-      store.kvSet('unrelated-read', 'ready');
+      const project = (await store.createProject('Blocked read'));
+      const task = (await store.createTask({ projectId: project.id, title: 'Lock fixture', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture' } }));
+      (await store.kvSet('unrelated-read', 'ready'));
       await store.taskMetadataAsync(task.id); // establish the pool before timing the lock
       await blocker.query('BEGIN');
       await blocker.query('LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE');
@@ -131,94 +131,94 @@ integration('PostgreSQL cutover', () => {
       expect(finished).toBe(false);
       await unlock;
       expect((await read)?.id).toBe(task.id);
-    } finally { await blocker.query('ROLLBACK'); blocker.release(); store.close(); }
+    } finally { await blocker.query('ROLLBACK'); blocker.release(); (await store.close()); }
   });
 
-  it('looks up usage IDs in bounded batches and task ownership without loading views', () => {
-    const store = new Store(url!);
+  it('looks up usage IDs in bounded batches and task ownership without loading views', async () => {
+    const store = (await Store.create(url!));
     try {
-      const project = store.createProject('Usage attribution');
-      const task = store.createTask({ projectId: project.id, title: 'Run', workflow: 'just-do',
-        workflowVersion: '1.0.0', params: { prompt: 'Run' } });
-      expect(store.taskAttribution(task.id)).toEqual({ projectId: project.id, organizationId: project.organizationId });
-      expect(store.taskAttribution('missing')).toBeUndefined();
-      store.recordUsage({ id: 'usage:e2b:known', organizationId: project.organizationId!, provider: 'e2b',
-        kind: 'world.active', quantity: 1, unit: 'second', costMicros: 14, startedAt: 1, endedAt: 1001 });
-      expect(store.recordedUsageEventIds([]).size).toBe(0);
+      const project = (await store.createProject('Usage attribution'));
+      const task = (await store.createTask({ projectId: project.id, title: 'Run', workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'Run' } }));
+      expect((await store.taskAttribution(task.id))).toEqual({ projectId: project.id, organizationId: project.organizationId });
+      expect((await store.taskAttribution('missing'))).toBeUndefined();
+      (await store.recordUsage({ id: 'usage:e2b:known', organizationId: project.organizationId!, provider: 'e2b',
+        kind: 'world.active', quantity: 1, unit: 'second', costMicros: 14, startedAt: 1, endedAt: 1001 }));
+      expect((await store.recordedUsageEventIds([])).size).toBe(0);
       const ids = Array.from({ length: 501 }, (_, i) => `missing-${i}`);
-      expect(store.recordedUsageEventIds([...ids, 'usage:e2b:known'])).toEqual(new Set(['usage:e2b:known']));
-    } finally { store.close(); }
+      expect((await store.recordedUsageEventIds([...ids, 'usage:e2b:known']))).toEqual(new Set(['usage:e2b:known']));
+    } finally { (await store.close()); }
   });
 
-  it('tracks transactions after multi-statement commits, comments and failed statements', () => {
+  it('tracks transactions after multi-statement commits, comments and failed statements', async () => {
     const db = openSqlDatabase(url!);
     try {
-      db.exec('BEGIN IMMEDIATE');
-      db.exec('SELECT 1; COMMIT');
+      (await db.exec('BEGIN IMMEDIATE'));
+      (await db.exec('SELECT 1; COMMIT'));
       expect(db.inTransaction()).toBe(false);
-      db.exec('-- begin with a comment\nBEGIN; SELECT 1');
+      (await db.exec('-- begin with a comment\nBEGIN; SELECT 1'));
       expect(db.inTransaction()).toBe(true);
-      expect(() => db.exec('SELECT * FROM missing_payment_table')).toThrow();
+      await expect((async () => (await db.exec('SELECT * FROM missing_payment_table')))()).rejects.toThrow();
       expect(db.inTransaction()).toBe(true);
-      db.exec('ROLLBACK');
+      (await db.exec('ROLLBACK'));
       expect(db.inTransaction()).toBe(false);
-      expect(() => db.exec('BEGIN; COMMIT; SELECT * FROM missing_payment_table')).toThrow();
+      await expect((async () => (await db.exec('BEGIN; COMMIT; SELECT * FROM missing_payment_table')))()).rejects.toThrow();
       expect(db.inTransaction()).toBe(false);
-    } finally { db.close(); }
+    } finally { (await db.close()); }
   });
 
   it('locks payment accounting in a real transaction and preserves nested rollback', async () => {
-    const store = new Store(url!);
+    const store = (await Store.create(url!));
     try {
       expect(store.db.inTransaction()).toBe(false);
-      const project = store.createProject('Postgres payments');
+      const project = (await store.createProject('Postgres payments'));
       const provider = new MockPaymentProvider(store);
       const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 10000 });
       await provider.fund(card.id, 10000);
-      const task = store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do',
-        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 } } });
+      const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 } } }));
       const service = new BudgetService(store, provider);
       const ctx = { projectId: project.id, taskId: task.id };
       const results = await Promise.all([service.request(ctx, { amount: 100, why: 'first' }),
         service.request(ctx, { amount: 100, why: 'second' })]);
       expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);
-      store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { cardIds: [card.id], budget: 200 } });
+      (await store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { cardIds: [card.id], budget: 200 } }));
       expect((await service.reconcileTask(ctx)).map(r => r.status)).toEqual(['granted']);
-      expect(store.paymentSpent(task.id)).toBe(200);
+      expect((await store.paymentSpent(task.id))).toBe(200);
       expect(store.db.inTransaction()).toBe(false);
-      store.db.exec('BEGIN');
-      store.paymentTransaction(() => store.updateCard(card.id, { available: 1 }));
+      (await store.db.exec('BEGIN'));
+      (await store.paymentTransaction(async () => (await store.updateCard(card.id, { available: 1 }))));
       expect(store.db.inTransaction()).toBe(true);
-      store.db.exec('ROLLBACK');
-      expect(store.getCard(card.id).available).toBe(9800);
-    } finally { store.close(); }
+      (await store.db.exec('ROLLBACK'));
+      expect((await store.getCard(card.id)).available).toBe(9800);
+    } finally { (await store.close()); }
   });
 
-  it('patches task fields without replacing unrelated metadata or merging revoked grants', () => {
-    const store = new Store(url!);
+  it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
+    const store = (await Store.create(url!));
     try {
-      const project = store.createProject('Parameter patches');
-      const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      const project = (await store.createProject('Parameter patches'));
+      const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
         workflowVersion: '1.0.0', params: { prompt: 'work', _workflowRunId: 'live-run',
-          _authorization: { capabilities: ['old'], delegationId: 'revoked' } } });
-      store.patchTaskParams(task.id, { base: 'main', _authorization: { capabilities: ['new'] },
-        nullable: null, ignored: undefined });
-      expect(store.getTask(task.id)?.params).toEqual({ prompt: 'work', _workflowRunId: 'live-run',
+          _authorization: { capabilities: ['old'], delegationId: 'revoked' } } }));
+      (await store.patchTaskParams(task.id, { base: 'main', _authorization: { capabilities: ['new'] },
+        nullable: null, ignored: undefined }));
+      expect((await store.getTask(task.id))?.params).toEqual({ prompt: 'work', _workflowRunId: 'live-run',
         base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
-    } finally { store.close(); }
+    } finally { (await store.close()); }
   });
 
-  it('retains shared snapshot chunks and releases only the last reference', () => {
+  it('retains shared snapshot chunks and releases only the last reference', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-chunks-'));
-    const { store } = openStore(path.join(home, 'karmax.db'), url!);
+    const { store } = (await openStore(path.join(home, 'karmax.db'), url!));
     try {
       const chunks = [{ id: 'shared-chunk', bytes: 12 }];
-      store.retainResourceChunks('org_personal', chunks);
-      store.retainResourceChunks('org_personal', chunks);
-      expect(store.releaseResourceChunks('org_personal', ['shared-chunk'])).toEqual([]);
-      expect(store.releaseResourceChunks('org_personal', ['shared-chunk'])).toEqual(['shared-chunk']);
+      (await store.retainResourceChunks('org_personal', chunks));
+      (await store.retainResourceChunks('org_personal', chunks));
+      expect((await store.releaseResourceChunks('org_personal', ['shared-chunk']))).toEqual([]);
+      expect((await store.releaseResourceChunks('org_personal', ['shared-chunk']))).toEqual(['shared-chunk']);
     } finally {
-      store.close(); fs.rmSync(home, { recursive: true, force: true });
+      (await store.close()); fs.rmSync(home, { recursive: true, force: true });
     }
   });
 
@@ -226,105 +226,105 @@ integration('PostgreSQL cutover', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-'));
     const storeFile = path.join(home, 'karmax.db');
     const authFile = path.join(home, 'auth.db');
-    const source = new Store(storeFile);
-    const project = source.createProject('Migrated workspace');
-    const task = source.createTask({ projectId: project.id, title: 'Keep me', workflow: 'software-dev',
-      workflowVersion: 'software-dev@1', params: { prompt: 'Keep me', draft: false } });
-    const eventSeq = source.appendEvent({ taskId: task.id, type: 'view.updated', ts: Date.now(), payload: { status: 'active' } });
-    source.createTag({ projectId: project.id, name: 'database' });
+    const source = (await Store.create(storeFile));
+    const project = (await source.createProject('Migrated workspace'));
+    const task = (await source.createTask({ projectId: project.id, title: 'Keep me', workflow: 'software-dev',
+      workflowVersion: 'software-dev@1', params: { prompt: 'Keep me', draft: false } }));
+    const eventSeq = (await source.appendEvent({ taskId: task.id, type: 'view.updated', ts: Date.now(), payload: { status: 'active' } }));
+    (await source.createTag({ projectId: project.id, name: 'database' }));
     // Simulate a legacy row that needs an idempotent data migration after copy.
-    source.db.prepare('UPDATE tasks SET intentId=NULL, attemptNumber=NULL WHERE id=?').run(task.id);
-    source.close();
+    (await source.db.prepare('UPDATE tasks SET intentId=NULL, attemptNumber=NULL WHERE id=?').run(task.id));
+    (await source.close());
 
     const secret = 'test-secret-with-at-least-32-characters';
     const sqliteIdentity = await IdentityService.open(authFile, { secret });
     const user = await sqliteIdentity.createUser({ name: 'Alice', email: 'alice@example.com', password: 'correct-horse-battery' });
     await sqliteIdentity.close();
 
-    const opened = openStore(storeFile, url!);
+    const opened = (await openStore(storeFile, url!));
     expect(opened.migration).toMatchObject({ imported: true });
-    expect(opened.store.getTask(task.id)).toMatchObject({ title: 'Keep me', intentId: task.id, attemptNumber: 1 });
-    expect(opened.store.eventsSince(task.id, 0).map((event) => event.seq)).toEqual([eventSeq]);
-    expect(opened.store.listTags(project.id).map((tag) => tag.name)).toEqual(['database']);
-    opened.store.saveView(task.id, { status: 'active', stage: 'do', messages: [], transcripts: {} } as any);
-    expect(opened.store.listTaskSummaries(project.id)[0]).toMatchObject({ id: task.id, lastView: { status: 'active', stage: 'do' } });
-    opened.store.setTaskArchived(task.id, true);
-    expect(opened.store.getTask(task.id)?.params.archived).toBe(true);
-    expect(Number(opened.store.operationalSnapshot().databaseBytes)).toBeGreaterThan(0);
+    expect((await opened.store.getTask(task.id))).toMatchObject({ title: 'Keep me', intentId: task.id, attemptNumber: 1 });
+    expect((await opened.store.eventsSince(task.id, 0)).map((event) => event.seq)).toEqual([eventSeq]);
+    expect((await opened.store.listTags(project.id)).map((tag) => tag.name)).toEqual(['database']);
+    (await opened.store.saveView(task.id, { status: 'active', stage: 'do', messages: [], transcripts: {} } as any));
+    expect((await opened.store.listTaskSummaries(project.id))[0]).toMatchObject({ id: task.id, lastView: { status: 'active', stage: 'do' } });
+    (await opened.store.setTaskArchived(task.id, true));
+    expect((await opened.store.getTask(task.id))?.params.archived).toBe(true);
+    expect(Number((await opened.store.operationalSnapshot()).databaseBytes)).toBeGreaterThan(0);
     expect(fs.existsSync(storeFile)).toBe(true);
-    const postCutoverProject = opened.store.createProject('Post-cutover workspace');
-    const postCutoverTask = opened.store.createTask({ projectId: postCutoverProject.id, title: 'Written in PostgreSQL',
-      workflow: 'software-dev', workflowVersion: 'software-dev@1', params: { prompt: 'Written in PostgreSQL', draft: false } });
-    expect(opened.store.appendEvent({ taskId: postCutoverTask.id, type: 'task.created', ts: Date.now(), payload: {} }))
+    const postCutoverProject = (await opened.store.createProject('Post-cutover workspace'));
+    const postCutoverTask = (await opened.store.createTask({ projectId: postCutoverProject.id, title: 'Written in PostgreSQL',
+      workflow: 'software-dev', workflowVersion: 'software-dev@1', params: { prompt: 'Written in PostgreSQL', draft: false } }));
+    expect((await opened.store.appendEvent({ taskId: postCutoverTask.id, type: 'task.created', ts: Date.now(), payload: {} })))
       .toBe(eventSeq + 1);
-    opened.store.deleteProject(postCutoverProject.id);
-    expect(opened.store.getProject(postCutoverProject.id)).toBeUndefined();
-    opened.store.close();
+    (await opened.store.deleteProject(postCutoverProject.id));
+    expect((await opened.store.getProject(postCutoverProject.id))).toBeUndefined();
+    (await opened.store.close());
 
     const identity = await IdentityService.open(authFile, { secret, databaseUrl: url! });
     expect(identity.migration).toMatchObject({ imported: true });
-    expect(identity.listUsers().map((candidate) => candidate.id)).toEqual([user.id]);
-    expect(await identity.providersForUserAsync(user.id)).toEqual(identity.providersForUser(user.id));
+    expect((await identity.listUsers()).map((candidate) => candidate.id)).toEqual([user.id]);
+    expect(await identity.providersForUserAsync(user.id)).toEqual((await identity.providersForUser(user.id)));
     expect((await identity.signIn('alice@example.com', 'correct-horse-battery')).status).toBe(200);
-    const connectedStore = openStore(storeFile, url!).store;
-    identity.connectOrganizationNames(() => connectedStore.organizationNameReservations());
-    connectedStore.connectUserNames(() => identity.listUsers());
-    connectedStore.claimPersonalOrganization(user.id, user.name);
-    expect(connectedStore.migratePersonalOrganizationNames(identity.listUsers())).toBe(0);
+    const connectedStore = (await openStore(storeFile, url!)).store;
+    identity.connectOrganizationNames(async () => (await connectedStore.organizationNameReservations()));
+    connectedStore.connectUserNames(async () => (await identity.listUsers()));
+    (await connectedStore.claimPersonalOrganization(user.id, user.name));
+    expect((await connectedStore.migratePersonalOrganizationNames((await identity.listUsers())))).toBe(0);
     const bob = await identity.createUser({ name: 'Bob', email: 'bob@example.com', password: 'correct-horse-battery' });
-    expect(identity.listUsers().map((candidate) => candidate.id)).toContain(bob.id);
+    expect((await identity.listUsers()).map((candidate) => candidate.id)).toContain(bob.id);
     await identity.removeUser(bob.id);
-    expect(identity.listUsers().map((candidate) => candidate.id)).not.toContain(bob.id);
-    connectedStore.close();
+    expect((await identity.listUsers()).map((candidate) => candidate.id)).not.toContain(bob.id);
+    (await connectedStore.close());
     await identity.close();
 
-    const reopened = openStore(storeFile, url!);
+    const reopened = (await openStore(storeFile, url!));
     expect(reopened.migration).toEqual({ imported: false, tables: 0, rows: 0 });
-    expect(reopened.store.eventsSince(task.id, 0)).toHaveLength(1);
-    reopened.store.close();
+    expect((await reopened.store.eventsSince(task.id, 0))).toHaveLength(1);
+    (await reopened.store.close());
 
     const reopenedIdentity = await IdentityService.open(authFile, { secret, databaseUrl: url! });
     expect(reopenedIdentity.migration).toEqual({ imported: false, tables: 0, rows: 0 });
-    expect(reopenedIdentity.listUsers()).toHaveLength(1);
+    expect((await reopenedIdentity.listUsers())).toHaveLength(1);
     await reopenedIdentity.close();
     fs.rmSync(home, { recursive: true, force: true });
   }, 30_000);
 
-  it('refuses to merge an unmarked SQLite source into a non-empty target', () => {
+  it('refuses to merge an unmarked SQLite source into a non-empty target', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-refusal-'));
     const sourceFile = path.join(home, 'karmax.db');
-    const source = new Store(sourceFile);
-    const sourceProject = source.createProject('SQLite source');
-    source.createTask({ projectId: sourceProject.id, title: 'Source task', workflow: 'software-dev',
-      workflowVersion: 'software-dev@1', params: { prompt: 'Source task', draft: false } });
-    source.close();
+    const source = (await Store.create(sourceFile));
+    const sourceProject = (await source.createProject('SQLite source'));
+    (await source.createTask({ projectId: sourceProject.id, title: 'Source task', workflow: 'software-dev',
+      workflowVersion: 'software-dev@1', params: { prompt: 'Source task', draft: false } }));
+    (await source.close());
 
-    const target = new Store(url!);
-    const targetProject = target.createProject('Existing PostgreSQL data');
-    target.createTask({ projectId: targetProject.id, title: 'Target task', workflow: 'software-dev',
-      workflowVersion: 'software-dev@1', params: { prompt: 'Target task', draft: false } });
-    target.close();
+    const target = (await Store.create(url!));
+    const targetProject = (await target.createProject('Existing PostgreSQL data'));
+    (await target.createTask({ projectId: targetProject.id, title: 'Target task', workflow: 'software-dev',
+      workflowVersion: 'software-dev@1', params: { prompt: 'Target task', draft: false } }));
+    (await target.close());
 
-    expect(() => openStore(sourceFile, url!)).toThrow(/refusing SQLite import into non-empty PostgreSQL/);
+    await expect((async () => (await openStore(sourceFile, url!)))()).rejects.toThrow(/refusing SQLite import into non-empty PostgreSQL/);
     expect(fs.existsSync(sourceFile)).toBe(true);
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  it('disambiguates legacy organization names before PostgreSQL import', () => {
+  it('disambiguates legacy organization names before PostgreSQL import', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-org-names-'));
     const sourceFile = path.join(home, 'karmax.db');
-    const source = new Store(sourceFile);
-    const oldest = source.createOrganization({ name: 'Acme' });
-    source.db.exec('DROP INDEX idx_organizations_name_nocase');
-    source.db.prepare(`INSERT INTO organizations (id, name, slug, kind, createdAt)
-      VALUES ('org_duplicate', 'ACME', 'acme-2', 'team', ?)`).run(oldest.createdAt + 1);
-    source.close();
+    const source = (await Store.create(sourceFile));
+    const oldest = (await source.createOrganization({ name: 'Acme' }));
+    (await source.db.exec('DROP INDEX idx_organizations_name_nocase'));
+    (await source.db.prepare(`INSERT INTO organizations (id, name, slug, kind, createdAt)
+      VALUES ('org_duplicate', 'ACME', 'acme-2', 'team', ?)`).run(oldest.createdAt + 1));
+    (await source.close());
 
-    const opened = openStore(sourceFile, url!);
+    const opened = (await openStore(sourceFile, url!));
     expect(opened.migration).toMatchObject({ imported: true });
-    expect(opened.store.getOrganization(oldest.id)?.name).toBe('Acme');
-    expect(opened.store.getOrganization('org_duplicate')?.name).toBe('acme-2');
-    opened.store.close();
+    expect((await opened.store.getOrganization(oldest.id))?.name).toBe('Acme');
+    expect((await opened.store.getOrganization('org_duplicate'))?.name).toBe('acme-2');
+    (await opened.store.close());
     fs.rmSync(home, { recursive: true, force: true });
   });
 });

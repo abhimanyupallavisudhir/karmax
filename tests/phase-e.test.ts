@@ -24,11 +24,11 @@ describe('defaultBranch detection', () => {
 
 describe('reconcileTasks (settle lost workflows on restart)', () => {
   it('preserves the server termination reason without fetching the full history', async () => {
-    const store = new Store(':memory:');
-    const p = store.createProject('P', {});
-    const t = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'x' } });
-    store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'merge', status: 'active',
-      messages: [], actions: [], state: {}, updatedAt: 0 });
+    const store = (await Store.create(':memory:'));
+    const p = (await store.createProject('P', {}));
+    const t = (await store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'x' } }));
+    (await store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'merge', status: 'active',
+      messages: [], actions: [], state: {}, updatedAt: 0 }));
     const handles: (string | undefined)[] = [];
     const client: any = { workflow: { getHandle: (_id: string, runId?: string) => {
       handles.push(runId);
@@ -41,48 +41,48 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
     try {
       expect((await reconcileTasks(store, client)).settled).toBe(1);
       expect(handles).toEqual([undefined, 'terminated-run']);
-      expect(store.getTask(t.id)?.lastView?.error).toBe('workflow terminated: Workflow history size exceeds limit.');
-    } finally { store.close(); }
+      expect((await store.getTask(t.id))?.lastView?.error).toBe('workflow terminated: Workflow history size exceeds limit.');
+    } finally { (await store.close()); }
   });
 
   it('marks a non-terminal task whose workflow is gone as failed', async () => {
-    const store = new Store(':memory:');
-    const p = store.createProject('P', {});
-    const t = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
-    store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 0 });
+    const store = (await Store.create(':memory:'));
+    const p = (await store.createProject('P', {}));
+    const t = (await store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    (await store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 0 }));
     const fakeClient: any = { workflow: { getHandle: () => ({ describe: async () => { throw new Error('not found'); } }) } };
     const r = await reconcileTasks(store, fakeClient);
     expect(r.settled).toBe(1);
-    expect(store.getTask(t.id)!.lastView!.status).toBe('failed');
+    expect((await store.getTask(t.id))!.lastView!.status).toBe('failed');
   });
 
   it('reconciles every attempt execution, including non-principal siblings', async () => {
-    const store = new Store(':memory:');
-    const p = store.createProject('P', {});
-    const first = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
-    const second = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y' }, intentId: first.intentId });
+    const store = (await Store.create(':memory:'));
+    const p = (await store.createProject('P', {}));
+    const first = (await store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const second = (await store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y' }, intentId: first.intentId }));
     for (const t of [first, second]) {
-      store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 0 });
+      (await store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 0 }));
     }
     const fakeClient: any = { workflow: { getHandle: () => ({ describe: async () => { throw new Error('not found'); } }) } };
     const r = await reconcileTasks(store, fakeClient);
     expect(r.settled).toBe(2);
-    expect(store.getTask(first.id)!.lastView!.status).toBe('failed');
-    expect(store.getTask(second.id)!.lastView!.status).toBe('failed');
+    expect((await store.getTask(first.id))!.lastView!.status).toBe('failed');
+    expect((await store.getTask(second.id))!.lastView!.status).toBe('failed');
   });
 
   it('settles a running Setup whose live workflow already received cancellation', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Hosted', ownerUserId: 'owner' });
-    const p = store.createProject('P', {}, organization.id);
-    const t = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.25.0', params: { prompt: 'x' } });
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Hosted', ownerUserId: 'owner' }));
+    const p = (await store.createProject('P', {}, organization.id));
+    const t = (await store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.25.0', params: { prompt: 'x' } }));
     const setup = { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'setup' as const,
       status: 'active' as const, messages: [], actions: [], state: {}, updatedAt: 0 };
-    store.saveView(t.id, setup);
-    store.createRunnerPool({ id: 'pool', organizationId: organization.id, name: 'Pool', provider: 'e2b',
-      mode: 'managed', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
-    const lease = store.requestWorldLease({ runnerPoolId: 'pool', organizationId: organization.id,
-      projectId: p.id, taskId: t.id, worldId: t.id });
+    (await store.saveView(t.id, setup));
+    (await store.createRunnerPool({ id: 'pool', organizationId: organization.id, name: 'Pool', provider: 'e2b',
+      mode: 'managed', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true }));
+    const lease = (await store.requestWorldLease({ runnerPoolId: 'pool', organizationId: organization.id,
+      projectId: p.id, taskId: t.id, worldId: t.id }));
     const terminated: string[] = [];
     const fakeClient: any = { workflow: { getHandle: () => ({
       describe: async () => ({ status: { name: 'RUNNING' } }),
@@ -94,8 +94,8 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
 
     expect(r.settled).toBe(1);
     expect(terminated).toEqual(['cancelled Setup did not settle']);
-    expect(store.getTask(t.id)?.lastView).toMatchObject({ stage: 'cancelled', status: 'cancelled' });
-    expect(store.worldLease(lease.id)?.state).toBe('released');
+    expect((await store.getTask(t.id))?.lastView).toMatchObject({ stage: 'cancelled', status: 'cancelled' });
+    expect((await store.worldLease(lease.id))?.state).toBe('released');
   });
 });
 

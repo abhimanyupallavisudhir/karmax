@@ -42,15 +42,15 @@ describe('ImapPuller', () => {
     // one org with a +tag address on the mailbox
     const mail = new AgentMail(s as any, 'gmail.com', 'agent');
     s.orgs.push({ id: 'org_a' });
-    const addr = mail.address('org_a'); // agent+agent-<tok>@gmail.com
+    const addr = (await mail.address('org_a')); // agent+agent-<tok>@gmail.com
     const conn: ImapConn = { fetchSince: async (last) => [raw(5, addr, '111222'), raw(6, addr, '333444')].filter((m) => m.uid > last), close: async () => {} };
     const puller = new ImapPuller(config, {
       store: s, organizationId: 'org_a', resolveSecret: (h) => (h === config.apiKeyHandle ? 'app-pass' : undefined),
-      ingest: (m) => mail.ingest(m), openImap: async () => conn,
+      ingest: async (m) => (await mail.ingest(m)), openImap: async () => conn,
     });
     expect(await puller.poll()).toBe(2);
-    expect(s.kvGet('agent-mail:imap-uid:org_a')).toBe('6');
-    expect(mail.recent('org_a').map((m) => m.code)).toContain('111222');
+    expect((await s.kvGet('agent-mail:imap-uid:org_a'))).toBe('6');
+    expect((await mail.recent('org_a')).map((m) => m.code)).toContain('111222');
     // a second poll starts after uid 6 → nothing new
     conn.fetchSince = async (last) => [raw(6, addr, '333444')].filter((m) => m.uid > last);
     expect(await puller.poll()).toBe(0);
@@ -73,7 +73,7 @@ describe('AgentMailPuller', () => {
     const s = store();
     const mail = new AgentMail(s as any, 'agentmail.to', undefined, config.agentmailAddress);
     s.orgs.push({ id: 'org_a' });
-    const addr = mail.address('org_a');
+    const addr = (await mail.address('org_a'));
     const calls: string[] = [];
     let messageId = 'm1';
     const fetchFn: any = async (url: string, init: any) => {
@@ -81,19 +81,19 @@ describe('AgentMailPuller', () => {
       if (url.includes('/messages')) return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({ messages: [{ message_id: messageId, timestamp: '2026-07-25T12:00:00Z', from: 'noreply@github.com', to: [addr], subject: 'Verify', text: 'code 909090' }] }) };
       return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({}) };
     };
-    const puller = new AgentMailPuller(config, { store: s, organizationId: 'org_a', resolveSecret: (h) => (h === config.apiKeyHandle ? 'am-key' : undefined), ingest: (m) => mail.ingest(m), fetchFn });
+    const puller = new AgentMailPuller(config, { store: s, organizationId: 'org_a', resolveSecret: (h) => (h === config.apiKeyHandle ? 'am-key' : undefined), ingest: async (m) => (await mail.ingest(m)), fetchFn });
     expect(await puller.poll()).toBe(1);
     expect(calls.some((c) => c.includes(`/inboxes/${encodeURIComponent(addr)}/messages`))).toBe(true);
-    expect(mail.recent('org_a')[0]!.code).toBe('909090');
-    expect(s.kvGet(`agent-mail:am-cursor:${addr}`)).toBe('2026-07-25T12:00:00Z');
+    expect((await mail.recent('org_a'))[0]!.code).toBe('909090');
+    expect((await s.kvGet(`agent-mail:am-cursor:${addr}`))).toBe('2026-07-25T12:00:00Z');
     calls.length = 0;
     expect(await puller.poll()).toBe(0);
-    expect(mail.recent('org_a')).toHaveLength(1);
+    expect((await mail.recent('org_a'))).toHaveLength(1);
     expect(calls.some((c) => c.includes('after=2026-07-25T12%3A00%3A00Z'))).toBe(true);
     // Distinct emails can have identical timestamps and bodies.
     messageId = 'm2';
     expect(await puller.poll()).toBe(1);
-    expect(mail.recent('org_a')).toHaveLength(2);
+    expect((await mail.recent('org_a'))).toHaveLength(2);
   });
 });
 

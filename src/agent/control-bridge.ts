@@ -109,7 +109,7 @@ export interface ControlBridge {
   entry: string;
   /** The tools actually served (schemas whose handler exists in this turn). */
   tools: ToolSchema[];
-  close(): void;
+  close(): (void) | Promise<void>;
 }
 
 /** Unix-domain sockets only; on Windows the rails keep their previous behaviour. */

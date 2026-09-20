@@ -41,18 +41,18 @@ describe('hosted plan entitlements', () => {
     expect(hostedActiveAgentRuns('team', 4)).toBe(35);
   });
 
-  it('does not apply hosted monetization limits to private installations', () => {
+  it('does not apply hosted monetization limits to private installations', async () => {
     expect(organizationEntitlements('free', false)).toMatchObject({
       deployment: 'private', plan: null, maxMembers: null, maxActiveAgentRuns: null,
       unlimitedProjects: true,
     });
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Private', ownerUserId: 'owner' });
-    for (let i = 0; i < 12; i++) store.setOrganizationMembership(organization.id, `user-${i}`, 'member');
-    expect(store.listOrganizationMemberships(organization.id)).toHaveLength(13);
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Private', ownerUserId: 'owner' }));
+    for (let i = 0; i < 12; i++) (await store.setOrganizationMembership(organization.id, `user-${i}`, 'member'));
+    expect((await store.listOrganizationMemberships(organization.id))).toHaveLength(13);
   });
 
-  it('migrates existing organizations onto Free without losing their identity', () => {
+  it('migrates existing organizations onto Free without losing their identity', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-plan-migration-'));
     const file = path.join(home, 'state.db');
     const legacy = new DatabaseSync(file);
@@ -63,60 +63,57 @@ describe('hosted plan entitlements', () => {
     legacy.prepare('INSERT INTO organizations (id, name, slug, kind, createdAt) VALUES (?, ?, ?, ?, ?)')
       .run('org_existing', 'Existing', 'existing', 'team', 123);
     legacy.close();
-    const migrated = new Store(file, { hosted: true });
-    expect(migrated.getOrganization('org_existing')).toMatchObject({
+    const migrated = (await Store.create(file, { hosted: true }));
+    expect((await migrated.getOrganization('org_existing'))).toMatchObject({
       id: 'org_existing', name: 'Existing', plan: 'free', createdAt: 123,
     });
-    migrated.close();
+    (await migrated.close());
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  it('enforces one-user plans at the persistence boundary and unlocks Team members', () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Hosted', ownerUserId: 'owner' });
+  it('enforces one-user plans at the persistence boundary and unlocks Team members', async () => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Hosted', ownerUserId: 'owner' }));
 
-    expect(() => store.setOrganizationMembership(organization.id, 'second', 'member'))
-      .toThrow('Free allows 1 organization user. Upgrade the plan');
-    expect(() => store.createOrganizationInvitation({
+    await expect((async () => (await store.setOrganizationMembership(organization.id, 'second', 'member')))()).rejects.toThrow('Free allows 1 organization user. Upgrade the plan');
+    await expect((async () => (await store.createOrganizationInvitation({
       organizationId: organization.id, email: 'second@example.com', invitedBy: 'user:owner',
-    })).toThrow('Free allows 1 organization user');
+    })))()).rejects.toThrow('Free allows 1 organization user');
 
-    expect(store.setOrganizationPlan(organization.id, 'individual').plan).toBe('individual');
-    expect(() => store.setOrganizationMembership(organization.id, 'second', 'member'))
-      .toThrow('Individual allows 1 organization user');
+    expect((await store.setOrganizationPlan(organization.id, 'individual')).plan).toBe('individual');
+    await expect((async () => (await store.setOrganizationMembership(organization.id, 'second', 'member')))()).rejects.toThrow('Individual allows 1 organization user');
 
-    expect(store.setOrganizationPlan(organization.id, 'team').plan).toBe('team');
-    store.setOrganizationMembership(organization.id, 'second', 'member');
-    store.setOrganizationMembership(organization.id, 'third', 'member');
-    expect(store.listOrganizationMemberships(organization.id)).toHaveLength(3);
-    expect(store.organizationEntitlements(organization.id).maxActiveAgentRuns).toBe(30);
+    expect((await store.setOrganizationPlan(organization.id, 'team')).plan).toBe('team');
+    (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+    (await store.setOrganizationMembership(organization.id, 'third', 'member'));
+    expect((await store.listOrganizationMemberships(organization.id))).toHaveLength(3);
+    expect((await store.organizationEntitlements(organization.id)).maxActiveAgentRuns).toBe(30);
   });
 
-  it('re-checks the member limit when an already-issued invitation is accepted', () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Invites', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'team');
-    const invite = store.createOrganizationInvitation({
+  it('re-checks the member limit when an already-issued invitation is accepted', async () => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Invites', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'team'));
+    const invite = (await store.createOrganizationInvitation({
       organizationId: organization.id, email: 'second@example.com', invitedBy: 'user:owner',
-    });
-    store.setOrganizationPlan(organization.id, 'free');
-    expect(() => store.acceptOrganizationInvitation(invite.token, 'second', 'second@example.com'))
-      .toThrow('Free allows 1 organization user');
-    expect(store.listOrganizationMemberships(organization.id)).toHaveLength(1);
+    }));
+    (await store.setOrganizationPlan(organization.id, 'free'));
+    await expect((async () => (await store.acceptOrganizationInvitation(invite.token, 'second', 'second@example.com')))()).rejects.toThrow('Free allows 1 organization user');
+    expect((await store.listOrganizationMemberships(organization.id))).toHaveLength(1);
   });
 
   it.each(['free', 'individual'] as const)(
     'makes a Team → %s downgrade non-destructive and recovers after extra members are removed',
-    (plan) => {
-      const store = new Store(':memory:', { hosted: true });
-      const organization = store.createOrganization({ name: `Downgrade ${plan}`, ownerUserId: 'owner' });
-      store.setOrganizationPlan(organization.id, 'team');
-      store.setOrganizationMembership(organization.id, 'second', 'member');
-      store.setOrganizationMembership(organization.id, 'third', 'member');
+    async (plan) => {
+      const store = (await Store.create(':memory:', { hosted: true }));
+      const organization = (await store.createOrganization({ name: `Downgrade ${plan}`, ownerUserId: 'owner' }));
+      (await store.setOrganizationPlan(organization.id, 'team'));
+      (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+      (await store.setOrganizationMembership(organization.id, 'third', 'member'));
 
-      store.setOrganizationPlan(organization.id, plan);
-      expect(store.listOrganizationMemberships(organization.id)).toHaveLength(3);
-      expect(store.organizationEntitlements(organization.id)).toMatchObject({
+      (await store.setOrganizationPlan(organization.id, plan));
+      expect((await store.listOrganizationMemberships(organization.id))).toHaveLength(3);
+      expect((await store.organizationEntitlements(organization.id))).toMatchObject({
         plan,
         currentMemberCount: 3,
         maxMembers: 1,
@@ -124,15 +121,14 @@ describe('hosted plan entitlements', () => {
         memberAdmissionAllowed: false,
         agentRunAdmissionAllowed: false,
       });
-      expect(() => store.setOrganizationMembership(organization.id, 'fourth', 'member'))
-        .toThrow(`Remove 2 members or restore Team`);
+      await expect((async () => (await store.setOrganizationMembership(organization.id, 'fourth', 'member')))()).rejects.toThrow(`Remove 2 members or restore Team`);
 
-      store.removeOrganizationMembership(organization.id, 'second');
-      expect(store.organizationEntitlements(organization.id)).toMatchObject({
+      (await store.removeOrganizationMembership(organization.id, 'second'));
+      expect((await store.organizationEntitlements(organization.id))).toMatchObject({
         currentMemberCount: 2, overMemberLimit: true, agentRunAdmissionAllowed: false,
       });
-      store.removeOrganizationMembership(organization.id, 'third');
-      expect(store.organizationEntitlements(organization.id)).toMatchObject({
+      (await store.removeOrganizationMembership(organization.id, 'third'));
+      expect((await store.organizationEntitlements(organization.id))).toMatchObject({
         currentMemberCount: 1,
         overMemberLimit: false,
         memberAdmissionAllowed: false,
@@ -142,8 +138,8 @@ describe('hosted plan entitlements', () => {
   );
 
   it('requires hosted remote subscription turns to pass through admission', async () => {
-    const hostedStore = new Store(':memory:', { hosted: true });
-    const privateStore = new Store(':memory:');
+    const hostedStore = (await Store.create(':memory:', { hosted: true }));
+    const privateStore = (await Store.create(':memory:'));
     const activity = (store: Store) => makeCoreActivities({
       store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock'),
     });
@@ -163,84 +159,82 @@ describe('hosted agent-run admission integration', () => {
     ['free', 5],
     ['individual', 10],
     ['team', 20],
-  ] as const)('uses the central %s plan limit of %i at model admission without a second default', (plan, limit) => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: `Usage ${plan}`, ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, plan);
-    const project = store.createProject('Product', {}, organization.id);
-    expect(store.getOrganizationUsagePolicy(organization.id)).toMatchObject({
+  ] as const)('uses the central %s plan limit of %i at model admission without a second default', async (plan, limit) => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: `Usage ${plan}`, ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, plan));
+    const project = (await store.createProject('Product', {}, organization.id));
+    expect((await store.getOrganizationUsagePolicy(organization.id))).toMatchObject({
       effectiveMaxActiveAgentTurns: limit,
       maxActiveWorlds: limit,
     });
-    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveAgentTurns).toBeUndefined();
+    expect((await store.getOrganizationUsagePolicy(organization.id)).maxActiveAgentTurns).toBeUndefined();
     for (let index = 0; index < limit; index++) {
-      const task = store.createTask({ projectId: project.id, title: `Run ${index}`, workflow: 'just-do',
-        workflowVersion: '1.0.0', params: { prompt: 'run' } });
-      expect(store.admitAgentUsage({ id: `turn-${index}`, organizationId: organization.id,
-        projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }))
+      const task = (await store.createTask({ projectId: project.id, title: `Run ${index}`, workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'run' } }));
+      expect((await store.admitAgentUsage({ id: `turn-${index}`, organizationId: organization.id,
+        projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' })))
         .toEqual({ reused: false });
     }
-    const overflow = store.createTask({ projectId: project.id, title: 'Overflow', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'run' } });
-    expect(() => store.admitAgentUsage({ id: 'overflow', organizationId: organization.id,
-      projectId: project.id, taskId: overflow.id, provider: 'openai', fundingSource: 'byok' }))
-      .toThrow(/active model turn limit/);
+    const overflow = (await store.createTask({ projectId: project.id, title: 'Overflow', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'run' } }));
+    await expect((async () => (await store.admitAgentUsage({ id: 'overflow', organizationId: organization.id,
+      projectId: project.id, taskId: overflow.id, provider: 'openai', fundingSource: 'byok' })))()).rejects.toThrow(/active model turn limit/);
   });
 
-  it('allows only an optional owner cap tighter than the central plan entitlement', () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Tighter cap', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'team');
-    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 3 })).toMatchObject({
+  it('allows only an optional owner cap tighter than the central plan entitlement', async () => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Tighter cap', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'team'));
+    expect((await store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 3 }))).toMatchObject({
       maxActiveAgentTurns: 3, effectiveMaxActiveAgentTurns: 3, maxActiveWorlds: 3,
     });
-    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 99 })).toMatchObject({
+    expect((await store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 99 }))).toMatchObject({
       maxActiveAgentTurns: 20, effectiveMaxActiveAgentTurns: 20, maxActiveWorlds: 20,
     });
-    const restored = store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: undefined });
+    const restored = (await store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: undefined }));
     expect(restored.maxActiveAgentTurns).toBeUndefined();
     expect(restored.effectiveMaxActiveAgentTurns).toBe(20);
   });
 
-  it('does not retain a second hosted remote-world limit outside the plan', () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'One capacity', ownerUserId: 'owner' });
-    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveWorlds: 999 }).maxActiveWorlds).toBe(5);
-    expect(JSON.parse(store.kvGet(`organization-usage-policy:${organization.id}`) ?? '{}'))
+  it('does not retain a second hosted remote-world limit outside the plan', async () => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'One capacity', ownerUserId: 'owner' }));
+    expect((await store.setOrganizationUsagePolicy(organization.id, { maxActiveWorlds: 999 })).maxActiveWorlds).toBe(5);
+    expect(JSON.parse((await store.kvGet(`organization-usage-policy:${organization.id}`)) ?? '{}'))
       .not.toHaveProperty('maxActiveWorlds');
-    store.setOrganizationPlan(organization.id, 'individual');
-    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(10);
-    store.setOrganizationPlan(organization.id, 'team');
-    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(20);
+    (await store.setOrganizationPlan(organization.id, 'individual'));
+    expect((await store.getOrganizationUsagePolicy(organization.id)).maxActiveWorlds).toBe(10);
+    (await store.setOrganizationPlan(organization.id, 'team'));
+    expect((await store.getOrganizationUsagePolicy(organization.id)).maxActiveWorlds).toBe(20);
   });
 
-  it('blocks over-member organizations at the final model boundary before any provider spend', () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Usage downgrade', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'team');
-    store.setOrganizationMembership(organization.id, 'second', 'member');
-    const project = store.createProject('Product', {}, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'run' } });
-    store.setOrganizationPlan(organization.id, 'free');
-    expect(() => store.admitAgentUsage({ id: 'blocked-turn', organizationId: organization.id,
-      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }))
-      .toThrow(/Remove 1 member or restore Team to start another agent run/);
-    expect(Number((store.db.prepare('SELECT COUNT(*) n FROM usage_admissions').get() as any).n)).toBe(0);
+  it('blocks over-member organizations at the final model boundary before any provider spend', async () => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Usage downgrade', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'team'));
+    (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'run' } }));
+    (await store.setOrganizationPlan(organization.id, 'free'));
+    await expect((async () => (await store.admitAgentUsage({ id: 'blocked-turn', organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' })))()).rejects.toThrow(/Remove 1 member or restore Team to start another agent run/);
+    expect(Number(((await store.db.prepare('SELECT COUNT(*) n FROM usage_admissions').get()) as any).n)).toBe(0);
   });
 
   it('reclaims stale queue and trusted-admission turns without evicting live owners', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Recovered capacity', ownerUserId: 'owner' });
-    const project = store.createProject('Product', {}, organization.id);
-    const stale = store.createTask({ projectId: project.id, title: 'Interrupted', workflow: 'software-dev',
-      workflowVersion: '1.20.0', params: { prompt: 'Run' } });
-    const live = store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
-      workflowVersion: '1.20.0', params: { prompt: 'Run' } });
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Recovered capacity', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const stale = (await store.createTask({ projectId: project.id, title: 'Interrupted', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } }));
+    const live = (await store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } }));
     const staleTurn = `${stale.id}#0`;
     const liveTurn = `${live.id}#0`;
-    store.admitAgentUsage({ id: staleTurn, organizationId: organization.id,
-      projectId: project.id, taskId: stale.id, provider: 'openai', fundingSource: 'byok' });
+    (await store.admitAgentUsage({ id: staleTurn, organizationId: organization.id,
+      projectId: project.id, taskId: stale.id, provider: 'openai', fundingSource: 'byok' }));
 
     const signals: Array<{ name: string; value: unknown }> = [];
     const queueHandle = {
@@ -263,19 +257,19 @@ describe('hosted agent-run admission integration', () => {
     expect(signals).toContainEqual({ name: 'releaseAgentSlot',
       value: { taskId: stale.id, turnId: staleTurn } });
     expect(signals).not.toContainEqual(expect.objectContaining({ name: 'cancelAgentSlot' }));
-    expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(staleTurn))
+    expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(staleTurn)))
       .toEqual({ state: 'released' });
   });
 
   it('preserves queue and usage leases when task ownership cannot be queried', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Conservative recovery', ownerUserId: 'owner' });
-    const project = store.createProject('Product', {}, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Temporarily unreachable', workflow: 'software-dev',
-      workflowVersion: '1.20.0', params: { prompt: 'Run' } });
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Conservative recovery', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Temporarily unreachable', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } }));
     const turnId = `${task.id}#0`;
-    store.admitAgentUsage({ id: turnId, organizationId: organization.id,
-      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' });
+    (await store.admitAgentUsage({ id: turnId, organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }));
     const signal = vi.fn(async () => undefined);
     const queueHandle = { signal, query: vi.fn(async () => ({ capacity: 1,
       current: [{ taskId: task.id, turnId, role: 'do' }], queue: [] })) };
@@ -286,19 +280,19 @@ describe('hosted agent-run admission integration', () => {
       .reconcileOrganization(organization.id);
 
     expect(signal).toHaveBeenCalledTimes(1);
-    expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(turnId))
+    expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(turnId)))
       .toEqual({ state: 'active' });
   });
 
   it('preserves pre-durable usage admissions whose workflow view has no turn identity', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Historical workflow', ownerUserId: 'owner' });
-    const project = store.createProject('Product', {}, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'software-dev',
-      workflowVersion: '1.3.0', params: { prompt: 'Run' } });
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Historical workflow', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'software-dev',
+      workflowVersion: '1.3.0', params: { prompt: 'Run' } }));
     const turnId = `agent:${task.id}:do:1`;
-    store.admitAgentUsage({ id: turnId, organizationId: organization.id,
-      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' });
+    (await store.admitAgentUsage({ id: turnId, organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }));
     const queueHandle = { signal: vi.fn(async () => undefined),
       query: vi.fn(async () => ({ capacity: 1, current: [], queue: [] })) };
     const client = { workflow: { getHandle: vi.fn((id: string) => id === `agent-queue:${organization.id}`
@@ -307,17 +301,17 @@ describe('hosted agent-run admission integration', () => {
     await new EntitlementQueueReconciler({ store, client, intervalMs: 0 })
       .reconcileOrganization(organization.id);
 
-    expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(turnId))
+    expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(turnId)))
       .toEqual({ state: 'active' });
   });
 
   it('reconciles the durable queue directly from member and billing-plan mutations', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Reconcile', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'team');
-    store.setOrganizationMembership(organization.id, 'second', 'member');
-    store.setOrganizationMembership(organization.id, 'third', 'member');
-    store.setOrganizationPlan(organization.id, 'free');
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Reconcile', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'team'));
+    (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+    (await store.setOrganizationMembership(organization.id, 'third', 'member'));
+    (await store.setOrganizationPlan(organization.id, 'free'));
     const signal = vi.fn(async () => undefined);
     const getHandle = vi.fn(() => ({ signal }));
     const reconciler = new EntitlementQueueReconciler({
@@ -325,26 +319,26 @@ describe('hosted agent-run admission integration', () => {
       client: { workflow: { getHandle } } as any,
       intervalMs: 0,
     });
-    reconciler.start();
+    (await reconciler.start());
     await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 0 }));
 
     signal.mockClear();
-    store.removeOrganizationMembership(organization.id, 'second');
+    (await store.removeOrganizationMembership(organization.id, 'second'));
     await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 0 }));
     signal.mockClear();
-    store.removeOrganizationMembership(organization.id, 'third');
+    (await store.removeOrganizationMembership(organization.id, 'third'));
     await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 5 }));
 
     signal.mockClear();
-    store.setOrganizationPlan(organization.id, 'team');
+    (await store.setOrganizationPlan(organization.id, 'team'));
     await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 20 }));
     expect(getHandle).toHaveBeenLastCalledWith(`agent-queue:${organization.id}`);
     await reconciler.stop();
   });
 
   it('does not finish stopping while an in-flight queue reconciliation still owns the Temporal client', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Orderly shutdown', ownerUserId: 'owner' });
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Orderly shutdown', ownerUserId: 'owner' }));
     let releaseSignal!: () => void;
     const signalBlocked = new Promise<void>((resolve) => { releaseSignal = resolve; });
     const signal = vi.fn(() => signalBlocked);
@@ -356,7 +350,7 @@ describe('hosted agent-run admission integration', () => {
       })) } } as any,
       intervalMs: 0,
     });
-    reconciler.start();
+    (await reconciler.start());
     await vi.waitFor(() => expect(signal).toHaveBeenCalled());
 
     let stopped = false;
@@ -365,22 +359,22 @@ describe('hosted agent-run admission integration', () => {
     const returnedBeforeRelease = stopped;
     releaseSignal();
     await stopping;
-    store.close();
+    (await store.close());
 
     expect(returnedBeforeRelease).toBe(false);
   });
 
   it('blocks new run admission while over the member limit and reopens after recovery', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'team');
-    store.setOrganizationMembership(organization.id, 'second', 'member');
-    store.setOrganizationMembership(organization.id, 'third', 'member');
-    const project = store.createProject('Product', {}, organization.id);
-    const task = store.createTask({
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'team'));
+    (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+    (await store.setOrganizationMembership(organization.id, 'third', 'member'));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const task = (await store.createTask({
       projectId: project.id, title: 'Blocked', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Run' },
-    });
-    store.setOrganizationPlan(organization.id, 'free');
+    }));
+    (await store.setOrganizationPlan(organization.id, 'free'));
     const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 5 }));
     const signalWithStart = vi.fn(async () => undefined);
     const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {
@@ -400,8 +394,8 @@ describe('hosted agent-run admission integration', () => {
       signalArgs: [{ capacity: 0 }],
     }));
 
-    store.removeOrganizationMembership(organization.id, 'second');
-    store.removeOrganizationMembership(organization.id, 'third');
+    (await store.removeOrganizationMembership(organization.id, 'second'));
+    (await store.removeOrganizationMembership(organization.id, 'third'));
     await expect(activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
     })).resolves.toMatchObject({
@@ -411,13 +405,13 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('uses a durable organization queue and refreshes its capacity from plan changes', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'individual');
-    const project = store.createProject('Product', {}, organization.id);
-    const task = store.createTask({
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'individual'));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const task = (await store.createTask({
       projectId: project.id, title: 'Ship', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Ship' },
-    });
+    }));
     const executeUpdate = vi.fn(async () => ({ granted: false, position: 1, capacity: 10 }));
     const signal = vi.fn(async () => undefined);
     const getHandle = vi.fn(() => ({ executeUpdate, signal }));
@@ -441,7 +435,7 @@ describe('hosted agent-run admission integration', () => {
       signalArgs: [{ capacity: 10 }],
     }));
 
-    store.setOrganizationPlan(organization.id, 'team');
+    (await store.setOrganizationPlan(organization.id, 'team'));
     executeUpdate.mockResolvedValueOnce({ granted: true, position: 0, capacity: 20 });
     await expect(activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#1`, role: 'confirm', projectId: project.id,
@@ -458,16 +452,16 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('releases and cancels through the durable queue identity after task deletion', async () => {
-    const store = new Store(':memory:', { hosted: true });
-    const organization = store.createOrganization({ name: 'Cleanup', ownerUserId: 'owner' });
-    store.setOrganizationPlan(organization.id, 'individual');
-    const project = store.createProject('Cleanup project', {}, organization.id);
-    const held = store.createTask({
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Cleanup', ownerUserId: 'owner' }));
+    (await store.setOrganizationPlan(organization.id, 'individual'));
+    const project = (await store.createProject('Cleanup project', {}, organization.id));
+    const held = (await store.createTask({
       projectId: project.id, title: 'Held', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Held' },
-    });
-    const waiting = store.createTask({
+    }));
+    const waiting = (await store.createTask({
       projectId: project.id, title: 'Waiting', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Waiting' },
-    });
+    }));
     const signal = vi.fn(async () => undefined);
     const executeUpdate = vi.fn()
       .mockResolvedValueOnce({ granted: true, position: 0, capacity: 10 })
@@ -483,8 +477,8 @@ describe('hosted agent-run admission integration', () => {
       taskId: waiting.id, turnId: `${waiting.id}#0`, role: 'do', projectId: project.id,
     });
 
-    store.deleteTask(held.id);
-    store.deleteTask(waiting.id);
+    (await store.deleteTask(held.id));
+    (await store.deleteTask(waiting.id));
     await activities.releaseAgentSlot(held.id, `${held.id}#0`, heldAdmission.queueId);
     await activities.cancelAgentSlot(waiting.id, `${waiting.id}#0`, waitingAdmission.queueId);
 
@@ -495,8 +489,8 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('keeps the configurable host queue for private installations', async () => {
-    const store = new Store(':memory:');
-    store.setSettings('global', 'agent-queue', { capacity: 7 });
+    const store = (await Store.create(':memory:'));
+    (await store.setSettings('global', 'agent-queue', { capacity: 7 }));
     const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 7 }));
     const signalWithStart = vi.fn(async () => undefined);
     const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {

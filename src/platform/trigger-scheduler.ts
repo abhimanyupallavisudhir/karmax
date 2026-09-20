@@ -67,11 +67,11 @@ export interface TriggerSchedulerDeps {
  * credential and release it once the API operation completes. */
 export function createTriggerFire(api: Pick<KarmaxApi, 'fireTriggeredTask'>, tokens: TokenAuthority): TriggerSchedulerDeps['fire'] {
   return async (taskId, mode) => {
-    const { token } = tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000);
+    const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
       return await api.fireTriggeredTask(token, taskId, mode);
     } finally {
-      tokens.revoke(token);
+      (await tokens.revoke(token));
     }
   };
 }
@@ -124,25 +124,26 @@ export class TriggerScheduler {
   }
 
   /** Subscribe to the bus and re-arm every stored armed task (call once on boot). */
-  start(): void {
-    for (const task of this.deps.store.listArmedTasks()) {
+  async start(): Promise<void> {
+    for (const task of (await this.deps.store.listArmedTasks())) {
       // A stored task can have become invalid since it was armed — most often a
       // dependency task that has since been deleted. Boot must never die on one
       // bad row, so the refusal is logged per task and the rest still arm.
       try {
-        this.arm(task);
+        (await this.arm(task));
       } catch (e) {
         this.log(`refusing to arm ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    this.unsub = this.deps.bus.onAny((ev) => this.onEvent(ev));
+    this.unsub = this.deps.bus.onAny(async (ev) => (await this.onEvent(ev)));
     const n = this.armed.size;
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
   }
 
-  private organizationOfTask(taskId: string, task = this.deps.store.taskMetadata(taskId)): string | undefined {
+  private async organizationOfTask(taskId: string, task?: TaskRecord): Promise<string | undefined> {
+    task ??= await this.deps.store.taskMetadata(taskId);
     const projectId = task?.projectId;
-    return projectId ? this.deps.store.getProject(projectId)?.organizationId ?? 'org_personal' : undefined;
+    return projectId ? (await this.deps.store.getProject(projectId))?.organizationId ?? 'org_personal' : undefined;
   }
 
   /**
@@ -153,15 +154,15 @@ export class TriggerScheduler {
    * here. Dependency ids are matched the way `arm()` matches them: by declared id,
    * with the principal lookup folding alternate attempts onto one logical task.
    */
-  validationErrors(task: TaskRecord): string[] {
-    const dependenciesOf = (id: string): string[] | undefined => {
-      const t = this.deps.store.taskMetadata(id);
+  async validationErrors(task: TaskRecord): Promise<string[]> {
+    const dependenciesOf = async (id: string): Promise<string[] | undefined> => {
+      const t = (await this.deps.store.taskMetadata(id));
       if (!t) return undefined;
       const out: string[] = [];
       for (const trig of normalizeTriggers(t.params)) if (trig.kind === 'dependency') out.push(...(trig.tasks ?? []));
       return out;
     };
-    return validateTriggers(normalizeTriggers(task.params), { taskId: task.id, dependenciesOf });
+    return (await validateTriggers(normalizeTriggers(task.params), { taskId: task.id, dependenciesOf }));
   }
 
   stop(): void {
@@ -185,10 +186,10 @@ export class TriggerScheduler {
    * signal — so the loud failure at the moment someone tries to arm it is the only
    * place a human can act on it. `start()` catches this per task so boot is safe.
    */
-  arm(task: TaskRecord): void {
+  async arm(task: TaskRecord): Promise<void> {
     const triggers = normalizeTriggers(task.params);
     if (!triggers.length) return;
-    const errs = this.validationErrors(task);
+    const errs = (await this.validationErrors(task));
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     this.disarm(task.id); // idempotent re-arm
     const entry: ArmedEntry = {
@@ -205,11 +206,11 @@ export class TriggerScheduler {
 
     // Seed dependency satisfaction from already-recorded statuses (a dep may have
     // completed before this task was armed, or while karmax was down).
-    this.refreshDependencies(entry);
+    (await this.refreshDependencies(entry));
 
     // Arm time-based triggers.
     for (const trig of triggers) {
-      if (trig.kind === 'schedule') this.armSchedule(entry, trig);
+      if (trig.kind === 'schedule') (await this.armSchedule(entry, trig));
     }
 
     // Dependencies may already be satisfied at arm time, and a durable pending
@@ -217,15 +218,15 @@ export class TriggerScheduler {
     this.evaluate(entry);
   }
 
-  private refreshDependencies(entry: ArmedEntry): void {
+  private async refreshDependencies(entry: ArmedEntry): Promise<void> {
     entry.satisfiedDeps.clear();
     for (const trig of entry.triggers) {
       if (trig.kind !== 'dependency') continue;
       for (const dep of trig.tasks ?? []) {
-        const group = this.deps.store.attemptPrincipalState(dep);
+        const group = (await this.deps.store.attemptPrincipalState(dep));
         const status = group
           ? group.status
-          : this.deps.store.taskMetadata(dep)?.lastView?.status;
+          : (await this.deps.store.taskMetadata(dep))?.lastView?.status;
         if (status && statusSatisfiesDependency(trig.on, status)) entry.satisfiedDeps.add(dep);
       }
     }
@@ -240,17 +241,17 @@ export class TriggerScheduler {
 
   // ─── Event routing ─────────────────────────────────────────────────────────
 
-  private onEvent(ev: KarmaxEvent): void {
+  private async onEvent(ev: KarmaxEvent): Promise<void> {
     if (!this.armed.size) return;
     // Events are tenant data: an armed task only ever sees events from tasks in
     // its own organization. Without this, `{kind:'event', where:{repo:…}}` in one
     // organization fired on (and probed the payloads of) another's tasks.
-    const sourceOrganization = this.organizationOfTask(ev.taskId);
+    const sourceOrganization = (await this.organizationOfTask(ev.taskId));
     if (!sourceOrganization) return;
     // Copy: firing mutates the map (one-shot disarm).
     for (const entry of [...this.armed.values()]) {
       if (entry.fired) continue;
-      if (this.organizationOfTask(entry.task.id, entry.task) !== sourceOrganization) continue;
+      if ((await this.organizationOfTask(entry.task.id, entry.task)) !== sourceOrganization) continue;
       // `event` triggers are activators. They become runnable only once every
       // dependency prerequisite is also satisfied.
       // `firedNow` is load-bearing for a REPEATABLE series: `entry.fired` is only
@@ -260,7 +261,7 @@ export class TriggerScheduler {
       for (const trig of entry.triggers) {
         if (entry.fired || firedNow) break;
         if (trig.kind === 'event' && eventMatchesEventTrigger(trig, ev)) {
-          this.markActivationPending(entry);
+          (await this.markActivationPending(entry));
           firedNow = this.evaluate(entry, trig);
         }
       }
@@ -268,7 +269,7 @@ export class TriggerScheduler {
       // `dependency` triggers: fold the event into satisfaction, then re-evaluate.
       let advanced = false;
       for (const trig of entry.triggers) {
-        if (trig.kind === 'dependency') advanced = this.applyDependencyEvent(entry, trig, ev) || advanced;
+        if (trig.kind === 'dependency') advanced = (await this.applyDependencyEvent(entry, trig, ev)) || advanced;
       }
       if (advanced) this.evaluate(entry);
     }
@@ -288,18 +289,18 @@ export class TriggerScheduler {
    *    completes. While the set was append-only, a repeatable dependency series
    *    fired at most once in its whole life and then sat armed doing nothing.
    */
-  private applyDependencyEvent(entry: ArmedEntry, trig: DependencyTrigger, ev: KarmaxEvent): boolean {
+  private async applyDependencyEvent(entry: ArmedEntry, trig: DependencyTrigger, ev: KarmaxEvent): Promise<boolean> {
     if (ev.type !== LIFECYCLE_EVENT) return false;
-    const eventTask = this.deps.store.taskMetadata(ev.taskId);
+    const eventTask = (await this.deps.store.taskMetadata(ev.taskId));
     const eventIntent = eventTask?.intentId ?? ev.taskId;
     let advanced = false;
     for (const dep of trig.tasks ?? []) {
-      const declared = this.deps.store.taskMetadata(dep);
+      const declared = (await this.deps.store.taskMetadata(dep));
       if ((declared?.intentId ?? dep) !== eventIntent) continue;
       // Read the logical task's CURRENT principal after Store.saveView has run.
       // Cancelling one attempt therefore cannot satisfy `settled` while another
       // eligible attempt remains; the eventual winner's outcome can.
-      const group = this.deps.store.attemptPrincipalState(eventIntent);
+      const group = (await this.deps.store.attemptPrincipalState(eventIntent));
       const status = group
         ? group.status ?? (group.principalAttemptId === ev.taskId ? (ev.payload as { status?: string })?.status : undefined)
         : (ev.payload as { status?: string })?.status;
@@ -339,8 +340,8 @@ export class TriggerScheduler {
   }
 
   /** Durably remember (or consume) an activation that is gated on dependencies. */
-  private setActivationPending(entry: ArmedEntry, pending: boolean): void {
-    const current = this.deps.store.taskMetadata(entry.task.id) ?? entry.task;
+  private async setActivationPending(entry: ArmedEntry, pending: boolean): Promise<void> {
+    const current = (await this.deps.store.taskMetadata(entry.task.id)) ?? entry.task;
     const persisted = current.params?.triggerPending === true;
     if (entry.activationPending === pending && persisted === pending) return;
     entry.activationPending = pending;
@@ -349,7 +350,7 @@ export class TriggerScheduler {
     else delete params.triggerPending;
     entry.task = { ...current, params: params as TaskRecord['params'] };
     try {
-      this.deps.store.updateTaskParams(entry.task.id, entry.task.params);
+      (await this.deps.store.updateTaskParams(entry.task.id, entry.task.params));
     } catch (e) {
       // The in-memory level still gives correct behavior for this process. A
       // vanished task will fail at fire time and be reported through that path.
@@ -357,8 +358,8 @@ export class TriggerScheduler {
     }
   }
 
-  private markActivationPending(entry: ArmedEntry): void {
-    this.setActivationPending(entry, true);
+  private async markActivationPending(entry: ArmedEntry): Promise<void> {
+    (await this.setActivationPending(entry, true));
   }
 
   /**
@@ -387,7 +388,7 @@ export class TriggerScheduler {
     }
     void this.deps
       .fire(taskId, repeatable ? 'clone' : 'self')
-      .then(() => {
+      .then(async () => {
         if (this.armed.get(taskId) !== entry) return;
         entry.retryDelay = INITIAL_RETRY_MS;
         if (consumesActivation) {
@@ -396,7 +397,7 @@ export class TriggerScheduler {
           // Preserve it and start one more coalesced run; otherwise the claimed
           // durable marker can now be cleared.
           if (repeatable && entry.activationPending) this.evaluate(entry);
-          else this.setActivationPending(entry, false);
+          else (await this.setActivationPending(entry, false));
         }
         if (!repeatable) this.disarm(taskId);
         this.log(`trigger fired for ${taskId} (${trig.kind}, ${repeatable ? 'run' : 'self'})`);
@@ -419,17 +420,17 @@ export class TriggerScheduler {
   private retry(entry: ArmedEntry): void {
     if (entry.retryTimer !== undefined) return;
     const taskId = entry.task.id;
-    const timer = this.setTimer(() => {
+    const timer = this.setTimer(async () => {
       entry.timers = entry.timers.filter((t) => t !== timer);
       entry.retryTimer = undefined;
       if (this.armed.get(taskId) !== entry) return;
       try {
-        const task = this.deps.store.taskMetadata(taskId);
+        const task = await this.deps.store.taskMetadata(taskId);
         if (task?.params?.triggerState !== 'armed') return this.disarm(taskId);
-        const errors = this.validationErrors(task);
+        const errors = (await this.validationErrors(task));
         if (errors.length) throw new Error(`invalid trigger(s): ${errors.join('; ')}`);
         entry.task = task;
-        this.refreshDependencies(entry);
+        (await this.refreshDependencies(entry));
         this.evaluate(entry);
       } catch (error) {
         this.disarm(taskId);
@@ -443,10 +444,10 @@ export class TriggerScheduler {
 
   // ─── Schedule (cron / at) ────────────────────────────────────────────────────
 
-  private armSchedule(entry: ArmedEntry, trig: ScheduleTrigger): void {
+  private async armSchedule(entry: ArmedEntry, trig: ScheduleTrigger): Promise<void> {
     if (trig.at !== undefined) {
-      this.armAt(entry, trig.at, () => {
-        this.markActivationPending(entry);
+      this.armAt(entry, trig.at, async () => {
+        (await this.markActivationPending(entry));
         this.evaluate(entry, trig);
       });
       return;
@@ -454,7 +455,7 @@ export class TriggerScheduler {
     if (trig.cron) {
       // Catch up on a window missed while karmax was down, then arm the next one.
       // The catch-up can itself disarm a (non-repeatable) entry, so re-check.
-      const mark = this.catchUpCron(entry, trig);
+      const mark = (await this.catchUpCron(entry, trig));
       if (this.armed.get(entry.task.id) === entry) this.armCron(entry, trig, mark);
     }
   }
@@ -471,11 +472,11 @@ export class TriggerScheduler {
    * Firing the oldest would also mean the mark only advanced one occurrence per
    * boot, so a restart loop would replay history one step at a time.
    */
-  private catchUpCron(entry: ArmedEntry, trig: ScheduleTrigger): number {
+  private async catchUpCron(entry: ArmedEntry, trig: ScheduleTrigger): Promise<number> {
     const now = this.now();
     const mark = entry.task.params?.triggerLastFiredAt;
     if (typeof mark !== 'number') {
-      this.recordCronFire(entry, now);
+      (await this.recordCronFire(entry, now));
       return now;
     }
     // Only look back a bounded window: an install that was off for a year should
@@ -494,18 +495,18 @@ export class TriggerScheduler {
     // historical occurrence, back to back — the replay the window exists to stop.
     if (last === undefined) return Math.max(mark, now - MAX_CATCHUP_WINDOW_MS);
     this.log(`cron catch-up for ${entry.task.id}: occurrence at ${new Date(last).toISOString()} was missed`);
-    this.recordCronFire(entry, last);
-    this.markActivationPending(entry);
+    (await this.recordCronFire(entry, last));
+    (await this.markActivationPending(entry));
     this.evaluate(entry, trig);
     return last;
   }
 
   /** Persist the cron mark so catch-up survives a restart. */
-  private recordCronFire(entry: ArmedEntry, whenMs: number): void {
+  private async recordCronFire(entry: ArmedEntry, whenMs: number): Promise<void> {
     const params = { ...entry.task.params, triggerLastFiredAt: whenMs };
     entry.task = { ...entry.task, params };
     try {
-      this.deps.store.updateTaskParams(entry.task.id, params);
+      (await this.deps.store.updateTaskParams(entry.task.id, params));
     } catch (e) {
       // A vanished row must not kill the timer chain; the in-memory mark still
       // dedupes for this process's lifetime.
@@ -530,11 +531,11 @@ export class TriggerScheduler {
       this.log(`cron trigger for ${entry.task.id} has no upcoming fire ("${trig.cron}")`);
       return;
     }
-    this.armAt(entry, next, () => {
+    this.armAt(entry, next, async () => {
       // Cron is recurring: fire a clone, then re-arm for the next occurrence,
       // measured from the SCHEDULED instant (never from the wall clock).
-      this.recordCronFire(entry, next);
-      this.markActivationPending(entry);
+      (await this.recordCronFire(entry, next));
+      (await this.markActivationPending(entry));
       this.evaluate(entry, trig);
       if (this.armed.get(entry.task.id) === entry) this.armCron(entry, trig, next);
     });

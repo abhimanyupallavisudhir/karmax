@@ -44,11 +44,11 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
   }
   beforeAll(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-browser-')); priorHome = process.env.KARMAX_HOME; process.env.KARMAX_HOME = dir;
-    store = new Store(':memory:'); const tokens = new TokenAuthority(), worlds = new WorldRegistry();
-    const project = store.createProject('MCP browser'); projectId = project.id; seedProfiles(store, 'mock');
+    store = (await Store.create(':memory:')); const tokens = new TokenAuthority(), worlds = new WorldRegistry();
+    const project = (await store.createProject('MCP browser')); projectId = project.id; (await seedProfiles(store, 'mock'));
     const client = { workflow: { getHandle: () => ({ query: async () => [] }), start: async () => ({}) } } as any;
     const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'browser-test', contentDir: dir });
-    const gateway = new Gateway({ store, tokens, worlds, client, api, broker: new CredentialBroker(new Vault(path.join(dir, 'vault'))), bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'browser-test', staticDir: path.resolve('web'), agentInfo: { provider: 'mock', reason: 'Test' } });
+    const gateway = (await Gateway.create({ store, tokens, worlds, client, api, broker: new CredentialBroker(new Vault(path.join(dir, 'vault'))), bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'browser-test', staticDir: path.resolve('web'), agentInfo: { provider: 'mock', reason: 'Test' } }));
     const running = await gateway.listen(await findFreePortFrom(48_700)); base = running.url; close = running.close;
     tab = await (await fetch(`${cdp}/json/new?${encodeURIComponent('about:blank')}`, { method: 'PUT' })).json();
     socket = new WebSocket(tab.webSocketDebuggerUrl); await once(socket, 'open');
@@ -59,7 +59,7 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
   }, 30_000);
   afterAll(async () => {
     socket?.close(); if (tab) await fetch(`${cdp}/json/close/${tab.id}`).catch(() => {});
-    await close?.(); store?.close(); if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
+    await close?.(); (await store?.close()); if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   });
   const field = '[data-profile] .mcp-picker';
@@ -74,7 +74,7 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
     expect(await js(`document.querySelector('[data-profile] .mcp-picker').dataset.value === 'null'`)).toBe(true);
     expect(await js(`document.querySelector('${field} .mcp-chips').textContent`)).toContain('chrome-devtools');
     await choose('browser:playwright'); await saveProfile();
-    expect(store.getProfile(`${projectId}::do-default`)!.mcpConnections).toEqual(['browser:chrome-devtools', 'browser:playwright']);
+    expect((await store.getProfile(`${projectId}::do-default`))!.mcpConnections).toEqual(['browser:chrome-devtools', 'browser:playwright']);
     await reload();
     await js(`document.querySelector('${field} .mcp-filter').focus();document.querySelector('${field} .mcp-custom').click()`);
     await wait('!!document.querySelector(".mcp-connection-form")');
@@ -87,9 +87,9 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
     expect(await js(`window.mcpXss === undefined && document.querySelectorAll('${field} img').length === 0`)).toBe(true);
     expect(await js(`document.querySelectorAll('${field} .mcp-chip').length`)).toBe(3);
     await saveProfile(); await reload();
-    expect(store.getProfile(`${projectId}::do-default`)!.mcpConnections).toHaveLength(3);
+    expect((await store.getProfile(`${projectId}::do-default`))!.mcpConnections).toHaveLength(3);
     await js(`while(document.querySelector('${field} [data-remove]')) document.querySelector('${field} [data-remove]').click()`);
-    await saveProfile(); expect(store.getProfile(`${projectId}::do-default`)!.mcpConnections).toEqual([]);
+    await saveProfile(); expect((await store.getProfile(`${projectId}::do-default`))!.mcpConnections).toEqual([]);
     await reload(); expect(await js(`document.querySelectorAll('${field} .mcp-chip').length`)).toBe(0);
   }, 45_000);
   it('searches the registry, prefills an installation form, saves and selects it, and ignores stale searches', async () => {
@@ -119,7 +119,7 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
     await wait(`document.querySelector('${field} .mcp-chips').textContent.includes('docs MCP')`);
     await js("document.querySelector('[data-resetprofile]').click()");
     await wait(`document.querySelector('${field} .mcp-chips').textContent.includes('chrome-devtools')`);
-    expect(store.getProfile(`${projectId}::do-default`)).toBeUndefined();
+    expect((await store.getProfile(`${projectId}::do-default`))).toBeUndefined();
   }, 30_000);
   it('supports keyboard selection and keeps the custom action outside the mobile result scroll', async () => {
     await rpc('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
@@ -137,7 +137,7 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
     await js("document.querySelector('.mcp-editor-cancel').click()");
   });
   it('uses organization defaults in the new-task form and persists chosen tools in a draft', async () => {
-    store.upsertProfile({ id: 'organization:org_personal::do-default', name: 'Agent', role: 'do', provider: 'codex', mcpConnections: ['browser:playwright'] });
+    (await store.upsertProfile({ id: 'organization:org_personal::do-default', name: 'Agent', role: 'do', provider: 'codex', mcpConnections: ['browser:playwright'] }));
     await rpc('Emulation.setDeviceMetricsOverride', { width: 1280, height: 1000, deviceScaleFactor: 1, mobile: false });
     await rpc('Page.navigate', { url: base + '/personal/mcp-browser' });
     await wait('!!document.querySelector("#expand-task")');
@@ -169,7 +169,7 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
       await js(`document.querySelector('.mcp-editor-cancel').click()`);
     }
     await js(`document.querySelector('#tf-page textarea[data-field="prompt"]').value='MCP combobox draft';document.querySelector('#tf-page textarea[data-field="prompt"]').dispatchEvent(new Event('input', {bubbles:true}));document.querySelector('#tf-draft').click()`);
-    await expect.poll(() => store.listTasks(projectId).find(task => task.params.prompt === 'MCP combobox draft')?.params?.['agent:do'], { timeout: 10_000 })
+    await expect.poll(async () => (await store.listTasks(projectId)).find(task => task.params.prompt === 'MCP combobox draft')?.params?.['agent:do'], { timeout: 10_000 })
       .toMatchObject({ mcpConnections: ['browser:playwright', 'browser:chrome-devtools'] });
   }, 30_000);
 

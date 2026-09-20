@@ -26,7 +26,7 @@ export interface IdentitySession {
 /** The outbound-email surface identity needs for confirmation / reset mail.
  *  Kept minimal so `src/auth` doesn't depend on the autonomy layer. */
 export interface Mailer {
-  configured(): boolean;
+  configured(): boolean | Promise<boolean>;
   send(msg: { to: string; subject: string; text: string; html?: string }): Promise<void>;
 }
 
@@ -79,7 +79,7 @@ export interface IdentityOptions {
   secret?: string;
     /** Read lazily so changing Installation → Site identity applies to new mail
    * immediately, without restarting the identity service. */
-  siteName?: () => string;
+  siteName?: () => string | Promise<string>;
   oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
   google?: { clientId: string; clientSecret: string };
   github?: {
@@ -98,11 +98,11 @@ export interface IdentityOptions {
  * user id and applies its own project/task capability policy.
  */
 export class IdentityService {
-  readonly auth: any;
-  private db: SqlDatabase;
+   auth!: any;
+  private db!: SqlDatabase;
   private pool?: Pool;
   migration?: SqliteImportResult;
-  private organizationNames?: () => Array<{ id: string; name: string }>;
+  private organizationNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
 
   /** Installation-wide outbound email, injected after construction (main.ts wires
    *  it once the vault/broker exist). The Better Auth hooks below read it lazily,
@@ -111,15 +111,25 @@ export class IdentityService {
    *  it just cannot confirm addresses or reset passwords by mail. */
   mailer?: Mailer;
 
-  readonly oidcProviderId?: string;
+   oidcProviderId?: string;
   /** Whether "Continue with Google" is offered. Google is a *consumer* identity
    *  option and deliberately does not consume the single generic-OIDC enterprise
    *  slot above — an installation pointed at Okta must still be able to offer it. */
-  readonly googleEnabled: boolean;
+   googleEnabled!: boolean;
   /** Whether GitHub sign-in is available through the deployment App (or the
    * legacy standalone OAuth fallback). */
-  readonly githubEnabled: boolean;
+   githubEnabled!: boolean;
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
+  }
+
+  static async create(dbFile: string, opts: IdentityOptions = {}) {
+    const instance = new IdentityService(dbFile, opts);
+    await instance.initialize(dbFile, opts);
+    return instance;
+  }
+
+  private async initialize(dbFile: string, opts: IdentityOptions = {}) {
+
     this.db = openSqlDatabase(opts.databaseUrl ?? dbFile);
     this.pool = opts.databaseUrl ? new Pool({ connectionString: opts.databaseUrl }) : undefined;
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
@@ -127,9 +137,9 @@ export class IdentityService {
     // concurrent writer must wait rather than fail with SQLITE_BUSY.
     if (dbFile !== ':memory:') {
       try {
-        this.db.exec('PRAGMA journal_mode=WAL');
-        this.db.exec('PRAGMA busy_timeout=5000');
-        this.db.exec('PRAGMA synchronous=NORMAL');
+        (await this.db.exec('PRAGMA journal_mode=WAL'));
+        (await this.db.exec('PRAGMA busy_timeout=5000'));
+        (await this.db.exec('PRAGMA synchronous=NORMAL'));
       } catch { /* a read-only or non-file database keeps its defaults */ }
     }
     this.oidcProviderId = opts.oidc?.providerId;
@@ -168,9 +178,9 @@ export class IdentityService {
         console.error('[github] could not connect sign-in authorization:', error instanceof Error ? error.message : error);
       }
     };
-    const siteName = () => opts.siteName?.() || 'krmax';
+    const siteName = async () => (await opts.siteName?.()) || 'krmax';
     this.auth = betterAuth({
-      appName: siteName(),
+      appName: (await siteName()),
       database: this.pool ?? this.db.native,
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
@@ -182,7 +192,7 @@ export class IdentityService {
       ...(trustedSocialProviders.length ? { socialProviders } : {}),
       databaseHooks: {
         user: { create: { before: async (user: Record<string, unknown>) => {
-          this.assertUserNameAvailable(String(user.name ?? ''));
+          (await this.assertUserNameAvailable(String(user.name ?? '')));
         } } },
         ...(opts.github?.onAuthorization ? { account: {
           create: { after: adoptGithubAuthorization },
@@ -218,8 +228,8 @@ export class IdentityService {
         // no-op when email isn't configured (the request still returns ok so we
         // don't disclose which addresses exist).
         sendResetPassword: async ({ user, url }: { user: IdentityUser; url: string }) => {
-          if (!this.mailer?.configured()) return;
-          const brand = siteName();
+          if (!(await this.mailer?.configured())) return;
+          const brand = (await siteName());
           await this.mailer.send({
             to: user.email,
             subject: `Reset your ${brand} password`,
@@ -235,8 +245,8 @@ export class IdentityService {
         sendOnSignUp: true,
         autoSignInAfterVerification: true,
         sendVerificationEmail: async ({ user, url }: { user: IdentityUser; url: string }) => {
-          if (!this.mailer?.configured()) return;
-          const brand = siteName();
+          if (!(await this.mailer?.configured())) return;
+          const brand = (await siteName());
           await this.mailer.send({
             to: user.email,
             subject: `Confirm your ${brand} email`,
@@ -288,39 +298,41 @@ export class IdentityService {
   }
 
   static async open(dbFile: string, opts: IdentityOptions = {}): Promise<IdentityService> {
-    const service = new IdentityService(dbFile, opts);
+
+    const service = (await IdentityService.create(dbFile, opts));
     const { runMigrations } = await getMigrations(service.auth.options);
     await runMigrations();
     if (opts.databaseUrl)
-      service.migration = importSqliteDatabase(dbFile, service.db, 'identity', { sentinelTable: 'user' });
+      service.migration = (await importSqliteDatabase(dbFile, service.db, 'identity', { sentinelTable: 'user' }));
     // Better Auth intentionally permits duplicate display names, but every
     // karmax user owns a same-named personal organization. This index closes the
     // concurrent-signup gap around the cross-store application check.
-    service.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_user_name_nocase ON user(name COLLATE NOCASE)');
+    (await service.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_user_name_nocase ON user(name COLLATE NOCASE)'));
     return service;
+  
   }
 
-  hasUsers(): boolean {
-    return Number((this.db.prepare('SELECT COUNT(*) AS n FROM user').get() as any)?.n ?? 0) > 0;
+  async hasUsers(): Promise<boolean> {
+    return Number(((await this.db.prepare('SELECT COUNT(*) AS n FROM user').get()) as any)?.n ?? 0) > 0;
   }
 
-  listUsers(): IdentityUser[] {
-    return (this.db.prepare('SELECT id, email, name, role, createdAt FROM user ORDER BY createdAt').all() as any[])
+  async listUsers(): Promise<IdentityUser[]> {
+    return ((await this.db.prepare('SELECT id, email, name, role, createdAt FROM user ORDER BY createdAt').all()) as any[])
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
   }
 
   /** Connect Better Auth's user lifecycle to the organization namespace. */
-  connectOrganizationNames(lookup: () => Array<{ id: string; name: string }>): void {
+  connectOrganizationNames(lookup: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>): void {
     this.organizationNames = lookup;
   }
 
-  assertUserNameAvailable(name: string): string {
+  async assertUserNameAvailable(name: string): Promise<string> {
     const value = name.trim();
     if (!value) throw new Error('user name is required');
     const key = canonicalAccountName(value);
-    if (this.listUsers().some((user) => canonicalAccountName(user.name) === key))
+    if ((await this.listUsers()).some((user) => canonicalAccountName(user.name) === key))
       throw new Error(`name "${value}" is already used by a user`);
-    if (this.organizationNames?.().some((organization) => canonicalAccountName(organization.name) === key))
+    if ((await this.organizationNames?.())?.some((organization) => canonicalAccountName(organization.name) === key))
       throw new Error(`name "${value}" is already used by an organization`);
     return value;
   }
@@ -328,8 +340,8 @@ export class IdentityService {
   /** Public account data for a self-service portability export. Password hashes,
    * OAuth tokens, verification values and sessions are deliberately unreachable:
    * this method projects an allowlist instead of redacting a raw auth database. */
-  exportUserData(userId: string): { profile: Record<string, unknown>; authentication: { providers: string[] } } {
-    const row = this.db.prepare('SELECT * FROM user WHERE id=?').get(userId) as any;
+  async exportUserData(userId: string): Promise<{ profile: Record<string, unknown>; authentication: { providers: string[] } }> {
+    const row = (await this.db.prepare('SELECT * FROM user WHERE id=?').get(userId)) as any;
     if (!row) throw new Error('user not found');
     const profile: Record<string, unknown> = {
       id: String(row.id),
@@ -341,7 +353,7 @@ export class IdentityService {
       createdAt: new Date(row.createdAt).toISOString(),
       updatedAt: new Date(row.updatedAt).toISOString(),
     };
-    return { profile, authentication: { providers: this.providersForUser(userId).sort() } };
+    return { profile, authentication: { providers: (await this.providersForUser(userId)).sort() } };
   }
 
   async session(headers: Headers): Promise<IdentitySession | undefined> {
@@ -360,7 +372,7 @@ export class IdentityService {
    * authorization.
    */
   async signUp(input: { name: string; email: string; password: string }, headers?: Headers): Promise<Response> {
-    return this.auth.api.signUpEmail({ body: { ...input, name: this.assertUserNameAvailable(input.name) }, headers, asResponse: true });
+    return this.auth.api.signUpEmail({ body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
   }
 
   async signOut(headers: Headers): Promise<Response> {
@@ -384,25 +396,31 @@ export class IdentityService {
     return this.auth.api.signInWithOAuth2({ body: { providerId: this.oidcProviderId, callbackURL }, headers, asResponse: true });
   }
 
-  providersForUser(userId: string): string[] {
-    return (this.db.prepare('SELECT providerId FROM account WHERE userId=?').all(userId) as any[]).map((row) => String(row.providerId));
+  async providersForUser(userId: string): Promise<string[]> {
+    return ((await this.db.prepare('SELECT providerId FROM account WHERE userId=?').all(userId)) as any[]).map((row) => String(row.providerId));
   }
 
   async providersForUserAsync(userId: string): Promise<string[]> {
-    if (!this.pool) return this.providersForUser(userId);
+    if (!this.pool) return (await this.providersForUser(userId));
     const result = await this.pool.query('SELECT "providerId" FROM account WHERE "userId"=$1', [userId]);
     return result.rows.map(row => String(row.providerId));
   }
 
-  revokeUserSessions(userId: string): void {
-    this.db.prepare('DELETE FROM session WHERE userId=?').run(userId);
+  async revokeUserSessions(userId: string): Promise<void> {
+    return this.db.transaction(async () => {
+
+    (await this.db.prepare('DELETE FROM session WHERE userId=?').run(userId));
+  
+    });
   }
 
   /** First-account setup. The route calling this is available only while empty. */
   async bootstrap(input: { name: string; email: string; password: string }, headers?: Headers): Promise<{ response: Response; user: IdentityUser }> {
-    if (this.hasUsers()) throw new Error('krmax has already been set up');
+    return this.db.transaction(async () => {
+
+    if ((await this.hasUsers())) throw new Error('krmax has already been set up');
     const response = await this.auth.api.signUpEmail({
-      body: { ...input, name: this.assertUserNameAvailable(input.name) }, headers, asResponse: true });
+      body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
     // Promote the account this call actually created, resolved by its own email —
     // NOT `listUsers()[0]`. `hasUsers()` above is a TOCTOU check, so two
@@ -412,37 +430,43 @@ export class IdentityService {
     // silently promoted twice.
     const created = (await response.clone().json().catch(() => ({})) as any)?.user as { id?: string } | undefined;
     const email = input.email.trim().toLowerCase();
-    const user = this.listUsers().find((candidate) => (created?.id ? candidate.id === created.id
+    const user = (await this.listUsers()).find((candidate) => (created?.id ? candidate.id === created.id
       : String(candidate.email).toLowerCase() === email));
     if (!user) throw new Error('account creation did not persist');
-    this.db.prepare("UPDATE user SET role = 'admin' WHERE id = ?").run(user.id);
+    (await this.db.prepare("UPDATE user SET role = 'admin' WHERE id = ?").run(user.id));
     return { response, user: { ...user, role: 'admin' } };
+  
+    });
   }
 
   async createUser(input: { name: string; email: string; password: string }): Promise<IdentityUser> {
     const result = await this.auth.api.createUser({
-      body: { ...input, name: this.assertUserNameAvailable(input.name), role: 'user' } });
+      body: { ...input, name: (await this.assertUserNameAvailable(input.name)), role: 'user' } });
     return (result?.user ?? result) as IdentityUser;
   }
 
   async removeUser(userId: string): Promise<void> {
+    return this.db.transaction(async () => {
+
     // Better Auth's admin plugin normally checks an HTTP admin session. At this
     // boundary karmax has already checked `user:write`; deleting the auth rows in
     // one transaction also revokes every session immediately.
-    this.db.exec('BEGIN IMMEDIATE');
+    (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      this.db.prepare('DELETE FROM session WHERE userId = ?').run(userId);
-      this.db.prepare('DELETE FROM account WHERE userId = ?').run(userId);
-      this.db.prepare('DELETE FROM user WHERE id = ?').run(userId);
-      this.db.exec('COMMIT');
+      (await this.db.prepare('DELETE FROM session WHERE userId = ?').run(userId));
+      (await this.db.prepare('DELETE FROM account WHERE userId = ?').run(userId));
+      (await this.db.prepare('DELETE FROM user WHERE id = ?').run(userId));
+      (await this.db.exec('COMMIT'));
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      (await this.db.exec('ROLLBACK'));
       throw e;
     }
+  
+    });
   }
 
   async close(): Promise<void> {
-    this.db.close();
+    (await this.db.close());
     await this.pool?.end();
   }
 }

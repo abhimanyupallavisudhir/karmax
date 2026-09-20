@@ -64,37 +64,44 @@ export interface CoordinatorActivityDeps {
   taskQueue: string;
   store?: {
     readonly hosted: boolean;
-    appendEvent?(event: import('../domain/types.js').KarmaxEvent): number;
-    getSettings(scopeKey: string, workflow: string): Record<string, unknown> | undefined;
-    getProject(projectId: string): { organizationId?: string } | undefined;
-    getTask(taskId: string): { projectId: string } | undefined;
-    organizationEntitlements(organizationId: string): {
+    appendEvent?(event: import('../domain/types.js').KarmaxEvent): (number) | Promise<number>;
+    getSettings(scopeKey: string, workflow: string): (Record<string, unknown> | undefined) | Promise<Record<string, unknown> | undefined>;
+    getProject(projectId: string): ({ organizationId?: string } | undefined) | Promise<{ organizationId?: string } | undefined>;
+    getTask(taskId: string): ({ projectId: string } | undefined) | Promise<{ projectId: string } | undefined>;
+    organizationEntitlements(organizationId: string): ({
       planName: string;
       maxActiveAgentRuns: number | null;
       currentMemberCount: number;
       maxMembers: number | null;
       overMemberLimit: boolean;
       agentRunAdmissionAllowed: boolean;
-    };
+    }) | Promise<{
+      planName: string;
+      maxActiveAgentRuns: number | null;
+      currentMemberCount: number;
+      maxMembers: number | null;
+      overMemberLimit: boolean;
+      agentRunAdmissionAllowed: boolean;
+    }>;
   };
 }
 
-function agentQueueTarget(deps: CoordinatorActivityDeps,
-  item: { taskId: string; projectId?: string; queueId?: string }): {
+async function agentQueueTarget(deps: CoordinatorActivityDeps,
+  item: { taskId: string; projectId?: string; queueId?: string }): Promise<{
     workflowId: string;
     capacity: number;
     detail?: string;
     blocked?: boolean;
-  } {
+  }> {
   if (deps.store?.hosted) {
     const durableOrganizationId = item.queueId?.startsWith('agent-queue:')
       ? item.queueId.slice('agent-queue:'.length)
       : undefined;
-    const projectId = durableOrganizationId ? undefined : item.projectId ?? deps.store.getTask(item.taskId)?.projectId;
+    const projectId = durableOrganizationId ? undefined : item.projectId ?? (await deps.store.getTask(item.taskId))?.projectId;
     const organizationId = durableOrganizationId
-      ?? (projectId ? deps.store.getProject(projectId)?.organizationId : undefined);
+      ?? (projectId ? (await deps.store.getProject(projectId))?.organizationId : undefined);
     if (!organizationId) throw new Error(`cannot resolve the organization for agent turn ${item.taskId}`);
-    const entitlements = deps.store.organizationEntitlements(organizationId);
+    const entitlements = (await deps.store.organizationEntitlements(organizationId));
     const planCapacity = entitlements.maxActiveAgentRuns;
     if (planCapacity == null) throw new Error(`hosted organization ${organizationId} has no active-run entitlement`);
     if (!entitlements.agentRunAdmissionAllowed) {
@@ -113,7 +120,7 @@ function agentQueueTarget(deps: CoordinatorActivityDeps,
       detail: `Waiting for ${entitlements.planName} plan capacity (${planCapacity} active agent run${planCapacity === 1 ? '' : 's'})`,
     };
   }
-  const saved = Number(deps.store?.getSettings('global', 'agent-queue')?.capacity);
+  const saved = Number((await deps.store?.getSettings('global', 'agent-queue'))?.capacity);
   return { workflowId: agentQueueId(), capacity: Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3 };
 }
 
@@ -125,11 +132,11 @@ function agentQueueTarget(deps: CoordinatorActivityDeps,
  */
 export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
   const { client, taskQueue } = deps;
-  const timing = (taskId: string, turnId: string, name: string) => {
-    if (!timingEnabled(deps.store)) return;
+  const timing = async (taskId: string, turnId: string, name: string) => {
+    if (!(await timingEnabled(deps.store))) return;
     let workflowRunId: string | undefined;
     try { workflowRunId = Context.current().info.workflowExecution?.runId; } catch { /* direct call */ }
-    installationTiming(deps.store, { taskId, turnId, workflowRunId }, row => deps.store?.appendEvent?.({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } })).mark(name);
+    (await (await installationTiming(deps.store, { taskId, turnId, workflowRunId }, async row => (await deps.store?.appendEvent?.({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } })))).mark(name));
   };
   return {
     /** Enqueue a task for the merge slot, creating the coordinator if needed. */
@@ -232,8 +239,8 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       title?: string;
       projectId?: string;
     }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string; blocked?: boolean; queueId: string }> {
-      timing(item.taskId, item.turnId, 'queue.slot.requested');
-      const target = agentQueueTarget(deps, item);
+      (await timing(item.taskId, item.turnId, 'queue.slot.requested'));
+      const target = (await agentQueueTarget(deps, item));
       await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
         workflowId: target.workflowId,
         taskQueue,
@@ -259,7 +266,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     },
     async cancelAgentSlot(taskId: string, turnId: string, queueId?: string): Promise<void> {
       try {
-        const target = agentQueueTarget(deps, { taskId, queueId });
+        const target = (await agentQueueTarget(deps, { taskId, queueId }));
         const handle = client.workflow.getHandle(target.workflowId);
         // Re-read the plan at every queue mutation as well as every request. In
         // particular, a downgrade must be applied before releasing a lease can
@@ -272,7 +279,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     },
     async releaseAgentSlot(taskId: string, turnId: string, queueId?: string): Promise<void> {
       try {
-        const target = agentQueueTarget(deps, { taskId, queueId });
+        const target = (await agentQueueTarget(deps, { taskId, queueId }));
         const handle = client.workflow.getHandle(target.workflowId);
         await handle.signal(SIG_SET_AGENT_CAPACITY, { capacity: target.capacity });
         await handle.signal(SIG_RELEASE_AGENT, { taskId, turnId });
@@ -301,7 +308,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: AccountProvider,
       allowed?: string[],
     ): Promise<{ waiting: boolean; earliestResetAt?: number; detail?: string }> {
-      timing(taskId, turnId, 'queue.account.requested');
+      (await timing(taskId, turnId, 'queue.account.requested'));
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,

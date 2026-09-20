@@ -1,142 +1,100 @@
 import { createRequire } from 'node:module';
-import fs from 'node:fs';
-import { MessageChannel, MessagePort, Worker } from 'node:worker_threads';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-
+import { AsyncPostgres } from './async-sql.js';
+import { splitStatements } from './postgres-sql.mjs';
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
-
-export interface SqlRunResult {
-  changes: number | bigint;
-  lastInsertRowid: number | bigint;
-}
-
+export interface SqlRunResult { changes: number | bigint; lastInsertRowid: number | bigint }
 export interface SqlStatement {
-  run(...params: any[]): SqlRunResult;
-  get(...params: any[]): unknown;
-  all(...params: any[]): unknown[];
+  run(...params: any[]): Promise<SqlRunResult>;
+  get(...params: any[]): Promise<unknown>;
+  all(...params: any[]): Promise<unknown[]>;
 }
-
-/** The small synchronous surface Store historically consumed from node:sqlite. */
 export interface SqlDatabase {
   readonly dialect: 'sqlite' | 'postgres';
   readonly native?: unknown;
   prepare(sql: string): SqlStatement;
-  exec(sql: string): void;
+  exec(sql: string): Promise<void>;
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   inTransaction(): boolean;
-  close(): void;
+  close(): Promise<void>;
 }
-
-class SqliteDatabase implements SqlDatabase {
-  readonly dialect = 'sqlite' as const;
-  readonly raw: DatabaseSyncType;
-  get native(): DatabaseSyncType { return this.raw; }
-
-  constructor(filename: string, options?: { readOnly?: boolean }) {
-    this.raw = options ? new DatabaseSync(filename, options) : new DatabaseSync(filename);
+interface Scope { active: boolean; rollback: boolean }
+class AsyncDatabase implements SqlDatabase {
+  readonly dialect: 'sqlite' | 'postgres';
+  readonly native?: DatabaseSyncType;
+  private postgres?: AsyncPostgres;
+  private scope = new AsyncLocalStorage<Scope>();
+  private tail: Promise<unknown> = Promise.resolve();
+  constructor(target: string, options?: { readOnly?: boolean }) {
+    this.dialect = isPostgresTarget(target) ? 'postgres' : 'sqlite';
+    if (this.dialect === 'postgres') this.postgres = new AsyncPostgres(target);
+    else this.native = options ? new DatabaseSync(target, options) : new DatabaseSync(target);
   }
-
-  prepare(sql: string): SqlStatement { return this.raw.prepare(sql) as SqlStatement; }
-  exec(sql: string): void { this.raw.exec(sql); }
-  inTransaction(): boolean { return this.raw.isTransaction; }
-  close(): void { this.raw.close(); }
-}
-
-interface RpcResponse {
-  ok: boolean;
-  transactionOpen?: boolean;
-  value?: unknown;
-  spill?: string;
-  error?: { message: string; stack?: string; code?: string };
-}
-
-/**
- * Transitional synchronous facade over node-postgres.
- *
- * Store predates remote databases and deliberately exposes synchronous methods
- * throughout the control plane. Rewriting that entire boundary in the same
- * release as the persistence migration would make the data cutover impossible
- * to review. A dedicated worker owns one PostgreSQL connection; Atomics only
- * block the calling thread while preserving Store's existing transaction scope.
- * This class is intentionally private to the store boundary and can disappear
- * when Store itself becomes asynchronous.
- */
-class PostgresDatabase implements SqlDatabase {
-  readonly dialect = 'postgres' as const;
-  private readonly worker: Worker;
-  private readonly port: MessagePort;
-  private readonly control = new Int32Array(new SharedArrayBuffer(12));
-  private readonly payload = new Uint8Array(new SharedArrayBuffer(4 * 1024 * 1024));
-  private requestId = 0;
-  private closed = false;
-  private transactionOpen = false;
-
-  constructor(connectionString: string) {
-    const channel = new MessageChannel();
-    this.port = channel.port1;
-    this.worker = new Worker(new URL('./postgres-worker.mjs', import.meta.url), {
-      workerData: {
-        connectionString,
-        port: channel.port2,
-        control: this.control.buffer,
-        payload: this.payload.buffer,
-      },
-      transferList: [channel.port2],
-    });
-    this.call('ready', {});
+  private async access<T>(operation: () => Promise<T>): Promise<T> {
+    const scope = this.scope.getStore();
+    if (scope && !scope.active) throw Error('transaction is already closed');
+    if (this.postgres || scope) return operation();
+    const next = this.tail.then(operation, operation);
+    this.tail = next.catch(() => {});
+    return next;
   }
-
   prepare(sql: string): SqlStatement {
     return {
-      run: (...params: any[]) => this.call('query', { sql, params, mode: 'run' }) as SqlRunResult,
-      get: (...params: any[]) => this.call('query', { sql, params, mode: 'get' }),
-      all: (...params: any[]) => this.call('query', { sql, params, mode: 'all' }) as unknown[],
+      run: (...params) => this.access(async () => {
+        if (!this.postgres) return this.native!.prepare(sql).run(...params);
+        const result = await this.postgres.result(sql, params);
+        return { changes: result.rowCount ?? 0, lastInsertRowid: Number(result.rows[0]?.seq ?? 0) };
+      }),
+      get: (...params) => this.access(async () => this.postgres ? (await this.postgres.query(sql, params))[0] : this.native!.prepare(sql).get(...params)),
+      all: (...params) => this.access(async () => this.postgres ? this.postgres.query(sql, params) : this.native!.prepare(sql).all(...params)),
     };
   }
-
-  exec(sql: string): void {
-    this.call('exec', { sql });
-  }
-  inTransaction(): boolean { return this.transactionOpen; }
-
-  close(): void {
-    if (this.closed) return;
-    try { this.call('close', {}); } finally {
-      this.closed = true;
-      this.port.close();
-      void this.worker.terminate();
+  async exec(sql: string): Promise<void> {
+    for (const statement of splitStatements(sql)) {
+      if (/^(BEGIN|COMMIT|ROLLBACK)\b/i.test(statement.trim())) {
+        const scope = this.scope.getStore();
+        if (!scope?.active) throw Error('use transaction() for transaction control');
+        if (/^ROLLBACK\b/i.test(statement.trim())) scope.rollback = true;
+        continue;
+      }
+      await this.access(async () => { if (this.postgres) await this.postgres.exec(statement); else this.native!.exec(statement); });
     }
   }
-
-  private call(op: string, input: Record<string, unknown>): unknown {
-    if (this.closed) throw new Error('database is closed');
-    Atomics.store(this.control, 0, 0);
-    Atomics.store(this.control, 1, 0);
-    this.port.postMessage({ id: ++this.requestId, op, ...input });
-    const status = Atomics.wait(this.control, 0, 0, 60_000);
-    if (status === 'timed-out') throw new Error(`PostgreSQL ${op} timed out after 60s`);
-    const length = Atomics.load(this.control, 1);
-    const decoded = new TextDecoder().decode(this.payload.subarray(0, length));
-    let response = JSON.parse(decoded) as RpcResponse;
-    if (response.spill) {
-      const spill = response.spill;
-      try { response = JSON.parse(fs.readFileSync(spill, 'utf8')) as RpcResponse; }
-      finally { fs.rmSync(spill, { force: true }); }
+  inTransaction(): boolean { return this.scope.getStore()?.active === true; }
+  async transaction<T>(operation: () => Promise<T>): Promise<T> {
+    const inherited = this.scope.getStore();
+    if (inherited) {
+      if (!inherited.active) throw Error('transaction is already closed');
+      return operation();
     }
-    if (response.transactionOpen !== undefined) this.transactionOpen = response.transactionOpen;
-    if (!response.ok) {
-      const error = new Error(response.error?.message ?? 'PostgreSQL operation failed');
-      if (response.error?.stack) error.stack = response.error.stack;
-      if (response.error?.code) (error as any).code = response.error.code;
-      throw error;
-    }
-    return response.value;
+    const run = async () => {
+      const scope: Scope = { active: true, rollback: false };
+      const rollback = new Error('transaction requested rollback');
+      let result!: T;
+      const work = async () => {
+        try {
+          result = await this.scope.run(scope, operation);
+          if (scope.rollback) throw rollback;
+          return result;
+        } finally { scope.active = false; }
+      };
+      try {
+        if (this.postgres) return await this.postgres.transaction(async () => {
+          // Preserve the former atomic Store mutation boundary across processes.
+          await this.postgres!.query('SELECT pg_advisory_xact_lock(1262572115)');
+          return work();
+        });
+        this.native!.exec('BEGIN IMMEDIATE');
+        try { const value = await work(); this.native!.exec('COMMIT'); return value; }
+        catch (error) { this.native!.exec('ROLLBACK'); throw error; }
+      } catch (error) { if (error === rollback) return result; throw error; }
+    };
+    const next = this.tail.then(run, run);
+    this.tail = next.catch(() => {});
+    return next;
   }
+  async close(): Promise<void> { await this.tail; if (this.postgres) await this.postgres.close(); else this.native!.close(); }
 }
-
-export function isPostgresTarget(target: string): boolean {
-  return /^postgres(?:ql)?:\/\//i.test(target);
-}
-
-export function openSqlDatabase(target: string, options?: { readOnly?: boolean }): SqlDatabase {
-  return isPostgresTarget(target) ? new PostgresDatabase(target) : new SqliteDatabase(target, options);
-}
+export function isPostgresTarget(target: string): boolean { return /^postgres(?:ql)?:\/\//i.test(target); }
+export function openSqlDatabase(target: string, options?: { readOnly?: boolean }): SqlDatabase { return new AsyncDatabase(target, options); }
