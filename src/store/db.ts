@@ -2901,6 +2901,17 @@ export class Store {
       confirmer: r.confirmer == null ? undefined : JSON.parse(r.confirmer), attempts: this.attemptsOf(intentId) };
   }
 
+  /** Dependency checks need the current representative, not its siblings or history.
+   * Keep an existing group with a missing principal distinct from no group. */
+  attemptPrincipalState(taskOrIntentId: string): { principalAttemptId: string; status?: string } | undefined {
+    const row = this.db.prepare(`SELECT i.principalAttemptId,
+      json_extract(principal.lastView, '$.status') AS status FROM task_intents i
+      LEFT JOIN tasks principal ON principal.id=i.principalAttemptId AND principal.intentId=i.id
+      WHERE i.id=COALESCE((SELECT intentId FROM tasks WHERE id=?), ?)`)
+      .get(taskOrIntentId, taskOrIntentId) as { principalAttemptId: string; status: string | null } | undefined;
+    return row ? { principalAttemptId: row.principalAttemptId, status: row.status ?? undefined } : undefined;
+  }
+
   /** One row per logical task: only the current principal appears in list/search. */
   listTasks(projectId: string): TaskRecord[] {
     const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
@@ -3208,7 +3219,10 @@ export class Store {
    *  WHOLE tasks table, hydrating every row — including every full `lastView`
    *  transcript — at every boot, to find the handful of armed rows. */
   listArmedTasks(): TaskRecord[] {
-    return (this.db.prepare(`SELECT * FROM tasks
+    return (this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
+      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
+      notes, lastView FROM tasks
       WHERE json_extract(params, '$.triggerState') = 'armed' ORDER BY createdAt`).all() as any[])
       .map(rowToTask);
   }

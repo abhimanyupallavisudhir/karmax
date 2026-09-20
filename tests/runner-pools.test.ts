@@ -185,7 +185,10 @@ describe('runner capacity and world lifecycle', () => {
       taskId: task.id, worldId: task.id, generation: 1, port: 3000, public: false, provider: 'e2b',
       runnerLeaseId: lease.leaseId, createdBy: 'owner', createdAt: now - 3 * 60_000, expiresAt: now + 60_000 });
 
+    const fullRead = vi.spyOn(store, 'getTask').mockImplementation(() => { throw Error('maintenance loaded history'); });
     await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(now);
+    expect(fullRead).not.toHaveBeenCalled();
+    fullRead.mockRestore();
 
     expect(store.worldLease(lease.leaseId)?.state).toBe('active');
     expect(store.worldLease(orphan.leaseId)?.state).toBe('released');
@@ -571,7 +574,10 @@ describe('runner capacity and world lifecycle', () => {
       } } as any);
 
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    const fullRead = vi.spyOn(store, 'getTask').mockImplementation(() => { throw Error('reaper loaded history'); });
     await lifecycle.sweep(Date.now());
+    expect(fullRead).not.toHaveBeenCalled();
+    fullRead.mockRestore();
 
     expect(destroyed).toEqual(['sb-orphan']);
     expect(store.auditSince(0).some((e: { action: string }) => e.action === 'world.orphanReaped')).toBe(true);

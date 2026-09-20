@@ -140,7 +140,7 @@ export class TriggerScheduler {
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
   }
 
-  private organizationOfTask(taskId: string, task = this.deps.store.getTask(taskId)): string | undefined {
+  private organizationOfTask(taskId: string, task = this.deps.store.taskMetadata(taskId)): string | undefined {
     const projectId = task?.projectId;
     return projectId ? this.deps.store.getProject(projectId)?.organizationId ?? 'org_personal' : undefined;
   }
@@ -151,11 +151,11 @@ export class TriggerScheduler {
    * `validateTriggers` is pure, so the *graph* half of validation (self-reference,
    * cycles, dangling dependency ids) can only run where a store is in reach —
    * here. Dependency ids are matched the way `arm()` matches them: by declared id,
-   * with `attemptGroup` folding alternate attempts onto one logical task.
+   * with the principal lookup folding alternate attempts onto one logical task.
    */
   validationErrors(task: TaskRecord): string[] {
     const dependenciesOf = (id: string): string[] | undefined => {
-      const t = this.deps.store.getTask(id);
+      const t = this.deps.store.taskMetadata(id);
       if (!t) return undefined;
       const out: string[] = [];
       for (const trig of normalizeTriggers(t.params)) if (trig.kind === 'dependency') out.push(...(trig.tasks ?? []));
@@ -222,10 +222,10 @@ export class TriggerScheduler {
     for (const trig of entry.triggers) {
       if (trig.kind !== 'dependency') continue;
       for (const dep of trig.tasks ?? []) {
-        const group = this.deps.store.attemptGroup(dep);
+        const group = this.deps.store.attemptPrincipalState(dep);
         const status = group
-          ? group.attempts.find((a) => a.id === group.principalAttemptId)?.lastView?.status
-          : this.deps.store.getTask(dep)?.lastView?.status;
+          ? group.status
+          : this.deps.store.taskMetadata(dep)?.lastView?.status;
         if (status && statusSatisfiesDependency(trig.on, status)) entry.satisfiedDeps.add(dep);
       }
     }
@@ -241,6 +241,7 @@ export class TriggerScheduler {
   // ─── Event routing ─────────────────────────────────────────────────────────
 
   private onEvent(ev: KarmaxEvent): void {
+    if (!this.armed.size) return;
     // Events are tenant data: an armed task only ever sees events from tasks in
     // its own organization. Without this, `{kind:'event', where:{repo:…}}` in one
     // organization fired on (and probed the payloads of) another's tasks.
@@ -289,19 +290,18 @@ export class TriggerScheduler {
    */
   private applyDependencyEvent(entry: ArmedEntry, trig: DependencyTrigger, ev: KarmaxEvent): boolean {
     if (ev.type !== LIFECYCLE_EVENT) return false;
-    const eventTask = this.deps.store.getTask(ev.taskId);
+    const eventTask = this.deps.store.taskMetadata(ev.taskId);
     const eventIntent = eventTask?.intentId ?? ev.taskId;
     let advanced = false;
     for (const dep of trig.tasks ?? []) {
-      const declared = this.deps.store.getTask(dep);
+      const declared = this.deps.store.taskMetadata(dep);
       if ((declared?.intentId ?? dep) !== eventIntent) continue;
       // Read the logical task's CURRENT principal after Store.saveView has run.
       // Cancelling one attempt therefore cannot satisfy `settled` while another
       // eligible attempt remains; the eventual winner's outcome can.
-      const group = this.deps.store.attemptGroup(eventIntent);
-      const principal = group?.attempts.find((a) => a.id === group.principalAttemptId);
+      const group = this.deps.store.attemptPrincipalState(eventIntent);
       const status = group
-        ? principal?.lastView?.status ?? (principal?.id === ev.taskId ? (ev.payload as { status?: string })?.status : undefined)
+        ? group.status ?? (group.principalAttemptId === ev.taskId ? (ev.payload as { status?: string })?.status : undefined)
         : (ev.payload as { status?: string })?.status;
       if (!status) continue;
       if (statusSatisfiesDependency(trig.on, status)) {
@@ -340,7 +340,7 @@ export class TriggerScheduler {
 
   /** Durably remember (or consume) an activation that is gated on dependencies. */
   private setActivationPending(entry: ArmedEntry, pending: boolean): void {
-    const current = this.deps.store.getTask(entry.task.id) ?? entry.task;
+    const current = this.deps.store.taskMetadata(entry.task.id) ?? entry.task;
     const persisted = current.params?.triggerPending === true;
     if (entry.activationPending === pending && persisted === pending) return;
     entry.activationPending = pending;
@@ -424,7 +424,7 @@ export class TriggerScheduler {
       entry.retryTimer = undefined;
       if (this.armed.get(taskId) !== entry) return;
       try {
-        const task = this.deps.store.getTask(taskId);
+        const task = this.deps.store.taskMetadata(taskId);
         if (task?.params?.triggerState !== 'armed') return this.disarm(taskId);
         const errors = this.validationErrors(task);
         if (errors.length) throw new Error(`invalid trigger(s): ${errors.join('; ')}`);

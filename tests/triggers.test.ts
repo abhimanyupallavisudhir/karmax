@@ -489,6 +489,34 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(fired).toEqual([[series.id, 'clone']]);
   });
 
+  it('dispatches dependencies and events without loading task or sibling histories', async () => {
+    const dep = sourceTask();
+    const dependent = armedTask([{ kind: 'dependency', tasks: [dep] }]);
+    const eventTask = armedTask([{ kind: 'event', type: 'release' }]);
+    // A malformed history is a sentinel: these decisions must never decode it.
+    store.db.prepare("UPDATE tasks SET lastView=?, conversation=?")
+      .run(JSON.stringify({ status: 'active' }), 'history must not be read');
+    const fullRead = vi.spyOn(store, 'getTask').mockImplementation(() => { throw Error('full task read'); });
+    const groupRead = vi.spyOn(store, 'attemptGroup').mockImplementation(() => { throw Error('full sibling read'); });
+    const scheduler = makeScheduler();
+    try {
+      scheduler.start();
+      expect(scheduler.size).toBe(2);
+      store.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify({ status: 'done' }), dep);
+      emitDone(dep);
+      bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(fired).toEqual([[dependent.id, 'self'], [eventTask.id, 'self']]);
+      expect(store.taskMetadata(eventTask.id)?.params.triggerPending).toBeUndefined();
+      expect(fullRead).not.toHaveBeenCalled();
+      expect(groupRead).not.toHaveBeenCalled();
+    } finally {
+      scheduler.stop();
+      fullRead.mockRestore();
+      groupRead.mockRestore();
+    }
+  });
+
   it('binds dependencies to the logical task, not a cancelled attempt', () => {
     const first = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'first' } });
     const second = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'second', draft: true }, intentId: first.intentId });

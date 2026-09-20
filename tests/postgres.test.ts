@@ -19,6 +19,24 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('reads dependency principals without hydrating any attempt history', () => {
+    const store = new Store(url!);
+    try {
+      const project = store.createProject('Dependencies', {});
+      const first = store.createTask({ projectId: project.id, title: 'First', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'work' } });
+      const second = store.createTask({ projectId: project.id, title: 'Second', workflow: 'just-do',
+        workflowVersion: '1', intentId: first.intentId, params: { prompt: 'work', draft: true } });
+      store.db.prepare('UPDATE tasks SET lastView=?, conversation=?').run(
+        JSON.stringify({ status: 'done' }), 'must not decode history');
+      expect(store.attemptPrincipalState(second.id)).toEqual({ principalAttemptId: first.id, status: 'done' });
+      store.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(second.id, first.intentId!);
+      store.db.prepare('UPDATE tasks SET lastView=NULL WHERE id=?').run(second.id);
+      expect(store.attemptPrincipalState(first.id)).toEqual({ principalAttemptId: second.id, status: undefined });
+      expect(store.attemptPrincipalState('missing')).toBeUndefined();
+    } finally { store.close(); }
+  });
+
   it('uses native asynchronous pagination with compact views and archive filtering', async () => {
     const store = new Store(url!);
     try {

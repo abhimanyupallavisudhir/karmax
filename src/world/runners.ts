@@ -119,7 +119,7 @@ export class RunnerPoolService {
   reconcileWorldLeases(now = Date.now()): number {
     let released = 0;
     for (const lease of this.store.unreleasedWorldLeases()) {
-      const task = this.store.getTask(String(lease.taskId));
+      const task = this.store.taskMetadata(String(lease.taskId));
       const world = this.store.currentWorld(String(lease.worldId));
       const worldState = this.store.worldState(String(lease.worldId));
       const passiveWorld = ['parked', 'hibernated', 'released'].includes(worldState ?? '');
@@ -330,7 +330,7 @@ export class WorldLifecycleManager {
           seen.add(sandbox.sandboxId);
           // No task id means karmax cannot attribute it — never destroy blind.
           if (!sandbox.taskId) continue;
-          const task = this.store.getTask(sandbox.taskId);
+          const task = this.store.taskMetadata(sandbox.taskId);
           const current = task ? this.store.currentWorld(sandbox.taskId) : undefined;
           const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
           if (task && !duplicate) continue;
@@ -348,7 +348,7 @@ export class WorldLifecycleManager {
   }
 
   private recordLifecycle(handle: WorldHandleRef, type: string, payload: Record<string, unknown>): void {
-    if (!this.store.getTask(handle.id)) return;
+    if (!this.store.taskMetadata(handle.id)) return;
     this.store.appendEvent({ taskId: handle.id, type, ts: Date.now(), payload: {
       provider: handle.provider ?? handle.kind, generation: handle.generation ?? 1, ...payload,
     } });
