@@ -1,4 +1,5 @@
 import { WorldOperationLock } from './operation-lock.js';
+import { SharedWorldCoordination } from './shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldLifecycleState, WorldProvider, WorldSpec } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { MemoryWorldProvider } from './memory.js';
@@ -12,13 +13,16 @@ import { DaytonaWorldProvider } from './daytona.js';
  * worktree → container → remote is a config change, not a code change.
  */
 export class WorldRegistry {
-  private readonly operations = new WorldOperationLock();
+  private readonly operations: WorldOperationLock;
+  private readonly shared?: SharedWorldCoordination;
   private readonly accessors = new Map<string, number>();
   private providers = new Map<WorldKind, WorldProvider>();
   private resolveHandle?: (handle: WorldHandle) => WorldHandle | undefined | Promise<WorldHandle | undefined>;
   private recover?: (handle: WorldHandle, error: unknown) => Promise<WorldHandle | undefined>;
 
-  constructor() {
+  constructor(options: { coordinationDirectory?: string } = {}) {
+    if (options.coordinationDirectory) this.shared = new SharedWorldCoordination(options.coordinationDirectory);
+    this.operations = new WorldOperationLock(this.shared);
     this.register(new WorktreeProvider());
     this.register(new MemoryWorldProvider());
     this.register(new ContainerWorldProvider());
@@ -68,18 +72,24 @@ export class WorldRegistry {
     return this.operations.run(worldId, operation);
   }
 
-  holdAccess(worldId: string): () => void {
+  async holdAccess(worldId: string): Promise<() => void> {
+    const releaseShared = await this.shared?.holdAccess(worldId);
     this.accessors.set(worldId, this.activeAccessCount(worldId) + 1);
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      releaseShared?.();
       const count = this.activeAccessCount(worldId) - 1;
       if (count > 0) this.accessors.set(worldId, count);
       else this.accessors.delete(worldId);
     };
   }
   activeAccessCount(worldId: string): number { return this.accessors.get(worldId) ?? 0; }
+
+  async hasActiveAccess(worldId: string): Promise<boolean> {
+    return this.shared ? this.shared.hasAccess(worldId) : this.activeAccessCount(worldId) > 0;
+  }
 
   async open(handle: WorldHandle): Promise<World> {
     return this.withOperation(handle.id, async () => {

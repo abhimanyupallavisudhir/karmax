@@ -24,7 +24,7 @@ export class WorldAccessService {
     // need it to release the capacity this request is waiting for.
     // All transient access is pinned, including callers borrowing a workflow's
     // lease, until the artifact/preview/terminal operation releases it.
-    const releaseAccess = this.worlds.holdAccess(input.id);
+    const releaseAccess = await this.worlds.holdAccess(input.id);
     try { return await this.openMetered(taskId, input, options, releaseAccess); }
     catch (error) { releaseAccess(); throw error; }
   }
@@ -61,7 +61,7 @@ export class WorldAccessService {
           released = true;
           releaseAccess();
           if (parkIfIdle && remote && (await this.store.activeWorldLeaseCount(openedHandle.id)) === 0
-            && this.worlds.activeAccessCount(openedHandle.id) === 0) {
+            && !(await this.worlds.hasActiveAccess(openedHandle.id))) {
             if ((await this.store.worldState(openedHandle.id)) === 'parked') return;
             await this.resources?.scrubSecrets(openedHandle).catch(() => undefined);
             await this.worlds.park(openedHandle).catch(() => undefined);
@@ -84,7 +84,7 @@ export class WorldAccessService {
   private async releaseWithinOperation(handle: WorldHandle, leaseId?: string): Promise<void> {
     if (leaseId) (await this.runners?.release(leaseId, handle.kind));
     if (this.worlds.get(handle.kind).capabilities?.remote !== true || (await this.store.activeWorldLeaseCount(handle.id)) > 0
-      || this.worlds.activeAccessCount(handle.id) > 0) return;
+      || await this.worlds.hasActiveAccess(handle.id)) return;
     if ((await this.store.worldState(handle.id)) === 'parked') return;
     await this.resources?.scrubSecrets(handle).catch(() => undefined);
     await this.worlds.park(handle).catch(() => undefined);

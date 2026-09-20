@@ -8,6 +8,8 @@ export class WorldOperationLock {
   private readonly tails = new Map<string, Promise<void>>();
   private readonly scopes = new AsyncLocalStorage<Map<string, { active: boolean }>>();
 
+  constructor(private shared?: { operation<T>(worldId: string, work: () => Promise<T>): Promise<T> }) {}
+
   async run<T>(worldId: string, operation: () => Promise<T>): Promise<T> {
     const inherited = this.scopes.getStore();
     if (inherited?.get(worldId)?.active) return operation();
@@ -19,7 +21,8 @@ export class WorldOperationLock {
     const scope = { active: true };
     const context = new Map(inherited);
     context.set(worldId, scope);
-    try { return await this.scopes.run(context, operation); }
+    const work = () => this.scopes.run(context, operation);
+    try { return await (this.shared ? this.shared.operation(worldId, work) : work()); }
     finally {
       scope.active = false;
       release();

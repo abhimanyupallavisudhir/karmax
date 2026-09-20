@@ -62,7 +62,7 @@ describe('separate waiting-world maintenance', () => {
       vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
         info: { workflowExecution: { runId: 'old-run' } } } as any);
     }
-    if (change === 'access') release = f.worlds.holdAccess(f.handle.id);
+    if (change === 'access') release = await f.worlds.holdAccess(f.handle.id);
     try { await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(f.view), fence!); }
     finally { release?.(); }
     expect(f.checkpoint).not.toHaveBeenCalled();

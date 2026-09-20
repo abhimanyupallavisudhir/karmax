@@ -908,7 +908,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
     // Pin access before admission, but never wait for capacity while holding a
     // transition lock: the previous owner needs that lock to release its lease.
-    const releaseAccess = worlds.holdAccess?.(handle.id);
+    const releaseAccess = await worlds.holdAccess?.(handle.id);
     const open = async (): Promise<World | undefined> => {
       const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
       if (isRemote(current.kind) && deps.runners) {
@@ -1010,7 +1010,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
     const valid = async () => {
       ctx?.cancellationSignal.throwIfAborted();
-      if ((worlds.activeAccessCount?.(waitingWorld.id) ?? 0) > 0) return false;
+      if (await worlds.hasActiveAccess?.(waitingWorld.id)) return false;
       const current = (await store.currentWorld(waitingWorld.id)) as WorldHandle | undefined;
       if ((await store.worldState(waitingWorld.id)) === 'released') return false;
       if (current && (current.kind !== waitingWorld.kind
