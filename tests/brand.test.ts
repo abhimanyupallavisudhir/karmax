@@ -129,7 +129,7 @@ describe('branding — portable defaults and dynamic surfaces', () => {
     const gateway = read('src/gateway/server.ts');
     expect(identity).toContain('`Reset your ${brand} password`');
     expect(identity).toContain('`Confirm your ${brand} email`');
-    expect(identity).toContain('appName: siteName()');
+    expect(identity).toContain('appName: (await siteName())');
     expect(gateway).toContain('on ${this.siteName}');
     expect(gateway).toContain('this.siteName)');
   });
