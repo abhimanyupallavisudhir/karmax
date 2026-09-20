@@ -236,3 +236,33 @@ files**. The final config/handoff/cancellation/teardown/split-main group passed
 split-process application case ran rather than skipped. These groups overlap and
 are not a count of unique tests across runs. No latest-head complete-suite run or
 production deployment is claimed. Process mode remains experimental.
+
+
+## Provisioning versus maintenance races
+
+Fresh-world creation now retains world transition ownership from allocation through
+resource/runtime provisioning and durable registration. Runner admission remains
+outside that transition. The orphan reaper takes the same ownership before
+classifying and destroying a provider allocation, so an in-progress replacement
+cannot be mistaken for a duplicate of the previous registered sandbox. Recovery
+through the registry/activity open paths already holds this transition.
+
+Ready-world provider probes revalidate generation, state and touch timestamp before
+and after the request. A stale missing result no longer publishes a loss transition
+for the old selection after release, replacement or a fresh touch.
+
+The initial focused provisioning/hibernation/runner/world group passed **58 tests in
+four files**. A new test blocks resource provisioning after allocation, runs orphan
+cleanup concurrently, then verifies that registration completes without destruction.
+Three stale-probe cases and an unchanged-world loss case cover reconciliation.
+The first compiler pass found closure type inference/narrowing errors; explicit
+WorldSpec credential types and a stable task-id binding fixed them, and the next
+1280 MiB compiler run passed.
+
+The broader final run passed **107 tests in seven files**: the full workflow
+pipeline, checkpoint restore, maintenance draining, split-main, provisioning
+transition, hibernation and runner pools. PostgreSQL was explicitly enabled for
+the split-main case. This includes the entire 48-case workflow pipeline; the run
+took 403.68 seconds. Together with the focused tests and passing compiler, these
+are the validation results for this follow-up, not a fresh full-suite capacity
+claim. Process mode remains opt-in and production deployment is separate.

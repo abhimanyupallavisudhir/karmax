@@ -201,11 +201,20 @@ export class WorldLifecycleManager {
       for (const candidate of (await this.store.listWorldInstances('ready', now - reconcileAfter))) {
         const key = `${candidate.handle.id}:${candidate.handle.generation ?? 1}`;
         if ((this.probedAt.get(key) ?? 0) > now - reconcileAfter) continue;
-        this.probedAt.set(key, now);
-        const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
-        if (state !== 'missing') continue;
-        (await this.store.setWorldState(candidate.handle, 'degraded'));
-        (await this.recordLifecycle(candidate.handle, 'world.providerLost', {}));
+        await this.worlds.withOperation(candidate.handle.id, async () => {
+          const unchanged = async () => {
+            const current = await this.store.worldStateSnapshot(candidate.handle.id);
+            return current?.state === 'ready'
+              && current.generation === (candidate.handle.generation ?? 1)
+              && current.updatedAt === Number(candidate.updatedAt);
+          };
+          if (!(await unchanged())) return;
+          this.probedAt.set(key, now);
+          const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
+          if (state !== 'missing' || !(await unchanged())) return;
+          await this.store.setWorldState(candidate.handle, 'degraded');
+          await this.recordLifecycle(candidate.handle, 'world.providerLost', {});
+        });
       }
     }
     await this.reapOrphanSandboxes();
@@ -361,18 +370,21 @@ export class WorldLifecycleManager {
           seen.add(sandbox.sandboxId);
           // No task id means karmax cannot attribute it — never destroy blind.
           if (!sandbox.taskId) continue;
-          const task = (await this.store.taskMetadata(sandbox.taskId));
-          const current = task ? (await this.store.currentWorld(sandbox.taskId)) : undefined;
-          const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
-          if (task && !duplicate) continue;
-          try {
-            await sandbox.destroy();
-            (await this.store.appendAudit({ principalId: 'system:lifecycle', action: 'world.orphanReaped',
-              detail: { provider: provider.kind, sandboxId: sandbox.sandboxId, taskId: sandbox.taskId,
-                reason: duplicate ? 'duplicate' : 'task-deleted' } }));
-          } catch {
-            // Transient control-plane failure — the next sweep tries again.
-          }
+          const taskId = sandbox.taskId;
+          await this.worlds.withOperation(taskId, async () => {
+            const task = (await this.store.taskMetadata(taskId));
+            const current = task ? (await this.store.currentWorld(taskId)) : undefined;
+            const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
+            if (task && !duplicate) return;
+            try {
+              await sandbox.destroy();
+              (await this.store.appendAudit({ principalId: 'system:lifecycle', action: 'world.orphanReaped',
+                detail: { provider: provider.kind, sandboxId: sandbox.sandboxId, taskId: sandbox.taskId,
+                  reason: duplicate ? 'duplicate' : 'task-deleted' } }));
+            } catch {
+              // Transient control-plane failure — the next sweep tries again.
+            }
+          });
         }
       }
     }

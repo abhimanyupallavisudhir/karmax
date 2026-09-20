@@ -103,3 +103,30 @@ it('requires a checkpoint for the generation being destroyed', async () => {
   expect(f.checkpointWorld).toHaveBeenCalledWith(expect.objectContaining({ generation: 2 }));
   expect(f.destroy).toHaveBeenCalledOnce();
 });
+
+it.each(['replacement', 'released', 'touched'])('ignores a missing probe after the selected world is %s', async change => {
+  const f = await fixture();
+  await f.store.setWorldState(f.handle, 'ready');
+  f.probe.mockImplementation(async () => {
+    if (change === 'replacement') await f.store.registerWorld({ ...f.handle, generation: 2 }, f.project.id);
+    else if (change === 'released') await f.store.setWorldState(f.handle, 'released');
+    else {
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 100);
+      try { await f.store.setWorldState(f.handle, 'ready'); } finally { clock.mockRestore(); }
+    }
+    return 'missing';
+  });
+  await f.lifecycle.sweep(Date.now() + 20 * 60_000);
+  expect(f.probe).toHaveBeenCalledOnce();
+  expect(await f.store.worldState(f.handle.id)).toBe(change === 'released' ? 'released' : 'ready');
+  expect(await f.store.eventsOfType(f.handle.id, 'world.providerLost')).toHaveLength(0);
+});
+
+it('records a missing probe for an unchanged ready world', async () => {
+  const f = await fixture();
+  await f.store.setWorldState(f.handle, 'ready');
+  f.probe.mockResolvedValue('missing');
+  await f.lifecycle.sweep(Date.now() + 20 * 60_000);
+  expect(await f.store.worldState(f.handle.id)).toBe('degraded');
+  expect(await f.store.eventsOfType(f.handle.id, 'world.providerLost')).toHaveLength(1);
+});
