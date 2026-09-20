@@ -75,6 +75,7 @@ const PROJECT_GRANT_CEILING: Capability[] = [
 ];
 
 export const ORGANIZATION_GRANT_CEILING: Capability[] = [
+  'project:transfer-out', 'project:transfer-in',
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*',
   'project:resource:shared-write',
@@ -138,7 +139,11 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit',
   ]],
-  administrator: [[...ORGANIZATION_GRANT_CEILING, 'workflow:install']],
+  administrator: [
+    ORGANIZATION_GRANT_CEILING.filter(cap => !cap.startsWith('project:transfer-')),
+    [...ORGANIZATION_GRANT_CEILING.filter(cap => !cap.startsWith('project:transfer-')), 'workflow:install'],
+    [...ORGANIZATION_GRANT_CEILING, 'workflow:install'],
+  ],
   operator: [[
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',

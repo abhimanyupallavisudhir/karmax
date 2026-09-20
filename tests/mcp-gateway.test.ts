@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -25,7 +25,31 @@ describe('MCP HTTP authorization boundary', () => {
     const gateway = (await Gateway.create({ store, tokens, broker: new CredentialBroker(new Vault(path.join(dir, 'vault'))), bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: {} as any, taskQueue: 'test', staticDir: dir, agentInfo: { provider: 'mock', reason: 'test' }, worlds: new WorldRegistry() }));
     const server = await gateway.listen(await findFreePortFrom(48_500)); base = server.url; close = server.close;
   });
-  afterAll(async () => { await close?.(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
+  afterAll(async () => { await close?.(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  it('serves a public client identity without reflecting request origins or requiring Composio', async () => {
+    vi.stubEnv('KARMAX_PUBLIC_URL', 'https://tavya.example');
+    try {
+      const response = await fetch(base + '/api/mcp-client-metadata', { headers: { host: 'attacker.example', origin: 'https://attacker.example' } });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ client_id: 'https://tavya.example/api/mcp-client-metadata', redirect_uris: ['https://tavya.example/mcp-callback'] });
+      expect(JSON.stringify(body)).not.toContain('attacker');
+      vi.stubEnv('KARMAX_PUBLIC_URL', '');
+      expect((await fetch(base + '/api/mcp-client-metadata')).status).toBe(404);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('accepts preregistered OAuth clients only for administrators and excludes client secrets from responses', async () => {
+    const route = `/api/mcp?projectId=${project}`;
+    const body = { label: 'Manual OAuth', auth: 'oauth', transport: { type: 'http', url: 'https://example.com/oauth' }, oauthClient: { clientId: 'client', clientSecret: 'private-secret', tokenEndpointAuthMethod: 'client_secret_basic' } };
+    expect((await request('POST', route, (await token(['profile:read'])), body)).status).toBe(403);
+    const response = await request('POST', route, (await token(['project:settings:write'])), body);
+    expect(response.status).toBe(200);
+    const saved = await response.json() as any;
+    expect(saved.oauthClient).toEqual({ clientId: 'client', tokenEndpointAuthMethod: 'client_secret_basic', hasSecret: true });
+    expect(JSON.stringify(saved)).not.toContain('private-secret');
+    expect(await (await request('GET', route, (await token(['profile:read'])))).text()).not.toContain('private-secret');
+    expect((await request('DELETE', `/api/mcp/${saved.id}?projectId=${project}`, (await token(['project:settings:write'])))).status).toBe(200);
+  });
   it('separates discovery from administration and never returns raw credentials', async () => {
     const route = `/api/mcp?projectId=${project}`;
     const definition = { label: 'Work', transport: { type: 'http', url: 'https://example.com/mcp' }, auth: 'secrets', secrets: { Authorization: 'Bearer do-not-return' } };

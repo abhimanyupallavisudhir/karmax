@@ -37,6 +37,14 @@ describe('MCP connections', () => {
     (await service.remove(c.id, project));
     expect(broker.listHandles()).toEqual([]);
   });
+  it('preserves simultaneous connection saves from separate service instances', async () => {
+    const peer = new McpConnections(store, broker, 'org_personal');
+    const saved = await Promise.all([
+      service.save({ ...definition, label: 'First' }, project),
+      peer.save({ ...definition, label: 'Second' }, project),
+    ]);
+    expect((await service.list(project)).map(c => c.id).sort()).toEqual(saved.map(c => c.id).sort());
+  });
   it('enforces tenant, project, and owning-scope boundaries independently of IDs', async () => {
     const org = (await store.createOrganization({ name: 'Other' }));
     const other = new McpConnections(store, broker, org.id);
@@ -52,6 +60,9 @@ describe('MCP connections', () => {
   });
   it('validates selections and preserves explicit empty sets across provider/default changes', async () => {
     expect(validateMcpSelection([])).toEqual([]);
+    expect(validateMcpSelection(['composio:conn_abc123'])).toEqual(['composio:conn_abc123']);
+    expect(await service.selected(['composio:conn_abc123'], project)).toEqual([]);
+    expect(() => validateMcpSelection(['composio:../../secret'])).toThrow();
     expect(() => validateMcpSelection(['karmax'])).toThrow();
     expect(validateMcpSelection(['browser:playwright', 'browser:chrome-devtools'])).toEqual(['browser:playwright', 'browser:chrome-devtools']);
     const base = { id: 'do-default', name: 'Agent', role: 'do', provider: 'claude' as const, mcpConnections: ['browser:playwright'] };

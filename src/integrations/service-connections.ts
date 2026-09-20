@@ -144,7 +144,7 @@ export class ServiceConnections {
   }
   async list(org: string, ctx: { ownerId?: string; taskId?: string; projectId?: string }) {
     return (await this.all()).filter(c => c.organizationId === org && (ctx.taskId
-      ? this.canUse(c, ctx.taskId, ctx.projectId!) : c.ownerId === ctx.ownerId)).map(c => this.view(c));
+      ? this.canUse(c, ctx.taskId, ctx.projectId!) : c.ownerId === ctx.ownerId || (!!ctx.projectId && c.projectIds.includes(ctx.projectId)))).map(c => this.view(c));
   }
   async pending(taskId: string) { return (await this.all()).filter(c => c.taskId === taskId && ['requested', 'connecting'].includes(c.status)); }
   async catalog(search = '') { return this.remote(() => this.backend().catalog(search.slice(0, 200))); }

@@ -79,7 +79,7 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
     await js(`document.querySelector('${field} .mcp-filter').focus();document.querySelector('${field} .mcp-custom').click()`);
     await wait('!!document.querySelector(".mcp-connection-form")');
     const label = '<img src=x onerror="window.mcpXss=1">';
-    await js(`document.querySelector('.mcp-label').value=${JSON.stringify(label)};document.querySelector('.mcp-url').value='https://127.0.0.1/private';document.querySelector('.mcp-connection-form').requestSubmit()`);
+    await js(`document.querySelector('.mcp-auth').value='none';document.querySelector('.mcp-auth').dispatchEvent(new Event('change'));document.querySelector('.mcp-label').value=${JSON.stringify(label)};document.querySelector('.mcp-url').value='https://127.0.0.1/private';document.querySelector('.mcp-connection-form').requestSubmit()`);
     await wait('document.querySelector(".mcp-message").textContent.includes("Private")');
     await wait('!document.querySelector(".mcp-connection-form [type=submit]").disabled && !document.querySelector(".mcp-connection-form [type=submit]").classList.contains("action-pending")');
     await js("document.querySelector('.mcp-url').value='https://example.com/mcp';document.querySelector('.mcp-connection-form').requestSubmit()");

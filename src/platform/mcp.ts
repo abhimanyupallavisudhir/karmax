@@ -581,7 +581,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     description: 'List app accounts explicitly shared with this task or project. Prefer these connections to requesting passwords. Tokens stay server-side.', inputSchema: {},
   }, async () => wrap(async () => (await ops.platformRequest('GET', '/api/connections'))));
   server.registerTool('request_connection', {
-    description: 'Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in the task; it resumes automatically after authorization. Continue independent work, but do not finish the task while the connection is pending. Reuse connected accounts from list_connections.',
+    description: 'Use the optional Composio fallback when no suitable native MCP connection is available. Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in the task; it resumes automatically after authorization. Continue independent work, but do not finish the task while the connection is pending. Reuse connected accounts from list_connections.',
     inputSchema: { toolkit: z.string(), why: z.string() },
   }, async a => wrap(async () => (await ops.platformRequest('POST', '/api/connections/request', a))));
   server.registerTool('search_connection_tools', {

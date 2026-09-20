@@ -345,6 +345,23 @@ export class TokenAuthority {
     const record = (await this.verify(token));
     if (!record) return { ok: false, reason: 'invalid or expired token' };
     if (!allows(record.caps, capability)) return { ok: false, record, reason: `missing capability ${capability}` };
+    // Resolve the tenant from durable ownership, including callers that pass
+    // only a project/task ID. A transfer must immediately fence old org tokens.
+    const projectId = scope?.projectId ?? (scope?.taskId ? (await this.store?.taskProjectIdAsync(scope.taskId)) : undefined);
+    const projectOrganization = projectId ? await this.store?.projectOrganizationAsync(projectId) : undefined;
+    if (projectOrganization && record.organizationId && projectOrganization !== record.organizationId)
+      return { ok: false, record, reason: 'project belongs to another organization' };
+    if (projectId && !capability.endsWith(':read') && !capability.startsWith('project:transfer-')) {
+      const lock = await this.store?.kvGet(`project-transfer-lock:${projectId}`);
+      if (lock && JSON.parse(lock).expiresAt > Date.now()
+        && !(JSON.parse(lock).kind === 'delete' && capability === 'project:delete'))
+        return { ok: false, record, reason: 'project move in progress; retry when it finishes' };
+    }
+    if (scope?.taskId && await this.store?.kvGet(`project-transfer-history:${scope.taskId}`)
+      && ['task:signal', 'task:create', 'task:edit', 'task:conversation:message', 'task:review:execute', 'task:git:publish',
+        'resolve-decision', 'confirm-decision', 'review:approve'].includes(capability))
+      return { ok: false, record, reason: 'This task is history from before the project moved. Start a new task to continue work.' };
+
     // Historical records predate the audience field and are platform-only by
     // construction. Treat them as this audience during their bounded TTL.
     if ((record.audience ?? 'karmax-platform') !== (scope?.audience ?? 'karmax-platform'))

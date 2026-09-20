@@ -1015,8 +1015,16 @@ export class Store {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
-  async createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Promise<Project> {
+  /** Keep slug checks and transfers under the same database transaction lock. */
+  private async projectNameTransaction<T>(write: () => Promise<T>): Promise<T> {
     return this.db.transaction(async () => {
+      if (this.db.dialect === 'postgres') await this.db.exec('LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE');
+      return write();
+    });
+  }
+
+  async createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Promise<Project> {
+    return this.projectNameTransaction(async () => {
 
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const path = parseProjectPath(name);
@@ -1051,7 +1059,7 @@ export class Store {
   }
 
   async renameProject(id: string, name: string): Promise<Project> {
-    return this.db.transaction(async () => {
+    return this.projectNameTransaction(async () => {
 
     const existing = (await this.getProject(id));
     if (!existing) throw new Error(`no project ${id}`);
@@ -3049,6 +3057,7 @@ export class Store {
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
 
+    await this.assertProjectNotTransferring(input.projectId);
     const listId =
       input.listId ?? (await this.listLists(input.projectId))[0]?.id ?? (await this.createList(input.projectId, 'Tasks')).id;
     const ord =
@@ -3735,6 +3744,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     const t = (await this.getTask(taskId));
+    if (t?.projectId) await this.assertProjectNotTransferring(t.projectId);
     if (!t) return;
     // A single UPDATE makes MAX+1 allocation safe even if two Store instances
     // queue tasks concurrently against the same SQLite database.
@@ -4850,6 +4860,10 @@ export class Store {
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     const prefix = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
     for (const projectId of projectIds) {
+      const recoveryPrefix = `environment-build-recovery:${projectId}:`;
+      await prefix.run(recoveryPrefix, recoveryPrefix);
+      await exact.run(`project-transfer-current:${projectId}`);
+      await exact.run(`project-transfer-lock:${projectId}`);
       (await exact.run(`authz:default:project:${projectId}`));
       (await exact.run(`credpolicy:project:${projectId}`));
       (await exact.run(`avatars:project:${projectId}`));
@@ -4858,6 +4872,7 @@ export class Store {
       (await prefix.run(workflowPrefix, workflowPrefix));
     }
     for (const taskId of taskIds) {
+      await exact.run(`project-transfer-history:${taskId}`);
       const sharePrefix = `conversation-share-index:${taskId}:`;
       const shares = (await this.db.prepare('SELECT v FROM kv WHERE substr(k, 1, length(?))=?').all(sharePrefix, sharePrefix)) as Array<{ v: string }>;
       for (const share of shares) (await exact.run(`conversation-share:${share.v}`));
@@ -5184,6 +5199,19 @@ export class Store {
   async setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
     return this.db.transaction(async () => {
 
+    if (workflow === 'vault') {
+      const grants = values.credentialGrants;
+      if (grants !== undefined && (!Array.isArray(grants) || grants.length > 500
+        || grants.some(grant => typeof grant !== 'string' || !/^use-credential:item:[a-zA-Z0-9_-]+$/.test(grant))
+        || new Set(grants).size !== grants.length)) throw new Error('Choose individual vault credentials for task defaults');
+      const policies = values.credentialPolicies;
+      if (policies !== undefined && (!policies || typeof policies !== 'object' || Array.isArray(policies)
+        || Object.entries(policies).some(([id, policy]) => !Array.isArray(grants) || !grants.includes(`use-credential:item:${id}`)
+          || !policy || typeof policy !== 'object' || Array.isArray(policy)
+          || Object.entries(policy).some(([key, value]) => key === 'use' ? !['auto', 'ask'].includes(value as string)
+            : key === 'reveal' ? !['auto', 'ask', 'never'].includes(value as string) : true))))
+        throw new Error('Invalid vault credential default policies');
+    }
     // A fresh epoch prevents an in-flight span crossing a rapid off/on cycle.
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
     if (workflow === 'payments') {
@@ -5209,13 +5237,25 @@ export class Store {
     });
   }
 
+  /** Fence late asynchronous provisioning across an organization transfer. */
+  async assertProjectOrganization(projectId: string, organizationId: string): Promise<void> {
+    const project = await this.getProject(projectId);
+    if (!project || project.organizationId !== organizationId) throw new Error('project organization changed; reload and retry');
+    await this.assertProjectNotTransferring(projectId);
+  }
+
+  async assertProjectNotTransferring(projectId: string): Promise<void> {
+    const lock = await this.kvGet(`project-transfer-lock:${projectId}`);
+    if (lock && JSON.parse(lock).expiresAt > Date.now()) throw new Error('project move in progress; retry when it finishes');
+  }
+
   // ─── Project resources ──────────────────────────────────────────────────
 
   async createResourceAttachment(input: Omit<ResourceAttachment, 'id' | 'createdAt' | 'updatedAt' | 'enabled'>
     & Partial<Pick<ResourceAttachment, 'id' | 'createdAt' | 'updatedAt' | 'enabled'>>): Promise<ResourceAttachment> {
     return this.db.transaction(async () => {
 
-    if (!(await this.getProject(input.projectId))) throw new Error('resource project not found');
+    await this.assertProjectOrganization(input.projectId, input.organizationId);
     const now = input.createdAt ?? Date.now();
     const value: ResourceAttachment = { ...input, id: input.id ?? newId('resource'), enabled: input.enabled ?? true,
       createdAt: now, updatedAt: input.updatedAt ?? now };
@@ -6320,6 +6360,7 @@ export class Store {
     & Partial<Pick<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>>): Promise<ExecutionRecord> {
     return this.db.transaction(async () => {
 
+    await this.assertProjectOrganization(input.projectId, input.organizationId);
     const startedAt = input.startedAt ?? Date.now();
     const value: ExecutionRecord = { ...input, state: input.state ?? 'starting', startedAt,
       heartbeatAt: input.heartbeatAt ?? startedAt };
@@ -6644,6 +6685,7 @@ export class Store {
     status: string; reason?: string; shortfall?: number; expiresAt?: number }): Promise<any> {
     return this.db.transaction(async () => {
 
+    await this.assertProjectOrganization(input.projectId, input.organizationId);
     const now = Date.now();
     const id = newId('spend');
     (await this.db.prepare(`INSERT INTO payment_spend_requests
@@ -6927,12 +6969,12 @@ export class Store {
     const now = Date.now();
     let revoked = 0;
     for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-      try {
-        const record = JSON.parse(row.json) as { projectId?: string; organizationId?: string };
-        if ((scope.projectId && record.projectId === scope.projectId)
+      let record: { projectId?: string; projectIds?: string[]; organizationId?: string; taskId?: string };
+      try { record = JSON.parse(row.json); } catch { continue; }
+        if ((scope.projectId && (record.projectId === scope.projectId || record.projectIds?.includes(scope.projectId)
+          || (record.taskId && (await this.taskProjectIdAsync(record.taskId)) === scope.projectId)))
           || (scope.organizationId && record.organizationId === scope.organizationId))
           revoked += Number((await update.run(now, row.tokenHash)).changes);
-      } catch {}
     }
     return revoked;
   
@@ -7268,7 +7310,7 @@ function parseJsonOptional<T>(value: unknown): T | undefined {
   return typeof value === 'string' && value ? JSON.parse(value) as T : undefined;
 }
 
-function slugify(value: string): string {
+export function slugify(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
 }
 

@@ -1060,10 +1060,14 @@ export class KarmaxApi {
     if (args.authorization && profileAttenuated
       && !(args.draft && args.allowAttenuation) && !args.acceptAttenuation)
       throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
-    this.applyCredentialGrants(authorization, args.credentialGrants, caller.caps);
-    const credentialPolicies = (await this.credentialPolicyOverrides(
-      project.organizationId ?? 'org_personal', args.credentialPolicies, caller.caps, authorization,
-    ));
+    const orgVault = (await this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault')) ?? {};
+    const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
+    const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
+    const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
+    this.applyCredentialGrants(authorization, grants, caller.caps);
+    const credentialPolicies = await this.credentialPolicyOverrides(
+      project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
+    );
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -1142,56 +1146,65 @@ export class KarmaxApi {
     // project/global defaults could never reach an unqueued task. Keeping the
     // task sparse means it re-resolves against the live defaults when it's
     // finally queued (createTask below for immediate start, queueTask for drafts).
-    let task = (await this.deps.store.createTask({
-      projectId: args.projectId,
-      title,
-      workflow,
-      workflowVersion: manifest.version,
-      params: {
-        ...taskOverrides,
-        prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
-        // Once an immediate task is queued, branch policy is execution state,
-        // not an inheritable form default. Persist the exact pair provisioning
-        // receives so recovery/fork/retarget paths cannot reconstruct a
-        // different base from changed project settings.
-        ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
-        ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
-        [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
-        profiles: args.profiles,
-        draft: !!args.draft,
-        _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
-          ...(profileAttenuated ? { attenuationAccepted: args.acceptAttenuation === true } : {}) },
-        ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
-        ...(repeatable ? { repeatable: true } : {}),
-      },
-      confirmer: (() => {
-        const field = manifest.params.find((f) => f.type === 'confirmer');
-        return field ? resolved[field.name] : undefined;
-      })(),
-      createdBy,
-      assignee: args.assignee,
-      delegate: args.delegate,
-      confirmationPolicy,
-    }));
-    const authorizationScope = authorization as typeof authorization & {
-      scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
-    };
-    const delegation = (await this.delegateTaskHuman(token, caller, {
-      taskId: task.id,
-      projectId: authorizationScope.scope ? undefined : task.projectId,
-      projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
-      organizationId: authorizationScope.scope === 'global' ? undefined
-        : (authorizationScope.organizationId ?? project.organizationId),
-      externalIdentities: githubAccountId ? { githubAccountId } : undefined,
-    }));
-    if (delegation) {
-      (await this.deps.store.updateTaskParams(task.id, {
-        ...task.params,
-        _authorization: { ...(task.params._authorization as object), delegationId: delegation.id },
+    // Resolution may await external policy. Do not persist a task prepared
+    // against an organization that changed while we were awaiting it.
+    let { task, delegation } = await this.deps.store.transaction(async () => {
+      await this.require(token, 'create_task', { projectId: args.projectId });
+      if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId)
+        throw new ValidationError('Project moved while preparing this task. Reload and retry.');
+      let task = (await this.deps.store.createTask({
+        projectId: args.projectId,
+        title,
+        workflow,
+        workflowVersion: manifest.version,
+        params: {
+          ...taskOverrides,
+          prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
+          // Once an immediate task is queued, branch policy is execution state,
+          // not an inheritable form default. Persist the exact pair provisioning
+          // receives so recovery/fork/retarget paths cannot reconstruct a
+          // different base from changed project settings.
+          ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
+          ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+          profiles: args.profiles,
+          draft: !!args.draft,
+          _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
+            ...(profileAttenuated ? { attenuationAccepted: args.acceptAttenuation === true } : {}) },
+          ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
+          ...(repeatable ? { repeatable: true } : {}),
+        },
+        confirmer: (() => {
+          const field = manifest.params.find((f) => f.type === 'confirmer');
+          return field ? resolved[field.name] : undefined;
+        })(),
+        createdBy,
+        assignee: args.assignee,
+        delegate: args.delegate,
+        confirmationPolicy,
       }));
-      task = (await this.deps.store.getTask(task.id))!;
-    }
-    (await this.persistTaskCredentialPolicies(task));
+      const authorizationScope = authorization as typeof authorization & {
+        scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
+      };
+      const delegation = (await this.delegateTaskHuman(token, caller, {
+        taskId: task.id,
+        projectId: authorizationScope.scope ? undefined : task.projectId,
+        projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
+        organizationId: authorizationScope.scope === 'global' ? undefined
+          : (authorizationScope.organizationId ?? project.organizationId),
+        externalIdentities: githubAccountId ? { githubAccountId } : undefined,
+      }));
+      if (delegation) {
+        (await this.deps.store.updateTaskParams(task.id, {
+          ...task.params,
+          _authorization: { ...(task.params._authorization as object), delegationId: delegation.id },
+        }));
+        task = (await this.deps.store.getTask(task.id))!;
+      }
+      (await this.persistTaskCredentialPolicies(task));
+
+      return { task, delegation };
+    });
     // Advisory only: GitHub is an external policy authority, so this can become
     // stale and is always revalidated at Merge. Still, catching the common
     // missing-reviewer setup at queue time is much kinder than discovering it
@@ -1634,6 +1647,11 @@ export class KarmaxApi {
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     if ((files as FileRef[] | undefined)?.length) input.files = files as FileRef[];
     if (_discardProgress === true) input.discardProgress = true;
+    const transferLock = await this.deps.store.kvGet(`project-transfer-lock:${project.id}`);
+    if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId
+      || transferLock && JSON.parse(transferLock).expiresAt > Date.now()
+      || await this.deps.store.kvGet(`project-transfer-history:${task.id}`))
+      throw new ValidationError('Project moved or is moving. Reload and start a new task.');
     return { startType, input, version: manifest.version };
   }
 
@@ -2242,6 +2260,10 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
+        const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
+        view = history;
+      }
       // Existing parked executions recorded only "account". Read the small
       // coordinator projection to explain that wait without replaying the task
       // or restarting its agent. New lease results already carry this detail.
@@ -2272,6 +2294,8 @@ export class KarmaxApi {
         ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
           : { actions: this.lifecycleActions(view) }),
+        ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
+          ? { actions: [], stageTransitions: [] } : {}),
       };
     };
     // Snapshot-first (the default). The workflow persists `lastView` to the store on

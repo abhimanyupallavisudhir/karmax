@@ -6005,9 +6005,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   const attemptGroupRequest = draft?.id && !cachedAttemptGroup
     ? api(`/api/tasks/${draft.id}/attempts`).catch(() => null)
     : Promise.resolve(cachedAttemptGroup);
-  const [inherited, formAttemptGroup] = await Promise.all([
+  const [inherited, formAttemptGroup, inheritedVault] = await Promise.all([
     consumeTaskFormDefaults(projectId, wf),
     attemptGroupRequest,
+    draft ? {} : readVaultDefaults(projectId, projectOrganizationId).catch(error => ({ error: error.message })),
   ]);
   // The user may have dismissed the loading page or navigated while either
   // request was in flight. Never let a late response reopen the old form.
@@ -6229,9 +6230,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // sidebar stays one compact button; the full checkbox list lives in a modal.
   // Applying a selection dispatches a change event into the form's auto-save
   // listener; grants persist via createTask/PATCH authorization.
-  const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities || [])
+  const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities ?? inheritedVault.credentialGrants ?? [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
-  let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies || {}));
+  let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies ?? inheritedVault.credentialPolicies ?? {}));
   let refreshVaultCount = () => {};
   // A fork's "Re-authorize previous grants?" writes into these same controls.
   wireResumeReauthorization($('#tf-body'), {
@@ -6251,6 +6252,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     if (!button || !count) return;
     // Vault items are organization-scoped — read the project's org's vault.
     const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
+    if (inheritedVault.error) { count.textContent = inheritedVault.error; return; }
     let items = [];
     try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
     catch { button.closest('[data-row="__vault"]')?.remove(); return; }
@@ -6304,8 +6306,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       body, notes: $('#tf-notes')?.value ?? '',
       authorization: readAuthorizationEditor($('#tf-authorization')),
       // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
-      credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
-      credentialPolicies: vaultCredentialPolicies,
+      credentialGrants: inheritedVault.error ? undefined : [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+      credentialPolicies: inheritedVault.error ? undefined : vaultCredentialPolicies,
     };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
@@ -11417,7 +11419,68 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + unique;
+  return common + resourceDefaultsHtml(scope) + unique;
+}
+
+function resourceDefaultsHtml(scope) {
+  return `<div class="card resource-defaults" data-resource-defaults="${scope}">
+    <div class="form-row"><button type="button" class="btn tf-vault-button resource-vault" disabled><span>Vault credentials</span><span class="tf-vault-count">Loading…</span></button></div>
+    ${taskPaymentsHtml(`resource-payments-${scope}`)}
+    <button class="btn primary sm resource-save" type="button" disabled>Save defaults</button>
+    <button class="btn sm resource-reset" type="button" disabled>Reset to inherited</button>
+    <span class="resource-error" role="status"></span></div>`;
+}
+async function readVaultDefaults(projectId, organizationId) {
+  const [org, project] = await Promise.all([
+    api(`/api/organizations/${encodeURIComponent(organizationId)}/settings/vault`),
+    projectId ? api(`/api/settings/project/${encodeURIComponent(projectId)}/vault`) : {},
+  ]);
+  // Selection and per-item policies form one override, including an explicit empty selection.
+  return Object.hasOwn(project, 'credentialGrants') ? project : org;
+}
+async function hydrateResourceDefaults(scope, projectId, organizationId) {
+  organizationId ||= S.projects.find(p => p.id === projectId)?.organizationId || S.organizationId;
+  const box = document.querySelector(`[data-resource-defaults="${scope}"]`); if (!box) return;
+  const current = beginAsyncElementRender(box);
+  const base = projectId ? `/api/settings/project/${encodeURIComponent(projectId)}` : `/api/organizations/${encodeURIComponent(organizationId)}/settings`;
+  try {
+    const [defaults, items] = await Promise.all([
+      readVaultDefaults(projectId, organizationId), api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId)}`),
+    ]);
+    if (!current()) return;
+    let ids = new Set((defaults.credentialGrants || []).map(id => id.slice('use-credential:item:'.length)));
+    let policies = defaults.credentialPolicies || {}, vaultDirty = false;
+    const paymentDirty = new Set();
+    const button = box.querySelector('.resource-vault');
+    const count = () => { button.querySelector('.tf-vault-count').textContent = `${ids.size} selected`; };
+    count(); button.disabled = false;
+    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; count(); });
+    const payments = box.querySelector('.task-payments');
+    await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
+    if (!current()) return;
+    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget')) paymentDirty.add('budget'); };
+    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget'); };
+    box.querySelector('.resource-save').disabled = false;
+    box.querySelector('.resource-reset').disabled = false;
+    box.querySelector('.resource-save').onclick = async event => {
+      try {
+        if (vaultDirty) await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: { credentialGrants: [...ids].map(id => `use-credential:item:${id}`), credentialPolicies: policies } }) });
+        if (paymentDirty.size) {
+          const payment = readTaskPayments(payments); if (!payment) throw new Error('Payment defaults are still loading');
+          await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: { ...await api(`${base}/payments`), ...Object.fromEntries([...paymentDirty].map(key => [key, payment[key]])) } }) });
+        }
+        flashSaved(event.currentTarget); vaultDirty = false; paymentDirty.clear();
+      } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
+    };
+    box.querySelector('.resource-reset').onclick = async () => {
+      try {
+        await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: {} }) });
+        const { cardIds, budget, allowance, threshold, ...rest } = await api(`${base}/payments`);
+        await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: rest }) });
+        await hydrateResourceDefaults(scope, projectId, organizationId);
+      } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
+    };
+  } catch (error) { if (current()) box.querySelector('.resource-error').textContent = error.message; }
 }
 
 function explanationSettingsCard(scope) {
@@ -12439,12 +12502,13 @@ function settingsView(proj) {
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
-    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
-    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="card" data-settings-advanced hidden>
       <div class="section-h" data-settings-access="project" hidden>Project name</div>
-      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
-    </div></div></div></div>`;
+      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm" id="move-project" data-settings-access="projectTransfer" hidden>Move to organization…</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
+    </div>
+    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
+    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
+    </div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
   return `<div class="card">
@@ -12710,7 +12774,7 @@ async function hydrateProjectEnvironment(proj) {
   const box = $('#project-environment-box'); if (!box) return;
   try {
     const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
-    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div></div>`;
+    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
@@ -12728,6 +12792,26 @@ async function hydrateProjectEnvironment(proj) {
       </div>
       <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : ''}`;
+    box.querySelectorAll('[data-environment-recover]').forEach(button => button.addEventListener('click', async () => {
+      const record = builds.find(build => build.recoveryRevision === button.dataset.environmentRecover);
+      if (!record) return;
+      const artifact = record.artifactName || `karmax-env-${proj.id.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${record.digest}`.toLowerCase();
+      const cleanup = ['worktree', 'memory'].includes(record.provider)
+        ? 'Verify that the gateway which started this build has stopped working on it. No provider artifact needs removal.'
+        : `Stop the builder or build job in ${record.provider} first, and remove its image or snapshot named “${artifact}”.`
+          + (record.builderId ? ` Builder: ${record.builderId}.` : ' For older builds, locate the builder in the provider dashboard or on the build host.')
+          + (record.buildHost ? ` Build host: ${record.buildHost}.` : '');
+      const note = prompt(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
+      if (!note?.trim()) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${proj.id}/environment/build/recover`, { method: 'POST', body: JSON.stringify({
+          provider: record.provider, digest: record.digest, revision: record.recoveryRevision, cleanupConfirmed: true, cleanupNote: note.trim(),
+        }) });
+        toast('Build recovered. You can rebuild or move the project.');
+        await hydrateProjectEnvironment(proj);
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    }));
     $('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
@@ -13016,6 +13100,7 @@ function wireSettingsView(proj) {
   hydrateProjectServices(proj);
   hydrateProjectEnvironment(proj);
   hydrateSettingsForms('project', proj.id);
+  hydrateResourceDefaults('project', proj.id, proj.organizationId);
   hydrateExplanationSettings('project', proj.id, proj.organizationId);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);
@@ -13052,6 +13137,7 @@ function wireSettingsView(proj) {
   $('#project-name')?.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
   });
+  $('#move-project')?.addEventListener('click', () => moveProject(proj));
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -13075,6 +13161,110 @@ function wireSettingsView(proj) {
       renderRail();
       renderMain();
     } catch (e) { toast(e.message, true); }
+  });
+}
+
+function moveProject(project) {
+  const opener = document.activeElement;
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="move-project-title">
+    <div class="new-project-head"><b id="move-project-title">Move “${esc(project.name)}”</b><button class="icon-btn" type="button" data-close aria-label="Close">×</button></div>
+    <label class="form-row"><span>Destination</span><select data-destination aria-label="Destination organization" disabled><option value="">Loading…</option></select></label>
+    <div data-preview aria-live="polite"></div>
+    <div class="form-error" data-error role="alert" hidden></div>
+    <div class="new-project-actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit" disabled>Move project</button></div>
+  </form></div>`;
+  const select = host.querySelector('[data-destination]');
+  const previewBox = host.querySelector('[data-preview]');
+  const error = host.querySelector('[data-error]');
+  const submit = host.querySelector('[type="submit"]');
+  const controller = new AbortController();
+  let closed = false, moving = false, revision = 0, preview;
+  const close = () => {
+    if (closed || moving) return;
+    closed = true;
+    controller.abort();
+    document.removeEventListener('keydown', keydown);
+    host.remove();
+    opener?.focus?.();
+  };
+  const keydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); close(); }
+    if (event.key !== 'Tab') return;
+    const controls = [...host.querySelectorAll('button:not(:disabled), select:not(:disabled), summary')];
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  };
+  host.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', close));
+  host.querySelector('.modal-overlay').addEventListener('mousedown', event => { if (event.target === event.currentTarget) close(); });
+  const loadPreview = async () => {
+    const current = ++revision;
+    preview = undefined; submit.disabled = true; error.hidden = true;
+    previewBox.textContent = select.value ? 'Checking project…' : '';
+    if (!select.value) return;
+    try {
+      const value = await api(`/api/projects/${encodeURIComponent(project.id)}/transfer?destinationOrganizationId=${encodeURIComponent(select.value)}`, { signal: controller.signal });
+      if (closed || revision !== current) return;
+      preview = value;
+      previewBox.innerHTML = `<p class="task-sub">${value.taskCount} task${value.taskCount === 1 ? '' : 's'} · History preserved</p>
+        <details><summary>Access and settings will change</summary><ul>${value.changes.map(change => `<li>${esc(change)}</li>`).join('')}</ul></details>
+        ${value.blockers.length ? `<div class="form-error" role="alert"><ul>${value.blockers.map(blocker => `<li>${esc(blocker.message)}</li>`).join('')}</ul></div>` : ''}`;
+      submit.disabled = !!value.blockers.length;
+    } catch (cause) {
+      if (closed || revision !== current) return;
+      previewBox.textContent = ''; error.textContent = cause.message; error.hidden = false;
+    }
+  };
+  select.addEventListener('change', loadPreview);
+  host.querySelector('form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!preview || preview.blockers.length || moving) return;
+    moving = true; submit.disabled = true; select.disabled = true; submit.textContent = 'Moving…'; error.hidden = true;
+    host.querySelectorAll('[data-close]').forEach(button => { button.disabled = true; });
+    try {
+      const moved = await api(`/api/projects/${encodeURIComponent(project.id)}/transfer`, {
+        method: 'POST', body: JSON.stringify({ destinationOrganizationId: select.value, previewId: preview.id }),
+      });
+      moving = false; close();
+      // Reset the selection so the route reloads permissions and task state even
+      // though this project's stable ID has not changed.
+      S.projectId = null;
+      await loadProjects();
+      S.projectId = null; S.organizationId = project.organizationId;
+      await go(projectById(moved.id) ? projectRoute(moved.id, 'settings') : globalRoute('dashboard', organizationById(moved.organizationId)));
+      toast(`Moved “${moved.name}”`);
+    } catch (cause) {
+      moving = false;
+      if (closed) { toast(cause.message, true); return; }
+      error.textContent = cause.message; error.hidden = false;
+      select.disabled = false; submit.textContent = 'Move project';
+      // Keep the same preview on transport failures: the server stores the
+      // result, so retry cannot perform a second transfer. A conflict needs a
+      // fresh preview; selecting the destination again refreshes it.
+      submit.disabled = cause.status === 409 || cause.status === 403;
+      if (cause.status === 409) {
+        const retry = document.createElement('button');
+        retry.type = 'button'; retry.className = 'btn sm'; retry.textContent = 'Check again';
+        retry.addEventListener('click', () => { retry.remove(); loadPreview(); });
+        error.append(' ', retry);
+      }
+      host.querySelectorAll('[data-close]').forEach(button => { button.disabled = false; });
+    }
+  });
+  $('#modal-root').appendChild(host);
+  document.addEventListener('keydown', keydown);
+  host.querySelector('[data-close]').focus();
+  api(`/api/projects/${encodeURIComponent(project.id)}/transfer`, { signal: controller.signal }).then(value => {
+    if (closed) return;
+    select.innerHTML = `<option value="">${value.organizations.length ? 'Choose organization' : 'No eligible organizations'}</option>`
+      + value.organizations.map(org => `<option value="${esc(org.id)}">${esc(org.name)}</option>`).join('');
+    select.disabled = !value.organizations.length;
+    if (value.organizations.length) select.focus();
+  }).catch(cause => {
+    if (closed) return;
+    select.innerHTML = '<option value="">Unavailable</option>';
+    error.textContent = cause.message; error.hidden = false;
   });
 }
 
@@ -13233,8 +13423,8 @@ function globalSettingsView(embedded = false) {
     ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
-      <p class="task-sub">Connect your accounts once. Choose which projects may use them. Service credentials are managed by Composio.</p>
-      <div id="service-connections">Loading connections…</div></div>
+      <p class="task-sub">List of connected apps. To set defaults, go to <a href="#settings-defaults">Task defaults</a>.</p>
+      <div id="native-connections">Loading connections…</div></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
     ${agentMailCard()}
@@ -13556,10 +13746,7 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Task defaults</div>
-    ${taskPaymentsHtml(`pay-defaults-${scope}`)}
-    <button class="btn sm" data-savepolicy="${scope}">Save defaults</button>
-    <div class="section-h" style="margin-top:20px">Saved cards</div>
+    <div class="section-h">Saved cards</div>
     <div class="cards-list" style="margin-bottom:10px"></div>
     <details class="payment-add-card"><summary>Add card</summary>
     <div class="payment-card-form">
@@ -13952,23 +14139,6 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
       await syncPaymentProviderControls(box, providerData, paymentsBase);
     } catch (e) { toast(e.message, true); }
   });
-  const sUrl = scope === 'global' && organizationId
-    ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`
-    : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
-  let policy = {};
-  try { policy = await api(sUrl); } catch {}
-  const defaults = box.querySelector('.task-payments');
-  await wireTaskPayments(defaults, projectId, undefined, undefined, organizationId);
-  box.querySelector(`[data-savepolicy]`).addEventListener('click', async () => {
-    try {
-      const selected = readTaskPayments(defaults);
-      if (!selected) throw new Error('Payment defaults are still loading');
-      const { allowance, threshold, ...rest } = policy;
-      await api(sUrl, { method: 'PUT', body: JSON.stringify({ values: { ...rest, ...selected } }) });
-      policy = { ...rest, ...selected };
-      toast('Payment defaults saved');
-    } catch (e) { toast(e.message, true); }
-  });
   const renderCards = async () => {
     let cards = [];
     const q = [projectId ? `projectId=${projectId}` : '', orgQ].filter(Boolean).join('&');
@@ -13976,7 +14146,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     // The org-settings surface shows the org's own cards (+ legacy global);
     // the project surface shows project cards (its org's cards appear too).
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
-    defaults._setCards?.(cards);
+    document.querySelector(`[data-resource-defaults="${scope}"] .task-payments`)?._setCards?.(cards);
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
@@ -14407,7 +14577,7 @@ async function wireInstallationComposioCard() {
     const config = await api('/api/connections/config');
     if (!box.isConnected) return;
     box.innerHTML = `<div class="section-h">Composio <span class="chip">${config.configured ? 'configured' : 'setup required'}</span></div>
-      <p class="task-sub">One Composio project API key serves every organization in this installation. Users connect their own accounts in Organization → Connected apps and choose which projects may use them.</p>
+      <p class="task-sub">One Composio project API key serves every organization in this installation. Users connect their own accounts in Passwords & payments or the Tools picker and choose which projects may use them.</p>
       ${config.canConfigure ? `<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="${config.configured ? 'New key to replace the configured key' : 'Composio project API key'}" autocomplete="new-password" required aria-label="Composio project API key"><button class="btn sm primary">${config.configured ? 'Replace API key' : 'Set up connections'}</button></form>` : ''}`;
     box.querySelector('[data-composio-config]')?.addEventListener('submit', async event => {
       event.preventDefault();
@@ -14424,39 +14594,94 @@ async function wireInstallationComposioCard() {
   } catch (error) { if (box.isConnected) paneError(box, error, wireInstallationComposioCard); }
 }
 
-async function hydrateConnections(organizationId) {
-  const root = document.getElementById('service-connections'); if (!root) return;
-  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
-  try {
-    const [config, connections] = await Promise.all([api(`/api/connections/config${oq}`), api(`/api/connections${oq}`)]);
-    if (!root.isConnected) return;
-    root.innerHTML = `${!config.configured ? `<p class="task-sub">An installation administrator needs to configure Composio before accounts can be connected.</p>
-      ${config.canConfigure ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-composio">Set up Composio in Installation settings</a>` : ''}` : `
-      <form data-connection-search class="inline-form"><input name="search" placeholder="Search apps, e.g. Gmail or Slack" aria-label="Search apps"><button class="btn sm">Search apps</button></form>
-      <div data-connection-catalog></div>`}
-      <div data-connection-list>${connectionRows(connections)}${!connections.length ? '<p class="task-sub">No accounts connected yet.</p>' : ''}</div>`;
-    const refresh = () => hydrateConnections(organizationId);
-    wireConnectionActions(root, organizationId, refresh);
-    root.querySelector('[data-connection-search]')?.addEventListener('submit', async e => {
-      e.preventDefault(); const form = e.currentTarget; const box = root.querySelector('[data-connection-catalog]');
-      box.textContent = 'Searching apps…';
-      try {
-        const apps = await api(`/api/connections/catalog${oq}&search=${encodeURIComponent(form.elements.search.value)}`);
-        box.innerHTML = apps.length ? apps.map(a => `<button type="button" class="btn sm" data-app="${esc(a.slug)}">Connect ${esc(a.name)}</button>`).join(' ') : '<p>No matching apps.</p>';
-        box.querySelectorAll('[data-app]').forEach(button => button.addEventListener('click', async () => {
-          const popup = window.open('about:blank', '_blank'); if (popup) popup.opener = null;
-          button.disabled = true;
-          try {
-            const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ toolkit: button.dataset.app }) });
-            if (popup && result.url) popup.location.href = result.url;
-            box.innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">After signing in, check the account’s status below.</p>`;
-            const list = root.querySelector('[data-connection-list]');
-            list.innerHTML = connectionRows(await api(`/api/connections${oq}`)); wireConnectionActions(list, organizationId, refresh);
-          } catch (error) { popup?.close(); button.disabled = false; toast(error.message, true); }
-        }));
-      } catch (error) { paneError(box, error, () => form.requestSubmit()); }
+async function hydrateNativeConnections(organizationId) {
+  const root = document.getElementById('native-connections'); if (!root) return;
+  const query = mcpScope(null, organizationId);
+  root.innerHTML = `${mcpPickerHtml([], [])}<div class="connected-app-list"></div>`;
+  const picker = root.querySelector('.mcp-picker');
+  picker.dataset.manager = 'true';
+  await wireMcpPicker(picker, query);
+}
+
+function connectionScope(query) {
+  const params = new URLSearchParams(query);
+  const projectId = params.get('projectId');
+  const organizationId = params.get('organizationId') || S.projects.find(p => p.id === projectId)?.organizationId || S.organizationId;
+  return { projectId, organizationId, query: `?organizationId=${encodeURIComponent(organizationId)}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}` };
+}
+
+async function openConnectorEditor(query, changed, app, existing) {
+  const scope = connectionScope(query);
+  const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog';
+  dialog.setAttribute('aria-label', 'Connect app');
+  dialog.innerHTML = `<div class="mcp-dialog-header"><h2>${esc(existing?.label || app?.name || 'Connect app')} <span class="chip">Composio</span></h2><button type="button" class="btn sm connector-close" aria-label="Close">✕</button></div>
+    <p class="task-sub">Sign in with your account, then choose which projects may use it.</p><div class="connector-account"></div>
+    <button class="btn primary connector-signin" type="button">${existing ? 'Reconnect' : 'Sign in'}</button>
+    <button class="btn connector-check" type="button" hidden>Check status</button>
+    <button class="btn primary connector-use" type="button" hidden>Use connection</button><p class="connector-message" role="status"></p>`;
+  document.body.append(dialog); dialog.showModal();
+  let connection = existing, busy = false;
+  const own = () => !connection?.ownerId || connection.ownerId === (typeof S.user === 'string' ? S.user : S.user?.id);
+  const message = text => { dialog.querySelector('.connector-message').textContent = text; };
+  const refresh = async () => {
+    if (!connection || !own() || busy || !dialog.isConnected) return;
+    busy = true;
+    try {
+      connection = await api(`/api/connections/${encodeURIComponent(connection.id)}/refresh${scope.query}`, { method: 'POST', body: '{}' });
+      paint();
+    } catch (error) { message(error.message); }
+    finally { busy = false; }
+  };
+  function paint() {
+    if (!dialog.isConnected) return;
+    dialog.querySelector('.connector-account').innerHTML = connection ? connectionRows([connection]) : '';
+    wireConnectionActions(dialog.querySelector('.connector-account'), scope.organizationId, async () => {
+      const items = await api(`/api/connections${scope.query}`);
+      connection = items.find(c => c.id === connection.id); paint(); await changed();
     });
-  } catch (error) { if (root.isConnected) paneError(root, error, () => hydrateConnections(organizationId)); }
+    dialog.querySelector('.connector-signin').hidden = !own();
+    dialog.querySelector('.connector-signin').textContent = connection ? 'Reconnect' : 'Sign in';
+    dialog.querySelector('.connector-check').hidden = !connection || !own();
+    dialog.querySelector('.connector-use').hidden = connection?.status !== 'active';
+    if (scope.projectId && connection && !connection.projectIds.includes(scope.projectId)) {
+      const checkbox = [...dialog.querySelectorAll('.connection-project input')].find(input => input.value === scope.projectId);
+      if (checkbox) checkbox.checked = true;
+    }
+  }
+  dialog.querySelector('.connector-close').onclick = () => dialog.close();
+  dialog.querySelector('.connector-signin').onclick = async () => {
+    const popup = window.open('about:blank', '_blank'); if (popup) popup.opener = null;
+    const button = dialog.querySelector('.connector-signin'); button.disabled = true;
+    try {
+      const result = await api(`/api/connections/connect${scope.query}`, { method: 'POST', body: JSON.stringify({ id: connection?.id, toolkit: app?.slug, restart: !!connection }) });
+      connection = result.connection;
+      paint();
+      if (result.url) {
+        if (popup) popup.location.href = result.url;
+        message('Complete sign-in in the new tab, then check status.');
+        const link = document.createElement('a'); link.href = result.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Open sign-in';
+        dialog.querySelector('.connector-message').append(' ', link);
+      } else popup?.close();
+    } catch (error) { popup?.close(); message(error.message); }
+    finally { button.disabled = false; }
+  };
+  dialog.querySelector('.connector-check').onclick = refresh;
+  dialog.querySelector('.connector-use').onclick = async event => {
+    event.currentTarget.disabled = true;
+    try {
+      const inputs = [...dialog.querySelectorAll('.connection-project input')];
+      if (inputs.length) connection = await api(`/api/connections/${encodeURIComponent(connection.id)}/access${scope.query}`, { method: 'PUT', body: JSON.stringify({ projectIds: inputs.filter(input => input.checked).map(input => input.value) }) });
+      if (scope.projectId && !connection.projectIds.includes(scope.projectId)) throw new Error('Share this account with this project before selecting it.');
+      await changed({ ...connection, id: `composio:${connection.id}`, enabled: true, connected: true, connector: connection });
+      dialog.close();
+    } catch (error) { message(error.message); event.currentTarget.disabled = false; }
+  };
+  const focus = () => { if (connection?.status === 'connecting') refresh(); };
+  window.addEventListener('focus', focus);
+  paint();
+  await new Promise(resolve => dialog.addEventListener('close', resolve, { once: true }));
+  window.removeEventListener('focus', focus); dialog.remove();
+  await changed();
 }
 
 function passwordsCard() {
@@ -15335,6 +15560,7 @@ function profilesCard(scope) {
 
 function wireGlobalSettings(organizationId) {
   hydrateSettingsForms('global', undefined, organizationId);
+  hydrateResourceDefaults('global', undefined, organizationId);
   hydrateExplanationSettings('global', undefined, organizationId || S.organizationId || 'org_personal');
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
@@ -15343,7 +15569,8 @@ function wireGlobalSettings(organizationId) {
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
   wireVaultCards(organizationId);
-  hydrateConnections(organizationId || S.organizationId);
+  hydrateNativeConnections(organizationId || S.organizationId);
+
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
   $('#wf-install')?.addEventListener('click', async () => {
@@ -16561,7 +16788,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-connections">Connected apps</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
@@ -18343,9 +18570,30 @@ async function wireMcpPicker(picker, query = mcpScope()) {
   const renderIsCurrent = beginAsyncElementRender(picker);
   const selected = new Set(JSON.parse(picker.dataset.value || 'null') ?? JSON.parse(picker.dataset.inherited || '["browser:chrome-devtools"]'));
   const input = picker.querySelector('.mcp-filter'), menu = picker.querySelector('.mcp-menu'), options = picker.querySelector('.mcp-options');
-  let connections = [], servers = [], nextCursor, searchTimer, generation = 0, active = -1, loaded = false, registryStatus = '';
-  const builtins = [{ id: 'browser:chrome-devtools', label: 'chrome-devtools', enabled: true }, { id: 'browser:playwright', label: 'playwright', enabled: true }];
+  let connections = [], servers = [], apps = [], connectorStatus = '', nextCursor, searchTimer, generation = 0, active = -1, loaded = false, registryStatus = '';
+  const builtins = picker.dataset.manager ? [] : [{ id: 'browser:chrome-devtools', label: 'chrome-devtools', enabled: true }, { id: 'browser:playwright', label: 'playwright', enabled: true }];
   const all = () => [...builtins, ...connections];
+  const scope = connectionScope(query);
+  const manager = picker.dataset.manager === 'true';
+  if (manager) { input.placeholder = 'Search MCPs and connectors…'; input.setAttribute('aria-label', 'Search MCPs and connectors'); }
+  async function reload() {
+    const results = await Promise.allSettled([api(`/api/mcp${query}`), api(`/api/connections${scope.query}`)]);
+    if (!renderIsCurrent()) return;
+    const native = results[0].status === 'fulfilled' ? results[0].value : [];
+    const connectors = results[1].status === 'fulfilled' ? results[1].value : [];
+    connections = [...native, ...connectors.map(c => ({ id: `composio:${c.id}`, label: c.label, enabled: c.status !== 'denied', connected: c.status === 'active', connector: c }))];
+    const errors = results.filter(r => r.status === 'rejected').map(r => r.reason.message);
+    picker.querySelector('.mcp-picker-status').textContent = errors.join(' · ');
+    loaded = true; paint();
+  }
+  async function connector(app, existing) {
+    expand(false);
+    await openConnectorEditor(query, async saved => {
+      if (saved && !manager) { selected.add(saved.id); change(); }
+      await reload();
+      for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
+    }, app, existing);
+  }
   function expand(open) {
     menu.hidden = !open; input.setAttribute('aria-expanded', String(open));
     if (open) positionMenu();
@@ -18373,7 +18621,7 @@ async function wireMcpPicker(picker, query = mcpScope()) {
   }
   function paint() {
     const available = all(), filter = input.value.trim().toLowerCase();
-    picker.querySelector('.mcp-chips').innerHTML = [...selected].map(id => {
+    picker.querySelector('.mcp-chips').innerHTML = [...(manager ? [] : selected)].map(id => {
       const c = available.find(c => c.id === id);
       const label = c?.label || (loaded ? 'Unavailable MCP' : 'Loading MCP…');
       return `<span class="mcp-chip" ${c?.enabled === false || (!c && loaded) ? 'data-unavailable="true"' : ''}><span>${esc(label)}</span><button type="button" data-remove="${esc(id)}" aria-label="Remove ${esc(label)}">×</button></span>`;
@@ -18381,21 +18629,42 @@ async function wireMcpPicker(picker, query = mcpScope()) {
     picker.querySelectorAll('[data-remove]').forEach(button => { button.onclick = () => { selected.delete(button.dataset.remove); change(); input.focus(); }; });
     let index = 0;
     const saved = available.filter(c => c.label.toLowerCase().includes(filter) || c.registry?.name.toLowerCase().includes(filter));
+    if (manager) {
+      const list = picker.parentElement.querySelector('.connected-app-list');
+      const ownId = typeof S.user === 'string' ? S.user : S.user?.id;
+      list.innerHTML = connections.map(c => `<div class="approval-request" data-connection="${esc(c.connector?.id || c.id)}"><span>${esc(c.label)} <span class="chip">${c.connector ? 'Composio' : 'MCP'} · ${c.connected ? 'connected' : 'needs connection'}</span></span><div class="approval-request-actions"><button type="button" class="btn sm" data-manage="${esc(c.id)}">Manage</button>
+        ${!c.connector || c.connector.ownerId === ownId ? `${c.connector || c.auth === 'oauth' ? `<button type="button" class="btn sm" data-reconnect="${esc(c.id)}">Reconnect</button>` : ''}<button type="button" class="btn sm" ${c.connector ? 'data-connection-action="disconnect"' : `data-native-disconnect="${esc(c.id)}"`}>Disconnect</button>` : ''}<span data-connection-result role="status"></span></div></div>`).join('');
+      list.querySelectorAll('[data-manage]').forEach(button => button.onclick = () => { const c = connections.find(c => c.id === button.dataset.manage); c.connector ? connector(undefined, c.connector) : install(undefined, c); });
+      list.querySelectorAll('[data-reconnect]').forEach(button => button.onclick = () => { const c = connections.find(c => c.id === button.dataset.reconnect); c.connector ? connector(undefined, c.connector) : openMcpEditor(query, reload, undefined, c, true); });
+      list.querySelectorAll('[data-native-disconnect]').forEach(button => button.onclick = async () => {
+        if (!confirm('Disconnect this MCP? Tasks using it will need another connection.')) return;
+        try { await api(`/api/mcp/${button.dataset.nativeDisconnect}${query}`, { method: 'DELETE' }); await reload(); }
+        catch (error) { toast(error.message, true); }
+      });
+      wireConnectionActions(list, scope.organizationId, reload);
+    }
     const registry = servers.filter(s => !connections.some(c => c.registry?.name === s.name));
-    options.innerHTML = saved.map(c => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="${selected.has(c.id)}" aria-disabled="${!c.enabled && !selected.has(c.id)}" data-mcp-id="${esc(c.id)}"><span>${esc(c.label)}${!c.enabled ? '<small>Unavailable</small>' : c.connected === false ? '<small>Needs sign-in</small>' : ''}</span><span>${selected.has(c.id) ? '✓' : ''}</span></button>${!c.id.startsWith('browser:') ? `<button type="button" class="mcp-edit" data-edit="${esc(c.id)}" aria-label="Edit ${esc(c.label)}">Edit</button>` : ''}</div>`).join('')
+    options.innerHTML = saved.map(c => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="${selected.has(c.id)}" aria-disabled="${!c.enabled && !selected.has(c.id)}" data-mcp-id="${esc(c.id)}"><span>${esc(c.label)}${c.connector ? '<small>Composio</small>' : c.id.startsWith('mcp_') ? '<small>MCP</small>' : ''}${!c.enabled ? '<small>Unavailable</small>' : c.connected === false ? '<small>Needs sign-in</small>' : ''}</span><span>${selected.has(c.id) ? '✓' : ''}</span></button>${!c.id.startsWith('browser:') ? `<button type="button" class="mcp-edit" data-edit="${esc(c.id)}" aria-label="Manage ${esc(c.label)}">Manage</button>` : ''}</div>`).join('')
       + (registry.length ? '<div class="mcp-group-label">Official MCP Registry</div>' : '')
       + registry.map((s, i) => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="false" data-registry="${i}"><span>${esc(s.title)}<small>${esc(s.name)}</small></span><span class="mcp-install">Install</span></button></div>`).join('')
+      + apps.map((app, i) => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${index++}" aria-selected="false" data-connector-app="${i}"><span>${esc(app.name)}<small>Composio</small></span><span>Connect</span></button></div>`).join('')
+      + (connectorStatus ? `<p class="mcp-search-status" role="status">${esc(connectorStatus)}</p>` : '')
       + (registryStatus ? `<p class="mcp-search-status" role="status">${esc(registryStatus)}</p>` : '')
-      + (!filter ? '<p class="mcp-search-status">Search to find MCPs in the official registry.</p>' : '')
+      + (!filter ? '<p class="mcp-search-status">Search MCPs and app connectors.</p>' : '')
       + (nextCursor ? '<button type="button" class="mcp-more">More results</button>' : '');
     options.querySelectorAll('[data-mcp-id]').forEach(button => { button.onclick = () => {
       if (button.getAttribute('aria-disabled') === 'true') return;
-      const id = button.dataset.mcpId; selected.has(id) ? selected.delete(id) : selected.add(id); change();
+      const id = button.dataset.mcpId; const c = connections.find(c => c.id === id);
+      if (c?.connector && !selected.has(id)) return connector(undefined, c.connector);
+      if (manager) return install(undefined, c);
+      if (c?.connected === false && !selected.has(id)) return install(undefined, c);
+      selected.has(id) ? selected.delete(id) : selected.add(id); change();
     }; });
+    options.querySelectorAll('[data-connector-app]').forEach(button => { button.onclick = () => connector(apps[Number(button.dataset.connectorApp)]); });
     options.querySelectorAll('[data-registry]').forEach(button => { button.onclick = () => install(registry[Number(button.dataset.registry)]); });
     options.querySelectorAll('[data-edit]').forEach(button => { button.onclick = () => {
       const connection = connections.find(c => c.id === button.dataset.edit);
-      install(undefined, connection);
+      connection?.connector ? connector(undefined, connection.connector) : install(undefined, connection);
     }; });
     options.querySelector('.mcp-more')?.addEventListener('click', () => search(nextCursor));
     markActive(-1);
@@ -18409,10 +18678,10 @@ async function wireMcpPicker(picker, query = mcpScope()) {
     expand(false);
     const editQuery = existing && !existing.projectId && query.includes('projectId=') ? mcpScope(null, existing.organizationId) : query;
     await openMcpEditor(editQuery, async (saved, removedId) => {
-      if (saved) { connections = [...connections.filter(c => c.id !== saved.id), saved]; selected.add(saved.id); }
+      if (saved) { connections = [...connections.filter(c => c.id !== saved.id), saved]; if (!manager) selected.add(saved.id); }
       if (removedId) selected.delete(removedId);
       change();
-      connections = await api(`/api/mcp${query}`); paint();
+      await reload();
       for (const other of document.querySelectorAll('.mcp-picker')) if (other !== picker && other.dataset.scope === query) wireMcpPicker(other, query);
     }, entry, existing);
     input.focus(); expand(false);
@@ -18421,16 +18690,24 @@ async function wireMcpPicker(picker, query = mcpScope()) {
     clearTimeout(searchTimer);
     const current = ++generation, term = input.value.trim();
     registryStatus = 'Searching registry…'; paint();
-    try {
-      const result = await api(`/api/mcp/registry${query}&search=${encodeURIComponent(term)}&cursor=${encodeURIComponent(cursor)}`);
-      if (current !== generation || !renderIsCurrent()) return;
+    const results = await Promise.allSettled([
+      api(`/api/mcp/registry${query}&search=${encodeURIComponent(term)}&cursor=${encodeURIComponent(cursor)}`),
+      cursor ? Promise.resolve(apps) : api(`/api/connections/catalog${scope.query}&search=${encodeURIComponent(term)}`),
+    ]);
+    if (current !== generation || !renderIsCurrent()) return;
+    if (results[0].status === 'fulfilled') {
+      const result = results[0].value;
       servers = cursor ? [...servers, ...result.servers.filter(s => !servers.some(old => old.name === s.name))] : result.servers;
-      nextCursor = result.nextCursor; registryStatus = servers.length ? '' : 'No registry matches.'; paint();
-    } catch (e) { if (current === generation && renderIsCurrent()) { registryStatus = e.message; paint(); } }
+      nextCursor = result.nextCursor; registryStatus = servers.length ? '' : 'No MCP matches.';
+    } else registryStatus = results[0].reason.message;
+    if (results[1].status === 'fulfilled') { apps = results[1].value; connectorStatus = ''; }
+    else connectorStatus = `App connectors: ${results[1].reason.message}`;
+    paint();
   }
+
   input.onfocus = () => expand(true);
   input.oninput = () => {
-    clearTimeout(searchTimer); generation++; servers = []; nextCursor = undefined; registryStatus = ''; active = -1;
+    clearTimeout(searchTimer); generation++; servers = []; apps = []; connectorStatus = ''; nextCursor = undefined; registryStatus = ''; active = -1;
     expand(true); paint();
     if (input.value.trim()) searchTimer = setTimeout(() => search(), 250);
   };
@@ -18446,10 +18723,9 @@ async function wireMcpPicker(picker, query = mcpScope()) {
   picker.onfocusout = event => { if (!picker.contains(event.relatedTarget)) expand(false); };
   picker.querySelector('.mcp-custom').onclick = () => install();
   paint();
-  try { const result = await api(`/api/mcp${query}`); if (!renderIsCurrent()) return; connections = result; loaded = true; paint(); }
-  catch (e) { if (!renderIsCurrent()) return; loaded = true; paint(); picker.querySelector('.mcp-picker-status').textContent = e.message; }
+  await reload();
 }
-async function openMcpEditor(query, changed, entry, existing) {
+async function openMcpEditor(query, changed, entry, existing, reconnect = false) {
   const dialog = document.createElement('dialog'); dialog.className = 'mcp-dialog'; dialog.setAttribute('aria-label', existing ? 'Edit MCP' : entry ? 'Install MCP' : 'Add custom MCP');
   dialog.innerHTML = `<div class="mcp-dialog-header"><h2>${existing ? 'Edit MCP' : entry ? `Install ${esc(entry.title)}` : 'Add custom MCP'}</h2><button type="button" class="btn sm mcp-close" aria-label="Close MCP form">✕</button></div><div class="mcp-editor"></div><p class="mcp-message" role="status"></p><button type="button" class="btn mcp-signin" hidden>Sign in</button>`;
   document.body.append(dialog); dialog.showModal();
@@ -18480,16 +18756,21 @@ async function openMcpEditor(query, changed, entry, existing) {
   function editor(existing) {
     const box = dialog.querySelector('.mcp-editor'); box.hidden = false;
     box.innerHTML = `${entry ? `<p class="mcp-entry-description">${esc(entry.description)}</p>${entry.options.length > 1 ? `<label>Installation<select class="mcp-install-option">${entry.options.map((o, i) => `<option value="${i}">${esc(o.label)}</option>`).join('')}</select></label>` : ''}${!entry.options.length ? '<p>Enter the server details to install this MCP.</p>' : ''}` : ''}
+      <p class="task-sub">${query.includes('projectId=') ? 'This connection is shared with this project.' : 'This connection is shared with this organization.'} Signing in grants the selected account to tasks that use this connection.</p>
       <form class="mcp-connection-form"><label>Name<input class="mcp-label" required maxlength="120" placeholder="GitHub — work" value="${esc(existing?.label || '')}"></label>
       <label>Connection type<select class="mcp-type"><option value="http">Remote HTTPS</option><option value="sse">Remote HTTPS (SSE)</option><option value="stdio">Process in task environment</option></select></label>
       <label class="mcp-url-row">Server URL<input class="mcp-url" type="url" placeholder="https://example.com/mcp"></label>
       <div class="mcp-process" hidden><label>Command<input class="mcp-command" placeholder="npx"></label><label>Arguments (JSON array)<textarea class="mcp-args" rows="3" spellcheck="false">[]</textarea></label><label>Public environment values (JSON object)<textarea class="mcp-env" rows="2" spellcheck="false">{}</textarea></label><p class="task-sub">Runs with access to this task’s files. Use pinned package versions. The task environment must provide the command.</p></div>
       <label>Authentication<select class="mcp-auth"><option value="none">No authentication</option><option value="oauth">Sign in with OAuth</option><option value="secrets">API key / secret values</option></select></label>
+      <details class="mcp-oauth-client" hidden><summary>Advanced OAuth setup</summary><p class="task-sub">Leave automatic registration enabled unless the server requires a preregistered OAuth application. Register this callback URL: <code>Loading installation callback URL…</code></p>
+        <label>Client registration<select class="mcp-registration"><option value="automatic">Automatic (recommended)</option><option value="manual">Preregistered client</option></select></label>
+        <div class="mcp-manual-client" hidden><label>Client ID<input class="mcp-client-id" autocomplete="off"></label><label>Token authentication<select class="mcp-client-method"><option value="none">Public client (no secret)</option><option value="client_secret_basic">Client secret — HTTP Basic</option><option value="client_secret_post">Client secret — request body</option></select></label><label>Client secret<input class="mcp-client-secret" type="password" autocomplete="new-password" placeholder="Leave blank to keep an existing secret"></label></div></details>
       <div class="mcp-secrets" hidden><p class="task-sub">HTTP header names for remote servers; environment variable names for processes. Saved values are kept in the vault.</p><div class="mcp-secret-fields"></div><button type="button" class="btn sm mcp-secret-add">Add secret</button>${existing?.secretNames?.length ? '<p>Leave existing values blank to keep them.</p>' : ''}</div>
       <div class="mcp-registry-fields"></div>${existing ? `<label class="mcp-enabled"><input type="checkbox" ${existing.enabled !== false ? 'checked' : ''}> Enabled</label>` : ''}
-      <div class="mcp-form-actions"><button class="btn primary" type="submit">${existing ? 'Save changes' : 'Save and add'}</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button>${existing ? '<button class="btn sm mcp-delete" type="button">Delete MCP</button>' : ''}</div></form>`;
+      <div class="mcp-form-actions"><button class="btn primary" type="submit">${existing ? 'Save changes' : 'Save and add'}</button><button class="btn sm mcp-editor-cancel" type="button">Cancel</button>${existing ? '<button class="btn sm mcp-delete" type="button">Disconnect</button>' : ''}</div></form>`;
     const form = box.querySelector('form'); let registry = existing?.registry; let fields = []; let secretDirty = false;
     const type = form.querySelector('.mcp-type'); const auth = form.querySelector('.mcp-auth');
+    let oauthClientDirty = false;
     function sync() {
       const process = type.value === 'stdio';
       form.querySelector('.mcp-url-row').hidden = process; form.querySelector('.mcp-url').required = !process;
@@ -18497,6 +18778,8 @@ async function openMcpEditor(query, changed, entry, existing) {
       auth.querySelector('[value="oauth"]').disabled = process;
       if (process && auth.value === 'oauth') auth.value = 'secrets';
       form.querySelector('.mcp-secrets').hidden = auth.value !== 'secrets';
+      form.querySelector('.mcp-oauth-client').hidden = auth.value !== 'oauth';
+      form.querySelector('.mcp-manual-client').hidden = form.querySelector('.mcp-registration').value !== 'manual';
     }
     function addSecret(name = '', value = '') {
       const row = document.createElement('div'); row.className = 'mcp-secret-row';
@@ -18511,14 +18794,22 @@ async function openMcpEditor(query, changed, entry, existing) {
       form.querySelector('.mcp-args').value = JSON.stringify(transport?.args || [], null, 2);
       form.querySelector('.mcp-env').value = JSON.stringify(transport?.env || {}, null, 2); sync();
     }
-    auth.value = existing?.auth || 'none'; fill(existing?.transport);
+    auth.value = existing?.auth || 'oauth';
+    if (existing?.oauthClient) {
+      form.querySelector('.mcp-registration').value = 'manual';
+      form.querySelector('.mcp-client-id').value = existing.oauthClient.clientId;
+      form.querySelector('.mcp-client-method').value = existing.oauthClient.tokenEndpointAuthMethod;
+    }
+    form.querySelector('.mcp-oauth-client').oninput = () => { oauthClientDirty = true; sync(); };
+    form.querySelector('.mcp-registration').onchange = () => { oauthClientDirty = true; sync(); };
+    fill(existing?.transport);
     for (const name of existing?.secretNames || []) addSecret(name);
     type.onchange = sync; auth.onchange = sync;
     form.querySelector('.mcp-secret-add').onclick = () => addSecret();
     form.querySelector('.mcp-editor-cancel').onclick = () => dialog.close();
     form.querySelector('.mcp-delete')?.addEventListener('click', async event => {
       const button = event.currentTarget;
-      if (button.dataset.confirm !== 'yes') { button.dataset.confirm = 'yes'; button.textContent = 'Confirm deletion'; return; }
+      if (button.dataset.confirm !== 'yes') { button.dataset.confirm = 'yes'; button.textContent = 'Confirm disconnect'; return; }
       button.disabled = true;
       try { await api(`/api/mcp/${existing.id}${query}`, { method: 'DELETE' }); await changed(undefined, existing.id); dialog.close(); }
       catch (e) { message(e.message); button.disabled = false; }
@@ -18549,8 +18840,13 @@ async function openMcpEditor(query, changed, entry, existing) {
           } else if (f.isSecret || transport.type !== 'stdio') secrets[f.name] = value;
           else transport.env[f.name] = value;
         }
-        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input')?.checked ?? true, registry,
+        const oauthClient = auth.value === 'oauth' && oauthClientDirty ? (form.querySelector('.mcp-registration').value === 'manual' ? {
+          clientId: form.querySelector('.mcp-client-id').value.trim(), tokenEndpointAuthMethod: form.querySelector('.mcp-client-method').value,
+          ...(form.querySelector('.mcp-client-secret').value ? { clientSecret: form.querySelector('.mcp-client-secret').value } : {}),
+        } : null) : undefined;
+        const saved = await api(`/api/mcp${query}`, { method: 'POST', body: JSON.stringify({ oauthClient, id: existing?.id, label: form.querySelector('.mcp-label').value.trim(), transport, auth: Object.keys(secrets).length ? 'secrets' : auth.value, enabled: form.querySelector('.mcp-enabled input')?.checked ?? true, registry,
           ...(Object.keys(secrets).length || secretDirty ? { secrets, mergeSecrets: !!existing, retainSecretNames: secretRows.map((row) => row.querySelector('.mcp-secret-name').value.trim()) } : {}) }) });
+        form.querySelector('.mcp-client-secret').value = ''; oauthClientDirty = false;
         existing = saved; // Retrying a failed refresh must update this MCP, not create a duplicate.
         await changed(saved);
         if (saved.auth === 'oauth') { message('Saved. Complete sign-in to use this MCP.'); box.hidden = true; await authorize(saved.id, oauthWindow); }
@@ -18560,6 +18856,13 @@ async function openMcpEditor(query, changed, entry, existing) {
     };
   }
   editor(existing);
+  if (existing?.auth === 'oauth') {
+    const retry = dialog.querySelector('.mcp-signin'); retry.hidden = false; retry.textContent = 'Reconnect'; retry.onclick = () => authorize(existing.id);
+  }
+  api(`/api/mcp/oauth-info${query}`).then(info => {
+    if (dialog.isConnected) dialog.querySelector('.mcp-oauth-client code').textContent = info.redirectUri || 'Configure the installation public URL first';
+  }).catch(() => { if (dialog.isConnected) dialog.querySelector('.mcp-oauth-client code').textContent = 'Could not load the callback URL. Close and reopen this form to retry.'; });
+  if (reconnect && existing) await authorize(existing.id);
   return closed;
 }
 async function finishMcpCallback() {

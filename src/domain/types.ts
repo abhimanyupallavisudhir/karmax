@@ -713,6 +713,14 @@ export interface ProjectEnvironmentSpec {
 }
 
 export interface EnvironmentBuildRecord {
+  /** Authority and attempt that produced this provider-owned artifact. */
+  organizationId?: string;
+  transferGeneration?: string;
+  buildId?: string;
+  artifactName?: string;
+  builderId?: string;
+  buildHost?: string;
+  recoveredFrom?: string;
   provider: string;
   digest: string;
   status: 'building' | 'ready' | 'failed';
@@ -1367,7 +1375,7 @@ export interface FieldSpec {
 
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
-  /** Omitted inherits tools; [] explicitly selects no optional connections. */
+  /** MCP IDs, browser IDs, or composio:conn_… account references. Omission inherits; [] clears the selection. */
   mcpConnections?: string[];
   provider: Provider;
   /** Select a durable Avatar. Provider/model remain snapshotted for replay and

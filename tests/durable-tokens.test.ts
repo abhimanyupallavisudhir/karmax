@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,4 +29,22 @@ describe('durable scoped tokens', () => {
     (await storeA.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
+  it('checks transferred task ownership without loading its conversation', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const project = await store.createProject('Token routing');
+      const task = await store.createTask({ projectId: project.id, title: 'History', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'history', draft: true } });
+      const authority = new TokenAuthority(store);
+      const issued = await authority.mint({ taskId: task.id, profileId: 'do', principal: 'user:a',
+        organizationId: project.organizationId, projectId: project.id, ceiling: ['task:read'], grantorCaps: ['task:read'] });
+      vi.spyOn(store, 'getTask').mockRejectedValue(new Error('must not hydrate task history'));
+      vi.spyOn(store, 'getProject').mockRejectedValue(new Error('must not hydrate project'));
+      expect((await authority.check(issued.token, 'task:read', { taskId: task.id })).ok).toBe(true);
+      const destination = await store.createOrganization({ name: 'Destination', ownerUserId: 'receiver' });
+      await store.db.prepare('UPDATE projects SET organizationId=? WHERE id=?').run(destination.id, project.id);
+      expect((await authority.check(issued.token, 'task:read', { taskId: task.id })).ok).toBe(false);
+    } finally { await store.close(); }
+  });
+
 });

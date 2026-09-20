@@ -1,3 +1,5 @@
+import { ProjectTransfers } from '../src/platform/project-transfer.js';
+import { beginEnvironmentBuild, finishEnvironmentBuild } from '../src/store/project-environment.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,6 +21,36 @@ integration('PostgreSQL cutover', () => {
     await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
   });
   afterAll(async () => { await admin?.end(); });
+
+  it('serializes build admission and rolls back failed transfers across independent pools', async () => {
+    const first = await Store.create(url!);
+    const otherUrl = new URL(url!);
+    otherUrl.searchParams.set('application_name', 'independent-transfer-test');
+    const second = await Store.create(otherUrl.href);
+    try {
+      const project = await first.createProject('Transfer');
+      const destination = await first.createOrganization({ name: 'Receiving', ownerUserId: 'receiver' });
+      const scope = { organizationId: project.organizationId!, transferGeneration: '' };
+      const attempts = await Promise.allSettled([
+        beginEnvironmentBuild(first, project.id, scope, 'e2b', 'digest'),
+        beginEnvironmentBuild(second, project.id, scope, 'e2b', 'digest'),
+      ]);
+      expect(attempts.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+      const admitted = attempts.find(result => result.status === 'fulfilled');
+      if (admitted?.status !== 'fulfilled') throw new Error('No build admitted');
+      expect(await finishEnvironmentBuild(first, admitted.value, { status: 'failed', error: 'provider stopped' })).toBe(true);
+      const actor = { principal: 'system:test', authorize: async () => {}, workflowClosed: async () => true };
+      const preview = await new ProjectTransfers(first, actor).preview(project.id, destination.id);
+      const audit = vi.spyOn(second, 'appendAudit').mockRejectedValueOnce(new Error('audit write failed'));
+      const transfers = new ProjectTransfers(second, actor);
+      await expect(transfers.move(project.id, destination.id, preview.id)).rejects.toThrow('audit write failed');
+      expect((await first.getProject(project.id))?.organizationId).toBe(project.organizationId);
+      expect(await first.kvGet(`project-transfer-lock:${project.id}`)).toBeUndefined();
+      audit.mockRestore();
+      expect((await transfers.move(project.id, destination.id, preview.id)).organizationId).toBe(destination.id);
+      expect(await finishEnvironmentBuild(first, admitted.value, { status: 'ready', ref: 'stale' })).toBe(false);
+    } finally { await second.close(); await first.close(); }
+  });
 
   it('serializes compound vault edits across independent PostgreSQL pools', async () => {
     const first = await Store.create(url!);

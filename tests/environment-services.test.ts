@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ProjectEnvironment, parseDevcontainer, proposeEnvironment, stripJsonComments } from '../src/store/project-environment.js';
-import { buildEnvironment, bootCommands, environmentDockerfile, setupCommands, type BuilderSandbox } from '../src/world/environment-build.js';
+import { buildEnvironment, bootCommands, environmentDockerfile, environmentArtifactName, setupCommands, type BuilderSandbox } from '../src/world/environment-build.js';
 import { ProjectServices, composeServiceProposals } from '../src/store/project-services.js';
 import { launchWorldServices } from '../src/world/services.js';
 
@@ -66,11 +66,12 @@ describe('project environment proposals and builds', () => {
       async createSnapshot(name) { calls.push(name); return { snapshotId: 'snapshot-1' }; },
       async kill() { killed = true; },
     };
-    expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd',
+    expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd', buildId: 'attempt-1',
       spec: { image: 'node:22-slim', setup: ['npm ci'] }, connection: { template: 'compute-template' },
       createBuilderSandbox: async (base) => { builderBase = base; return builder; } })).toEqual({ ref: 'snapshot-1' });
     expect(builderBase).toBe('compute-template');
     expect(calls).toContain('npm ci');
+    expect(calls).toContain(environmentArtifactName('p', 'd', 'attempt-1'));
     expect(killed).toBe(true);
   });
 

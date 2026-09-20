@@ -2338,7 +2338,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           session,
           deliveredMessages,
           fork,
-          systemPrompt,
+          systemPrompt: systemPrompt + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),

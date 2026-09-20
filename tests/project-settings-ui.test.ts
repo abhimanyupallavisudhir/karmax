@@ -37,6 +37,9 @@ describe('Project settings browser source', () => {
     expect(project).not.toContain('id="project-folder"');
     expect(project).toContain('id="rename-project"');
     expect(project).toContain('data-settings-access="projectDelete"');
+    expect(project).toContain('data-settings-access="projectTransfer"');
+    expect(project.indexOf('id="move-project"')).toBeGreaterThan(project.indexOf('id="project-advanced"'));
+    expect(project.indexOf('id="move-project"')).toBeLessThan(project.indexOf('id="project-experimental"'));
     expect(organization).toContain('id="organization-name"');
     expect(organization).toContain('id="rename-organization"');
     expect(projectWiring).toContain("method: 'PATCH'");

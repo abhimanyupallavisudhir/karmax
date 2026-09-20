@@ -3,6 +3,22 @@ import { auth, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client
 import { publicFetch, publicUrl } from './http.js';
 import { McpConnections, type McpConnection } from './store.js';
 
+export const MCP_CLIENT_METADATA_PATH = '/api/mcp-client-metadata';
+export function mcpClientMetadata(publicOrigin = process.env.KARMAX_PUBLIC_URL) {
+  if (!publicOrigin) return undefined;
+  try {
+    const origin = publicUrl(publicOrigin).origin;
+    return { client_id: new URL(MCP_CLIENT_METADATA_PATH, origin).href,
+      client_name: 'Tavya', redirect_uris: [new URL('/mcp-callback', origin).href],
+      grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' as const };
+  } catch { return undefined; }
+}
+
+async function authorize(...args: Parameters<typeof auth>) {
+  try { return await auth(...args); }
+  catch { throw new Error('MCP authorization failed. Retry sign-in, or check the server’s required OAuth client details and installation callback URL.'); }
+}
+
 const locks = new Map<string, Promise<unknown>>();
 const waiters = new Map<string, number>();
 async function exclusive<T>(key: string, run: () => Promise<T>): Promise<T> {
@@ -16,9 +32,10 @@ function provider(service: McpConnections, connection: McpConnection, data: any,
   onRedirect: (url: string) => void): OAuthClientProvider {
   return {
     redirectUrl: redirect,
-    clientMetadata: { client_name: 'Tavya', redirect_uris: [redirect], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' },
+    clientMetadataUrl: data.clientMetadataUrl,
+    clientMetadata: { client_name: 'Tavya', redirect_uris: [redirect], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: data.manualClient?.token_endpoint_auth_method ?? 'none' },
     state: () => data.pending.state,
-    clientInformation: () => data.client,
+    clientInformation: () => data.manualClient ?? data.client,
     saveClientInformation: async (client) => { data.client = client; (await service.setSecret(connection, data)); },
     tokens: () => data.tokens,
     saveTokens: async (tokens) => { data.tokens = { ...tokens, refresh_token: tokens.refresh_token ?? data.tokens?.refresh_token }; data.expiresAt = Date.now() + (tokens.expires_in ?? 3600) * 1000; (await service.setSecret(connection, data)); },
@@ -33,12 +50,17 @@ export async function beginOAuth(service: McpConnections, c: McpConnection, acto
   if (c.auth !== 'oauth' || c.transport.type === 'stdio') throw new Error('This connection does not use OAuth');
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
     const data = service.secret(c);
+    // Dynamic registration is tied to its redirect URI. Do not reuse it after
+    // the installation's public origin changes.
+    if (data.redirect && data.redirect !== redirect) { delete data.client; delete data.discovery; }
+    const metadata = mcpClientMetadata();
+    data.clientMetadataUrl = metadata?.redirect_uris.includes(redirect) ? metadata.client_id : undefined;
     data.tokens = undefined;
     data.pending = { state: crypto.randomBytes(32).toString('hex'), actor, expires: Date.now() + 600_000, revision: c.revision };
     data.redirect = redirect;
     (await service.setSecret(c, data));
     let authorizationUrl = '';
-    await auth(provider(service, c, data, redirect, (url) => { authorizationUrl = url; }), { serverUrl: (c.transport as any).url, fetchFn: publicFetch });
+    await authorize(provider(service, c, data, redirect, (url) => { authorizationUrl = url; }), { serverUrl: (c.transport as any).url, fetchFn: publicFetch });
     if (!authorizationUrl) throw new Error('Server did not provide an authorization URL');
     return { authorizationUrl };
   });
@@ -54,7 +76,7 @@ export async function finishOAuth(service: McpConnections, c: McpConnection, act
     (await service.setSecret(c, { ...data, pending: undefined }));
     const p = provider(service, c, data, data.redirect, () => { throw new Error('Authorization must be restarted'); });
     try {
-      await auth(p, { serverUrl: (c.transport as any).url, authorizationCode: code, fetchFn: publicFetch });
+      await authorize(p, { serverUrl: (c.transport as any).url, authorizationCode: code, fetchFn: publicFetch });
     } finally { delete data.pending; (await service.setSecret(c, data)); }
   });
 }
@@ -65,7 +87,7 @@ export async function connectionHeaders(service: McpConnections, c: McpConnectio
     const data = service.secret(c, taskId);
     if (!data.tokens?.access_token) throw new Error(`Connect “${c.label}” in MCP settings before running this task`);
     if (data.expiresAt < Date.now() + 60_000) {
-      await auth(provider(service, c, data, data.redirect, () => { throw new Error(`Reconnect “${c.label}” in MCP settings`); }),
+      await authorize(provider(service, c, data, data.redirect, () => { throw new Error(`Reconnect “${c.label}” in MCP settings`); }),
         { serverUrl: (c.transport as any).url, fetchFn: publicFetch });
     }
     return { Authorization: `Bearer ${data.tokens.access_token}` };
