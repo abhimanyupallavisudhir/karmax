@@ -55,3 +55,33 @@ checks were not run.
 Gateway/worker process isolation remains separate work. In-process world locks,
 secret-file ownership and durable trigger delivery must be addressed before
 independent processes can safely share the same application home.
+
+## Integrated upstream validation
+
+The integration at `90e5600235532c1c429da5bfab951fb74ab6e658` includes upstream
+`afe32b9e9315303998c75f074a3889d7b30d061b`. All 301 test files were exercised
+sequentially against that integration: 287 files passed, 14 were skipped by
+environment conditions; 2,944 assertions passed and 33 were skipped. Live agent
+and Docker execution were disabled. PostgreSQL tests used a disposable local
+database, including independent-pool transaction and ownership-fence cases.
+
+This was a batched run resumed after an interruption, not one uninterrupted
+invocation. Batch 8 exited with a worker-process error, leaving four Git-transfer
+assertions unfinished. The entire five-test Git-transfer file then passed alone,
+including the transfer over 256 MiB; those results replace that file's partial
+results in the totals. No test file is missing from the manifest.
+
+Follow-up `00ba79f` adds coalesced maintenance and shutdown draining: 124 focused
+tests passed. Follow-up `40458ec` closes worker-refresh admission during shutdown:
+15 focused tests passed, including real Temporal worker refresh and workflow
+installation. The first version of its unit fixture did not intercept an already
+cached module in the shared Vitest process; an instance-level build stub repaired
+the fixture. Typechecking passed after that repair.
+
+The actual application entrypoint at `40458ec` was also started with an isolated
+temporary application home and the mock agent. Database and Temporal readiness
+passed; SIGTERM exited with code zero, recorded `runtime.stopped`, and cleared
+the active-runtime marker. This was an idle startup/shutdown smoke test; the
+focused tests cover draining accepted work. These follow-ups were not subjected
+to a second complete suite, and none of this is evidence of production deployment
+or production load capacity. Gateway/activity process separation remains pending.
