@@ -85,3 +85,30 @@ the active-runtime marker. This was an idle startup/shutdown smoke test; the
 focused tests cover draining accepted work. These follow-ups were not subjected
 to a second complete suite, and none of this is evidence of production deployment
 or production load capacity. Gateway/activity process separation remains pending.
+
+## Same-host coordination prerequisites
+
+`86aa8ae` adds opt-in shared world transition locks and access pins. Four focused
+files passed 45 tests, including real child-process exclusion, owner SIGKILL,
+access-pin cleanup, nested transition recovery, and lock admission timeout.
+The default registry remains in-process; separate gateway/worker execution is
+not enabled by this change. Shared coordination requires same-host Linux kernel
+locks and is not a lease protocol for independent hosts or filesystems.
+
+`7dd03f9` serializes Linux vault mutations without changing the secret-map format.
+It awaits credential persistence throughout its callers, initializes shared keys
+without replacement, and makes rename and conditional token cleanup atomic.
+Vault/resource/GitHub regression coverage passed 107 tests; broader gateway,
+connector, billing and world coverage passed 268; MCP/OAuth passed 73 with two
+environment skips; backup coverage passed 14. The final shared-vault file passed
+five tests (four of them reruns of the earlier group), including concurrent
+process initialization/writes and observing one key across concurrent creators.
+Backup tests also cover excluding temporary key files left by a crash.
+Typechecking passed at `7dd03f9`; the asynchronous-call audit found no unawaited
+credential mutation call sites in application source.
+
+The actual application entrypoint with these changes passed database and Temporal
+readiness and an isolated SIGTERM shutdown: exit zero, a persisted stop record,
+and no active-runtime marker. This checks single-process startup/shutdown; it is
+not evidence of a deployed split-process runtime. Supervised worker lifecycle and
+cross-process event/trigger delivery remain necessary before enabling that split.
