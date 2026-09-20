@@ -13,8 +13,9 @@ describe('Better Auth identity hardening', () => {
       // NODE_ENV=production, so sign-in/reset/verification were unthrottled in
       // every deployment until this was passed explicitly.
       rateLimitEnabled: true,
-      // Each racing bootstrap gets back the account IT created, not `listUsers()[0]`.
-      bootstrapClaims: ['first@example.com', 'second@example.com'],
+      // The empty-install check and first administrator promotion are atomic.
+      bootstrapClaims: ['first@example.com', 'error'],
+      bootstrapAdmins: ['first@example.com'],
       // …and every response that claimed administrator names a real administrator.
       claimsHonest: true,
       // Reopening reuses the persisted secret rather than minting a new one.

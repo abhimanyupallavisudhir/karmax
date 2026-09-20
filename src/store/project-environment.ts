@@ -7,6 +7,7 @@ const KV_SPEC = 'project-environment:';
 const KV_BUILDS = 'project-environment-builds:';
 
 export interface ProjectEnvironmentStore {
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(key: string): (string | undefined) | Promise<string | undefined>;
   kvSet(key: string, value: string): (void) | Promise<void>;
 }
@@ -46,13 +47,15 @@ export class ProjectEnvironment {
   }
 
   async recordBuild(projectId: string, value: Omit<EnvironmentBuildRecord, 'createdAt' | 'updatedAt'>): Promise<EnvironmentBuildRecord> {
-    const builds = (await this.builds(projectId));
-    const prior = builds.find((candidate) => candidate.provider === value.provider && candidate.digest === value.digest);
-    const next = { ...value, createdAt: prior?.createdAt ?? Date.now(), updatedAt: Date.now() };
-    (await this.store.kvSet(KV_BUILDS + projectId, JSON.stringify([
-      ...builds.filter((candidate) => candidate.provider !== value.provider || candidate.digest !== value.digest), next,
-    ])));
-    return next;
+    return this.store.transaction(async () => {
+      const builds = await this.builds(projectId);
+      const prior = builds.find((candidate) => candidate.provider === value.provider && candidate.digest === value.digest);
+      const next = { ...value, createdAt: prior?.createdAt ?? Date.now(), updatedAt: Date.now() };
+      await this.store.kvSet(KV_BUILDS + projectId, JSON.stringify([
+        ...builds.filter((candidate) => candidate.provider !== value.provider || candidate.digest !== value.digest), next,
+      ]));
+      return next;
+    });
   }
 
   async readyBuild(projectId: string, provider: string, digest: string): Promise<EnvironmentBuildRecord | undefined> {

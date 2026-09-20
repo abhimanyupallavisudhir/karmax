@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, it, expect } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,7 +22,7 @@ import {
 
 function memStore(): VaultItemStore & { kv: Map<string, string> } {
   const kv = new Map<string, string>();
-  return { kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v), appendAudit: () => 0, kv };
+  return { transaction: memoryTransaction(kv), kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v), appendAudit: () => 0, kv };
 }
 function makeVault() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-conn-'));

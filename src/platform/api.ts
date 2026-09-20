@@ -106,7 +106,7 @@ export class ValidationError extends Error {
  * boot's re-arm (the store is the durable source of truth).
  */
 export interface TriggerArmer {
-  arm(task: TaskRecord): void | Promise<void>;
+  arm(task: TaskRecord): unknown;
   disarm(taskId: string): void;
   /** Graph-aware validation (self-dependency, cycles, dangling dependency ids).
    *  Only the armer can do this half — it needs the store to resolve dependency

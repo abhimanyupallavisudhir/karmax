@@ -68,6 +68,7 @@ export interface GitIdentity {
 }
 
 export interface GitProfileStore {
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
 }
@@ -115,14 +116,18 @@ export class GitProfiles {
   }
 
   async setDefault(name: string | undefined) {
+    return this.store.transaction(async () => {
     if (name && !(await this.get(name))) throw new Error(`unknown git profile "${name}" in ${this.scopeLabel()}`);
     (await this.store.kvSet(this.defaultKey(), name ?? ''));
+
+    });
   }
 
   /** Link an empty organization's service Git configuration to the signed-in
    * member's default user profile. Secrets remain in the user's vault namespace
    * so there is one rotation/revocation authority rather than a stale copy. */
   async reuseUserProfile(userProfiles: GitProfiles): Promise<GitProfile> {
+    return this.store.transaction(async () => {
     if (userIdOfScope(this.organizationId)) throw new Error('a user profile cannot reuse another user profile');
     if ((await this.list()).length || (await this.defaultProfile())) throw new Error('organization Git is already configured');
     const userId = userIdOfScope(userProfiles.organizationId);
@@ -142,6 +147,8 @@ export class GitProfiles {
     (await this.store.kvSet(this.profilesKey(), JSON.stringify([linked])));
     (await this.setDefault(linked.name));
     return linked;
+
+    });
   }
 
   /**
@@ -152,6 +159,7 @@ export class GitProfiles {
   async save(args: { name: string; userName: string; userEmail: string; sshKey?: string; signingKey?: string;
     githubToken?: string; github?: { id: string; login: string; name?: string };
     customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean }): Promise<GitProfile> {
+    return this.store.transaction(async () => {
     const name = args.name.trim();
     assertProfileName(name);
     if (!args.userName?.trim() || !args.userEmail?.trim()) throw new Error('userName and userEmail are required');
@@ -182,12 +190,15 @@ export class GitProfiles {
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });
     return rec;
+
+    });
   }
 
   /** GitHub OAuth is the normal human onboarding path: the public account
    * identity supplies both commit fields, while authentication remains in the
    * App's refreshable user grant rather than this profile. */
   async saveGithubIdentity(identity: { id: string | number; login: string; name?: string | null }): Promise<GitProfile> {
+    return this.store.transaction(async () => {
     const id = String(identity.id).trim();
     const login = identity.login.trim();
     if (!/^\d+$/.test(id) || !/^[A-Za-z0-9-]+$/.test(login))
@@ -203,6 +214,8 @@ export class GitProfiles {
     }));
     if (!(await this.defaultProfile())) (await this.setDefault(profile.name));
     return profile;
+
+    });
   }
 
   async githubProfile(accountId: string): Promise<GitProfile | undefined> {
@@ -210,14 +223,18 @@ export class GitProfiles {
   }
 
   async setActiveGithub(accountId: string): Promise<GitProfile> {
+    return this.store.transaction(async () => {
     const profile = (await this.githubProfile(accountId));
     if (!profile) throw new Error('GitHub account identity is not configured');
     (await this.setDefault(profile.name));
     return profile;
+
+    });
   }
 
   async saveGithubCustomIdentity(accountId: string, args: { userName?: string; userEmail?: string;
     signingKey?: string; removeSigningKey?: boolean }): Promise<GitProfile> {
+    return this.store.transaction(async () => {
     const profile = (await this.githubProfile(accountId));
     if (!profile?.github) throw new Error('Connect GitHub before customizing its identity');
     const customIdentity = {
@@ -233,18 +250,26 @@ export class GitProfiles {
       signingKey: args.signingKey,
       clearSigningKey: args.removeSigningKey,
     }));
+
+    });
   }
 
   /** Compatibility for callers from the single-account UI/API. */
   async saveGithubSigningKey(signingKey: string): Promise<GitProfile> {
+    return this.store.transaction(async () => {
     const profile = (await this.resolve(undefined));
     if (!profile?.github) throw new Error('Connect GitHub before adding a signing key');
     return (await this.saveGithubCustomIdentity(profile.github.id, { signingKey }));
+
+    });
   }
 
   async deleteGithubIdentity(accountId: string): Promise<void> {
+    return this.store.transaction(async () => {
     const profile = (await this.githubProfile(accountId));
     if (profile) (await this.delete(profile.name));
+
+    });
   }
 
   async automationIdentity(): Promise<GitProfile | undefined> {
@@ -253,6 +278,7 @@ export class GitProfiles {
 
   async saveAutomationIdentity(args: { userName?: string; userEmail?: string; signingKey?: string;
     removeSigningKey?: boolean }): Promise<GitProfile | undefined> {
+    return this.store.transaction(async () => {
     const customIdentity = {
       ...(args.userName?.trim() ? { userName: args.userName.trim() } : {}),
       ...(args.userEmail?.trim() ? { userEmail: args.userEmail.trim() } : {}),
@@ -267,9 +293,12 @@ export class GitProfiles {
     }));
     (await this.setDefault(profile.name));
     return profile;
+
+    });
   }
 
   async delete(name: string) {
+    return this.store.transaction(async () => {
     const profile = (await this.get(name));
     (await this.store.kvSet(this.profilesKey(), JSON.stringify((await this.list()).filter((p) => p.name !== name))));
     if ((await this.defaultProfile()) === name) (await this.setDefault(undefined));
@@ -279,6 +308,8 @@ export class GitProfiles {
       }
     }
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });
+
+    });
   }
 
   /** Resolve a named override (legacy organization automation) or this scope's default. */

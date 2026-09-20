@@ -303,7 +303,7 @@ describe('Stripe subscription provider', () => {
     const digest = crypto.createHmac('sha256', env.KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET)
       .update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
     expect((await provider.verifyWebhook(raw, `t=${timestamp},v1=${digest}`)).id).toBe('evt_signed');
-    expect(async () => (await provider.verifyWebhook(raw, `t=${timestamp},v1=bad`))).toThrow('invalid subscription webhook signature');
+    await expect(provider.verifyWebhook(raw, `t=${timestamp},v1=bad`)).rejects.toThrow('invalid subscription webhook signature');
   });
 
   it('reconciles Dahlia item periods and invoice parent references', async () => {

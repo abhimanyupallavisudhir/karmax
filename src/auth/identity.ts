@@ -1,3 +1,4 @@
+import { identitySqliteDatabase } from '../store/identity-sqlite.js';
 import { betterAuth } from 'better-auth';
 import { admin, genericOAuth } from 'better-auth/plugins';
 import { getMigrations } from 'better-auth/db/migration';
@@ -100,6 +101,7 @@ export interface IdentityOptions {
 export class IdentityService {
    auth!: any;
   private db!: SqlDatabase;
+  private sqlite?: ReturnType<typeof identitySqliteDatabase>;
   private pool?: Pool;
   migration?: SqliteImportResult;
   private organizationNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
@@ -132,6 +134,7 @@ export class IdentityService {
 
     this.db = openSqlDatabase(opts.databaseUrl ?? dbFile);
     this.pool = opts.databaseUrl ? new Pool({ connectionString: opts.databaseUrl }) : undefined;
+    this.sqlite = this.pool ? undefined : identitySqliteDatabase(this.db);
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
     // runs the gateway, the worker and every activity in one process, so a
     // concurrent writer must wait rather than fail with SQLITE_BUSY.
@@ -181,7 +184,7 @@ export class IdentityService {
     const siteName = async () => (await opts.siteName?.()) || 'krmax';
     this.auth = betterAuth({
       appName: (await siteName()),
-      database: this.pool ?? this.db.native,
+      database: this.pool ?? { db: this.sqlite!, type: 'sqlite', transaction: true },
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
       // Native Better Auth social sign-in. No gateway routes are needed:
@@ -228,7 +231,7 @@ export class IdentityService {
         // no-op when email isn't configured (the request still returns ok so we
         // don't disclose which addresses exist).
         sendResetPassword: async ({ user, url }: { user: IdentityUser; url: string }) => {
-          if (!(await this.mailer?.configured())) return;
+          if (!this.mailer || !(await this.mailer.configured())) return;
           const brand = (await siteName());
           await this.mailer.send({
             to: user.email,
@@ -245,7 +248,7 @@ export class IdentityService {
         sendOnSignUp: true,
         autoSignInAfterVerification: true,
         sendVerificationEmail: async ({ user, url }: { user: IdentityUser; url: string }) => {
-          if (!(await this.mailer?.configured())) return;
+          if (!this.mailer || !(await this.mailer.configured())) return;
           const brand = (await siteName());
           await this.mailer.send({
             to: user.email,
@@ -423,11 +426,8 @@ export class IdentityService {
       body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
     // Promote the account this call actually created, resolved by its own email —
-    // NOT `listUsers()[0]`. `hasUsers()` above is a TOCTOU check, so two
-    // concurrent bootstrap POSTs both create an account and both used to promote
-    // whichever row sorted first: requester B got a valid session and an
-    // "you are the administrator" response while holding role `user`, and A was
-    // silently promoted twice.
+    // NOT `listUsers()[0]`. The surrounding transaction serializes the empty-
+    // installation check, so only one concurrent bootstrap may create an admin.
     const created = (await response.clone().json().catch(() => ({})) as any)?.user as { id?: string } | undefined;
     const email = input.email.trim().toLowerCase();
     const user = (await this.listUsers()).find((candidate) => (created?.id ? candidate.id === created.id
@@ -466,6 +466,7 @@ export class IdentityService {
   }
 
   async close(): Promise<void> {
+    await this.sqlite?.destroy();
     (await this.db.close());
     await this.pool?.end();
   }

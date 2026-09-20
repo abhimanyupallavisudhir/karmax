@@ -110,6 +110,9 @@ const MAX_CATCHUP_STEPS = 20_000;
 
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
+  private eventTail: Promise<void> = Promise.resolve();
+  private epoch = 0;
+  private versions = new Map<string, number>();
   private unsub?: () => void;
   private now: () => number;
   private setTimer: (fn: () => void, ms: number) => unknown;
@@ -125,17 +128,27 @@ export class TriggerScheduler {
 
   /** Subscribe to the bus and re-arm every stored armed task (call once on boot). */
   async start(): Promise<void> {
+    const startEpoch = this.epoch;
     for (const task of (await this.deps.store.listArmedTasks())) {
       // A stored task can have become invalid since it was armed — most often a
       // dependency task that has since been deleted. Boot must never die on one
       // bad row, so the refusal is logged per task and the rest still arm.
       try {
+        if (this.epoch !== startEpoch) return;
         (await this.arm(task));
       } catch (e) {
         this.log(`refusing to arm ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    this.unsub = this.deps.bus.onAny(async (ev) => (await this.onEvent(ev)));
+    if (this.epoch !== startEpoch) return;
+    const epoch = this.epoch;
+    this.unsub = this.deps.bus.onAny(ev => {
+      // Lifecycle edges must not overtake one another while attribution reads
+      // yield. A stopped/restarted scheduler must not consume its old backlog.
+      const next = this.eventTail.then(() => this.epoch === epoch ? this.onEvent(ev) : undefined);
+      this.eventTail = next.catch(error => this.log(`trigger event failed: ${String(error)}`));
+      return next;
+    });
     const n = this.armed.size;
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
   }
@@ -166,6 +179,7 @@ export class TriggerScheduler {
   }
 
   stop(): void {
+    this.epoch++;
     this.unsub?.();
     this.unsub = undefined;
     for (const e of this.armed.values()) for (const t of e.timers) this.clearTimer(t);
@@ -189,7 +203,11 @@ export class TriggerScheduler {
   async arm(task: TaskRecord): Promise<void> {
     const triggers = normalizeTriggers(task.params);
     if (!triggers.length) return;
+    const epoch = this.epoch;
+    const version = (this.versions.get(task.id) ?? 0) + 1;
+    this.versions.set(task.id, version);
     const errs = (await this.validationErrors(task));
+    if (this.epoch !== epoch || this.versions.get(task.id) !== version) return;
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     this.disarm(task.id); // idempotent re-arm
     const entry: ArmedEntry = {
@@ -207,6 +225,7 @@ export class TriggerScheduler {
     // Seed dependency satisfaction from already-recorded statuses (a dep may have
     // completed before this task was armed, or while karmax was down).
     (await this.refreshDependencies(entry));
+    if (this.armed.get(task.id) !== entry) return;
 
     // Arm time-based triggers.
     for (const trig of triggers) {
@@ -233,6 +252,7 @@ export class TriggerScheduler {
   }
 
   disarm(taskId: string): void {
+    this.versions.set(taskId, (this.versions.get(taskId) ?? 0) + 1);
     const e = this.armed.get(taskId);
     if (!e) return;
     for (const t of e.timers) this.clearTimer(t);
@@ -250,8 +270,9 @@ export class TriggerScheduler {
     if (!sourceOrganization) return;
     // Copy: firing mutates the map (one-shot disarm).
     for (const entry of [...this.armed.values()]) {
-      if (entry.fired) continue;
+      if (this.armed.get(entry.task.id) !== entry || entry.fired) continue;
       if ((await this.organizationOfTask(entry.task.id, entry.task)) !== sourceOrganization) continue;
+      if (this.armed.get(entry.task.id) !== entry) continue;
       // `event` triggers are activators. They become runnable only once every
       // dependency prerequisite is also satisfied.
       // `firedNow` is load-bearing for a REPEATABLE series: `entry.fired` is only
@@ -326,7 +347,7 @@ export class TriggerScheduler {
    * its dependencies is itself the activation.
    */
   private evaluate(entry: ArmedEntry, cause?: TaskTrigger): boolean {
-    if (entry.fired) return false;
+    if (this.armed.get(entry.task.id) !== entry || entry.fired) return false;
     const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
     if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return false;
 
@@ -341,20 +362,23 @@ export class TriggerScheduler {
 
   /** Durably remember (or consume) an activation that is gated on dependencies. */
   private async setActivationPending(entry: ArmedEntry, pending: boolean): Promise<void> {
-    const current = (await this.deps.store.taskMetadata(entry.task.id)) ?? entry.task;
-    const persisted = current.params?.triggerPending === true;
-    if (entry.activationPending === pending && persisted === pending) return;
-    entry.activationPending = pending;
-    const params = { ...(current.params as Record<string, unknown>) };
-    if (pending) params.triggerPending = true;
-    else delete params.triggerPending;
-    entry.task = { ...current, params: params as TaskRecord['params'] };
     try {
-      (await this.deps.store.updateTaskParams(entry.task.id, entry.task.params));
-    } catch (e) {
-      // The in-memory level still gives correct behavior for this process. A
-      // vanished task will fail at fire time and be reported through that path.
-      this.log(`could not record pending trigger for ${entry.task.id}: ${e instanceof Error ? e.message : String(e)}`);
+      await this.deps.store.transaction(async () => {
+        const current = await this.deps.store.taskMetadata(entry.task.id);
+        if (!current || this.armed.get(entry.task.id) !== entry) return;
+        const persisted = current.params?.triggerPending === true;
+        if (entry.activationPending === pending && persisted === pending) return;
+        const params = { ...(current.params as Record<string, unknown>) };
+        if (pending) params.triggerPending = true;
+        else delete params.triggerPending;
+        await this.deps.store.updateTaskParams(entry.task.id, params as TaskRecord['params']);
+        if (this.armed.get(entry.task.id) !== entry) return;
+        entry.activationPending = pending;
+        entry.task = { ...current, params: params as TaskRecord['params'] };
+      });
+    } catch (error) {
+      this.log(`could not record pending trigger for ${entry.task.id}: ${String(error)}`);
+      throw error;
     }
   }
 
@@ -369,7 +393,7 @@ export class TriggerScheduler {
    * rejected start cannot starve HTTP, health checks, or shutdown signals.
    */
   private fireFor(entry: ArmedEntry, trig: TaskTrigger): boolean {
-    if (entry.fired || entry.retryTimer !== undefined) return false;
+    if (this.armed.get(entry.task.id) !== entry || entry.fired || entry.retryTimer !== undefined) return false;
     const consumesActivation = entry.triggers.some((t) => t.kind !== 'dependency');
     if (consumesActivation && entry.activationInFlight) return false;
     if (consumesActivation) {
@@ -426,13 +450,16 @@ export class TriggerScheduler {
       if (this.armed.get(taskId) !== entry) return;
       try {
         const task = await this.deps.store.taskMetadata(taskId);
+        if (this.armed.get(taskId) !== entry) return;
         if (task?.params?.triggerState !== 'armed') return this.disarm(taskId);
         const errors = (await this.validationErrors(task));
         if (errors.length) throw new Error(`invalid trigger(s): ${errors.join('; ')}`);
+        if (this.armed.get(taskId) !== entry) return;
         entry.task = task;
         (await this.refreshDependencies(entry));
         this.evaluate(entry);
       } catch (error) {
+        if (this.armed.get(taskId) !== entry) return;
         this.disarm(taskId);
         this.log(`refusing to retry ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -503,10 +530,11 @@ export class TriggerScheduler {
 
   /** Persist the cron mark so catch-up survives a restart. */
   private async recordCronFire(entry: ArmedEntry, whenMs: number): Promise<void> {
+    if (this.armed.get(entry.task.id) !== entry) return;
     const params = { ...entry.task.params, triggerLastFiredAt: whenMs };
     entry.task = { ...entry.task, params };
     try {
-      (await this.deps.store.updateTaskParams(entry.task.id, params));
+      (await this.deps.store.patchTaskParams(entry.task.id, { triggerLastFiredAt: whenMs }));
     } catch (e) {
       // A vanished row must not kill the timer chain; the in-memory mark still
       // dedupes for this process's lifetime.
@@ -542,7 +570,7 @@ export class TriggerScheduler {
   }
 
   /** Set a (possibly very long) timer that fires `onDue` at absolute time `whenMs`. */
-  private armAt(entry: ArmedEntry, whenMs: number, onDue: () => void): void {
+  private armAt(entry: ArmedEntry, whenMs: number, onDue: () => unknown): void {
     const delay = Math.max(0, whenMs - this.now());
     if (delay > MAX_TIMER_MS) {
       const h = this.setTimer(() => {
@@ -552,9 +580,10 @@ export class TriggerScheduler {
       entry.timers.push(h);
       return;
     }
-    const h = this.setTimer(() => {
+    const h = this.setTimer(async () => {
       entry.timers = entry.timers.filter((t) => t !== h);
-      onDue();
+      if (this.armed.get(entry.task.id) !== entry) return;
+      try { await onDue(); } catch (error) { this.log(`trigger timer failed: ${String(error)}`); }
     }, delay);
     entry.timers.push(h);
   }

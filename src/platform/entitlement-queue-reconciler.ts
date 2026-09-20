@@ -1,3 +1,4 @@
+import { AsyncInterval } from '../util/async-interval.js';
 import type { Client } from '@temporalio/client';
 import {
   QRY_AGENT_QUEUE,
@@ -51,7 +52,7 @@ export class EntitlementQueueReconciler {
   private readonly intervalMs: number;
   private readonly requested = new Set<string>();
   private unsubscribe?: () => void;
-  private timer?: ReturnType<typeof setInterval>;
+  private timer?: AsyncInterval;
   private draining?: Promise<void>;
 
   constructor(private readonly options: EntitlementQueueReconcilerOptions) {
@@ -65,7 +66,7 @@ export class EntitlementQueueReconciler {
     });
     (await this.requestAll());
     if (this.intervalMs > 0) {
-      this.timer = setInterval(async () => (await this.requestAll()), this.intervalMs);
+      this.timer = new AsyncInterval(() => this.requestAll(), this.intervalMs);
       this.timer.unref?.();
     }
   }
@@ -73,7 +74,7 @@ export class EntitlementQueueReconciler {
   async stop(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
-    if (this.timer) clearInterval(this.timer);
+    await this.timer?.stop();
     this.timer = undefined;
     this.requested.clear();
     // The Temporal client must remain open until a signal/query already in

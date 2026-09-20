@@ -282,14 +282,14 @@ class FakeClock {
     this.timers = this.timers.filter((t) => t.id !== h);
   };
   /** Advance the clock, firing due timers in chronological order. */
-  advance(ms: number) {
+  async advance(ms: number) {
     const target = this.time + ms;
     for (;;) {
       const due = this.timers.filter((t) => t.at <= target).sort((a, b) => a.at - b.at)[0];
       if (!due) break;
       this.timers = this.timers.filter((t) => t !== due);
       this.time = due.at;
-      due.fn();
+      await due.fn();
     }
     this.time = target;
   }
@@ -361,24 +361,24 @@ describe('TriggerScheduler (dispatcher)', () => {
       },
     });
     (await scheduler.start());
-    if (kind === 'event') bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
-    clock.advance(kind === 'cron' ? 60_000 : 0);
+    if (kind === 'event') (await bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} }));
+    (await clock.advance(kind === 'cron' ? 60_000 : 0));
     const due = clock.time;
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(attempts).toEqual([due]);
     if (kind !== 'dependency') expect((await store.getTask(task.id))!.params.triggerPending).toBe(true);
-    bus.emit({ type: 'other', taskId: dep, ts: 0, payload: {} });
+    (await bus.emit({ type: 'other', taskId: dep, ts: 0, payload: {} }));
     expect(fired).toContainEqual([other.id, 'self']);
     // Matching events cannot bypass the retry cooldown.
-    bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
-    clock.advance(999);
+    (await bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} }));
+    (await clock.advance(999));
     expect(attempts).toHaveLength(1);
-    clock.advance(1);
+    (await clock.advance(1));
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(attempts).toEqual([due, due + 1000]);
-    clock.advance(1999);
+    (await clock.advance(1999));
     expect(attempts).toHaveLength(2);
-    clock.advance(1);
+    (await clock.advance(1));
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(attempts).toEqual([due, due + 1000, due + 3000]);
     expect(fired).toContainEqual([task.id, kind === 'cron' ? 'clone' : 'self']);
@@ -394,7 +394,7 @@ describe('TriggerScheduler (dispatcher)', () => {
       fire: () => { attempts++; return new Promise((_, fail) => { reject = fail; }); },
     });
     (await scheduler.start());
-    clock.advance(0);
+    (await clock.advance(0));
     if (action === 'stop') scheduler.stop();
     else if (action === 'disarm') scheduler.disarm(task.id);
     else {
@@ -403,7 +403,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     }
     reject(new Error('engine unavailable'));
     await new Promise<void>((resolve) => setImmediate(resolve));
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     expect(attempts).toBe(1);
     expect(scheduler.size).toBe(action === 'edit' ? 1 : 0);
     scheduler.stop();
@@ -416,10 +416,10 @@ describe('TriggerScheduler (dispatcher)', () => {
       fire: async () => { if (++attempts < 3) throw new Error('engine unavailable'); },
     });
     (await scheduler.start());
-    clock.advance(0);
+    (await clock.advance(0));
     await new Promise<void>((resolve) => setImmediate(resolve));
     scheduler.disarm(task.id);
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     expect(attempts).toBe(1);
     scheduler.stop();
   });
@@ -440,7 +440,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     const delays = [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000];
     let expected = 0;
     for (const delay of delays) {
-      clock.advance(delay);
+      (await clock.advance(delay));
       expected += delay;
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(attempts.at(-1)).toBe(expected);
@@ -449,7 +449,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     // A dependency can cease to be satisfied while a start is in flight, when
     // one-shot event routing is suppressed. Retry must read the live state.
     (await store.saveView(dep, { status: 'running' } as any));
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     expect(attempts).toHaveLength(delays.length + 1);
     scheduler.stop();
   });
@@ -468,9 +468,9 @@ describe('TriggerScheduler (dispatcher)', () => {
     const b = (await armedTask([{ kind: 'dependency', tasks: [dep.id] }]));
     const s = makeScheduler();
     (await s.start());
-    emitDone(dep.id, 'failed'); // wrong outcome for default `success` → no fire
+    (await emitDone(dep.id, 'failed')); // wrong outcome for default `success` → no fire
     expect(fired).toHaveLength(0);
-    emitDone(dep.id, 'done');
+    (await emitDone(dep.id, 'done'));
     expect(fired).toEqual([[b.id, 'self']]);
     expect(s.size).toBe(0); // disarmed after firing
   });
@@ -483,9 +483,9 @@ describe('TriggerScheduler (dispatcher)', () => {
     (await s.start());
     // A finishing task emits several terminal `view.updated` events; a repeatable
     // series never disarms, so only the first (newly-satisfied) one may fire.
-    emitDone(dep.id, 'done');
-    emitDone(dep.id, 'done');
-    emitDone(dep.id, 'done');
+    (await emitDone(dep.id, 'done'));
+    (await emitDone(dep.id, 'done'));
+    (await emitDone(dep.id, 'done'));
     expect(fired).toEqual([[series.id, 'clone']]);
   });
 
@@ -503,8 +503,8 @@ describe('TriggerScheduler (dispatcher)', () => {
       (await scheduler.start());
       expect(scheduler.size).toBe(2);
       (await store.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify({ status: 'done' }), dep));
-      emitDone(dep);
-      bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} });
+      (await emitDone(dep));
+      (await bus.emit({ type: 'release', taskId: dep, ts: 0, payload: {} }));
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(fired).toEqual([[dependent.id, 'self'], [eventTask.id, 'self']]);
       expect((await store.taskMetadata(eventTask.id))?.params.triggerPending).toBeUndefined();
@@ -524,10 +524,10 @@ describe('TriggerScheduler (dispatcher)', () => {
     const s = makeScheduler();
     (await s.start());
     (await store.saveView(first.id, { taskId: first.id, title: 'dep', workflow: 'just-do', stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: {}, updatedAt: 1 }));
-    emitDone(first.id, 'cancelled');
+    (await emitDone(first.id, 'cancelled'));
     expect(fired).toHaveLength(0); // second is now principal and still eligible
     (await store.saveView(second.id, { taskId: second.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 2 }));
-    emitDone(second.id, 'done');
+    (await emitDone(second.id, 'done'));
     expect(fired).toEqual([[dependent.id, 'self']]);
   });
 
@@ -538,9 +538,9 @@ describe('TriggerScheduler (dispatcher)', () => {
     const any = (await armedTask([{ kind: 'dependency', tasks: [a.id, c.id], mode: 'any' }]));
     const s = makeScheduler();
     (await s.start());
-    emitDone(a.id);
+    (await emitDone(a.id));
     expect(fired).toEqual([[any.id, 'self']]); // any fired; all still waiting
-    emitDone(c.id);
+    (await emitDone(c.id));
     expect(fired).toContainEqual([all.id, 'self']);
   });
 
@@ -557,9 +557,9 @@ describe('TriggerScheduler (dispatcher)', () => {
     const t = (await armedTask([{ kind: 'event', type: 'github.pr-merged', where: { branch: 'main' } }]));
     const s = makeScheduler();
     (await s.start());
-    bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'dev' } } as KarmaxEvent);
+    (await bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'dev' } } as KarmaxEvent));
     expect(fired).toHaveLength(0);
-    bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    (await bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'main' } } as KarmaxEvent));
     expect(fired).toEqual([[t.id, 'self']]);
   });
 
@@ -570,12 +570,12 @@ describe('TriggerScheduler (dispatcher)', () => {
     const foreign = (await store.createTask({ projectId: otherProject.id, title: 'f', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'f' } }));
     const s = makeScheduler();
     (await s.start());
-    bus.emit({ type: 'github.pr-merged', taskId: foreign.id, ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    (await bus.emit({ type: 'github.pr-merged', taskId: foreign.id, ts: 0, payload: { branch: 'main' } } as KarmaxEvent));
     expect(fired).toHaveLength(0);
     // An event whose task no longer exists has no tenant and reaches nobody.
-    bus.emit({ type: 'github.pr-merged', taskId: 'task_gone', ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    (await bus.emit({ type: 'github.pr-merged', taskId: 'task_gone', ts: 0, payload: { branch: 'main' } } as KarmaxEvent));
     expect(fired).toHaveLength(0);
-    bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'main' } } as KarmaxEvent);
+    (await bus.emit({ type: 'github.pr-merged', taskId: (await sourceTask()), ts: 0, payload: { branch: 'main' } } as KarmaxEvent));
     expect(fired).toEqual([[t.id, 'self']]);
   });
 
@@ -588,14 +588,14 @@ describe('TriggerScheduler (dispatcher)', () => {
     const first = makeScheduler();
     (await first.start());
 
-    bus.emit({ type: 'release.approved', taskId: (await sourceTask()), ts: 0, payload: {} } as KarmaxEvent);
+    (await bus.emit({ type: 'release.approved', taskId: (await sourceTask()), ts: 0, payload: {} } as KarmaxEvent));
     expect(fired).toHaveLength(0);
     expect((await store.getTask(t.id))!.params.triggerPending).toBe(true);
 
     first.stop();
     const restarted = makeScheduler();
     (await restarted.start());
-    emitDone(dep.id);
+    (await emitDone(dep.id));
     expect(fired).toEqual([[t.id, 'self']]);
     await new Promise((r) => setTimeout(r, 0));
     expect((await store.getTask(t.id))!.params.triggerPending).toBeUndefined();
@@ -606,9 +606,9 @@ describe('TriggerScheduler (dispatcher)', () => {
     const t = (await armedTask([{ kind: 'schedule', at: 5000 }]));
     const s = makeScheduler();
     (await s.start());
-    clock.advance(4000);
+    (await clock.advance(4000));
     expect(fired).toHaveLength(0);
-    clock.advance(2000);
+    (await clock.advance(2000));
     expect(fired).toEqual([[t.id, 'self']]);
     expect(s.size).toBe(0);
   });
@@ -622,11 +622,11 @@ describe('TriggerScheduler (dispatcher)', () => {
     const s = makeScheduler();
     (await s.start());
 
-    clock.advance(5000);
+    (await clock.advance(5000));
     expect(fired).toHaveLength(0); // due, but its prerequisite is still running
     expect(s.size).toBe(1);
 
-    emitDone(dep.id);
+    (await emitDone(dep.id));
     expect(fired).toEqual([[t.id, 'self']]);
     expect(s.size).toBe(0);
   });
@@ -640,10 +640,10 @@ describe('TriggerScheduler (dispatcher)', () => {
     const s = makeScheduler();
     (await s.start());
 
-    emitDone(dep.id);
+    (await emitDone(dep.id));
     expect(fired).toHaveLength(0); // prerequisite met, but the earliest start is still ahead
 
-    clock.advance(5000);
+    (await clock.advance(5000));
     expect(fired).toEqual([[t.id, 'self']]);
     expect(s.size).toBe(0);
   });
@@ -653,11 +653,11 @@ describe('TriggerScheduler (dispatcher)', () => {
     const t = (await armedTask([{ kind: 'schedule', cron: '* * * * *' }]));
     const s = makeScheduler();
     (await s.start());
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     expect(fired).toEqual([[t.id, 'clone']]);
     await new Promise((r) => setTimeout(r, 0));
     expect(s.size).toBe(1); // still armed for the next occurrence
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     await new Promise((r) => setTimeout(r, 0));
     expect(fired).toEqual([
       [t.id, 'clone'],
@@ -685,7 +685,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(scheduler.size).toBe(1);
 
     // Simulate the dep completing on the bus → dispatcher fires b.
-    bus.emit({ type: 'view.updated', taskId: dep.id, ts: 0, payload: { status: 'done' } } as KarmaxEvent);
+    (await bus.emit({ type: 'view.updated', taskId: dep.id, ts: 0, payload: { status: 'done' } } as KarmaxEvent));
     await new Promise((r) => setTimeout(r, 0)); // let the async fire settle
     expect(started).toContain(b.id);
     expect(scheduler.size).toBe(0);
@@ -847,11 +847,11 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(series.params.triggerState).toBe('armed');
     expect((await store.runsOf(series.id))).toHaveLength(0); // waits for the first fire
 
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     await new Promise((r) => setTimeout(r, 0));
     expect((await store.runsOf(series.id))).toHaveLength(1);
     expect(scheduler.size).toBe(1); // series stays armed for the next occurrence
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     await new Promise((r) => setTimeout(r, 0));
     expect((await store.runsOf(series.id))).toHaveLength(2);
   });
@@ -867,7 +867,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     const s = new TriggerScheduler({ store, bus, fire: async (id, mode) => void fired.push([id, mode]),
       now: lagging, setTimer: clock.set, clearTimer: clock.clear });
     (await s.start());
-    clock.advance(60_100);
+    (await clock.advance(60_100));
     expect(fired).toEqual([[t.id, 'clone']]); // exactly one fire for the 60s occurrence
     s.stop();
   });
@@ -885,7 +885,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect((await store.getTask(t.id))!.params.triggerLastFiredAt).toBe(nine('08'));
     // ...and it is still armed for tomorrow, not re-firing today's.
     expect(s.size).toBe(1);
-    clock.advance(3600_000);
+    (await clock.advance(3600_000));
     expect(fired).toHaveLength(1);
     s.stop();
   });
@@ -899,7 +899,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     const first = makeScheduler();
     (await first.start());
 
-    clock.advance(120_000); // two blocked occurrences coalesce into one pending run
+    (await clock.advance(120_000)); // two blocked occurrences coalesce into one pending run
     expect(fired).toHaveLength(0);
     expect((await store.getTask(series.id))!.params.triggerPending).toBe(true);
 
@@ -908,12 +908,12 @@ describe('TriggerScheduler (dispatcher)', () => {
     (await restarted.start());
     expect(fired).toHaveLength(0);
 
-    emitDone(dep.id);
+    (await emitDone(dep.id));
     expect(fired).toEqual([[series.id, 'clone']]);
     await new Promise((r) => setTimeout(r, 0));
     expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined();
 
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]);
     restarted.stop();
   });
@@ -933,7 +933,7 @@ describe('TriggerScheduler (dispatcher)', () => {
       clearTimer: clock.clear,
     });
     (await first.start());
-    clock.advance(60_000);
+    (await clock.advance(60_000));
     await new Promise((r) => setTimeout(r, 0));
     expect(failedAttempts).toBe(1);
     expect((await store.getTask(series.id))!.params.triggerPending).toBe(true);
@@ -968,16 +968,16 @@ describe('TriggerScheduler (dispatcher)', () => {
     (await store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' }));
     const s = makeScheduler();
     (await s.start());
-    emitDone(dep.id, 'done');
+    (await emitDone(dep.id, 'done'));
     expect(fired).toHaveLength(1);
     // The dep genuinely runs again: it reports a non-terminal status first, which
     // must drop it back out of the satisfied set (which used to be append-only, so
     // the series fired at most once in its whole life and then sat armed doing nothing).
-    emitDone(dep.id, 'active');
-    emitDone(dep.id, 'done');
+    (await emitDone(dep.id, 'active'));
+    (await emitDone(dep.id, 'done'));
     expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]);
     // Duplicate terminal events are still deduped.
-    emitDone(dep.id, 'done');
+    (await emitDone(dep.id, 'done'));
     expect(fired).toHaveLength(2);
     s.stop();
   });
@@ -991,7 +991,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     (await store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' }));
     const s = makeScheduler();
     (await s.start());
-    bus.emit({ type: 'x.y', taskId: (await sourceTask()), ts: 0, payload: { a: 1 } } as KarmaxEvent);
+    (await bus.emit({ type: 'x.y', taskId: (await sourceTask()), ts: 0, payload: { a: 1 } } as KarmaxEvent));
     expect(fired).toEqual([[series.id, 'clone']]); // both triggers matched; one run
     s.stop();
   });
@@ -1022,8 +1022,33 @@ describe('TriggerScheduler (dispatcher)', () => {
     const s = makeScheduler();
     (await s.start());
     s.disarm(t.id);
-    clock.advance(10_000);
+    (await clock.advance(10_000));
     expect(fired).toHaveLength(0);
     expect(s.size).toBe(0);
   });
+  it.each(['stop', 'disarm'] as const)('does not arm after %s supersedes an asynchronous validation', async action => {
+    const task = await armedTask([{ kind: 'event', type: 'release' }]);
+    const scheduler = makeScheduler();
+    let release!: (errors: string[]) => void;
+    vi.spyOn(scheduler, 'validationErrors').mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = scheduler.arm(task);
+    if (action === 'stop') scheduler.stop(); else scheduler.disarm(task.id);
+    release([]);
+    await pending;
+    expect(scheduler.size).toBe(0);
+    scheduler.stop();
+  });
+
+  it('preserves dependency lifecycle edges delivered concurrently', async () => {
+    const dep = await sourceTask();
+    const task = await armedTask([{ kind: 'dependency', tasks: [dep] }]);
+    await store.patchTaskParams(task.id, { repeatable: true });
+    const scheduler = makeScheduler();
+    await scheduler.start();
+    try {
+      await Promise.all([emitDone(dep, 'done'), emitDone(dep, 'running'), emitDone(dep, 'done')]);
+      expect(fired).toEqual([[task.id, 'clone'], [task.id, 'clone']]);
+    } finally { scheduler.stop(); }
+  });
+
 });

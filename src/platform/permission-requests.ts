@@ -50,7 +50,7 @@ export function exactCapability(raw: string): Capability {
  * axes of the next turn's scoped token. Nothing mutates a human/profile grant.
  */
 export class PermissionRequests {
-  constructor(private store: Pick<Store, 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
 
   async requests(filter: { taskId?: string; status?: PermissionRequest['status'] } = {}): Promise<PermissionRequest[]> {
     let all: PermissionRequest[] = [];
@@ -91,6 +91,7 @@ export class PermissionRequests {
     reason: string;
     requestedBy: string;
   }): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
     const capabilities = [...new Set(input.capabilities.map(exactCapability))];
     const projectIds = [...new Set((input.projectIds ?? []).map(String))];
     if (!capabilities.length && !projectIds.length) throw new Error('choose at least one capability or project');
@@ -138,9 +139,12 @@ export class PermissionRequests {
       detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, projectIds, baseAuthorization: input.baseAuthorization, audience, recipients, avatarRecipients },
     }));
     return request;
+
+    });
   }
 
   async resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean }): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === requestId);
     if (!request) throw new Error(`no permission request ${requestId}`);
@@ -165,9 +169,12 @@ export class PermissionRequests {
       detail: { requestId, taskId: request.taskId, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds, action: input.action },
     }));
     return request;
+
+    });
   }
 
   async dismiss(id: string, by: string): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no permission request ${id}`);
@@ -177,6 +184,8 @@ export class PermissionRequests {
     (await this.store.appendAudit({ principalId: by, action: 'permission.request.dismissed',
       scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
+
+    });
   }
 
   private async save(requests: PermissionRequest[]): Promise<void> {

@@ -35,6 +35,7 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
   const task = (await store.getTask(taskId));
   const project = task && (await store.getProject(task.projectId));
   if (!project?.organizationId) throw new Error('review artifact task has no organization');
+  const organizationId = project.organizationId;
   const index: Record<string, string> = {};
   for (const target of targets) {
     if (onlyMissing && (await savedReviewArtifact(store, taskId, target))) continue;
@@ -72,19 +73,17 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
         data.length, Date.now() + 60 * 60_000));
       try {
         await objects.put(objectKey, data, mediaType);
-        (await store.db.exec('BEGIN IMMEDIATE'));
-        try {
+        await store.transaction(async () => {
           if (!(await store.getTask(taskId))) throw new Error('review artifact task was deleted during upload');
           if (!(await store.getPromotedArtifact(id))) {
-            (await store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
+            (await store.savePromotedArtifact({ id, organizationId, projectId: project.id,
               taskId, objectKey, sha256, bytes: data.length, mediaType, name, createdAt: Date.now() }));
-            (await store.recordUsage({ id: `usage:artifact:${id}`, organizationId: project.organizationId,
+            (await store.recordUsage({ id: `usage:artifact:${id}`, organizationId,
               projectId: project.id, taskId, worldId: world.handle.id, provider: 'managed-object-store',
               kind: 'resource.storage', quantity: data.length, unit: 'byte', costMicros: 0, fundingSource: 'managed',
               startedAt: Date.now(), endedAt: Date.now(), metadata: { artifactId: id, mediaType } }));
           }
-          (await store.db.exec('COMMIT'));
-        } catch (error) { (await store.db.exec('ROLLBACK')); throw error; }
+        });
       } finally {
         if ((await store.getPromotedArtifact(id))?.objectKey !== objectKey)
           await objects.delete(objectKey).catch(() => {});
@@ -94,7 +93,9 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
     index[hash(target)] = id;
   }
   // Publish pointers only after every attachment is durable.
-  (await store.kvSet(indexKey(taskId), JSON.stringify({
-    ...JSON.parse((await store.kvGet(indexKey(taskId))) ?? '{}'), ...index,
-  })));
+  await store.transaction(async () => {
+    await store.kvSet(indexKey(taskId), JSON.stringify({
+      ...JSON.parse((await store.kvGet(indexKey(taskId))) ?? '{}'), ...index,
+    }));
+  });
 }

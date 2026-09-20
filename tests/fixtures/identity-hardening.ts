@@ -60,6 +60,7 @@ console.log(JSON.stringify({
   rateLimitEnabled: rateLimit.enabled === true,
   bootstrapClaims: promoted.map((claim) => ('error' in claim ? 'error' : claim.email)),
   claimsHonest,
+  bootstrapAdmins: admins,
   secretStable,
   unreadableThrew,
   secretNotClobbered,

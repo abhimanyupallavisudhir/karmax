@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -151,7 +152,7 @@ describe('age and mounted Git password stores', () => {
     const f = fixture();
     const kv = new Map<string, string>();
     const db = {
-      kvGet: (k: string) => kv.get(k),
+      transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k),
       kvSet: (k: string, v: string) => {
         kv.set(k, v);
       },
@@ -217,7 +218,7 @@ describe('age and mounted Git password stores', () => {
     const c = connector(f.config, f.root);
     const kv = new Map<string, string>();
     const db = {
-      kvGet: (key: string) => kv.get(key),
+      transaction: memoryTransaction(kv), kvGet: (key: string) => kv.get(key),
       kvSet: (key: string, value: string) => {
         kv.set(key, value);
       },
@@ -271,7 +272,7 @@ it('keeps healthy mounts available when another repository disappears', async ()
   const config = { ...f.config, mounts: [{ ...mount.config, name: 'work' }] };
   const c = connector(config, f.root);
   const kv = new Map<string, string>();
-  const db = { kvGet: (key: string) => kv.get(key), kvSet: (key: string, value: string) => { kv.set(key, value); }, appendAudit: () => 0 };
+  const db = { transaction: memoryTransaction(kv), kvGet: (key: string) => kv.get(key), kvSet: (key: string, value: string) => { kv.set(key, value); }, appendAudit: () => 0 };
   const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
   const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
   const service = new Connectors(db, items, broker); service.register(c);
@@ -292,7 +293,7 @@ it('keeps healthy mounts available when another repository disappears', async ()
 it('persists failed write-back, blocks remote conflicts and imports an explicitly accepted remote value', async () => {
   const f = fixture();
   const kv = new Map<string, string>();
-  const db = { kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
+  const db = { transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
   const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
   const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
   const makeService = () => {

@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -105,7 +106,7 @@ describe('Bitwarden JSON export import', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-bw-import-'));
     const kv = new Map<string, string>();
     const store: VaultItemStore = {
-      kvGet: (key) => kv.get(key),
+      transaction: memoryTransaction(kv), kvGet: (key) => kv.get(key),
       kvSet: (key, value) => void kv.set(key, value),
       appendAudit: () => 0,
     };

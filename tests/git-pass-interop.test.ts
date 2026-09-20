@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 /** Real CLI interoperability. Run with KARMAX_TEST_PASS_INTEROP=1; requires pass,
  * pass-otp, gopass, age and GnuPG. All keys, remotes and configs are ephemeral. */
 import { execFileSync } from 'node:child_process';
@@ -55,7 +56,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     const config = { repositoryUrl: remote, gpgPrivateKey: privateKey };
     const connector = new GitPassConnector(() => JSON.stringify(config), 'org_personal', () => ({}), path.join(root, 'connector'), { allowLocalRepository: true });
     const kv = new Map<string, string>();
-    const db = { kvGet: (key: string) => kv.get(key), kvSet: (key: string, val: string) => { kv.set(key, val); }, appendAudit: () => 0 };
+    const db = { transaction: memoryTransaction(kv), kvGet: (key: string) => kv.get(key), kvSet: (key: string, val: string) => { kv.set(key, val); }, appendAudit: () => 0 };
     const broker = new CredentialBroker(new Vault(path.join(root, 'vault')));
     const items = new VaultItems(db, broker, path.join(root, 'state'));
     const connectors = new Connectors(db, items, broker);

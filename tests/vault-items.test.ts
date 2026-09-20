@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { Store } from '../src/store/db.js';
 import { VAULT_USAGE_HALF_LIFE_MS } from '../src/util/vault-usage.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -22,6 +23,7 @@ function memStore(): VaultItemStore & { audit: any[] } {
   const kv = new Map<string, string>();
   const audit: any[] = [];
   return {
+    transaction: memoryTransaction(kv, audit),
     kvGet: (k) => kv.get(k),
     kvSet: (k, v) => void kv.set(k, v),
     appendAudit: (e) => audit.push(e),
@@ -264,7 +266,7 @@ describe('the pull model: requests + human resolutions (§7)', () => {
 
     const item = (await items.save({ type: 'login', label: 'gh', domains: ['github.com'], secrets: { password: 'p' } }));
     // a grant action without a bound item is rejected
-    expect(async () => (await items.resolve(r.requestId!, { action: 'task', by: 'user:alice' }))).not.toThrow;
+    await expect(items.resolve(r.requestId!, { action: 'task', by: 'user:alice' })).rejects.toThrow('bind this request');
     const resolved = (await items.resolve(r.requestId!, { action: 'task', by: 'user:alice', itemId: item.id }));
     expect(resolved.status).toBe('granted');
     // the task grant extension is durable and covers the item

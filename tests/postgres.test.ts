@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Pool } from 'pg';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { VaultItems } from '../src/autonomy/vault-items.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { IdentityService } from '../src/auth/identity.js';
 import { openStore, Store } from '../src/store/db.js';
@@ -18,6 +19,27 @@ integration('PostgreSQL cutover', () => {
     await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
   });
   afterAll(async () => { await admin?.end(); });
+
+  it('serializes compound vault edits across independent PostgreSQL pools', async () => {
+    const first = await Store.create(url!);
+    const otherUrl = new URL(url!);
+    otherUrl.searchParams.set('application_name', 'independent-vault-test');
+    const second = await Store.create(otherUrl.href);
+    try {
+      const a = new VaultItems(first);
+      const b = new VaultItems(second);
+      const created = await Promise.all([
+        a.save({ type: 'note', label: 'First' }),
+        b.save({ type: 'note', label: 'Second' }),
+      ]);
+      expect((await a.list()).map(item => item.id).sort()).toEqual(created.map(item => item.id).sort());
+      await Promise.all([
+        a.save({ type: 'note', id: created[0]!.id, label: 'Renamed' }),
+        b.save({ type: 'note', id: created[0]!.id, tags: ['preserved'] }),
+      ]);
+      expect(await a.get(created[0]!.id)).toMatchObject({ label: 'Renamed', tags: ['preserved'] });
+    } finally { await first.close(); await second.close(); }
+  });
 
   it('reads dependency principals without hydrating any attempt history', async () => {
     const store = (await Store.create(url!));
@@ -150,21 +172,22 @@ integration('PostgreSQL cutover', () => {
     } finally { (await store.close()); }
   });
 
-  it('tracks transactions after multi-statement commits, comments and failed statements', async () => {
+  it('pins explicit transactions and rejects raw control and caught statement failures', async () => {
     const db = openSqlDatabase(url!);
     try {
-      (await db.exec('BEGIN IMMEDIATE'));
-      (await db.exec('SELECT 1; COMMIT'));
+      await expect(db.exec('BEGIN')).rejects.toThrow('use transaction()');
+      await db.transaction(async () => {
+        expect(db.inTransaction()).toBe(true);
+        await db.exec('-- batch with a comment\nSELECT 1; SELECT 2');
+      });
       expect(db.inTransaction()).toBe(false);
-      (await db.exec('-- begin with a comment\nBEGIN; SELECT 1'));
-      expect(db.inTransaction()).toBe(true);
-      await expect((async () => (await db.exec('SELECT * FROM missing_payment_table')))()).rejects.toThrow();
-      expect(db.inTransaction()).toBe(true);
-      (await db.exec('ROLLBACK'));
+      await expect(db.transaction(async () => {
+        await expect(db.exec('SELECT * FROM missing_payment_table')).rejects.toThrow();
+        expect(db.inTransaction()).toBe(true);
+      })).rejects.toThrow();
       expect(db.inTransaction()).toBe(false);
-      await expect((async () => (await db.exec('BEGIN; COMMIT; SELECT * FROM missing_payment_table')))()).rejects.toThrow();
-      expect(db.inTransaction()).toBe(false);
-    } finally { (await db.close()); }
+      await db.exec('SELECT 1');
+    } finally { await db.close(); }
   });
 
   it('locks payment accounting in a real transaction and preserves nested rollback', async () => {
@@ -186,10 +209,11 @@ integration('PostgreSQL cutover', () => {
       expect((await service.reconcileTask(ctx)).map(r => r.status)).toEqual(['granted']);
       expect((await store.paymentSpent(task.id))).toBe(200);
       expect(store.db.inTransaction()).toBe(false);
-      (await store.db.exec('BEGIN'));
-      (await store.paymentTransaction(async () => (await store.updateCard(card.id, { available: 1 }))));
-      expect(store.db.inTransaction()).toBe(true);
-      (await store.db.exec('ROLLBACK'));
+      await expect(store.transaction(async () => {
+        await store.paymentTransaction(async () => store.updateCard(card.id, { available: 1 }));
+        expect(store.db.inTransaction()).toBe(true);
+        throw new Error('rollback outer transaction');
+      })).rejects.toThrow('rollback outer transaction');
       expect((await store.getCard(card.id)).available).toBe(9800);
     } finally { (await store.close()); }
   });

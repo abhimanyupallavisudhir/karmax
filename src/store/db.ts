@@ -9,7 +9,6 @@ import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
-import { AsyncPostgres } from './async-sql.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
@@ -135,11 +134,14 @@ export const isReviewRequestEvent = (type: string): boolean =>
  * append-only event log that powers the live UI stream.
  */
 export class Store {
+  /** Compound service mutations must include their reads in this boundary. */
+  transaction<T>(operation: () => Promise<T>): Promise<T> {
+    return this.db.transaction(operation);
+  }
    db!: SqlDatabase;
    hosted!: boolean;
-  private asyncDatabase?: AsyncPostgres;
   private userNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
-  private organizationEntitlementListeners = new Set<(organizationId: string) => void>();
+  private organizationEntitlementListeners = new Set<(organizationId: string) => unknown>();
 
   constructor(private readonly dbPath = ':memory:', options: { hosted?: boolean } = {}) {
   }
@@ -1395,7 +1397,7 @@ export class Store {
       .map((row) => String(row.id));
     const authorizationInboxIds = ((await this.db.prepare("SELECT id FROM inbox WHERE json_extract(subject, '$.projectId')=?").all(id)) as any[])
       .map((row) => String(row.id));
-    const inboxIds = [...rowsFor(this.db, 'inbox', 'taskId', taskIds).map((row) => String(row.id)), ...authorizationInboxIds];
+    const inboxIds = [...(await rowsFor(this.db, 'inbox', 'taskId', taskIds)).map((row) => String(row.id)), ...authorizationInboxIds];
     const teamIds = ((await this.db.prepare('SELECT id FROM teams WHERE projectId=?').all(id)) as any[])
       .map((row) => String(row.id));
     const scopeKey = `project:${id}`;
@@ -1403,22 +1405,22 @@ export class Store {
     try {
       (await this.revokeScopedTokens({ projectId: id }));
       (await this.revokeHumanDelegations({ projectId: id }));
-      deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
-      deleteRows(this.db, 'execution_frames', 'executionId', executionIds);
-      deleteRows(this.db, 'team_memberships', 'teamId', teamIds);
-      deleteRows(this.db, 'team_aliases', 'teamId', teamIds);
-      deleteRows(this.db, 'task_subscribers', 'taskId', taskIds);
-      deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
-      deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
-      deleteRows(this.db, 'task_tags', 'taskId', taskIds);
-      deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
-      deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
-      deleteRows(this.db, 'events', 'taskId', taskIds);
-      deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`));
-      deleteRows(this.db, 'world_instances', 'worldId', taskIds);
-      deleteRows(this.db, 'task_intents', 'id', intentIds);
+      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds));
+      (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
+      (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
+      (await deleteRows(this.db, 'team_aliases', 'teamId', teamIds));
+      (await deleteRows(this.db, 'task_subscribers', 'taskId', taskIds));
+      (await deleteRows(this.db, 'task_confirmation', 'taskId', taskIds));
+      (await deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds));
+      (await deleteRows(this.db, 'task_tags', 'taskId', taskIds));
+      (await deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds));
+      (await deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds));
+      (await deleteRows(this.db, 'events', 'taskId', taskIds));
+      (await deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`)));
+      (await deleteRows(this.db, 'world_instances', 'worldId', taskIds));
+      (await deleteRows(this.db, 'task_intents', 'id', intentIds));
       (await this.db.prepare('DELETE FROM inbox WHERE taskId IN (SELECT id FROM tasks WHERE projectId=?)').run(id));
-      deleteRows(this.db, 'inbox', 'id', authorizationInboxIds);
+      (await deleteRows(this.db, 'inbox', 'id', authorizationInboxIds));
       (await this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
@@ -1432,8 +1434,8 @@ export class Store {
       (await this.db.prepare('DELETE FROM attachment_scopes WHERE projectId=?').run(id));
       const resourceIds = ((await this.db.prepare('SELECT id FROM resource_attachments WHERE projectId=?').all(id)) as any[])
         .map((row) => String(row.id));
-      deleteRows(this.db, 'resource_leases', 'attachmentId', resourceIds);
-      deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
+      (await deleteRows(this.db, 'resource_leases', 'attachmentId', resourceIds));
+      (await deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds));
       (await this.db.prepare('DELETE FROM resource_candidates WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM avatars WHERE projectId=?').run(id));
@@ -1442,8 +1444,8 @@ export class Store {
       (await this.deleteProjectKv([id], taskIds));
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         (await this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id));
-      deleteRows(this.db, 'teams', 'id', teamIds);
-      deleteRows(this.db, 'tasks', 'id', taskIds);
+      (await deleteRows(this.db, 'teams', 'id', teamIds));
+      (await deleteRows(this.db, 'tasks', 'id', taskIds));
       (await this.db.prepare('DELETE FROM projects WHERE id=?').run(id));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -1467,23 +1469,20 @@ export class Store {
 
   /**
    * Observe organization mutations that can change hosted admission. The store
-   * remains the single synchronous billing/member write boundary; control-plane
+   * owns the transactional billing/member write boundary; control-plane
    * services use this hook to reconcile derived durable coordinator state.
    */
-  onOrganizationEntitlementsChanged(listener: (organizationId: string) => void): () => void {
+  onOrganizationEntitlementsChanged(listener: (organizationId: string) => unknown): () => void {
     this.organizationEntitlementListeners.add(listener);
     return () => this.organizationEntitlementListeners.delete(listener);
   }
 
   private notifyOrganizationEntitlementsChanged(organizationId: string): void {
-    // Run after the current synchronous write/transaction has completed. In
-    // particular, deprovisionOrganizationUser removes the membership inside a
-    // larger transaction and must never reconcile from an intermediate state.
-    queueMicrotask(() => {
-      for (const listener of this.organizationEntitlementListeners) {
-        try { listener(organizationId); } catch { /* a periodic reconciler retries */ }
-      }
-    });
+    // Notifications must observe committed state and must not inherit a closed
+    // transaction context. Rollbacks discard the pending notifications.
+    for (const listener of this.organizationEntitlementListeners) {
+      this.db.afterCommit(() => listener(organizationId));
+    }
   }
 
   /** Keep hosted customer-world admission aligned with plan/member concurrency.
@@ -1729,12 +1728,12 @@ export class Store {
     const organization = (await this.getOrganization(organizationId));
     if (!organization) throw new Error('organization not found');
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
-    const taskIds = rowsFor(this.db, 'tasks', 'projectId', projectIds).map((r) => String(r.id));
+    const taskIds = (await rowsFor(this.db, 'tasks', 'projectId', projectIds)).map((r) => String(r.id));
     const teamIds = ((await this.db.prepare('SELECT id FROM teams WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const repositoryIds = ((await this.db.prepare('SELECT id FROM repositories WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const executionIds = ((await this.db.prepare('SELECT id FROM executions WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const inboxIds = ((await this.db.prepare('SELECT id FROM inbox WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
-    const intentIds = rowsFor(this.db, 'tasks', 'projectId', projectIds).map((r) => String(r.intentId)).filter(Boolean);
+    const intentIds = (await rowsFor(this.db, 'tasks', 'projectId', projectIds)).map((r) => String(r.intentId)).filter(Boolean);
     const identityPolicy = (await this.getOrganizationIdentityPolicy(organizationId));
     const projectSettingKeys = [
       `organization:${organizationId}`, `quick:organization:${organizationId}`,
@@ -1745,50 +1744,50 @@ export class Store {
       organization_invitations: (await selectRows(this.db, 'organization_invitations', 'organizationId=?', [organizationId]))
         .map(({ tokenHash: _secret, ...row }) => row),
       teams: (await selectRows(this.db, 'teams', 'organizationId=?', [organizationId])),
-      team_memberships: rowsFor(this.db, 'team_memberships', 'teamId', teamIds),
-      team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
-      projects: rowsFor(this.db, 'projects', 'id', projectIds),
-      avatars: rowsFor(this.db, 'avatars', 'projectId', projectIds),
-      resource_attachments: rowsFor(this.db, 'resource_attachments', 'projectId', projectIds)
+      team_memberships: (await rowsFor(this.db, 'team_memberships', 'teamId', teamIds)),
+      team_aliases: (await rowsFor(this.db, 'team_aliases', 'teamId', teamIds)),
+      projects: (await rowsFor(this.db, 'projects', 'id', projectIds)),
+      avatars: (await rowsFor(this.db, 'avatars', 'projectId', projectIds)),
+      resource_attachments: (await rowsFor(this.db, 'resource_attachments', 'projectId', projectIds))
         .map(({ credentialHandles: _handles, ...row }) => ({ ...row, credentialHandles: '[]' })),
-      resource_revisions: rowsFor(this.db, 'resource_revisions', 'attachmentId',
-        rowsFor(this.db, 'resource_attachments', 'projectId', projectIds).map((row) => String(row.id)))
+      resource_revisions: (await rowsFor(this.db, 'resource_revisions', 'attachmentId',
+        (await rowsFor(this.db, 'resource_attachments', 'projectId', projectIds)).map((row) => String(row.id))))
         .map(({ sealedRef: _sealedRef, ...row }) => row),
-      resource_leases: rowsFor(this.db, 'resource_leases', 'taskId', taskIds)
+      resource_leases: (await rowsFor(this.db, 'resource_leases', 'taskId', taskIds))
         .map(({ sealedDriverRef: _sealed, ...row }) => row),
-      resource_candidates: rowsFor(this.db, 'resource_candidates', 'taskId', taskIds)
+      resource_candidates: (await rowsFor(this.db, 'resource_candidates', 'taskId', taskIds))
         .map(({ vaultItemId: _item, vaultField: _field, ...row }) => row),
       storage_locations: (await selectRows(this.db, 'storage_locations', 'organizationId=?', [organizationId]))
         .map(({ credentialHandle: _credential, ...row }) => ({ ...row, credentialHandle: null })),
-      project_memberships: rowsFor(this.db, 'project_memberships', 'projectId', projectIds),
-      task_lists: rowsFor(this.db, 'task_lists', 'projectId', projectIds),
-      tasks: rowsFor(this.db, 'tasks', 'projectId', projectIds),
-      task_intents: rowsFor(this.db, 'task_intents', 'id', intentIds),
-      task_subscribers: rowsFor(this.db, 'task_subscribers', 'taskId', taskIds),
-      task_confirmation: rowsFor(this.db, 'task_confirmation', 'taskId', taskIds),
-      confirmation_votes: rowsFor(this.db, 'confirmation_votes', 'taskId', taskIds),
+      project_memberships: (await rowsFor(this.db, 'project_memberships', 'projectId', projectIds)),
+      task_lists: (await rowsFor(this.db, 'task_lists', 'projectId', projectIds)),
+      tasks: (await rowsFor(this.db, 'tasks', 'projectId', projectIds)),
+      task_intents: (await rowsFor(this.db, 'task_intents', 'id', intentIds)),
+      task_subscribers: (await rowsFor(this.db, 'task_subscribers', 'taskId', taskIds)),
+      task_confirmation: (await rowsFor(this.db, 'task_confirmation', 'taskId', taskIds)),
+      confirmation_votes: (await rowsFor(this.db, 'confirmation_votes', 'taskId', taskIds)),
       collaboration_requests: [
         ...new Map([
-          ...rowsFor(this.db, 'collaboration_requests', 'requesterTaskId', taskIds),
-          ...rowsFor(this.db, 'collaboration_requests', 'targetTaskId', taskIds),
+          ...(await rowsFor(this.db, 'collaboration_requests', 'requesterTaskId', taskIds)),
+          ...(await rowsFor(this.db, 'collaboration_requests', 'targetTaskId', taskIds)),
         ].map((row) => [String(row.id), row])).values(),
       ],
-      events: rowsFor(this.db, 'events', 'taskId', taskIds).filter(row => includeTiming || row.type !== 'timing'),
-      tags: rowsFor(this.db, 'tags', 'projectId', projectIds),
-      task_tags: rowsFor(this.db, 'task_tags', 'taskId', taskIds),
-      saved_views: rowsFor(this.db, 'saved_views', 'projectId', projectIds),
+      events: (await rowsFor(this.db, 'events', 'taskId', taskIds)).filter(row => includeTiming || row.type !== 'timing'),
+      tags: (await rowsFor(this.db, 'tags', 'projectId', projectIds)),
+      task_tags: (await rowsFor(this.db, 'task_tags', 'taskId', taskIds)),
+      saved_views: (await rowsFor(this.db, 'saved_views', 'projectId', projectIds)),
       git_connections: (await selectRows(this.db, 'git_connections', 'organizationId=?', [organizationId])),
-      repositories: rowsFor(this.db, 'repositories', 'id', repositoryIds),
-      project_repositories: rowsFor(this.db, 'project_repositories', 'projectId', projectIds),
-      project_wikis: rowsFor(this.db, 'project_wikis', 'projectId', projectIds),
+      repositories: (await rowsFor(this.db, 'repositories', 'id', repositoryIds)),
+      project_repositories: (await rowsFor(this.db, 'project_repositories', 'projectId', projectIds)),
+      project_wikis: (await rowsFor(this.db, 'project_wikis', 'projectId', projectIds)),
       organization_wiki_versions: (await selectRows(this.db, 'organization_wiki_versions', 'organizationId=?', [organizationId])),
       // Public key IDs make external cleanup auditable; credential-broker handles
       // and private material never belong in an export.
-      repository_deploy_keys: rowsFor(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds)
+      repository_deploy_keys: (await rowsFor(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds))
         .map(({ cloneHandle: _clone, writeHandle: _write, ...row }) => row),
-      world_instances: rowsFor(this.db, 'world_instances', 'worldId', taskIds)
+      world_instances: (await rowsFor(this.db, 'world_instances', 'worldId', taskIds))
         .map(({ handle, ...row }) => ({ ...row, handle: redactWorldHandle(handle) })),
-      world_checkpoints: rowsFor(this.db, 'world_checkpoints', 'projectId', projectIds),
+      world_checkpoints: (await rowsFor(this.db, 'world_checkpoints', 'projectId', projectIds)),
       runner_pools: (await selectRows(this.db, 'runner_pools', 'organizationId=?', [organizationId])),
       world_provider_connections: (await selectRows(this.db, 'world_provider_connections', 'organizationId=?', [organizationId]))
         .map(({ credentialHandle: _credential, ...row }) => row),
@@ -1797,24 +1796,24 @@ export class Store {
       usage_admissions: (await selectRows(this.db, 'usage_admissions', 'organizationId=?', [organizationId])),
       promoted_artifacts: (await selectRows(this.db, 'promoted_artifacts', 'organizationId=?', [organizationId])),
       executions: (await selectRows(this.db, 'executions', 'organizationId=?', [organizationId])),
-      execution_frames: rowsFor(this.db, 'execution_frames', 'executionId', executionIds),
+      execution_frames: (await rowsFor(this.db, 'execution_frames', 'executionId', executionIds)),
       preview_leases: (await selectRows(this.db, 'preview_leases', 'organizationId=?', [organizationId]))
         .map(({ tokenHash: _secret, ...row }) => row),
       inbox: (await selectRows(this.db, 'inbox', 'organizationId=?', [organizationId])),
       delivery_preferences: (await selectRows(this.db, 'delivery_preferences', 'organizationId=?', [organizationId])),
-      delivery_outbox: rowsFor(this.db, 'delivery_outbox', 'inboxId', inboxIds),
-      settings: rowsFor(this.db, 'settings', 'scopeKey', projectSettingKeys),
-      cards: rowsFor(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]),
+      delivery_outbox: (await rowsFor(this.db, 'delivery_outbox', 'inboxId', inboxIds)),
+      settings: (await rowsFor(this.db, 'settings', 'scopeKey', projectSettingKeys)),
+      cards: (await rowsFor(this.db, 'cards', 'scopeId', [organizationId, ...projectIds])),
       payment_connections: (await selectRows(this.db, 'payment_connections', 'organizationId=?', [organizationId])),
       payment_spend_requests: (await selectRows(this.db, 'payment_spend_requests', 'organizationId=?', [organizationId])),
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
       policy_acceptances: (await selectRows(this.db, 'policy_acceptances', 'organizationId=?', [organizationId])),
-      authorization_profiles: rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
-      principal_grants: rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
-      audit_log: rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
-      attachment_scopes: rowsFor(this.db, 'attachment_scopes', 'projectId', projectIds),
+      authorization_profiles: (await rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)])),
+      principal_grants: (await rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)])),
+      audit_log: (await rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)])),
+      attachment_scopes: (await rowsFor(this.db, 'attachment_scopes', 'projectId', projectIds)),
     };
     return {
       format: 'karmax-organization-export',
@@ -1849,7 +1848,7 @@ export class Store {
       : (await selectRows(this.db, 'organization_invitations', 'invitedBy IN (?,?)', [userId, principalId]));
     const inbox = (await selectRows(this.db, 'inbox', 'userId=?', [userId]));
     const teamMemberships = (await selectRows(this.db, 'team_memberships', 'userId=?', [userId]));
-    const teams = rowsFor(this.db, 'teams', 'id', teamMemberships.map((row) => String(row.teamId)));
+    const teams = (await rowsFor(this.db, 'teams', 'id', teamMemberships.map((row) => String(row.teamId))));
     const projectMemberships = (await selectRows(this.db, 'project_memberships', 'principalKey=?', [principalId]));
     const wikiEdits = (await selectRows(this.db, 'organization_wiki_versions', 'principal IN (?,?)', [userId, principalId]));
     const previewLeases = (await selectRows(this.db, 'preview_leases', 'createdBy IN (?,?)', [userId, principalId]))
@@ -1876,7 +1875,7 @@ export class Store {
       ...projectMemberships.map((row) => String(row.projectId)),
       ...ownedAvatars.map((row) => String(row.projectId)),
     ])];
-    const projects = rowsFor(this.db, 'projects', 'id', projectIds);
+    const projects = (await rowsFor(this.db, 'projects', 'id', projectIds));
     const projectById = new Map(projects.map((project) => [String(project.id), rowToProject(project)]));
     const organizationIds = [...new Set([
       ...memberships.map((row) => String(row.organizationId)),
@@ -1927,8 +1926,8 @@ export class Store {
             confirmationVotes: votes.filter((row) => row.taskId === task.id),
           }))),
         inbox: organizationInbox.map(rowToInbox),
-        deliveryOutbox: rowsFor(this.db, 'delivery_outbox', 'inboxId',
-          organizationInbox.map((row) => String(row.id))),
+        deliveryOutbox: (await rowsFor(this.db, 'delivery_outbox', 'inboxId',
+          organizationInbox.map((row) => String(row.id)))),
         deliveryPreferences: deliveryRow ? JSON.parse(deliveryRow.json) : null,
         activity: {
           wikiEdits: wikiEdits.filter((row) => row.organizationId === organizationId),
@@ -1969,7 +1968,7 @@ export class Store {
     attachmentIds: string[]; leases: Array<{ id: string; provider: string }> }> {
     const taskIds = ((await this.db.prepare('SELECT id FROM tasks WHERE projectId=?').all(projectId)) as any[]).map((r) => String(r.id));
     const worlds: WorldHandleRef[] = [];
-    for (const row of rowsFor(this.db, 'world_instances', 'worldId', taskIds)) {
+    for (const row of (await rowsFor(this.db, 'world_instances', 'worldId', taskIds))) {
       if (row.state === 'released') continue;
       try { worlds.push(JSON.parse(row.handle) as WorldHandleRef); } catch {}
     }
@@ -2013,7 +2012,7 @@ export class Store {
     if (organizationId === 'org_personal') throw new Error('the installation personal organization cannot be deleted');
     if (!(await this.getOrganization(organizationId))) throw new Error('organization not found');
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
-    const tasks = rowsFor(this.db, 'tasks', 'projectId', projectIds);
+    const tasks = (await rowsFor(this.db, 'tasks', 'projectId', projectIds));
     const taskIds = tasks.map((r) => String(r.id));
     const intentIds = tasks.map((r) => String(r.intentId)).filter(Boolean);
     const teamIds = ((await this.db.prepare('SELECT id FROM teams WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
@@ -2031,23 +2030,23 @@ export class Store {
       (await this.revokeScopedTokens({ organizationId }));
       (await this.revokeHumanDelegations({ organizationId }));
       for (const projectId of projectIds) (await this.revokeScopedTokens({ projectId }));
-      deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
-      deleteRows(this.db, 'execution_frames', 'executionId', executionIds);
-      deleteRows(this.db, 'team_memberships', 'teamId', teamIds);
-      deleteRows(this.db, 'team_aliases', 'teamId', teamIds);
-      deleteRows(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds);
-      deleteRows(this.db, 'task_subscribers', 'taskId', taskIds);
-      deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
-      deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
-      deleteRows(this.db, 'task_tags', 'taskId', taskIds);
-      deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
-      deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
-      deleteRows(this.db, 'events', 'taskId', taskIds);
-      deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`));
-      deleteRows(this.db, 'world_instances', 'worldId', taskIds);
-      deleteRows(this.db, 'task_intents', 'id', intentIds);
-      deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys);
-      deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]);
+      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds));
+      (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
+      (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
+      (await deleteRows(this.db, 'team_aliases', 'teamId', teamIds));
+      (await deleteRows(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds));
+      (await deleteRows(this.db, 'task_subscribers', 'taskId', taskIds));
+      (await deleteRows(this.db, 'task_confirmation', 'taskId', taskIds));
+      (await deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds));
+      (await deleteRows(this.db, 'task_tags', 'taskId', taskIds));
+      (await deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds));
+      (await deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds));
+      (await deleteRows(this.db, 'events', 'taskId', taskIds));
+      (await deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`)));
+      (await deleteRows(this.db, 'world_instances', 'worldId', taskIds));
+      (await deleteRows(this.db, 'task_intents', 'id', intentIds));
+      (await deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys));
+      (await deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_transactions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_spend_requests WHERE organizationId=?').run(organizationId));
@@ -2055,14 +2054,14 @@ export class Store {
       (await this.db.prepare('DELETE FROM payment_connections WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_requests WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId));
-      deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys);
-      deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys);
-      deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
-      deleteRows(this.db, 'attachment_scopes', 'projectId', projectIds);
+      (await deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys));
+      (await deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys));
+      (await deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys));
+      (await deleteRows(this.db, 'attachment_scopes', 'projectId', projectIds));
       (await this.deletePermissionRequestKv(organizationId, taskIds));
       (await this.deleteProjectKv(projectIds, taskIds));
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
-        deleteRows(this.db, table, 'projectId', projectIds);
+        (await deleteRows(this.db, table, 'projectId', projectIds));
       (await this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId));
@@ -2093,10 +2092,10 @@ export class Store {
         `git:profiles:${organizationId}`,
         `git:default-profile:${organizationId}`,
       ));
-      deleteRows(this.db, 'repositories', 'id', repositoryIds);
-      deleteRows(this.db, 'teams', 'id', teamIds);
-      deleteRows(this.db, 'tasks', 'id', taskIds);
-      deleteRows(this.db, 'projects', 'id', projectIds);
+      (await deleteRows(this.db, 'repositories', 'id', repositoryIds));
+      (await deleteRows(this.db, 'teams', 'id', teamIds));
+      (await deleteRows(this.db, 'tasks', 'id', taskIds));
+      (await deleteRows(this.db, 'projects', 'id', projectIds));
       (await this.db.prepare('DELETE FROM user_preferences WHERE defaultOrganizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId));
       (await this.db.exec('COMMIT'));
@@ -3187,7 +3186,7 @@ export class Store {
     return (await this.attachTags(projectId, rows.map(rowToTask)));
   }
 
-  get asyncReadStats() { return this.asyncDatabase?.stats ?? { pending: 0, connections: 0, waiting: 0 }; }
+  get asyncReadStats() { return this.db.stats; }
 
   private async readRows<T>(sql: string, params: unknown[] = []): Promise<T[]> {
     return await this.db.prepare(sql).all(...params) as T[];
@@ -3788,7 +3787,7 @@ export class Store {
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       (await this.revokeHumanDelegationsForTask(taskId));
-      deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
+      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds));
       (await this.db.prepare('DELETE FROM inbox WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId));
@@ -3949,16 +3948,16 @@ export class Store {
    * exact allocation pattern `listTaskSummaries` documents as pushing a few
    * hundred tasks past 1 GiB RSS. Project the six fields the panel renders.
    */
-  taskHeaders(taskIds: string[]): Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }> {
+  async taskHeaders(taskIds: string[]): Promise<Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }>> {
     const out = new Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }>();
-    chunked([...new Set(taskIds)], async (chunk) => {
+    (await chunked([...new Set(taskIds)], async (chunk) => {
       const rows = (await this.db.prepare(`SELECT id, num, title, projectId,
         json_extract(lastView, '$.status') status, json_extract(lastView, '$.stage') stage
         FROM tasks WHERE id IN (${chunk.map(() => '?').join(',')})`).all(...chunk)) as any[];
       for (const row of rows) out.set(String(row.id), { id: String(row.id),
         ...(row.num == null ? {} : { num: Number(row.num) }), title: String(row.title), projectId: String(row.projectId),
         ...(row.status ? { status: String(row.status) } : {}), ...(row.stage ? { stage: String(row.stage) } : {}) });
-    });
+    }));
     return out;
   }
 
@@ -4091,8 +4090,8 @@ export class Store {
     const ids = ((await this.db.prepare(`SELECT id FROM inbox WHERE ${where}`).all(...(params as any[]))) as any[])
       .map((row) => String(row.id));
     if (!ids.length) return 0;
-    deleteRows(this.db, 'delivery_outbox', 'inboxId', ids);
-    deleteRows(this.db, 'inbox', 'id', ids);
+    (await deleteRows(this.db, 'delivery_outbox', 'inboxId', ids));
+    (await deleteRows(this.db, 'inbox', 'id', ids));
     return ids.length;
   }
 
@@ -7084,7 +7083,6 @@ export class Store {
   }
 
   async close() {
-    void this.asyncDatabase?.close().catch(error => console.error('[store] closing read pool:', error));
     this.organizationEntitlementListeners.clear();
     (await this.db.close());
   }
@@ -7232,23 +7230,23 @@ async function selectRows(db: SqlDatabase, table: string, where: string, args: a
  */
 const SQL_VARIABLE_CHUNK = 900;
 
-function chunked<T>(values: T[], run: (chunk: T[]) => void): void {
-  for (let i = 0; i < values.length; i += SQL_VARIABLE_CHUNK) run(values.slice(i, i + SQL_VARIABLE_CHUNK));
+async function chunked<T>(values: T[], run: (chunk: T[]) => Promise<void>): Promise<void> {
+  for (let i = 0; i < values.length; i += SQL_VARIABLE_CHUNK) await run(values.slice(i, i + SQL_VARIABLE_CHUNK));
 }
 
-function rowsFor(db: SqlDatabase, table: string, column: string, values: string[]): any[] {
+async function rowsFor(db: SqlDatabase, table: string, column: string, values: string[]): Promise<any[]> {
   if (!values.length) return [];
   const out: any[] = [];
-  chunked(values, async (chunk) => {
+  (await chunked(values, async (chunk) => {
     out.push(...(await selectRows(db, table, `${column} IN (${chunk.map(() => '?').join(',')})`, chunk)));
-  });
+  }));
   return out;
 }
 
-export function deleteRows(db: SqlDatabase, table: string, column: string, values: string[]): void {
-  chunked(values, async (chunk) => {
+export async function deleteRows(db: SqlDatabase, table: string, column: string, values: string[]): Promise<void> {
+  (await chunked(values, async (chunk) => {
     (await db.prepare(`DELETE FROM ${table} WHERE ${column} IN (${chunk.map(() => '?').join(',')})`).run(...chunk));
-  });
+  }));
 }
 
 function redactWorldHandle(value: string): Record<string, unknown> {

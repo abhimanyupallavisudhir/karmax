@@ -124,6 +124,8 @@ export interface CredentialAccessRequest {
 }
 
 export interface VaultItemStore {
+  /** Serialize compound reads and writes on the same transaction connection. */
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
@@ -225,6 +227,7 @@ export class VaultItems {
 
   // ── items ──
   async list(): Promise<VaultItem[]> {
+    return this.store.transaction(async () => {
     const raw = (await this.store.kvGet(kvItems(this.organizationId)));
     if (!raw) return [];
     let items: VaultItem[];
@@ -247,6 +250,8 @@ export class VaultItems {
       (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
     }
     return items;
+
+    });
   }
 
   async get(id: string): Promise<VaultItem | undefined> {
@@ -291,6 +296,7 @@ export class VaultItems {
     replaceSecrets?: boolean;
     provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; connectorFormatVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): Promise<VaultItem> {
+    return this.store.transaction(async () => {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? (await this.get(args.id)) : undefined;
     if (args.id && !prior) throw new Error(`no vault item ${args.id}`);
@@ -351,6 +357,8 @@ export class VaultItems {
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
     return item;
+
+    });
   }
 
   /** Bind an item to a connector's external id (write-back round-trips, §9).
@@ -360,6 +368,7 @@ export class VaultItems {
   setExternalId(id: string, externalId: string): Promise<VaultItem>;
   setExternalId(id: string, connector: string, externalId: string): Promise<VaultItem>;
   async setExternalId(id: string, connectorOrExternalId: string, boundExternalId?: string): Promise<VaultItem> {
+    return this.store.transaction(async () => {
     const all = (await this.list());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
@@ -377,9 +386,12 @@ export class VaultItems {
     item.updatedAt = Math.max(Date.now(), item.updatedAt + 1);
     (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all)));
     return item;
+
+    });
   }
 
   async setPolicy(id: string, patch: Partial<VaultItemPolicy>): Promise<VaultItem> {
+    return this.store.transaction(async () => {
     const all = (await this.list());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
@@ -387,14 +399,19 @@ export class VaultItems {
     item.updatedAt = Math.max(Date.now(), item.updatedAt + 1);
     (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all)));
     return item;
+
+    });
   }
 
   async delete(id: string) {
+    return this.store.transaction(async () => {
     const item = (await this.get(id));
     (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
     (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
     for (const field of item?.fields ?? []) this.broker?.deleteHandle(itemHandle(id, field));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
+
+    });
   }
 
   // ── grants: task extensions + one-shot passes (human-resolved escalations) ──
@@ -416,10 +433,13 @@ export class VaultItems {
   }
 
   private async extend(taskId: string, cap: Capability, grantedBy: string) {
+    return this.store.transaction(async () => {
     const cur = (await this.extensions(taskId));
     if (!cur.some((e) => e.cap === cap)) {
       (await this.store.kvSet(kvGrant(taskId), JSON.stringify([...cur, { cap, grantedBy, at: Date.now() }])));
     }
+
+    });
   }
 
   private async passes(taskId: string): Promise<{ itemId: string; mode: AccessMode }[]> {
@@ -433,10 +453,14 @@ export class VaultItems {
   }
 
   private async addPass(taskId: string, itemId: string, mode: AccessMode) {
+    return this.store.transaction(async () => {
     (await this.store.kvSet(kvPasses(taskId), JSON.stringify([...(await this.passes(taskId)), { itemId, mode }])));
+
+    });
   }
 
   private async takePass(taskId: string, itemId: string, mode: AccessMode, consume: boolean): Promise<boolean> {
+    return this.store.transaction(async () => {
     const all = (await this.passes(taskId));
     // A reveal pass also covers non-revealing use of the same item.
     const idx = all.findIndex((p) => p.itemId === itemId && (p.mode === mode || p.mode === 'reveal'));
@@ -446,6 +470,8 @@ export class VaultItems {
       (await this.store.kvSet(kvPasses(taskId), JSON.stringify(all)));
     }
     return true;
+
+    });
   }
 
   /** Sparse task-local policy overrides. Invalid persisted values are ignored so
@@ -529,6 +555,7 @@ export class VaultItems {
 
   /** Resolve a secret field AFTER an access decision granted it. Audited. */
   async resolveField(item: VaultItem, field: VaultFieldName, ctx: { taskId?: string; principal?: string; mode: AccessMode }): Promise<string> {
+    return this.store.transaction(async () => {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
     const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
@@ -551,6 +578,8 @@ export class VaultItems {
       (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
     }
     return secret;
+
+    });
   }
 
   /** The current TOTP code for a login item (never the seed). */
@@ -644,6 +673,7 @@ export class VaultItems {
   }
 
   private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string }): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
     const all = (await this.requests());
     const existing = all.find((r) => r.status === 'pending' && r.taskId === args.taskId && r.mode === args.mode
       && (r.kind ?? 'access') === (args.kind ?? 'access')
@@ -664,6 +694,8 @@ export class VaultItems {
     };
     (await this.saveRequests([...all, req]));
     return req;
+
+    });
   }
 
   /**
@@ -674,6 +706,7 @@ export class VaultItems {
    * (created meanwhile) via `itemId` before a grant action.
    */
   async resolve(requestId: string, args: { action: 'once' | 'task' | 'always' | 'deny'; by: string; itemId?: string }): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
     const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
     if (!req) throw new Error(`no credential request ${requestId}`);
@@ -694,6 +727,8 @@ export class VaultItems {
     (await this.saveRequests(all));
     (await this.store.appendAudit({ principalId: args.by, action: 'vault.request.resolved', detail: { requestId, taskId: req.taskId, itemId: req.itemId, action: args.action } }));
     return req;
+
+    });
   }
 
   /** Write a key to a 0600 file (idempotent per save) and return its path. */

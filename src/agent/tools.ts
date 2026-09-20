@@ -873,7 +873,7 @@ export const SDK_CONTROL_TOOL_SCHEMAS: ToolSchema[] = PLATFORM_TOOL_SCHEMAS.filt
 );
 
 /** Returns name → executor for the platform tools, bound to a world + context. */
-export async function platformToolHandlers(
+export function platformToolHandlers(
   world: World,
   ctx: PlatformToolContext,
 ): Record<string, (args: any) => Promise<string>> {
@@ -1352,9 +1352,10 @@ export async function platformToolHandlers(
       return `confirm decision recorded: ${action}`;
     },
   };
-  const trace = (await currentTiming());
+  const capturedTrace = currentTiming();
   return Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name,
     async (args: any) => {
+      const trace = await capturedTrace;
       const execute = () => timed(name === 'search_connection_tools' ? 'tool.discovery.managed' : 'tool.execution.platform',
         () => handler(args), { operation: name });
       return trace ? (await withTiming(trace, execute)) : execute();

@@ -183,12 +183,16 @@ export class MockPaymentProvider implements PaymentProvider {
     return (await this.store.getCard(cardId));
   }
   async fund(cardId: string, amount: number): Promise<void> {
+    return this.store.transaction(async () => {
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('funding amount must be a positive number of cents');
     const c = (await this.store.getCard(cardId));
     if (!c) throw new Error('no such card');
     (await this.store.updateCard(cardId, { available: c.available + amount }));
+
+    });
   }
   async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
+    return this.store.transaction(async () => {
     const c = (await this.store.getCard(cardId));
     if (!c) return { ok: false, reason: 'no such card' };
     if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
@@ -197,6 +201,8 @@ export class MockPaymentProvider implements PaymentProvider {
     if (amount > c.available) return { ok: false, reason: 'insufficient funds' };
     (await this.store.updateCard(cardId, { available: c.available - amount }));
     return { ok: true, transactionId: newId('txn') };
+
+    });
   }
   describe(): ProviderInfo {
     return { name: this.name, label: 'Local test funds', kind: 'local', available: true, connected: true,
@@ -210,8 +216,11 @@ export class MockPaymentProvider implements PaymentProvider {
       .filter((card) => card.provider === this.name).reduce((sum, card) => sum + card.available, 0), currency: 'usd' };
   }
   async revoke(cardId: string): Promise<void> {
+    return this.store.transaction(async () => {
     if (!(await this.store.getCard(cardId))) throw new Error('no such card');
     (await this.store.updateCard(cardId, { status: 'canceled', available: 0 }));
+
+    });
   }
 }
 

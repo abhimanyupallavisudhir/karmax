@@ -65,8 +65,8 @@ export interface BillingAccount {
 
 export interface SubscriptionProvider {
   readonly name: string;
-  configured(): boolean;
-  catalog(): SubscriptionCatalogConfig | undefined;
+  configured(): boolean | Promise<boolean>;
+  catalog(): SubscriptionCatalogConfig | undefined | Promise<SubscriptionCatalogConfig | undefined>;
   createCustomer(input: { organizationId: string; name: string; idempotencyKey: string }): Promise<{ id: string }>;
   createCheckout(input: { organizationId: string; customerId: string; plan: PaidHostedPlanId;
     seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
@@ -76,7 +76,7 @@ export interface SubscriptionProvider {
   cancelAtPeriodEnd(input: { subscriptionId: string; idempotencyKey: string }): Promise<{ id: string }>;
   updateSeats(input: { subscriptionId: string; seatItemId?: string; seats: number;
     idempotencyKey: string }): Promise<{ id: string }>;
-  verifyWebhook(raw: Buffer, signature?: string): BillingEvent;
+  verifyWebhook(raw: Buffer, signature?: string): BillingEvent | Promise<BillingEvent>;
 }
 
 export interface BillingEvent {
@@ -248,7 +248,7 @@ export class SubscriptionBillingService {
     const access = ['active', 'trialing'].includes(status) ? 'active'
       : status === 'past_due' && graceEndsAt && graceEndsAt > Date.now() ? 'grace'
         : status === 'none' || status === 'canceled' ? 'free' : 'restricted';
-    return { managed: true, providerConfigured: this.provider.configured(), plan, billedPlan, status, seats,
+    return { managed: true, providerConfigured: (await this.provider.configured()), plan, billedPlan, status, seats,
       activeUsers: members, seatDeficit: plan === 'team' ? Math.max(0, members - seats)
         : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
@@ -265,7 +265,7 @@ export class SubscriptionBillingService {
   }
 
   async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
-    this.requireHosted(); this.requireKey(key);
+    await this.requireHosted(); this.requireKey(key);
     if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const current = (await this.account(organizationId));
     if (current?.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(current.status))
@@ -298,7 +298,7 @@ export class SubscriptionBillingService {
   }
 
   async portal(organizationId: string, returnUrl: string, key: string) {
-    this.requireHosted(); this.requireKey(key);
+    await this.requireHosted(); this.requireKey(key);
     const customerId = (await this.account(organizationId))?.customerId;
     if (!customerId) throw new Error('no billing account exists for this organization');
     return this.idempotent(organizationId, 'portal', key,
@@ -306,7 +306,7 @@ export class SubscriptionBillingService {
   }
 
   async changePlan(organizationId: string, plan: unknown, key: string) {
-    this.requireHosted(); this.requireKey(key);
+    await this.requireHosted(); this.requireKey(key);
     if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const account = (await this.account(organizationId));
     if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
@@ -322,7 +322,7 @@ export class SubscriptionBillingService {
   }
 
   async cancel(organizationId: string, key: string) {
-    this.requireHosted(); this.requireKey(key);
+    await this.requireHosted(); this.requireKey(key);
     const account = (await this.account(organizationId));
     if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
       throw new Error('there is no cancellable subscription');
@@ -354,26 +354,18 @@ export class SubscriptionBillingService {
   }
 
   async handleWebhook(raw: Buffer, signature?: string): Promise<{ duplicate: boolean }> {
-    this.requireHosted();
-    const event = this.provider.verifyWebhook(raw, signature);
-    (await this.store.db.exec('BEGIN'));
-    try {
-      const claim = (await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_events
+    await this.requireHosted();
+    const event = (await this.provider.verifyWebhook(raw, signature));
+    return this.store.transaction(async () => {
+      const claim = await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_events
         (provider, eventId, type, createdAt, processedAt) VALUES (?, ?, ?, ?, NULL)`)
-        .run(this.provider.name, event.id, event.type, event.created * 1000));
-      if (Number(claim.changes) === 0) {
-        (await this.store.db.exec('ROLLBACK'));
-        return { duplicate: true };
-      }
-      (await this.applyEvent(event));
-      (await this.store.db.prepare('UPDATE subscription_billing_events SET processedAt=? WHERE provider=? AND eventId=?')
-        .run(Date.now(), this.provider.name, event.id));
-      (await this.store.db.exec('COMMIT'));
+        .run(this.provider.name, event.id, event.type, event.created * 1000);
+      if (Number(claim.changes) === 0) return { duplicate: true };
+      await this.applyEvent(event);
+      await this.store.db.prepare('UPDATE subscription_billing_events SET processedAt=? WHERE provider=? AND eventId=?')
+        .run(Date.now(), this.provider.name, event.id);
       return { duplicate: false };
-    } catch (error) {
-      try { (await this.store.db.exec('ROLLBACK')); } catch { /* preserve the original reconciliation failure */ }
-      throw error;
-    }
+    });
   }
 
   private async applyEvent(event: BillingEvent): Promise<void> {
@@ -406,7 +398,7 @@ export class SubscriptionBillingService {
         (await this.reconcileAccount(updated));
         return;
       }
-      const mapped = this.mapSubscription(object);
+      const mapped = (await this.mapSubscription(object));
       const status = normalizeStatus(object.status);
       const rank = billingEventRank(event.type, status);
       const cancelAtPeriodEnd = Boolean(object.cancel_at_period_end);
@@ -456,8 +448,8 @@ export class SubscriptionBillingService {
       (await this.store.setOrganizationPlan(account.organizationId, plan));
   }
 
-  private mapSubscription(object: any): { plan: HostedPlanId; seats: number; items: Record<string, string> } {
-    const catalog = this.provider.catalog();
+  private async mapSubscription(object: any): Promise<{ plan: HostedPlanId; seats: number; items: Record<string, string> }> {
+    const catalog = (await this.provider.catalog());
     if (!catalog) throw new Error('subscription catalog is not configured');
     const items: Record<string, string> = {};
     let plan: HostedPlanId | undefined;
@@ -553,9 +545,9 @@ export class SubscriptionBillingService {
       throw error;
     }
   }
-  private requireHosted(): void {
+  private async requireHosted(): Promise<void> {
     if (!this.hosted) throw new Error('hosted subscription billing is not used by self-hosted installations');
-    if (!this.provider.configured()) throw new Error('hosted subscription billing is not configured');
+    if (!(await this.provider.configured())) throw new Error('hosted subscription billing is not configured');
   }
   private requireKey(key: string): void {
     if (!/^[A-Za-z0-9._:-]{8,200}$/.test(key)) throw new Error('a valid Idempotency-Key header is required');

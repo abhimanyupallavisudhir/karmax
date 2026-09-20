@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,7 +20,9 @@ let tmp: string;
 let broker: CredentialBroker;
 let profiles: GitProfiles;
 let kv: Map<string, string>;
+let transaction: ReturnType<typeof memoryTransaction>;
 const store = {
+  transaction: <T>(operation: () => Promise<T>) => transaction(operation),
   kvGet: (k: string) => kv.get(k),
   kvSet: (k: string, v: string) => void kv.set(k, v),
 };
@@ -27,6 +30,7 @@ const store = {
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gitp-'));
   kv = new Map();
+  transaction = memoryTransaction(kv);
   broker = new CredentialBroker(new Vault(path.join(tmp, 'vault')));
   profiles = new GitProfiles(store, broker, path.join(tmp, 'state'));
 });

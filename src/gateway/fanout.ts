@@ -9,8 +9,18 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
  * connected browsers still observe it. The local bus only wakes the poller to
  * reduce latency; correctness comes from monotonically increasing event.seq.
  */
+type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; bytes: number };
+interface Subscriber {
+  listener: (event: KarmaxEvent & { seq?: number }, projectId?: string) => unknown;
+  overflow?: () => void;
+  queue: RoutedEvent[];
+  bytes: number;
+  running: boolean;
+  closed: boolean;
+}
+
 export class DurableEventFanout {
-  private listeners = new Set<(event: KarmaxEvent & { seq?: number }, projectId?: string) => void>();
+  private listeners = new Set<Subscriber>();
   private cursor!: number;
   private timer!: NodeJS.Timeout;
   private offBus?: () => void;
@@ -38,9 +48,47 @@ export class DurableEventFanout {
     this.offBus = bus?.onAny(() => this.schedule());
   }
 
-  on(listener: (event: KarmaxEvent & { seq?: number }, projectId?: string) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+  on(listener: Subscriber['listener'], overflow?: () => void): () => void {
+    const subscriber: Subscriber = { listener, overflow, queue: [], bytes: 0, running: false, closed: false };
+    this.listeners.add(subscriber);
+    return () => this.remove(subscriber);
+  }
+
+  private remove(subscriber: Subscriber): void {
+    subscriber.closed = true;
+    subscriber.queue = [];
+    subscriber.bytes = 0;
+    this.listeners.delete(subscriber);
+  }
+
+  private deliver(subscriber: Subscriber, routed: RoutedEvent): void {
+    if (subscriber.closed) return;
+    // Authorization and timing reads are asynchronous. Bound work waiting on
+    // those reads as well as bytes already in the WebSocket's send buffer.
+    if (subscriber.queue.length >= 1024 || subscriber.bytes + routed.bytes > 2 * 1024 * 1024) {
+      this.remove(subscriber);
+      try { subscriber.overflow?.(); } catch { /* already disconnected */ }
+      return;
+    }
+    subscriber.queue.push(routed);
+    subscriber.bytes += routed.bytes;
+    if (!subscriber.running) this.pump(subscriber);
+  }
+
+  private pump(subscriber: Subscriber): void {
+    while (!subscriber.closed && subscriber.queue.length) {
+      const routed = subscriber.queue.shift()!;
+      subscriber.bytes -= routed.bytes;
+      try {
+        const result = subscriber.listener(routed.event, routed.projectId);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          subscriber.running = true;
+          void Promise.resolve(result).catch(error => console.error('[fanout] subscriber failed:', error))
+            .finally(() => { subscriber.running = false; this.pump(subscriber); });
+          return;
+        }
+      } catch (error) { console.error('[fanout] subscriber failed:', error); }
+    }
   }
 
   close(): void {
@@ -48,7 +96,7 @@ export class DurableEventFanout {
     if (this.scheduled) clearImmediate(this.scheduled);
     clearInterval(this.timer);
     this.offBus?.();
-    this.listeners.clear();
+    for (const subscriber of this.listeners) this.remove(subscriber);
   }
 
   private schedule(): void {
@@ -73,10 +121,8 @@ export class DurableEventFanout {
         for (const event of rows) {
           if (this.closed) break;
           this.cursor = Math.max(this.cursor, event.seq ?? 0);
-          for (const listener of this.listeners) {
-            try { listener(event, projects.get(event.taskId)); }
-            catch (error) { console.error('[fanout] subscriber failed:', error); }
-          }
+          const routed = { event, projectId: projects.get(event.taskId), bytes: Buffer.byteLength(JSON.stringify(event)) };
+          for (const subscriber of this.listeners) this.deliver(subscriber, routed);
         }
         if (rows.length < 500) break;
         await yieldTurn();

@@ -7,8 +7,8 @@ import { TimingTrace, type TimingContext, type TimingRow } from './index.js';
 export class TimingDelivery {
   private seen = new Set<string>();
   private pending = new Map<string, { trace: TimingTrace; end: Awaited<ReturnType<TimingTrace['start']>>; at: number }>();
-  constructor(private sink: (row: TimingRow) => void | Promise<void>, private enabled: () => boolean | Promise<boolean> = () => true,
-    private traceFactory?: (context: TimingContext, sink: (row: TimingRow) => void | Promise<void>) => TimingTrace | Promise<TimingTrace>) {}
+  constructor(private sink: (row: TimingRow) => unknown, private enabled: () => boolean | Promise<boolean> = () => true,
+    private traceFactory?: (context: TimingContext, sink: (row: TimingRow) => unknown) => TimingTrace | Promise<TimingTrace>) {}
   async offer(context: TimingContext) {
     if (!(await this.enabled()) || !context.turnId) return undefined;
     const key = `${context.taskId}/${context.workflowRunId}/${context.turnId}/${context.attempt}`;

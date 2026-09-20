@@ -567,8 +567,9 @@ export class CodexAdapter implements AgentAdapter {
       };
     };
 
-    client.onNotification(async (method, params) => {
-      (await (await currentTiming())?.markOnce('provider.first-event'));
+    const notificationTrace = await currentTiming();
+    client.onNotification((method, params) => {
+      void notificationTrace?.markOnce('provider.first-event');
       switch (method) {
         case 'turn/started':
           currentTurnId = params?.turn?.id ?? currentTurnId;

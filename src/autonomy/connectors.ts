@@ -1466,6 +1466,7 @@ export interface SyncResult {
 }
 
 export interface ConnectorStore {
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
   findRepositoryBySshUrl?(organizationId: string, sshUrl: string): (Repository | undefined) | Promise<Repository | undefined>;

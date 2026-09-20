@@ -71,7 +71,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     messageCount: input.messages.length }));
   const opaqueEnd = (await trace?.start('adapter.to-first-output.opaque'));
   const observedTools = new Map<string, Awaited<ReturnType<NonNullable<typeof trace>['start']>>>();
-  const outputObserved = async () => { (await trace?.markOnce('first.output')); (await opaqueEnd?.()); };
+  const outputObserved = async () => { await Promise.all([trace?.markOnce('first.output'), opaqueEnd?.()]); };
   let completed = false;
   let openPrRequested = false;
   let reviewInfo: ReviewInfo | undefined;
@@ -189,12 +189,16 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     fillPaymentCard: deps.fillPaymentCard,
     async emit(text, source) {
-      if (text.trim()) (await outputObserved());
+      const output = text.trim() ? outputObserved() : undefined;
+      const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
       deps.onEmit?.(text, source);
-      if (source === 'assistant' && text.trim()) (await trace?.markOnce('first.text'));
+      await Promise.all([output, firstText]);
     },
     async emitActivity(activity) {
-      (await outputObserved());
+      const output = outputObserved();
+      const firstText = activity.kind === 'message' && activity.title?.trim() ? trace?.markOnce('first.text') : undefined;
+      deps.onActivity?.(activity);
+      await Promise.all([output, firstText]);
       if ((await trace?.enabled()) && ['tool', 'command', 'search', 'file', 'subagent'].includes(activity.kind)) {
         if (activity.phase === 'started' && !observedTools.has(activity.id) && trace)
           observedTools.set(activity.id, (await trace.start('tool.provider-observed', { itemId: activity.id, operation: activity.kind })));
@@ -203,8 +207,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
           observedTools.delete(activity.id);
         }
       }
-      deps.onActivity?.(activity);
-      if (activity.kind === 'message' && activity.title?.trim()) (await trace?.markOnce('first.text'));
+
     },
     onSession: deps.onSession,
     signal: deps.signal,

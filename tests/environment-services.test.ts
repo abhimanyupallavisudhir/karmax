@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,7 +10,7 @@ import { launchWorldServices } from '../src/world/services.js';
 
 function memoryKv() {
   const values = new Map<string, string>();
-  return { kvGet: (key: string) => values.get(key), kvSet: (key: string, value: string) => void values.set(key, value) };
+  return { transaction: memoryTransaction(values), kvGet: (key: string) => values.get(key), kvSet: (key: string, value: string) => void values.set(key, value) };
 }
 
 describe('project environment proposals and builds', () => {

@@ -51,10 +51,10 @@ it('keeps concurrent async traces separate and propagates cancellation', async (
   await Promise.all([1, 2].map(async attempt => {
     const trace = new TimingTrace({ taskId: 't', turnId: 'x', attempt }, row => rows.push(row));
     const abort = new AbortController();
-    await expect((await withTiming(trace, () => trace.measure('agent.attempt', async () => {
+    await expect(withTiming(trace, () => trace.measure('agent.attempt', async () => {
       await Promise.resolve(); expect((await currentTiming())).toBe(trace);
       return timed('tool.execution', async () => { abort.abort(); throw Error('stop'); });
-    }, undefined, abort.signal)))).rejects.toThrow('stop');
+    }, undefined, abort.signal))).rejects.toThrow('stop');
   }));
   expect(timingReport(rows).attempts.map(a => a.status)).toEqual(['cancelled', 'cancelled']);
 });

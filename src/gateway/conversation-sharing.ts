@@ -21,11 +21,15 @@ export async function currentShare(store: Store, taskId: string, role: string): 
   return raw ? JSON.parse(raw) : undefined;
 }
 export async function revokeShare(store: Store, taskId: string, role: string) {
+  return store.transaction(async () => {
   const old = (await currentShare(store, taskId, role));
   if (old) (await store.kvDelete(`conversation-share:${old.id}`));
   (await store.kvDelete(indexKey(taskId, role)));
+
+  });
 }
 export async function createShare(store: Store, taskId: string, role: string, messages: Message[]) {
+  return store.transaction(async () => {
   const task = (await store.getTask(taskId));
   if (!task || !(await sharingPolicy(store, task.projectId)).effective) throw new Error('Public conversation sharing is disabled');
   const existing = (await currentShare(store, taskId, role));
@@ -36,6 +40,8 @@ export async function createShare(store: Store, taskId: string, role: string, me
   (await store.kvSet(`conversation-share:${share.id}`, JSON.stringify(share)));
   (await store.kvSet(indexKey(taskId, role), share.id));
   return share;
+
+  });
 }
 export async function publicShare(store: Store, id: string): Promise<ConversationShare | undefined> {
   if (!/^[A-Za-z0-9_-]{43}$/.test(id)) return;

@@ -35,7 +35,7 @@ const key = (organizationId: string) => `authorization:requests:${organizationId
  * Unlike agent permission requests these never elevate the requester: approval
  * is applied directly to the named task or Avatar. */
 export class AuthorizationRequests {
-  constructor(private store: Pick<Store, 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
 
   async requests(filter: { status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string } = {}): Promise<AuthorizationRequest[]> {
     let all: AuthorizationRequest[] = [];
@@ -49,6 +49,7 @@ export class AuthorizationRequests {
   }
 
   async request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt'>): Promise<AuthorizationRequest> {
+    return this.store.transaction(async () => {
     const audience = [...new Set(input.audience.map(String).map((value) => value.trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
     const avatarRecipients = [...new Set((input.avatarRecipients ?? []).map(String).filter(Boolean))];
@@ -74,9 +75,12 @@ export class AuthorizationRequests {
         missingCapabilities: request.missingCapabilities, audience, recipients, avatarRecipients },
     }));
     return request;
+
+    });
   }
 
   async resolve(id: string, action: 'approve' | 'deny', by: string): Promise<AuthorizationRequest> {
+    return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
@@ -91,9 +95,12 @@ export class AuthorizationRequests {
       detail: { requestId: request.id, target: request.target, authorization: request.authorization, action },
     }));
     return request;
+
+    });
   }
 
   async dismiss(id: string, by: string): Promise<AuthorizationRequest> {
+    return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
@@ -103,6 +110,8 @@ export class AuthorizationRequests {
     (await this.store.appendAudit({ principalId: by, action: 'authorization.request.dismissed',
       scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
+
+    });
   }
 
   private async save(requests: AuthorizationRequest[]): Promise<void> {

@@ -58,7 +58,7 @@ export class TimingTrace {
   private once = new Set<string>();
   /** Observes cancellation; does not cancel or alter the underlying operation. */
   signal?: AbortSignal;
-  constructor(readonly context: TimingContext, private sink: (row: TimingRow) => void | Promise<void>,
+  constructor(readonly context: TimingContext, private sink: (row: TimingRow) => unknown,
     private now: () => number = () => performance.now(), clockId?: string, private active: () => boolean | Promise<boolean> = () => true) {
     this.traceId = randomUUID();
     this.clockId = clockId ?? processClock;
@@ -76,10 +76,14 @@ export class TimingTrace {
     } catch { this.active = () => false; return undefined; }
   }
 
-  async mark(name: string, metadata?: TimingMetadata, at?: { monoMs: number; wallMs: number }) { if (!(await this.enabled())) return; (await this.emit(name, 'mark', { metadata, ...at })); }
+  async mark(name: string, metadata?: TimingMetadata, at?: { monoMs: number; wallMs: number }) {
+    try { at ??= { monoMs: this.now(), wallMs: Date.now() }; } catch { this.active = () => false; return; }
+    if (!(await this.enabled())) return;
+    await this.emit(name, 'mark', { metadata, ...at });
+  }
   async markOnce(name: string, metadata?: TimingMetadata, key = name) {
-    if (!(await this.enabled()) || this.once.has(key)) return;
-    this.once.add(key); (await this.mark(name, metadata));
+    if (this.once.has(key)) return;
+    this.once.add(key); await this.mark(name, metadata);
   }
   async start(name: string, metadata?: TimingMetadata): Promise<(status?: TimingRow['status'], finishMetadata?: TimingMetadata) => Promise<void>> {
     if (!(await this.enabled())) return async () => {};
@@ -87,9 +91,10 @@ export class TimingTrace {
     if (!start) return async () => {};
     let ended = false;
     return async (status: TimingRow['status'] = 'ok', finishMetadata?: TimingMetadata) => {
-      if (ended || !(await this.enabled())) return; ended = true;
+      if (ended) return; ended = true;
       try {
         const monoMs = this.now();
+        if (!(await this.enabled())) return;
         (await this.emit(name, 'end', { spanId, monoMs, durationMs: Math.max(0, monoMs - start.monoMs), status,
           metadata: finishMetadata ?? metadata }));
       } catch { this.active = () => false; }
@@ -108,7 +113,7 @@ export class TimingTrace {
 export async function timingEnabled(store?: { getSettings(scope: string, key: string): (Record<string, unknown> | undefined) | Promise<Record<string, unknown> | undefined> }): Promise<boolean> {
   try { return (await store?.getSettings('global', 'timing'))?.enabled === true; } catch { return false; }
 }
-export async function installationTiming(store: Parameters<typeof timingEnabled>[0], context: TimingContext, sink: (row: TimingRow) => void | Promise<void>): Promise<TimingTrace> {
+export async function installationTiming(store: Parameters<typeof timingEnabled>[0], context: TimingContext, sink: (row: TimingRow) => unknown): Promise<TimingTrace> {
   let snapshot: Record<string, unknown> | undefined;
   try { snapshot = (await store?.getSettings('global', 'timing')); } catch { /* fail closed */ }
   return new TimingTrace(context, sink, undefined, undefined, async () => {

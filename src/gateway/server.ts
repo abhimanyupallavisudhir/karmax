@@ -1,3 +1,4 @@
+import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
 import { GatewayMetrics } from './metrics.js';
@@ -597,7 +598,7 @@ export class Gateway {
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
   private pendingPolicyAcceptances = new Map<string, { versions: Record<string, string>; expiresAt: number }>();
   private stopLoginPoolSync?: () => void;
-  private gitPassAutoSyncTimer?: NodeJS.Timeout;
+  private gitPassAutoSyncTimer?: AsyncInterval;
   /** Preserve every observed push while keeping one Git/GPG operation per
    *  organization in flight. A push arriving mid-sync queues one more refresh. */
   private gitPassAutoSyncRuns = new Map<string, Promise<void>>();
@@ -639,7 +640,7 @@ export class Gateway {
 
   private timingListeners = new Set<(enabled: boolean) => void>();
   private operationalMetrics?: GatewayMetrics;
-  private timingPoll?: ReturnType<typeof setInterval>;
+  private timingPoll?: AsyncInterval;
   private timingValue = false;
   private async refreshTiming(): Promise<void> {
     const enabled = (await timingEnabled(this.deps.store));
@@ -652,10 +653,10 @@ export class Gateway {
     (await this.refreshTiming());
     this.timingListeners.add(listener);
     listener(this.timingValue);
-    this.timingPoll ??= setInterval(async () => (await this.refreshTiming()), 1000);
+    this.timingPoll ??= new AsyncInterval(() => this.refreshTiming(), 1000);
     return () => {
       this.timingListeners.delete(listener);
-      if (!this.timingListeners.size) { clearInterval(this.timingPoll); this.timingPoll = undefined; }
+      if (!this.timingListeners.size) { void this.timingPoll?.stop(); this.timingPoll = undefined; }
     };
   }
 
@@ -701,9 +702,10 @@ export class Gateway {
           ? (await delivery.offer({ taskId: ev.taskId, turnId: typeof payload.turnId === 'string' ? payload.turnId : undefined,
             workflowRunId: typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined,
             attempt: typeof payload.attempt === 'number' ? payload.attempt : undefined })) : undefined;
+        if (ws.readyState !== WebSocketClient.OPEN) return;
         ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
-    });
+    }, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
     ws.on('close', off);
     ws.on('error', off);
   }
@@ -1075,20 +1077,20 @@ export class Gateway {
     this.connectionTimer = setInterval(() => this.sweepConnections(), 5000);
     this.connectionTimer.unref();
     (await this.enqueueGitPassBackstop());
-    this.gitPassAutoSyncTimer = setInterval(async () => (await this.enqueueGitPassBackstop()), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
+    this.gitPassAutoSyncTimer = new AsyncInterval(() => this.enqueueGitPassBackstop(), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
     this.gitPassAutoSyncTimer.unref();
     return {
       url: publicUrl,
       internalUrl,
       port,
-      close: () =>
-        new Promise<void>(async (resolve) => {
+      close: async () => {
           if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
-          if (this.gitPassAutoSyncTimer) clearInterval(this.gitPassAutoSyncTimer);
+          await this.gitPassAutoSyncTimer?.stop();
+          await this.timingPoll?.stop();
           this.gitPassAutoSyncTimer = undefined;
-          (await this.reviewActions.stopAll());
+          try { await this.reviewActions.stopAll(); } finally {
           this.fanout.close();
           this.operationalMetrics?.close();
           // `WebSocketServer.close()` does not terminate existing upgraded
@@ -1103,9 +1105,12 @@ export class Gateway {
           wssTerm.close();
           wssAction.close();
           wssPreview.close();
-          server.close(() => resolve());
-          server.closeAllConnections();
-        }),
+          await new Promise<void>((resolve, reject) => {
+            server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
+            server.closeAllConnections();
+          });
+          }
+        },
     };
   }
 
@@ -1186,12 +1191,12 @@ export class Gateway {
       : () => {};
     let finalized = false;
     let clientClosed = false;
-    const heartbeat = setInterval(async () => (await this.deps.store.heartbeatExecution(executionId)), 30_000);
+    const heartbeat = new AsyncInterval(() => this.deps.store.heartbeatExecution(executionId), 30_000);
     heartbeat.unref();
     const finish = async (code: number | null, cancelled = false) => {
       if (finalized) return;
       finalized = true;
-      clearInterval(heartbeat);
+      await heartbeat.stop();
       untrack();
       (await this.deps.store.finishExecution(executionId, code, cancelled ? 'cancelled' : undefined));
       if (worldLeaseId && this.deps.worldAccess) void this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
@@ -1895,7 +1900,7 @@ export class Gateway {
         const request = { requestedAt: Date.now(), userId: subject.userId,
           email: (await this.deps.identity?.listUsers())?.find((user) => user.id === subject.userId)?.email ?? session.email };
         (await store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request)));
-        if (privacyContact && (await this.deps.email?.configured())) {
+        if (privacyContact && this.deps.email && (await this.deps.email.configured())) {
           await this.deps.email.send({ to: privacyContact, subject: `${(await this.siteName)} account deletion request`,
             text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${request.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
             .catch((error) => console.error('[privacy] deletion-request notification failed:', error instanceof Error ? error.message : error));
@@ -2421,7 +2426,7 @@ export class Gateway {
           // Auto-deliver the invite when outbound email is configured; the copyable
           // link is still returned as a fallback (and for email-less installs).
           let emailed = false;
-          if ((await this.deps.email?.configured()) && result.invitation.email) {
+          if (this.deps.email && (await this.deps.email.configured()) && result.invitation.email) {
             const link = `${this.publicUrl(req)}/invite?token=${encodeURIComponent(result.token)}`;
             const organization = (await store.getOrganization(organizationId));
             const orgName = organization?.name ?? `a ${(await this.siteName)} organization`;
@@ -2800,7 +2805,7 @@ export class Gateway {
         if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
         const items = (await store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) }));
-        const headers = store.taskHeaders(items.map((item) => item.taskId));
+        const headers = await store.taskHeaders(items.map((item) => item.taskId));
         return this.json(res, 200, (await __asyncCollections.map(items, async (item) => {
           const avatar = item.subject?.kind === 'avatar-authorization'
             ? (await store.getAvatar(item.subject.avatarId)) : undefined;
@@ -5558,7 +5563,7 @@ export class Gateway {
           return this.json(res, 503, { error: 'Stripe Issuing is unavailable' });
         const publicUrl = this.publicUrl(req);
         if (method === 'GET') return this.json(res, 200, {
-          ...provider.platformStatus(),
+          ...await provider.platformStatus(),
           canManage: (await this.deps.tokens.check(token, 'settings:write')).ok,
           callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
           webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
@@ -5569,7 +5574,7 @@ export class Gateway {
           const b = await this.body(req);
           try {
             return this.json(res, 200, {
-              ...provider.configurePlatform({
+              ...await provider.configurePlatform({
                 clientId: String(b.clientId ?? ''),
                 secretKey: b.secretKey ? String(b.secretKey) : undefined,
                 webhookSecret: b.webhookSecret ? String(b.webhookSecret) : undefined,
@@ -6307,7 +6312,7 @@ export class Gateway {
         return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
       }
       if (p === '/api/email/test' && method === 'POST') {
-        if (!(await this.deps.email?.configured())) return this.json(res, 400, { error: 'connect an email provider first' });
+        if (!this.deps.email || !(await this.deps.email.configured())) return this.json(res, 400, { error: 'connect an email provider first' });
         const b = await this.body(req);
         const to = String(b.to ?? session.email ?? '').trim();
         if (!to) return this.json(res, 400, { error: 'no recipient — pass { to } or sign in with an email' });

@@ -1,3 +1,4 @@
+import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import type { WorldHandle, WorldProcess } from '../world/types.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -59,12 +60,12 @@ export interface ActionStatus {
 
 export class ReviewActionRunner {
   private procs = new Map<string, RunningAction>();
-  private commandPoll: NodeJS.Timeout;
+  private commandPoll: AsyncInterval;
 
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
     private access?: import('../world/access.js').WorldAccessService,
     private resources?: import('../world/resources.js').ProjectResourceService) {
-    this.commandPoll = setInterval(async () => {
+    this.commandPoll = new AsyncInterval(async () => {
       for (const rec of this.procs.values()) {
         if (!rec.running) continue;
         (await this.store.heartbeatExecution(rec.procId));
@@ -224,7 +225,7 @@ export class ReviewActionRunner {
 
   /** Kill everything — called on gateway shutdown so no dev server is orphaned. */
   async stopAll(): Promise<void> {
-    clearInterval(this.commandPoll);
+    await this.commandPoll.stop();
     for (const rec of this.procs.values()) if (rec.running) {
       (await this.store.finishExecution(rec.procId, null, 'cancelled'));
       void rec.process.kill('SIGKILL');

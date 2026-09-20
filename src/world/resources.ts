@@ -114,7 +114,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
           const chunkId = crypto.createHmac('sha256', key)
             .update(chunkNamespace ? `${chunkNamespace}\0${plainHash}` : plainHash).digest('hex');
           if (!retained.has(chunkId)) {
-            this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId);
+            await this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId);
             retained.set(chunkId, plain.length);
           }
           await objects.put(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`, sealDeterministic(key, chunkId, plain));
@@ -252,7 +252,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   private attachmentResolver?: (id: string) => ResourceAttachment | undefined | Promise<ResourceAttachment | undefined>;
   setAttachmentResolver(resolve: (id: string) => ResourceAttachment | undefined | Promise<ResourceAttachment | undefined>): void { this.attachmentResolver = resolve; }
   private chunkAccounting?: {
-    retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void;
+    retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void | Promise<void>;
     release(organizationId: string, chunkIds: string[]): string[] | Promise<string[]>;
   };
   setChunkAccounting(value: NonNullable<ObjectSnapshotEngine['chunkAccounting']>): void { this.chunkAccounting = value; }

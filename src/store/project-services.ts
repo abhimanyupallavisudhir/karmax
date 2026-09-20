@@ -3,6 +3,7 @@ import type { ProjectService } from '../domain/types.js';
 
 const KV_PREFIX = 'project-services:';
 export interface ProjectServicesStore {
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(key: string): (string | undefined) | Promise<string | undefined>;
   kvSet(key: string, value: string): (void) | Promise<void>;
 }
@@ -14,6 +15,7 @@ export class ProjectServices {
     catch { return []; }
   }
   async save(projectId: string, service: ProjectService): Promise<ProjectService> {
+    return this.store.transaction(async () => {
     const name = service.name?.trim();
     if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name ?? '')) throw new Error('service name must be alphanumeric with - or _');
     if (service.kind === 'external' && !service.connectionResourceId)
@@ -30,10 +32,15 @@ export class ProjectServices {
       ...(await this.list(projectId)).filter((candidate) => candidate.name !== name), record,
     ])));
     return record;
+
+    });
   }
   async delete(projectId: string, name: string): Promise<void> {
+    return this.store.transaction(async () => {
     (await this.store.kvSet(KV_PREFIX + projectId, JSON.stringify(
       (await this.list(projectId)).filter((candidate) => candidate.name !== name))));
+
+    });
   }
 }
 
