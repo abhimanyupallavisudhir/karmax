@@ -215,22 +215,49 @@ export class WorldLifecycleManager {
       const project = (await this.store.getProject(projectId));
       const after = project ? (await this.store.effectiveProjectConfig(project)).hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
       if (!project || candidate.updatedAt > now - after) continue;
-      const checkpoint = (await this.store.latestWorldCheckpoint(candidate.handle.id))
-        ?? await this.checkpoints.checkpoint(candidate.handle);
-      if (!checkpoint) continue;
-      try {
-        const world = await this.worlds.open(candidate.handle as any);
-        await world.destroy();
-        (await this.store.setWorldState(candidate.handle, 'hibernated'));
-        (await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id }));
+      // Selection is only a hint: a gateway or activity can resume this world
+      // while the sweep awaits another provider. Own the complete destructive
+      // transition, and recheck after every potentially slow preparation step.
+      await this.worlds.withOperation(candidate.handle.id, async () => {
+        const eligible = async (checkSelection = false) => {
+          const current = await this.store.worldStateSnapshot(candidate.handle.id);
+          return !!current && current.generation === (candidate.handle.generation ?? 1)
+            && current.state === 'parked'
+            && (!checkSelection || current.updatedAt === Number(candidate.updatedAt))
+            && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0
+            && !(await this.worlds.hasActiveAccess(candidate.handle.id))
+            && (await this.store.taskMetadata(candidate.handle.id))?.lastView?.status !== 'active';
+        };
+        if (!(await eligible(true))) return;
+        let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
+        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1))
+          checkpoint = await this.checkpoints.checkpoint(candidate.handle);
+        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return;
+        try {
+          const world = await this.worlds.open(candidate.handle as any);
+          // Recovery may replace a missing sandbox during open. Never destroy
+          // that new generation on the authority of the old parked candidate.
+          if (!(await eligible())) return;
+          await world.destroy();
+        } catch (error) {
+          // A timeout/5xx is not proof of eviction. Preserve the recoverable
+          // state and let the next sweep retry unless the provider proves loss.
+          const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
+          if (state !== 'missing' || !(await eligible())) {
+            await this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return;
+          }
+          await this.store.setWorldState(candidate.handle, 'hibernated');
+          await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, providerEvicted: true });
+          hibernated++;
+          return;
+        }
+        await this.store.setWorldState(candidate.handle, 'hibernated');
+        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id });
         hibernated++;
-      } catch {
-        // A provider that has already evicted the parked sandbox is effectively
-        // hibernated as long as the portable checkpoint exists.
-        (await this.store.setWorldState(candidate.handle, 'hibernated'));
-        (await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, providerEvicted: true }));
-        hibernated++;
-      }
+      });
     }
     return hibernated;
   }

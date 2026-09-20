@@ -5705,6 +5705,12 @@ export class Store {
     return ((await this.db.prepare('SELECT state FROM world_instances WHERE worldId=? ORDER BY generation DESC LIMIT 1').get(worldId)) as any)?.state;
   }
 
+  async worldStateSnapshot(worldId: string): Promise<{ state: string; generation: number; updatedAt: number } | undefined> {
+    const row = await this.db.prepare('SELECT state, generation, updatedAt FROM world_instances WHERE worldId=? ORDER BY generation DESC LIMIT 1')
+      .get(worldId) as { state: string; generation: number; updatedAt: number } | undefined;
+    return row ? { state: row.state, generation: Number(row.generation), updatedAt: Number(row.updatedAt) } : undefined;
+  }
+
   async setWorldState(handle: WorldHandleRef, state: 'ready' | 'parked' | 'hibernated' | 'degraded' | 'released'): Promise<void> {
     return this.db.transaction(async () => {
 
