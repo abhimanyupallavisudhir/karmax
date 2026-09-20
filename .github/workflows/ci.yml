@@ -119,6 +119,9 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+      - name: Run standalone UI and browser regressions
+        run: node --test --test-concurrency=1 web/*.test.cjs
+
   deploy-artifacts:
     name: deploy artifacts
     runs-on: ubuntu-latest

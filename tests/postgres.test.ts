@@ -22,6 +22,36 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('migrates multiple pages of legacy conversations without losing history on restart or status writes', async () => {
+    let store = await Store.create(url!);
+    const expected = new Map<string, any>();
+    try {
+      const project = await store.createProject('Legacy PostgreSQL history');
+      for (let index = 0; index < 205; index++) {
+        const task = await store.createTask({ projectId: project.id, title: `Legacy ${index}`, workflow: 'just-do',
+          workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+        const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
+          actions: [], state: {}, updatedAt: 1,
+          messages: [{ id: 'message', role: 'agent', text: `History ${index}`, ts: 1 }],
+          transcripts: { do: [{ role: 'assistant', text: `Transcript ${index}` }] } };
+        await store.db.prepare('UPDATE tasks SET lastView=?, conversation=NULL WHERE id=?').run(JSON.stringify(view), task.id);
+        expected.set(task.id, view);
+      }
+      await store.close();
+      store = await Store.create(url!);
+      for (const [id, view] of expected) {
+        expect((await store.getTask(id))?.lastView).toEqual(view);
+        expect((await store.taskMetadata(id))?.lastView?.messages).toBeUndefined();
+      }
+      const [id, view] = [...expected][0]!;
+      await store.checkpointReviewInfo(id, { summary: 'Status updated after migration' });
+      await store.close();
+      store = await Store.create(url!);
+      expect((await store.getTask(id))?.lastView).toEqual({ ...view, reviewInfo: { summary: 'Status updated after migration' } });
+      expect((await store.getTask([...expected.keys()].at(-1)!))?.lastView).toEqual([...expected.values()].at(-1));
+    } finally { await store.close(); }
+  });
+
   it('serializes build admission and rolls back failed transfers across independent pools', async () => {
     const first = await Store.create(url!);
     const otherUrl = new URL(url!);

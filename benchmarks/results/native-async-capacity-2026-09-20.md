@@ -266,3 +266,56 @@ the split-main case. This includes the entire 48-case workflow pipeline; the run
 took 403.68 seconds. Together with the focused tests and passing compiler, these
 are the validation results for this follow-up, not a fresh full-suite capacity
 claim. Process mode remains opt-in and production deployment is separate.
+
+
+## Deployment safety validation follow-up
+
+A fresh sequential run covered the 318 TypeScript test files present at `2f1f5f5`.
+The application source stayed at that revision during this audit. A multi-page
+PostgreSQL migration test was added before its file ran; it verified all 205 legacy
+histories, restart, and subsequent status writes. Deployment-only fixes and their
+new tests were checked separately after the main run.
+
+The manifest audit accounts for **every one of the 318 files**, with **3,026 passing
+assertions and 33 explicit skips**. Fourteen files are entirely environment-gated
+(live providers, Docker, and optional browser/password-store integration). This is
+a batched run, not one uninterrupted invocation: batch 9 lost its Vitest worker
+to a kernel-confirmed OOM during the 257 MiB Git-transfer test. All fifteen files
+in that batch were rerun in individual sequential processes; all completed, and
+all five Git-transfer assertions passed, including transfer in both directions
+and fresh-clone verification. Only those complete replacement reports are counted.
+No unfinished assertions or missing files are counted as passes.
+
+The deployment audit found that code-only rollback could start legacy code after
+conversation data had moved out of `lastView`. `deploy/data-epoch` now marks this
+compatibility boundary. A lower epoch is rejected before startup. Failed readiness
+across epochs stops the app and retains the candidate/data rather than starting
+incompatible old code; recovery requires a forward fix or a coordinated backup
+restore with matching code and Temporal history. Same-epoch rollback remains.
+This prevents unsafe rollback, but a failed epoch transition can still cause
+outage. Each readiness HTTP request now has a five-second timeout.
+
+The final deployment group passed **19 tests**, including real temporary Git
+histories for success, compatible rollback, incompatible rollback refusal,
+malformed/downgraded epochs, and build/backup failure. A real loopback HTTP server
+that accepts a readiness request but never responds verified probe termination.
+The new rollback file contributes eight assertions; the CI coverage guard adds
+one to an existing file. The resulting combined unique TypeScript coverage is
+**319 files, 3,035 passed assertions, 33 skipped**.
+
+Final typechecking passed with a 1280 MiB heap; shell parsing and diff whitespace
+checks also passed.
+
+All **98 standalone UI/browser checks across 60 scripts** passed sequentially,
+including the real Chromium fixtures. These scripts now run in the required CI
+job after `npm test`. The combined application smoke test passed readiness for
+both database and Temporal, SIGTERM exit zero, one persisted stop record and a
+cleared active-runtime marker (0.067 seconds idle shutdown). This is not an
+active-agent drain or production load benchmark.
+
+Docker is unavailable in this workspace. No production-container execution,
+production-data restore rehearsal, or paid live-provider test is claimed.
+GitHub Actions evidence could not yet be inspected: the tool refused the request
+because this task lacks `github:actions:read`. Container/CI verification remains
+a release requirement, and process mode remains opt-in. Nothing in this report
+guarantees zero regressions or asserts a production deployment.
