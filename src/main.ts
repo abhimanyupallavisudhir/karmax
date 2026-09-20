@@ -1,3 +1,4 @@
+import { createExecutionServices } from './runtime/execution-services.js';
 import { AsyncInterval } from './util/async-interval.js';
 import * as __asyncCollections from './util/async-collections.js';
 import path from 'node:path';
@@ -11,12 +12,8 @@ import { TASK_QUEUE } from './temporal/config.js';
 import { WorkflowManager } from './packages/manager.js';
 import { WorkflowRepoLoader } from './packages/repo.js';
 import { openStore } from './store/db.js';
-import { WorldRegistry } from './world/registry.js';
-import { WorktreeProvider } from './world/worktree.js';
-import { buildAdapters, defaultProvider } from './agent/adapters.js';
-import { ProfileResolver, seedProfiles } from './agent/profiles.js';
+import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
-import { TokenAuthority } from './platform/tokens.js';
 import { CredentialBroker } from './autonomy/broker.js';
 import { Vault } from './autonomy/vault.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
@@ -34,18 +31,10 @@ import { siteNameOf } from './domain/brand.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
-import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
-import { StorageLocationService } from './store/storage-locations.js';
-import { WorldCheckpointService } from './world/checkpoint.js';
-import { RunnerPoolService, WorldLifecycleManager } from './world/runners.js';
+import { WorldLifecycleManager } from './world/runners.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
 import { hydrateEnvFile, hydrateSecretFiles, validateDeployment } from './config/deployment.js';
-import { WorldProviderConnectionService } from './world/connections.js';
-import { E2BWorldProvider } from './world/e2b.js';
-import { DaytonaWorldProvider } from './world/daytona.js';
 import { WorldHandoffService } from './world/handoff.js';
-import { WorldAccessService } from './world/access.js';
-import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.js';
 import { sweepOrphanedServiceContainers } from './world/services.js';
 import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-restart.js';
 import { EntitlementQueueReconciler } from './platform/entitlement-queue-reconciler.js';
@@ -226,13 +215,10 @@ async function main() {
   const installationOwner = (await identity.listUsers())[0];
   if (installationOwner) (await store.claimPersonalOrganization(installationOwner.id, installationOwner.name));
   (await store.migratePersonalOrganizationNames((await identity.listUsers())));
-  const worlds = new WorldRegistry();
-  worlds.register(new WorktreeProvider(p.worlds));
-  const adapters = buildAdapters();
-  const profiles = new ProfileResolver(store, provider);
-  (await seedProfiles(store, provider));
+  const { worlds, adapters, profiles, tokens, providerConnections, objectStore, storageLocations,
+    resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes } =
+    await createExecutionServices({ store, client, broker, githubApp, p, deployment, provider, bootstrap: true });
   const bus = new KarmaxBus();
-  const tokens = new TokenAuthority(store);
   // Installation-wide outbound email (account confirmation, password reset, org
   // invites). Reads its live config + vaulted secret on each send, so connecting
   // a provider in Settings takes effect without a restart. Handed to identity so
@@ -243,32 +229,6 @@ async function main() {
   const emailService = new EmailService(emailConfig,
     (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined));
   identity.mailer = emailService;
-  const providerConnections = new WorldProviderConnectionService(store, broker);
-  (await providerConnections.importEnvironment());
-  worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
-    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind))));
-  worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
-    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind))));
-  const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
-    ? new S3ObjectStore({
-        endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),
-        region: process.env.KARMAX_S3_REGION ?? 'us-east-1', accessKeyId: requiredEnv('KARMAX_S3_ACCESS_KEY_ID'),
-        secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
-      })
-    : new LocalObjectStore(p.objects);
-  const configuredStorageQuota = process.env.KARMAX_MANAGED_STORAGE_QUOTA_BYTES;
-  const managedStorageQuotaBytes = configuredStorageQuota == null
-    ? (deployment.hosted ? 5 * 1024 * 1024 * 1024 : undefined)
-    : Number(configuredStorageQuota) > 0 ? Math.floor(Number(configuredStorageQuota)) : undefined;
-  const storageLocations = new StorageLocationService(store, objectStore, broker, managedStorageQuotaBytes,
-    !deployment.hosted);
-  for (const organization of (await store.listOrganizations())) (await storageLocations.ensureManaged(organization.id));
-  const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker, storageLocations);
-  const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
-    { client, taskQueue: TASK_QUEUE }, storageLocations);
-  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
-  const runners = new RunnerPoolService(store);
-  const worldAccess = new WorldAccessService(store, worlds, runners, resources);
   const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess, p.localCheckouts, resources);
   const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
   const delivery = new DeliveryDispatcher(store, {
@@ -279,40 +239,13 @@ async function main() {
     const user = (await identity.listUsers()).find((candidate) => candidate.id === id);
     return user ? { id: user.id, name: user.name, email: user.email } : undefined;
   });
-  worlds.setHandleResolver(async (handle) => (await store.currentWorld(handle.id)) as import('./world/types.js').WorldHandle | undefined);
-  // Rebuild a world from its last checkpoint ONLY when the provider has genuinely
-  // lost the sandbox. Restoring replays just the dirty delta captured at the last
-  // park, so doing it after a *transient* control-plane error (a 5xx, a rate limit,
-  // a socket timeout) would silently discard everything the agent has done since
-  // then. The probe gate is the whole safety property — see the matching gate in
-  // activities/core.ts (recoverVanishedWorld). Providers with no probe (the local
-  // worktree) return undefined and are therefore never rolled back.
-  worlds.setRecoveryHandler(async (handle) => {
-    if ((await store.worldState(handle.id)) === 'released') return undefined;
-    const checkpoint = (await store.latestWorldCheckpoint(handle.id));
-    if (!checkpoint) return undefined;
-    const state = await worlds.probe(handle).catch(() => undefined);
-    if (state !== 'missing') return undefined; // transient/parked → keep the original error
-    (await store.setWorldState(((await store.currentWorld(handle.id)) ?? handle) as import('./world/types.js').WorldHandle, 'degraded'));
-    return checkpoints.restore(checkpoint.id, handle.kind);
-  });
-  const { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
-  const payments = new MockPaymentProvider(store);
-  const paymentRegistry = new PaymentRegistry(store);
-  paymentRegistry.register(payments);
-  // The universal rail: a card the human already holds, limit enforced by their
-  // own issuer. Registered before Stripe Issuing, which needs a business account.
-  paymentRegistry.register(new VaultCardProvider(store, broker));
-  paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
   // Hosted-plan billing is deliberately a different provider and ledger from
   // the agent card registry above. Self-hosted installs construct the service so
   // status calls can report "unmetered", but it never contacts Stripe there.
   const { StripeSubscriptionProvider, SubscriptionBillingService } = await import('./billing/subscriptions.js');
   const subscriptionBilling = new SubscriptionBillingService(store,
     new StripeSubscriptionProvider(async () => (await paidLaunchSettings.subscriptionConfig()), fetch), deployment.hosted);
-  const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
-  const configHomes = new ConfigHomeManager();
   const login = new LoginManager(configHomes);
   // Upgrade durable MCP launch/auth configuration before the worker starts
   // polling and can resume an agent. The gateway refresh below replaces this
@@ -745,12 +678,6 @@ main().catch((e) => {
   console.error('krmax failed to start:', e);
   process.exit(1);
 });
-
-function requiredEnv(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-}
 
 function temporalConnectionFromEnv(): import('./temporal/config.js').TemporalConn | undefined {
   const address = process.env.KARMAX_TEMPORAL_ADDRESS?.trim();
