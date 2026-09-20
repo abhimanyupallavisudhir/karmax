@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Kysely, SqliteAdapter, SqliteIntrospector, SqliteQueryCompiler,
-  type CompiledQuery, type DatabaseConnection, type Driver, type QueryResult } from 'kysely';
+  type CompiledQuery, type DatabaseConnection, type Driver, type QueryResult, type TransactionBuilder } from 'kysely';
 import type { SqlDatabase } from './sql.js';
 
 interface Lease extends DatabaseConnection {
@@ -63,10 +63,32 @@ class IdentitySqliteDriver implements Driver {
 
 export function identitySqliteDatabase(db: SqlDatabase): Kysely<any> {
   if (db.dialect !== 'sqlite') throw new Error('identity SQLite driver requires SQLite');
-  return new Kysely({ dialect: {
+  const identity = new Kysely({ dialect: {
     createDriver: () => new IdentitySqliteDriver(db),
     createAdapter: () => new SqliteAdapter(),
     createQueryCompiler: () => new SqliteQueryCompiler(),
     createIntrospector: kysely => new SqliteIntrospector(kysely),
   } });
+  const transaction = identity.transaction.bind(identity);
+  identity.transaction = () => withinStoreTransaction(transaction(), db);
+  return identity;
+}
+
+/** The checkout scope alone only covers SQL statements. Better Auth also runs
+ * lifecycle hooks inside its transaction callback; those hooks read the Store
+ * directly. Enter the Store scope around the entire callback so they cannot
+ * queue behind the very transaction that is waiting for them to return. */
+function withinStoreTransaction<T>(builder: TransactionBuilder<T>, db: SqlDatabase): TransactionBuilder<T> {
+  return new Proxy(builder, {
+    get(target, property) {
+      if (property === 'execute') return (callback: Parameters<typeof target.execute>[0]) =>
+        db.transaction(() => target.execute(callback));
+      // Fluent builders return new instances; preserve the scope wrapper.
+      if (property === 'setIsolationLevel') return (level: Parameters<typeof target.setIsolationLevel>[0]) =>
+        withinStoreTransaction(target.setIsolationLevel(level), db);
+      if (property === 'setAccessMode') return (mode: Parameters<typeof target.setAccessMode>[0]) =>
+        withinStoreTransaction(target.setAccessMode(mode), db);
+      return Reflect.get(target, property, target);
+    },
+  });
 }
