@@ -2953,73 +2953,127 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async destroyWorld(handle: WorldHandle): Promise<void> {
-      const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
-      const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
-      // Backfill reviews authored before durable attachment publication. A failed
-      // upload must propagate before teardown's best-effort catch/finally: this
-      // world may contain the only remaining copy of an uncommitted attachment.
-      if (deps.objects && (await unsavedReviewArtifacts(store, handle.id, (await store.getTask(handle.id))?.lastView?.reviewInfo))) {
-        const world = await worlds.open(current);
-        await preserveReviewArtifacts(store, deps.objects, world, handle.id,
-          (await store.getTask(handle.id))?.lastView?.reviewInfo, true);
-      }
-      try {
-        if ((await store.getTask(handle.id))?.lastView?.status === 'cancelled')
-          await deps.resources?.discardTaskCandidates(handle.id, 'system:task-cancel');
-        await deps.resources?.release(current);
-        const world = await worlds.open(handle);
-        await world.destroy();
-        (await store.setWorldState(((await store.currentWorld(handle.id)) ?? current) as WorldHandle, 'released'));
-        (await record(handle.id, 'world.destroyed', {}));
-      } catch (error) {
-        // The provider may be unavailable while its own timeout is evicting the
-        // sandbox. Do not retain admission capacity forever; keep the durable
-        // world degraded so operations can see/retry the incomplete teardown.
-        (await store.setWorldState(((await store.currentWorld(handle.id)) ?? current) as WorldHandle, 'degraded'));
-        (await record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) }));
-      } finally {
-        await destroyWorldServices(handle.id).catch(() => undefined);
-        if (leaseId) (await deps.runners?.release(leaseId, current.kind));
-      }
+      let runId: string | undefined;
+      try { runId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct tests */ }
+      const destroy = async () => {
+        const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+        const ownerRun = (await store.taskMetadata(handle.id))?.params._workflowRunId;
+        // A restored sandbox can legitimately advance generation within the
+        // same workflow run. Without that proof, a stale handle cannot authorize
+        // destroying whichever replacement the resolver currently returns.
+        if (ownerRun && runId && ownerRun !== runId) return;
+        if ((current.kind !== handle.kind || (current.generation ?? 1) !== (handle.generation ?? 1))
+          && (!runId || ownerRun !== runId)) return;
+        const owns = async () => {
+          const latest = await store.currentWorld(handle.id);
+          const latestRun = (await store.taskMetadata(handle.id))?.params._workflowRunId;
+          return (!latest || latest.kind === current.kind && (latest.generation ?? 1) === (current.generation ?? 1))
+            && latestRun === ownerRun;
+        };
+        const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
+        const alreadyReleased = await store.worldState(handle.id) === 'released';
+        // A failed artifact upload must propagate before best-effort teardown:
+        // this world may hold the only remaining copy of a review attachment.
+        if (!alreadyReleased && deps.objects
+          && (await unsavedReviewArtifacts(store, handle.id, (await store.getTask(handle.id))?.lastView?.reviewInfo))) {
+          const world = await worlds.open(current);
+          if (!(await owns())) return;
+          await preserveReviewArtifacts(store, deps.objects, world, handle.id,
+            (await store.getTask(handle.id))?.lastView?.reviewInfo, true);
+        }
+        try {
+          if (!(await owns()) || alreadyReleased) return;
+          if ((await store.taskMetadata(handle.id))?.lastView?.status === 'cancelled')
+            await deps.resources?.discardTaskCandidates(handle.id, 'system:task-cancel');
+          if (!(await owns())) return;
+          await deps.resources?.release(current);
+          if (!(await owns())) return;
+          const world = await worlds.open(current);
+          if (!(await owns())) return;
+          await world.destroy();
+          if (!(await owns())) return;
+          await store.setWorldState(current, 'released');
+          await record(handle.id, 'world.destroyed', {});
+        } catch (error) {
+          if (!(await owns())) return;
+          // A transient provider failure remains visible, without rewriting a
+          // replacement generation's state or retaining this run's capacity.
+          await store.setWorldState(current, 'degraded');
+          await record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          if (await owns()) {
+            await destroyWorldServices(handle.id).catch(() => undefined);
+            if (leaseId && await owns()) await deps.runners?.release(leaseId, current.kind);
+          }
+        }
+      };
+      await (worlds.withOperation ? worlds.withOperation(handle.id, destroy) : destroy());
     },
 
     /** Preserve a reversible task cancellation without retaining billable
      * compute where the provider can park. Draft/reset remains the operation
      * that deliberately discards this state. */
     async suspendWorldForRecovery(handle: WorldHandle): Promise<void> {
-      const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+      let ctx: ReturnType<typeof activityContext.current> | undefined;
+      try { ctx = activityContext.current(); } catch { /* direct tests */ }
+      const valid = async () => {
+        const current = await store.currentWorld(handle.id);
+        const task = await store.taskMetadata(handle.id);
+        return !!current && current.kind === handle.kind
+          && (current.generation ?? 1) === (handle.generation ?? 1)
+          && !['released', 'hibernated'].includes((await store.worldState(handle.id)) ?? '')
+          && task?.lastView?.status === 'cancelled'
+          && (!task.params._workflowRunId || !ctx
+            || task.params._workflowRunId === ctx.info.workflowExecution?.runId);
+      };
       try {
-        if (deps.checkpoints) {
-          if (isRemote(current.kind) && worldRepos(current).length) {
-            const world = await openWorld(current, current.id);
-            const projectId = String(current.meta?.projectId ?? '');
-            if ((await store.listProjectRepositories(projectId)).length) {
-              const pushed = await publishTaskBranch(world, current.id);
-              if (pushed.skipped.length)
-                throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+        if (!(await valid())) return;
+        let current = (await store.currentWorld(handle.id)) as WorldHandle;
+        // Capacity admission cannot hold the transition lock: an existing
+        // accessor may need that lock to release the capacity we are awaiting.
+        const prepared = deps.checkpoints && isRemote(current.kind) && worldRepos(current).length
+          ? await openWorld(current, current.id) : undefined;
+        const suspend = async () => {
+          if (!(await valid())) return;
+          current = (await store.currentWorld(handle.id)) as WorldHandle;
+          const idle = async () => {
+            if (await worlds.hasActiveAccess?.(handle.id))
+              throw new Error('world remains in use; preserving it for recovery');
+          };
+          await idle();
+          if (deps.checkpoints) {
+            if (prepared) {
+              const projectId = String(current.meta?.projectId ?? '');
+              if ((await store.listProjectRepositories(projectId)).length) {
+                const pushed = await publishTaskBranch(prepared, current.id);
+                if (pushed.skipped.length)
+                  throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+              }
+            }
+            await deps.checkpoints.checkpoint(current);
+          }
+          if (!(await valid())) return;
+          await idle();
+          const provider = worlds.get(current.kind);
+          if (provider.parkable) {
+            await worlds.park(current);
+            if (await worlds.status(current) === 'parked') {
+              const parked = ((await store.currentWorld(current.id)) ?? current) as WorldHandle;
+              const leaseId = typeof parked.meta?.worldLeaseId === 'string' ? parked.meta.worldLeaseId : undefined;
+              if (leaseId) {
+                (await deps.runners?.release(leaseId, parked.kind));
+                (await store.updateWorldMeta(parked, { worldLeaseId: null }));
+              }
+              (await store.setWorldState(((await store.currentWorld(current.id)) ?? parked) as WorldHandle, 'parked'));
             }
           }
-          await deps.checkpoints.checkpoint(current);
-        }
-        const provider = worlds.get(current.kind);
-        if (provider.parkable) {
-          await worlds.park(current);
-          if (await worlds.status(current) === 'parked') {
-            const parked = ((await store.currentWorld(current.id)) ?? current) as WorldHandle;
-            const leaseId = typeof parked.meta?.worldLeaseId === 'string' ? parked.meta.worldLeaseId : undefined;
-            if (leaseId) {
-              (await deps.runners?.release(leaseId, parked.kind));
-              (await store.updateWorldMeta(parked, { worldLeaseId: null }));
-            }
-            (await store.setWorldState(((await store.currentWorld(current.id)) ?? parked) as WorldHandle, 'parked'));
-          }
-        }
-        (await record(current.id, 'world.suspended', { provider: current.kind, parkable: !!provider.parkable }));
+          (await record(current.id, 'world.suspended', { provider: current.kind, parkable: !!provider.parkable }));
+        };
+        await (worlds.withOperation ? worlds.withOperation(handle.id, suspend) : suspend());
       } catch (error) {
-        // Cancellation itself remains reliable. The live world is intentionally
-        // left intact when persistence/parking fails, so a later restore has the
-        // best available chance of recovering it.
-        (await record(current.id, 'world.suspend_failed', {
+        // Cancellation itself remains reliable. Persistence, parking, or busy
+        // access failures leave the world intact and emit a diagnostic.
+        (await record(handle.id, 'world.suspend_failed', {
           error: error instanceof Error ? error.message : String(error),
         }));
       }

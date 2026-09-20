@@ -37,6 +37,47 @@ async function fixture(kind: 'memory' | 'e2b' = 'memory') {
   return { store, project, task, handle, worlds, checkpoint, core, view, publish, open, park, runners, setParked: () => { parked = true; } };
 }
 
+describe('cancelled-world recovery', () => {
+  it('checkpoints and parks the current cancelled generation', async () => {
+    const f = await fixture();
+    await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
+    await f.core.suspendWorldForRecovery(f.handle);
+    expect(f.checkpoint).toHaveBeenCalledOnce();
+    expect(f.park).toHaveBeenCalledOnce();
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  });
+
+  it.each(['generation', 'run', 'active', 'access', 'hibernated'])('leaves an obsolete or busy cancellation intact: %s', async change => {
+    const f = await fixture();
+    await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
+    let release: (() => void) | undefined;
+    if (change === 'generation') await f.store.registerWorld({ ...f.handle, generation: 2 }, f.project.id);
+    if (change === 'active') await f.store.saveView(f.task.id, { ...f.view, status: 'active' });
+    if (change === 'hibernated') await f.store.setWorldState(f.handle, 'hibernated');
+    if (change === 'run') {
+      await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'replacement' });
+      vi.spyOn(Context, 'current').mockReturnValue({ info: { workflowExecution: { runId: 'old' } } } as any);
+    }
+    if (change === 'access') release = await f.worlds.holdAccess(f.handle.id);
+    try { await f.core.suspendWorldForRecovery(f.handle); }
+    finally { release?.(); }
+    expect(f.checkpoint).not.toHaveBeenCalled();
+    expect(f.park).not.toHaveBeenCalled();
+    if (change === 'access') expect(await f.store.eventsOfType(f.task.id, 'world.suspend_failed')).toHaveLength(1);
+  });
+
+  it('rechecks cancellation after slow checkpointing', async () => {
+    const f = await fixture(), entered = deferred(), finish = deferred();
+    await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
+    f.checkpoint.mockImplementation(async () => { entered.resolve(); await finish.promise; return { id: 'checkpoint', generation: 1 }; });
+    const suspend = f.core.suspendWorldForRecovery(f.handle);
+    await entered.promise;
+    await f.store.saveView(f.task.id, { ...f.view, status: 'active' });
+    finish.resolve(); await suspend;
+    expect(f.park).not.toHaveBeenCalled();
+  });
+});
+
 describe('separate waiting-world maintenance', () => {
   it('persists status without checkpoint work, then runs checkpoint and park independently', async () => {
     const f = (await fixture());

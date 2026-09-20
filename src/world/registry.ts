@@ -65,7 +65,10 @@ export class WorldRegistry {
   }
 
   async create(kind: WorldKind, spec: WorldSpec): Promise<World> {
-    return this.get(kind).create(spec);
+    return this.withOperation(spec.taskId, () => {
+      spec.signal?.throwIfAborted();
+      return this.get(kind).create(spec);
+    });
   }
 
   withOperation<T>(worldId: string, operation: () => Promise<T>): Promise<T> {
