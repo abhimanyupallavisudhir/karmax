@@ -11408,11 +11408,6 @@ function resourceDefaultsHtml(scope) {
     <button class="btn sm resource-reset" type="button" disabled>Reset to inherited</button>
     <span class="resource-error" role="status"></span></div>`;
 }
-async function syncPaymentDefaultCopies(scope, projectId, organizationId, source) {
-  for (const box of document.querySelectorAll(`[data-payments="${scope}"] .task-payments, [data-resource-defaults="${scope}"] .task-payments`)) {
-    if (box !== source) await wireTaskPayments(box, projectId, undefined, undefined, organizationId);
-  }
-}
 async function readVaultDefaults(projectId, organizationId) {
   const [org, project] = await Promise.all([
     api(`/api/organizations/${encodeURIComponent(organizationId)}/settings/vault`),
@@ -11452,7 +11447,6 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
           const payment = readTaskPayments(payments); if (!payment) throw new Error('Payment defaults are still loading');
           await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: { ...await api(`${base}/payments`), ...Object.fromEntries([...paymentDirty].map(key => [key, payment[key]])) } }) });
         }
-        if (paymentDirty.size) await syncPaymentDefaultCopies(scope, projectId, organizationId, payments);
         flashSaved(event.currentTarget); vaultDirty = false; paymentDirty.clear();
       } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
     };
@@ -11462,7 +11456,6 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
         const { cardIds, budget, allowance, threshold, ...rest } = await api(`${base}/payments`);
         await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: rest }) });
         await hydrateResourceDefaults(scope, projectId, organizationId);
-        await syncPaymentDefaultCopies(scope, projectId, organizationId, payments);
       } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
     };
   } catch (error) { if (current()) box.querySelector('.resource-error').textContent = error.message; }
@@ -13605,10 +13598,7 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Task defaults</div>
-    ${taskPaymentsHtml(`pay-defaults-${scope}`)}
-    <button class="btn sm" data-savepolicy="${scope}">Save defaults</button>
-    <div class="section-h" style="margin-top:20px">Saved cards</div>
+    <div class="section-h">Saved cards</div>
     <div class="cards-list" style="margin-bottom:10px"></div>
     <details class="payment-add-card"><summary>Add card</summary>
     <div class="payment-card-form">
@@ -14001,24 +13991,6 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
       await syncPaymentProviderControls(box, providerData, paymentsBase);
     } catch (e) { toast(e.message, true); }
   });
-  const sUrl = scope === 'global' && organizationId
-    ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`
-    : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
-  let policy = {};
-  try { policy = await api(sUrl); } catch {}
-  const defaults = box.querySelector('.task-payments');
-  await wireTaskPayments(defaults, projectId, undefined, undefined, organizationId);
-  box.querySelector(`[data-savepolicy]`).addEventListener('click', async () => {
-    try {
-      const selected = readTaskPayments(defaults);
-      if (!selected) throw new Error('Payment defaults are still loading');
-      const { allowance, threshold, ...rest } = policy;
-      await api(sUrl, { method: 'PUT', body: JSON.stringify({ values: { ...rest, ...selected } }) });
-      policy = { ...rest, ...selected };
-      await syncPaymentDefaultCopies(scope, projectId, organizationId, defaults);
-      toast('Payment defaults saved');
-    } catch (e) { toast(e.message, true); }
-  });
   const renderCards = async () => {
     let cards = [];
     const q = [projectId ? `projectId=${projectId}` : '', orgQ].filter(Boolean).join('&');
@@ -14026,7 +13998,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     // The org-settings surface shows the org's own cards (+ legacy global);
     // the project surface shows project cards (its org's cards appear too).
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
-    defaults._setCards?.(cards);
+    document.querySelector(`[data-resource-defaults="${scope}"] .task-payments`)?._setCards?.(cards);
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
