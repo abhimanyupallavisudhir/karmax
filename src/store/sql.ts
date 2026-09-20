@@ -2,7 +2,8 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { AsyncPostgres, DatabaseCapacityError } from './async-sql.js';
+import { AsyncPostgres } from './async-sql.js';
+import { DatabaseQueue } from './database-queue.js';
 import { splitStatements } from './postgres-sql.mjs';
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 export interface SqlRunResult { changes: number | bigint; lastInsertRowid: number | bigint }
@@ -28,20 +29,20 @@ class AsyncDatabase implements SqlDatabase {
   readonly native?: DatabaseSyncType;
   private postgres?: AsyncPostgres;
   private scope = new AsyncLocalStorage<Scope>();
-  private tail: Promise<unknown> = Promise.resolve();
-  private queued = 0;
+  private queue = new DatabaseQueue();
   private closed = false;
+  private closing = false;
   get stats() {
     const pool = this.postgres?.stats ?? { pending: 0, connections: 0, waiting: 0 };
-    return { ...pool, pending: pool.pending + this.queued };
+    return {
+      connections: pool.connections,
+      pending: this.postgres ? pool.pending + this.queue.waiting : this.queue.pending,
+      waiting: pool.waiting + this.queue.waiting,
+    };
   }
   private async enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.closed) throw new Error('database is closed');
-    if (this.queued >= 256) throw new DatabaseCapacityError();
-    this.queued++;
-    const next = this.tail.then(operation);
-    this.tail = next.then(() => {}, () => {});
-    try { return await next; } finally { this.queued--; }
+    if (this.closed || this.closing) throw new Error('database is closed');
+    return this.queue.enqueue(operation);
   }
   constructor(target: string, options?: { readOnly?: boolean }) {
     this.dialect = isPostgresTarget(target) ? 'postgres' : 'sqlite';
@@ -49,8 +50,8 @@ class AsyncDatabase implements SqlDatabase {
     else this.native = options ? new DatabaseSync(target, options) : new DatabaseSync(target);
   }
   private async access<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.closed) throw new Error('database is closed');
     const scope = this.scope.getStore();
+    if (this.closed || (this.closing && !scope?.active)) throw new Error('database is closed');
     if (scope && !scope.active) throw Error('transaction is already closed');
     if (this.postgres || scope) return operation();
     return this.enqueue(operation);
@@ -140,7 +141,8 @@ class AsyncDatabase implements SqlDatabase {
     return this.enqueue(run);
   }
   async close(): Promise<void> {
-    await this.tail;
+    this.closing = true;
+    await this.queue.close();
     this.closed = true;
     if (this.postgres) await this.postgres.close(); else this.native!.close();
   }
