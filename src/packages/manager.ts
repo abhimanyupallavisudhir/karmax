@@ -45,7 +45,7 @@ export class WorkflowManager {
   private stores = new Map<string, PackageStore>();
 
   constructor(
-    private worker: WorkerManager,
+    private worker: Pick<WorkerManager, 'refresh'>,
     private loader: WorkflowRepoLoader,
     store: PackageStore = PackageStore.withBundled(),
     /** Directory for the persisted install registry; omit to disable persistence (tests). */
