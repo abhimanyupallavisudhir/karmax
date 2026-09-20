@@ -1,0 +1,640 @@
+{
+  "taskId": "task_mu7n8khu91bfe7e6f6",
+  "outcome": "cancelled after 120s activity deadline; worldReady false",
+  "report": {
+    "version": 1,
+    "attempts": [
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "status": "incomplete",
+        "metadata": {
+          "scheduleToStartWallEstimateMs": 21
+        },
+        "totalMs": null,
+        "firstTextMs": null,
+        "firstOutputMs": null,
+        "firstProviderEventMs": null,
+        "coveredMs": null,
+        "unattributedMs": null,
+        "externalSpans": [],
+        "openSpans": 2,
+        "spans": [
+          {
+            "name": "world.open",
+            "count": 1,
+            "sumMs": 336.1024399998132,
+            "unionMs": 336.1024399998132
+          },
+          {
+            "name": "world.runner.wait",
+            "count": 1,
+            "sumMs": 59.86378900008276,
+            "unionMs": 59.86378900008276
+          },
+          {
+            "name": "prompt.prepare",
+            "count": 1,
+            "sumMs": 3578.6260540001094,
+            "unionMs": 3578.6260540001094
+          },
+          {
+            "name": "admission.host",
+            "count": 1,
+            "sumMs": 18.05381099996157,
+            "unionMs": 18.05381099996157
+          }
+        ]
+      }
+    ],
+    "requests": [
+      {
+        "requestId": "task_mu7n8khu91bfe7e6f6:m0",
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "firstTextMs": null,
+        "completionMs": null,
+        "preActivityMs": 29557.204206000082,
+        "firstResponseBreakdown": null,
+        "completionBreakdown": null,
+        "firstTextWallEstimateMs": null,
+        "completionWallEstimateMs": null,
+        "clockBasis": "monotonic-only; cross-process wall estimates are separate"
+      }
+    ],
+    "intervals": [
+      {
+        "name": "workflow.dispatch",
+        "count": 1,
+        "missing": 0,
+        "medianMs": 274.1996869998984,
+        "p95Ms": 274.1996869998984,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "world.prepare",
+        "count": 1,
+        "missing": 0,
+        "medianMs": 12540.174046,
+        "p95Ms": 12540.174046,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "world.runner.wait",
+        "count": 2,
+        "missing": 0,
+        "medianMs": 63.67131100001279,
+        "p95Ms": 67.47883299994282,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "agent.attempt",
+        "count": 0,
+        "missing": 1,
+        "medianMs": null,
+        "p95Ms": null,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "world.open",
+        "count": 1,
+        "missing": 0,
+        "medianMs": 336.1024399998132,
+        "p95Ms": 336.1024399998132,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "prompt.prepare",
+        "count": 1,
+        "missing": 0,
+        "medianMs": 3578.6260540001094,
+        "p95Ms": 3578.6260540001094,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "admission.host",
+        "count": 1,
+        "missing": 0,
+        "medianMs": 18.05381099996157,
+        "p95Ms": 18.05381099996157,
+        "failed": 0,
+        "cancelled": 0
+      },
+      {
+        "name": "tool.connection.prepare",
+        "count": 0,
+        "missing": 1,
+        "medianMs": null,
+        "p95Ms": null,
+        "failed": 0,
+        "cancelled": 0
+      }
+    ],
+    "queueIntervals": [
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "name": "queue.observed.waiting-slot",
+        "durationMs": 4433.139060999965,
+        "wallEstimateMs": 4433,
+        "basis": "publication-observed; includes workflow/activity dispatch, not exact coordinator residence"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "name": "queue.account.requested",
+        "durationMs": 14986.253030000022,
+        "wallEstimateMs": 14986,
+        "basis": "request-to-publication/activity; includes scheduling, not exact coordinator residence"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "name": "queue.slot.requested",
+        "durationMs": 263.77950599999167,
+        "wallEstimateMs": 263,
+        "basis": "request-to-publication/activity; includes scheduling, not exact coordinator residence"
+      }
+    ],
+    "cohorts": [
+      {
+        "dimensions": [
+          null,
+          null,
+          null,
+          null,
+          "initial"
+        ],
+        "attempts": 1,
+        "firstResponse": {
+          "count": 0,
+          "missing": 1,
+          "medianMs": null,
+          "p95Ms": null
+        },
+        "completion": {
+          "count": 0,
+          "missing": 1,
+          "medianMs": null,
+          "p95Ms": null
+        }
+      }
+    ],
+    "browserFrame": {
+      "count": 0,
+      "missing": 0,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "cohortDimensions": [
+      "provider",
+      "model",
+      "sessionMode",
+      "worldKind",
+      "initialOrRetry"
+    ],
+    "firstResponse": {
+      "count": 0,
+      "missing": 1,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "completion": {
+      "count": 0,
+      "missing": 1,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "requestFirstResponse": {
+      "count": 0,
+      "missing": 1,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "requestCompletion": {
+      "count": 0,
+      "missing": 1,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "requestFirstResponseWallEstimate": {
+      "count": 0,
+      "missing": 1,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "requestCompletionWallEstimate": {
+      "count": 0,
+      "missing": 1,
+      "medianMs": null,
+      "p95Ms": null
+    },
+    "notes": [
+      "Attempt durations begin at activity execution, not user receipt.",
+      "Span sums overlap; use unionMs. Unattributed time is not model inference.",
+      "CLI/provider intervals include opaque startup, queueing, inference and transport.",
+      "Missing or interrupted spans are unknown. No browser render or network delivery is inferred."
+    ],
+    "observations": [
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "0b404a48-e258-49d9-91f9-0e3ffc09d693",
+        "traceId": "f64745ee-bacf-46bd-929a-871d2e2a0b77",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777374330,
+        "monoMs": 1108520.87433,
+        "name": "request.received",
+        "phase": "mark",
+        "metadata": {
+          "requestId": "task_mu7n8khu91bfe7e6f6:m0"
+        }
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "c38ccffe-3b3e-4464-b671-bda4ae52b730",
+        "traceId": "f64745ee-bacf-46bd-929a-871d2e2a0b77",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777375207,
+        "monoMs": 1109397.671511,
+        "name": "workflow.dispatch",
+        "phase": "start",
+        "spanId": "a4b36b96-50c9-4675-ac53-bccdd1310a0a"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "c85949d0-dc04-4cce-a905-8e95ed1ee268",
+        "traceId": "f64745ee-bacf-46bd-929a-871d2e2a0b77",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777375481,
+        "monoMs": 1109671.871198,
+        "name": "workflow.dispatch",
+        "phase": "end",
+        "spanId": "a4b36b96-50c9-4675-ac53-bccdd1310a0a",
+        "durationMs": 274.1996869998984,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "version": 1,
+        "id": "f9467521-35ae-4b51-a17d-2fca3b2f97cf",
+        "traceId": "c43a76ef-ae6d-4737-9f47-97b9e4258ce9",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777375780,
+        "monoMs": 1109970.525178,
+        "name": "world.prepare",
+        "phase": "start",
+        "spanId": "661694d1-f81c-4db1-963c-b51865dcea2e"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "version": 1,
+        "id": "b0fa893d-29cf-4826-810b-db224cf7fc7b",
+        "traceId": "c43a76ef-ae6d-4737-9f47-97b9e4258ce9",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777376789,
+        "monoMs": 1110979.291156,
+        "name": "world.runner.wait",
+        "phase": "start",
+        "spanId": "0668861d-3830-4cd0-8f95-6c700f10d2a1"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "version": 1,
+        "id": "6600f204-ef9d-4e91-ab49-a2d222872819",
+        "traceId": "c43a76ef-ae6d-4737-9f47-97b9e4258ce9",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777376856,
+        "monoMs": 1111046.769989,
+        "name": "world.runner.wait",
+        "phase": "end",
+        "spanId": "0668861d-3830-4cd0-8f95-6c700f10d2a1",
+        "durationMs": 67.47883299994282,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "version": 1,
+        "id": "dc17cadd-2896-43e6-896a-42e5baf0c8ad",
+        "traceId": "c43a76ef-ae6d-4737-9f47-97b9e4258ce9",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777388320,
+        "monoMs": 1122510.699224,
+        "name": "world.prepare",
+        "phase": "end",
+        "spanId": "661694d1-f81c-4db1-963c-b51865dcea2e",
+        "durationMs": 12540.174046,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "version": 1,
+        "id": "ddd558f4-adbe-4600-ae33-5a65385f6d0d",
+        "traceId": "cbf61487-c448-4f73-9b8f-29fa816d9f78",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777388525,
+        "monoMs": 1122715.380232,
+        "name": "queue.account.requested",
+        "phase": "mark"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "role": "do",
+        "version": 1,
+        "id": "3fe7e51a-f350-43e7-8f41-5527277de15a",
+        "traceId": "b6238404-647a-4488-b6de-1e71696206d3",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403511,
+        "monoMs": 1137701.633262,
+        "name": "queue.observed.waiting-slot",
+        "phase": "mark"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "version": 1,
+        "id": "37ebf13d-fa53-40cd-a6ad-976ec14c3d95",
+        "traceId": "e0a18817-f8b6-422a-b8bf-fe20da31f74f",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403624,
+        "monoMs": 1137814.29903,
+        "name": "queue.slot.requested",
+        "phase": "mark"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "6fdb430a-8681-4f99-8f56-16a808ee1c6b",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403887,
+        "monoMs": 1138078.078536,
+        "name": "agent.attempt",
+        "phase": "start",
+        "spanId": "2464c967-1c38-4cd7-b80a-215b69af94f8"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "8ba1c42c-83b1-4edf-846b-90c1e48b2049",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403897,
+        "monoMs": 1138088.074053,
+        "name": "activity.started",
+        "phase": "mark",
+        "metadata": {
+          "scheduleToStartWallEstimateMs": 21
+        }
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "d31404c6-56f9-4017-96ce-ca5a0e2eadae",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403909,
+        "monoMs": 1138099.42733,
+        "name": "world.open",
+        "phase": "start",
+        "spanId": "cceed7d9-89d8-4c84-a018-01c68f4606a9"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "14453253-47dd-43f9-86eb-d35a0434e640",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403919,
+        "monoMs": 1138109.929174,
+        "name": "world.runner.wait",
+        "phase": "start",
+        "spanId": "0b1efb26-4185-43d3-8c8a-dc75ebb80262"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "b96765e5-323f-45dd-985e-e0e59a1f50eb",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777403979,
+        "monoMs": 1138169.792963,
+        "name": "world.runner.wait",
+        "phase": "end",
+        "spanId": "0b1efb26-4185-43d3-8c8a-dc75ebb80262",
+        "durationMs": 59.86378900008276,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "8275bd84-8712-449f-a94d-43131094a9ef",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777404245,
+        "monoMs": 1138435.52977,
+        "name": "world.open",
+        "phase": "end",
+        "spanId": "cceed7d9-89d8-4c84-a018-01c68f4606a9",
+        "durationMs": 336.1024399998132,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "8438d139-3265-4d97-a3d7-290266f29482",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777404272,
+        "monoMs": 1138462.751309,
+        "name": "prompt.prepare",
+        "phase": "start",
+        "spanId": "5ca86202-4e0d-4ed8-b88b-82bdd650c218"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "de00f1d3-7c86-46df-be37-415b0d4ba99d",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777407851,
+        "monoMs": 1142041.377363,
+        "name": "prompt.prepare",
+        "phase": "end",
+        "spanId": "5ca86202-4e0d-4ed8-b88b-82bdd650c218",
+        "durationMs": 3578.6260540001094,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "4176ef33-47fd-4376-8a88-9d7e738c35ec",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777407862,
+        "monoMs": 1142052.334949,
+        "name": "admission.host",
+        "phase": "start",
+        "spanId": "ea8015ca-fabd-453b-be36-679b3c2fdc53"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "6e096037-40ee-4c00-bf84-066b4616c637",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777407880,
+        "monoMs": 1142070.38876,
+        "name": "admission.host",
+        "phase": "end",
+        "spanId": "ea8015ca-fabd-453b-be36-679b3c2fdc53",
+        "durationMs": 18.05381099996157,
+        "status": "ok"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "attempt": 1,
+        "role": "do",
+        "requestIds": [
+          "task_mu7n8khu91bfe7e6f6:m0"
+        ],
+        "version": 1,
+        "id": "858ffb3d-ff75-4573-976a-1a5cebcb0308",
+        "traceId": "0585567e-eac5-40f6-8d3e-737fbf4aada2",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777407901,
+        "monoMs": 1142092.095033,
+        "name": "tool.connection.prepare",
+        "phase": "start",
+        "spanId": "6c59b38f-d9ef-4b30-bd55-adf82c329672"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "role": "do",
+        "version": 1,
+        "id": "52404598-9443-495d-af49-dc9365f38bb1",
+        "traceId": "57b791a0-f4ce-4cb6-938b-17f73cfd800d",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777407944,
+        "monoMs": 1142134.772323,
+        "name": "queue.observed.running",
+        "phase": "mark"
+      },
+      {
+        "taskId": "task_mu7n8khu91bfe7e6f6",
+        "workflowRunId": "01a0b70b-6fec-7470-bbe1-ad29cfa0299e",
+        "turnId": "task_mu7n8khu91bfe7e6f6:01a0b70b-6fec-7470-bbe1-ad29cfa0299e#0",
+        "role": "do",
+        "version": 1,
+        "id": "fb46abc5-0a92-4cd9-8668-12f21b141f57",
+        "traceId": "23912efb-d8d7-4a32-9fd8-60be10d70cd1",
+        "clockId": "3525db30-aa21-43cd-a391-64ebaae63102",
+        "wallMs": 1789777527292,
+        "monoMs": 1261482.473477,
+        "name": "queue.observed.released",
+        "phase": "mark"
+      }
+    ]
+  }
+}

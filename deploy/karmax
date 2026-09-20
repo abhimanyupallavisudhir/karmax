@@ -12,6 +12,12 @@ die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
 dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
+compact_backups() {
+  # Optional space optimization must never invalidate a verified backup or
+  # prevent an emergency deployment on a host without util-linux hardlink.
+  sh "$DEPLOY_DIR/compact-backups.sh" "$DEPLOY_DIR/backups" || note 'Backup compaction failed; snapshots are retained.'
+}
+
 need_docker() {
   command -v docker >/dev/null 2>&1 || die 'Docker is required: https://docs.docker.com/engine/install/'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required (the `docker compose` command)'
@@ -209,6 +215,7 @@ cmd_backup() {
   chmod -R go-rwx "$destination"
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+  compact_backups
 }
 
 # Pre-update snapshots must run the backup code from the validated candidate,
@@ -254,6 +261,7 @@ cmd_backup_candidate() {
   if ! chmod -R go-rwx "$destination"; then rm -rf "$destination"; return 1; fi
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+  compact_backups
 }
 
 cmd_restore() {

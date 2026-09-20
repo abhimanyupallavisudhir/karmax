@@ -1,3 +1,4 @@
+import WebSocket from 'ws';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -59,6 +60,13 @@ describe('connection gateway flow', () => {
   });
   afterAll(async () => { await close?.(); store?.close(); fs.rmSync(home, { recursive: true, force: true }); });
 
+  it('defaults off and requires installation authority for opt-in', async () => {
+    expect(await (await request('/api/settings/global/timing')).json()).toEqual({enabled:false});
+    expect((await request('/api/meta').then(r=>r.json()) as any).timingEnabled).toBe(false);
+    expect((await request('/api/settings/global/timing', {token:agent, method:'PUT',body:{values:{enabled:true}}})).status).toBe(403);
+    expect((await request('/api/settings/global/timing', {method:'PUT',body:{values:{enabled:'true'}}})).status).toBe(400);
+    expect((await request('/api/settings/global/timing', {method:'PUT',body:{values:{enabled:true}}})).status).toBe(200);
+  });
   it('renders a durable request, accepts owner sign-in, verifies the account, and resumes the exact task', async () => {
     const res = await request('/api/connections/request', { token: agent, method: 'POST', body: { toolkit: 'gmail', why: 'Read my mail' } });
     expect(res.status).toBe(200); const pending: any = await res.json();
@@ -88,8 +96,32 @@ describe('connection gateway flow', () => {
     expect((await report.json() as any).observations.length).toBeGreaterThan(0);
     expect((await request(`/api/tasks/${taskId}/timing`, { token: agent })).status).toBe(403);
     for (const secret of ['exact-account', 'private-session', 'Fixture mail', 'secret-api-key']) expect(JSON.stringify(timing)).not.toContain(secret);
+    await request('/api/settings/global/timing', {method:'PUT',body:{values:{enabled:false}}});
+    expect((await request(`/api/tasks/${taskId}/timing`)).status).not.toBe(200);
+    expect((await (await request(`/api/tasks/${taskId}/events`)).json() as any[]).some(e=>e.type==='timing')).toBe(false);
+    expect((await (await request(`/api/activity?organizationId=${org}`)).json() as any[]).some(e=>e.type==='timing')).toBe(false);
+    const count = store.eventsOfType(taskId,'timing').length;
+    expect(count).toBeGreaterThan(0);
+    expect((await request(`/api/connections/${id}/execute`, { token: agent, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } })).status).toBe(200);
+    expect(store.eventsOfType(taskId,'timing')).toHaveLength(count);
+    await request('/api/settings/global/timing', {method:'PUT',body:{values:{enabled:true}}});
+    expect((await request(`/api/tasks/${taskId}/timing`)).status).toBe(200);
     const exposed = JSON.stringify(await (await request('/api/connections', { token: agent })).json());
     for (const secret of ['exact-account', 'private-session', 'secret-api-key', '/link/private']) expect(exposed).not.toContain(secret);
+  });
+  it('pushes settings to existing sockets and hides timing events while off', async () => {
+    const ws = new WebSocket(base.replace('http:', 'ws:') + '/ws', {headers:{cookie:'test-user=alice'}});
+    const messages: any[] = [];
+    ws.on('message',data=>messages.push(JSON.parse(String(data))));
+    try {
+      await vi.waitFor(()=>expect(messages.some(e=>e.type==='timing.setting' && e.enabled===true)).toBe(true));
+      store.setSettings('global','timing',{enabled:false});
+      await vi.waitFor(()=>expect(messages.some(e=>e.type==='timing.setting' && e.enabled===false)).toBe(true), {timeout:3000});
+      store.appendEvent({taskId,type:'timing',ts:Date.now(),payload:{name:'hidden'}});
+      store.appendEvent({taskId,type:'fixture.visible',ts:Date.now(),payload:{}});
+      await vi.waitFor(()=>expect(messages.some(e=>e.type==='fixture.visible')).toBe(true));
+      expect(messages.some(e=>e.type==='timing')).toBe(false);
+    } finally {ws.close();}
   });
   it('enforces task, tenant, owner, and execution capability independently', async () => {
     const id = service.all()[0]!.id;

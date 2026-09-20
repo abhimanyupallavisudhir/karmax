@@ -1265,7 +1265,11 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await accounts.terminate('test complete').catch(() => {});
   });
 
-  it('retries a transient transport failure in-place — session resumed, Resolve never runs', async () => {
+  it('retries a transient transport failure in-place — session resumed, Resolve never runs', async ({ onTestFinished }) => {
+    // This case verifies retry timing as well as recovery; other cases keep the installation default.
+    const previousTiming = h.store.getSettings('global', 'timing');
+    onTestFinished(() => h.store.setSettings('global', 'timing', previousTiming ?? { enabled: false }));
+    h.store.setSettings('global', 'timing', { enabled: true });
     const repo = await h.makeRepo('app-flaky');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {

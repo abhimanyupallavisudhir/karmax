@@ -1,4 +1,4 @@
-import { TimingTrace, withTiming, timed } from '../timing/index.js';
+import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
@@ -985,7 +985,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
-      const trace = new TimingTrace({ taskId: args.taskId }, row => record(args.taskId, 'timing', { ...row }));
+      const trace = installationTiming(store, { taskId: args.taskId }, row => record(args.taskId, 'timing', { ...row }));
       try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
       return withTiming(trace, () => trace.measure('world.prepare', async () => {
       const remote = isRemote(args.kind);
@@ -1473,6 +1473,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async runAgentTurn(args: RunAgentTurnArgs) {
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let hbSession: string | undefined;
       let workflowRunId: string | undefined;
       let scheduleToStartWallEstimateMs: number | undefined;
       try {
@@ -1481,15 +1483,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         workflowRunId = activity.info.workflowExecution?.runId;
         timingSignal = activity.cancellationSignal;
         timingTurnId ??= `legacy:${activity.info.workflowExecution?.runId ?? 'standalone'}:${activity.info.activityId}`;
+        hbSession = (activity.info.heartbeatDetails as { session?: string } | undefined)?.session
+          ?? (activity.info.attempt > 1 ? store.kvGet(`turnsession:${timingTurnId}`) : undefined);
+        heartbeat = () => activity.heartbeat(hbSession ? { session: hbSession } : undefined);
         // Cross-clock estimate only: Temporal schedule to worker receipt.
-        scheduleToStartWallEstimateMs = Date.now() - activity.info.currentAttemptScheduledTimestampMs;
+        if (timingEnabled(store)) scheduleToStartWallEstimateMs = Date.now() - activity.info.currentAttemptScheduledTimestampMs;
       } catch { /* direct fixture */ }
-      const requestIds = args.messages.slice(args.deliveredMessages ?? 0)
-        .filter(m => m.role === 'user').map(m => `${args.taskId}:${m.id}`);
-      const trace = new TimingTrace({ taskId: args.taskId, turnId: timingTurnId, workflowRunId,
+      const requestIds = timingEnabled(store) ? args.messages.slice(args.deliveredMessages ?? 0)
+        .filter(m => m.role === 'user').map(m => `${args.taskId}:${m.id}`) : undefined;
+      const trace = installationTiming(store, { taskId: args.taskId, turnId: timingTurnId, workflowRunId,
         attempt: timingAttempt, role: args.role, requestIds }, row => record(args.taskId, 'timing', { ...row }));
       trace.signal = timingSignal;
-      return withTiming(trace, () => trace.measure('agent.attempt', async () => {
+      // Sandbox resume, history/tool preparation and final artifact retention
+      // can each outlast the heartbeat timeout. The runtime's timer only covers
+      // the provider call. Keep this entire activity alive, retaining the exact
+      // retry session even before world.open finishes, and stop on every exit.
+      const keepAlive = heartbeat ? setInterval(() => {
+        try { heartbeat!(); } catch { /* cancellation is handled by the activity */ }
+      }, 1_000) : undefined;
+      keepAlive?.unref();
+      try {
+      return await withTiming(trace, () => trace.measure('agent.attempt', async () => {
       trace.mark('activity.started', { scheduleToStartWallEstimateMs });
       const spec = args.task.agents?.[args.role];
       const selectedTurn = turnProfile(args.task, args.role, args.explicitProfileId);
@@ -1528,8 +1542,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // cut, host slept, heartbeat timeout) RESUMES the interrupted session from
       // heartbeat details instead of replaying the whole turn from scratch.
       let signal: AbortSignal | undefined;
-      let heartbeat: (() => void) | undefined;
-      let hbSession: string | undefined; // set once real progress exists (onSession)
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
       let resumedActivityAttempt = false;
@@ -2534,6 +2546,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       });
       return result;
       }, undefined, timingSignal));
+      } finally {
+        if (keepAlive) clearInterval(keepAlive);
+      }
     },
 
     /** Auto-derive the changed-files summary so Review always shows what changed
@@ -4633,21 +4648,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Persist conversation snapshots above even for suppressed frames: the
       // next publication may reference the same immutable snapshot.
       if (view.state?.humanPauseOrigin && view.status === 'active' && !view.waitingFor) return;
-      let workflowRunId: string | undefined;
-      try { workflowRunId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
-      const previousView = store.getTask(taskId)?.lastView;
-      const accountBefore = previousView?.waitingFor?.kind === 'account';
-      const accountAfter = view.waitingFor?.kind === 'account';
-      if (accountBefore !== accountAfter) {
-        const trace = new TimingTrace({ taskId, workflowRunId, role: view.agentTurn?.role }, row => record(taskId, 'timing', { ...row }));
-        trace.mark(accountAfter ? 'account.wait.observed.start' : 'account.wait.observed.end');
-      }
-      const before = previousView?.agentTurn;
-      const after = view.agentTurn;
-      if (before?.turnId !== after?.turnId || before?.state !== after?.state) {
-        const trace = new TimingTrace({ taskId, workflowRunId, turnId: after?.turnId ?? before?.turnId,
-          role: after?.role ?? before?.role }, row => record(taskId, 'timing', { ...row }));
-        trace.mark(`queue.observed.${after?.state ?? 'released'}`);
+      if (timingEnabled(store)) {
+        let workflowRunId: string | undefined;
+        try { workflowRunId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
+        const previousView = store.getTask(taskId)?.lastView;
+        const accountBefore = previousView?.waitingFor?.kind === 'account';
+        const accountAfter = view.waitingFor?.kind === 'account';
+        if (accountBefore !== accountAfter) {
+          const trace = installationTiming(store, { taskId, workflowRunId, role: view.agentTurn?.role }, row => record(taskId, 'timing', { ...row }));
+          trace.mark(accountAfter ? 'account.wait.observed.start' : 'account.wait.observed.end');
+        }
+        const before = previousView?.agentTurn;
+        const after = view.agentTurn;
+        if (before?.turnId !== after?.turnId || before?.state !== after?.state) {
+          const trace = installationTiming(store, { taskId, workflowRunId, turnId: after?.turnId ?? before?.turnId,
+            role: after?.role ?? before?.role }, row => record(taskId, 'timing', { ...row }));
+          trace.mark(`queue.observed.${after?.state ?? 'released'}`);
+        }
       }
       store.saveView(taskId, view);
       // First Merge admission freezes whether sibling proposals remain eligible.
@@ -4686,8 +4703,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // every waiting publish creates avoidable activity contention precisely
       // while parent/child cancellation signals need to settle promptly.
       const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
+      // Existing version-pinned workflows publish this transient frame before
+      // requesting admission and again after a slot is granted. Checkpointing
+      // here can take longer than publishView's timeout and parks the sandbox
+      // that the next activity must immediately resume. Keep the compatibility
+      // check in the activity; genuine capacity/account/human waits still park.
+      const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
       if ((view.status === 'waiting' || view.status === 'blocked')
-        && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
+        && !startingAgent && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
         try {
           const before = await worlds.status(waitingWorld);
           if (before === 'ready') {

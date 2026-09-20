@@ -31,7 +31,7 @@ async function main() {
     loadParamDefaults: async () => ({}), toast: message => { throw new Error(message); },
     api: async url => {
       if (url.endsWith('/events?since=0&limit=300')) return history.promise;
-      if (url.endsWith('/sessions')) return sessions.promise;
+      if (url.split('?')[0].endsWith('/sessions')) return sessions.promise;
       if (url === '/api/tasks/task') return view;
       if (url.endsWith('/explanation-settings')) return { effective: {} };
       return [];

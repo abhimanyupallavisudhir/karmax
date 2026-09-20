@@ -1,7 +1,7 @@
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { TimingDelivery } from '../timing/delivery.js';
-import { TimingTrace, withTiming, toolFailed } from '../timing/index.js';
+import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
 import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
@@ -29,6 +29,8 @@ import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
+import { localCodexFiles } from '../agent/codex-history-files.js';
+import { validCodexSessionId } from '../agent/codex-history.js';
 import { exportConversationWithPanagent } from '../agent/panagent.js';
 import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
@@ -361,7 +363,7 @@ function providerHomeFromSessionFile(provider: DownloadableProvider, filename: s
  * with legacy metadata that lacks its source home falls back to a generated
  * transcript export instead of sweeping the installation by opaque id. */
 function storedConversationSession(store: Store, taskId: string, intentId: string | undefined, role: string,
-  providerHint?: unknown): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
+  providerHint?: unknown, metadataOnly = false): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
   const sessionTaskId = role === 'confirm' ? (intentId ?? taskId) : taskId;
   const id = store.kvGet(`session:${sessionTaskId}:${role}`) || undefined;
   let home: string | undefined;
@@ -376,7 +378,11 @@ function storedConversationSession(store: Store, taskId: string, intentId: strin
   const candidates = [...new Set([hinted, metadataProvider, 'codex', 'claude'])]
     .filter((provider): provider is DownloadableProvider => provider === 'codex' || provider === 'claude');
   for (const provider of candidates) {
-    const source = findProviderSession({ provider, session: id, srcHome: home });
+    // Discovery for the task page only needs availability. Full copy/lineage
+    // validation belongs to the explicit export, which can read a large history.
+    const source = metadataOnly && provider === 'codex'
+      ? (home && validCodexSessionId(id) ? localCodexFiles(home).find(file => path.basename(file).endsWith(`${id}.jsonl`)) : undefined)
+      : findProviderSession({ provider, session: id, srcHome: home });
     if (source) return { id, provider, home: home ?? providerHomeFromSessionFile(provider, source), source };
   }
   return { id, provider: hinted ?? metadataProvider, home };
@@ -619,20 +625,50 @@ export class Gateway {
     });
   }
 
+  private timingListeners = new Set<(enabled: boolean) => void>();
+  private timingPoll?: ReturnType<typeof setInterval>;
+  private timingValue = false;
+  private refreshTiming(): void {
+    const enabled = timingEnabled(this.deps.store);
+    if (enabled === this.timingValue) return;
+    this.timingValue = enabled;
+    for (const listener of this.timingListeners) listener(enabled);
+  }
+  /** One poll per gateway, shared by all sockets; catches other gateway writes. */
+  private watchTiming(listener: (enabled: boolean) => void): () => void {
+    this.refreshTiming();
+    this.timingListeners.add(listener);
+    listener(this.timingValue);
+    this.timingPoll ??= setInterval(() => this.refreshTiming(), 1000);
+    return () => {
+      this.timingListeners.delete(listener);
+      if (!this.timingListeners.size) { clearInterval(this.timingPoll); this.timingPoll = undefined; }
+    };
+  }
+
   /** The live event stream (`/ws`): every durable event the caller may read. */
   private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
 
     const url = new URL(req.url ?? '/', 'http://localhost');
     const auth = await this.socketAuth(req, url);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
+    if (ws.readyState !== WebSocketClient.OPEN) return;
     const scoped = this.deps.tokens.verify(auth.apiToken);
     const delivery = new TimingDelivery(row => this.deps.store.appendEvent({ taskId: row.taskId,
-      type: 'timing', ts: row.wallMs, payload: { ...row } }));
+      type: 'timing', ts: row.wallMs, payload: { ...row } }), () => timingEnabled(this.deps.store),
+      (context, sink) => installationTiming(this.deps.store, context, sink));
+    const syncTiming = (enabled: boolean) => {
+      try { ws.send(JSON.stringify({ type: 'timing.setting', enabled })); } catch { /* disconnected */ }
+    };
+    const offTiming = this.watchTiming(syncTiming);
+    ws.on('close', offTiming);
+    ws.on('error', offTiming);
     ws.on('message', data => {
       if (data.toString().length > 1024) return;
       try { delivery.acknowledge(JSON.parse(data.toString())); } catch { /* invalid observation */ }
     });
     const off = this.fanout.on((ev) => {
+      if (ev.type === 'timing' && !timingEnabled(this.deps.store)) return;
       const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
       if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
@@ -684,34 +720,32 @@ export class Gateway {
     }).finally(() => { this.connectionSweep = undefined; });
   }
 
-  private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
-    const task = this.deps.store.getTask(taskId);
-    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
-    if (!organizationId) return [];
-    return new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
-      .requests({ taskId, status: 'pending' });
+  /** Read each organization request ledger once per response, not once per row.
+   * Task list projections must never hydrate every task's transcript again. */
+  private approvalCounts(organizationId: string): Map<string, number> {
+    const counts = new Map<string, number>();
+    const add = (taskId: string | undefined) => {
+      if (taskId) counts.set(taskId, (counts.get(taskId) ?? 0) + 1);
+    };
+    for (const request of new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
+      .requests({ status: 'pending' })) add(request.taskId);
+    for (const request of new PermissionRequests(this.deps.store, organizationId).requests({ status: 'pending' }))
+      if (!request.dismissed) add(request.taskId);
+    for (const request of new AuthorizationRequests(this.deps.store, organizationId).requests({ status: 'pending' }))
+      if (!request.dismissed && request.target.kind === 'task') add(request.target.taskId);
+    for (const connection of this.connections()?.all() ?? [])
+      if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId);
+    return counts;
   }
 
-  private pendingPermissionRequests(taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
-    if (!organizationId) return [];
-    return new PermissionRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
-  }
-
-  private pendingAuthorizationRequests(taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
-    if (!organizationId) return [];
-    return new AuthorizationRequests(this.deps.store, organizationId)
-      .requests({ taskId, status: 'pending' }).filter((request) => !request.dismissed);
-  }
-
-  private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
+  private withApprovalRequests(view: TaskView | undefined, taskId: string,
+    counts?: Map<string, number>): TaskView | undefined {
     if (!view) return view;
-    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length
-      + this.pendingAuthorizationRequests(taskId).length + (this.connections()?.pending(taskId).length ?? 0);
+    if (!counts) {
+      const organizationId = this.deps.store.taskAttribution(taskId)?.organizationId;
+      counts = organizationId ? this.approvalCounts(organizationId) : new Map();
+    }
+    const count = counts.get(taskId) ?? 0;
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -1192,7 +1226,7 @@ export class Gateway {
 
   // ─── request handling ────────────────────────────────────────────────────────
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
-    const receivedAt = { monoMs: performance.now(), wallMs: Date.now() };
+    const receivedAt = req.method === 'POST' && timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
     const previewOrigin = configuredPreviewOrigin();
@@ -1232,7 +1266,7 @@ export class Gateway {
     return this.static(p, res, req);
   }
 
-  private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, receivedAt = { monoMs: performance.now(), wallMs: Date.now() }) {
+  private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, receivedAt?: { monoMs: number; wallMs: number }) {
     const p = url.pathname;
     const method = req.method ?? 'GET';
 
@@ -1655,6 +1689,7 @@ export class Gateway {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         ...(consoleRevision ? { consoleRevision } : {}),
+        timingEnabled: timingEnabled(this.deps.store),
         safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
@@ -3995,9 +4030,11 @@ export class Gateway {
           // rows computed attempt/stage metadata independently and turned one list
           // request into thousands of synchronous SQLite reads. Drawer-only fields
           // (including stageTransitions) are resolved by the single-task endpoint.
+          const organizationId = store.getProject(projectId)?.organizationId;
+          const approvalCounts = organizationId ? this.approvalCounts(organizationId) : new Map<string, number>();
           const listed = page.map((t) => ({
             ...t,
-            lastView: trimListView(this.withApprovalRequests(t.lastView, t.id)),
+            lastView: trimListView(this.withApprovalRequests(t.lastView, t.id, approvalCounts)),
           }));
           if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
           return this.json(res, 200, listed);
@@ -5112,6 +5149,7 @@ export class Gateway {
       const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
+        const metadataOnly = url.searchParams.get('metadata') === '1';
         const t = store.getTask(id);
         // Include the exact effective agent selection captured at queue time (and
         // kept current after an accepted in-flight retune). Besides powering the
@@ -5143,7 +5181,7 @@ export class Gateway {
           }
           const spec = agents?.[role];
           try {
-            const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
+            const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider, metadataOnly);
             const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
             const transcript = role === 'do'
               ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
@@ -5153,7 +5191,7 @@ export class Gateway {
               ? stored.id
               : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
             let exportMetadata = {};
-            if (resolvedProvider === 'codex' && (exportId || (stored.id && stored.home))) {
+            if (!metadataOnly && resolvedProvider === 'codex' && (exportId || (stored.id && stored.home))) {
               const sessionId = stored.id ?? exportId!;
               const exported = await createCodexConversationExport(this.deps.objects ?? new LocalObjectStore(paths().objects),
                 id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
@@ -5172,7 +5210,7 @@ export class Gateway {
               ...(resolvedProvider ? { provider: resolvedProvider } : {}),
               ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
               ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
-              ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
+              ...(exportId ? { ...(!metadataOnly ? { exportId } : {}), downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
             };
           } catch (error) {
             if (s) out[role] = { id: s, provider: spec?.provider ?? provider, downloadable: false,
@@ -5680,7 +5718,7 @@ export class Gateway {
             const c = service.get(org, id);
             if (action === 'tools' || action === 'execute') {
               if (!callerTaskId || !projectId) return this.json(res, 403, { error: 'A task-agent token is required' });
-              const trace = new TimingTrace({ taskId: callerTaskId, role: authRecord.role,
+              const trace = installationTiming(this.deps.store, { taskId: callerTaskId, role: authRecord.role,
                 turnId: authRecord.executionId, workflowRunId: authRecord.executionRunId, attempt: authRecord.executionAttempt }, row => {
                 store.appendEvent({ taskId: callerTaskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
               });
@@ -6925,9 +6963,10 @@ export class Gateway {
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
-        if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf));
+        if (method === 'GET') return this.json(res, 200, wf === 'timing' ? { enabled: timingEnabled(store) } : globalSettingsFor((s, w) => store.getSettings(s, w), wf));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (wf === 'timing' && typeof b.values?.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be a boolean' });
           if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
             return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
           }
@@ -6941,6 +6980,7 @@ export class Gateway {
           store.setSettings('global', wf, wf === 'appearance'
             ? { ...(store.getSettings('global', wf) ?? {}), ...values }
             : values);
+          if (wf === 'timing') this.refreshTiming();
           if (wf === 'agent-queue') await api.setAgentCapacity(token, Number(values.capacity));
           return this.json(res, 200, { ok: true });
         }
@@ -7027,7 +7067,7 @@ export class Gateway {
           if (!projectCache.has(id)) projectCache.set(id, store.getProject(id));
           return projectCache.get(id);
         };
-        const events = store.allEventsSince(since, 300).filter((e) => {
+        const events = store.allEventsSince(since, 300, !timingEnabled(store)).filter((e) => {
           const projectId = store.getTask(e.taskId)?.projectId;
           if (!projectId) return false;
           if (visibleProjects) return visibleProjects.has(projectId);

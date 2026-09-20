@@ -1,0 +1,23 @@
+{
+  "taskId": "task_mu7o048c4c3903fe07",
+  "browser": "153.0.8010.12",
+  "observer": "headless Chromium in collector E2B; scoped-token bootstrap of deployed console",
+  "rows": [
+    {
+      "marker": "CLAUDE_FOLLOWUP",
+      "receivedMonoMs": 44355.299999999814,
+      "receivedWallMs": 1789778796103,
+      "visible": "visible",
+      "domMonoMs": 44355.299999999814,
+      "frameMonoMs": 44373.39999999944
+    },
+    {
+      "marker": "CLAUDE_ACTIVE_ACK",
+      "receivedMonoMs": 165966.7999999998,
+      "receivedWallMs": 1789778917714,
+      "visible": "visible",
+      "domMonoMs": 165966.89999999944,
+      "frameMonoMs": 165985.69999999925
+    }
+  ]
+}

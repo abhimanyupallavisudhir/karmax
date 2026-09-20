@@ -2895,6 +2895,7 @@ async function checkConsoleRevision() {
       location.reload();
       return true;
     }
+    applyTimingSetting(meta.timingEnabled);
     if (!S.meta?.consoleRevision && meta.consoleRevision) S.meta.consoleRevision = meta.consoleRevision;
   } catch {}
   return false;
@@ -3493,6 +3494,8 @@ function connectWs() {
   ws.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
+    if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
@@ -3508,10 +3511,10 @@ function connectWs() {
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
         scheduleTaskPageRender();
       }
-      if (ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
+      if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
         const received = performance.now();
         requestAnimationFrame(() => requestAnimationFrame(() => {
-          if (S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
+          if (S.meta?.timingEnabled && S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'timing.frame', id: ev.timingDeliveryId, frameMs: performance.now() - received }));
         }));
       }
@@ -5244,7 +5247,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
         const attempts = group?.attempts?.length ? group.attempts : [task];
         return Promise.all(attempts.map(async (attempt) => ({
           task: attempt,
-          sessions: await api(`/api/tasks/${attempt.id}/sessions`),
+          sessions: await api(`/api/tasks/${attempt.id}/sessions?metadata=1`),
         })));
       })());
       el.setAttribute('aria-busy', 'true');
@@ -6626,6 +6629,8 @@ const TASK_TABS = [
   { key: 'timing', label: 'Timing' },
 ];
 
+function visibleTaskTabs() { return TASK_TABS.filter(t => t.key !== 'timing' || S.meta?.timingEnabled === true); }
+
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
 // is asking the human to decide (an enabled `confirm` action — the Review gate),
 // the conversation that led here is the thing to read, so open Check-in on the
@@ -6870,7 +6875,7 @@ function mergeTaskHistory(events) {
     if (event.type === 'conversation.explanation')
       explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
   }
-  S.taskEvents = [...ordinary, ...explanations.values()];
+  S.taskEvents = [...ordinary, ...explanations.values()].filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true);
 }
 
 async function refreshTaskHistory(taskId) {
@@ -6962,7 +6967,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       // but opening a task should have a fixed memory and response-size budget.
       draft ? Promise.resolve([]) : refreshTaskHistory(taskId),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
-      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
       draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
@@ -7028,7 +7033,7 @@ async function refreshTask() {
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
-      api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+      api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
       api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
@@ -7408,6 +7413,7 @@ function renderTaskPage() {
   const main = $('#main');
   if (!v || !main) return;
   if (S.taskFile) return renderTaskFilePage(v, S.taskFile);
+  if (S.taskTab === 'timing' && !S.meta?.timingEnabled) S.taskTab = null;
   if (!S.taskTab) S.taskTab = defaultTaskTab(v); // resolved once at open; never auto-switches under the user
   const tab = S.taskTab;
   // A background refresh (or a just-sent follow-up) re-renders the whole page,
@@ -7468,7 +7474,7 @@ function renderTaskPage() {
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
-          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
+          ${visibleTaskTabs().map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
           ${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="local-checkout">Work locally</button>' : ''}
         </div>
       </div>
@@ -7638,7 +7644,7 @@ function wireWorkflowMode(v) {
 // Switch the open task page to another of its tabs, pinning the tab in the URL
 // (replace, not push — Back should leave the task, not walk through its tabs).
 function setTaskTab(key) {
-  if (!TASK_TABS.some((t) => t.key === key) || S.taskTab === key) return;
+  if (!visibleTaskTabs().some((t) => t.key === key) || S.taskTab === key) return;
   S.conversationFullscreen = false;
   S.taskTab = key;
   if (S.selected) history.replaceState({}, '', `${taskUrl(S.selected)}/${key}`);
@@ -7647,8 +7653,8 @@ function setTaskTab(key) {
 
 // Cycle the open task page's tabs ([ and ]), wrapping at the ends.
 function cycleTaskTab(delta) {
-  const i = Math.max(0, TASK_TABS.findIndex((t) => t.key === S.taskTab));
-  setTaskTab(TASK_TABS[(i + delta + TASK_TABS.length) % TASK_TABS.length].key);
+  const i = Math.max(0, visibleTaskTabs().findIndex((t) => t.key === S.taskTab));
+  setTaskTab(visibleTaskTabs()[(i + delta + visibleTaskTabs().length) % visibleTaskTabs().length].key);
 }
 
 function taskTabBody(v, tab) {
@@ -9381,11 +9387,11 @@ async function downloadNativeConversation(button) {
   } finally { button.disabled = false; }
 }
 
-function localConversationHandoff(v, cwd, portable = false) {
-  const errors = Object.entries(S.sessions || {}).filter(([, session]) => session?.exportError)
+function localConversationHandoff(v, cwd, portable = false, preparedSessions = S.sessions) {
+  const errors = Object.entries(preparedSessions || {}).filter(([, session]) => session?.exportError)
     .map(([role, session]) => `<p class="task-sub" role="alert">${esc(role)} conversation export: ${esc(session.exportError)}</p>`).join('');
   const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
-  const sessions = Object.entries(S.sessions || {})
+  const sessions = Object.entries(preparedSessions || {})
     .filter(([, session]) => session?.id && session?.downloadable && ['codex', 'claude'].includes(session.provider))
     .map(([role, session]) => {
       const installDownloaded = portable || !session.home || session.generated || session.provider === 'codex';
@@ -9421,8 +9427,13 @@ async function openLocalCheckout(v) {
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
   wireClose();
-  let plan;
-  try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
+  let plan, preparedSessions;
+  try {
+    [plan, preparedSessions] = await Promise.all([
+      api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
+      api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
+    ]);
+  }
   catch (error) { host.remove(); return toast(error.message, true); }
   if (!host.isConnected) return;
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
@@ -9431,7 +9442,7 @@ async function openLocalCheckout(v) {
     <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
-    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true)}
+    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
@@ -9489,9 +9500,10 @@ async function materializeLocalCheckout(v) {
   </div></div>`;
   host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
   host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  let checkout;
+  let checkout, preparedSessions;
   try {
     checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+    preparedSessions = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`);
   } catch (error) { host.remove(); toast(error.message, true); return null; }
   if (!host.isConnected) return null;
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
@@ -9499,7 +9511,7 @@ async function materializeLocalCheckout(v) {
     <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
-    ${localConversationHandoff(v, checkout.cwd)}
+    ${localConversationHandoff(v, checkout.cwd, false, preparedSessions)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
     <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
   </div></div>`;
@@ -10934,7 +10946,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.reverse();
+    S.activity = activity.filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true).reverse();
     renderMain();
   } catch {}
 }
@@ -16490,6 +16502,7 @@ function installationView() {
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
+      <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
       <div class="settings-section-title" id="installation-composio"><div>Composio<small>App connection setup shared by every organization</small></div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
@@ -16615,6 +16628,14 @@ function wireInstallationSettings() {
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();
+  $('#timing-enabled')?.addEventListener('change', async event => {
+    const control = event.currentTarget; control.disabled = true;
+    try {
+      await api('/api/settings/global/timing', { method: 'PUT', body: JSON.stringify({ values: { enabled: control.checked } }) });
+      applyTimingSetting(control.checked);
+    } catch (error) { control.checked = S.meta?.timingEnabled === true; toast(error.message, true); }
+    finally { control.disabled = false; }
+  });
   wireInstallationGithubCard();
   wireInstallationComposioCard();
   wirePaidLaunchCard();
@@ -16894,7 +16915,7 @@ async function hydrateOrganizationView() {
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
       ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
-        : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
+        : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
@@ -18834,8 +18855,24 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
 
 // Timing is fetched on demand, independently of the bounded conversation window.
 const timingReports = new Map();
+function applyTimingSetting(enabled) {
+  enabled = enabled === true;
+  if (S.meta?.timingEnabled === enabled) return;
+  S.meta = { ...S.meta, timingEnabled: enabled };
+  if (!enabled) {
+    timingReports.clear();
+    S.activity = (S.activity || []).filter(e => e.type !== 'timing');
+    S.taskEvents = (S.taskEvents || []).filter(e => e.type !== 'timing');
+    if (S.taskTab === 'timing') S.taskTab = 'overview';
+  }
+  const control = document.getElementById('timing-enabled');
+  if (control) control.checked = enabled;
+  if (S.selected && S.view) renderTaskPage();
+  else if (S.tab === 'activity') bgRenderMain();
+}
 function timingMs(value) { return value == null ? 'Unknown' : `${(value / 1000).toFixed(3)} s`; }
 function timingTab(v) {
+  if (!S.meta?.timingEnabled) return "";
   const report = timingReports.get(v.taskId);
   const stats = report ? [['Activity → first text', report.firstResponse], ['Activity → completion', report.completion],
     ['Request → first text', report.requestFirstResponse], ['Request → completion', report.requestCompletion],
@@ -18856,12 +18893,14 @@ function timingTab(v) {
       <span class="task-sub">${a.openSpans} unfinished spans</span></details>`).join('') || '<p class="task-sub">No instrumented agent turns yet.</p>'}` : ''}`;
 }
 function wireTiming(v) {
+  if (!S.meta?.timingEnabled) return;
   const refresh = document.getElementById('timing-refresh');
   if (!refresh) return;
   refresh.onclick = async () => {
     refresh.disabled = true;
     try {
       const report = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/timing`);
+      if (!S.meta?.timingEnabled) return;
       if (timingReports.size >= 10) timingReports.delete(timingReports.keys().next().value);
       timingReports.set(v.taskId, report);
       if (S.selected === v.taskId && S.taskTab === 'timing') renderTaskPage();
@@ -18869,6 +18908,7 @@ function wireTiming(v) {
     finally { refresh.disabled = false; }
   };
   document.getElementById('timing-download').onclick = () => {
+    if (!S.meta?.timingEnabled) return;
     const blob = new Blob([JSON.stringify(timingReports.get(v.taskId), null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = `${v.taskId}-timing.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);

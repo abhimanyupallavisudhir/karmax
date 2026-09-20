@@ -1,3 +1,4 @@
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
 import type { ProviderSandboxRef } from './types.js';
@@ -144,6 +145,7 @@ export class RunnerPoolService {
 /** Turns old parked provider state into cheap object/Git state. */
 export class WorldLifecycleManager {
   private timer?: NodeJS.Timeout;
+  private sweeping?: Promise<number>;
   /** Last provider probe per world generation, so reconciliation does not hit
    * the provider control plane on every sweep tick. */
   private probedAt = new Map<string, number>();
@@ -161,7 +163,11 @@ export class WorldLifecycleManager {
   }
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
-  async sweep(now = Date.now()): Promise<number> {
+  sweep(now = Date.now()): Promise<number> {
+    return this.sweeping ??= this.sweepOnce(now).finally(() => { this.sweeping = undefined; });
+  }
+
+  private async sweepOnce(now: number): Promise<number> {
     this.runners?.reconcileWorldLeases(now);
     await this.reconcileProviderUsage(now);
     for (const artifact of this.store.expiredPromotedArtifacts(now)) {
@@ -237,22 +243,37 @@ export class WorldLifecycleManager {
         try { previous = JSON.parse(this.store.kvGet(syncKey) ?? '{}'); } catch {}
         try {
           const events = await provider.listUsageEvents!(organization.id);
-          for (const event of events) {
-            const task = event.taskId ? this.store.getTask(event.taskId) : undefined;
-            const project = task ? this.store.getProject(task.projectId) : undefined;
-            const attributed = project?.organizationId === organization.id;
-            const seconds = event.activeMs / 1000;
-            this.store.recordUsage({ id: `usage:${provider.kind}:${event.id}`,
-              organizationId: organization.id,
-              ...(attributed ? { projectId: project.id, taskId: task!.id, worldId: task!.id } : {}),
-              provider: provider.kind, kind: 'world.active', quantity: seconds, unit: 'second',
-              fundingSource: 'byok',
-              costMicros: Math.round(seconds * costMicrosPerSecond(provider.kind,
-                event.cpu, event.memoryMb, event.gpu ?? 0)),
-              startedAt: event.startedAt, endedAt: event.endedAt,
-              metadata: { source: 'provider-lifecycle', executionId: event.id,
-                sandboxId: event.sandboxId, cpu: event.cpu, memoryMb: event.memoryMb, gpu: event.gpu ?? 0 },
-            });
+          // Providers return a rolling history. Check immutable execution IDs
+          // in batches before doing attribution or writes, including after a
+          // restart. A timestamp cursor would lose late-arriving executions.
+          const attribution = new Map<string, ReturnType<Store['taskAttribution']>>();
+          for (let offset = 0; offset < events.length; offset += 100) {
+            const batch = events.slice(offset, offset + 100);
+            const recorded = this.store.recordedUsageEventIds(batch.map(event => `usage:${provider.kind}:${event.id}`));
+            for (const event of batch) {
+              const id = `usage:${provider.kind}:${event.id}`;
+              if (recorded.has(id)) continue;
+              if (event.taskId && !attribution.has(event.taskId))
+                attribution.set(event.taskId, this.store.taskAttribution(event.taskId));
+              const task = event.taskId ? attribution.get(event.taskId) : undefined;
+              const attributed = task?.organizationId === organization.id;
+              const seconds = event.activeMs / 1000;
+              this.store.recordUsage({ id,
+                organizationId: organization.id,
+                ...(attributed ? { projectId: task.projectId, taskId: event.taskId, worldId: event.taskId } : {}),
+                provider: provider.kind, kind: 'world.active', quantity: seconds, unit: 'second',
+                fundingSource: 'byok',
+                costMicros: Math.round(seconds * costMicrosPerSecond(provider.kind,
+                  event.cpu, event.memoryMb, event.gpu ?? 0)),
+                startedAt: event.startedAt, endedAt: event.endedAt,
+                metadata: { source: 'provider-lifecycle', executionId: event.id,
+                  sandboxId: event.sandboxId, cpu: event.cpu, memoryMb: event.memoryMb, gpu: event.gpu ?? 0 },
+              });
+              recorded.add(id);
+            }
+            // The PostgreSQL adapter is synchronous. Even a first-time catchup
+            // must let HTTP requests and activity heartbeats make progress.
+            await yieldToEventLoop();
           }
           const retentionMs = 7 * 24 * 60 * 60_000;
           const lastSuccessfulAt = Number(previous.lastSuccessfulAt ?? previous.at);
