@@ -85,6 +85,27 @@ test('rejects accepted work when the child exits unexpectedly', async () => {
   await worker.stop();
 });
 
+test('detects a child event loop that freezes after startup without a refresh request', async () => {
+  const failed = vi.fn();
+  const worker = manager('frozen-idle', {
+    heartbeatIntervalMs: 25, heartbeatTimeoutMs: 150, onFailure: failed,
+  });
+  await worker.start();
+  await expect.poll(() => worker.failure?.message, { timeout: 5_000 }).toBe('worker ping timed out');
+  expect(worker.isReady).toBe(false);
+  expect(failed).toHaveBeenCalledTimes(1);
+  await worker.stop();
+});
+
+test('keeps a healthy idle worker alive across heartbeat checks', async () => {
+  const worker = manager('', { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500 });
+  await worker.start();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect(worker.isReady).toBe(true);
+  await worker.stop();
+  expect(worker.failure).toBeUndefined();
+});
+
 test('bounds refresh admission and kills a child that cannot drain on shutdown', async () => {
   const worker = manager('frozen-refresh', { stopTimeoutMs: 150 });
   await worker.start();

@@ -65,6 +65,7 @@ export interface Harness {
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
   startGateway(opts?: { password?: string; hosted?: boolean; port?: number; identity?: import('../../src/auth/identity.js').IdentityService;
+    runtimeReady?: () => boolean;
     serviceConnections?: import('../../src/integrations/service-connections.js').ServiceConnections;
     loginCommand?: LoginCommand;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
@@ -184,6 +185,7 @@ export async function bootHarness(
       const handoffs = new WorldHandoffService(store, worlds, {} as any, undefined, undefined,
         path.join(worldsHome, 'local-checkouts'), resources);
       const gw = (await Gateway.create({
+        runtimeReady: opts?.runtimeReady,
         api,
         store,
         bus,

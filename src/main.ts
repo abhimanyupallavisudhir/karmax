@@ -9,6 +9,8 @@ import { ensurePaths, paths } from './config/paths.js';
 import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager } from './temporal/worker-pool.js';
+import { WorkerProcessManager } from './temporal/worker-process.js';
+import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
 import { TASK_QUEUE } from './temporal/config.js';
 import { WorkflowManager } from './packages/manager.js';
 import { WorkflowRepoLoader } from './packages/repo.js';
@@ -79,6 +81,13 @@ async function main() {
   const envFile = hydrateEnvFile(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
   hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
   const deployment = validateDeployment();
+  const workerMode = process.env.KARMAX_WORKER_MODE ?? 'combined';
+  if (!['combined', 'process'].includes(workerMode)) throw new Error('invalid KARMAX_WORKER_MODE');
+  const separateWorker = workerMode === 'process';
+  if (separateWorker && (process.platform !== 'linux' || !/^postgres(?:ql)?:\/\//i.test(process.env.KARMAX_DATABASE_URL ?? '')))
+    throw new Error('process worker mode requires Linux and PostgreSQL');
+  let startupReady = false;
+  let eventRelay: ForeignEventRelay | undefined;
   const p = ensurePaths();
   const { provider, reason } = defaultProvider();
 
@@ -98,7 +107,7 @@ async function main() {
   // The combined runtime participates in worker ownership too. A future split
   // primary may have exited while its child is still being terminated; acquiring
   // only app.lock would allow overlapping pollers during that transition.
-  const releaseWorker = process.platform === 'linux' ? await claimWorkerOwnership(p.home) : () => {};
+  const releaseWorker = !separateWorker && process.platform === 'linux' ? await claimWorkerOwnership(p.home) : () => {};
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
   // One long-lived server, reused across restarts/reloads (see dev-server.ts):
   // spawning a fresh one per reload against the same SQLite file is what wedges
@@ -222,8 +231,10 @@ async function main() {
   (await store.migratePersonalOrganizationNames((await identity.listUsers())));
   const { worlds, adapters, profiles, tokens, providerConnections, objectStore, storageLocations,
     resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes } =
-    await createExecutionServices({ store, client, broker, githubApp, p, deployment, provider, bootstrap: true });
+    await createExecutionServices({ store, client, broker, githubApp, p, deployment, provider, bootstrap: true,
+      ...(separateWorker ? { coordinationDirectory: path.join(p.state, 'world-coordination') } : {}) });
   const bus = new KarmaxBus();
+  const relayCursor = separateWorker ? await store.latestEventSeq() : undefined;
   // Installation-wide outbound email (account confirmation, password reset, org
   // invites). Reads its live config + vaulted secret on each send, so connecting
   // a provider in Settings takes effect without a restart. Handed to identity so
@@ -252,16 +263,18 @@ async function main() {
     new StripeSubscriptionProvider(async () => (await paidLaunchSettings.subscriptionConfig()), fetch), deployment.hosted);
   const { LoginManager } = await import('./autonomy/login.js');
   const login = new LoginManager(configHomes);
-  // Upgrade durable MCP launch/auth configuration before the worker starts
-  // polling and can resume an agent. The gateway refresh below replaces this
-  // provisional address with the actual bound control-plane URL.
-  configHomes.refreshManagedMcp(
-    process.env.KARMAX_GATEWAY_URL ?? `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
-  );
-
   // A managed worker so newly-installed workflow packages can be picked up by
   // rolling the worker without a restart (§21d/§21e).
-  const workerManager = new WorkerManager(conn, {
+  const workerEnvironment: NodeJS.ProcessEnv = { ...process.env, KARMAX_TEMPORAL_ADDRESS: conn.address,
+    KARMAX_TEMPORAL_NAMESPACE: conn.namespace };
+  const workerManager = separateWorker ? new WorkerProcessManager({
+    entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
+    env: workerEnvironment,
+    onFailure: error => {
+      console.error('  ! Activity worker failed:', error);
+      process.kill(process.pid, 'SIGTERM');
+    },
+  }) : new WorkerManager(conn, {
     store,
     worlds,
     adapters,
@@ -283,6 +296,97 @@ async function main() {
     hostLocal: deployment.hostLocal,
     taskQueue: TASK_QUEUE,
   });
+  const workflows = new WorkflowManager(
+    workerManager,
+    new WorkflowRepoLoader(p.workflows),
+    undefined,
+    p.workflows,
+    async (organizationId) => {
+      const profiles = new GitProfiles(store, broker, p.state, organizationId);
+      const profile = (await profiles.resolve(undefined));
+      return profile ? (await profiles.env(profile, {})) : {};
+    },
+    deployment.hosted,
+  );
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
+    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
+    providerConnections, worlds,
+    worldAccess, runners, resources, broker, githubApp, bus,
+    refreshCredentialHealth: async (task, credentialProvider) => {
+      if (!credentialProvider) return;
+      const { retryCredentials } = await import('./agent/credential-health.js');
+      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider);
+    },
+  });
+
+  // Workflow code activation is an explicit install operation with current
+  // authorization. A completed edit must never activate a moving branch tip.
+  const contributions = new ContributionRegistry();
+  const overlays = new Overlays();
+
+  const staticDir = fileURLToPath(new URL('../web', import.meta.url));
+  let gatewayPort = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : 4505;
+  const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
+  const gateway = (await Gateway.create({
+    runtimeReady: () => startupReady && !workerManager.failure,
+    api,
+    store,
+    bus,
+    tokens,
+    contributions,
+    overlays,
+    client,
+    taskQueue: TASK_QUEUE,
+    staticDir,
+    agentInfo: { provider, reason },
+    broker,
+    email: emailService,
+    payments,
+    paymentRegistry,
+    login,
+    configHomes,
+    password: process.env.KARMAX_PASSWORD,
+    version: VERSION,
+    identity,
+    authorization,
+    worlds,
+    githubApp,
+    providerConnections,
+    workflows,
+    handoffs,
+    runners,
+    worldAccess,
+    objects: objectStore,
+    resources,
+    subscriptions: subscriptionBilling,
+    paidLaunchSettings,
+    cellId: deployment.cellId,
+    hosted: deployment.hosted,
+    hostLocal: deployment.hostLocal,
+    // Exactly the channels wired into the DeliveryDispatcher above, so the console
+    // can disable a switch it cannot honour instead of reporting a false "saved".
+    deliveryChannels: [
+      'browser',
+      ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? ['email'] : []),
+      ...(process.env.KARMAX_SLACK_DELIVERY_URL ? ['slack'] : []),
+    ],
+    remoteAccess,
+  }));
+  const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
+  const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
+  gatewayPort = port;
+
+  // Activities read this lazily when an agent invokes the complete platform API.
+  // Keep service-to-service agent/MCP traffic on the control plane's loopback,
+  // even when browsers use a public TLS URL through a reverse proxy.
+  process.env.KARMAX_GATEWAY_URL = internalUrl;
+  workerEnvironment.KARMAX_GATEWAY_URL = internalUrl;
+  // Config homes are durable and may contain MCP commands written by an older
+  // karmax version. Refresh managed entries on every boot so existing accounts
+  // receive transport/auth/browser-fill fixes without reconnecting or losing
+  // user-defined MCP servers.
+  configHomes.refreshManagedMcp(internalUrl);
+
   await workerManager.start();
   console.log('  • Worker started');
 
@@ -423,33 +527,10 @@ async function main() {
     console.log(`  • Registered ${pool.length} credential(s) into the account pool`);
   }
 
-  const workflows = new WorkflowManager(
-    workerManager,
-    new WorkflowRepoLoader(p.workflows),
-    undefined,
-    p.workflows,
-    async (organizationId) => {
-      const profiles = new GitProfiles(store, broker, p.state, organizationId);
-      const profile = (await profiles.resolve(undefined));
-      return profile ? (await profiles.env(profile, {})) : {};
-    },
-    deployment.hosted,
-  );
   // Reload workflows installed in previous sessions (SPEC §4.2) and roll the
   // worker once so their tasks — new and in-flight — can run after a restart.
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
-    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
-    providerConnections, worlds,
-    worldAccess, runners, resources, broker, githubApp, bus,
-    refreshCredentialHealth: async (task, credentialProvider) => {
-      if (!credentialProvider) return;
-      const { retryCredentials } = await import('./agent/credential-health.js');
-      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider);
-    },
-  });
-
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency prerequisites are met and a schedule/event activates it. Runs
   // in-process off the same bus as the self-heal loop; the store is the durable
@@ -491,11 +572,6 @@ async function main() {
   });
   mailPoller.start();
 
-  // Workflow code activation is an explicit install operation with current
-  // authorization. A completed edit must never activate a moving branch tip.
-  const contributions = new ContributionRegistry();
-  const overlays = new Overlays();
-
   // Ensure a default project exists for first-run UX. Seed it with an EMPTY
   // config so branches inherit from global settings (or the repo's real default
   // branch) instead of baking a project-scope "main" override that would shadow
@@ -509,67 +585,6 @@ async function main() {
         (await store.setProjectMembership(project.id, { kind: 'user', userId: installationOwner.id }, 'owner'));
     }
   }
-
-  const staticDir = fileURLToPath(new URL('../web', import.meta.url));
-  let gatewayPort = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : 4505;
-  const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
-  const gateway = (await Gateway.create({
-    api,
-    store,
-    bus,
-    tokens,
-    contributions,
-    overlays,
-    client,
-    taskQueue: TASK_QUEUE,
-    staticDir,
-    agentInfo: { provider, reason },
-    broker,
-    email: emailService,
-    payments,
-    paymentRegistry,
-    login,
-    configHomes,
-    password: process.env.KARMAX_PASSWORD,
-    version: VERSION,
-    identity,
-    authorization,
-    worlds,
-    githubApp,
-    providerConnections,
-    workflows,
-    handoffs,
-    runners,
-    worldAccess,
-    objects: objectStore,
-    resources,
-    subscriptions: subscriptionBilling,
-    paidLaunchSettings,
-    cellId: deployment.cellId,
-    hosted: deployment.hosted,
-    hostLocal: deployment.hostLocal,
-    // Exactly the channels wired into the DeliveryDispatcher above, so the console
-    // can disable a switch it cannot honour instead of reporting a false "saved".
-    deliveryChannels: [
-      'browser',
-      ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? ['email'] : []),
-      ...(process.env.KARMAX_SLACK_DELIVERY_URL ? ['slack'] : []),
-    ],
-    remoteAccess,
-  }));
-  const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
-  const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
-  gatewayPort = port;
-
-  // Activities read this lazily when an agent invokes the complete platform API.
-  // Keep service-to-service agent/MCP traffic on the control plane's loopback,
-  // even when browsers use a public TLS URL through a reverse proxy.
-  process.env.KARMAX_GATEWAY_URL = internalUrl;
-  // Config homes are durable and may contain MCP commands written by an older
-  // karmax version. Refresh managed entries on every boot so existing accounts
-  // receive transport/auth/browser-fill fixes without reconnecting or losing
-  // user-defined MCP servers.
-  configHomes.refreshManagedMcp(internalUrl);
 
   // A successful CI webhook creates a durable CI→Deploy expectation. Polling is
   // intentionally independent of webhook delivery: if GitHub rejects deploy.yml
@@ -612,6 +627,7 @@ async function main() {
   const shutdown = async (restart = false, reason = 'shutdown') => {
     if (shuttingDown) return;
     shuttingDown = true;
+    startupReady = false;
     console.log(restart ? '\n  merged source changed; restarting…' : '\n  shutting down…');
     const exit = () => {
       releaseWorker();
@@ -623,7 +639,7 @@ async function main() {
           console.error('  ! Could not start the replacement process:', error instanceof Error ? error.message : error);
         }
       }
-      process.exit(0);
+      process.exit(workerManager.failure ? 1 : 0);
     };
     // Backstop: never let a hung dependency (e.g. a slow worker drain) block exit.
     // Must beat tsx-watch's 5s force-kill: a SIGKILLed worker dies mid-activity,
@@ -645,6 +661,7 @@ async function main() {
     await step(entitlementQueues.stop());
     await step(closeGateway());
     await step(workerManager.stop());
+    await eventRelay?.stop();
     await maintenanceDrain;
     await step(closeClient());
     await step(identity.close());
@@ -678,6 +695,12 @@ async function main() {
     console.log(`  • Task ${event.taskId} updated the live checkout; scheduling a graceful restart`);
     setTimeout(() => { void shutdown(true, `live-source-merge:${event.taskId}`); }, 1500).unref();
   });
+  // Capture precedes worker startup, but polling follows every subscriber.
+  // Durable rows retain events emitted during coordinator/bootstrap recovery.
+  if (separateWorker) eventRelay = await ForeignEventRelay.create(store, bus, {
+    cursor: relayCursor, onError: error => console.warn('  • Worker event relay failed:', error),
+  });
+  startupReady = true;
 }
 
 main().catch((e) => {

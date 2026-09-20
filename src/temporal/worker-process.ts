@@ -2,7 +2,7 @@ import { fork, type ChildProcess } from 'node:child_process';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
 
 export interface WorkerProcessRequest {
-  type: 'worker.request'; id: number; action: 'start' | 'refresh' | 'stop';
+  type: 'worker.request'; id: number; action: 'start' | 'refresh' | 'stop' | 'ping';
   packages?: ExternalWorkflowRef[];
 }
 export interface WorkerProcessReply {
@@ -27,6 +27,7 @@ export class WorkerProcessManager {
   private serial = 0;
   private queuedRefreshes = 0;
   private refreshing: Promise<void> = Promise.resolve();
+  private heartbeat?: NodeJS.Timeout;
   private externals: ExternalWorkflowRef[] = [];
   private pending = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   failure?: Error;
@@ -37,9 +38,12 @@ export class WorkerProcessManager {
     execArgv?: string[];
     requestTimeoutMs?: number;
     stopTimeoutMs?: number;
+    heartbeatIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
     onFailure?: (error: Error) => void;
   }) {
-    for (const value of [options.requestTimeoutMs, options.stopTimeoutMs])
+    for (const value of [options.requestTimeoutMs, options.stopTimeoutMs,
+      options.heartbeatIntervalMs, options.heartbeatTimeoutMs])
       if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647))
         throw new Error('worker timeouts must be positive timer durations');
   }
@@ -48,6 +52,7 @@ export class WorkerProcessManager {
   get isReady(): boolean { return this.ready && !this.stopRequested && !this.failure; }
 
   private fail(error: Error): void {
+    clearInterval(this.heartbeat);
     this.ready = false;
     if (!this.failure) {
       this.failure = error;
@@ -117,6 +122,17 @@ export class WorkerProcessManager {
       await this.request('start', snapshot);
       this.externals = snapshot;
       this.ready = !this.stopRequested;
+      if (this.ready) {
+        this.heartbeat = setInterval(() => {
+          // Accepted control work already has a deadline. Do not mistake a
+          // legitimate bundle refresh for an unresponsive idle event loop.
+          if (!this.isReady || this.pending.size || this.queuedRefreshes) return;
+          void this.request('ping', undefined, this.options.heartbeatTimeoutMs ?? 15_000).catch(error => {
+            if (!this.stopRequested && !this.failure) this.terminate(error);
+          });
+        }, this.options.heartbeatIntervalMs ?? 10_000);
+        this.heartbeat.unref();
+      }
     } catch (error) {
       this.terminate(error instanceof Error ? error : new Error('worker startup failed'));
       await this.exited;
@@ -143,6 +159,7 @@ export class WorkerProcessManager {
 
   async stop(): Promise<void> {
     this.stopRequested = true;
+    clearInterval(this.heartbeat);
     this.ready = false;
     this.stopping ??= (async () => {
       if (!this.child) return;

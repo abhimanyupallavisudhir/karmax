@@ -3,7 +3,10 @@ import { serveWorkerProcess } from '../../src/temporal/worker-process-server.ts'
 const mode = process.env.WORKER_FIXTURE_MODE;
 serveWorkerProcess(async () => ({
   worker: {
-    async start() { if (mode === 'frozen') while (true) { /* deliberate CPU stall */ } },
+    async start() {
+      if (mode === 'frozen') while (true) { /* deliberate CPU stall */ }
+      if (mode === 'frozen-idle') setTimeout(() => { while (true) { /* deliberate CPU stall */ } }, 50);
+    },
     async refresh() {
       if (mode === 'crash-refresh') process.exit(7);
       if (mode === 'frozen-refresh') while (true) { /* deliberate CPU stall */ }

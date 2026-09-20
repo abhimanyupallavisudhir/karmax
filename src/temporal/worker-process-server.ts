@@ -77,9 +77,13 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
     if (!value || typeof value !== 'object') return;
     const request = value as Partial<WorkerProcessRequest>;
     if (request.type !== 'worker.request' || !Number.isSafeInteger(request.id)
-      || !['start', 'refresh', 'stop'].includes(String(request.action))) return;
+      || !['start', 'refresh', 'stop', 'ping'].includes(String(request.action))) return;
     const id = request.id!;
     if (closing || (pending >= 16 && request.action !== 'stop')) { void reply(id, false, 'worker is not accepting commands'); return; }
+    if (request.action === 'ping') {
+      void reply(id, !!runtime, runtime ? undefined : 'worker is not started');
+      return;
+    }
     if (request.action !== 'stop' && (!Array.isArray(request.packages) || request.packages.some(ref =>
       !ref || typeof ref.type !== 'string' || typeof ref.entryFile !== 'string'))) {
       void reply(id, false, 'invalid workflow package references'); return;

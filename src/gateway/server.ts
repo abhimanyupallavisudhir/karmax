@@ -96,6 +96,8 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
 export interface GatewayDeps {
+  /** Primary startup/recovery and worker liveness, independent of DB health. */
+  runtimeReady?: () => boolean;
   serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
@@ -1030,7 +1032,7 @@ export class Gateway {
     const wssAction = new WebSocketServer({ noServer: true });
     const wssPreview = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
-      if (this.closing) { socket.destroy(); return; }
+      if (this.closing || this.deps.runtimeReady?.() === false) { socket.destroy(); return; }
       const { pathname } = new URL(req.url ?? '/', 'http://localhost');
       const isolatedPreview = Boolean(configuredPreviewOrigin());
       const onPreviewOrigin = isolatedPreview && this.requestIsPreviewOrigin(req);
@@ -1300,6 +1302,8 @@ export class Gateway {
     // that exposes only opaque preview leases, never Karmax API/static routes or
     // the reviewer's authenticated application cookies.
     if (onPreviewOrigin && !p.startsWith('/preview/')) return this.json(res, 404, { error: 'not found' });
+    if (p.startsWith('/api/') && p !== '/api/health/live' && this.deps.runtimeReady?.() === false)
+      return this.json(res, 503, { ok: false, error: 'runtime is not ready', ts: Date.now() });
     if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
       const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
       if (!leaseId) return this.json(res, 404, { error: 'not found' });
