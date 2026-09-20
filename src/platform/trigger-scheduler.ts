@@ -143,9 +143,16 @@ export class TriggerScheduler {
     if (this.epoch !== startEpoch) return;
     const epoch = this.epoch;
     this.unsub = this.deps.bus.onAny(ev => {
+      // Do not retain high-volume output or perform attribution reads unless
+      // an already-armed trigger could consume this event. Capture entry
+      // identities now: an old queued event cannot activate a later re-arm.
+      const candidates = [...this.armed.values()].filter(entry => !entry.fired && entry.triggers.some(trigger =>
+        trigger.kind === 'event' ? eventMatchesEventTrigger(trigger, ev)
+          : trigger.kind === 'dependency' && ev.type === LIFECYCLE_EVENT));
+      if (!candidates.length) return;
       // Lifecycle edges must not overtake one another while attribution reads
       // yield. A stopped/restarted scheduler must not consume its old backlog.
-      const next = this.eventTail.then(() => this.epoch === epoch ? this.onEvent(ev) : undefined);
+      const next = this.eventTail.then(() => this.epoch === epoch ? this.onEvent(ev, candidates) : undefined);
       this.eventTail = next.catch(error => this.log(`trigger event failed: ${String(error)}`));
       return next;
     });
@@ -261,15 +268,14 @@ export class TriggerScheduler {
 
   // ─── Event routing ─────────────────────────────────────────────────────────
 
-  private async onEvent(ev: KarmaxEvent): Promise<void> {
+  private async onEvent(ev: KarmaxEvent, candidates: ArmedEntry[]): Promise<void> {
     if (!this.armed.size) return;
     // Events are tenant data: an armed task only ever sees events from tasks in
     // its own organization. Without this, `{kind:'event', where:{repo:…}}` in one
     // organization fired on (and probed the payloads of) another's tasks.
     const sourceOrganization = (await this.organizationOfTask(ev.taskId));
     if (!sourceOrganization) return;
-    // Copy: firing mutates the map (one-shot disarm).
-    for (const entry of [...this.armed.values()]) {
+    for (const entry of candidates) {
       if (this.armed.get(entry.task.id) !== entry || entry.fired) continue;
       if ((await this.organizationOfTask(entry.task.id, entry.task)) !== sourceOrganization) continue;
       if (this.armed.get(entry.task.id) !== entry) continue;

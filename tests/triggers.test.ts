@@ -1051,4 +1051,52 @@ describe('TriggerScheduler (dispatcher)', () => {
     } finally { scheduler.stop(); }
   });
 
+  it('ignores unrelated output before any database attribution reads', async () => {
+    const dep = await sourceTask();
+    await armedTask([{ kind: 'dependency', tasks: [dep] }]);
+    await armedTask([{ kind: 'event', type: 'release', where: { branch: 'main' } }]);
+    const scheduler = makeScheduler();
+    await scheduler.start();
+    const metadata = vi.spyOn(store, 'taskMetadata');
+    const projects = vi.spyOn(store, 'getProject');
+    try {
+      for (let i = 0; i < 1_000; i++)
+        await bus.emit({ type: 'agent.output', taskId: dep, ts: i, payload: { text: 'output' } } as KarmaxEvent);
+      await bus.emit({ type: 'release', taskId: dep, ts: 0, payload: { branch: 'feature' } } as KarmaxEvent);
+      expect(metadata).not.toHaveBeenCalled();
+      expect(projects).not.toHaveBeenCalled();
+      expect(fired).toEqual([]);
+    } finally { metadata.mockRestore(); projects.mockRestore(); scheduler.stop(); }
+  });
+
+  it('does not deliver an old queued event to a newly armed replacement', async () => {
+    const source = await sourceTask();
+    const task = await armedTask([{ kind: 'event', type: 'release' }]);
+    const scheduler = makeScheduler();
+    await scheduler.start();
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const original = store.taskMetadata.bind(store);
+    const metadata = vi.spyOn(store, 'taskMetadata').mockImplementationOnce(async id => {
+      entered();
+      await blocked;
+      return original(id);
+    });
+    const event = { type: 'release', taskId: source, ts: 0, payload: {} } as KarmaxEvent;
+    const first = bus.emit(event);
+    try {
+      await started;
+      const second = bus.emit(event);
+      scheduler.disarm(task.id);
+      await scheduler.arm(task);
+      release();
+      await Promise.all([first, second]);
+      expect(fired).toEqual([]);
+      await bus.emit(event);
+      expect(fired).toEqual([[task.id, 'self']]);
+    } finally { release(); await first; metadata.mockRestore(); scheduler.stop(); }
+  });
+
 });
