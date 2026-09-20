@@ -21,7 +21,7 @@ export async function prepareConnections(service: McpConnections | undefined, wo
   const remote = isRemoteAgentWorld(world);
   if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote) throw new Error('Hosted MCP connections require a remote execution environment');
   if (!ids.length) return [];
-  if (!service && ids.some(id => !BUILTIN_MCPS.includes(id as any))) throw new Error('MCP connections require the credential vault');
+  if (!service && ids.some(id => !BUILTIN_MCPS.includes(id as any) && !id.startsWith('composio:'))) throw new Error('MCP connections require the credential vault');
   const selected = service?.selected(ids, projectId) ?? [];
   const container = world.handle.kind === 'container';
   const root = container ? '/work' : world.handle.root;

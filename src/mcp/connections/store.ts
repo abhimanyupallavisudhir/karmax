@@ -9,13 +9,14 @@ export interface McpConnection {
   id: string; label: string; organizationId: string; projectId?: string;
   transport: McpTransport; enabled: boolean; revision: string;
   secretNames: string[]; auth: 'none' | 'secrets' | 'oauth';
+  oauthClient?: { clientId: string; tokenEndpointAuthMethod: 'none' | 'client_secret_basic' | 'client_secret_post'; hasSecret: boolean };
   registry?: { name: string; version: string }; createdAt: number;
 }
 export const BUILTIN_MCPS = ['browser:chrome-devtools', 'browser:playwright'] as const;
 export function validateMcpSelection(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > 24 || value.some((v) => typeof v !== 'string'
-    || (!BUILTIN_MCPS.includes(v as any) && !/^mcp_[a-f0-9]{24}$/.test(v)))) throw new Error('Tools must be a list of MCP connection IDs');
+    || (!BUILTIN_MCPS.includes(v as any) && !/^mcp_[a-f0-9]{24}$/.test(v) && !/^composio:conn_[a-z0-9]+$/.test(v)))) throw new Error('Tools must be a list of MCP or app connection IDs');
   if (new Set(value).size !== value.length) throw new Error('Tools contains duplicate connections');
   return value;
 }
@@ -62,14 +63,38 @@ export class McpConnections {
     const transport = validateTransport(input.transport);
     const auth = input.auth ?? 'none';
     if (!['none', 'secrets', 'oauth'].includes(auth) || (auth === 'oauth' && transport.type === 'stdio')) throw new Error('Invalid authentication method');
+    const changed = prior && (JSON.stringify(prior.transport) !== JSON.stringify(transport) || prior.auth !== auth);
+    let oauthData: any;
+    let oauthClient = changed ? undefined : prior?.oauthClient;
+    if (input.oauthClient !== undefined) {
+      if (auth !== 'oauth') throw new Error('OAuth client details require OAuth authentication');
+      oauthData = {};
+      oauthClient = undefined;
+      if (input.oauthClient !== null) {
+        const v = input.oauthClient;
+        if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Invalid OAuth client details');
+        const clientId = bounded(v.clientId, 2048, 'OAuth client ID').trim();
+        const method = v.tokenEndpointAuthMethod ?? 'none';
+        if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) throw new Error('Unsupported OAuth client authentication method');
+        const previous = prior && !changed ? this.secret(prior).manualClient : undefined;
+        const secret = v.clientSecret === undefined && previous?.client_id === clientId && previous?.token_endpoint_auth_method === method
+          ? previous.client_secret : v.clientSecret;
+        if (method !== 'none' && (typeof secret !== 'string' || !secret || secret.length > 16384 || /[\r\n\0]/.test(secret)))
+          throw new Error('A client secret is required for this authentication method');
+        oauthData.manualClient = { client_id: clientId, token_endpoint_auth_method: method,
+          ...(method !== 'none' ? { client_secret: secret } : {}) };
+        oauthClient = { clientId, tokenEndpointAuthMethod: method, hasSecret: method !== 'none' };
+        if (previous && JSON.stringify(previous) === JSON.stringify(oauthData.manualClient)) oauthData = undefined;
+      }
+    }
     const connection: McpConnection = {
       id: prior?.id ?? `mcp_${crypto.randomBytes(12).toString('hex')}`,
       organizationId: this.organizationId, ...(projectId ? { projectId } : {}),
       label: bounded(input.label, 120, 'connection name'), transport, enabled: input.enabled !== false,
+      ...(oauthClient ? { oauthClient } : {}),
       auth, secretNames: prior?.secretNames ?? [], revision: crypto.randomUUID(), createdAt: prior?.createdAt ?? Date.now(),
       ...(input.registry ? { registry: { name: bounded(input.registry.name, 256, 'registry name'), version: bounded(input.registry.version, 128, 'registry version') } } : {}),
     };
-    const changed = prior && (JSON.stringify(prior.transport) !== JSON.stringify(transport) || prior.auth !== auth);
     let secrets: Record<string, string> | undefined;
     if (input.secrets !== undefined && auth === 'secrets') {
       secrets = validateSecrets(input.secrets, transport.type === 'stdio');
@@ -87,6 +112,7 @@ export class McpConnections {
     const connections = this.all().filter((c) => c.id !== connection.id);
     if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization)');
     this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] });
+    if (oauthData !== undefined) this.setSecret(connection, oauthData);
     return connection;
   }
   remove(id: string, projectId?: string) {
@@ -105,7 +131,7 @@ export class McpConnections {
     this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)); }
   selected(ids: string[], projectId: string): McpConnection[] {
     validateMcpSelection(ids);
-    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any)).map((id) => {
+    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any) && !id.startsWith('composio:')).map((id) => {
       const c = this.get(id, projectId);
       if (!c.enabled) throw new Error(`MCP connection “${c.label}” is disabled. Update the Agent tools selection.`);
       return c;

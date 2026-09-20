@@ -52,6 +52,9 @@ describe('MCP connections', () => {
   });
   it('validates selections and preserves explicit empty sets across provider/default changes', () => {
     expect(validateMcpSelection([])).toEqual([]);
+    expect(validateMcpSelection(['composio:conn_abc123'])).toEqual(['composio:conn_abc123']);
+    expect(service.selected(['composio:conn_abc123'], project)).toEqual([]);
+    expect(() => validateMcpSelection(['composio:../../secret'])).toThrow();
     expect(() => validateMcpSelection(['karmax'])).toThrow();
     expect(validateMcpSelection(['browser:playwright', 'browser:chrome-devtools'])).toEqual(['browser:playwright', 'browser:chrome-devtools']);
     const base = { id: 'do-default', name: 'Agent', role: 'do', provider: 'claude' as const, mcpConnections: ['browser:playwright'] };

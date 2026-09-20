@@ -130,3 +130,45 @@ describe('fork_agent reauthorize', () => {
     f.store.close();
   });
 });
+
+describe('vault task defaults', () => {
+  it('rejects wildcard grants and policies for unselected credentials in saved defaults', () => {
+    const f = fixture();
+    try {
+      expect(() => f.store.setSettings(f.project.id, 'vault', { credentialGrants: ['use-credential:*'] })).toThrow(/individual vault/);
+      expect(() => f.store.setSettings(f.project.id, 'vault', { credentialGrants: [], credentialPolicies: { private: { reveal: 'auto' } } })).toThrow(/Invalid vault/);
+    } finally { f.store.close(); }
+  });
+  it('inherits organization then project selections, snapshots grants, and honors explicit empty overrides', async () => {
+    const f = fixture();
+    try {
+      const token = f.tokenFor('owner', ['use-credential:item:org_login', 'use-credential:item:project_login']);
+      const create = (credentialGrants?: string[]) => f.api.createTask(token, { projectId: f.project.id, draft: true, params: { prompt: 'Defaults' }, credentialGrants });
+      const grants = (task: any) => task.params._authorization.capabilities.filter((cap: string) => cap.startsWith('use-credential:item:'));
+      f.store.setSettings('organization:org_personal', 'vault', { credentialGrants: ['use-credential:item:org_login'] });
+      const inherited = await create();
+      expect(grants(inherited)).toContain('use-credential:item:org_login');
+      f.store.setSettings(f.project.id, 'vault', { credentialGrants: ['use-credential:item:project_login'] });
+      expect(grants(await create())).toEqual(['use-credential:item:project_login']);
+      expect(grants(await create([]))).toEqual([]);
+      f.store.setSettings(f.project.id, 'vault', { credentialGrants: [] });
+      expect(grants(await create())).toEqual([]);
+      f.store.setSettings(f.project.id, 'vault', {});
+      expect(grants(await create())).toEqual(['use-credential:item:org_login']);
+      expect(grants(f.store.getTask(inherited.id))).toContain('use-credential:item:org_login');
+    } finally { f.store.close(); }
+  });
+  it('does not grant inherited credentials beyond the creator’s authority or cross organizations', async () => {
+    const f = fixture();
+    try {
+      f.store.setSettings('organization:org_personal', 'vault', { credentialGrants: ['use-credential:item:private'] });
+      const limited = await f.api.createTask(f.tokenFor('dev'), { projectId: f.project.id, draft: true, params: { prompt: 'Limited' } });
+      expect((limited.params._authorization as any).capabilities).not.toContain('use-credential:item:private');
+      const otherOrg = f.store.createOrganization({ name: 'Other', ownerUserId: 'owner' });
+      f.store.setSettings('organization:org_personal', 'vault', {});
+      f.store.setSettings(`organization:${otherOrg.id}`, 'vault', { credentialGrants: ['use-credential:item:private'] });
+      const task = await f.api.createTask(f.tokenFor('owner'), { projectId: f.project.id, draft: true, params: { prompt: 'Other defaults do not apply' } });
+      expect((task.params._authorization as any).capabilities).not.toContain('use-credential:item:private');
+    } finally { f.store.close(); }
+  });
+});

@@ -43,6 +43,9 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/connections/config (PUT: installation settings:write; body {apiKey}; key is write-only)',
   ],
   mcpConnections: [
+    'GET /api/mcp-client-metadata (public OAuth client identity; requires configured public HTTPS installation URL)',
+    'GET /api/mcp/oauth-info?projectId= (or organizationId; callback URL and automatic registration identity)',
+    'POST /api/mcp accepts optional oauthClient {clientId,tokenEndpointAuthMethod,clientSecret?} for preregistration; null restores automatic registration; secrets are write-only',
     'GET|POST /api/mcp?projectId= (or organizationId; POST creates/updates {id?, label, transport, auth, enabled?, secrets?}; secrets are write-only)',
     'GET /api/mcp/registry?projectId=&search=&cursor= (Official MCP Registry discovery; listings are untrusted metadata)',
     'DELETE /api/mcp/:id?projectId= (or organizationId; owning scope required)',

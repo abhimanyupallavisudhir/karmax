@@ -5,7 +5,7 @@ import { timingEnabled, installationTiming, withTiming, toolFailed } from '../ti
 import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
-import { beginOAuth, finishOAuth } from '../mcp/connections/oauth.js';
+import { beginOAuth, finishOAuth, mcpClientMetadata, MCP_CLIENT_METADATA_PATH } from '../mcp/connections/oauth.js';
 import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
 import { ServiceConnections, ConnectionError } from '../integrations/service-connections.js';
@@ -145,6 +145,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
+  if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
@@ -1269,6 +1270,12 @@ export class Gateway {
     const p = url.pathname;
     const method = req.method ?? 'GET';
 
+    // A public OAuth application identity, derived only from operator configuration.
+    // Never reflect Host/Origin or tenant data into redirect URIs.
+    if (p === MCP_CLIENT_METADATA_PATH && method === 'GET') {
+      const metadata = mcpClientMetadata();
+      return this.json(res, metadata ? 200 : 404, metadata ?? { error: 'A public HTTPS installation URL is required' });
+    }
     // ── unauthenticated endpoints ──
     if (p === '/api/session' && method === 'GET') {
       if (this.deps.identity) {
@@ -5354,6 +5361,11 @@ export class Gateway {
         const connections = new McpConnections(store, this.deps.broker, organizationId);
         const actor = actorPrincipal(callerIdentity.actor);
         try {
+          if (p === '/api/mcp/oauth-info' && method === 'GET') {
+            const origin = process.env.KARMAX_PUBLIC_URL ?? (hostLocal() ? url.origin : undefined);
+            return this.json(res, 200, { redirectUri: origin ? new URL('/mcp-callback', origin).href : undefined,
+              clientMetadataUrl: mcpClientMetadata()?.client_id });
+          }
           if (p === '/api/mcp/registry' && method === 'GET')
             return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? ''));
           if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, connections.list(projectId).map((c) => ({ ...c,
@@ -5662,7 +5674,8 @@ export class Gateway {
           return this.json(res, 403, { error: 'Task access denied' });
         const ownerId = callerIdentity.humanSubject?.userId;
         const requireOwner = () => requireHumanSubject(callerIdentity).userId;
-        const projectId = task?.projectId;
+        const projectId = task?.projectId ?? url.searchParams.get('projectId') ?? undefined;
+        if (!task && projectId && (store.getProject(projectId)?.organizationId !== org || !this.deps.tokens.check(token, 'project:read', { projectId, organizationId: org }).ok)) return this.json(res, 403, { error: 'Project access denied' });
         const b = ['POST', 'PUT'].includes(method) ? await this.body(req) : {};
         try {
           if (p === '/api/connections/config') {
