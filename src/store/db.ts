@@ -76,6 +76,9 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 
+// Shared by Store instances in this process, never by another gateway/worker.
+const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
+
 export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
 
 export interface CollaborationRequest {
@@ -634,7 +637,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_avatars_owner ON avatars(ownerUserId, deletedAt);
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
-        type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
+        type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL, origin TEXT
       );
       CREATE TABLE IF NOT EXISTS collaboration_requests (
         id TEXT PRIMARY KEY, requesterTaskId TEXT NOT NULL, targetTaskId TEXT NOT NULL,
@@ -811,6 +814,8 @@ export class Store {
     }
     // Free-form human notes, added after the initial schema. Guarded so existing
     // installs pick it up without a re-create.
+    const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
+    if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
     const projectCols = (await this.db.prepare('PRAGMA table_info(projects)').all()) as any[];
     const cardCols = (await this.db.prepare('PRAGMA table_info(cards)').all()) as { name: string }[];
@@ -5090,8 +5095,8 @@ export class Store {
     if (!nested) (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       const info = (await this.db
-        .prepare('INSERT INTO events (taskId, type, ts, payload) VALUES (?, ?, ?, ?)')
-        .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload)));
+        .prepare('INSERT INTO events (taskId, type, ts, payload, origin) VALUES (?, ?, ?, ?, ?)')
+        .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload), PROCESS_EVENT_ORIGIN));
       const seq = Number(info.lastInsertRowid);
       (await this.materializeInbox(seq, ev));
       if (!nested) (await this.db.exec('COMMIT'));
@@ -5158,6 +5163,23 @@ export class Store {
   async nextEventsSince(seq: number, limit: number): Promise<(KarmaxEvent & { seq: number })[]> {
     const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?', [seq, limit]);
     return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
+  /** Advance across local rows too, but only decode/deliver foreign events.
+   * Local publishers already emit on this process's bus. Origin is transport
+   * metadata and is deliberately absent from public event representations. */
+  async nextForeignEventPage(seq: number, limit = 128): Promise<{
+    cursor: number; scanned: number; events: Array<KarmaxEvent & { seq: number }>;
+  }> {
+    const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?',
+      [seq, Math.max(1, Math.min(500, Math.floor(limit)))]);
+    return {
+      cursor: rows.length ? Number(rows[rows.length - 1].seq) : seq,
+      scanned: rows.length,
+      events: rows.filter(row => row.origin !== PROCESS_EVENT_ORIGIN).map(row => ({
+        seq: Number(row.seq), taskId: row.taskId, type: row.type, ts: Number(row.ts), payload: JSON.parse(row.payload),
+      })),
+    };
   }
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
