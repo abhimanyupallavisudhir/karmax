@@ -30,3 +30,20 @@ it('observes failures and permits the next tick to retry', async () => {
   expect(failed).toHaveBeenCalledExactlyOnceWith(error);
   expect(job).toHaveBeenCalledTimes(2);
 });
+
+it('shares a boot invocation with timer ticks and refuses new work after stop', async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const job = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+  const interval = new AsyncInterval(job, 10);
+  const boot = interval.run();
+  expect(interval.run()).toBe(boot);
+  await vi.advanceTimersByTimeAsync(100);
+  expect(job).toHaveBeenCalledTimes(1);
+  const stopping = interval.stop();
+  await interval.run();
+  release();
+  await stopping;
+  await interval.run();
+  expect(job).toHaveBeenCalledTimes(1);
+});

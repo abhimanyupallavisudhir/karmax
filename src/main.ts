@@ -1,3 +1,4 @@
+import { AsyncInterval } from './util/async-interval.js';
 import * as __asyncCollections from './util/async-collections.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -380,7 +381,7 @@ async function main() {
       console.log(`  • Purged ${swept.scopedTokens} expired token(s) and ${swept.githubDeliveries} aged webhook delivery id(s)`);
   };
   (await sweepRetention());
-  const retentionTimer = setInterval(sweepRetention, 3600_000);
+  const retentionTimer = new AsyncInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
 
   // Re-derive effective plans from the last signed provider state at boot and
@@ -394,19 +395,22 @@ async function main() {
     }
   };
   (await reconcileSubscriptionEntitlements());
-  const subscriptionEntitlementTimer = setInterval(reconcileSubscriptionEntitlements, 60_000);
+  const subscriptionEntitlementTimer = new AsyncInterval(reconcileSubscriptionEntitlements, 60_000);
   subscriptionEntitlementTimer.unref();
 
   // Membership hooks submit seat changes immediately; this bounded sweep makes
   // provider quantity reconciliation eventual after an outage or process crash.
   const syncSubscriptionSeats = async () => {
-    for (const organization of (await store.listOrganizations()))
-      void subscriptionBilling.syncSeats(organization.id).catch((error) =>
-        console.warn(`  • Subscription seat sync failed for ${organization.id}:`,
-          error instanceof Error ? error.message : String(error)));
+    const organizations = await store.listOrganizations();
+    for (let offset = 0; offset < organizations.length; offset += 4) {
+      await Promise.all(organizations.slice(offset, offset + 4).map(organization =>
+        subscriptionBilling.syncSeats(organization.id).catch(error =>
+          console.warn(`  • Subscription seat sync failed for ${organization.id}:`,
+            error instanceof Error ? error.message : error))));
+    }
   };
-  (await syncSubscriptionSeats());
-  const subscriptionSeatTimer = setInterval(syncSubscriptionSeats, 5 * 60_000);
+  const subscriptionSeatTimer = new AsyncInterval(syncSubscriptionSeats, 5 * 60_000);
+  void subscriptionSeatTimer.run();
   subscriptionSeatTimer.unref();
 
   // Repair coordinator singletons whose history this build can no longer replay.
@@ -443,8 +447,8 @@ async function main() {
   // stands forever. Reconciling only at boot left such a task rendering as
   // active-and-progressing (and hid the recovery affordance, which requires a
   // failed status) until the next restart, which for a long-lived host is never.
-  const reconcileSweep = setInterval(() => {
-    void reconcileTasks(store, client)
+  const reconcileSweep = new AsyncInterval(() => {
+    return reconcileTasks(store, client)
       .then((r) => {
         if (r.settled) console.log(`  • Reconciled ${r.settled} task(s) whose workflow ended without publishing`);
       })
@@ -650,8 +654,8 @@ async function main() {
       deploymentSweepRunning = false;
     }
   };
-  void reconcileDeployments();
-  const deploymentSweep = setInterval(() => { void reconcileDeployments(); }, RECONCILE_INTERVAL_MS);
+  const deploymentSweep = new AsyncInterval(reconcileDeployments, RECONCILE_INTERVAL_MS);
+  void deploymentSweep.run();
   deploymentSweep.unref();
 
   console.log(`\n  ✓ krmax is running:  ${url}\n`);
@@ -691,15 +695,18 @@ async function main() {
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     clearInterval(orphanSweep);
-    clearInterval(reconcileSweep);
-    clearInterval(deploymentSweep);
+    // Stop admission immediately. Drain alongside the worker so a slow external
+    // service cannot consume the worker's shutdown grace period. The existing
+    // process-exit backstop bounds shutdown; do not close Store under these jobs.
+    const maintenanceDrain = Promise.allSettled([
+      retentionTimer.stop(), subscriptionEntitlementTimer.stop(), subscriptionSeatTimer.stop(),
+      reconcileSweep.stop(), deploymentSweep.stop(),
+      triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),
+    ]);
     await step(entitlementQueues.stop());
-    triggerScheduler.stop();
-    mailPoller.stop();
-    worldLifecycle.stop();
-    delivery.stop();
     await step(closeGateway());
     await step(workerManager.stop());
+    await maintenanceDrain;
     await step(closeClient());
     await step(identity.close());
     (await endRuntimeLifecycle(store, runtime, { stoppedAt: Date.now(), reason, restart }));

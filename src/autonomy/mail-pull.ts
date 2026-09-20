@@ -1,3 +1,4 @@
+import { AsyncInterval } from '../util/async-interval.js';
 import { MailboxConfig, defaultMailboxRegistry } from './mailbox.js';
 import { extractMimeText, cleanAddress, htmlToText } from './agent-mail.js';
 
@@ -195,8 +196,8 @@ export function createPuller(config: MailboxConfig, deps: PullDeps): Puller | un
 // ── the poll loop (mirrors WorldLifecycleManager) ─────────────────────────────
 
 export class MailPoller {
-  private timer?: NodeJS.Timeout;
-  private running = false;
+  private timer?: AsyncInterval;
+  private active?: Promise<number>;
   constructor(
     private deps: {
       readConfigs(): { organizationId: string; config: MailboxConfig }[] | Promise<{ organizationId: string; config: MailboxConfig }[]>;
@@ -209,41 +210,44 @@ export class MailPoller {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.sweep(), this.intervalMs);
+    this.timer = new AsyncInterval(() => this.sweep(), this.intervalMs, error => {
+      console.error('[mail] poll failed:', error instanceof Error ? error.message : String(error));
+    });
     this.timer.unref();
   }
-  stop(): void {
-    if (this.timer) clearInterval(this.timer);
+  async stop(): Promise<void> {
+    const timer = this.timer;
     this.timer = undefined;
+    await timer?.stop();
+    await this.active?.catch(() => {});
   }
 
-  /** One poll cycle. Never throws; a provider hiccup is logged to the audit
-   *  trail and retried next tick. Returns messages delivered this cycle. */
-  async sweep(): Promise<number> {
-    if (this.running) return 0; // don't overlap a slow poll
-    this.running = true;
-    try {
-      let delivered = 0;
-      for (const { organizationId, config } of (await this.deps.readConfigs())) {
-        try {
-          const puller = createPuller(config, {
-            store: this.deps.store,
-            organizationId,
-            resolveSecret: this.deps.resolveSecret,
-            ingest: this.deps.makeIngest(organizationId, config),
-          });
-          if (puller) delivered += await puller.poll();
-        } catch (e) {
-          (await this.deps.store.appendAudit?.({
-            principalId: 'system:mail-poller',
-            action: 'agent-mail.poll.failed',
-            detail: { organizationId, error: e instanceof Error ? e.message : String(e) },
-          }));
-        }
+  /** Provider failures are audited and retried next tick. Database failures
+   * propagate to the caller (the periodic runner observes and reports them). */
+  sweep(): Promise<number> {
+    if (this.active) return Promise.resolve(0);
+    return this.active = this.sweepOnce().finally(() => { this.active = undefined; });
+  }
+
+  private async sweepOnce(): Promise<number> {
+    let delivered = 0;
+    for (const { organizationId, config } of (await this.deps.readConfigs())) {
+      try {
+        const puller = createPuller(config, {
+          store: this.deps.store,
+          organizationId,
+          resolveSecret: this.deps.resolveSecret,
+          ingest: this.deps.makeIngest(organizationId, config),
+        });
+        if (puller) delivered += await puller.poll();
+      } catch (e) {
+        (await this.deps.store.appendAudit?.({
+          principalId: 'system:mail-poller',
+          action: 'agent-mail.poll.failed',
+          detail: { organizationId, error: e instanceof Error ? e.message : String(e) },
+        }));
       }
-      return delivered;
-    } finally {
-      this.running = false;
     }
+    return delivered;
   }
 }

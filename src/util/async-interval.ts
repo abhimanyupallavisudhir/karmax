@@ -7,14 +7,16 @@ export class AsyncInterval {
   private running?: Promise<void>;
   private stopped = false;
 
-  constructor(operation: () => unknown, milliseconds: number,
-    onError: (error: unknown) => void = error => console.error('[interval] job failed:', error)) {
-    this.timer = setInterval(() => {
-      if (this.stopped || this.running) return;
-      this.running = Promise.resolve().then(operation).then(() => {}, error => {
-        try { onError(error); } catch { /* a diagnostic must not reject the timer */ }
-      }).finally(() => { this.running = undefined; });
-    }, milliseconds);
+  constructor(private operation: () => unknown, milliseconds: number,
+    private onError: (error: unknown) => void = error => console.error('[interval] job failed:', error)) {
+    this.timer = setInterval(() => { void this.run(); }, milliseconds);
+  }
+  /** Boot/manual invocation shares the same admission and shutdown boundary. */
+  run(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    return this.running ??= Promise.resolve().then(this.operation).then(() => {}, error => {
+      try { this.onError(error); } catch { /* a diagnostic must not reject the timer */ }
+    }).finally(() => { this.running = undefined; });
   }
   unref(): this { this.timer.unref(); return this; }
   async stop(): Promise<void> {

@@ -111,6 +111,7 @@ const MAX_CATCHUP_STEPS = 20_000;
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
   private eventTail: Promise<void> = Promise.resolve();
+  private pendingOperations = new Set<Promise<unknown>>();
   private epoch = 0;
   private versions = new Map<string, number>();
   private unsub?: () => void;
@@ -121,7 +122,8 @@ export class TriggerScheduler {
 
   constructor(private deps: TriggerSchedulerDeps) {
     this.now = deps.now ?? (() => Date.now());
-    this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    const schedule = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+    this.setTimer = (fn, ms) => schedule(() => this.track(Promise.resolve().then(fn)), ms);
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.log = deps.log ?? (() => {});
   }
@@ -185,12 +187,20 @@ export class TriggerScheduler {
     return (await validateTriggers(normalizeTriggers(task.params), { taskId: task.id, dependenciesOf }));
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.epoch++;
     this.unsub?.();
     this.unsub = undefined;
     for (const e of this.armed.values()) for (const t of e.timers) this.clearTimer(t);
     this.armed.clear();
+    await this.eventTail;
+    while (this.pendingOperations.size) await Promise.allSettled([...this.pendingOperations]);
+  }
+
+  private track<T>(operation: Promise<T>): Promise<T> {
+    this.pendingOperations.add(operation);
+    void operation.then(() => this.pendingOperations.delete(operation), () => this.pendingOperations.delete(operation));
+    return operation;
   }
 
   /** Number of tasks currently armed (used by tests / diagnostics). */
@@ -416,7 +426,7 @@ export class TriggerScheduler {
       for (const timer of entry.timers) this.clearTimer(timer);
       entry.timers = [];
     }
-    void this.deps
+    this.track(this.deps
       .fire(taskId, repeatable ? 'clone' : 'self')
       .then(async () => {
         if (this.armed.get(taskId) !== entry) return;
@@ -443,7 +453,7 @@ export class TriggerScheduler {
         this.log(`trigger fire failed for ${taskId}: ${e instanceof Error ? e.message : String(e)}`);
         entry.fired = false;
         this.retry(entry);
-      });
+      }));
     return true;
   }
 

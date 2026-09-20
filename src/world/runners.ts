@@ -162,7 +162,11 @@ export class WorldLifecycleManager {
     this.timer = setInterval(() => void this.sweep().catch(() => undefined), this.intervalMs);
     this.timer.unref();
   }
-  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
+  async stop(): Promise<void> {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    await this.sweeping?.catch(() => {});
+  }
 
   sweep(now = Date.now()): Promise<number> {
     return this.sweeping ??= this.sweepOnce(now).finally(() => { this.sweeping = undefined; });

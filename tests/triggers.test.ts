@@ -1051,6 +1051,27 @@ describe('TriggerScheduler (dispatcher)', () => {
     } finally { scheduler.stop(); }
   });
 
+  it.each(['event', 'schedule'] as const)('drains an in-flight %s start before shutdown completes', async kind => {
+    const task = await armedTask(kind === 'event' ? [{ kind: 'event', type: 'release' }] : [{ kind: 'schedule', at: 0 }]);
+    const source = await sourceTask();
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const fire = vi.fn(() => blocked);
+    const scheduler = new TriggerScheduler({ store, bus, now: clock.now,
+      setTimer: clock.set, clearTimer: clock.clear, fire });
+    await scheduler.start();
+    if (kind === 'event') await bus.emit({ type: 'release', taskId: source, ts: 0, payload: {} });
+    else await clock.advance(0);
+    expect(fire).toHaveBeenCalledWith(task.id, 'self');
+    let stopped = false;
+    const stopping = scheduler.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    release();
+    await stopping;
+    expect(scheduler.size).toBe(0);
+  });
+
   it('ignores unrelated output before any database attribution reads', async () => {
     const dep = await sourceTask();
     await armedTask([{ kind: 'dependency', tasks: [dep] }]);
