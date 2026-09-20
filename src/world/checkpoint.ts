@@ -64,8 +64,6 @@ export class WorldCheckpointService {
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
     private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
     private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService) {
-    if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
-      broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
     this.runners = runners ?? new RunnerPoolService(store);
   }
 
@@ -127,7 +125,7 @@ export class WorldCheckpointService {
         yield readPath === undefined ? file : { ...file, data: await world.readFileBuffer(readPath) };
       }
     }
-    const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), this.key());
+    const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), await this.key());
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
     const managedStorage = (await this.store.listStorageLocations(project.organizationId))
@@ -169,7 +167,7 @@ export class WorldCheckpointService {
     const executionConfig = (await this.store.effectiveProjectConfig(project));
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     // A checkpoint must be restorable after its sandbox disappears even when a
     // checkout is not a normal project enrollment (the project wiki is the
@@ -302,7 +300,7 @@ export class WorldCheckpointService {
     if (checkpoint.worldId === world.handle.id) throw new Error('fork requires an independent world');
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     const destinations = new Map<string, WorldRepo>();
     for (const repo of checkpoint.repos) {
@@ -334,13 +332,15 @@ export class WorldCheckpointService {
     }
   }
 
-  private key(): Buffer {
+  private async key(): Promise<Buffer> {
+    if (!this.broker.hasHandle(CHECKPOINT_KEY_HANDLE))
+      await this.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
     return Buffer.from(this.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
   }
 
-  private decrypt(blob: Buffer): Buffer {
+  private async decrypt(blob: Buffer): Promise<Buffer> {
     if (blob.subarray(0, 4).toString() !== 'KMX1') throw new Error('invalid checkpoint envelope');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', this.key(), blob.subarray(4, 16));
+    const decipher = crypto.createDecipheriv('aes-256-gcm', await this.key(), blob.subarray(4, 16));
     decipher.setAuthTag(blob.subarray(16, 32));
     return Buffer.concat([decipher.update(blob.subarray(32)), decipher.final()]);
   }

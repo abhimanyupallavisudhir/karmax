@@ -99,9 +99,9 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-'));
   });
 
-  it('stores secrets encrypted at rest and resolves only with capability', () => {
+  it('stores secrets encrypted at rest and resolves only with capability', async () => {
     const vault = new Vault(dir);
-    vault.put('openai', 'sk-secret-123');
+    (await vault.put('openai', 'sk-secret-123'));
     // raw file never contains the plaintext secret
     const raw = fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8');
     expect(raw).not.toContain('sk-secret-123');
@@ -118,16 +118,16 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
     expect(log[1]!.granted).toBe(false);
   });
 
-  it('write-back of a newly created account is resolvable later', () => {
+  it('write-back of a newly created account is resolvable later', async () => {
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle('new-acct', 'pw-xyz');
+    (await broker.registerHandle('new-acct', 'pw-xyz'));
     expect(broker.resolve('new-acct', { caps: ['use-credential:*'] })).toBe('pw-xyz');
   });
 
-  it('renames and rotates a handle without leaving the old credential behind', () => {
+  it('renames and rotates a handle without leaving the old credential behind', async () => {
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle('openrouter:old', 'old-secret');
-    broker.updateHandle('openrouter:old', 'openrouter:new', 'new-secret');
+    (await broker.registerHandle('openrouter:old', 'old-secret'));
+    (await broker.updateHandle('openrouter:old', 'openrouter:new', 'new-secret'));
     expect(broker.hasHandle('openrouter:old')).toBe(false);
     expect(broker.resolve('openrouter:new', { caps: ['use-credential:*'] })).toBe('new-secret');
   });

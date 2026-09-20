@@ -89,7 +89,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>) {
-    const key = this.key(attachment.organizationId);
+    const key = await this.key(attachment.organizationId);
     const storageLocationId = this.storageLocations
       ? (await this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId)).id
       : attachment.storageLocationId;
@@ -154,7 +154,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   /** One shared streaming integrity check for restore and verification. */
   private async *readFile(revision: ResourceRevision, file: SnapshotFile): AsyncIterable<Buffer> {
     const attachment = (await this.attachmentFor(revision));
-    const key = this.key(attachment.organizationId, false);
+    const key = await this.key(attachment.organizationId, false);
     const objects = (await this.objectsForRevision(revision));
     const digest = crypto.createHash('sha256');
     let bytes = 0;
@@ -210,7 +210,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
       throw new Error('resource reference does not match revision');
     const encrypted = await (await this.objectsForRevision(revision, ref)).get(ref.objectKey);
     if (sha256(encrypted) !== ref.sha256) throw new Error('resource manifest integrity mismatch');
-    const manifest = JSON.parse(openRandom(this.key(attachment.organizationId, false), encrypted).toString('utf8')) as SnapshotManifest;
+    const manifest = JSON.parse(openRandom(await this.key(attachment.organizationId, false), encrypted).toString('utf8')) as SnapshotManifest;
     if (manifest.version !== 1 || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
       throw new Error('resource manifest does not match its revision');
     if (!Array.isArray(manifest.files) || manifest.files.length !== (revision.files ?? manifest.files.length)
@@ -264,10 +264,10 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     return locationId && this.storageLocations ? (await this.storageLocations.objectStore(locationId)) : this.objects;
   }
 
-  private key(organizationId: string, create = true): Buffer {
+  private async key(organizationId: string, create = true): Promise<Buffer> {
     const handle = `${RESOURCE_KEY_PREFIX}${organizationId}`;
     if (!create && !this.broker.hasHandle(handle)) throw new Error('resource key unavailable');
-    if (!this.broker.hasHandle(handle)) this.broker.registerHandle(handle, crypto.randomBytes(32).toString('base64'));
+    if (!this.broker.hasHandle(handle)) await this.broker.ensureHandle(handle, crypto.randomBytes(32).toString('base64'));
     return Buffer.from(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
   }
 }
@@ -420,11 +420,11 @@ export class ProjectResourceService {
 
   /** Store generated per-world service endpoints behind opaque vault handles.
    * World metadata may be durable; connection strings and tokens may not be. */
-  registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>): WorldHandle {
+  async registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>): Promise<WorldHandle> {
     const refs: Record<string, string> = {};
     for (const [name, value] of Object.entries(values)) {
       const ref = `world-service:${handle.id}:${handle.generation ?? 1}:${name}`;
-      this.broker.registerHandle(ref, value);
+      (await this.broker.registerHandle(ref, value));
       refs[name] = ref;
     }
     return { ...handle, meta: { ...handle.meta,
@@ -491,7 +491,7 @@ export class ProjectResourceService {
     const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object')
       for (const value of Object.values(serviceHandles as Record<string, unknown>))
-        if (typeof value === 'string') this.broker.deleteHandle(value);
+        if (typeof value === 'string') (await this.broker.deleteHandle(value));
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       // Read-only projections remove write permission recursively. Restore owner
@@ -572,13 +572,13 @@ export class ProjectResourceService {
                   && attachment.target.name === value.name);
                 if (existing) { result.reused.push(value.name); continue; }
                 const id = newId('resource'), handle = `resource:${id}:credential`;
-                this.broker.registerHandle(handle, value.value);
+                (await this.broker.registerHandle(handle, value.value));
                 try {
                   (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                     projectId: project.id, name: value.name, driver: 'secret@1',
                     target: { kind: 'environment', name: value.name }, access: 'read', isolation: 'fork',
                     source: sourceRecord, credentialHandles: [handle], publish: 'discard' }));
-                } catch (error) { this.broker.deleteHandle(handle); throw error; }
+                } catch (error) { (await this.broker.deleteHandle(handle)); throw error; }
                 created.push(id); result.environmentSecrets.push(value.name);
               }
               continue;
@@ -588,13 +588,13 @@ export class ProjectResourceService {
             if (existing) { result.reused.push(target); continue; }
             if (data && !data.includes(0)) {
               const id = newId('resource'), handle = `resource:${id}:credential`;
-              this.broker.registerHandle(handle, data.toString('utf8'));
+              (await this.broker.registerHandle(handle, data.toString('utf8')));
               try {
                 (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                   projectId: project.id, name: copyGlobSecretName(entry.name), driver: 'secret@1',
                   target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
                   source: sourceRecord, credentialHandles: [handle], publish: 'discard' }));
-              } catch (error) { this.broker.deleteHandle(handle); throw error; }
+              } catch (error) { (await this.broker.deleteHandle(handle)); throw error; }
               created.push(id); result.fileSecrets.push(target);
             } else {
               const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!,
@@ -634,7 +634,7 @@ export class ProjectResourceService {
     // projection must not destroy the underlying credential, which may already
     // control a live external account or be used by another project.
     if (typeof attachment.source.vaultItemId !== 'string')
-      for (const handle of attachment.credentialHandles) this.broker.deleteHandle(handle);
+      for (const handle of attachment.credentialHandles) (await this.broker.deleteHandle(handle));
     (await this.store.deleteResourceAttachment(attachmentId));
   }
 
@@ -645,8 +645,8 @@ export class ProjectResourceService {
     (await this.store.kvDelete(`project-services:${projectId}`));
   }
 
-  deleteOrganizationKey(organizationId: string): void {
-    this.broker.deleteHandle(`${RESOURCE_KEY_PREFIX}${organizationId}`);
+  async deleteOrganizationKey(organizationId: string): Promise<void> {
+    (await this.broker.deleteHandle(`${RESOURCE_KEY_PREFIX}${organizationId}`));
   }
 
   /** Stage a declared non-secret path from the caller's current generation.

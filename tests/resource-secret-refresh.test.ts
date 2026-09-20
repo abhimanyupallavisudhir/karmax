@@ -35,7 +35,7 @@ describe('existing world secret refresh', () => {
     await world?.destroy(); (await store?.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
   async function add(name = 'REFRESH_TEST_TOKEN', projectId = project.id) {
-    const credential = `resource:test:${name}`; broker.registerHandle(credential, 'fixture-value');
+    const credential = `resource:test:${name}`; (await broker.registerHandle(credential, 'fixture-value'));
     return (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId, name,
       driver: 'secret@1', target: { kind: 'environment', name }, access: 'read', isolation: 'fork',
       source: {}, credentialHandles: [credential], publish: 'discard' }));
@@ -75,10 +75,10 @@ describe('existing world secret refresh', () => {
   });
 
   it('retries a broker failure without persisting values or silently skipping the secret', async () => {
-    const secret = (await add()); broker.deleteHandle(secret.credentialHandles[0]!);
+    const secret = (await add()); (await broker.deleteHandle(secret.credentialHandles[0]!));
     await expect(resources.prepare(world)).rejects.toThrow();
     expect((await store.listResourceLeases(world.handle.id))).toEqual([]);
-    broker.registerHandle(secret.credentialHandles[0]!, 'fixture-value');
+    (await broker.registerHandle(secret.credentialHandles[0]!, 'fixture-value'));
     expect(await present(await resources.prepare(world))).toBe('true');
     expect(JSON.stringify((await store.auditSince()))).not.toContain('fixture-value');
     expect(JSON.stringify((await store.listResourceLeases(world.handle.id)))).not.toContain('fixture-value');

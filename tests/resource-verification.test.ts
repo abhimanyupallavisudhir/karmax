@@ -127,7 +127,7 @@ describe('historical snapshot byte verification', () => {
     try {
       const revision = await f.service.importFiles(f.resource.id, [{ path: 'file', data: Buffer.from('original') }]);
       const handle = `resource-store:key:${f.project.organizationId}`;
-      f.broker.deleteHandle(handle);
+      (await f.broker.deleteHandle(handle));
       expect(await f.service.verifyRevision(f.project.id, f.resource.id, revision.id))
         .toMatchObject({ status: 'failed', manifestVerified: false, verifiedFiles: 0 });
       expect(f.broker.hasHandle(handle)).toBe(false);

@@ -106,9 +106,9 @@ export class McpConnections {
           secrets = validateSecrets({ ...Object.fromEntries(Object.entries(old).filter(([key]) => keep.includes(key))), ...secrets }, transport.type === 'stdio');
         }
       }
-      if (changed || auth === 'none') { this.broker.deleteHandle(this.handle(connection.id)); connection.secretNames = []; }
+      if (changed || auth === 'none') { (await this.broker.deleteHandle(this.handle(connection.id))); connection.secretNames = []; }
       if (secrets) {
-        this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets));
+        (await this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets)));
         connection.secretNames = Object.keys(secrets);
       }
       const connections = (await this.all()).filter((c) => c.id !== connection.id);
@@ -124,7 +124,7 @@ export class McpConnections {
       const c = (await this.get(id, projectId));
       if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
       (await this.store.setSettings(this.key(), 'mcp', { connections: (await this.all()).filter((v) => v.id !== id) }));
-      this.broker.deleteHandle(this.handle(id));
+      (await this.broker.deleteHandle(this.handle(id)));
     });
   }
 
@@ -136,7 +136,7 @@ export class McpConnections {
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {
       if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
-      this.broker.registerHandle(this.handle(c.id), JSON.stringify(value));
+      (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)));
     });
   }
   async selected(ids: string[], projectId: string): Promise<McpConnection[]> {

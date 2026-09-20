@@ -275,9 +275,9 @@ export class VaultCardProvider implements PaymentProvider {
       currency: (spec.currency ?? 'usd').toLowerCase(), status: 'active',
       last4: details.number.slice(-4), createdAt: Date.now(),
     };
-    this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details));
+    (await this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details)));
     try { (await this.store.createCard(card)); }
-    catch (error) { this.broker.deleteHandle(cardSecretHandle(card.id)); throw error; }
+    catch (error) { (await this.broker.deleteHandle(cardSecretHandle(card.id))); throw error; }
     return card;
   }
   async getCard(cardId: string): Promise<Card | undefined> {
@@ -327,7 +327,7 @@ export class VaultCardProvider implements PaymentProvider {
   /** Revoking must destroy the secret, not just hide the row. */
   async revoke(cardId: string): Promise<void> {
     if (!await this.getCard(cardId)) throw new Error('no such card');
-    this.broker.deleteHandle(cardSecretHandle(cardId));
+    (await this.broker.deleteHandle(cardSecretHandle(cardId)));
     (await this.store.updateCard(cardId, { status: 'canceled', available: 0 }));
   }
 }
@@ -410,8 +410,8 @@ export class StripeIssuingProvider implements PaymentProvider {
     if (!secretKey && !this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))
       throw new Error('Stripe secret key is required');
     (await store.kvSet(STRIPE_CLIENT_ID_KEY, clientId));
-    if (secretKey) this.broker.registerHandle(STRIPE_SECRET_KEY_HANDLE, secretKey);
-    if (webhookSecret) this.broker.registerHandle(STRIPE_WEBHOOK_SECRET_HANDLE, webhookSecret);
+    if (secretKey) (await this.broker.registerHandle(STRIPE_SECRET_KEY_HANDLE, secretKey));
+    if (webhookSecret) (await this.broker.registerHandle(STRIPE_WEBHOOK_SECRET_HANDLE, webhookSecret));
     return (await this.platformStatus());
   }
   private requireStore(): Store {

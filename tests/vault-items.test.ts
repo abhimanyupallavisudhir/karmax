@@ -116,7 +116,7 @@ describe('vault usage frequency', () => {
     expect((await items.get(item.id))?.useCount).toBe(0);
     (await items.resolveField(item, 'password', { mode: 'use' }));
     expect((await items.get(item.id))?.useCount).toBe(1);
-    broker.deleteHandle(itemHandle(item.id, 'password'));
+    (await broker.deleteHandle(itemHandle(item.id, 'password')));
     await expect((async () => (await items.resolveField(item, 'password', { mode: 'use' })))()).rejects.toThrow();
     expect((await items.get(item.id))?.useCount).toBe(1);
   });

@@ -80,8 +80,8 @@ export class StorageLocationService {
     const handle = existing?.credentialHandle ?? `storage:${id}:s3`;
     if (input.accessKeyId || input.secretAccessKey) {
       if (!input.accessKeyId || !input.secretAccessKey) throw new Error('both S3 access key fields are required');
-      this.broker.registerHandle(handle, JSON.stringify({ accessKeyId: input.accessKeyId,
-        secretAccessKey: input.secretAccessKey, sessionToken: input.sessionToken }));
+      (await this.broker.registerHandle(handle, JSON.stringify({ accessKeyId: input.accessKeyId,
+        secretAccessKey: input.secretAccessKey, sessionToken: input.sessionToken })));
     } else if (!this.broker.hasHandle(handle)) throw new Error('S3 access key is required');
     const value = (await this.store.saveStorageLocation({ id, organizationId, name: input.name.trim() || 'Customer S3', kind: 's3',
       config: { endpoint, bucket, region: input.region?.trim() || 'us-east-1', prefix }, credentialHandle: handle,
@@ -132,7 +132,7 @@ export class StorageLocationService {
     const location = (await this.ownedLocation(organizationId, id));
     if (location.kind === 'managed') throw new Error('managed storage cannot be removed');
     (await this.store.deleteStorageLocation(id));
-    if (location.credentialHandle) this.broker.deleteHandle(location.credentialHandle);
+    if (location.credentialHandle) (await this.broker.deleteHandle(location.credentialHandle));
     this.stores.delete(id);
   }
 

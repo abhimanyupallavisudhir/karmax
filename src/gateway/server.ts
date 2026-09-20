@@ -2401,13 +2401,13 @@ export class Gateway {
         const storageLocations = this.deps.resources?.storageLocationService();
         for (const location of (await storageLocations?.list(organizationId)) ?? [])
           if (location.kind === 's3') (await storageLocations!.delete(organizationId, location.id));
-        this.deps.resources?.deleteOrganizationKey(organizationId);
+        await this.deps.resources?.deleteOrganizationKey(organizationId);
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
         const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
         for (const profile of (await gitProfiles.list())) (await gitProfiles.delete(profile.name));
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
-          this.deps.broker?.deleteHandle(handle);
+          (await this.deps.broker?.deleteHandle(handle));
         this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
         (await store.deleteOrganization(organizationId));
@@ -3547,7 +3547,7 @@ export class Gateway {
                 resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
               if (existing) {
                 const handle = existing.credentialHandles[0] ?? `resource:${existing.id}:credential`;
-                if (entry.value) this.deps.broker.registerHandle(handle, entry.value);
+                if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value));
                 saved.push((await store.updateResourceAttachment(existing.id, {
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
                   credentialHandles: [handle], enabled: true,
@@ -3555,7 +3555,7 @@ export class Gateway {
               } else {
                 if (!entry.value) continue;
                 const id = newId('resource'), handle = `resource:${id}:credential`;
-                this.deps.broker.registerHandle(handle, entry.value);
+                (await this.deps.broker.registerHandle(handle, entry.value));
                 saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
                   projectId: project.id, name: entry.name, driver: 'secret@1',
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
@@ -3721,7 +3721,7 @@ export class Gateway {
             if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
             if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
             const handle = `resource:${id}:credential`;
-            this.deps.broker.registerHandle(handle, secret);
+            (await this.deps.broker.registerHandle(handle, secret));
             credentialHandles.push(handle);
           }
           try {
@@ -3752,7 +3752,7 @@ export class Gateway {
             return this.json(res, 200, { ...redactResource((await store.getResourceAttachment(resource.id))!),
               revision: redactResourceRevision(revision) });
           } catch (error) {
-            for (const handle of credentialHandles) this.deps.broker?.deleteHandle(handle);
+            for (const handle of credentialHandles) (await this.deps.broker?.deleteHandle(handle));
             (await store.deleteResourceAttachment(id));
             return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
           }
@@ -3836,14 +3836,14 @@ export class Gateway {
                 : {}),
               ...(b.credentialHandles ? { credentialHandles: b.credentialHandles } : {}),
             }));
-            if (secretUpdate) this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value);
+            if (secretUpdate) (await this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value));
             return this.json(res, 200, redactResource(next));
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
         if (method === 'DELETE') {
           await this.deps.resources?.deleteAttachment(resource.id);
           if (!this.deps.resources) {
-            for (const handle of resource.credentialHandles) this.deps.broker?.deleteHandle(handle);
+            for (const handle of resource.credentialHandles) (await this.deps.broker?.deleteHandle(handle));
             (await store.deleteResourceAttachment(resource.id));
           }
           return this.json(res, 200, { deleted: true, resourceId: resource.id });
@@ -6396,7 +6396,7 @@ export class Gateway {
             // The provider secret (AgentMail key / IMAP password) → the vault under
             // an org-scoped handle the poller resolves; never echoed or stored raw.
             const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));
-            if (b.apiKey && this.deps.broker) this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey));
+            if (b.apiKey && this.deps.broker) (await this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey)));
             // REPLACE (not merge) so switching providers can't leave a stale field.
             const config = { ...result.config, ...(b.apiKey ? { apiKeyHandle } : {}) };
             (await this.setMailboxConfig(organizationId, config));
@@ -6435,7 +6435,7 @@ export class Gateway {
         });
         if (result.status === 'connected' && result.config) {
           const handle = 'email:outbound:auth';
-          if (b.secret && this.deps.broker) this.deps.broker.registerHandle(handle, String(b.secret));
+          if (b.secret && this.deps.broker) (await this.deps.broker.registerHandle(handle, String(b.secret)));
           // REPLACE, not merge, so switching providers can't leave a stale field.
           (await this.setOutboundEmailConfig({ ...result.config, secretHandle: handle }));
         }
@@ -6586,7 +6586,7 @@ export class Gateway {
         const handle = resourceOrganizationId === 'org_personal'
           ? `${provider}:${account}`
           : `${provider}:${resourceOrganizationId}:${account}`;
-        this.deps.broker.registerHandle(handle, String(b.apiKey));
+        (await this.deps.broker.registerHandle(handle, String(b.apiKey)));
         await this.refreshLoginPool();
         return this.json(res, 200, { handle }); // never echoes the secret
       }
@@ -6607,7 +6607,7 @@ export class Gateway {
         if (!this.deps.broker.hasHandle(handle)) return this.json(res, 404, { error: 'API key not found' });
         const credentialKey = `key:handle:${handle}`;
         if (method === 'DELETE') {
-          this.deps.broker.deleteHandle(handle);
+          (await this.deps.broker.deleteHandle(handle));
           (await this.remapCredentialPolicies(resourceOrganizationId, credentialKey));
           await this.refreshLoginPool();
           return this.json(res, 200, { ok: true });
@@ -6619,7 +6619,7 @@ export class Gateway {
         if (nextHandle !== handle && this.deps.broker.hasHandle(nextHandle))
           return this.json(res, 409, { error: `API key ${provider}:${nextAccount} already exists` });
         const replacement = b.apiKey === undefined || b.apiKey === '' ? undefined : String(b.apiKey);
-        this.deps.broker.updateHandle(handle, nextHandle, replacement);
+        (await this.deps.broker.updateHandle(handle, nextHandle, replacement));
         if (nextHandle !== handle)
           (await this.remapCredentialPolicies(resourceOrganizationId, credentialKey, `key:handle:${nextHandle}`));
         await this.refreshLoginPool();

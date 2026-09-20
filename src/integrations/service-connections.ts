@@ -97,7 +97,7 @@ export class ServiceConnections {
     // Changing projects would orphan their grants and sessions.
     for (const c of (await this.all()).filter(c => c.accountId))
       await this.remote(() => candidate.active(c.accountId!, c.toolkit));
-    this.broker.registerHandle(KEY, key.trim());
+    (await this.broker.registerHandle(KEY, key.trim()));
     this.client = candidate;
   }
   private backend() {
@@ -168,7 +168,7 @@ export class ServiceConnections {
       if (input.restart && c?.status === 'connecting' && c.accountId && await this.remote(() => this.backend().active(c!.accountId!, toolkit))) {
         c.sessionId = await this.remote(async () => this.backend().session((await this.user(c!)), toolkit, c!.accountId!));
         c.status = 'active'; c.notifiedAt = undefined;
-        this.broker.deleteHandle(PREFIX + c.id); (await this.save(c));
+        (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
         return { connection: this.view(c) };
       }
       if (!input.restart && c?.status === 'connecting' && Date.now() - c.updatedAt < TTL && this.broker.hasHandle(PREFIX + c.id))
@@ -181,7 +181,7 @@ export class ServiceConnections {
       if (c.accountId) {
         await this.remote(() => this.backend().disconnect(c!.accountId!));
         c.accountId = undefined; c.sessionId = undefined; c.status = 'expired'; c.notifiedAt = undefined;
-        this.broker.deleteHandle(PREFIX + c.id); (await this.save(c));
+        (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
       }
       const auth = await this.remote(async () => this.backend().authorize((await this.user(c!)), toolkit));
       const url = new URL(auth.url);
@@ -190,7 +190,7 @@ export class ServiceConnections {
       // A returned account id is trusted only because it came from our own
       // server-side authorize call; a browser callback never supplies it.
       c.accountId = auth.id; c.sessionId = undefined; c.notifiedAt = undefined; c.status = 'connecting';
-      this.broker.registerHandle(PREFIX + c.id, auth.url);
+      (await this.broker.registerHandle(PREFIX + c.id, auth.url));
       (await this.save(c));
       return { connection: this.view(c), url: auth.url };
     });
@@ -203,11 +203,11 @@ export class ServiceConnections {
       if (active && c.status === 'connecting') {
         c.sessionId = await this.remote(async () => this.backend().session((await this.user(c)), c.toolkit, c.accountId!));
         c.status = 'active'; c.notifiedAt = undefined;
-        this.broker.deleteHandle(PREFIX + c.id);
+        (await this.broker.deleteHandle(PREFIX + c.id));
         (await this.save(c));
       } else if (!active && (c.status === 'active' || Date.now() - c.updatedAt > TTL)) {
         c.status = 'expired'; c.sessionId = undefined; c.notifiedAt = undefined;
-        this.broker.deleteHandle(PREFIX + c.id); (await this.save(c));
+        (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
       }
       return c;
     });
@@ -230,7 +230,7 @@ export class ServiceConnections {
       // Revoke local access first, even if upstream deletion is unavailable.
       if (!['disconnected', 'denied'].includes(c.status)) c.notifiedAt = undefined;
       c.status = c.ownerId ? 'disconnected' : 'denied'; c.projectIds = []; c.sessionId = undefined;
-      (await this.save(c)); this.broker.deleteHandle(PREFIX + id);
+      (await this.save(c)); (await this.broker.deleteHandle(PREFIX + id));
       if (c.accountId) { await this.remote(() => this.backend().disconnect(c.accountId!)); c.accountId = undefined; (await this.save(c)); }
       (await this.audit(c, ownerId, 'disconnected'));
       return this.view(c);

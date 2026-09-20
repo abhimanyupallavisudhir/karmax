@@ -238,7 +238,7 @@ describe('WorktreeProvider (real git)', () => {
       name: 'Dataset', driver: 'volume@1', target: { kind: 'path', path: 'data' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
     await resources.importFiles(dataset.id, [{ path: 'packets.jsonl', data: Buffer.from('dataset') }]);
-    broker.registerHandle('resource:wiki-test', 'private-token');
+    (await broker.registerHandle('resource:wiki-test', 'private-token'));
     (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'File secret', driver: 'secret@1', target: { kind: 'path', path: '.env.local' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:wiki-test'], publish: 'discard' }));

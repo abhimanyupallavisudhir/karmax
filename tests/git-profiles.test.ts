@@ -430,7 +430,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const store2 = (await Store.create(':memory:'));
       const organization = (await store2.createOrganization({ name: 'Acme' }));
       const project = (await store2.createProject('Acme project', {}, organization.id));
-      broker.registerHandle('claude:personal-key', 'must-not-leak');
+      (await broker.registerHandle('claude:personal-key', 'must-not-leak'));
       const worlds = new WorldRegistry();
       worlds.register(new WorktreeProvider(path.join(tmp, 'tenant-worlds')));
       const core = makeCoreActivities({
@@ -450,7 +450,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
       expect(order).not.toContain('key:handle:claude:personal-key');
 
       const organizationHandle = `claude:${organization.id}:work`;
-      broker.registerHandle(organizationHandle, 'tenant-key');
+      (await broker.registerHandle(organizationHandle, 'tenant-key'));
       (await store2.upsertProfile({
         id: 'do-default',
         name: 'Do',

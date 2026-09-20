@@ -152,11 +152,11 @@ async function main() {
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
+    (await broker.ensureHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n')));
   if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
-    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET);
+    (await broker.ensureHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET));
   if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET);
+    (await broker.ensureHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET));
   // One deployment App owns repository installations and user OAuth. Environment
   // values remain an upgrade/enterprise bootstrap path; the normal path is the
   // browser manifest, whose converted client credentials persist in Store/Vault.

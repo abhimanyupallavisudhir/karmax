@@ -16,7 +16,7 @@ describe('GitHub App integration', () => {
     const broker = new CredentialBroker(new Vault(dir));
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
     let appPermissions: Record<string, string> = { contents: 'write' };
     let installationPermissions: Record<string, string> = { contents: 'write' };
     const fakeFetch = async (input: string | URL | Request) => {
@@ -73,7 +73,7 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-permission-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
       if (url.pathname === '/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
@@ -101,7 +101,7 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-accounts-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
       if (url.pathname === '/login/oauth/access_token') {
@@ -203,7 +203,7 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-signin-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
       if (url.pathname === '/user' && String((init.headers as Record<string, string>)?.authorization) === 'Bearer sign-in-token')
@@ -258,8 +258,8 @@ describe('GitHub App integration', () => {
     const broker = new CredentialBroker(new Vault(dir));
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-    broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'user-token' }));
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    (await broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'user-token' })));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
@@ -309,14 +309,14 @@ describe('GitHub App integration', () => {
     const broker = new CredentialBroker(new Vault(dir));
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     // A token whose recorded expiry is hours away — karmax's own clock trusts it —
     // but which GitHub has already invalidated (revoked / secret rotation / a
     // refresh chain consumed by a concurrent instance). Its refresh token is live.
     const handle = 'github-app:user:owner:authorization';
-    broker.registerHandle(handle, JSON.stringify({ accessToken: 'dead-token',
-      expiresAt: Date.now() + 7 * 3600_000, refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'dead-token',
+      expiresAt: Date.now() + 7 * 3600_000, refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 })));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
@@ -359,10 +359,10 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-revoked-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const handle = 'github-app:user:owner:authorization';
-    broker.registerHandle(handle, JSON.stringify({ accessToken: 'dead-token',
-      expiresAt: Date.now() + 7 * 3600_000, refreshToken: 'dead-refresh', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'dead-token',
+      expiresAt: Date.now() + 7 * 3600_000, refreshToken: 'dead-refresh', refreshExpiresAt: Date.now() + 180 * 86_400_000 })));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
@@ -402,10 +402,10 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-singleflight-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const handle = 'github-app:user:owner:authorization';
-    broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
-      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 })));
     let refreshes = 0;
     const fakeFetch = async (input: string | URL | Request) => {
       const url = new URL(String(input));
@@ -435,16 +435,16 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-contention-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const handle = 'github-app:user:owner:authorization';
-    broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
-      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 })));
     const replacement = JSON.stringify({ accessToken: 'other-instance-token', expiresAt: Date.now() + 28_800_000,
       refreshToken: 'refresh-2', refreshExpiresAt: Date.now() + 180 * 86_400_000 });
     const fakeFetch = async (input: string | URL | Request) => {
       const url = new URL(String(input));
       if (url.pathname === '/login/oauth/access_token') {
-        broker.registerHandle(handle, replacement);
+        (await broker.registerHandle(handle, replacement));
         return Response.json({ error: 'bad_refresh_token',
           error_description: 'The refresh token passed is incorrect or expired.' });
       }
@@ -467,10 +467,10 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-diagnostic-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret'));
     const handle = 'github-app:user:owner:authorization';
-    broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
-      refreshToken: 'sensitive-refresh-token', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'sensitive-refresh-token', refreshExpiresAt: Date.now() + 180 * 86_400_000 })));
     const fakeFetch = async () => new Response('provider body must not be persisted', { status: 503 });
     const service = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
 
@@ -493,8 +493,8 @@ describe('GitHub App integration', () => {
     const broker = new CredentialBroker(new Vault(dir));
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret');
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret'));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     let repositories = [{ id: 7, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
       default_branch: 'main', owner: { login: 'acme' } }];
@@ -549,7 +549,7 @@ describe('GitHub App integration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-pr-hook-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret');
+    (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret'));
     const organization = (await store.createOrganization({ name: 'Hooks', ownerUserId: 'owner' }));
     (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
@@ -677,7 +677,7 @@ describe('GitHub App integration', () => {
     const broker = new CredentialBroker(new Vault(dir));
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
     const organization = (await store.createOrganization({ name: 'Migration', ownerUserId: 'owner' }));
     const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '9', accountLogin: 'acme', accountType: 'Organization' }));
@@ -686,8 +686,8 @@ describe('GitHub App integration', () => {
       defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
     const cloneHandle = `github:repository:${repository.id}:clone`;
     const writeHandle = `github:repository:${repository.id}:write`;
-    broker.registerHandle(cloneHandle, 'OLD-CLONE-KEY');
-    broker.registerHandle(writeHandle, 'OLD-WRITE-KEY');
+    (await broker.registerHandle(cloneHandle, 'OLD-CLONE-KEY'));
+    (await broker.registerHandle(writeHandle, 'OLD-WRITE-KEY'));
     (await store.setRepositoryDeployKeys({ repositoryId: repository.id, cloneKeyId: '201',
       writeKeyId: '202', cloneHandle, writeHandle }));
     const deleted: string[] = [];
@@ -722,8 +722,8 @@ describe('GitHub App failure and suspension handling', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-fail-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa());
-    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret');
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa()));
+    (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret'));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'karmax-test',
       fetch: ((input: any, init: RequestInit = {}) => fetcher(new URL(String(input)), init)) as typeof fetch,
@@ -788,8 +788,8 @@ describe('GitHub App failure and suspension handling', () => {
     const repository = (await h.store.upsertRepository({ organizationId: h.organization.id, provider: 'github',
       providerId: '7', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
       defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
-    h.broker.registerHandle(`repokey:${repository.id}:clone`, 'CLONE');
-    h.broker.registerHandle(`repokey:${repository.id}:write`, 'WRITE');
+    (await h.broker.registerHandle(`repokey:${repository.id}:clone`, 'CLONE'));
+    (await h.broker.registerHandle(`repokey:${repository.id}:write`, 'WRITE'));
     (await h.store.setRepositoryDeployKeys({ repositoryId: repository.id, cloneKeyId: '1', writeKeyId: '2',
       cloneHandle: `repokey:${repository.id}:clone`, writeHandle: `repokey:${repository.id}:write` }));
 
@@ -808,7 +808,7 @@ describe('GitHub App failure and suspension handling', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-retry-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa());
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa()));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const service = (await GitHubAppService.create(store, broker, { appId: '123',
       sleep: async (ms) => { waits.push(ms); },
@@ -907,7 +907,7 @@ describe('GitHub App failure and suspension handling', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-tokcache-'));
     const store = (await Store.create(':memory:'));
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa());
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa()));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const service = (await GitHubAppService.create(store, broker, { appId: '123', fetch: (async (input: any) => {
       if (new URL(String(input)).pathname.endsWith('/access_tokens')) {

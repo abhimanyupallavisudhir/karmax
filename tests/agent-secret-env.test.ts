@@ -30,7 +30,7 @@ describe('agent project-secret delivery', () => {
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const credential = 'resource:test:agent-token';
-    broker.registerHandle(credential, 'secret-project-token');
+    (await broker.registerHandle(credential, 'secret-project-token'));
     const initial = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Agent token', driver: 'secret@1', target: { kind: 'environment', name: 'PROJECT_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [credential], publish: 'discard' }));
@@ -46,7 +46,7 @@ describe('agent project-secret delivery', () => {
     const core = makeCoreActivities({ store, worlds, resources, broker,
       adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });
     let handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
-    const serviceHandle = resources.registerServiceEnvironment(handle, { DATABASE_URL: 'postgres://task-service' });
+    const serviceHandle = await resources.registerServiceEnvironment(handle, { DATABASE_URL: 'postgres://task-service' });
     handle = (await store.updateWorldMeta(handle, {
       serviceEnvironmentHandles: serviceHandle.meta?.serviceEnvironmentHandles,
     }));
@@ -64,7 +64,7 @@ describe('agent project-secret delivery', () => {
       });
       // A resumed turn opens the same world, without materializing its files again.
       const lateHandle = 'resource:test:late-token';
-      broker.registerHandle(lateHandle, 'late-project-token');
+      (await broker.registerHandle(lateHandle, 'late-project-token'));
       const late = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
         name: 'Late token', driver: 'secret@1', target: { kind: 'environment', name: 'LATE_TOKEN' },
         access: 'read', isolation: 'fork', source: {}, credentialHandles: [lateHandle], publish: 'discard' }));
@@ -78,7 +78,7 @@ describe('agent project-secret delivery', () => {
       await resume();
       expect((await store.listResourceLeases(handle.id, handle.generation))).toEqual(leases);
       (await store.updateResourceAttachment(initial.id, { enabled: false }));
-      broker.registerHandle(lateHandle, 'rotated-project-token');
+      (await broker.registerHandle(lateHandle, 'rotated-project-token'));
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service', LATE_TOKEN: 'rotated-project-token' });
       (await store.updateResourceLease(leases.find((lease) => lease.attachmentId === late.id)!.id, 'released'));

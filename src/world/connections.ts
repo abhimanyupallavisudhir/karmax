@@ -44,7 +44,7 @@ export class WorldProviderConnectionService {
     // endpoint must leave the previous working credential/config untouched.
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) });
     const key = input.apiKey?.trim();
-    if (key) this.broker.registerHandle(handle, key);
+    if (key) (await this.broker.registerHandle(handle, key));
     if (!key && !this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
     const value = (await this.store.upsertWorldProviderConnection({
       organizationId: input.organizationId,
@@ -112,7 +112,7 @@ export class WorldProviderConnectionService {
 
   async delete(organizationId: string, provider: string): Promise<WorldProviderConnection | undefined> {
     const value = (await this.store.deleteWorldProviderConnection(organizationId, provider));
-    if (value) this.broker.deleteHandle(value.credentialHandle);
+    if (value) (await this.broker.deleteHandle(value.credentialHandle));
     return value;
   }
 

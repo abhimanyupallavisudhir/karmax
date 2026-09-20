@@ -69,14 +69,14 @@ describe('project resources', () => {
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
     const initial = await resources.importFiles(volume.id, [{ path: 'model.bin', data: Buffer.from('base-model') }]);
     const secretHandle = `resource:test:token`;
-    broker.registerHandle(secretHandle, 'secret-token');
+    (await broker.registerHandle(secretHandle, 'secret-token'));
     (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Training token', driver: 'secret@1', target: { kind: 'environment', name: 'TRAINING_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [secretHandle], publish: 'discard' }));
 
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = await resources.materialize(project.id, task.id, world, 1);
-    world.handle = resources.registerServiceEnvironment(world.handle,
+    world.handle = await resources.registerServiceEnvironment(world.handle,
       { DATABASE_URL: 'postgres://private-per-world-endpoint' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     expect(await world.readFile('resources/model/model.bin')).toBe('base-model');
@@ -272,7 +272,7 @@ describe('project resources', () => {
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
 
     const handle = itemHandle('vi_generated', 'secret');
-    broker.registerHandle(handle, 'generated-api-key');
+    (await broker.registerHandle(handle, 'generated-api-key'));
     const credential = await resources.proposeCredential(task.id, {
       itemId: 'vi_generated', field: 'secret', credentialHandle: handle, name: 'Generated API key',
       driver: 'secret@1', target: { kind: 'environment', name: 'GENERATED_API_KEY' }, access: 'read',
@@ -297,7 +297,7 @@ describe('project resources', () => {
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
-    const handle = itemHandle('vi_agent_key', 'secret'); broker.registerHandle(handle, 'sk-agent-created');
+    const handle = itemHandle('vi_agent_key', 'secret'); (await broker.registerHandle(handle, 'sk-agent-created'));
     const proposed = await resources.proposeCredential(task.id, {
       itemId: 'vi_agent_key', field: 'secret', credentialHandle: handle, name: 'Agent API key', driver: 'secret@1',
       target: { kind: 'environment', name: 'AGENT_API_KEY' }, access: 'read',

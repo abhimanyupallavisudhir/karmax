@@ -644,7 +644,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     };
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    (await h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
     const githubApp = (await GitHubAppService.create(h.store, h.broker,
       { appId: '1', fetch: fakeFetch as typeof fetch }));
     await githubApp.adoptUserAuthorization('delegator', '42', { accessToken: 'pinned-token' });

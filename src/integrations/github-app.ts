@@ -430,9 +430,9 @@ export class GitHubAppService {
     (await this.store.kvSet(GITHUB_APP_ID_KEY, appId));
     (await this.store.kvSet(GITHUB_APP_SLUG_KEY, appSlug));
     if (this.options.clientId) (await this.store.kvSet(GITHUB_APP_CLIENT_ID_KEY, this.options.clientId));
-    this.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, input.privateKey);
-    if (input.webhookSecret) this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret);
-    if (input.clientSecret) this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret);
+    (await this.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, input.privateKey));
+    if (input.webhookSecret) (await this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret));
+    if (input.clientSecret) (await this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret));
     this.tokenCache.clear();
     return (await this.status());
   }
@@ -514,7 +514,7 @@ export class GitHubAppService {
     const identity = await this.identityForToken(String(value.access_token));
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
-    this.saveUserToken(userId, identity.id, value);
+    await this.saveUserToken(userId, identity.id, value);
     (await this.clearUserAuthorizationFailure(userId, identity.id));
     (await this.clearUserAuthorizationFailure(userId));
     (await this.saveUserIdentity(userId, identity, options.makeActive));
@@ -532,12 +532,12 @@ export class GitHubAppService {
     const identity = await this.identityForToken(authorization.accessToken);
     if (identity.id !== expectedAccountId)
       throw new Error(`GitHub signed in as @${identity.login}, but returned a mismatched account id`);
-    this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
+    (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
       accessToken: authorization.accessToken,
       ...(authorization.accessTokenExpiresAt ? { expiresAt: authorization.accessTokenExpiresAt.getTime() } : {}),
       ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
       ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
-    }));
+    })));
     (await this.clearUserAuthorizationFailure(userId, identity.id));
     (await this.clearUserAuthorizationFailure(userId));
     (await this.saveUserIdentity(userId, identity, false));
@@ -700,7 +700,7 @@ export class GitHubAppService {
     const accounts = await this.listUserAccounts(userId);
     if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
     if (accounts.length <= 1) throw new Error('Connect a new GitHub account first');
-    this.broker.deleteHandle(githubUserTokenHandle(userId, accountId));
+    (await this.broker.deleteHandle(githubUserTokenHandle(userId, accountId)));
     (await this.clearUserAuthorizationFailure(userId, accountId));
     const remaining = accounts.filter((account) => account.id !== accountId);
     (await this.saveUserAccounts(userId, remaining));
@@ -1241,8 +1241,8 @@ export class GitHubAppService {
           await this.deleteDeployKey(repository, keys.cloneKeyId, token);
           await this.deleteDeployKey(repository, keys.writeKeyId, token);
         }
-        this.broker.deleteHandle(keys.cloneHandle);
-        this.broker.deleteHandle(keys.writeHandle);
+        (await this.broker.deleteHandle(keys.cloneHandle));
+        (await this.broker.deleteHandle(keys.writeHandle));
         (await this.store.clearRepositoryDeployKeys(repository.id));
       }
       this.tokenCache.delete(connection.id);
@@ -1257,8 +1257,8 @@ export class GitHubAppService {
     if (!keys) return;
     await this.deleteDeployKey(repository, keys.cloneKeyId, installationToken);
     await this.deleteDeployKey(repository, keys.writeKeyId, installationToken);
-    this.broker.deleteHandle(keys.cloneHandle);
-    this.broker.deleteHandle(keys.writeHandle);
+    (await this.broker.deleteHandle(keys.cloneHandle));
+    (await this.broker.deleteHandle(keys.writeHandle));
     (await this.store.clearRepositoryDeployKeys(repository.id));
   }
 
@@ -1269,8 +1269,8 @@ export class GitHubAppService {
         this.deleteDeployKey(repository, keys.cloneKeyId, installationToken),
         this.deleteDeployKey(repository, keys.writeKeyId, installationToken),
       ].map((promise) => promise.catch(() => undefined)));
-      this.broker.deleteHandle(keys.cloneHandle);
-      this.broker.deleteHandle(keys.writeHandle);
+      (await this.broker.deleteHandle(keys.cloneHandle));
+      (await this.broker.deleteHandle(keys.writeHandle));
       (await this.store.clearRepositoryDeployKeys(repository.id));
     }
     (await this.store.deleteRepository(repository.id));
@@ -1375,18 +1375,18 @@ export class GitHubAppService {
     }
   }
 
-  private saveUserToken(userId: string, accountId: string, value: any): void {
-    this.saveTokenHandle(githubUserTokenHandle(userId, accountId), value);
+  private async saveUserToken(userId: string, accountId: string, value: any): Promise<void> {
+    await this.saveTokenHandle(githubUserTokenHandle(userId, accountId), value);
   }
 
-  private saveTokenHandle(handle: string, value: any): void {
+  private async saveTokenHandle(handle: string, value: any): Promise<void> {
     const now = Date.now();
-    this.broker.registerHandle(handle, JSON.stringify({
+    (await this.broker.registerHandle(handle, JSON.stringify({
       accessToken: String(value.access_token),
       expiresAt: value.expires_in ? now + Number(value.expires_in) * 1000 : undefined,
       refreshToken: value.refresh_token ? String(value.refresh_token) : undefined,
       refreshExpiresAt: value.refresh_token_expires_in ? now + Number(value.refresh_token_expires_in) * 1000 : undefined,
-    }));
+    })));
   }
 
   private resolvedUserToken(handle: string): { raw: string; value: {
@@ -1400,11 +1400,8 @@ export class GitHubAppService {
   /** Delete only the credential whose refresh attempt failed. A different
    * process may already have rotated the single-use chain and stored its new
    * token while this request was in flight. */
-  private deleteUserTokenIfUnchanged(handle: string, observed: string): boolean {
-    const current = this.resolvedUserToken(handle);
-    if (!current || current.raw !== observed) return false;
-    this.broker.deleteHandle(handle);
-    return true;
+  private async deleteUserTokenIfUnchanged(handle: string, observed: string): Promise<boolean> {
+    return this.broker.deleteHandleIfUnchanged(handle, observed);
   }
 
   private replacementUserToken(handle: string, observed: string): string | undefined {
@@ -1447,7 +1444,7 @@ export class GitHubAppService {
         (await this.recordRefreshContentionRecovery(userId, accountId));
         return replacement;
       }
-      const deleted = this.deleteUserTokenIfUnchanged(handle, observed);
+      const deleted = await this.deleteUserTokenIfUnchanged(handle, observed);
       if (!deleted) {
         const raced = this.replacementUserToken(handle, observed);
         if (raced) {
@@ -1488,7 +1485,7 @@ export class GitHubAppService {
         (await this.recordRefreshContentionRecovery(userId, accountId, providerError));
         return replacement;
       }
-      const deleted = this.deleteUserTokenIfUnchanged(handle, observed);
+      const deleted = await this.deleteUserTokenIfUnchanged(handle, observed);
       if (!deleted) {
         const raced = this.replacementUserToken(handle, observed);
         if (raced) {
@@ -1504,7 +1501,7 @@ export class GitHubAppService {
       }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
-    this.saveTokenHandle(handle, value);
+    await this.saveTokenHandle(handle, value);
     (await this.clearUserAuthorizationFailure(userId, accountId));
     (await this.store.appendAudit({
       principalId: `user:${userId}`,
@@ -1555,11 +1552,11 @@ export class GitHubAppService {
     if (!this.broker.hasHandle(legacy)) return;
     const identity = await this.userIdentity(userId);
     const stored = this.broker.resolve(legacy, { caps: [`use-credential:${legacy}`] });
-    this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored);
+    (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored));
     const accounts = (await this.userAccounts(userId));
     (await this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), identity]));
     if (!(await this.store.kvGet(githubUserActiveAccountKey(userId)))) (await this.store.kvSet(githubUserActiveAccountKey(userId), identity.id));
-    this.broker.deleteHandle(legacy);
+    (await this.broker.deleteHandle(legacy));
   }
 
   private async oauthToken(input: Record<string, string>): Promise<any> {

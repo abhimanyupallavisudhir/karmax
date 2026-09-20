@@ -84,7 +84,7 @@ describe('hosted onboarding status API', () => {
 
     (await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'installation-1', accountLogin: 'alice', accountType: 'User' }));
-    broker.registerHandle('openai:first', 'sk-test');
+    (await broker.registerHandle('openai:first', 'sk-test'));
     (await providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b-test' }));
     (await store.createProject('First project', {}, 'org_personal'));
 
@@ -169,7 +169,7 @@ describe('hosted onboarding status API', () => {
     const userId = (await identity.listUsers())[0]!.id;
     (await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'keep-installation', accountLogin: 'alice', accountType: 'User' }));
-    broker.registerHandle('openai:first', 'sk-test');
+    (await broker.registerHandle('openai:first', 'sk-test'));
     (await providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b-test' }));
     const project = (await store.createProject('Keep my work', {}, 'org_personal'));
     expect(await (await request()).json()).toMatchObject({ complete: true, visible: false });

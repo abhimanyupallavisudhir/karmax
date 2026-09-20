@@ -39,6 +39,6 @@ export async function deleteItemConnectorWrites(store: OutboxStore, broker: Cred
   (await store.kvSet(connectorOutboxKey(organizationId), JSON.stringify(remaining)));
   for (const entry of removed) {
     if (entry.snapshotHandle && !remaining.some(other => other.snapshotHandle === entry.snapshotHandle))
-      broker?.deleteHandle(entry.snapshotHandle);
+      (await broker?.deleteHandle(entry.snapshotHandle));
   }
 }

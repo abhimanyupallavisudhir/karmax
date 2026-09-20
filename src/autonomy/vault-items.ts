@@ -307,7 +307,7 @@ export class VaultItems {
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
       if (args.secrets?.[field] === undefined || (field !== 'note' && !args.secrets[field]?.trim())) {
-        this.requireBroker().deleteHandle(itemHandle(id, field));
+        (await this.requireBroker().deleteHandle(itemHandle(id, field)));
         fields.delete(field);
       }
     }
@@ -315,12 +315,12 @@ export class VaultItems {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
       if (field === 'note' && value !== undefined) {
-        this.requireBroker().registerHandle(itemHandle(id, field), value);
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
         fields.add(field);
         continue;
       }
       if (value?.trim()) {
-        this.requireBroker().registerHandle(itemHandle(id, field), value);
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
         fields.add(field);
       }
     }
@@ -408,7 +408,7 @@ export class VaultItems {
     const item = (await this.get(id));
     (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
     (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
-    for (const field of item?.fields ?? []) this.broker?.deleteHandle(itemHandle(id, field));
+    for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
 
     });

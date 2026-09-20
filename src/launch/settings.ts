@@ -166,8 +166,8 @@ export class PaidLaunchSettingsService {
       throw new Error('Stripe secret key must be an sk_test_… or sk_live_… key');
     if (webhookSecret && !/^whsec_\S+$/.test(webhookSecret))
       throw new Error('Stripe webhook signing secret must start with whsec_');
-    if (secretKey) this.broker.registerHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey);
-    if (webhookSecret) this.broker.registerHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret);
+    if (secretKey) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey));
+    if (webhookSecret) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret));
     const next: StoredPaidLaunchSettings = {
       paidLaunch: input.paidLaunch === true,
       founderReviewedPolicyVersion: input.founderReviewed === true ? POLICY_VERSION : undefined,

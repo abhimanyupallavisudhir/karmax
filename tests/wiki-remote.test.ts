@@ -55,7 +55,7 @@ describe('project wiki remote provisioning', () => {
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' },
       publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
     // The operator's user OAuth token has expired. The App installation can
     // still mint its own short-lived token.
     const githubCalls: Array<{ path: string; method: string }> = [];
@@ -66,7 +66,7 @@ describe('project wiki remote provisioning', () => {
         return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
       return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
     };
-    broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'expired-token' }));
+    (await broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'expired-token' })));
     const githubApp = (await GitHubAppService.create(store, broker,
       { appId: '123', clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
 

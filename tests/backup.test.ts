@@ -187,16 +187,19 @@ describe('control-plane backup', () => {
     // beside the auth database — so a default backup directory is a
     // plaintext-equivalent credential bundle, not merely "portable".
     fs.writeFileSync(path.join(home, 'vault', 'vault.key'), 'KEY');
+    fs.writeFileSync(path.join(home, 'vault', 'vault.key.123.fixture.tmp'), 'CRASHED-KEY');
     fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'ciphertext');
     fs.writeFileSync(path.join(home, 'state', 'auth.db.secret'), 'AUTH');
 
     const withSecrets = await createBackup({ home, destination: path.join(root, 'a'), externalTemporal: true });
     expect(withSecrets.manifest.secretsIncluded).toBe(true);
     expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key.123.fixture.tmp'))).toBe(false);
 
     const without = await createBackup({ home, destination: path.join(root, 'b'), externalTemporal: true, excludeSecrets: true });
     expect(without.manifest.secretsIncluded).toBe(false);
     expect(fs.existsSync(path.join(root, 'b', 'payload', 'vault', 'vault.key'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'b', 'payload', 'vault', 'vault.key.123.fixture.tmp'))).toBe(false);
     expect(fs.existsSync(path.join(root, 'b', 'payload', 'state', 'auth.db.secret'))).toBe(false);
     // The ciphertext is still there, and the manifest still verifies.
     expect(without.manifest.files.map((f) => f.path)).toContain('vault/ciphertext'.replace('ciphertext', 'vault.json'));

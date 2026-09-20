@@ -177,9 +177,9 @@ export class GitProfiles {
     };
     for (const [kind, value, flag] of secrets) {
       if (kind === 'signing' && args.clearSigningKey) {
-        this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId));
+        (await this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId)));
       } else if (value?.trim()) {
-        this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim());
+        (await this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim()));
         (rec as any)[flag] = true;
       } else if (prior?.[flag] && !prior.source) {
         (rec as any)[flag] = true; // keep the existing secret
@@ -304,7 +304,7 @@ export class GitProfiles {
     if ((await this.defaultProfile()) === name) (await this.setDefault(undefined));
     if (!profile?.source) {
       for (const kind of ['ssh', 'signing', 'token'] as const) {
-        this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId));
+        (await this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId)));
       }
     }
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });

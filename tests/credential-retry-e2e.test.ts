@@ -123,11 +123,11 @@ describe('credential Retry end to end', () => {
   it('rearms enabled API keys for every harness without requiring a usage endpoint', async () => {
     const providers = ['claude', 'codex', 'kimi', 'grok', 'opencode'] as const;
     const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
-    const rows = providers.map(provider => {
+    const rows = await Promise.all(providers.map(async provider => {
       const handle = `${provider}:retry-test`;
-      h.broker.registerHandle(handle, 'test-key');
+      (await h.broker.registerHandle(handle, 'test-key'));
       return { id: `key:handle:${handle}`, provider, kind: 'key' as const, configHome: '', apiKeyHandle: handle };
-    });
+    }));
     await coordinator.registerAccounts(rows);
     for (const row of rows) await coordinator.setAccountAvailability({ accountId: row.id, status: 'needs-attention' });
     const project = (await h.store.createProject('Key retry'));

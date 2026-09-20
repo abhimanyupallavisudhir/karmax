@@ -1642,7 +1642,7 @@ export class Connectors {
       previous !== undefined &&
       gitPassRepositoryIdentity(previous) !== gitPassRepositoryIdentity(value);
     const validated = await connector.validateSecret?.(value);
-    this.broker.registerHandle(handle, value);
+    (await this.broker.registerHandle(handle, value));
     try {
       const info = validated ?? (await connector.describe());
       if (!info.available) throw new Error(info.detail);
@@ -1657,8 +1657,8 @@ export class Connectors {
         ));
       return info;
     } catch (error) {
-      if (previous === undefined) this.broker.deleteHandle(handle);
-      else this.broker.registerHandle(handle, previous);
+      if (previous === undefined) (await this.broker.deleteHandle(handle));
+      else (await this.broker.registerHandle(handle, previous));
       throw error;
     }
   }
@@ -1827,7 +1827,7 @@ export class Connectors {
     if (!remove) pending.push(write);
     (await this.store.kvSet(connectorOutboxKey(this.organizationId), JSON.stringify(pending)));
     if (remove && write.snapshotHandle && !pending.some((entry) => entry.snapshotHandle === write.snapshotHandle))
-      this.broker?.deleteHandle(write.snapshotHandle);
+      (await this.broker?.deleteHandle(write.snapshotHandle));
       });
   }
   private writeTarget(name: string): string {
@@ -1864,7 +1864,7 @@ export class Connectors {
           const value = this.items.readSecret(item, field);
           if (value !== undefined) secrets[field] = value;
         }
-        this.broker.registerHandle(
+        (await this.broker.registerHandle(
           write.snapshotHandle,
           JSON.stringify({
             externalId: write.externalId,
@@ -1875,7 +1875,7 @@ export class Connectors {
             fields: item.fields,
             secrets,
           }),
-        );
+        ));
       }
     }
     const pending = (await this.pendingWrites()).filter((entry) => entry.id !== existing?.id);
