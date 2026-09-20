@@ -8037,20 +8037,19 @@ export class Gateway {
     if (!this.deps.identity) return undefined;
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
-    if ((this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).paidLaunch && !this.deps.store.policyAcceptances(identity.user.id)
-      .some((acceptance) => acceptance.context === 'signup')) return undefined;
+    if ((this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).paidLaunch && !await this.deps.store.hasSignupAcceptanceAsync(identity.user.id)) return undefined;
     const principal = `user:${identity.user.id}`;
-    const resolvedOrganizationId = organizationId ?? (projectId ? this.deps.store.getProject(projectId)?.organizationId : undefined);
+    const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
     if (resolvedOrganizationId) {
-      const policy = this.deps.store.getOrganizationIdentityPolicy(resolvedOrganizationId);
+      const policy = await this.deps.store.getOrganizationIdentityPolicyAsync(resolvedOrganizationId);
       if (policy.enforceSso && (!policy.oidcProviderId
-        || !this.deps.identity.providersForUser(identity.user.id).includes(policy.oidcProviderId))) return undefined;
-      if (policy.enforceSso && policy.verifiedDomains.length && this.deps.store.organizationMembership(resolvedOrganizationId, identity.user.id)) {
+        || !(await this.deps.identity.providersForUserAsync(identity.user.id)).includes(policy.oidcProviderId))) return undefined;
+      if (policy.enforceSso && policy.verifiedDomains.length && await this.deps.store.hasOrganizationMembershipAsync(resolvedOrganizationId, identity.user.id)) {
         const domain = identity.user.email.split('@')[1]?.toLowerCase();
         if (!domain || !policy.verifiedDomains.includes(domain)) return undefined;
       }
     }
-    const caps = this.deps.authorization?.capabilities(principal, projectId, resolvedOrganizationId) ?? [];
+    const caps = await this.deps.authorization?.capabilitiesAsync(principal, projectId, resolvedOrganizationId) ?? [];
     const fingerprint = JSON.stringify(caps.slice().sort());
     const cacheKey = `${identity.session.id}:${resolvedOrganizationId ?? 'global'}:${projectId ?? '*'}`;
     let cached = this.identityTokens.get(cacheKey);

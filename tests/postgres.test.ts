@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Pool } from 'pg';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AuthorizationService } from '../src/platform/authorization.js';
 import { IdentityService } from '../src/auth/identity.js';
 import { openStore, Store } from '../src/store/db.js';
 import { openSqlDatabase } from '../src/store/sql.js';
@@ -39,6 +40,7 @@ integration('PostgreSQL cutover', () => {
 
   it('reads task details and review audiences without the synchronous PostgreSQL bridge', async () => {
     const store = new Store(url!);
+    const authorization = new AuthorizationService(store);
     try {
       const org = store.createOrganization({ name: 'Async audience', ownerUserId: 'owner' });
       const project = store.createProject('Detail', {}, org.id);
@@ -49,8 +51,12 @@ integration('PostgreSQL cutover', () => {
       store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
         messages: [{ id: 'm', text: 'history', role: 'agent', ts: 1 }], state: {}, actions: [], updatedAt: 1 });
       const expected = store.getTask(task.id);
+      const expectedCaps = authorization.capabilities('user:owner', project.id);
       const prepare = vi.spyOn(store.db, 'prepare').mockImplementation(() => { throw Error('blocking database access'); });
       try {
+        expect(await authorization.capabilitiesAsync('user:owner', project.id)).toEqual(expectedCaps);
+        expect(await store.getOrganizationIdentityPolicyAsync(org.id)).toMatchObject({ enforceSso: false });
+        expect(await store.hasSignupAcceptanceAsync('owner')).toBe(false);
         expect(await store.getTaskAsync(task.id)).toEqual(expected);
         expect(await store.listTasksAsync(project.id)).toEqual([expected]);
         expect((await store.listTasksAsync(project.id, false))[0]?.lastView?.messages).toBeUndefined();
@@ -61,6 +67,28 @@ integration('PostgreSQL cutover', () => {
         expect(await store.taskSnapshotAsync(task.id)).toEqual(expected?.lastView);
       } finally { prepare.mockRestore(); }
     } finally { store.close(); }
+  });
+
+  it('keeps the event loop live while a native permission lookup waits for the database', async () => {
+    const store = new Store(url!);
+    const blocker = await admin!.connect();
+    try {
+      const authorization = new AuthorizationService(store);
+      authorization.grant('root', { principalId: 'user:reader', scopeKey: 'global', profileId: 'god' });
+      store.kvSet('permission-probe', 'ready');
+      await authorization.capabilitiesAsync('user:reader');
+      await blocker.query('BEGIN');
+      await blocker.query('LOCK TABLE authorization_profiles IN ACCESS EXCLUSIVE MODE');
+      const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
+      let complete = false;
+      const reading = authorization.capabilitiesAsync('user:reader').then(caps => { complete = true; return caps; });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(complete).toBe(false);
+      expect(await store.kvGetAsync('permission-probe')).toBe('ready');
+      expect(complete).toBe(false);
+      await unlock;
+      expect(await reading).toEqual(['*']);
+    } finally { await blocker.query('ROLLBACK'); blocker.release(); store.close(); }
   });
 
   it('keeps timers and independent reads live while a task-table lock delays detail and full-list reads', async () => {
@@ -218,6 +246,7 @@ integration('PostgreSQL cutover', () => {
     const identity = await IdentityService.open(authFile, { secret, databaseUrl: url! });
     expect(identity.migration).toMatchObject({ imported: true });
     expect(identity.listUsers().map((candidate) => candidate.id)).toEqual([user.id]);
+    expect(await identity.providersForUserAsync(user.id)).toEqual(identity.providersForUser(user.id));
     expect((await identity.signIn('alice@example.com', 'correct-horse-battery')).status).toBe(200);
     const connectedStore = openStore(storeFile, url!).store;
     identity.connectOrganizationNames(() => connectedStore.organizationNameReservations());

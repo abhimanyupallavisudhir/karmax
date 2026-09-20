@@ -2124,10 +2124,16 @@ export class Store {
 
   getOrganizationIdentityPolicy(organizationId: string): OrganizationIdentityPolicy {
     const row = this.db.prepare('SELECT * FROM organization_identity_policy WHERE organizationId=?').get(organizationId) as any;
-    return row ? { organizationId, oidcProviderId: row.oidcProviderId ?? undefined,
-      verifiedDomains: JSON.parse(row.verifiedDomains), enforceSso: Boolean(row.enforceSso),
-      scimTokenId: row.scimTokenId ?? undefined, updatedAt: Number(row.updatedAt) }
-      : { organizationId, verifiedDomains: [], enforceSso: false, updatedAt: 0 };
+    return rowToOrganizationIdentityPolicy(organizationId, row);
+  }
+
+  async getOrganizationIdentityPolicyAsync(organizationId: string): Promise<OrganizationIdentityPolicy> {
+    const [row] = await this.readRows<any>('SELECT * FROM organization_identity_policy WHERE organizationId=?', [organizationId]);
+    return rowToOrganizationIdentityPolicy(organizationId, row);
+  }
+
+  async hasSignupAcceptanceAsync(userId: string): Promise<boolean> {
+    return (await this.readRows("SELECT 1 FROM policy_acceptances WHERE userId=? AND context='signup' LIMIT 1", [userId])).length > 0;
   }
 
   setOrganizationIdentityPolicy(input: { organizationId: string; oidcProviderId?: string;
@@ -4244,6 +4250,32 @@ export class Store {
   getAuthorizationProfile(scopeKey: string, id: string): any | undefined {
     const r = this.db.prepare('SELECT json FROM authorization_profiles WHERE scopeKey = ? AND id = ?').get(scopeKey, id) as any;
     return r ? { ...JSON.parse(r.json), scopeKey } : undefined;
+  }
+
+  async getAuthorizationProfileAsync(scopeKey: string, id: string): Promise<any | undefined> {
+    const [row] = await this.readRows<{ json: string }>(
+      'SELECT json FROM authorization_profiles WHERE scopeKey = ? AND id = ?', [scopeKey, id]);
+    return row ? { ...JSON.parse(row.json), scopeKey } : undefined;
+  }
+
+  async listPrincipalGrantsAsync(principalId: string): Promise<any[]> {
+    const rows = await this.readRows<{ principalId: string; scopeKey: string; json: string }>(
+      'SELECT principalId, scopeKey, json FROM principal_grants WHERE principalId = ? ORDER BY scopeKey', [principalId]);
+    return rows.map(row => ({ ...JSON.parse(row.json), principalId: row.principalId, scopeKey: row.scopeKey }));
+  }
+
+  async listProjectMembershipsAsync(projectId: string): Promise<ProjectMembership[]> {
+    const rows = await this.readRows<any>(
+      'SELECT projectId, principal, role, joinedAt FROM project_memberships WHERE projectId=? ORDER BY joinedAt', [projectId]);
+    return rows.map(row => ({ ...row, principal: JSON.parse(row.principal) }));
+  }
+
+  async hasTeamMembershipAsync(teamId: string, userId: string): Promise<boolean> {
+    return (await this.readRows('SELECT 1 FROM team_memberships WHERE teamId=? AND userId=?', [teamId, userId])).length > 0;
+  }
+
+  async hasOrganizationMembershipAsync(organizationId: string, userId: string): Promise<boolean> {
+    return (await this.readRows('SELECT 1 FROM organization_memberships WHERE organizationId=? AND userId=?', [organizationId, userId])).length > 0;
   }
 
   setAuthorizationProfile(scopeKey: string, profile: { id: string; [key: string]: unknown }): void {
@@ -6708,4 +6740,11 @@ function rowToTask(r: any): TaskRecord {
 function assertTagColor(color: string | null | undefined): void {
   if (color == null || color === '') return;
   if (!/^#[0-9a-fA-F]{3,8}$/.test(color)) throw new Error('tag color must be a hex colour like #4a90d9');
+}
+
+function rowToOrganizationIdentityPolicy(organizationId: string, row: any): OrganizationIdentityPolicy {
+  return row ? { organizationId, oidcProviderId: row.oidcProviderId ?? undefined,
+    verifiedDomains: JSON.parse(row.verifiedDomains), enforceSso: Boolean(row.enforceSso),
+    scimTokenId: row.scimTokenId ?? undefined, updatedAt: Number(row.updatedAt) }
+    : { organizationId, verifiedDomains: [], enforceSso: false, updatedAt: 0 };
 }

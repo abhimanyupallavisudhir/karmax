@@ -388,6 +388,12 @@ export class IdentityService {
     return (this.db.prepare('SELECT providerId FROM account WHERE userId=?').all(userId) as any[]).map((row) => String(row.providerId));
   }
 
+  async providersForUserAsync(userId: string): Promise<string[]> {
+    if (!this.pool) return this.providersForUser(userId);
+    const result = await this.pool.query('SELECT "providerId" FROM account WHERE "userId"=$1', [userId]);
+    return result.rows.map(row => String(row.providerId));
+  }
+
   revokeUserSessions(userId: string): void {
     this.db.prepare('DELETE FROM session WHERE userId=?').run(userId);
   }
