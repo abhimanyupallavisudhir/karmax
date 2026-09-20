@@ -200,3 +200,39 @@ observed exit. This was idle shutdown, not an active-agent drain benchmark.
 Process mode remains experimental. Cancellation/handoff compound transitions and
 primary-written config files read by the child still require review before a
 production rollout. No production deployment or new complete-suite run is claimed.
+
+
+## Shared configuration and compound lifecycle follow-up
+
+Managed MCP/model-provider files now use atomic same-directory replacement,
+preserving existing modes and symlink targets. Concurrent child readers see complete
+documents. Credential discovery tolerates organization removal during enumeration.
+This is a single managed writer contract, not multi-writer conflict resolution or
+power-loss durability.
+
+Cancellation and handoff imports now serialize their compound transitions, admit
+capacity outside the transition lock, and revalidate workflow/generation/access
+state around slow operations. Handoff rejects stale review state and releases new
+admission if it fails before opening. Busy cancellation still preserves the world
+and logs a diagnostic; immediate parking and durable retry are not guaranteed.
+
+Teardown rejects another workflow run's world, follows restored generations only
+with same-run proof, and rechecks ownership after asynchronous cleanup. Retrying a
+released world finishes lease cleanup without reopening it. Creation shares the
+transition lock and honors cancellation after acquiring it. Artifact preservation
+still precedes destructive cleanup.
+
+Before the teardown additions, the combined config/cancellation/handoff/stage/split
+application group passed **139 tests in eight files**. The real Temporal cancelled
+Review restore case also passed (27 other cases filtered). The initial handoff
+fixture used a module mock ineffective with the suite's shared module cache; it
+was replaced with a scoped spy before the passing runs. Typechecking after the
+teardown additions passed with a 1280 MiB heap.
+
+At `51aa828` (including config commit `99d6161`), the real GitHub pipeline,
+world/provider, teardown and artifact-retention group passed **71 tests in four
+files**. The final config/handoff/cancellation/teardown/split-main group passed
+**46 tests in seven files**, with PostgreSQL explicitly enabled so the full
+split-process application case ran rather than skipped. These groups overlap and
+are not a count of unique tests across runs. No latest-head complete-suite run or
+production deployment is claimed. Process mode remains experimental.
