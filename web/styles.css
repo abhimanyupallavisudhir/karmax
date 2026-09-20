@@ -435,17 +435,18 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .inbox-controls .switch input { width:30px; height:18px; }
 /* The kind sub-tabs sit under the page title, so they are not the sticky bar. */
 .inbox-tabs { position:static; }
-.inbox-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid var(--line); border-radius:var(--r); background:var(--surface); margin-bottom:7px; cursor:pointer; }
-.inbox-row.unread { border-left:3px solid var(--accent); background:var(--surface-2); }
-.inbox-kind { color:var(--accent); }
-.inbox-row.priority-high { border-left:4px solid var(--working); }
-.inbox-row.priority-critical { border-left:4px solid var(--danger); }
-.inbox-row.priority-critical.unread { background:color-mix(in srgb, var(--danger) 7%, var(--surface)); }
-.inbox-row b { overflow-wrap:anywhere; }
+/* Row border, padding, and hover/focus treatments come from .task-row. */
+.inbox-row .task-sub { flex-wrap:wrap; }
+.inbox-project { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
+.inbox-row time { font-size:12px; color:var(--ink-3); white-space:nowrap; }
+.inbox-read[aria-pressed="true"] { color:var(--merged); }
+@media (max-width: 700px) {
+  .inbox-row { grid-template-columns:auto minmax(0, 1fr); }
+  .inbox-row .task-right { grid-column:2; justify-content:flex-end; gap:10px; }
+}
 .priority-bars { letter-spacing:1px; }
 .inbox-row .urgency-chip { white-space:nowrap; }
-.inbox-row.priority-low .inbox-kind { color:var(--ink-3); }
-/* Priority uses labels, bars and an edge accent, so color is never the only cue. */
+/* Priority uses labels and bars, so color is never the only cue. */
 .urgency-chip {
   display:inline-block; padding:1px 7px; border-radius:999px;
   font-family:var(--font-mono); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em;
@@ -453,10 +454,6 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 }
 .urgency-chip.critical { background:var(--danger-weak); color:var(--danger); }
 .urgency-chip.normal, .urgency-chip.low { background:var(--surface-2); color:var(--ink-3); }
-/* Trailing the task title in a list; leading its own row in the settings table,
-   where a grid item would otherwise stretch to the full column instead of
-   hugging the word. */
-.inbox-row .urgency-chip { margin-left:8px; }
 .notify-row .urgency-chip { justify-self:start; }
 /* Per-urgency behaviour: one row per level, one column per behaviour. */
 .notify-grid { overflow-x:auto; display:grid; gap:2px; margin:6px 0 12px; }
@@ -2707,3 +2704,27 @@ html[data-theme="dark"] .github-signin-btn:active,
 .attempt-crown:hover:not(:disabled) { background: var(--accent-weak); color: var(--accent); }
 .attempt-crown:focus-visible { outline: 2px solid var(--accent); }
 .attempt-crown:disabled { cursor: default; }
+
+/* Compact task payment controls; card entry follows the order on a physical card. */
+.task-payments { display: grid; gap: 7px; margin: 12px 0; max-width: 440px; }
+.payment-cards-label, .payment-budget-row label { font-size: 12px; font-weight: 600; }
+.payment-picker { min-width: 0; }
+.payment-search { flex: 1; min-width: 90px; width: 90px; border: 0; background: transparent; outline: none; padding: 5px; }
+.payment-caret { position: absolute; right: 5px; top: 7px; border: 0; background: none; color: var(--ink-3); cursor: pointer; padding: 6px; }
+.payment-budget-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.payment-budget { width: 100px; min-width: 0; min-height: 34px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; }
+.payment-spent { color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.payment-save { justify-self: start; }
+.payment-error { color: var(--ink-3); font-size: 12px; }
+.payment-error:empty { display: none; }
+.payment-empty { display: block; padding: 10px; color: var(--ink-3); }
+.payment-card-form { max-width: 440px; display: flex; flex-direction: column; gap: 12px; margin: 16px 0; }
+.payment-card-form .form-row { margin: 0; min-width: 0; }
+.payment-card-form input { width: 100%; }
+.payment-field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.payment-address { border: 0; border-top: 1px solid var(--line); padding: 12px 0 0; margin: 4px 0 0; display: grid; gap: 12px; }
+.payment-address legend { padding-right: 8px; font-size: 12px; font-weight: 600; }
+.payment-restrictions summary { font-size: 12px; color: var(--ink-3); cursor: pointer; margin-bottom: 6px; }
+.task-payments :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.payment-add-card > summary { cursor: pointer; font-size: 13px; font-weight: 600; padding: 8px 0; }

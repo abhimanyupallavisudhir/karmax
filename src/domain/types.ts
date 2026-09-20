@@ -575,6 +575,8 @@ export type ResourceAccess = 'read' | 'write';
 export type ResourceIsolation = 'fork' | 'shared';
 export type ResourcePublishPolicy = 'discard' | 'review';
 export type ResourceTarget =
+  /** Relative to the task working directory: the sole development checkout,
+   * or the encompassing workspace for multiple development repositories. */
   | { kind: 'path'; path: string }
   | { kind: 'environment'; name: string }
   | { kind: 'service'; name: string };

@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { cardRemaining, evaluateSpend, MockPaymentProvider, StripeIssuingProvider, PaymentRegistry, BudgetService } from '../src/autonomy/payments.js';
 import { Store } from '../src/store/db.js';
@@ -33,8 +36,8 @@ describe('evaluateSpend (four outcomes; SPEC §7.6)', () => {
   it('needs_approval over the agent allowance', () => {
     expect(evaluateSpend({ ...base, amount: 200, spent: 900, allowance: 1000 }).status).toBe('needs_approval');
   });
-  it('needs_approval over the review threshold (even within allowance)', () => {
-    expect(evaluateSpend({ ...base, amount: 600, allowance: 100000, threshold: 500 }).status).toBe('needs_approval');
+  it('ignores the removed review threshold', () => {
+    expect(evaluateSpend({ ...base, amount: 600, allowance: 100000, threshold: 500 }).status).toBe('granted');
   });
   it('needs_funding when the card lacks money (policy ok)', () => {
     const d = evaluateSpend({ ...base, amount: 800, available: 300, allowance: 100000 });
@@ -62,6 +65,7 @@ describe('BudgetService over the mock rail', () => {
     provider = new MockPaymentProvider(store);
     budget = new BudgetService(store, provider);
     projectId = store.createProject('P', {}).id;
+    store.setSettings(projectId, 'payments', { budget: null });
   });
 
   it('needs_funding when no card is configured', async () => {
@@ -129,7 +133,7 @@ describe('BudgetService over the mock rail', () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: otherProject.id, label: 'Other card', cap: 100000 });
     await provider.fund(card.id, 100000);
     const r = await budget.request({ projectId, taskId: 't4' }, { amount: 100, cardId: card.id });
-    expect(r.status).toBe('needs_funding');
+    expect(r.status).toBe('denied');
     expect(r.reason).toContain('not available');
     expect((await provider.getCard(card.id))!.available).toBe(100000);
   });
@@ -173,7 +177,7 @@ describe('BudgetService over the mock rail', () => {
   it('re-counts the card cap at the review gate, not only when the spend is requested', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Capped', cap: 500 });
     await provider.fund(card.id, 5000);
-    store.setSettings(projectId, 'payments', { threshold: 100 });
+    store.setSettings(projectId, 'payments', { budget: 100 });
     // Both clear the request-time check independently — 300 ≤ the full 500 cap,
     // because neither is counted until the gate decides. Approving both would put
     // 600 on a card capped at 500: the cumulative ceiling has to be re-counted
@@ -220,4 +224,127 @@ describe('BudgetService over the mock rail', () => {
     await expect(provider.fund(card.id, -1)).rejects.toThrow(/positive/);
     await expect(provider.fund(card.id, 1.5)).rejects.toThrow(/positive/);
   });
+});
+
+
+describe('task payment policy', () => {
+  it('defaults to zero and inherits editable organization and project budgets', async () => {
+    const store = new Store(':memory:');
+    try {
+      const project = store.createProject('Default budget', {});
+      const provider = new MockPaymentProvider(store);
+      const service = new BudgetService(store, provider);
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 1000 });
+      await provider.fund(card.id, 1000);
+      expect(service.policy(project.id).budget).toBe(0);
+      expect((await service.request({ projectId: project.id, taskId: 'default-budget' }, { amount: 1 })).status).toBe('needs_approval');
+      expect(store.paymentSpent('default-budget')).toBe(0);
+      const org = `organization:${project.organizationId}`;
+      store.setSettings(org, 'payments', { budget: 500 });
+      expect(service.policy(project.id).budget).toBe(500);
+      store.setSettings(project.id, 'payments', { cardIds: [card.id] });
+      expect(service.policy(project.id).budget).toBe(500);
+      store.setSettings(org, 'payments', { budget: null });
+      expect(service.policy(project.id).budget).toBeNull();
+      store.setSettings(project.id, 'payments', { budget: 200 });
+      expect(service.policy(project.id).budget).toBe(200);
+      store.setSettings(project.id, 'payments', { budget: null });
+      expect(service.policy(project.id).budget).toBeNull();
+    } finally { store.close(); }
+  });
+
+  it('selects by name, counts across cards, and releases pending requests in order', async () => {
+    const store = new Store(':memory:');
+    const provider = new MockPaymentProvider(store);
+    const budget = new BudgetService(store, provider);
+    const project = store.createProject('Payments', {});
+    const first = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Employer', cap: 10000 });
+    const second = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Personal', cap: 10000 });
+    await provider.fund(first.id, 10000);
+    await provider.fund(second.id, 10000);
+    const task = store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do', workflowVersion: '1.0.0', params: { paymentPolicy: { cardIds: [first.id, second.id], budget: 100 } } } as any);
+    const ctx = { projectId: project.id, taskId: task.id };
+    expect((await budget.request(ctx, { amount: 100, cardName: 'Employer' })).status).toBe('granted');
+    const pending = await budget.request(ctx, { amount: 200, cardName: 'Personal' });
+    expect(pending.status).toBe('needs_approval');
+    // A human may return after the checkout reservation window has elapsed.
+    store.updatePaymentSpendRequest(pending.requestId!, { expiresAt: Date.now() - 1000 });
+    const later = await budget.request(ctx, { amount: 50, cardName: 'Employer' });
+    expect(later.status).toBe('needs_approval');
+    store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { cardIds: [first.id, second.id], budget: 300 } } as any);
+    const released = await budget.reconcileTask(ctx);
+    expect(released.map(r => r.requestId)).toEqual([pending.requestId]);
+    expect(store.getPaymentSpendRequest(later.requestId!)?.status).toBe('pending_approval');
+    expect(store.paymentSpent(task.id)).toBe(300);
+    expect((await budget.request(ctx, { amount: 200, cardName: 'Personal' })).requestId).toBe(pending.requestId);
+    store.close();
+  });
+  it('requires unique names across all projects in an organization', async () => {
+    const store = new Store(':memory:');
+    const provider = new MockPaymentProvider(store);
+    const a = store.createProject('A', {}), b = store.createProject('B', {});
+    await provider.provisionCard({ scope: 'project', scopeId: a.id, label: 'Employer', cap: 100 });
+    await expect(provider.provisionCard({ scope: 'project', scopeId: b.id, label: ' employer ', cap: 100 })).rejects.toThrow(/name.*unique/i);
+    store.close();
+  });
+});
+
+describe('payment reservations under concurrency', () => {
+  it('counts in-progress charges and never charges the same approval twice', async () => {
+    const store = new Store(':memory:');
+    const provider = new MockPaymentProvider(store);
+    const project = store.createProject('Concurrent', {});
+    const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 10000 });
+    await provider.fund(card.id, 10000);
+    store.setSettings(project.id, 'payments', { budget: 100 });
+    const one = new BudgetService(store, provider), two = new BudgetService(store, provider);
+    const ctx = { projectId: project.id, taskId: 'concurrent' };
+    const results = await Promise.all([one.request(ctx, { amount: 100, why: 'one' }), two.request(ctx, { amount: 100, why: 'two' })]);
+    expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);
+    const pending = results.find(r => r.status === 'needs_approval')!;
+    await Promise.all([one.approve(pending.requestId!, 'user:a'), two.approve(pending.requestId!, 'user:a')]);
+    expect(store.paymentSpent(ctx.taskId)).toBe(200);
+    expect(store.getCard(card.id).available).toBe(9800);
+    store.close();
+  });
+
+  it('an empty card selection grants no access and task budget overrides defaults', async () => {
+    const store = new Store(':memory:');
+    const provider = new MockPaymentProvider(store);
+    const project = store.createProject('Selection', {});
+    const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 10000 });
+    await provider.fund(card.id, 10000);
+    store.setSettings(project.id, 'payments', { budget: 5000, cardIds: [card.id] });
+    const task = store.createTask({ projectId: project.id, title: 'None', workflow: 'just-do', workflowVersion: '1.0.0', params: { paymentPolicy: { budget: 0, cardIds: [] } } } as any);
+    const service = new BudgetService(store, provider), ctx = { projectId: project.id, taskId: task.id };
+    expect((await service.request(ctx, { amount: 100, cardName: 'Expenses' })).status).toBe('denied');
+    store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { budget: 0, cardIds: [card.id] } } as any);
+    const pending = await service.request(ctx, { amount: 100, cardName: 'Expenses' });
+    expect(pending.status).toBe('needs_approval');
+    store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { budget: 500, cardIds: [] } } as any);
+    expect(await service.reconcileTask(ctx)).toEqual([]);
+    expect((await service.approve(pending.requestId!, 'user')).status).toBe('denied');
+    expect(store.paymentSpent(task.id)).toBe(0);
+    store.close();
+  });
+});
+
+
+it('migrates legacy card-name collisions without changing card identities', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-card-names-'));
+  const filename = path.join(dir, 'store.db');
+  let store = new Store(filename);
+  try {
+    const project = store.createProject('Names', {});
+    const provider = new MockPaymentProvider(store);
+    const first = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 100 });
+    const second = await provider.provisionCard({ scope: 'organization', scopeId: project.organizationId, label: 'Work 2', cap: 100 });
+    store.db.prepare('UPDATE cards SET label=? WHERE id=?').run(' work ', second.id);
+    store.kvDelete('migration:unique-card-names');
+    store.close();
+    store = new Store(filename);
+    expect(store.getCard(first.id).label.toLowerCase()).not.toBe(store.getCard(second.id).label.toLowerCase());
+    expect(store.getCard(first.id).cap).toBe(100);
+    expect(store.getCard(second.id).cap).toBe(100);
+  } finally { store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

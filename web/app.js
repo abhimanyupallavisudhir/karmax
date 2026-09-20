@@ -2895,6 +2895,7 @@ async function checkConsoleRevision() {
       location.reload();
       return true;
     }
+    applyTimingSetting(meta.timingEnabled);
     if (!S.meta?.consoleRevision && meta.consoleRevision) S.meta.consoleRevision = meta.consoleRevision;
   } catch {}
   return false;
@@ -3493,6 +3494,8 @@ function connectWs() {
   ws.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
+    if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
@@ -3508,10 +3511,10 @@ function connectWs() {
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
         scheduleTaskPageRender();
       }
-      if (ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
+      if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
         const received = performance.now();
         requestAnimationFrame(() => requestAnimationFrame(() => {
-          if (S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
+          if (S.meta?.timingEnabled && S.selected === ev.taskId && S.taskTab === 'checkin' && document.visibilityState === 'visible' && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'timing.frame', id: ev.timingDeliveryId, frameMs: performance.now() - received }));
         }));
       }
@@ -3920,13 +3923,28 @@ let editingRailItem = null;
 // theme, so it lives in localStorage — keyed per organization because the rail
 // shows one organization's projects at a time.
 function railCollapsedFolders() {
-  try { return new Set(JSON.parse(localStorage.getItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`) || '[]')); }
-  catch { return new Set(); }
+  const key = `karmax-rail-folders:${S.organizationId || 'org_personal'}`;
+  // If storage is unavailable, keep explicit choices for this session.
+  if (S.railFolderFallback?.has(key)) return new Set(S.railFolderFallback.get(key));
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || '[]');
+    return new Set(Array.isArray(saved) ? saved.filter((path) => typeof path === 'string') : []);
+  } catch { return new Set(); }
+}
+function saveRailCollapsedFolders(folded) {
+  const key = `karmax-rail-folders:${S.organizationId || 'org_personal'}`;
+  try {
+    localStorage.setItem(key, JSON.stringify([...folded]));
+    S.railFolderFallback?.delete(key);
+  } catch {
+    S.railFolderFallback ||= new Map();
+    S.railFolderFallback.set(key, new Set(folded));
+  }
 }
 function toggleRailFolder(path) {
   const folded = railCollapsedFolders();
   if (!folded.delete(path)) folded.add(path);
-  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...folded])); } catch {}
+  saveRailCollapsedFolders(folded);
   renderRail();
 }
 
@@ -3951,7 +3969,7 @@ function replaceProjectRouteAfterRename(projectId, previousBase) {
 function renameCollapsedRailFolder(previous, next) {
   const folded = [...railCollapsedFolders()].map((path) =>
     path === previous || path.startsWith(`${previous}/`) ? `${next}${path.slice(previous.length)}` : path);
-  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...new Set(folded)])); } catch {}
+  saveRailCollapsedFolders(new Set(folded));
 }
 
 // One compact editor serves both project links and folder headers. It deliberately
@@ -4088,7 +4106,7 @@ function railProjectRows(projectScoped) {
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
-    if (query || !folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
     const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
     return header(child, depth, false) + (active ? row(active, depth + 1) : '');
   }).join('');
@@ -4112,6 +4130,7 @@ function renderRail() {
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
   // Keep the input node alive during typing, composition, and live refreshes.
+  const scrollTop = rail.scrollTop;
   const searching = active?.id === 'project-search';
   if (searching) {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
@@ -4171,6 +4190,7 @@ function renderRail() {
   }));
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
+  rail.scrollTop = scrollTop;
 }
 
 // HTML5 drag-and-drop reordering of the rail's project links. The rail holds more
@@ -4743,7 +4763,7 @@ function seriesRow(t) {
       <span class="status-dot ${dot}" title="repeatable series"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-sub"><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
@@ -4776,7 +4796,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot waiting" title="waiting for trigger"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub"><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
@@ -4794,7 +4814,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub"><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Run task</button>
@@ -4816,7 +4836,6 @@ function taskRow(t, { showTags = true } = {}) {
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
-          <span class="wf">${esc(workflowLabel(t.workflow))}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
           ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
@@ -5228,7 +5247,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
         const attempts = group?.attempts?.length ? group.attempts : [task];
         return Promise.all(attempts.map(async (attempt) => ({
           task: attempt,
-          sessions: await api(`/api/tasks/${attempt.id}/sessions`),
+          sessions: await api(`/api/tasks/${attempt.id}/sessions?metadata=1`),
         })));
       })());
       el.setAttribute('aria-busy', 'true');
@@ -6034,6 +6053,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
                 <span class="tf-vault-count" id="tf-vault-count">Loading…</span>
               </button>
             </div>
+            ${taskPaymentsHtml("tf-payments")}
             <div class="form-row" data-row="__creds">
               <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Codex/Claude</label></div>
               <div id="cred-editor-newtask">Loading…</div>
@@ -6053,6 +6073,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
         </div>
       </footer>
     </div>`;
+  wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
   activeTaskFormKeyController = formKeyController;
   const releaseFormKeys = () => {
@@ -6252,6 +6273,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // through auto-save, draft, and queue the same way the prompt text does.
   const formState = () => {
     const body = collectForm($('#tf-body'), fields);
+    const paymentPolicy = readTaskPayments($('#tf-payments')) ?? values.paymentPolicy;
+    if (paymentPolicy) body.paymentPolicy = paymentPolicy;
     if (formImages.length) body.images = [...formImages];
     if (formFiles.length) body.files = [...formFiles];
     // Triggers + repeatable are generic (workflow-agnostic) params, not part of the
@@ -6280,7 +6303,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   const hasContent = ({ body, notes }) => {
     // Wiki context alone (default or edited) isn't "content" worth a draft — it
     // rides along once there's a real prompt/command. Exclude it from the scan.
-    const { wikiContext: _wc, ...rest } = body;
+    const { wikiContext: _wc, paymentPolicy: _paymentPolicy, ...rest } = body;
     return notes.trim() !== '' ||
       hasPolicy() ||
       formImages.length > 0 ||
@@ -6577,6 +6600,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       releaseFormKeys();
       return;
     }
+    if (e.key === 'Escape' && e.target.closest?.('.task-payments')?.querySelector('[aria-expanded="true"]')) return;
     const action = taskFormKeyAction(e, secondaryModalOpen);
     if (!action) return;
     e.preventDefault();
@@ -6602,6 +6626,8 @@ const TASK_TABS = [
   { key: 'parameters', label: 'Parameters' },
   { key: 'timing', label: 'Timing' },
 ];
+
+function visibleTaskTabs() { return TASK_TABS.filter(t => t.key !== 'timing' || S.meta?.timingEnabled === true); }
 
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
 // is asking the human to decide (an enabled `confirm` action — the Review gate),
@@ -6847,7 +6873,7 @@ function mergeTaskHistory(events) {
     if (event.type === 'conversation.explanation')
       explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
   }
-  S.taskEvents = [...ordinary, ...explanations.values()];
+  S.taskEvents = [...ordinary, ...explanations.values()].filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true);
 }
 
 async function refreshTaskHistory(taskId) {
@@ -6939,7 +6965,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       // but opening a task should have a fixed memory and response-size budget.
       draft ? Promise.resolve([]) : refreshTaskHistory(taskId),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
-      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
       draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
@@ -7005,7 +7031,7 @@ async function refreshTask() {
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
-      api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+      api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
       api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
@@ -7317,6 +7343,21 @@ function restoreConversationScroll(thread, state) {
 function patchTaskPage(main, html) {
   const template = document.createElement('template');
   template.innerHTML = html;
+  const oldParams = main.querySelector('#tp-params');
+  const newParams = template.content.querySelector('#tp-params');
+  if (oldParams && newParams && oldParams.dataset.renderKey === newParams.dataset.renderKey) {
+    const fields = schemaFor(S.view.workflow).filter((f) => f.scopes.includes('task') && (S.view.editableParams || []).includes(f.name));
+    const current = collectParamEdits(oldParams, fields);
+    const incoming = collectParamEdits(newParams, fields);
+    const draft = S.paramEditDrafts[S.view.taskId];
+    // Dirty fields belong to the local editor, including transient empty input
+    // that the stored-value serializer deliberately omits. Clean fields must
+    // still pick up changes from another operator or new server defaults.
+    if (fields.every((f) => isParamDraftField(draft, f.name) || sameJson(current[f.name], incoming[f.name]))) {
+      patchTaskAncestors(main, oldParams, newParams);
+      return false;
+    }
+  }
   const previous = main.querySelector('#ck-thread');
   const next = template.content.querySelector('#ck-thread');
   const same = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
@@ -7346,6 +7387,11 @@ function patchTaskPage(main, html) {
     cursor.remove();
     cursor = nextSibling;
   }
+  patchTaskAncestors(main, previous, next);
+  return true;
+}
+
+function patchTaskAncestors(main, previous, next) {
   // Walk both ancestor paths upward, replacing siblings without moving the
   // retained child. These wrappers contain layout only, with no event handlers.
   let oldChild = previous, newChild = next;
@@ -7358,7 +7404,6 @@ function patchTaskPage(main, html) {
     for (const node of siblings.slice(index + 1)) parent.appendChild(node);
     oldChild = parent; newChild = freshParent;
   }
-  return true;
 }
 
 function renderTaskPage() {
@@ -7366,6 +7411,7 @@ function renderTaskPage() {
   const main = $('#main');
   if (!v || !main) return;
   if (S.taskFile) return renderTaskFilePage(v, S.taskFile);
+  if (S.taskTab === 'timing' && !S.meta?.timingEnabled) S.taskTab = null;
   if (!S.taskTab) S.taskTab = defaultTaskTab(v); // resolved once at open; never auto-switches under the user
   const tab = S.taskTab;
   // A background refresh (or a just-sent follow-up) re-renders the whole page,
@@ -7426,7 +7472,7 @@ function renderTaskPage() {
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
-          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
+          ${visibleTaskTabs().map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
           ${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="local-checkout">Work locally</button>' : ''}
         </div>
       </div>
@@ -7474,6 +7520,7 @@ function renderTaskPage() {
   } else if (tab === 'parameters') {
     wireParams(v);
     wireTaskAuthorization(v);
+    wireTaskPayments($('#tp-payments'), rec?.projectId || S.projectId, rec?.params?.paymentPolicy, v.taskId);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   }
   wireCopyButtons();
@@ -7595,7 +7642,7 @@ function wireWorkflowMode(v) {
 // Switch the open task page to another of its tabs, pinning the tab in the URL
 // (replace, not push — Back should leave the task, not walk through its tabs).
 function setTaskTab(key) {
-  if (!TASK_TABS.some((t) => t.key === key) || S.taskTab === key) return;
+  if (!visibleTaskTabs().some((t) => t.key === key) || S.taskTab === key) return;
   S.conversationFullscreen = false;
   S.taskTab = key;
   if (S.selected) history.replaceState({}, '', `${taskUrl(S.selected)}/${key}`);
@@ -7604,8 +7651,8 @@ function setTaskTab(key) {
 
 // Cycle the open task page's tabs ([ and ]), wrapping at the ends.
 function cycleTaskTab(delta) {
-  const i = Math.max(0, TASK_TABS.findIndex((t) => t.key === S.taskTab));
-  setTaskTab(TASK_TABS[(i + delta + TASK_TABS.length) % TASK_TABS.length].key);
+  const i = Math.max(0, visibleTaskTabs().findIndex((t) => t.key === S.taskTab));
+  setTaskTab(visibleTaskTabs()[(i + delta + visibleTaskTabs().length) % visibleTaskTabs().length].key);
 }
 
 function taskTabBody(v, tab) {
@@ -9338,11 +9385,11 @@ async function downloadNativeConversation(button) {
   } finally { button.disabled = false; }
 }
 
-function localConversationHandoff(v, cwd, portable = false) {
-  const errors = Object.entries(S.sessions || {}).filter(([, session]) => session?.exportError)
+function localConversationHandoff(v, cwd, portable = false, preparedSessions = S.sessions) {
+  const errors = Object.entries(preparedSessions || {}).filter(([, session]) => session?.exportError)
     .map(([role, session]) => `<p class="task-sub" role="alert">${esc(role)} conversation export: ${esc(session.exportError)}</p>`).join('');
   const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
-  const sessions = Object.entries(S.sessions || {})
+  const sessions = Object.entries(preparedSessions || {})
     .filter(([, session]) => session?.id && session?.downloadable && ['codex', 'claude'].includes(session.provider))
     .map(([role, session]) => {
       const installDownloaded = portable || !session.home || session.generated || session.provider === 'codex';
@@ -9378,8 +9425,13 @@ async function openLocalCheckout(v) {
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
   wireClose();
-  let plan;
-  try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
+  let plan, preparedSessions;
+  try {
+    [plan, preparedSessions] = await Promise.all([
+      api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
+      api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
+    ]);
+  }
   catch (error) { host.remove(); return toast(error.message, true); }
   if (!host.isConnected) return;
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
@@ -9388,7 +9440,7 @@ async function openLocalCheckout(v) {
     <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
-    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true)}
+    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
@@ -9446,9 +9498,10 @@ async function materializeLocalCheckout(v) {
   </div></div>`;
   host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
   host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  let checkout;
+  let checkout, preparedSessions;
   try {
     checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+    preparedSessions = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`);
   } catch (error) { host.remove(); toast(error.message, true); return null; }
   if (!host.isConnected) return null;
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
@@ -9456,7 +9509,7 @@ async function materializeLocalCheckout(v) {
     <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
-    ${localConversationHandoff(v, checkout.cwd)}
+    ${localConversationHandoff(v, checkout.cwd, false, preparedSessions)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
     <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
   </div></div>`;
@@ -9499,6 +9552,7 @@ function parametersTab(v) {
   return `
     ${paramsSection(v)}
     ${authorizationSection(v)}
+    ${!taskRecord(v.taskId)?.params?.draft && (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) ? taskPaymentsHtml("tp-payments", true) : ''}
     <div class="section-h">Codex/Claude</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Drag to reorder, toggle to disable — for this task only.</p>
     <div id="cred-editor-task">Loading…</div>`;
@@ -9531,6 +9585,7 @@ function authorizationSection(v) {
           <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
         </button>
       </div>
+      ${taskPaymentsHtml("tp-payments", true)}
       <div class="params-save-bar" data-save-state="saved">
         <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
@@ -10140,7 +10195,11 @@ function paramsSection(v) {
     : `<div class="task-sub" style="color:var(--ink-3)">${terminal
       ? 'This task has finished. Parameters are read-only.'
       : 'Locked after queue — send a follow-up to change direction.'}</div>`;
-  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
+  // Identity and lifecycle/schema changes must replace the form. Ordinary task
+  // events retain the connected controls, preserving native editing state.
+  const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields, [...editable], inheritedAll,
+    fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec))]);
+  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields" data-render-key="${esc(renderKey)}">${rows}${footer}</div>`;
 }
 
 function isParamDraftField(draft, name) {
@@ -10253,6 +10312,8 @@ function wireParams(v) {
     return;
   }
   const root = document.getElementById('tp-params');
+  if (root?.paramsWired) return; // retained controls already own their handlers
+  if (root) root.paramsWired = true;
   if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
@@ -10883,7 +10944,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.reverse();
+    S.activity = activity.filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true).reverse();
     renderMain();
   } catch {}
 }
@@ -12443,7 +12504,7 @@ async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
     const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
-    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
+    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'New private files are delivered when a task world is created.' : 'Changes apply on the next agent turn. Restart existing shells and servers to refresh their environment. Removing a secret does not erase it from running processes.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
         <div class="project-form-grid">
@@ -13611,22 +13672,28 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Payments</div>
-    <p class="task-sub" style="margin-top:0">Agents can make payments with a virtual card.</p>
+    <div class="section-h">Task defaults</div>
+    ${taskPaymentsHtml(`pay-defaults-${scope}`)}
+    <button class="btn sm" data-savepolicy="${scope}">Save defaults</button>
+    <div class="section-h" style="margin-top:20px">Saved cards</div>
     <div class="cards-list" style="margin-bottom:10px"></div>
-    <div class="settings-grid">
-      <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
-      <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
-      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
-      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" inputmode="numeric" placeholder="MM/YY" /></label>
-      <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
-      <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
-      <label class="form-row">City<input class="card-city" /></label>
-      <label class="form-row">Postal code<input class="card-postal" /></label>
-      <label class="form-row">Country<input class="card-country" placeholder="GB" maxlength="2" /></label>
-      <label class="form-row">Restrict to merchants<input class="card-merchants" placeholder="optional, comma-separated domains" /></label>
+    <details class="payment-add-card"><summary>Add card</summary>
+    <div class="payment-card-form">
+      <div class="payment-field-pair"><label class="form-row">Card name<input class="card-label" placeholder="e.g. Work expenses" /></label>
+      <label class="form-row">Limit (USD)<input class="card-cap" type="number" min="0.01" step="0.01" placeholder="250.00" /></label></div>
+      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="1234 5678 9012 3456" /></label>
+      <div class="payment-field-pair"><label class="form-row">Expiry<input class="card-expiry" autocomplete="off" inputmode="numeric" placeholder="MM/YY" /></label>
+      <label class="form-row">CVC<input class="card-cvc" type="password" autocomplete="off" inputmode="numeric" placeholder="•••" /></label></div>
+      <fieldset class="payment-address"><legend>Billing address</legend>
+      <label class="form-row">Street address<input class="card-line1" autocomplete="billing address-line1" /></label>
+      <div class="payment-field-pair"><label class="form-row">City<input class="card-city" autocomplete="billing address-level2" /></label>
+      <label class="form-row">Postal code<input class="card-postal" autocomplete="billing postal-code" /></label></div>
+      <label class="form-row">Country<input class="card-country" placeholder="US" maxlength="2" autocomplete="billing country" /></label>
+      </fieldset>
+      <details class="payment-restrictions"><summary>Merchant restrictions</summary><label class="form-row">Allowed domains<input class="card-merchants" placeholder="example.com, shop.example.com" /></label></details>
     </div>
     <button class="btn primary" data-addcard="${scope}">Add card</button>
+    </details>
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets ${siteNameMarkup()} issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
@@ -13659,12 +13726,6 @@ function paymentsCard(scope) {
         </div>
       </div>
     </details>
-    <div class="section-h" style="margin-top:16px">Spend limits</div>
-    <div class="settings-grid">
-      <label class="form-row">Allowance per task (USD)<input class="pay-allow" type="number" step="0.01" placeholder="unlimited" /></label>
-      <label class="form-row">Approval threshold (USD)<input class="pay-thresh" type="number" step="0.01" placeholder="never" /></label>
-    </div>
-    <button class="btn sm" data-savepolicy="${scope}">Save spend limits</button>
     ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
       <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
@@ -14012,15 +14073,17 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}
-  if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
-  if (policy.threshold != null) box.querySelector('.pay-thresh').value = (policy.threshold / 100).toFixed(2);
+  const defaults = box.querySelector('.task-payments');
+  await wireTaskPayments(defaults, projectId, undefined, undefined, organizationId);
   box.querySelector(`[data-savepolicy]`).addEventListener('click', async () => {
-    const a = box.querySelector('.pay-allow').value;
-    const t = box.querySelector('.pay-thresh').value;
-    const values = { ...policy };
-    values.allowance = a === '' ? undefined : Math.round(Number(a) * 100);
-    values.threshold = t === '' ? undefined : Math.round(Number(t) * 100);
-    try { await api(sUrl, { method: 'PUT', body: JSON.stringify({ values }) }); toast('Budget policy saved'); } catch (e) { toast(e.message, true); }
+    try {
+      const selected = readTaskPayments(defaults);
+      if (!selected) throw new Error('Payment defaults are still loading');
+      const { allowance, threshold, ...rest } = policy;
+      await api(sUrl, { method: 'PUT', body: JSON.stringify({ values: { ...rest, ...selected } }) });
+      policy = { ...rest, ...selected };
+      toast('Payment defaults saved');
+    } catch (e) { toast(e.message, true); }
   });
   const renderCards = async () => {
     let cards = [];
@@ -14029,6 +14092,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     // The org-settings surface shows the org's own cards (+ legacy global);
     // the project surface shows project cards (its org's cards appear too).
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
+    defaults._setCards?.(cards);
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
@@ -14453,6 +14517,29 @@ function wireConnectionActions(root, organizationId, refresh) {
   }));
 }
 
+async function wireInstallationComposioCard() {
+  const box = document.getElementById('installation-composio-card'); if (!box) return;
+  try {
+    const config = await api('/api/connections/config');
+    if (!box.isConnected) return;
+    box.innerHTML = `<div class="section-h">Composio <span class="chip">${config.configured ? 'configured' : 'setup required'}</span></div>
+      <p class="task-sub">One Composio project API key serves every organization in this installation. Users connect their own accounts in Organization → Connected apps and choose which projects may use them.</p>
+      ${config.canConfigure ? `<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="${config.configured ? 'New key to replace the configured key' : 'Composio project API key'}" autocomplete="new-password" required aria-label="Composio project API key"><button class="btn sm primary">${config.configured ? 'Replace API key' : 'Set up connections'}</button></form>` : ''}`;
+    box.querySelector('[data-composio-config]')?.addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget; const button = form.querySelector('button');
+      const apiKey = form.elements.apiKey.value; form.elements.apiKey.value = '';
+      button.disabled = true;
+      try {
+        await api('/api/connections/config', { method: 'PUT', body: JSON.stringify({ apiKey }) });
+        toast('Composio configured for this installation');
+        await wireInstallationComposioCard();
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    });
+  } catch (error) { if (box.isConnected) paneError(box, error, wireInstallationComposioCard); }
+}
+
 async function hydrateConnections(organizationId) {
   const root = document.getElementById('service-connections'); if (!root) return;
   const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
@@ -14460,17 +14547,12 @@ async function hydrateConnections(organizationId) {
     const [config, connections] = await Promise.all([api(`/api/connections/config${oq}`), api(`/api/connections${oq}`)]);
     if (!root.isConnected) return;
     root.innerHTML = `${!config.configured ? `<p class="task-sub">An installation administrator needs to configure Composio before accounts can be connected.</p>
-      ${config.canConfigure ? '<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="Composio project API key" autocomplete="off" required aria-label="Composio project API key"><button class="btn sm primary">Set up connections</button></form>' : ''}` : `
+      ${config.canConfigure ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-composio">Set up Composio in Installation settings</a>` : ''}` : `
       <form data-connection-search class="inline-form"><input name="search" placeholder="Search apps, e.g. Gmail or Slack" aria-label="Search apps"><button class="btn sm">Search apps</button></form>
       <div data-connection-catalog></div>`}
       <div data-connection-list>${connectionRows(connections)}${!connections.length ? '<p class="task-sub">No accounts connected yet.</p>' : ''}</div>`;
     const refresh = () => hydrateConnections(organizationId);
     wireConnectionActions(root, organizationId, refresh);
-    root.querySelector('[data-composio-config]')?.addEventListener('submit', async e => {
-      e.preventDefault(); const form = e.currentTarget; const key = form.elements.apiKey.value; form.elements.apiKey.value = '';
-      try { await api(`/api/connections/config${oq}`, { method: 'PUT', body: JSON.stringify({ apiKey: key }) }); await refresh(); }
-      catch (error) { toast(error.message, true); }
-    });
     root.querySelector('[data-connection-search]')?.addEventListener('submit', async e => {
       e.preventDefault(); const form = e.currentTarget; const box = root.querySelector('[data-connection-catalog]');
       box.textContent = 'Searching apps…';
@@ -14698,6 +14780,7 @@ async function wireVaultCards(organizationId) {
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+          if (result.propagated?.error) { toast('Saved in vault; remote write-back failed: ' + result.propagated.error + '. Retry from the connector panel.', true); await renderConnectors(); return; }
           toast(result.propagated?.connector ? `Secret updated (also pushed to ${result.propagated.connector})` : 'Secret updated');
         } catch (e) { toast(e.message, true); }
       }));
@@ -14781,7 +14864,7 @@ async function wireVaultCards(organizationId) {
       <div class="form-row"><label>Encryption</label><select class="git-pass-crypto"><option value="gpg">GPG (pass / gopass)</option><option value="age">age (gopass)</option></select></div>
       <div data-git-pass-gpg><div class="form-row"><label>ASCII-armored GPG private key</label><textarea class="git-pass-key" rows="7" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea></div>
       <div class="form-row"><label>GPG key passphrase <span class="task-sub">(leave blank if none)</span></label><input class="git-pass-passphrase" type="password" autocomplete="new-password" /></div></div>
-      <div data-git-pass-age hidden><div class="form-row"><label>Native age identity</label><textarea class="git-pass-age-key" rows="4" autocomplete="off" spellcheck="false" placeholder="AGE-SECRET-KEY-1…"></textarea></div><p class="task-sub">Paste the decrypted native age identity. SSH keys and age plugins are not supported.</p></div>
+      <div data-git-pass-age hidden><div class="form-row"><label>Native age identity</label><textarea class="git-pass-age-key" rows="4" autocomplete="off" spellcheck="false" placeholder="AGE-SECRET-KEY-1…"></textarea></div><p class="task-sub">Paste a native identity, or upload your encrypted gopass identity file below. SSH keys and age plugins are not supported.</p><div class="form-row"><label>Encrypted age identity file</label><input type="file" class="git-pass-age-file" /></div><div class="form-row"><label>Identity file passphrase</label><input type="password" class="git-pass-age-passphrase" autocomplete="new-password" /></div></div><div class="form-row"><label>Entry to verify (optional; otherwise first entry)</label><input class="git-pass-verify-entry" placeholder="example.com" /></div>
 `;
     overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%;max-height:90vh;overflow:auto" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
       <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
@@ -14815,16 +14898,21 @@ async function wireVaultCards(organizationId) {
       overlay.querySelector('[data-git-pass-mounts]').appendChild(row);
       row.querySelector('input').focus();
     });
-    const readStore = (row) => {
+    const readStore = async (row) => {
       const repositoryUrl = row.querySelector('.git-pass-repo').value.trim();
       const crypto = row.querySelector('.git-pass-crypto').value;
       const key = row.querySelector(crypto === 'age' ? '.git-pass-age-key' : '.git-pass-key').value.trim();
-      if (!repositoryUrl || !key) throw new Error('Repository URL and encryption key are required for each store');
+      const file = crypto === 'age' ? row.querySelector('.git-pass-age-file').files[0] : undefined;
+      if (file && key) throw new Error('Use either a native identity or an encrypted file');
+      if (file?.size > 2 * 1024 * 1024) throw new Error('Identity file is too large');
+      const encrypted = file ? btoa(Array.from(new Uint8Array(await file.arrayBuffer()), byte => String.fromCharCode(byte)).join('')) : undefined;
+      if (!repositoryUrl || (!key && !encrypted)) throw new Error('Repository URL and encryption key are required for each store');
       return {
         repositoryUrl, crypto,
+        validationEntry: row.querySelector('.git-pass-verify-entry').value.trim() || undefined,
         storePath: row.querySelector('.git-pass-path').value.trim() || undefined,
         gitProfile: row.querySelector('.git-pass-profile').value || undefined,
-        ...(crypto === 'age' ? { ageIdentity: key } : {
+        ...(crypto === 'age' ? (encrypted ? { ageIdentityEncrypted: encrypted, agePassphrase: row.querySelector('.git-pass-age-passphrase').value } : { ageIdentity: key }) : {
           gpgPrivateKey: key, gpgPassphrase: row.querySelector('.git-pass-passphrase').value || undefined,
         }),
       };
@@ -14833,17 +14921,17 @@ async function wireVaultCards(organizationId) {
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        const connection = readStore(overlay.querySelector('[data-git-pass-root]'));
-        connection.mounts = [...overlay.querySelectorAll('[data-git-pass-mount]')].map(row => {
+        const connection = await readStore(overlay.querySelector('[data-git-pass-root]'));
+        connection.mounts = await Promise.all([...overlay.querySelectorAll('[data-git-pass-mount]')].map(async row => {
           const name = row.querySelector('.git-pass-mount-name').value.trim();
           if (!name) throw new Error('Each mounted store needs a name');
-          return { name, ...readStore(row) };
-        });
-        await api(`/api/vault/connectors/pass-git/connect${oq}`, {
+          return { name, ...await readStore(row) };
+        }));
+        const result = await api(`/api/vault/connectors/pass-git/connect${oq}`, {
           method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
         });
         close();
-        toast('Git-backed pass connected');
+        toast('Git-backed pass connected. ' + (result.connector?.checks || []).map(check => `${check.store}: ${check.read === 'verified' ? 'entry decrypted' : 'empty store'}, encryption ${check.encryption ? 'verified' : 'unavailable'}, push transport ${check.push ? 'reachable' : 'unavailable'}`).join('; ') + '. A real push can still be rejected by server policy.');
         await renderConnectors();
       } catch (error) {
         button.disabled = false;
@@ -14860,13 +14948,49 @@ async function wireVaultCards(organizationId) {
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
+      ${c.pendingWrites?.length ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button><button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
-        ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>`
+        ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back <button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button><button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
+      row.querySelector('[data-conn-discard]')?.addEventListener('click', async () => {
+        if (!confirm('Stop retrying pending writes to this store? Credentials stay in the vault.')) return;
+        try {
+          await api(`/api/vault/connectors/${name}/discard-writes${oq}`, {method:'POST',body:'{}'});
+          await renderConnectors();
+        } catch (error) { toast(error.message, true); }
+      });
+      row.querySelector('[data-conn-retry]')?.addEventListener('click', async (event) => {
+        event.currentTarget.disabled = true;
+        try {
+          const results = await api(`/api/vault/connectors/${name}/retry-writes${oq}`, {method:'POST',body:'{}'});
+          const failure = results.find(result => result.error);
+          toast(failure?.error || 'Retry complete', !!failure);
+        } catch (error) { toast(error.message, true); }
+        await renderConnectors();
+      });
+      row.querySelector('[data-git-pass-check]')?.addEventListener('click', async (event) => {
+        const button = event.currentTarget; button.disabled = true;
+        try {
+          const result = await api(`/api/vault/connectors/pass-git/check${oq}`, { method: 'POST', body: '{}' });
+          toast((result.checks || []).map(check => `${check.store}: ${check.read === 'verified' ? 'entry decrypted' : 'empty store'}, encryption ${check.encryption ? 'verified' : 'unavailable'}, push transport ${check.push ? 'reachable' : 'unavailable'}`).join('; ') + '. Server policy may still reject an actual push.');
+        } catch (error) { toast(error.message, true); }
+        finally { button.disabled = false; }
+      });
+      row.querySelectorAll('[data-write-retry], [data-write-remote]').forEach(button => button.addEventListener('click', async () => {
+        const remote = button.hasAttribute('data-write-remote');
+        if (remote && !confirm('Replace this vault item with the current remote entry and discard the pending write-back?')) return;
+        button.disabled = true;
+        try {
+          const result = await api(`/api/vault/connectors/pass-git/${remote ? 'accept-remote' : 'retry-write-back'}${oq}`, { method: 'POST', body: JSON.stringify({ itemId: remote ? button.dataset.writeRemote : button.dataset.writeRetry }) });
+          if (result.skipped) throw new Error(result.skipped);
+          toast(remote ? 'Imported remote value' : 'Write-back completed'); await renderItems(); await renderConnectors();
+        } catch (error) { toast(error.message, true); button.disabled = false; }
+      }));
       row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
         const button = row.querySelector('[data-conn-connect]');
         button.disabled = true;
@@ -14900,7 +15024,7 @@ async function wireVaultCards(organizationId) {
         <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
           <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option ${conn?.config?.autoSync?.policy?.use !== 'ask' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.use === 'ask' ? 'selected' : ''}>ask</option></select></label>
           <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option ${!conn?.config?.autoSync?.policy?.reveal || conn.config.autoSync.policy.reveal === 'ask' ? 'selected' : ''}>ask</option><option ${conn?.config?.autoSync?.policy?.reveal === 'auto' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.reveal === 'never' ? 'selected' : ''}>never</option></select></label>
-          ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+          ${(conn?.canPush || conn?.canUpdate) ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="${conn?.canPush ? 'Export new credentials and update existing entries' : 'Update existing entries only; new credentials cannot be exported to this store'}"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
           ${name === 'pass-git' ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Refresh the credentials selected above after password-store changes"><input type="checkbox" class="imp-keep" ${conn?.config?.autoSync?.enabled ? 'checked' : ''}/> Keep selected credentials updated</label>
           <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Select the entire store now and automatically import credentials added later"><input type="checkbox" class="imp-new" ${conn?.config?.autoSync?.importNew ? 'checked' : ''}/> Import new credentials automatically</label>` : ''}
         </div>
@@ -14917,7 +15041,17 @@ async function wireVaultCards(organizationId) {
     const countEl = overlay.querySelector('.imp-count');
     const refreshCount = () => { const n = tree.querySelectorAll('.imp-pick:checked').length; countEl.textContent = n ? `· ${n} selected` : ''; };
     let ext = [];
-    try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
+    let storeFailures = [];
+    try {
+      const result = await api(`/api/vault/connectors/${name}/${name === 'pass-git' ? 'catalog' : 'list'}${oq}`, { method: 'POST', body: '{}' });
+      ext = name === 'pass-git' ? result.items : result;
+      storeFailures = name === 'pass-git' ? result.failures : [];
+      if (storeFailures.length) {
+        const notice = document.createElement('p'); notice.className = 'task-sub';
+        notice.textContent = storeFailures.map(failure => `${failure.store}: ${failure.error}`).join('; ') + '. Reopen Import to retry unavailable stores.';
+        tree.before(notice);
+      }
+    }
     catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
     if (!ext.length) tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import yet.</span>';
     const folders = {};
@@ -15508,6 +15642,29 @@ function urgencyChip(urgency) {
   const level = URGENCY_LEVELS[urgencyRank(urgency)];
   return `<span class="urgency-chip ${level}" aria-label="${level} priority"><span class="priority-bars" aria-hidden="true">${'▮'.repeat(urgencyRank(level) + 1)}</span> ${level}</span>`;
 }
+function inboxTimeLabel(ts, now = Date.now()) {
+  const date = new Date(ts);
+  const today = new Date(now);
+  const yesterday = new Date(now);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return 'yesterday';
+  if (date.toDateString() !== today.toDateString()) {
+    return date.toLocaleDateString(undefined, {
+      month: 'short', day: 'numeric', ...(date.getFullYear() !== today.getFullYear() ? { year: 'numeric' } : {}),
+    });
+  }
+  const minutes = Math.max(0, Math.floor((now - ts) / 60000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+}
+
+function inboxProjectLabel(item) {
+  const projectId = item.task?.projectId || item.resource?.projectId || item.subject?.projectId;
+  return S.projects?.find((project) => project.id === projectId)?.name || '';
+}
+
 function inboxView() {
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
@@ -15516,19 +15673,25 @@ function inboxView() {
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row priority-${URGENCY_LEVELS[urgencyRank(item.urgency)]} ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
-      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.resource?.name || item.kind)}</b>${urgencyChip(item.urgency)}
-      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
-      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
+      <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
+      <div class="task-main">
+        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
+        <div class="task-sub">${inboxProjectLabel(item) ? `<span class="inbox-project" title="${esc(inboxProjectLabel(item))}">${esc(inboxProjectLabel(item))}</span>` : ''}<span class="chip">${esc(inboxRowLabel(item))}</span></div>
+      </div>
+      <div class="task-right">${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}" title="${esc(new Date(item.createdAt).toLocaleString())}">${esc(inboxTimeLabel(item.createdAt))}</time><button class="icon-btn inbox-read" data-inbox-toggle="${esc(item.id)}" aria-label="${item.unread ? 'Mark as read' : 'Mark as unread'}" title="${item.unread ? 'Mark as read' : 'Mark as unread'}" aria-pressed="${!item.unread}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
     <p class="task-sub">Sorted by priority, newest first within each level. System notifications and sounds are set in
       <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
 }
 
 function wireInboxView() {
-  $('#main').querySelectorAll('[data-inbox]').forEach((row) => row.addEventListener('click', (e) => {
-    if (e.target.closest('[data-inbox-toggle]')) return;
-    openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
-  }));
+  $('#main').querySelectorAll('[data-inbox]').forEach((row) => {
+    row.addEventListener('focus', () => { S.cursorId = rowKey(row); applyCursor(); });
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('[data-inbox-toggle]')) return;
+      openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
+    });
+  });
   $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
     const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
     try {
@@ -16359,12 +16522,14 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
+      <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
+      <div class="settings-section-title" id="installation-composio"><div>Composio<small>App connection setup shared by every organization</small></div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
@@ -16488,7 +16653,16 @@ function wireInstallationSettings() {
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();
+  $('#timing-enabled')?.addEventListener('change', async event => {
+    const control = event.currentTarget; control.disabled = true;
+    try {
+      await api('/api/settings/global/timing', { method: 'PUT', body: JSON.stringify({ values: { enabled: control.checked } }) });
+      applyTimingSetting(control.checked);
+    } catch (error) { control.checked = S.meta?.timingEnabled === true; toast(error.message, true); }
+    finally { control.disabled = false; }
+  });
   wireInstallationGithubCard();
+  wireInstallationComposioCard();
   wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
@@ -16766,7 +16940,7 @@ async function hydrateOrganizationView() {
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
       ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
-        : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
+        : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
@@ -17305,7 +17479,7 @@ function focusFollowup() {
 function cursorRows() {
   return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
 }
-function rowKey(r) { return r.dataset.id || r.dataset.draft; }
+function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox; }
 function applyCursor() {
   cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
 }
@@ -18525,10 +18699,129 @@ async function finishMcpCallback() {
   } catch (e) { status.textContent = e.message; }
 }
 
+
+function taskPaymentsHtml(id, live = false) {
+  return `<div class="task-payments" id="${id}">
+    <label class="payment-cards-label" for="${id}-search">Cards</label>
+    <div class="payment-picker mcp-combo"><div class="mcp-input-wrap"><div class="mcp-chips"></div>
+      <input id="${id}-search" class="payment-search" role="combobox" aria-expanded="false" aria-controls="${id}-options" aria-autocomplete="list" autocomplete="off" placeholder="Loading…" disabled>
+      <button class="payment-caret" type="button" aria-label="Choose cards" disabled>▾</button></div>
+      <div class="mcp-menu" hidden><div class="mcp-options" id="${id}-options" role="listbox" aria-multiselectable="true" aria-label="Cards"></div></div>
+    </div>
+    <div class="payment-budget-row"><label for="${id}-budget" title="Payments above this task’s total budget ask for approval. Leave blank for no budget limit.">Budget (USD)</label>
+      <input id="${id}-budget" class="payment-budget" type="number" min="0" step="0.01" placeholder="Unlimited" disabled>
+      ${live ? '<span class="payment-spent" role="status" title="Includes payments reserved for checkout">Loading spent…</span>' : ''}</div>
+    ${live ? '<button class="btn sm payment-save" type="button" disabled>Save payments</button>' : ''}
+    <span class="payment-error" role="status"></span>
+  </div>`;
+}
+function readTaskPayments(box) {
+  if (!box?.dataset.policy) return undefined;
+  const budget = box.querySelector('.payment-budget');
+  if (!budget.checkValidity()) throw new Error('Enter a non-negative budget in USD');
+  const cents = budget.value === '' ? null : Math.round(Number(budget.value) * 100);
+  if (cents !== null && !Number.isSafeInteger(cents)) throw new Error('Enter a valid budget in USD');
+  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: cents };
+}
+async function wireTaskPayments(box, projectId, initial, taskId, organizationId) {
+  if (!box) return;
+  organizationId ||= S.projects.find(p => p.id === projectId)?.organizationId || S.organizationId;
+  const query = projectId ? `projectId=${encodeURIComponent(projectId)}` : `organizationId=${encodeURIComponent(organizationId)}`;
+  const input = box.querySelector('.payment-search'), menu = box.querySelector('.mcp-menu'), options = box.querySelector('.mcp-options');
+  const budget = box.querySelector('.payment-budget'), save = box.querySelector('.payment-save');
+  try {
+    const [cards0, org, project, live] = await Promise.all([
+      api(`/api/cards?${query}`).catch(error => { if (taskId) return []; throw error; }),
+      taskId ? {} : api(`/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`),
+      !taskId && projectId ? api(`/api/settings/project/${encodeURIComponent(projectId)}/payments`) : {},
+      taskId ? api(`/api/tasks/${encodeURIComponent(taskId)}/payments`) : null,
+    ]);
+    if (!box.isConnected) return;
+    let cards = (cards0.length ? cards0 : live?.cards || []).filter(c => c.status !== 'canceled' && c.status !== 'inactive');
+    const inherited = { cardIds: project.cardIds ?? org.cardIds,
+      budget: Object.hasOwn(project, 'budget') ? project.budget : project.allowance ?? (Object.hasOwn(org, 'budget') ? org.budget : org.allowance ?? 0) };
+    const policy = (taskId && S.paymentEdits?.[taskId]) || live || initial || inherited;
+    let selected = new Set(policy.cardIds ?? cards.map(c => c.id)), active = -1;
+    budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);
+    input.disabled = budget.disabled = box.querySelector('.payment-caret').disabled = false;
+    input.placeholder = 'Choose cards…';
+    if (live) box.querySelector('.payment-spent').textContent = `${usd(live.spent)} spent`;
+    function expand(open) { menu.hidden = !open; input.setAttribute('aria-expanded', String(open)); active = -1; input.removeAttribute('aria-activedescendant'); }
+    function paint() {
+      box.dataset.policy = JSON.stringify({ cardIds: [...selected] });
+      box.querySelector('.mcp-chips').innerHTML = [...selected].map(id => {
+        const name = cards.find(c => c.id === id)?.label || 'Unavailable card';
+        return `<span class="mcp-chip"><span>${esc(name)}</span><button type="button" data-remove="${esc(id)}" aria-label="Remove ${esc(name)}">×</button></span>`;
+      }).join('');
+      box.querySelectorAll('[data-remove]').forEach(button => button.onclick = () => { selected.delete(button.dataset.remove); change(); input.focus(); });
+      const filtered = cards.filter(c => c.label.toLowerCase().includes(input.value.toLowerCase()));
+      options.innerHTML = filtered.map((c, i) => `<div class="mcp-option-row"><button type="button" role="option" id="${options.id}-${i}" aria-selected="${selected.has(c.id)}" data-card="${esc(c.id)}"><span>${esc(c.label)}${c.last4 ? `<small>•••• ${esc(c.last4)}</small>` : ''}</span><span>${selected.has(c.id) ? '✓' : ''}</span></button></div>`).join('') || '<span class="payment-empty">No matching cards</span>';
+      options.querySelectorAll('[data-card]').forEach(button => button.onclick = () => { const id = button.dataset.card; selected.has(id) ? selected.delete(id) : selected.add(id); input.value = ''; change(); input.focus(); });
+    }
+    function change() {
+      paint();
+      if (taskId) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; }
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    box._setCards = next => { cards = next.filter(c => c.status !== 'canceled' && c.status !== 'inactive'); paint(); };
+    input.onfocus = () => expand(true);
+    input.oninput = () => { paint(); expand(true); };
+    box.querySelector('.payment-caret').onclick = () => { const open = menu.hidden; input.focus(); expand(open); };
+    box.addEventListener('focusout', () => setTimeout(() => { if (!box.contains(document.activeElement)) expand(false); }, 0));
+    input.onkeydown = event => {
+      const rows = [...options.querySelectorAll('[role="option"]')];
+      if (event.key === 'Escape' && !menu.hidden) { event.preventDefault(); event.stopPropagation(); expand(false); }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault(); if (menu.hidden) expand(true);
+        active = rows.length ? (active + (event.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length : -1;
+        rows.forEach((r, i) => r.classList.toggle('active', i === active));
+        if (rows[active]) { input.setAttribute('aria-activedescendant', rows[active].id); rows[active].scrollIntoView({ block: 'nearest' }); }
+      }
+      if (event.key === 'Enter' && !menu.hidden) { event.preventDefault(); rows[active]?.click(); }
+    };
+    budget.addEventListener('input', () => { if (taskId && budget.checkValidity()) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; } });
+    paint();
+    if (live && !live.canEdit) {
+      box.querySelectorAll('input, button').forEach(control => { control.disabled = true; });
+      if (save) save.hidden = true;
+      return;
+    }
+    if (save) {
+      save.disabled = !S.paymentEdits?.[taskId];
+      save.onclick = async () => {
+        save.disabled = true;
+        try {
+          const policy = readTaskPayments(box);
+          const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/payments`, { method: 'PUT', body: JSON.stringify(policy) });
+          delete S.paymentEdits?.[taskId];
+          box.querySelector('.payment-spent').textContent = `${usd(result.spent)} spent`;
+          toast(result.released.length ? 'Budget saved; pending payment approved' : 'Payments saved');
+        } catch (e) { save.disabled = false; toast(e.message, true); }
+      };
+    }
+  } catch (e) { box.querySelector('.payment-error').textContent = e.message; }
+}
+
 // Timing is fetched on demand, independently of the bounded conversation window.
 const timingReports = new Map();
+function applyTimingSetting(enabled) {
+  enabled = enabled === true;
+  if (S.meta?.timingEnabled === enabled) return;
+  S.meta = { ...S.meta, timingEnabled: enabled };
+  if (!enabled) {
+    timingReports.clear();
+    S.activity = (S.activity || []).filter(e => e.type !== 'timing');
+    S.taskEvents = (S.taskEvents || []).filter(e => e.type !== 'timing');
+    if (S.taskTab === 'timing') S.taskTab = 'overview';
+  }
+  const control = document.getElementById('timing-enabled');
+  if (control) control.checked = enabled;
+  if (S.selected && S.view) renderTaskPage();
+  else if (S.tab === 'activity') bgRenderMain();
+}
 function timingMs(value) { return value == null ? 'Unknown' : `${(value / 1000).toFixed(3)} s`; }
 function timingTab(v) {
+  if (!S.meta?.timingEnabled) return "";
   const report = timingReports.get(v.taskId);
   const stats = report ? [['Activity → first text', report.firstResponse], ['Activity → completion', report.completion],
     ['Request → first text', report.requestFirstResponse], ['Request → completion', report.requestCompletion],
@@ -18549,12 +18842,14 @@ function timingTab(v) {
       <span class="task-sub">${a.openSpans} unfinished spans</span></details>`).join('') || '<p class="task-sub">No instrumented agent turns yet.</p>'}` : ''}`;
 }
 function wireTiming(v) {
+  if (!S.meta?.timingEnabled) return;
   const refresh = document.getElementById('timing-refresh');
   if (!refresh) return;
   refresh.onclick = async () => {
     refresh.disabled = true;
     try {
       const report = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/timing`);
+      if (!S.meta?.timingEnabled) return;
       if (timingReports.size >= 10) timingReports.delete(timingReports.keys().next().value);
       timingReports.set(v.taskId, report);
       if (S.selected === v.taskId && S.taskTab === 'timing') renderTaskPage();
@@ -18562,6 +18857,7 @@ function wireTiming(v) {
     finally { refresh.disabled = false; }
   };
   document.getElementById('timing-download').onclick = () => {
+    if (!S.meta?.timingEnabled) return;
     const blob = new Blob([JSON.stringify(timingReports.get(v.taskId), null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = `${v.taskId}-timing.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);

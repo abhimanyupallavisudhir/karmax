@@ -71,6 +71,14 @@ describe('project transfer', () => {
     expect(store.kvGet(`project-transfer-lock:${project.id}`)).toBeUndefined();
   });
 
+  it('blocks a payment while the provider authorization is in flight', () => {
+    const { store, project, destination, transfers } = fixture();
+    const task = store.createTask({ projectId: project.id, title: 'Draft', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'purchase', draft: true } });
+    store.createPaymentSpendRequest({ organizationId: project.organizationId!, projectId: project.id, taskId: task.id,
+      amount: 100, status: 'authorizing' });
+    expect(transfers.preview(project.id, destination.id).blockers).toContainEqual(expect.objectContaining({ code: 'spending' }));
+  });
+
   it('blocks active work, name collisions, and resources with source-owned storage', () => {
     const { store, destination, project, transfers } = fixture();
     store.createProject('Project', {}, destination.id);
@@ -128,7 +136,7 @@ describe('project transfer boundaries and recovery', () => {
     const { store, destination, project, transfers, source } = fixture();
     const task = store.createTask({ projectId: project.id, title: 'Draft', workflow: 'just-do', workflowVersion: '1', params: {
       prompt: 'Keep the prompt', draft: true, profiles: { do: 'source-profile' }, 'agent:do': { mcpConnections: ['source-mcp'] },
-      _authorization: { capabilities: ['*'], principal: 'user:alice' }, _githubAccountId: 'source-account',
+      _authorization: { capabilities: ['*'], principal: 'user:alice' }, _githubAccountId: 'source-account', paymentPolicy: { cardIds: ['source-card'], budget: null },
     } });
     for (const key of [`vault:grant:${task.id}`, `vault:pass:${task.id}`, `vault:task-policy:${task.id}`, `permission:grant:${task.id}`]) store.kvSet(key, 'secret-authority');
     store.kvSet(`conversation-share-index:${task.id}:do`, 'public'); store.kvSet('conversation-share:public', '{}');
@@ -142,6 +150,7 @@ describe('project transfer boundaries and recovery', () => {
     expect(params.prompt).toBe('Keep the prompt');
     expect(params.profiles).toBeUndefined();
     expect(params._githubAccountId).toBeUndefined();
+    expect(params.paymentPolicy).toBeUndefined();
     expect(params['agent:do']).toBeUndefined();
     expect(params._authorization).toMatchObject({ capabilities: [], organizationId: destination.id, attenuationAccepted: false });
     expect(store.kvGet(`vault:grant:${task.id}`)).toBeUndefined();

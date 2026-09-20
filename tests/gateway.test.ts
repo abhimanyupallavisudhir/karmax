@@ -1,6 +1,6 @@
 import { platformToolHandlers } from '../src/agent/tools.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -114,6 +114,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     // infer it from the retained native file instead of hiding the handoff.
     h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: nativeHome }));
     try {
+      const read = vi.spyOn(fs, 'readFileSync');
+      try {
+        const metadata: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions?metadata=1`, { headers: auth() })).json();
+        expect(metadata.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true });
+        expect(metadata.do.exportId).toBeUndefined();
+        expect(metadata.do.downloadUrl).toBeUndefined();
+        expect(read.mock.calls.some(([file]) => String(file).includes(sessionId))).toBe(false);
+      } finally { read.mockRestore(); }
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
       expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.154.0-alpha.11' });
       const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
@@ -1932,6 +1940,28 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(third.status).toBe('needs_approval');
   });
 
+  it('lists task approval counts without hydrating each task conversation', async () => {
+    const project = h.store.createProject('Compact approval list');
+    const taskIds = new Set<string>();
+    for (let i = 0; i < 30; i++) {
+      const task = h.store.createTask({ projectId: project.id, title: `Task ${i}`, workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'x', draft: true } });
+      taskIds.add(task.id);
+      h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [{ id: 'large', text: 'x'.repeat(10_000), role: 'agent', ts: 1 }],
+        actions: [], state: {}, updatedAt: 1 });
+    }
+    const hydrate = vi.spyOn(h.store, 'getTask');
+    try {
+      const response = await fetch(`${base}/api/projects/${project.id}/tasks?includeArchived=1`, { headers: auth() });
+      expect(response.status).toBe(200);
+      const listed: any = await response.json();
+      expect(listed).toHaveLength(30);
+      expect(listed.every((task: any) => !task.lastView.messages)).toBe(true);
+      expect(hydrate.mock.calls.filter(([id]) => taskIds.has(id))).toHaveLength(0);
+    } finally { hydrate.mockRestore(); }
+  });
+
   it('projects credential approvals onto the task, notifies its human, and resumes it after resolution', async () => {
     const repo = await h.makeRepo('gw-credential-approval');
     const project: any = await (await fetch(`${base}/api/projects`, {
@@ -2034,13 +2064,15 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     fs.writeFileSync(fakePass, `#!/bin/sh
 case "$1" in
   show) cat "$KARMAX_TEST_PASS_ENTRY" ;;
-  insert) cat > "$KARMAX_TEST_PASS_ENTRY" ;;
+  insert) cat > "$KARMAX_TEST_PASS_ENTRY"; mkdir -p "$PASSWORD_STORE_DIR"; touch "$PASSWORD_STORE_DIR/export.gpg" ;;
   *) exit 1 ;;
 esac
 `);
     fs.chmodSync(fakePass, 0o755);
     const previousPath = process.env.PATH;
     const previousEntry = process.env.KARMAX_TEST_PASS_ENTRY;
+    const previousStore = process.env.PASSWORD_STORE_DIR;
+    process.env.PASSWORD_STORE_DIR = fakeHome;
     process.env.PATH = `${fakeHome}${path.delimiter}${previousPath ?? ''}`;
     process.env.KARMAX_TEST_PASS_ENTRY = entryFile;
     try {
@@ -2068,7 +2100,7 @@ esac
         }),
       })).json();
       expect(created.writeBack).toEqual([
-        { connector: 'pass', externalId: 'karmax/Agent-created-pass-rotation' },
+        { connector: 'pass', externalId: `karmax/${created.id}.login` },
       ]);
       expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\nusername: agent@example.com\n');
 
@@ -2089,6 +2121,20 @@ esac
       expect(fs.readFileSync(entryFile, 'utf8')).toBe(
         'rotated\nusername: agent@example.com\nkeep this note\n',
       );
+      const { PasskeyManager } = await import('../src/autonomy/passkey.js');
+      const { parsePassItem } = await import('../src/autonomy/pass-format.js');
+      const credentials = [{ credentialId: 'test-id', privateKey: 'test-key', rpId: 'example.com', userHandle: 'test-user', signCount: 0 }];
+      const harvest = vi.spyOn(PasskeyManager.prototype, 'harvest').mockResolvedValue(credentials);
+      try {
+        const response = await fetch(`${base}/api/vault/passkey/save`, {
+          method: 'POST', headers: agentAuth, body: JSON.stringify({authenticatorId:'test',label:'Enrolled passkey'}),
+        });
+        expect(response.status).toBe(200);
+        const saved: any = await response.json();
+        expect(saved.writeBack).toEqual([{connector:'pass',externalId:`karmax/${saved.itemId}.passkey`}]);
+        expect(parsePassItem(fs.readFileSync(entryFile,'utf8')).secrets.passkey).toBe(JSON.stringify(credentials));
+      } finally { harvest.mockRestore(); }
+
     } finally {
       await fetch(`${base}/api/vault/connectors/pass/config`, {
         method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: false }),
@@ -2097,6 +2143,8 @@ esac
       else process.env.PATH = previousPath;
       if (previousEntry === undefined) delete process.env.KARMAX_TEST_PASS_ENTRY;
       else process.env.KARMAX_TEST_PASS_ENTRY = previousEntry;
+      if (previousStore === undefined) delete process.env.PASSWORD_STORE_DIR;
+      else process.env.PASSWORD_STORE_DIR=previousStore;
       fs.rmSync(fakeHome, { recursive: true, force: true });
     }
   });
@@ -2106,6 +2154,16 @@ esac
     expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass', 'pass-git']);
     // In CI none of the CLIs are configured, so each reports a clear reason.
     for (const c of conns) { expect(typeof c.available).toBe('boolean'); expect(c.detail).toBeTruthy(); }
+  });
+
+  it('requires connector administration for retrying or discarding pending writes', async () => {
+    const reader=h.tokens.mint({taskId:'task_retry_reader',profileId:'do',principal:'user:test',ceiling:['credential:read'],grantorCaps:['credential:read']});
+    for(const action of ['retry-writes','discard-writes']){
+      const denied=await fetch(`${base}/api/vault/connectors/pass-git/${action}`,{method:'POST',headers:{authorization:`Bearer ${reader.token}`,'content-type':'application/json'},body:'{}'});
+      expect(denied.status).toBe(403);
+      const allowed=await fetch(`${base}/api/vault/connectors/pass-git/${action}`,{method:'POST',headers:auth(),body:'{}'});
+      expect(allowed.status).toBe(200);
+    }
   });
 
   it('agent mailbox: per-org address, shared-secret ingest, reads, and tenant isolation', async () => {

@@ -7,20 +7,22 @@ import { TimingTrace, type TimingContext, type TimingRow } from './index.js';
 export class TimingDelivery {
   private seen = new Set<string>();
   private pending = new Map<string, { trace: TimingTrace; end: ReturnType<TimingTrace['start']>; at: number }>();
-  constructor(private sink: (row: TimingRow) => void) {}
+  constructor(private sink: (row: TimingRow) => void, private enabled = () => true,
+    private traceFactory?: (context: TimingContext, sink: (row: TimingRow) => void) => TimingTrace) {}
   offer(context: TimingContext) {
-    if (!context.turnId) return undefined;
+    if (!this.enabled() || !context.turnId) return undefined;
     const key = `${context.taskId}/${context.workflowRunId}/${context.turnId}/${context.attempt}`;
     if (this.seen.has(key)) return undefined;
     this.seen.add(key);
     if (this.seen.size > 512) this.seen.delete(this.seen.values().next().value!);
-    const trace = new TimingTrace(context, this.sink);
+    const trace = this.traceFactory?.(context, this.sink) ?? new TimingTrace(context, this.sink, undefined, undefined, this.enabled);
     const id = randomUUID();
     if (this.pending.size >= 256) this.pending.delete(this.pending.keys().next().value!);
     this.pending.set(id, { trace, end: trace.start('delivery.socket-roundtrip'), at: performance.now() });
     return id;
   }
   acknowledge(input: unknown) {
+    if (!this.enabled()) { this.pending.clear(); return; }
     if (!input || typeof input !== 'object') return;
     const value = input as Record<string, unknown>;
     if (value.type !== 'timing.frame' || typeof value.id !== 'string' || typeof value.frameMs !== 'number'

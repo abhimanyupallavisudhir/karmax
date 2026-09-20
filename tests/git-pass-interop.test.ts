@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { expect, it } from 'vitest';
-import { GitPassConnector, Connectors } from '../src/autonomy/connectors.js';
+import { GitPassConnector, PassConnector, Connectors } from '../src/autonomy/connectors.js';
 import { VaultItems, totpCode } from '../src/autonomy/vault-items.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
@@ -19,7 +19,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
     PASSWORD_STORE_DIR: path.join(root, 'store'), PASSWORD_STORE_ENABLE_EXTENSIONS: 'true', GOPASS_AGE_PASSWORD: 'test-only' };
-  const run = (cmd: string, args: string[], input?: string, cwd?: string) => execFileSync(cmd, args,
+  const run = (cmd: string, args: string[], input?: string, cwd?: string) => execFileSync(cmd === 'gopass' ? process.env.GOPASS_BIN || cmd : cmd, args,
     { env, input, cwd, encoding: 'utf8', timeout: 30000, stdio: ['pipe', 'pipe', 'pipe'] });
   try {
     run('gpg', ['--batch', '--passphrase', '', '--quick-generate-key', 'Interop <interop@example.invalid>', 'rsa2048', 'encr', '0']);
@@ -44,6 +44,12 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     run('gopass', ['insert', '-m', '-f', 'kv'], `password\ntotp: ${seed}\nusername: alice\n`);
     run('gopass', ['insert', '-m', '-f', 'mixed-kv'], `password\ntotp: ${seed}\notpauth: otpauth://totp/mixed?secret=JBSWY3DPEHPK3PXP\n`);
     run('gopass', ['insert', '-m', '-f', 'mixed-bare'], `password\ntotp: ${seed}\notpauth://totp/mixed?secret=JBSWY3DPEHPK3PXP\n`);
+    const variants = [
+      ['sha256', `otpauth://totp/sha256?secret=${seed}&algorithm=SHA256&digits=8&period=45`],
+      ['sha512', `otpauth://totp/sha512?secret=${seed}&algorithm=SHA512&digits=6&period=60`],
+      ['custom', `otpauth://totp/custom?secret=${seed}&algorithm=SHA1&digits=8&period=15`],
+    ];
+    for (const [name, token] of variants) run('pass', ['otp', 'insert', '-e', name!], token+'\n');
     run('git', ['push', '-u', 'origin', branch], undefined, store);
 
     const config = { repositoryUrl: remote, gpgPrivateKey: privateKey };
@@ -55,7 +61,57 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     const connectors = new Connectors(db, items, broker);
     connectors.register(connector);
     await connectors.connect('pass-git', JSON.stringify(config));
-    const names = ['standalone', 'appended', 'yaml', 'kv', 'mixed-kv', 'mixed-bare'];
+    const local = new PassConnector(
+      async (cmd, args, opts) =>
+        execFileSync(cmd, args, {
+          env: { ...env, ...opts?.env },
+          input: opts?.input,
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }),
+      store,
+    );
+    for (const [type, field, value] of [
+      ['api-key', 'secret', 'synthetic-key'],
+      ['note', 'note', 'one\ntwo\n'],
+      ['ssh-key', 'privateKey', 'private\nkey'],
+      ['env', 'env', 'A=one\n'],
+      ['passkey', 'passkey', '{"credentialId":"test"}'],
+    ] as const) {
+      const entry = {
+        externalId: `karmax/local-${type}`,
+        type,
+        label: 'same label',
+        fields: [field],
+        secrets: { [field]: value },
+      };
+      const exported = await local.push(entry);
+      {
+        expect(await local.push(entry)).toEqual(exported);
+        await expect(local.push({ ...entry, secrets: { [field]: 'different' } })).rejects.toThrow(/not overwritten/);
+      }
+      expect((await local.pull([exported.externalId])).items[0]?.secrets[field]).toBe(value);
+      await local.updateSecret(exported.externalId, field, value + '!');
+      expect((await local.pull([exported.externalId])).items[0]?.secrets[field]).toBe(value + '!');
+    }
+    const collisionA = await local.push({
+      externalId: '',
+      type: 'login',
+      label: 'a b',
+      fields: ['password'],
+      secrets: { password: 'one' },
+    });
+    const collisionB = await local.push({
+      externalId: '',
+      type: 'login',
+      label: 'a-b',
+      fields: ['password'],
+      secrets: { password: 'two' },
+    });
+    expect(collisionA.externalId).not.toBe(collisionB.externalId);
+    expect((await local.pull([collisionA.externalId])).items[0]?.secrets.password).toBe('one');
+    run('git', ['push'], undefined, store);
+    const names = ['standalone', 'appended', 'yaml', 'kv', 'mixed-kv', 'mixed-bare', ...variants.map(([name]) => name!)];
     expect((await connectors.sync('pass-git', names)).count).toBe(names.length);
     const compareCodes = (name: string, secret: string) => {
       const before = Date.now();
@@ -71,7 +127,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
       const item = items.list().find(i => i.provenance.externalId === name)!;
       if (name === 'standalone') expect(item.fields).not.toContain('password');
       const token = items.readSecret(item, 'totp')!;
-      expect(items.totp(item, {})).toMatch(/^\d{6}$/);
+      expect(items.totp(item, {})).toHaveLength(token.startsWith('otpauth://') ? Number(new URL(token).searchParams.get('digits') || 6) : 6);
       compareCodes(name, token);
     }
     const newSeed = 'JBSWY3DPEHPK3PXP';
@@ -105,8 +161,12 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     const ageBranch = run('git', ['branch', '--show-current'], undefined, ageStore).trim();
     run('git', ['symbolic-ref', 'HEAD', `refs/heads/${ageBranch}`], undefined, ageRemote);
     run('git', ['push', '-u', 'origin', ageBranch], undefined, ageStore);
+    const identityFile = fs.readdirSync(root, { recursive: true }).map(String).find(file => file.endsWith('age/identities'))!;
+    expect(identityFile).toBeTruthy();
+    const encryptedIdentity = fs.readFileSync(path.join(root, identityFile)).toString('base64');
     const mounted = new GitPassConnector(() => JSON.stringify({ ...config,
-      mounts: [{ name: 'work', repositoryUrl: ageRemote, crypto: 'age', ageIdentity }] }),
+      mounts: [{ name: 'work', repositoryUrl: ageRemote, crypto: 'age',
+        ageIdentityEncrypted: encryptedIdentity, agePassphrase: env.GOPASS_AGE_PASSWORD }] }),
       'org_personal', () => ({}), path.join(root, 'connector'), { allowLocalRepository: true });
     connectors.register(mounted);
     expect((await connectors.sync('pass-git', ['work/otp'])).count).toBe(1);

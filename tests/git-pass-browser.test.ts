@@ -7,5 +7,5 @@ it.runIf(process.env.KARMAX_TEST_PASS_BROWSER === '1')('connects and imports thr
     { timeout: 240_000, maxBuffer: 4 * 1024 * 1024 });
   const result = JSON.parse(stdout.trim().split('\n').at(-1)!);
   expect(result).toEqual({ browserLogin: true, hostedGateway: true, tlsVerified: true, gitChallengeResponse: true,
-    gpgAndAgeMountImport: true, totpResolution: true, authenticatedGitPush: true, failedReplacementPreservesConnection: true, browserErrors: 0 });
+    gpgAndAgeMountImport: true, totpResolution: true, authenticatedGitPush: true, typedExportsAndRetry: true, failedReplacementPreservesConnection: true, browserErrors: 0 });
 }, 250_000);

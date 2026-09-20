@@ -4,7 +4,7 @@ import {
   GithubActionsApiError,
   actionLogExcerpt,
   classifyGithubActionsFailure,
-  classifyGithubActionsDiagnostic,
+  classifyGithubCheckStates,
   githubActionsRunIdFromUrl,
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
@@ -34,96 +34,105 @@ describe('GitHub Actions API', () => {
     artifacts: [], notices: [],
   });
 
-  it('classifies code, transient, account/configuration, and post-merge failures by owner', () => {
-    expect(classifyGithubActionsFailure(inspection('AssertionError: expected 2 to equal 3')).disposition).toBe('revision');
-    expect(classifyGithubActionsFailure(inspection('The hosted runner lost communication with the server')).disposition).toBe('retry');
-    expect(classifyGithubActionsFailure(inspection(
-      'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
-      { conclusion: 'cancelled' },
-    )).disposition).toBe('superseded');
-    expect(classifyGithubActionsFailure(inspection('The job never started'), {
-      providerContext: 'GitHub annotation: Recent account payments failed and the spending limit must be increased',
-    })).toMatchObject({ disposition: 'human', waitReason: 'GitHub Actions billing action required' });
-    expect(classifyGithubActionsDiagnostic('Workflow did not start because your spending limit needs to be increased')).toBe('human');
-    expect(classifyGithubActionsDiagnostic(
-      'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
-    )).toBe('superseded');
-    expect(classifyGithubActionsDiagnostic('AssertionError: expected 2 to equal 3')).toBeUndefined();
-    const deployment = classifyGithubActionsFailure(inspection('backup contains a symbolic link', {
-      name: 'Deploy', event: 'workflow_run', branch: 'master',
-    }), { postMerge: true });
-    expect(deployment.disposition).toBe('deployment');
-    expect(renderGithubActionsFailure(deployment)).toContain('backup contains a symbolic link');
+  const misleading = [
+    'taskPaymentsHtml("tp-payments", true)',
+    'ACTION_REQUIRED', 'startup_failure', 'CANCELLED', 'timed_out',
+    'Recent account payments have failed or your spending limit needs to be increased',
+    'The job was not started because your account is locked due to a billing issue.',
+    'Actions is disabled for this repository',
+    'Resource not accessible by integration',
+    'requires approval; approve and run; action required',
+    'Quota for Actions minutes exhausted; no included minutes',
+    'The hosted runner lost communication with the server',
+    'The operation was canceled',
+    'Canceling since a higher priority waiting request for CI exists',
+    'billing'.repeat(20_000),
+  ];
+
+  it.each(misleading.map((text, index) => [index, text] as const))(
+    'does not classify repository-controlled text as provider evidence (%s)', (_index, text) => {
+      const value = inspection(text);
+      value.run.name = text;
+      value.run.displayTitle = text;
+      value.notices = [`Could not read logs for ${text}`];
+      value.failedJobs[0]!.name = text;
+      value.failedJobs[0]!.steps[0]!.name = text;
+      const decision = classifyGithubActionsFailure(value, { checkContext: text });
+      expect(decision.disposition).toBe('revision');
+      expect(decision.waitReason).toBeUndefined();
+    });
+
+  it.each(['action_required', 'cancelled', 'timed_out', 'stale', 'startup_failure'])(
+    'classifies structured %s independently of annotation wording', (conclusion) => {
+      for (const checkContext of misleading) {
+        const value = inspection(checkContext, { conclusion });
+        value.failedJobs[0]!.conclusion = conclusion;
+        value.failedJobs[0]!.steps = [];
+        expect(classifyGithubActionsFailure(value, { checkContext }).disposition)
+          .toBe(['action_required', 'startup_failure'].includes(conclusion) ? 'human' : 'retry');
+      }
+    });
+
+  it.each(misleading.map((text, index) => [index, text] as const))(
+    'keeps unstarted or uninspectable failures neutral regardless of wording (%s)', (_index, text) => {
+      const value = inspection('');
+      value.failedJobs = [];
+      const decision = classifyGithubActionsFailure(value, { checkContext: text });
+      expect(decision).toMatchObject({ disposition: 'human', waitReason: 'GitHub Actions failure needs inspection' });
+      expect(decision.reason).not.toMatch(/billing|account|cannot fix/i);
+      expect(renderGithubActionsFailure(decision)).toContain(text.slice(0, 100));
+    });
+
+  it('uses every job, including failures outside the downloaded log cap', () => {
+    const value = inspection('');
+    value.jobs = [{ ...value.failedJobs[0]!, id: 101 }];
+    value.failedJobs = [];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
+  });
+
+  it('recognizes failure evidence even if logs are unavailable and ignores cancelled fixtures', () => {
+    const value = inspection('');
+    delete value.failedJobs[0]!.log;
+    value.notices = ['Could not read logs for billing: Resource not accessible by integration'];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
+  });
+
+  it('keeps diagnostics for code repair without using them as authority', () => {
+    const text = 'tests/billing.test.ts:14: expected "recent account payments have failed"';
+    const decision = classifyGithubActionsFailure(inspection('test failed'), { checkContext: text });
+    expect(decision.disposition).toBe('revision');
+    expect(renderGithubActionsFailure(decision)).toContain(text);
+  });
+
+  it('prioritizes failed execution evidence over a different interrupted job', () => {
+    const value = inspection('error', { conclusion: 'cancelled' });
+    value.jobs = [{ ...value.failedJobs[0]!, id: 102, conclusion: 'timed_out', steps: [] }];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
+  });
+
+  it('does not invent a cause when all jobs are skipped or metadata is partial', () => {
+    const value = inspection('');
+    value.failedJobs = [];
+    value.jobs = [{ id: 102, name: 'billing', status: 'completed', conclusion: 'skipped', steps: [], url: '' }];
+    value.notices = ['Job listing capped at 1,000', 'Failed to read logs: Actions is disabled'];
+    expect(classifyGithubActionsFailure(value)).toMatchObject({
+      disposition: 'human', waitReason: 'GitHub Actions failure needs inspection',
+    });
+  });
+
+  it('routes post-merge failures to deployment recovery', () => {
+    expect(classifyGithubActionsFailure(inspection('anything'), { postMerge: true }).disposition).toBe('deployment');
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/actions/runs/123/job/456')).toBe(123);
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/pull/1')).toBeUndefined();
   });
 
-  it('routes CI #410 source-diff keywords to revision because a job log is not provider evidence', () => {
-    const vitestDiff = [
-      'FAIL tests/web-console-ux.test.ts > reconnects after a dropped socket',
-      'AssertionError: expected app.js to contain if (wsHadDropped) { refreshTasks()',
-      '- Expected',
-      '+ Received',
-      '+ const fixtures = {',
-      '+ billing: "Payment failed; increase the spending limit or budget",',
-      '+ quota: "Quota for Actions minutes exhausted; no included minutes",',
-      '+ permissions: "Resource not accessible by integration; not permitted to use this action",',
-      '+ approval: "Action required: requires approval; approve and run",',
-      '+ runners: "Actions is disabled; workflows are disabled; no hosted runners",',
-      '+ prepaid: "Your prepaid balance has been fully consumed"',
-      '+ };',
-    ].join('\n');
-
-    const decision = classifyGithubActionsFailure(inspection(vitestDiff));
-    expect(decision.disposition).toBe('revision');
-    expect(renderGithubActionsFailure(decision)).toContain('tests/web-console-ux.test.ts');
-  });
-
-  it('routes only direct provider evidence and action_required to a human', () => {
-    const annotation = classifyGithubActionsFailure(inspection('AssertionError: ordinary test failure'), {
-      providerContext: 'GitHub check annotation: Actions is disabled for this repository',
-    });
-    expect(annotation).toMatchObject({
-      disposition: 'human',
-      waitReason: 'GitHub Actions is disabled',
-      providerEvidence: expect.stringContaining('Actions is disabled'),
-    });
-    expect(renderGithubActionsFailure(annotation)).toContain('Provider evidence:');
-
-    expect(classifyGithubActionsFailure(inspection('', {
-      conclusion: 'action_required',
-    }))).toMatchObject({
-      disposition: 'human',
-      waitReason: 'GitHub Actions approval required',
-    });
-  });
-
-  it('classifies GitHub concurrency preemption as superseded in inspected and fallback diagnostics', () => {
-    const message = 'Canceling since a higher priority waiting request for CI-refs/pull/113/merge exists.';
-    const decision = classifyGithubActionsFailure(inspection(message, { conclusion: 'cancelled' }));
-    expect(decision).toMatchObject({
-      disposition: 'superseded',
-      reason: expect.stringMatching(/newer or higher-priority run.*wait/i),
-    });
-    expect(classifyGithubActionsDiagnostic(message)).toBe('superseded');
-    expect(classifyGithubActionsDiagnostic('Pull request check\n- CI: CANCELLED')).toBe('retry');
-  });
-
-  it('does not route a cancelled run from billing/quota fixture text printed by tests', () => {
-    const fixture = [
-      "expected classification fixture: You're out of usage credits",
-      'Your prepaid balance has now been fully consumed.',
-      'all negative-path classifier assertions passed',
-      'The operation was canceled.',
-    ].join('\n');
-    expect(classifyGithubActionsFailure(inspection(fixture, {
-      conclusion: 'cancelled', status: 'completed',
-    })).disposition).toBe('retry');
-    // Direct GitHub check evidence still routes a genuine provider/account
-    // block accurately even when the execution itself was cancelled.
-    expect(classifyGithubActionsFailure(inspection('The operation was canceled.', {
-      conclusion: 'cancelled', status: 'completed',
-    }), { providerContext: 'GitHub annotation: Actions is disabled for this repository' }).disposition).toBe('human');
+  it('classifies fallback checks from state fields only', () => {
+    for (const state of ['FAILURE', 'ERROR', 'UNKNOWN', 'conclusion: CANCELLED', 'requires approval'])
+      expect(classifyGithubCheckStates([state])).toBeUndefined();
+    expect(classifyGithubCheckStates(['ACTION_REQUIRED'])).toMatchObject({ disposition: 'human' });
+    expect(classifyGithubCheckStates(['STARTUP_FAILURE'])).toMatchObject({ disposition: 'human' });
+    for (const state of ['CANCELLED', 'TIMED_OUT', 'STALE'])
+      expect(classifyGithubCheckStates([state])).toMatchObject({ disposition: 'retry' });
   });
 
   it('reconciles duplicate run observations by canonical exact-head validation identity', () => {

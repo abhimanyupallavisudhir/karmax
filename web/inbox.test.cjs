@@ -42,7 +42,7 @@ global.profileRoute = () => '/profile';
 // A `const` inside a direct eval stays in the eval's own scope; hoist it out.
 eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
-for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxView', 'updateBell']) eval(extractFn(name));
+for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'updateBell']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -128,6 +128,26 @@ ok(html.includes('href="/personal/inbox/escalated"'), 'empty sub-tabs are still 
 ok(html.includes('id="inbox-show-read"'), 'the panel offers the Show read toggle');
 ok(!/id="inbox-show-read"[^>]*checked/.test(html), 'Show read is unchecked by default');
 ok(html.includes('Task 1'), 'rows render the task title');
+ok(/class="task-row inbox-row/.test(html), 'notifications reuse task-row styling');
+ok(/class="task-title"><span class="task-num">#1<\/span> Task 1/.test(html), 'task number and title share the task title line');
+ok(/class="task-main"/.test(html) && /class="task-right"/.test(html), 'notification content and actions use task row columns');
+ok(/class="status-dot /.test(html), 'notifications use task status dots');
+ok(/data-inbox="1" tabindex="0"/.test(html), 'notification rows can receive keyboard focus');
+ok(/aria-label="Mark as read"/.test(html) && /data-inbox-toggle="1"/.test(html), 'checkmark has an accessible read action');
+ok(/class="task-right">[\s\S]*urgency-chip[\s\S]*<time[\s\S]*data-inbox-toggle/.test(html), 'urgency, time, and checkmark appear in order on the right');
+const now = new Date(2026, 8, 18, 14, 0).getTime();
+ok(inboxTimeLabel(now - 10 * 60000, now) === '10 minutes ago', 'minutes are relative');
+ok(inboxTimeLabel(now - 3600000, now) === '1 hour ago', 'singular hour is relative');
+ok(inboxTimeLabel(now - 10000, now) === 'just now', 'recent arrivals say just now');
+ok(inboxTimeLabel(new Date(2026, 8, 17, 23).getTime(), now) === 'yesterday', 'previous calendar day says yesterday');
+ok(!/ago|:/.test(inboxTimeLabel(new Date(2026, 8, 16).getTime(), now)), 'older notifications use only a date');
+S.projects = [{ id: 'project_1', name: 'Karmax & tools' }];
+ok(inboxProjectLabel(S.inbox[0]) === 'Karmax & tools', 'task project name is resolved');
+ok(inboxProjectLabel({ resource: { projectId: 'project_1' } }) === 'Karmax & tools', 'resource notifications resolve their project');
+ok(inboxView().includes('Karmax &amp; tools'), 'project label is escaped');
+for (const name of ['taskRow', 'seriesRow']) ok(!extractFn(name).includes('workflowLabel('), name + ' omits workflow type');
+
+
 ok(!html.includes('Task 3'), 'a read row is not rendered while Show read is off');
 ok(!html.includes('Task 4'), 'All does not render an unread routine update');
 ok(html.includes('<span>2 unread</span>'), 'the All toolbar count excludes routine updates');

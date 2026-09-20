@@ -98,21 +98,25 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
 }
 
 async function buildDaytona(input: EnvironmentBuildInput): Promise<EnvironmentBuildResult> {
-  const sdk: any = await import('@daytona/sdk').catch(() => undefined);
-  if (!sdk?.Daytona || !sdk.Image?.base) throw new Error('this Daytona SDK cannot build snapshots declaratively');
-  const daytona = new sdk.Daytona({
+  const { Daytona, Image, DaytonaAuthorizationError } = await import('@daytona/sdk');
+  const daytona = new Daytona({
     ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}),
     ...(input.connection?.apiUrl ? { apiUrl: input.connection.apiUrl } : {}),
     ...(input.connection?.target ? { target: input.connection.target } : {}),
   });
-  if (!daytona.snapshot?.create) throw new Error('this Daytona SDK cannot create snapshots');
-  let image = sdk.Image.base(input.spec.image ?? 'ubuntu:22.04');
-  const commands = setupCommands(input.spec);
-  if (commands.length) image = image.runCommands(...commands);
-  const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
-  input.assertActive?.();
-  await daytona.snapshot.create({ name, image }, { timeout: 45 * 60_000 });
-  return { ref: name };
+  try {
+    let image = Image.base(input.spec.image ?? 'ubuntu:22.04');
+    const commands = setupCommands(input.spec);
+    if (commands.length) image = image.runCommands(...commands);
+    const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
+    input.assertActive?.();
+    await daytona.snapshot.create({ name, image }, { timeout: 45 * 60 });
+    return { ref: name };
+  } catch (error) {
+    if (error instanceof DaytonaAuthorizationError)
+      throw new Error('Daytona denied the environment build. Configure an API key with write:snapshots permission to build setup snapshots.', { cause: error });
+    throw error;
+  } finally { await daytona[Symbol.asyncDispose](); }
 }
 
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }

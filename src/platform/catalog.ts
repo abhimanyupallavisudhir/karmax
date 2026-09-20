@@ -231,7 +231,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why, urgency?}; approval is high urgency by default)',
     'POST /api/vault/requests/:id/resolve (credential:write: body {action: once|task|always|deny, itemId?})',
     'GET /api/vault/connectors (hosted 1Password + Git-backed pass; host-local Bitwarden/1Password/pass where available)',
-    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
+    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back|retry-writes|discard-writes (selective mirror + opt-in write-back; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
     'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
   ],
   agentMail: [
@@ -270,6 +270,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/payments/requests',
     'POST /api/organizations/:organizationId/payments/requests/:id/:decision',
     'GET /api/organizations/:organizationId/payments/transactions',
+    'GET /api/tasks/:taskId/payments (selected cardIds, budget in cents or null, spent in cents)',
+    'PUT /api/tasks/:taskId/payments (payment:write; body {cardIds, budget}; releases pending payments that now fit)',
     'GET|POST /api/cards',
     'POST /api/cards/:id/fund',
     'DELETE /api/cards/:id',

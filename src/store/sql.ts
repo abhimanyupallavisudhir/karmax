@@ -43,6 +43,7 @@ class SqliteDatabase implements SqlDatabase {
 
 interface RpcResponse {
   ok: boolean;
+  transactionOpen?: boolean;
   value?: unknown;
   spill?: string;
   error?: { message: string; stack?: string; code?: string };
@@ -94,9 +95,6 @@ class PostgresDatabase implements SqlDatabase {
 
   exec(sql: string): void {
     this.call('exec', { sql });
-    const command = sql.trimStart().toUpperCase();
-    if (command.startsWith('BEGIN')) this.transactionOpen = true;
-    else if (command.startsWith('COMMIT') || command.startsWith('ROLLBACK')) this.transactionOpen = false;
   }
   inTransaction(): boolean { return this.transactionOpen; }
 
@@ -124,6 +122,7 @@ class PostgresDatabase implements SqlDatabase {
       try { response = JSON.parse(fs.readFileSync(spill, 'utf8')) as RpcResponse; }
       finally { fs.rmSync(spill, { force: true }); }
     }
+    if (response.transactionOpen !== undefined) this.transactionOpen = response.transactionOpen;
     if (!response.ok) {
       const error = new Error(response.error?.message ?? 'PostgreSQL operation failed');
       if (response.error?.stack) error.stack = response.error.stack;

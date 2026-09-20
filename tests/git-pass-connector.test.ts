@@ -90,7 +90,7 @@ describe('Git-backed unix pass connector', () => {
     expect(fs.readdirSync(connectorRoot).filter((name) => name.startsWith('.git-auth-'))).toEqual([]);
     await connector.updateSecret('sites/example.com', 'note', 'Username: administrator\r\n  free text  ');
     expect((await connector.pull(['sites/example.com'])).items[0]!.secrets).toMatchObject({
-      password: 'rotated-password', note: 'Username: administrator\r\n  free text  ',
+      password: 'rotated-password', note: 'Username: administrator\r\n  free text  \notpauth://totp/example?secret=OLDSEED\n', totp: 'otpauth://totp/example?secret=OLDSEED',
     });
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }, 30_000);

@@ -72,7 +72,7 @@ export class ProjectTransfers {
       rows('world_leases').some(r => r.state !== 'released') || rows('usage_admissions').some(r => r.state === 'active'));
     block('previews', 'Revoke live preview links before moving.', rows('preview_leases').some(r => !r.revokedAt && r.expiresAt > Date.now()));
     block('cards', 'Remove project payment cards before moving.', s.db.prepare('SELECT 1 FROM cards WHERE scopeId=?').get(projectId));
-    block('spending', 'Resolve pending spending requests before moving.', rows('payment_spend_requests').some(r => ['authorized', 'pending_approval', 'needs_funding'].includes(r.status)));
+    block('spending', 'Resolve pending spending requests before moving.', rows('payment_spend_requests').some(r => ['authorizing', 'authorized', 'pending_approval', 'needs_funding'].includes(r.status)));
     block('deletion', 'Wait for deletion to finish before moving this project.',
       s.kvGet(`organization-deleting:${project.organizationId}`) || s.kvGet(`organization-deleting:${destinationOrganizationId}`)
       || JSON.parse(s.kvGet(transferLockKey(projectId)) ?? '{}').kind === 'delete');
@@ -218,7 +218,7 @@ export class ProjectTransfers {
       }
       const { _authorization, _githubAccountId, profiles, ...params } = task.params;
       if (task.params.draft) {
-        for (const key of Object.keys(params)) if (key.startsWith('agent:') || ['confirm', 'confirmer', 'responder', 'confirmation', 'gitProfile', 'runnerPoolId', 'environment', 'worldProvider', 'copyGlobs'].includes(key))
+        for (const key of Object.keys(params)) if (key.startsWith('agent:') || ['confirm', 'confirmer', 'responder', 'confirmation', 'gitProfile', 'runnerPoolId', 'environment', 'worldProvider', 'copyGlobs', 'paymentPolicy'].includes(key))
           delete params[key];
         // Creator identity is historical provenance, not permission. If that
         // person is absent from the receiving org, route new draft decisions

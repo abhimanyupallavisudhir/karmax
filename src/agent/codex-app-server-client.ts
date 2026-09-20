@@ -1,4 +1,5 @@
 import type { Writable, Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 /**
  * Minimal JSON-RPC client for the `codex app-server` protocol (SPEC §7.1). The
@@ -14,7 +15,8 @@ import type { Writable, Readable } from 'node:stream';
  * without spawning the real binary.
  */
 export class CodexAppServerClient {
-  private buf = '';
+  private fragments: string[] = [];
+  private readonly decoder = new StringDecoder('utf8');
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private notificationHandler?: (method: string, params: any) => void;
@@ -25,7 +27,9 @@ export class CodexAppServerClient {
     private readonly stdin: Writable,
     stdout: Readable,
   ) {
-    stdout.on('data', (d: Buffer | string) => this.onData(d.toString()));
+    stdout.on('data', (d: Buffer | string) => {
+      if (!this.closed) this.onData(typeof d === 'string' ? d : this.decoder.write(d));
+    });
     // Writable failures are normally reported asynchronously through the stream's
     // `error` event (a write to a child that just exited is the classic EPIPE).
     // A try/catch around `.write()` cannot catch that event; without a listener,
@@ -50,12 +54,23 @@ export class CodexAppServerClient {
   }
 
   private onData(chunk: string): void {
-    this.buf += chunk;
-    let i: number;
-    while ((i = this.buf.indexOf('\n')) >= 0) {
-      const line = this.buf.slice(0, i);
-      this.buf = this.buf.slice(i + 1);
+    // PTYs deliver large responses (including native thread history) in small
+    // chunks. Appending to and searching the entire accumulated string on each
+    // chunk is quadratic and can starve HTTP, Temporal and sandbox heartbeats.
+    // Search only new bytes; assemble each complete line once.
+    let start = 0;
+    for (;;) {
+      const end = chunk.indexOf('\n', start);
+      if (end < 0) {
+        if (start < chunk.length) this.fragments.push(chunk.slice(start));
+        return;
+      }
+      const tail = chunk.slice(start, end);
+      const line = this.fragments.length ? [...this.fragments, tail].join('') : tail;
+      this.fragments = [];
       if (line.trim()) this.handleLine(line);
+      if (this.closed) return;
+      start = end + 1;
     }
   }
 
@@ -127,6 +142,7 @@ export class CodexAppServerClient {
   private failTransport(cause: unknown): void {
     if (this.closed) return;
     this.closed = true;
+    this.fragments = [];
     const detail = cause instanceof Error ? cause.message : String(cause);
     const error = new Error(`codex app-server transport failed: ${detail}`);
     for (const p of this.pending.values()) p.reject(error);
@@ -137,6 +153,7 @@ export class CodexAppServerClient {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.fragments = [];
     for (const p of this.pending.values()) p.reject(new Error('codex app-server client closed'));
     this.pending.clear();
     try {

@@ -1,5 +1,6 @@
+import { resolvePaymentPolicy, validatePaymentPolicy } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
-import { TimingTrace, timingReport } from '../timing/index.js';
+import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
 import { requireHumanSubject } from './identity.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
@@ -1037,7 +1038,7 @@ export class KarmaxApi {
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
     },
-    receivedAt = { monoMs: performance.now(), wallMs: Date.now() },
+    receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined,
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
     const project = this.deps.store.getProject(args.projectId);
@@ -1079,6 +1080,12 @@ export class KarmaxApi {
     // Wiki context (which pages to inline) isn't a manifest param either; a
     // top-level arg (MCP/API) is folded in like the form sends it via `params`.
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
+    if (taskOverrides.paymentPolicy !== undefined) {
+      validatePaymentPolicy(this.deps.store, project.id, project.organizationId ?? 'org_personal', taskOverrides.paymentPolicy);
+      if (JSON.stringify(taskOverrides.paymentPolicy) !== JSON.stringify(resolvePaymentPolicy(this.deps.store, project.id)))
+        this.require(token, 'manage_payments', { projectId: project.id });
+    }
+    taskOverrides.paymentPolicy ??= resolvePaymentPolicy(this.deps.store, project.id);
     this.assertBranchParams(taskOverrides);
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
@@ -1340,7 +1347,7 @@ export class KarmaxApi {
     const initialFiles = taskOverrides.files as FileRef[] | undefined;
     if (initialFiles?.length) input.files = initialFiles;
 
-    const requestTiming = new TimingTrace({ taskId: task.id, requestIds: [`${task.id}:m0`] }, row => {
+    const requestTiming = installationTiming(this.deps.store, { taskId: task.id, requestIds: [`${task.id}:m0`] }, row => {
       this.deps.store.appendEvent({ taskId: task.id, type: 'timing', ts: row.wallMs, payload: { ...row } });
     });
     requestTiming.mark('request.received', { requestId: `${task.id}:m0` }, receivedAt);
@@ -2157,6 +2164,10 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     if (!task) throw new NotFoundError(`no task ${taskId}`);
+    if (params.paymentPolicy !== undefined && JSON.stringify(params.paymentPolicy) !== JSON.stringify((task.params as any).paymentPolicy)) {
+      this.require(token, 'manage_payments', { projectId: task.projectId, taskId });
+      validatePaymentPolicy(this.deps.store, task.projectId, this.deps.store.getProject(task.projectId)!.organizationId ?? 'org_personal', params.paymentPolicy);
+    }
     this.assertBranchParams(params);
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
@@ -2173,6 +2184,7 @@ export class KarmaxApi {
     }
     const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
+      paymentPolicy: (task.params as any).paymentPolicy,
       ...(archived !== undefined ? { archived } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
       ...(priority !== undefined ? { priority } : {}),
@@ -3771,13 +3783,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async taskTiming(token: string, taskId: string) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
+    if (!timingEnabled(this.deps.store)) throw new Error('Timing is disabled for this installation');
     return timingReport(this.deps.store.eventsOfType(taskId, 'timing').map(e => e.payload as unknown as import('../timing/index.js').TimingRow));
   }
 
   async taskEvents(token: string, taskId: string, since = 0, limit?: number) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
-    return this.deps.store.eventsSince(taskId, since, limit);
+    return this.deps.store.eventsSince(taskId, since, limit, !timingEnabled(this.deps.store));
   }
 
   /** Resolve an Actions request through the calling task's project attachment.
@@ -4153,7 +4166,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt = { monoMs: performance.now(), wallMs: Date.now() }): Promise<Message | undefined> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
@@ -4428,7 +4441,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        const trace = new TimingTrace({ taskId, requestIds: [`${taskId}:${followUp.id}`] }, row => {
+        const trace = installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:${followUp.id}`] }, row => {
           this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
         });
         trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt);
@@ -4608,6 +4621,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return accepted;
   }
 
+  async setTaskPaymentPolicy(token: string, taskId: string, value: unknown): Promise<void> {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    this.require(token, 'manage_payments', { projectId: task.projectId, taskId });
+    if (['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')) throw new Error('Payments are read-only after a task finishes');
+    validatePaymentPolicy(this.deps.store, task.projectId, this.deps.store.getProject(task.projectId)!.organizationId ?? 'org_personal', value);
+    this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any);
+  }
+
   /**
    * Apply an in-flight param edit (SPEC §4.5/§5.5) via the workflow's validated
    * `updateParams` update. Throws with the validator's reason if any field isn't
@@ -4619,6 +4641,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = this.require(token, 'edit_task', { projectId: task.projectId, taskId });
+    if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
     this.assertBranchParams(patch);
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.

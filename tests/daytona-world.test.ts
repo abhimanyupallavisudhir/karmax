@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DaytonaWorldProvider, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
 
 describe('Daytona cloud world provider', () => {
@@ -40,8 +40,8 @@ describe('Daytona cloud world provider', () => {
       async getSignedPreviewUrl() { return { url: 'https://preview.invalid/?signed=keep' }; },
       async refreshData() {},
       async start() { started++; sandbox.state = 'started'; },
-      async stop() {},
-      async archive() { archived++; sandbox.state = 'archived'; },
+      async stop() { sandbox.state = 'stopped'; },
+      async archive() { expect(sandbox.state).toBe('stopped'); archived++; sandbox.state = 'archived'; },
       async delete() { deleted++; },
     };
     const factory: DaytonaFactory = {
@@ -53,7 +53,9 @@ describe('Daytona cloud world provider', () => {
       network: { allowDomains: ['registry.npmjs.org'] }, resources: { cpu: 2, memoryMb: 4096 } });
 
     expect(createOptions).toMatchObject({ snapshot: 'snapshot-v1', public: false, autoStopInterval: 2,
-      networkBlockAll: true, domainAllowList: expect.stringContaining('registry.npmjs.org'), resources: { cpu: 2, memory: 4 } });
+      domainAllowList: expect.stringContaining('registry.npmjs.org') });
+    expect(createOptions).not.toHaveProperty('resources');
+    expect(createOptions).not.toHaveProperty('networkBlockAll');
     expect(world.handle).toMatchObject({ version: 2, kind: 'daytona', provider: 'daytona', root: '/home/daytona/karmax' });
     expect(world.handle.sealedProviderRef).toBeTruthy();
     expect(JSON.stringify(world.handle)).not.toContain('daytona-secret-id');
@@ -102,6 +104,216 @@ describe('Daytona cloud world provider', () => {
     expect(started).toBe(1);
     await world.destroy();
     expect(deleted).toBe(1);
+  });
+
+  it.each([undefined, 'custom-snapshot'])('never sends resources with snapshot %s, including the API-key-only default', async (snapshot) => {
+    const sandbox = fakeSandbox();
+    const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
+    await new DaytonaWorldProvider({ create, get: async () => sandbox }, undefined, snapshot)
+      .create({ taskId: 'default', base: 'main', resources: { cpu: 2, memoryMb: 2048, gpu: 0 } });
+    expect(create.mock.calls[0]![0]).not.toHaveProperty('resources');
+  });
+
+  it('passes resource sizes only to image builds', async () => {
+    const sandbox = fakeSandbox();
+    const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
+    await new DaytonaWorldProvider({ create, get: async () => sandbox })
+      .create({ taskId: 'image', base: 'main', environment: { image: 'ubuntu:24.04' }, resources: { cpu: 2, memoryMb: 4096 } });
+    expect(create.mock.calls[0]![0]).toMatchObject({ image: 'ubuntu:24.04', resources: { cpu: 2, memory: 4 } });
+  });
+
+  it('waits for a starting sandbox before handing it to a caller', async () => {
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'resume', base: 'main' });
+    sandbox.state = 'starting';
+    sandbox.waitUntilStarted = vi.fn(async () => { sandbox.state = 'started'; });
+    await provider.open(world.handle);
+    expect(sandbox.waitUntilStarted).toHaveBeenCalledWith(120);
+  });
+
+  it('rejects unsupported CIDR policies before creating a sandbox', async () => {
+    const create = vi.fn(async () => fakeSandbox());
+    await expect(new DaytonaWorldProvider({ create, get: async () => fakeSandbox() }).create({
+      taskId: 'cidr', base: 'main', network: { allowCidrs: ['10.0.0.0/8'] },
+    })).rejects.toThrow(/CIDR/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('reports the fixed snapshot allocation when requested sizing differs', async () => {
+    const sandbox = fakeSandbox();
+    Object.assign(sandbox, { cpu: 4, memory: 2, gpu: 0 });
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox }).create({
+      taskId: 'size', base: 'main', resources: { cpu: 2, memoryMb: 4096, gpu: 0 },
+    });
+    expect(world.handle.warnings).toEqual([expect.stringContaining('4 CPUs, 2 GiB RAM')]);
+  });
+
+  it('cleans up when snapshot GPU requirements cannot be satisfied', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.delete = vi.fn(async () => {});
+    await expect(new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox }).create({
+      taskId: 'gpu', base: 'main', resources: { gpu: 1 },
+    })).rejects.toThrow(/GPU snapshot/);
+    expect(sandbox.delete).toHaveBeenCalled();
+  });
+
+  it('cleans up a background session when launching its command fails', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createSession = vi.fn(async () => {});
+    sandbox.process.executeSessionCommand = vi.fn(async () => { throw new Error('launch failed'); });
+    sandbox.process.getSessionCommand = vi.fn();
+    sandbox.process.getSessionCommandLogs = vi.fn();
+    sandbox.process.deleteSession = vi.fn(async () => {});
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'launch', base: 'main' });
+    await expect(world.startProcess({ command: 'false' })).rejects.toThrow('launch failed');
+    expect(sandbox.process.deleteSession).toHaveBeenCalledOnce();
+  });
+
+  it('drains output before exit and releases completed background sessions', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createSession = async () => {};
+    sandbox.process.executeSessionCommand = async () => ({ cmdId: 'cmd' });
+    sandbox.process.getSessionCommand = async () => ({ exitCode: 7 });
+    sandbox.process.getSessionCommandLogs = async (_session, _command, stdout) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      stdout?.('last output');
+    };
+    sandbox.process.deleteSession = vi.fn(async () => {});
+    sandbox.refreshActivity = vi.fn(async () => {});
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'complete', base: 'main' });
+    const process = await world.startProcess({ command: 'echo done' });
+    let output = '';
+    process.onOutput((chunk) => { output += chunk; });
+    const code = await new Promise((resolve) => process.onExit(resolve));
+    expect(code).toBe(7);
+    expect(output).toBe('last output');
+    expect(sandbox.process.deleteSession).toHaveBeenCalledOnce();
+    expect(sandbox.refreshActivity).toHaveBeenCalled();
+  });
+
+  it('recovers an allocated generation after create times out instead of creating another world', async () => {
+    const sandbox = fakeSandbox();
+    let labels: Record<string, string> | undefined;
+    const create = vi.fn(async (options: Record<string, unknown>) => {
+      labels = options.labels as Record<string, string>;
+      sandbox.labels = labels;
+      throw new Error('request timed out');
+    });
+    const provider = new DaytonaWorldProvider({ create, get: async () => sandbox,
+      list: async () => labels ? [sandbox] : [] });
+    const world = await provider.create({ taskId: 'recover', generation: 3, base: 'main' });
+    expect(world.handle.id).toBe('recover');
+    expect(labels).toMatchObject({ karmaxTaskId: 'recover', karmaxGeneration: '3' });
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it('deletes a sandbox if cancellation happens during allocation', async () => {
+    const abort = new AbortController();
+    const sandbox = fakeSandbox();
+    sandbox.delete = vi.fn(async () => {});
+    const provider = new DaytonaWorldProvider({ create: async () => { abort.abort(); return sandbox; }, get: async () => sandbox });
+    await expect(provider.create({ taskId: 'cancel', base: 'main', signal: abort.signal })).rejects.toThrow();
+    expect(sandbox.delete).toHaveBeenCalledOnce();
+  });
+
+  it('keeps SSH provisioning unrestricted then applies task policy after removing credentials', async () => {
+    const sandbox = fakeSandbox();
+    const commands: string[] = [];
+    sandbox.process.executeCommand = async (command) => {
+      commands.push(command);
+      return { exitCode: 0, result: command.includes('rev-parse') ? 'a'.repeat(40) : '' };
+    };
+    sandbox.updateNetworkSettings = vi.fn(async () => { expect(commands.at(-1)).toContain('rm -f'); });
+    const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
+    await new DaytonaWorldProvider({ create, get: async () => sandbox }).create({
+      taskId: 'ssh', base: 'main', repo: 'git@github.com:acme/private.git', gitCredentials: { sshKey: 'test-key' },
+    });
+    expect(create.mock.calls[0]![0]).toMatchObject({ networkBlockAll: false });
+    expect(create.mock.calls[0]![0]).not.toHaveProperty('domainAllowList');
+    expect(sandbox.updateNetworkSettings).toHaveBeenCalledWith({ domainAllowList: expect.stringContaining('github.com') });
+  });
+
+  it('lets a project image override the organization snapshot', async () => {
+    const sandbox = fakeSandbox();
+    const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
+    await new DaytonaWorldProvider({ create, get: async () => sandbox }, undefined, 'organization-snapshot')
+      .create({ taskId: 'image-override', base: 'main', environment: { image: 'ubuntu:24.04' } });
+    expect(create.mock.calls[0]![0]).toMatchObject({ image: 'ubuntu:24.04' });
+    expect(create.mock.calls[0]![0]).not.toHaveProperty('snapshot');
+  });
+
+  it('deletes the sandbox if final network enforcement fails', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.updateNetworkSettings = async () => { throw new Error('network rejected'); };
+    sandbox.delete = vi.fn(async () => {});
+    await expect(new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox }).create({
+      taskId: 'network', base: 'main', gitCredentials: { sshKey: 'test' },
+    })).rejects.toThrow('network rejected');
+    expect(sandbox.delete).toHaveBeenCalledOnce();
+  });
+
+  it('treats deletion of an already removed sandbox as success, including stale listings', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.delete = vi.fn(async () => { throw Object.assign(new Error('already deleted'), { statusCode: 404 }); });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox,
+      list: async () => [sandbox] });
+    const world = await provider.create({ taskId: 'deleted', base: 'main' });
+    await world.destroy();
+    await (await provider.listSandboxes())[0]!.destroy();
+    expect(await provider.status(world.handle)).toBe('missing');
+    sandbox.delete = async () => { throw Object.assign(new Error('denied'), { statusCode: 403 }); };
+    await expect(world.destroy()).rejects.toThrow('denied');
+  });
+
+  it('cleans up a terminal when connection setup fails', async () => {
+    const sandbox = fakeSandbox();
+    const kill = vi.fn(async () => {}), disconnect = vi.fn(async () => {});
+    sandbox.process.createPty = async () => ({ kill, disconnect,
+      waitForConnection: async () => { throw new Error('socket closed'); } });
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'pty-failure', base: 'main' });
+    await expect(world.openPty()).rejects.toThrow('socket closed');
+    expect(kill).toHaveBeenCalledOnce();
+    expect(disconnect).toHaveBeenCalledOnce();
+  });
+
+  it('preserves UTF-8 characters split across terminal frames', async () => {
+    const sandbox = fakeSandbox();
+    let onData: (data: Uint8Array) => void = () => {};
+    sandbox.process.createPty = async (options) => {
+      onData = options.onData;
+      return { wait: () => new Promise(() => {}), sendInput: async () => {}, kill: async () => {} };
+    };
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'utf8', base: 'main' });
+    const pty = await world.openPty();
+    let output = '';
+    pty.onData((chunk) => { output += chunk; });
+    const bytes = Buffer.from('🙂');
+    onData(bytes.subarray(0, 2));
+    onData(bytes.subarray(2));
+    await pty.close();
+    expect(output).toBe('🙂');
+  });
+
+  it('explains restricted-tier failures without retrying with a weaker network policy', async () => {
+    const create = vi.fn(async () => { throw new Error('Network access is restricted and cannot be overridden at the sandbox level. Remove domainAllowList from the request.'); });
+    await expect(new DaytonaWorldProvider({ create, get: async () => fakeSandbox() }).create({ taskId: 'tier', base: 'main' }))
+      .rejects.toThrow('Daytona Tier 3');
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it('runs provisioning in bash even when the image default shell is zsh', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.executeCommand = vi.fn(async () => ({ exitCode: 0, result: '' }));
+    await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'shell', base: 'main' });
+    const commands = vi.mocked(sandbox.process.executeCommand).mock.calls.map(([command]) => command);
+    expect(commands.length).toBeGreaterThan(0);
+    expect(commands.every((command) => command.startsWith('bash -c '))).toBe(true);
   });
 
   it('uses clone keys only during trusted SSH provisioning', async () => {
@@ -157,7 +369,7 @@ describe('Daytona cloud world provider', () => {
 
 function fakeSandbox(): DaytonaSandboxLike {
   return {
-    id: 'fake', state: 'started',
+    id: 'fake', state: 'started', updateNetworkSettings: async () => {},
     process: { executeCommand: async () => ({ exitCode: 0, result: '' }),
       createPty: async () => ({ waitForConnection: async () => {}, wait: () => new Promise(() => {}) }) },
     fs: { downloadFile: async () => Buffer.alloc(0), uploadFile: async () => {} },
