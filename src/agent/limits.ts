@@ -80,6 +80,26 @@ export class ProviderFailure extends Error {
   }
 }
 
+// A request-level safety decision says nothing about the shared login's health.
+export function isProviderPolicyRejection(value: unknown): boolean {
+  const diagnostic = nativeProviderDiagnostic(value);
+  return /misalignmentPolicyViolation|content_policy_violation|safety_violation/i.test(diagnostic?.code ?? '')
+    || /misalignmentPolicyViolation|content_policy_violation|safety_violation|blocked by (?:our|the) safety systems/i.test(
+      value instanceof Error ? value.message : diagnostic?.message ?? '',
+    );
+}
+
+export class ProviderPolicyFailure extends Error {
+  readonly diagnostic?: ProviderNativeDiagnostic;
+  constructor(value: unknown, provider?: string, context: Pick<ProviderNativeDiagnostic, 'model' | 'operation'> = {}) {
+    const diagnostic = nativeProviderDiagnostic(value, context);
+    const name = provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'Provider';
+    super(`${name} safety rejection${diagnostic?.code ? ` · ${diagnostic.code}` : ''}${diagnostic?.model ? ` · model ${diagnostic.model}` : ''}: ${diagnostic?.message ?? 'Request blocked by provider safety systems.'}`);
+    this.name = 'ProviderPolicyFailure';
+    this.diagnostic = diagnostic;
+  }
+}
+
 export interface LimitClassifierOptions {
   /** Enables semantic phrase-family matching. Use only at the provider adapter
    * boundary; arbitrary build/git errors must remain on the Resolve path. */
@@ -205,6 +225,7 @@ function termsNear(tokens: string[], left: Set<string>, right: Set<string>, dist
  * signal, not transport.
  */
 export function isTransportError(error: unknown): boolean {
+  if (isProviderPolicyRejection(error)) return false;
   const seen = new Set<unknown>();
   const inspect = (value: unknown): boolean => {
     if (value && typeof value === 'object') {
@@ -279,6 +300,7 @@ export function isResourceKill(message: string): boolean {
 /** Detect + classify a usage/session-limit error from its message. Pure. */
 export function classifyLimitError(message: string, options: LimitClassifierOptions = {}): LimitClassification {
   const m = String(message ?? '');
+  if (isProviderPolicyRejection(m)) return { limited: false };
   const lc = m.toLowerCase();
   const tokens = words(lc);
 
@@ -340,6 +362,7 @@ export function providerErrorFromMessage(
   message: string,
   source: ProviderFailureSource = 'message',
 ): Error {
+  if (isProviderPolicyRejection(message)) return new ProviderPolicyFailure(message, provider);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
   const diagnostic = nativeProviderDiagnostic(message);
@@ -369,6 +392,7 @@ export function classifyProviderTurnError(
   err: unknown,
   provider?: ProviderFailureMetadata['provider'],
 ): { classification: LimitClassification; metadata?: ProviderFailureMetadata } {
+  if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) return { classification: { limited: false } };
   if (err instanceof ProviderFailure) {
     const m = err.metadata;
     return {

@@ -24,6 +24,8 @@ import {
   providerFailure,
   providerFailureDisplay,
   ProviderFailure,
+  ProviderPolicyFailure,
+  isProviderPolicyRejection,
   type ProviderFailureMetadata,
 } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
@@ -548,7 +550,12 @@ export class CodexAdapter implements AgentAdapter {
       settleTurn?.();
     });
 
+    let policyFailure: ProviderPolicyFailure | undefined;
     const noteLimit = (native: unknown, operation = 'app-server notification') => {
+      if (isProviderPolicyRejection(native)) {
+        policyFailure ??= new ProviderPolicyFailure(native, 'codex', { model, operation });
+        return;
+      }
       const blob = typeof native === 'string' ? native : JSON.stringify(native ?? {});
       const cls = classifyLimitError(blob, { providerOrigin: true });
       if (!cls.limited) return;
@@ -641,7 +648,7 @@ export class CodexAdapter implements AgentAdapter {
           // same top-level `error` channel as model failures. It can continue the
           // model turn without that MCP, so leave the already-emitted MCP status
           // visible and wait for the real turn terminal event.
-          if (isOptionalAppsMcpError(blob)) break;
+          if (!isProviderPolicyRejection(params) && isOptionalAppsMcpError(blob)) break;
           // `willRetry=true` is an intermediate Responses-stream notification,
           // not the terminal result of the turn. Current Codex uses messages such
           // as "Reconnecting... 2/5" with `codexErrorInfo=unauthorized`; treating
@@ -879,6 +886,7 @@ export class CodexAdapter implements AgentAdapter {
     // A limit can also arrive as a rejected request (handshake/turn) or a subprocess
     // death recorded in `turnError` — scan it so those paths rotate the login too.
     if (turnError && !limit) noteLimit(turnError, 'app-server turn');
+    if (policyFailure) throw policyFailure;
     if (limit) {
       // Same shape as the exec path so limits.ts computes the refresh instant and the
       // workflow rotates to another login (RESOLVE-PLAN §2.4).
