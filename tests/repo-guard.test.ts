@@ -160,7 +160,8 @@ describe('repository selection validation', () => {
   });
 
   it('lets a draft be saved and queued without a repo', async () => {
-    const p = (await store.createProject('Draft', {}));
+    await store.setSettings('global', 'timing', { enabled: true });
+    const p = await store.createProject('Draft', {});
     const draft = await api.createTask(token, {
       projectId: p.id,
       workflow: 'software-dev',
@@ -168,8 +169,12 @@ describe('repository selection validation', () => {
       draft: true,
     });
     expect(started).toHaveLength(0); // a draft starts nothing
+    expect((await store.eventsOfType(draft.id, 'timing'))).toHaveLength(0);
     await api.queueTask(token, draft.id);
     expect(started).toHaveLength(1);
+    const rows = (await store.eventsOfType(draft.id, 'timing')).map(event => event.payload);
+    expect(rows.filter(row => row.name === 'request.received')).toHaveLength(1);
+    expect(rows.some(row => row.name === 'workflow.dispatch' && row.phase === 'end' && row.status === 'ok')).toBe(true);
   });
 
   it('does not retain a number when the durable engine refuses the queue', async () => {

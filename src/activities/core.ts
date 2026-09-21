@@ -1,3 +1,4 @@
+import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
@@ -475,6 +476,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const ev = { type, taskId, ts: Date.now(), payload };
     const seq = (await store.appendEvent(ev));
     deps.bus?.emit({ ...ev, seq });
+    return seq;
   }
 
   /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
@@ -984,6 +986,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
     try {
+      const snapshotFiles = new Map<string, string>();
       for (const file of await world.listFiles()) {
         if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
         const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
@@ -991,9 +994,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const target = path.resolve(root, rel);
         if (target !== root && !target.startsWith(`${root}${path.sep}`))
           throw new Error('invalid file path in project wiki checkout');
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(target, await world.readFileBuffer(file));
+        snapshotFiles.set(file, target);
       }
+      await mapBatches([...snapshotFiles], async ([file, target]) => {
+        const content = await world.readFileBuffer(file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, content);
+      });
       return { root, release: () => fs.rmSync(root, { recursive: true, force: true }) };
     } catch (error) {
       fs.rmSync(root, { recursive: true, force: true });
@@ -1008,8 +1015,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
+    // Carry the publication cursor in the opaque fence so retries and the
+    // separate lifecycle activity use the same follow-up boundary. Historical
+    // fences lack a cursor and retain their original behavior.
+    const publicationSeq = Number(fence.split(':')[0]);
+    const parkingTrace = await installationTiming(store, { taskId }, row => record(taskId, 'timing', { ...row }));
     const valid = async () => {
       ctx?.cancellationSignal.throwIfAborted();
+      if (view.stage === 'review' && view.waitingFor?.kind === 'human' && Number.isSafeInteger(publicationSeq)
+        && (await store.eventsSince(taskId, publicationSeq, undefined, true)).some(event =>
+          event.type === 'conversation.message' && (event.payload.role === undefined || event.payload.role === 'do'))) {
+        await record(taskId, 'world.park-deferred', { reason: 'accepted-follow-up' });
+        return false;
+      }
       if (await worlds.hasActiveAccess?.(waitingWorld.id)) return false;
       const current = (await store.currentWorld(waitingWorld.id)) as WorldHandle | undefined;
       if ((await store.worldState(waitingWorld.id)) === 'released') return false;
@@ -1028,7 +1046,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     };
     const maintain = async () => {
       if (!(await valid())) return;
-      const before = await worlds.status(waitingWorld);
+      const before = await parkingTrace.measure('lifecycle.status', () => worlds.status(waitingWorld));
       if (!(await valid())) return;
       if (before === 'ready') {
         if (deps.checkpoints) {
@@ -1036,16 +1054,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // The branch is the portable checkpoint's committed layer. Push
             // it through the trusted broker before capturing the dirty delta.
             if (isRemote(waitingWorld.kind)) {
-              const remoteWorld = await openWorld(waitingWorld, taskId);
+              const remoteWorld = await parkingTrace.measure('lifecycle.open', () => withTiming(parkingTrace, () => openWorld(waitingWorld, taskId)));
+              if (!(await valid())) return;
               const projectId = String(remoteWorld.handle.meta?.projectId ?? (await store.getTask(taskId))?.projectId ?? '');
               if ((await store.listProjectRepositories(projectId)).length) {
-                await enrollLiveProjectRepositories(remoteWorld, taskId);
-                const pushed = await publishTaskBranch(remoteWorld, taskId);
+                await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
+                if (!(await valid())) return;
+                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId)));
                 if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                 (await record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
               }
             }
-            const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
+            if (!(await valid())) return;
+            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld));
             (await record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
               generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
           } catch (error) {
@@ -1054,7 +1075,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
 
         if (!(await valid())) return;
-        await worlds.park(waitingWorld);
+        await parkingTrace.measure('lifecycle.park', () => withTiming(parkingTrace, () => worlds.park(waitingWorld)));
       }
       // Retry after a worker crash between parking and lease cleanup must finish
       // the accounting even when the provider is already parked.
@@ -1070,7 +1091,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     };
     try {
-      await (worlds.withOperation ? worlds.withOperation(waitingWorld.id, maintain) : maintain());
+      await parkingTrace.measure('lifecycle.waiting-publication', () => worlds.withOperation ? worlds.withOperation(waitingWorld.id, maintain) : maintain());
     } catch (error) {
       if (ctx?.cancellationSignal.aborted) throw error;
       if (retryFailure) throw error; // Separate maintenance retries without republishing status.
@@ -2084,7 +2105,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           .filter(Boolean)
           .join('\n');
         const wikiContext = (await store.getTask(args.taskId))?.params?.wikiContext;
-        wikiSnapshot = await projectWikiPromptSnapshot(world);
+        wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
         projectInstructions = buildWikiPromptContext({
           contentDir: deps.contentDir ?? paths().content,
           organizationId: (await store.getProject(args.task.projectId))?.organizationId,
@@ -4838,7 +4859,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!claim.accepted) throw ApplicationFailure.nonRetryable('Another attempt cancelled this proposal at Merge admission', 'attempt-superseded');
       }
-      (await record(taskId, 'view.updated', {
+      const publicationSeq = (await record(taskId, 'view.updated', {
         stage: view.stage,
         status: view.status,
         waitingFor: view.waitingFor?.kind ?? null,
@@ -4849,7 +4870,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         agentTurn: view.agentTurn?.state ?? null,
         agentRole: view.agentTurn?.role ?? null,
       }));
-      const fence = newId('publication');
+      const fence = `${publicationSeq}:${newId('publication')}`;
       (await store.kvSet(`view-lifecycle:${taskId}`, fence));
       if (options?.separateLifecycle) return fence;
       await maintainWaitingWorld(taskId, view, fence, false);

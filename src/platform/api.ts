@@ -1739,7 +1739,8 @@ export class KarmaxApi {
 
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
-    const task = (await this.deps.store.getTask(taskId));
+    const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
+    const task = await this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const storedAuthorization = task.params?._authorization as {
@@ -1768,7 +1769,16 @@ export class KarmaxApi {
     // current now — queueing a draft after an upgrade must not silently swap code.
     const { startType, input } = await this.buildStart(task, false, caller);
     const hadNumber = task.num != null;
-    (await this.deps.store.clearDraft(taskId));
+    await this.deps.store.clearDraft(taskId);
+    const requestTiming = await installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:m0`] }, async row => {
+      await this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
+    });
+    // Draft creation is not a request to run. Start the initial-request clock
+    // when it is queued; an idempotent queue retry must not restart that clock.
+    if ((await requestTiming.enabled()) && task.params.draft && !task.params._workflowRunId
+      && !(await this.deps.store.eventsOfType(taskId, 'timing')).some(event => event.payload?.name === 'request.received'))
+      await requestTiming.mark('request.received', { requestId: `${taskId}:m0` }, receivedAt);
+    const dispatchEnd = await requestTiming.start('workflow.dispatch');
     // Bounded + compensated: on a wedged engine, restore the draft and release a
     // number minted by this failed transition. Previously established permalinks
     // remain stable when already-numbered work is queued again.
@@ -1796,13 +1806,15 @@ export class KarmaxApi {
       // acceptance for this task's unique workflow ID, not a queue failure.
       // Keep the task queued and repair the stale draft metadata.
       if (!(e instanceof WorkflowExecutionAlreadyStartedError)) {
-        (await this.deps.store.restoreDraft(taskId, !hadNumber));
+        await dispatchEnd('failed');
+        await this.deps.store.restoreDraft(taskId, !hadNumber);
         throw new Error(
           `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
             `It's still saved as a draft — check that Temporal is healthy and try again.`,
         );
       }
     }
+    await dispatchEnd();
     const started = this.resolveStart(task.workflow, task.workflowVersion,
       (await this.deps.store.getProject(task.projectId))?.organizationId);
     if (started) (await this.saveAgentSnapshot(task.id, started.manifest, input));

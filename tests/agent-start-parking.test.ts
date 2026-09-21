@@ -6,6 +6,45 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import type { TaskView } from '../src/domain/types.js';
 
 describe('parking during agent admission', () => {
+  it.each([['status', false], ['checkpoint', false], ['status', true], ['checkpoint', true]] as const)('defers idle parking during %s (separate lifecycle: %s)', async (boundary, separateLifecycle) => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Follow-up');
+    const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const handle = { id: task.id, kind: 'container', root: '/workspace', branch: 'task', base: 'main' };
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const atBoundary = new Promise<void>(resolve => { entered = resolve; });
+    const wait = async () => { entered(); await gate; };
+    const worlds = { get: () => ({ parkable: true }),
+      status: vi.fn(async () => { if (boundary === 'status') await wait(); return 'ready'; }),
+      park: vi.fn(async () => handle) };
+    const checkpoint = vi.fn(async () => { if (boundary === 'checkpoint') await wait(); return { id: 'saved', generation: 1 }; });
+    const core = makeCoreActivities({ store, worlds: worlds as any, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), checkpoints: { checkpoint } as any });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,
+      state: {}, world: handle } as TaskView;
+    try {
+      const publication = separateLifecycle
+        ? core.publishView(task.id, view, undefined, { separateLifecycle: true }).then(fence => core.parkWaitingWorld(task.id, view, fence!))
+        : core.publishView(task.id, view);
+      await atBoundary;
+      await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(),
+        payload: { role: 'do', message: { id: 'new', role: 'user', text: 'Continue' } } });
+      release();
+      await publication;
+      expect(worlds.park).not.toHaveBeenCalled();
+      expect(checkpoint).toHaveBeenCalledTimes(boundary === 'checkpoint' ? 1 : 0);
+      expect((await store.eventsOfType(task.id, 'world.park-deferred'))).toHaveLength(1);
+      // The next real wait still parks; an old accepted message is no longer
+      // grounds to defer another publication indefinitely.
+      await core.publishView(task.id, view);
+      expect(worlds.park).toHaveBeenCalledTimes(1);
+    } finally { release(); await store.close(); }
+  });
+
   it.each([false, true])('publishes startup without checkpointing or parking (recovery handle: %s)', async recovery => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Admission'));

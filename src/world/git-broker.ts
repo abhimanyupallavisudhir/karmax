@@ -1,3 +1,4 @@
+import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createGitBundle, knownGitCommits, downloadGitBundle, uploadGitBundle, type GitBundle } from './git-transfer.js';
@@ -727,14 +728,14 @@ async function withTransferredRepo<T>(
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
     const clone = path.join(temp, 'repo');
-    const cloned = await git(temp, ['clone', '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 });
+    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 }));
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
-    await importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp);
+    await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
       if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
     }
-    return await use(clone, env);
+    return await timed('git-broker.operation', () => use(clone, env));
   } catch (error) {
     operationFailed = true;
     throw error;

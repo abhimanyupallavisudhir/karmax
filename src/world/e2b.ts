@@ -1,3 +1,4 @@
+import { timed } from '../timing/index.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type {
@@ -222,11 +223,11 @@ export class E2BWorldProvider implements WorldProvider {
     const sandboxId = reference.sandboxId;
     let sandbox = this.sandboxes.get(sandboxId);
     if (!sandbox || this.states.get(sandboxId) === 'parked') {
-      const connection = (await this.connection(reference.organizationId));
-      sandbox = await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
+      const connection = await this.connection(reference.organizationId);
+      sandbox = await timed('e2b.connect', () => this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
         requestTimeoutMs: envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
         ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
-        ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
+        ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) }));
       this.sandboxes.set(sandboxId, sandbox);
     }
     this.states.set(sandboxId, 'ready');
@@ -242,7 +243,7 @@ export class E2BWorldProvider implements WorldProvider {
       requestTimeoutMs: envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
       ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
-    await sandbox.pause();
+    await timed('e2b.pause', () => sandbox.pause());
     this.sandboxes.set(sandboxId, sandbox);
     this.states.set(sandboxId, 'parked');
     return handle;

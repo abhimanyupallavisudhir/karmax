@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
-import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
+import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
   reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
@@ -80,15 +80,53 @@ describe('remote subscription agents', () => {
     expect(world.commands.filter((command) => command.includes('ln -sfnT') && command.includes('/usr/local/bin/node'))).toHaveLength(2);
   });
 
+  it('bounds parallel config uploads and settles them before protecting the home', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-parallel-home-'));
+    fs.mkdirSync(path.join(localHome, 'skills'));
+    for (let i = 0; i < 21; i++) fs.writeFileSync(path.join(localHome, 'skills', `${i}.md`), `skill-${i}`);
+    const world = fakeWorld();
+    const write = world.writeFileBuffer!.bind(world);
+    let active = 0, peak = 0;
+    world.writeFileBuffer = async (file, content) => {
+      peak = Math.max(peak, ++active);
+      try { await new Promise(resolve => setTimeout(resolve, 1)); await write(file, content); }
+      finally { active--; }
+    };
+    const exec = world.exec.bind(world);
+    world.exec = async (command, args, options) => {
+      if (args?.some(arg => arg.includes('chmod 600'))) expect(active).toBe(0);
+      return exec(command, args, options);
+    };
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    expect(peak).toBe(8);
+    expect(active).toBe(0);
+    for (let i = 0; i < 21; i++) expect(world.files.get(`${home.relative}/skills/${i}.md`)?.toString()).toBe(`skill-${i}`);
+  });
+
   it('reports when a sandbox cannot expose the managed toolchain', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
     const world = fakeWorld();
     const exec = world.exec.bind(world);
-    world.exec = async (command, args = [], options) => args.some((arg) => arg.includes('ln -sfnT'))
+    world.exec = async (command, args = [], options) => args.some((arg) => arg.includes('ln -sfnT') && arg.includes('/usr/local/bin/node'))
       ? { code: 1, stdout: '', stderr: 'sudo: a password is required' }
       : exec(command, args, options);
     await expect(seedRemoteAgentHome(world, 'claude', localHome)).rejects.toThrow(
       'could not make managed Node/npm the sandbox default');
+  });
+
+  it('probes baked browser packages without an out-of-world working directory', async () => {
+    const world = fakeWorld();
+    world.exec = async (_command, args = [], options) => {
+      if (options?.cwd && !options.cwd.startsWith('/workspace')) throw new Error('path must be relative to the world');
+      if (args.includes('-e')) {
+        expect(options?.env?.NODE_PATH).toBe('/opt/karmax/browser/node_modules');
+        return { code: 0, stdout: '/opt/karmax/browsers/chromium', stderr: '' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const result = await ensureRemoteBrowser(world, 'playwright');
+    expect(result.playwright?.command).toBe('/opt/karmax/bin/playwright-mcp');
+    expect(result.playwright?.env?.PLAYWRIGHT_BROWSERS_PATH).toBe('/opt/karmax/browsers');
   });
 
   it('delivers remote stderr before close, including when diagnostics cannot be read', async () => {
