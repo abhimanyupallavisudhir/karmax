@@ -246,6 +246,7 @@ export class CodexAdapter implements AgentAdapter {
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
     const reportedUsage = new ReportedUsage();
+    let completionPending = false;
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed (the initial delta covers up to
@@ -264,7 +265,7 @@ export class CodexAdapter implements AgentAdapter {
       return add;
     };
 
-    for (let i = 0; i < maxIters; i++) {
+    for (let i = 0; i < maxIters || (i === maxIters && completionPending); i++) {
       if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
       ctx.heartbeat?.(); // let Temporal deliver a pending cancellation
       // `instructions` is NOT carried across `previous_response_id` — the
@@ -273,7 +274,7 @@ export class CodexAdapter implements AgentAdapter {
       // prompt (task, world path, wiki context, role template) after the very
       // first model call, and a resumed turn never sent it at all. Always send
       // it, alongside the chain id. (Claude's metered path does the same.)
-      const body: any = { model, tools, tool_choice: 'auto', store: true, input: nextInput, instructions: input.systemPrompt };
+      const body: any = { model, tools, tool_choice: completionPending ? 'none' : 'auto', store: true, input: nextInput, instructions: input.systemPrompt };
       if (respId) body.previous_response_id = respId;
       // Reasoning effort (SPEC §10.5) — only reasoning models accept it (not gpt-4.1).
       const reasoningEffort = codexReasoningEffort(model, input.profile.effort);
@@ -321,6 +322,8 @@ export class CodexAdapter implements AgentAdapter {
 
       const outputs: any[] = data.output ?? [];
       const calls = outputs.filter((o) => o.type === 'function_call');
+      if (completionPending && calls.length)
+        throw new Error('OpenAI Responses completion acknowledgement unexpectedly requested tools');
       const text = outputs
         .filter((o) => o.type === 'message')
         .flatMap((m: any) => (m.content ?? []).filter((c: any) => c.type === 'output_text').map((c: any) => c.text))
@@ -333,10 +336,10 @@ export class CodexAdapter implements AgentAdapter {
       if (calls.length === 0) {
         // Idle. Fold in any follow-up that landed mid-turn and keep going on the same
         // response chain (previous_response_id carries the history); else finish.
-        const more = await injectFollowUps();
+        const more = completionPending ? [] : await injectFollowUps();
         if (more.length) { nextInput = more; continue; }
         terminalStatus = data.status;
-        terminalReason = data.incomplete_details?.reason;
+        terminalReason = completionPending ? 'signal_completion' : data.incomplete_details?.reason;
         break;
       }
 
@@ -373,11 +376,10 @@ export class CodexAdapter implements AgentAdapter {
         if (call.name === 'signal_completion') completed = true;
       }
       nextInput = toolOutputs;
-      if (completed) {
-        terminalStatus = data.status;
-        terminalReason = 'signal_completion';
-        break;
-      }
+      // A response containing function calls cannot be resumed until every
+      // output is submitted. Acknowledge completion with tools disabled, even
+      // at the iteration cap, before returning a resumable session.
+      if (completed) completionPending = true;
     }
 
     if (ctx.signal?.aborted) throw new Error('OpenAI Responses turn cancelled');
