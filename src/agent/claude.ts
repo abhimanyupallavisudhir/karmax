@@ -340,7 +340,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     }
     const remoteHome = remote
-      ? await seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none')
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
       : undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and

@@ -1,3 +1,4 @@
+import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
@@ -475,6 +476,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const ev = { type, taskId, ts: Date.now(), payload };
     const seq = store.appendEvent(ev);
     deps.bus?.emit({ ...ev, seq });
+    return seq;
   }
 
   /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
@@ -966,6 +968,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
     try {
+      const snapshotFiles = new Map<string, string>();
       for (const file of await world.listFiles()) {
         if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
         const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
@@ -973,9 +976,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const target = path.resolve(root, rel);
         if (target !== root && !target.startsWith(`${root}${path.sep}`))
           throw new Error('invalid file path in project wiki checkout');
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(target, await world.readFileBuffer(file));
+        snapshotFiles.set(file, target);
       }
+      await mapBatches([...snapshotFiles], async ([file, target]) => {
+        const content = await world.readFileBuffer(file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, content);
+      });
       return { root, release: () => fs.rmSync(root, { recursive: true, force: true }) };
     } catch (error) {
       fs.rmSync(root, { recursive: true, force: true });
@@ -1981,7 +1988,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           .filter(Boolean)
           .join('\n');
         const wikiContext = store.getTask(args.taskId)?.params?.wikiContext;
-        wikiSnapshot = await projectWikiPromptSnapshot(world);
+        wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
         projectInstructions = buildWikiPromptContext({
           contentDir: deps.contentDir ?? paths().content,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
@@ -4681,7 +4688,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!claim.accepted) throw ApplicationFailure.nonRetryable('Another attempt cancelled this proposal at Merge admission', 'attempt-superseded');
       }
-      record(taskId, 'view.updated', {
+      const publicationSeq = record(taskId, 'view.updated', {
         stage: view.stage,
         status: view.status,
         waitingFor: view.waitingFor?.kind ?? null,
@@ -4709,33 +4716,52 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // that the next activity must immediately resume. Keep the compatibility
       // check in the activity; genuine capacity/account/human waits still park.
       const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
+      // The view is visible before its idle checkpoint finishes. A follow-up
+      // accepted in that interval is durably journalled after Temporal accepts
+      // it. Let the pending turn retain its world instead of finishing an idle
+      // transition and immediately resuming it. Never interrupt in-flight Git
+      // or checkpoint I/O; check only between fully settled operations.
+      const parkingSuperseded = () => {
+        if (view.stage !== 'review' || view.waitingFor?.kind !== 'human') return false;
+        const pending = store.eventsSince(taskId, publicationSeq, undefined, true).some(event =>
+          event.type === 'conversation.message' && (event.payload.role === undefined || event.payload.role === 'do'));
+        if (pending) record(taskId, 'world.park-deferred', { reason: 'accepted-follow-up' });
+        return pending;
+      };
       if ((view.status === 'waiting' || view.status === 'blocked')
         && !startingAgent && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
+        const parkingTrace = installationTiming(store, { taskId }, row => record(taskId, 'timing', { ...row }));
+        const parkingEnd = parkingTrace.start('lifecycle.waiting-publication');
         try {
-          const before = await worlds.status(waitingWorld);
+          const before = await parkingTrace.measure('lifecycle.status', () => worlds.status(waitingWorld));
           if (before === 'ready') {
+            if (parkingSuperseded()) return;
             if (deps.checkpoints) {
               try {
                 // The branch is the portable checkpoint's committed layer. Push
                 // it through the trusted broker before capturing the dirty delta.
                 if (isRemote(waitingWorld.kind)) {
-                  const remoteWorld = await openWorld(waitingWorld, taskId);
+                  const remoteWorld = await parkingTrace.measure('lifecycle.open', () => withTiming(parkingTrace, () => openWorld(waitingWorld, taskId)));
+                  if (parkingSuperseded()) return;
                   const projectId = String(remoteWorld.handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
                   if (store.listProjectRepositories(projectId).length) {
-                    await enrollLiveProjectRepositories(remoteWorld, taskId);
-                    const pushed = await publishTaskBranch(remoteWorld, taskId);
+                    await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
+                    if (parkingSuperseded()) return;
+                    const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId)));
                     if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                     record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' });
                   }
                 }
-                const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
+                if (parkingSuperseded()) return;
+                const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld));
                 record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
                   generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 });
               } catch (error) {
                 record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) });
               }
             }
-            await worlds.park(waitingWorld);
+            if (parkingSuperseded()) return;
+            await parkingTrace.measure('lifecycle.park', () => withTiming(parkingTrace, () => worlds.park(waitingWorld)));
             if (await worlds.status(waitingWorld) === 'parked') {
               const current = (store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle;
               const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
@@ -4751,7 +4777,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Auto-pause remains the cost backstop; a transient park failure must
           // never roll back or retry the authoritative view update.
           record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` });
-        }
+        } finally { parkingEnd(); }
       }
     },
 

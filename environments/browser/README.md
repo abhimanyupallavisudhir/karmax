@@ -20,6 +20,20 @@ npx tsx environments/browser/e2b-template.ts
 
 Put the resulting tag in E2B's **Headless template** field.
 
+Alternatively build directly from E2B's `codex` base, without publishing a Docker
+image (`E2B_API_KEY` must be available to the SDK):
+
+```sh
+KARMAX_E2B_TEMPLATE_TAG=karmax-browser-v2 npx tsx environments/browser/e2b-prebuilt.ts
+```
+
+This installs the runtime's pinned Node/npm pair as well as the browser and native
+agents, then runs a real render/screenshot smoke test. It prints the template and
+build IDs. Select the verified template only after the runtime changes supporting
+the baked Node pair and E2B browser working directory have deployed. Building does
+not change any organization or project selector. The template uses 2 CPUs and
+2048 MiB; compare cost as well as latency with the current provider plan.
+
 Desktop worlds deliberately use each provider's desktop machinery: E2B's
 `desktop` template through `@e2b/desktop`, and Daytona Computer Use on Daytona's
 VNC-capable default environment. Karmax installs and probes the same pinned
