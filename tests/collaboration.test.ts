@@ -129,8 +129,11 @@ describe('organization and collaboration domain', () => {
 
     const connection = store.upsertGitConnection({ organizationId: acme.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    expect(() => store.upsertGitConnection({ organizationId: other.id, provider: 'github',
-      installationId: '42', accountLogin: 'acme' })).toThrow(/another organization/);
+    const otherConnection = store.upsertGitConnection({ organizationId: other.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme' });
+    expect(otherConnection.id).not.toBe(connection.id);
+    expect(store.listGitConnections(acme.id)).toEqual([connection]);
+    expect(store.listGitConnections(other.id)).toEqual([otherConnection]);
     const repository = store.upsertRepository({ organizationId: acme.id, provider: 'github', providerId: '100',
       owner: 'acme', name: 'product', sshUrl: 'git@github.com:acme/product.git', defaultBranch: 'main',
       private: true, gitConnectionId: connection.id });

@@ -16629,7 +16629,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
-      <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
+      <div class="settings-section-title" id="installation-github"><div>GitHub<small>GitHub App for repository access</small></div></div>${installationGithubCard()}
       <div class="settings-section-title" id="installation-composio"><div>Composio<small>App connection setup shared by every organization</small></div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
       <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}

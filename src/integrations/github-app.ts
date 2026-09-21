@@ -895,9 +895,19 @@ export class GitHubAppService {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
-    const connection = this.store.db.prepare('SELECT * FROM git_connections WHERE provider=? AND installationId=?')
-      .get('github', installationId) as any;
-    if (!connection) return { accepted: true };
+    const result: GithubWebhookResult = { accepted: true };
+    for (const connection of this.store.gitConnectionsForInstallation('github', installationId)) {
+      const next = await this.dispatchConnectionWebhook(event, payload, connection);
+      if (next.reconciled !== undefined) result.reconciled = (result.reconciled ?? 0) + next.reconciled;
+      if (next.events?.length) (result.events ??= []).push(...next.events);
+      if (next.projectEvents?.length) (result.projectEvents ??= []).push(...next.projectEvents);
+      if (next.vaultPushes?.length) (result.vaultPushes ??= []).push(...next.vaultPushes);
+    }
+    return result;
+  }
+
+  private async dispatchConnectionWebhook(event: string, payload: any, connection: GitConnection): Promise<GithubWebhookResult> {
+    const installationId = connection.installationId;
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {
       const saved = this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
         accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() });

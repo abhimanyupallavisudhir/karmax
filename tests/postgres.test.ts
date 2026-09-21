@@ -18,6 +18,29 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('migrates a shared GitHub installation and preserves connections across restarts', () => {
+    const db = openSqlDatabase(url!);
+    db.exec(`CREATE TABLE git_connections (
+      id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
+      installationId TEXT NOT NULL, accountLogin TEXT NOT NULL, accountType TEXT,
+      createdAt INTEGER NOT NULL, suspendedAt INTEGER, UNIQUE (provider, installationId));
+      INSERT INTO git_connections VALUES ('original', 'org_personal', 'github', '42', 'acme', 'User', 123, 456)`);
+    db.close();
+    let store = new Store(url!);
+    try {
+      const original = store.getGitConnection('original')!;
+      expect(original).toMatchObject({ createdAt: 123, suspendedAt: 456 });
+      const other = store.createOrganization({ name: 'Second', ownerUserId: 'owner' });
+      const second = store.upsertGitConnection({ ...original, id: undefined, organizationId: other.id });
+      expect(second.id).not.toBe(original.id);
+      expect(store.upsertGitConnection({ ...second, id: undefined }).id).toBe(second.id);
+      store.close();
+      store = new Store(url!);
+      expect(store.getGitConnection(original.id)).toEqual(original);
+      expect(store.gitConnectionsForInstallation('github', '42')).toHaveLength(2);
+    } finally { store.close(); }
+  });
+
   it('looks up usage IDs in bounded batches and task ownership without loading views', () => {
     const store = new Store(url!);
     try {

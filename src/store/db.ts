@@ -393,7 +393,7 @@ export class Store {
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
         installationId TEXT NOT NULL, accountLogin TEXT NOT NULL, accountType TEXT,
         createdAt INTEGER NOT NULL, suspendedAt INTEGER,
-        UNIQUE (provider, installationId)
+        UNIQUE (organizationId, provider, installationId)
       );
       CREATE TABLE IF NOT EXISTS repositories (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
@@ -739,6 +739,33 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `);
+    // An installation belongs to a GitHub account, which may serve multiple
+    // Tavya organizations. Rebuild the old inline UNIQUE constraint atomically;
+    // IDs stay intact so repository links and cached credential handles survive.
+    if (!this.kvGet('migration:shared-github-installations')) {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        if (this.db.dialect === 'postgres') this.db.exec('LOCK TABLE git_connections IN ACCESS EXCLUSIVE MODE');
+        this.db.exec(`
+          CREATE TABLE git_connections_shared (
+            id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
+            installationId TEXT NOT NULL, accountLogin TEXT NOT NULL, accountType TEXT,
+            createdAt INTEGER NOT NULL, suspendedAt INTEGER,
+            UNIQUE (organizationId, provider, installationId)
+          );
+          INSERT INTO git_connections_shared SELECT id, organizationId, provider, installationId,
+            accountLogin, accountType, createdAt, suspendedAt FROM git_connections;
+          DROP TABLE git_connections;
+          ALTER TABLE git_connections_shared RENAME TO git_connections;
+          CREATE INDEX idx_git_connections_installation ON git_connections(provider, installationId);
+        `);
+        this.kvSet('migration:shared-github-installations', '1');
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    }
     // Organization names became a shared, case-insensitive account namespace
     // after organizations had already shipped. Old builds allowed duplicates,
     // so creating the index in the schema batch made those installs fail before
@@ -2437,14 +2464,12 @@ export class Store {
   }
 
   upsertGitConnection(input: Omit<GitConnection, 'id' | 'createdAt'> & { id?: string }): GitConnection {
-    const existing = this.db.prepare('SELECT id, organizationId, createdAt FROM git_connections WHERE provider=? AND installationId=?')
-      .get(input.provider, input.installationId) as any;
-    if (existing && existing.organizationId !== input.organizationId)
-      throw new Error('GitHub installation is already connected to another organization');
-    const connection: GitConnection = { ...input, id: input.id ?? existing?.id ?? newId('gitconn'), createdAt: existing?.createdAt ?? Date.now() };
+    const existing = this.db.prepare('SELECT id, createdAt FROM git_connections WHERE organizationId=? AND provider=? AND installationId=?')
+      .get(input.organizationId, input.provider, input.installationId) as any;
+    const connection: GitConnection = { ...input, id: existing?.id ?? input.id ?? newId('gitconn'), createdAt: existing?.createdAt ?? Date.now() };
     this.db.prepare(`INSERT INTO git_connections (id, organizationId, provider, installationId, accountLogin, accountType, createdAt, suspendedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(provider, installationId) DO UPDATE SET
-      organizationId=excluded.organizationId, accountLogin=excluded.accountLogin, accountType=excluded.accountType, suspendedAt=excluded.suspendedAt`)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organizationId, provider, installationId) DO UPDATE SET
+      accountLogin=excluded.accountLogin, accountType=excluded.accountType, suspendedAt=excluded.suspendedAt`)
       .run(connection.id, connection.organizationId, connection.provider, connection.installationId, connection.accountLogin,
         connection.accountType ?? null, connection.createdAt, connection.suspendedAt ?? null);
     return connection;
@@ -2457,6 +2482,11 @@ export class Store {
 
   listGitConnections(organizationId: string): GitConnection[] {
     return (this.db.prepare('SELECT * FROM git_connections WHERE organizationId=? ORDER BY createdAt').all(organizationId) as any[]).map(rowToGitConnection);
+  }
+
+  gitConnectionsForInstallation(provider: GitConnection['provider'], installationId: string): GitConnection[] {
+    return (this.db.prepare('SELECT * FROM git_connections WHERE provider=? AND installationId=? ORDER BY createdAt, id')
+      .all(provider, installationId) as any[]).map(rowToGitConnection);
   }
 
   deleteGitConnection(id: string): void {
