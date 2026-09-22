@@ -33,7 +33,7 @@ integration('PostgreSQL cutover', () => {
       const other = store.createOrganization({ name: 'Second', ownerUserId: 'owner' });
       const second = store.upsertGitConnection({ ...original, id: undefined, organizationId: other.id });
       expect(second.id).not.toBe(original.id);
-      expect(store.upsertGitConnection({ ...second, id: undefined }).id).toBe(second.id);
+      expect(store.upsertGitConnection({ ...second, id: 'losing-concurrent-candidate' }).id).toBe(second.id);
       store.close();
       store = new Store(url!);
       expect(store.getGitConnection(original.id)).toEqual(original);

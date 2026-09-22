@@ -37,7 +37,7 @@ describe('shared GitHub installations', () => {
       const other = store.createOrganization({ name: 'Second', ownerUserId: 'owner' });
       const second = store.upsertGitConnection({ ...original, id: undefined, organizationId: other.id });
       expect(second.id).not.toBe(original.id);
-      expect(store.upsertGitConnection({ ...second, id: undefined }).id).toBe(second.id);
+      expect(store.upsertGitConnection({ ...second, id: 'losing-concurrent-candidate' }).id).toBe(second.id);
       store.close();
       store = new Store(filename);
       expect(store.getGitConnection(original.id)).toEqual(original);
@@ -61,13 +61,25 @@ describe('shared GitHub installations', () => {
       let repositories = [{ id: 7, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
         default_branch: 'main', owner: { login: 'acme' } }];
       let failListing = false;
+      let delayListings = false;
+      let activeListings = 0;
+      let maxActiveListings = 0;
+      let completedListings = 0;
       const service = new GitHubAppService(store, broker, { appId: '123', fetch: (async (input) => {
         const url = new URL(String(input));
         if (url.pathname === '/app/installations/42') return Response.json({ id: 42, account: { login: 'acme', type: 'User' } });
         if (url.pathname.endsWith('/access_tokens')) return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
         if (url.pathname === '/installation/repositories') {
-          if (failListing) throw new Error('listing unavailable');
-          return Response.json({ repositories });
+          activeListings++;
+          maxActiveListings = Math.max(maxActiveListings, activeListings);
+          try {
+            if (delayListings) await new Promise(resolve => setTimeout(resolve, 30));
+            if (failListing) throw new Error('listing unavailable');
+            return Response.json({ repositories });
+          } finally {
+            activeListings--;
+            completedListings++;
+          }
         }
         return new Response('not found', { status: 404 });
       }) as typeof fetch });
@@ -87,7 +99,15 @@ describe('shared GitHub installations', () => {
         expect((await callback(state)).status).toBe(400);
         return { connection: store.listGitConnections(organizationId)[0]!, repositories: store.listRepositories(organizationId) };
       };
-      const first = await connect(organizations[0]!.id);
+      const concurrentStates = [
+        store.createGithubInstallState(organizations[0]!.id, 'owner'),
+        store.createGithubInstallState(organizations[0]!.id, 'owner'),
+      ];
+      const concurrentResponses = await Promise.all(concurrentStates.map(callback));
+      expect(concurrentResponses.map(response => response.status)).toEqual([303, 303]);
+      expect(store.listGitConnections(organizations[0]!.id)).toHaveLength(1);
+      const first = { connection: store.listGitConnections(organizations[0]!.id)[0]!,
+        repositories: store.listRepositories(organizations[0]!.id) };
       const foreign = store.createOrganization({ name: 'Foreign', ownerUserId: 'someone-else' });
       expect((await callback(store.createGithubInstallState(foreign.id, 'someone-else'))).status).toBe(400);
       expect(store.listGitConnections(foreign.id)).toEqual([]);
@@ -134,9 +154,20 @@ describe('shared GitHub installations', () => {
         }
       }
       await deliver('installation', { action: 'created' });
+      delayListings = true;
+      maxActiveListings = 0;
+      completedListings = 0;
+      await deliver('installation_repositories', { action: 'added' });
+      expect(maxActiveListings).toBe(2);
+      expect(completedListings).toBe(2);
       failListing = true;
+      completedListings = 0;
       await expect(deliver('installation_repositories', { action: 'removed' }, 'retry')).rejects.toThrow();
+      // A failed sibling does not abandon in-flight tenant work before the
+      // delivery is released for GitHub's retry.
+      expect(completedListings).toBe(2);
       failListing = false;
+      delayListings = false;
       repositories = [];
       expect(await deliver('installation_repositories', { action: 'removed' }, 'retry')).toMatchObject({ accepted: true, reconciled: 0 });
       for (const org of organizations) expect(store.listRepositories(org.id)).toEqual([]);

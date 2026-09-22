@@ -2464,15 +2464,18 @@ export class Store {
   }
 
   upsertGitConnection(input: Omit<GitConnection, 'id' | 'createdAt'> & { id?: string }): GitConnection {
-    const existing = this.db.prepare('SELECT id, createdAt FROM git_connections WHERE organizationId=? AND provider=? AND installationId=?')
-      .get(input.organizationId, input.provider, input.installationId) as any;
-    const connection: GitConnection = { ...input, id: existing?.id ?? input.id ?? newId('gitconn'), createdAt: existing?.createdAt ?? Date.now() };
-    this.db.prepare(`INSERT INTO git_connections (id, organizationId, provider, installationId, accountLogin, accountType, createdAt, suspendedAt)
+    const candidate: GitConnection = { ...input, id: input.id ?? newId('gitconn'), createdAt: Date.now() };
+    // Return the row chosen by the unique constraint, not the optimistic candidate.
+    // Two callbacks can both observe no connection before either inserts; RETURNING
+    // makes the winner's stable id authoritative for both callers in one statement.
+    const saved = this.db.prepare(`INSERT INTO git_connections (id, organizationId, provider, installationId, accountLogin, accountType, createdAt, suspendedAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organizationId, provider, installationId) DO UPDATE SET
-      accountLogin=excluded.accountLogin, accountType=excluded.accountType, suspendedAt=excluded.suspendedAt`)
-      .run(connection.id, connection.organizationId, connection.provider, connection.installationId, connection.accountLogin,
-        connection.accountType ?? null, connection.createdAt, connection.suspendedAt ?? null);
-    return connection;
+      accountLogin=excluded.accountLogin, accountType=excluded.accountType, suspendedAt=excluded.suspendedAt
+      RETURNING *`)
+      .get(candidate.id, candidate.organizationId, candidate.provider, candidate.installationId, candidate.accountLogin,
+        candidate.accountType ?? null, candidate.createdAt, candidate.suspendedAt ?? null) as any;
+    if (!saved) throw new Error('GitHub connection upsert returned no row');
+    return rowToGitConnection(saved);
   }
 
   getGitConnection(id: string): GitConnection | undefined {
