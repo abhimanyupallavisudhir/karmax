@@ -3085,15 +3085,16 @@ async function loadOrganizations() {
 }
 
 async function loadCollaboration() {
+  const inbox = loadInbox().catch(() => {});
   const organizationId = S.organizationId;
-  if (!organizationId) return;
+  if (!organizationId) return inbox;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
   const [members, teams, users, catalog] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/organizations/${organizationId}/roles`).catch(() => null),
-    loadInbox().catch(() => {}),
+    inbox,
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.authorizationCatalog = catalog;
@@ -3104,16 +3105,16 @@ async function loadCollaboration() {
 }
 
 async function loadInbox() {
-  const organizationId = S.organizationId;
-  if (!organizationId) return;
   const epoch = S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
-  // A failed request must not erase the inbox or reset arrival tracking.
-  const inbox = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`);
-  if (S.inboxLoadEpoch !== epoch || S.organizationId !== organizationId) return;
-  const seen = S.announcedOrganizationId === organizationId ? S.announcedInbox : null;
-  S.inbox = inbox || [];
+  // The inbox belongs to the signed-in person, independent of the current route.
+  // Keep organization-scoped requests so each inbox retains its authorization check.
+  // Publish the complete snapshot together; a failed request preserves the old one.
+  const inboxes = await Promise.all(S.organizations.map((organization) =>
+    api(`/api/inbox?organizationId=${encodeURIComponent(organization.id)}`)));
+  if (S.inboxLoadEpoch !== epoch) return;
+  const seen = S.announcedInbox;
+  S.inbox = inboxes.flat();
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
-  S.announcedOrganizationId = organizationId;
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
   if (S.tab === 'inbox') bgRenderMain();
@@ -3552,7 +3553,7 @@ function connectWs() {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
-    if (S.organizationId && inboxEventChanges(ev)) scheduleInboxReload();
+    if (inboxEventChanges(ev)) scheduleInboxReload();
     if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
@@ -15867,8 +15868,8 @@ function wireInboxView() {
   $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
     const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
     try {
-      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
-      item.unread = !item.unread; renderMain(); renderRail();
+      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
+      item.unread = !item.unread; updateBell(); renderMain(); renderRail();
     } catch (error) { toast(error.message, true); }
   }));
   $('#inbox-show-read')?.addEventListener('change', (e) => {
@@ -15886,24 +15887,21 @@ function wireInboxView() {
 }
 
 async function markVisibleInboxRead() {
-  const organizationId = S.organizationId;
   const items = inboxItems().filter((item) => item.unread);
   const results = await Promise.allSettled(items.map(async (item) => {
-    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(organizationId)}`, {
+    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, {
       method: 'PATCH', body: JSON.stringify({ unread: false }),
     });
     if (!saved) throw new Error('Notification could not be marked read.');
   }));
-  if (S.organizationId === organizationId) {
-    items.forEach((item, index) => {
-      if (results[index].status !== 'fulfilled') return;
-      const current = S.inbox.find((candidate) => candidate.id === item.id);
-      if (current) current.unread = false;
-    });
-    // Invalidate reads started before the mutation; they may contain stale unread flags.
-    S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
-    updateBell(); renderMain(); renderRail();
-  }
+  items.forEach((item, index) => {
+    if (results[index].status !== 'fulfilled') return;
+    const current = S.inbox.find((candidate) => candidate.id === item.id);
+    if (current) current.unread = false;
+  });
+  // Invalidate reads started before the mutation; they may contain stale unread flags.
+  S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+  updateBell(); renderMain(); renderRail();
   const failed = results.filter((result) => result.status === 'rejected');
   if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
 }
@@ -16042,7 +16040,7 @@ async function openInboxItem(item) {
     // its task. Update the badge locally and let the PATCH finish behind the
     // navigation; restore unread state if it fails.
     markInboxItemReadLocally(item);
-    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
+    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
       .catch(() => { item.unread = true; updateBell(); });
   }
   if (item.subject?.kind === 'avatar-authorization') {
