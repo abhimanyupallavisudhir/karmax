@@ -897,7 +897,11 @@ describe('Store', () => {
     (await store.db.prepare(`INSERT INTO delivery_outbox (id, inboxId, channel, state, attempts, nextAt, createdAt)
       VALUES ('do1', 'ib1', 'email', 'pending', 0, 0, 1)`).run());
 
+    await store.kvSet(`view-publication-fence:${t.id}:run:37`, '1:fence');
+    await store.kvSet(`view-publication-fence:${other.id}:run:37`, '2:other');
     (await store.deleteTask(t.id));
+    expect(await store.kvGet(`view-publication-fence:${t.id}:run:37`)).toBeUndefined();
+    expect(await store.kvGet(`view-publication-fence:${other.id}:run:37`)).toBe('2:other');
 
     const count = async (sql: string, ...args: any[]) => Number(((await store.db.prepare(sql).get(...args)) as any).n);
     expect((await count('SELECT COUNT(*) n FROM tasks WHERE id=?', t.id))).toBe(0);

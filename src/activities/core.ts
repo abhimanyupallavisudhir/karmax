@@ -1029,9 +1029,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const parkingTrace = await installationTiming(store, { taskId }, row => record(taskId, 'timing', { ...row }));
     const valid = async () => {
       ctx?.cancellationSignal.throwIfAborted();
-      if (view.stage === 'review' && view.waitingFor?.kind === 'human' && Number.isSafeInteger(publicationSeq)
+      if (Number.isSafeInteger(publicationSeq)
         && (await store.eventsSince(taskId, publicationSeq, undefined, true)).some(event =>
-          event.type === 'conversation.message' && (event.payload.role === undefined || event.payload.role === 'do'))) {
+          event.type === 'conversation.message')) {
         await record(taskId, 'world.park-deferred', { reason: 'accepted-follow-up' });
         return false;
       }
@@ -1051,6 +1051,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         && (!task?.params._workflowRunId || !ctx
           || task.params._workflowRunId === ctx.info.workflowExecution?.runId);
     };
+    const deferred = new Error('waiting-world maintenance superseded');
+    const checkContinue = async () => { if (!(await valid())) throw deferred; };
     const maintain = async () => {
       if (!(await valid())) return;
       const before = await parkingTrace.measure('lifecycle.status', () => worlds.status(waitingWorld));
@@ -1073,10 +1075,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
             }
             if (!(await valid())) return;
-            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld));
+            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld, { checkContinue }));
             (await record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
               generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
           } catch (error) {
+            if (error === deferred) return;
+            if (ctx?.cancellationSignal.aborted) throw error;
             (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) }));
           }
         }
@@ -4877,7 +4881,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         agentTurn: view.agentTurn?.state ?? null,
         agentRole: view.agentTurn?.role ?? null,
       }));
-      const fence = `${publicationSeq}:${newId('publication')}`;
+      let fence = `${publicationSeq}:${newId('publication')}`;
+      // Legacy publishView performs maintenance inline. Its retry must retain
+      // the FIRST publication's message boundary, including replies accepted
+      // before the worker restarted. Claim atomically for overlapping attempts.
+      let publicationKey: string | undefined;
+      try {
+        const { workflowExecution, activityId } = activityContext.current().info;
+        if (workflowExecution) publicationKey = `view-publication-fence:${taskId}:${workflowExecution.runId}:${activityId}`;
+      } catch { /* direct invocation has no retry identity */ }
+      if (publicationKey) {
+        await store.kvClaim(publicationKey, fence);
+        fence = (await store.kvGet(publicationKey))!;
+      }
       (await store.kvSet(`view-lifecycle:${taskId}`, fence));
       if (options?.separateLifecycle) return fence;
       await maintainWaitingWorld(taskId, view, fence, false);
