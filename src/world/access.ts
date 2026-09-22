@@ -16,71 +16,80 @@ export interface MeteredWorldAccess {
  * artifacts, previews, desktops). Opening a parked provider is never allowed to
  * bypass runner admission, budget checks, usage attribution, or reparking. */
 export class WorldAccessService {
-  /** Transient callers may borrow an already-accounted workflow/terminal lease.
-   * Track those borrows so the lease owner cannot park the world underneath an
-   * in-flight artifact, preview, or WebSocket request. */
-  private borrowed = new Map<string, number>();
-
   constructor(private store: Store, private worlds: WorldRegistry, private runners?: RunnerPoolService,
     private resources?: import('./resources.js').ProjectResourceService) {}
 
   async open(taskId: string, input: WorldHandle, options: { dedicated?: boolean } = {}): Promise<MeteredWorldAccess> {
-    const handle = (this.store.currentWorld(input.id) ?? input) as WorldHandle;
+    // Admission must not hold the transition lock: an existing accessor may
+    // need it to release the capacity this request is waiting for.
+    // All transient access is pinned, including callers borrowing a workflow's
+    // lease, until the artifact/preview/terminal operation releases it.
+    const releaseAccess = await this.worlds.holdAccess(input.id);
+    try { return await this.openMetered(taskId, input, options, releaseAccess); }
+    catch (error) { releaseAccess(); throw error; }
+  }
+
+  private async openMetered(taskId: string, input: WorldHandle, options: { dedicated?: boolean }, releaseAccess: () => void): Promise<MeteredWorldAccess> {
+    const handle = ((await this.store.currentWorld(input.id)) ?? input) as WorldHandle;
     const remote = this.worlds.get(handle.kind).capabilities?.remote === true;
     let runnerLeaseId: string | undefined;
-    const borrowing = remote && !!this.runners && !options.dedicated && this.store.activeWorldLeaseCount(handle.id) > 0;
-    if (borrowing) this.borrowed.set(handle.id, (this.borrowed.get(handle.id) ?? 0) + 1);
+    const borrowing = remote && !!this.runners && !options.dedicated && (await this.store.activeWorldLeaseCount(handle.id)) > 0;
     if (remote && this.runners && !borrowing) {
-      const projectId = String(handle.meta?.projectId ?? this.store.getTask(taskId)?.projectId ?? '');
-      const project = this.store.getProject(projectId);
+      const projectId = String(handle.meta?.projectId ?? (await this.store.getTask(taskId))?.projectId ?? '');
+      const project = (await this.store.getProject(projectId));
       if (!project) throw new Error('cloud world has no owning project');
       runnerLeaseId = (await this.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
-        priority: Number(this.store.getTask(taskId)?.params.priority ?? 0) })).leaseId;
+        priority: Number((await this.store.getTask(taskId))?.params.priority ?? 0) })).leaseId;
     }
     try {
-      const opened = await this.worlds.open(handle);
-      const world = this.resources ? await this.resources.prepare(opened) : opened;
+      const world = await this.worlds.withOperation(handle.id, async () => {
+        // A park already in flight may release the lease we intended to borrow.
+        // Re-enter admission outside this lock before resuming the provider.
+        if (borrowing && (await this.store.activeWorldLeaseCount(handle.id)) === 0) return undefined;
+        const opened = await this.worlds.open(handle);
+        return this.resources ? await this.resources.prepare(opened) : opened;
+      });
+      if (!world) return this.openMetered(taskId, input, options, releaseAccess);
       const openedHandle = world.handle;
-      this.store.setWorldState((this.store.currentWorld(openedHandle.id) ?? openedHandle) as WorldHandle, 'ready');
+      (await this.store.setWorldState(((await this.store.currentWorld(openedHandle.id)) ?? openedHandle) as WorldHandle, 'ready'));
       let released = false;
       return {
         world, handle: openedHandle, ...(runnerLeaseId ? { runnerLeaseId } : {}),
-        release: async (parkIfIdle = true) => {
+        release: async (parkIfIdle = true) => this.worlds.withOperation(openedHandle.id, async () => {
           if (released) return;
+          if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, openedHandle.kind));
           released = true;
-          if (runnerLeaseId) this.runners?.release(runnerLeaseId, openedHandle.kind);
-          if (borrowing) this.releaseBorrow(openedHandle.id);
-          if (parkIfIdle && remote && this.store.activeWorldLeaseCount(openedHandle.id) === 0
-            && (this.borrowed.get(openedHandle.id) ?? 0) === 0) {
-            if (this.store.worldState(openedHandle.id) === 'parked') return;
+          releaseAccess();
+          if (parkIfIdle && remote && (await this.store.activeWorldLeaseCount(openedHandle.id)) === 0
+            && !(await this.worlds.hasActiveAccess(openedHandle.id))) {
+            if ((await this.store.worldState(openedHandle.id)) === 'parked') return;
             await this.resources?.scrubSecrets(openedHandle).catch(() => undefined);
             await this.worlds.park(openedHandle).catch(() => undefined);
             if (await this.worlds.status(openedHandle).catch(() => 'ready') === 'parked')
-              this.store.setWorldState((this.store.currentWorld(openedHandle.id) ?? openedHandle) as WorldHandle, 'parked');
+              (await this.store.setWorldState(((await this.store.currentWorld(openedHandle.id)) ?? openedHandle) as WorldHandle, 'parked'));
           }
-        },
+        }),
       };
     } catch (error) {
-      if (runnerLeaseId) this.runners?.release(runnerLeaseId, handle.kind);
-      if (borrowing) this.releaseBorrow(handle.id);
+      if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, handle.kind));
+      releaseAccess();
       throw error;
     }
   }
 
   async releaseLeaseAndParkIfIdle(handle: WorldHandle, leaseId?: string): Promise<void> {
-    if (leaseId) this.runners?.release(leaseId, handle.kind);
-    if (this.worlds.get(handle.kind).capabilities?.remote !== true || this.store.activeWorldLeaseCount(handle.id) > 0
-      || (this.borrowed.get(handle.id) ?? 0) > 0) return;
-    if (this.store.worldState(handle.id) === 'parked') return;
+    return this.worlds.withOperation(handle.id, () => this.releaseWithinOperation(handle, leaseId));
+  }
+
+  private async releaseWithinOperation(handle: WorldHandle, leaseId?: string): Promise<void> {
+    if (leaseId) (await this.runners?.release(leaseId, handle.kind));
+    if (this.worlds.get(handle.kind).capabilities?.remote !== true || (await this.store.activeWorldLeaseCount(handle.id)) > 0
+      || await this.worlds.hasActiveAccess(handle.id)) return;
+    if ((await this.store.worldState(handle.id)) === 'parked') return;
     await this.resources?.scrubSecrets(handle).catch(() => undefined);
     await this.worlds.park(handle).catch(() => undefined);
     if (await this.worlds.status(handle).catch(() => 'ready') === 'parked')
-      this.store.setWorldState((this.store.currentWorld(handle.id) ?? handle) as WorldHandle, 'parked');
+      (await this.store.setWorldState(((await this.store.currentWorld(handle.id)) ?? handle) as WorldHandle, 'parked'));
   }
 
-  private releaseBorrow(worldId: string): void {
-    const next = (this.borrowed.get(worldId) ?? 1) - 1;
-    if (next > 0) this.borrowed.set(worldId, next);
-    else this.borrowed.delete(worldId);
-  }
 }

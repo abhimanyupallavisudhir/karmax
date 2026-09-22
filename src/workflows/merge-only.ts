@@ -1,3 +1,4 @@
+import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -249,7 +250,7 @@ async function mergeOnlyImpl(
       updatedAt: workflowInfo().historyLength,
     };
   }
-  const publish = async () => core.publishView(taskId, view());
+  const publish = async () => publishTaskView(core, taskId, view());
   const leaser = managedTurns
     ? createAgentTurnLeaser(core, coordinator, {
         taskId,

@@ -4,25 +4,25 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
 
-function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Promise<void>) {
-  const store = new Store(':memory:');
-  const project = store.createProject('Parallel collaboration');
-  const requester = store.createTask({
+async function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Promise<void>) {
+  const store = (await Store.create(':memory:'));
+  const project = (await store.createProject('Parallel collaboration'));
+  const requester = (await store.createTask({
     projectId: project.id, title: 'Requester', workflow: 'software-dev',
     workflowVersion: '1.3.0', params: { prompt: 'assemble the work' },
-  });
-  const target = store.createTask({
+  }));
+  const target = (await store.createTask({
     projectId: project.id, title: 'Publisher', workflow: 'software-dev',
     workflowVersion: '1.3.0', params: { prompt: 'build a part' },
-  });
+  }));
   for (const task of [requester, target]) {
-    store.saveView(task.id, {
+    (await store.saveView(task.id, {
       taskId: task.id, title: task.title, workflow: task.workflow,
       stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 1,
-    });
+    }));
   }
   const tokens = new TokenAuthority();
-  const token = tokens.mint({
+  const token = (await tokens.mint({
     taskId: requester.id,
     projectId: project.id,
     organizationId: project.organizationId,
@@ -30,7 +30,7 @@ function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Promise<
     principal: `task-agent:${requester.id}:do`,
     ceiling: ['task:conversation:message'],
     grantorCaps: ['task:conversation:message'],
-  }).token;
+  })).token;
   const signals = new Map<string, unknown[][]>();
   const client = {
     workflow: {
@@ -53,7 +53,7 @@ function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Promise<
 
 describe('durable background collaboration requests', () => {
   it('returns immediately after registering the requester and nudging the target', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
@@ -66,7 +66,7 @@ describe('durable background collaboration requests', () => {
       action: 'publish_branch',
       status: 'pending',
     });
-    expect(f.store.getCollaborationRequest(request.id)?.status).toBe('pending');
+    expect((await f.store.getCollaborationRequest(request.id))?.status).toBe('pending');
     expect(f.signals.get(f.requester.id)?.[0]).toEqual(['collaborationRequested', request.id]);
     expect(f.signals.get(f.target.id)?.[0]?.[0]).toBe('followUp');
     expect((f.signals.get(f.target.id)?.[0]?.[1] as any).text)
@@ -74,7 +74,7 @@ describe('durable background collaboration requests', () => {
   });
 
   it('settles on push.branch and injects one import-ready update into the requester', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
@@ -85,17 +85,17 @@ describe('durable background collaboration requests', () => {
       ts: Date.now(),
       payload: { branch: `karmax/${f.target.id}`, repos: ['app'] },
     };
-    const seq = f.store.appendEvent(event);
+    const seq = (await f.store.appendEvent(event));
     f.bus.emit({ ...event, seq });
 
-    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.status).toBe('completed');
-    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.notifiedAt).toEqual(expect.any(Number));
+    await expect.poll(async () => (await f.store.getCollaborationRequest(request.id))?.status).toBe('completed');
+    await expect.poll(async () => (await f.store.getCollaborationRequest(request.id))?.notifiedAt).toEqual(expect.any(Number));
     const requesterSignals = f.signals.get(f.requester.id) ?? [];
     expect(requesterSignals.filter((call) => call[0] === 'collaborationSettled')).toHaveLength(1);
     expect(requesterSignals.filter((call) => call[0] === 'followUp')).toHaveLength(1);
     expect((requesterSignals.find((call) => call[0] === 'collaborationSettled')?.[2] as any).text)
       .toContain(`source_task_id "${f.target.id}"`);
-    expect(f.store.eventsSince(f.requester.id, 0).filter((item) => item.type === 'conversation.message'))
+    expect((await f.store.eventsSince(f.requester.id, 0)).filter((item) => item.type === 'conversation.message'))
       .toHaveLength(1);
 
     // Duplicate/replayed bus delivery is idempotent.
@@ -106,7 +106,7 @@ describe('durable background collaboration requests', () => {
   });
 
   it('reports a target terminal failure without polling', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
@@ -117,10 +117,10 @@ describe('durable background collaboration requests', () => {
       ts: Date.now(),
       payload: { stage: 'do', status: 'failed' },
     };
-    const seq = f.store.appendEvent(event);
+    const seq = (await f.store.appendEvent(event));
     f.bus.emit({ ...event, seq });
 
-    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.status).toBe('failed');
+    await expect.poll(async () => (await f.store.getCollaborationRequest(request.id))?.status).toBe('failed');
     const settled = await vi.waitFor(() => {
       const call = (f.signals.get(f.requester.id) ?? []).find((item) => item[0] === 'collaborationSettled');
       expect(call).toBeTruthy();
@@ -130,7 +130,7 @@ describe('durable background collaboration requests', () => {
   });
 
   it('reports a target escalation as failed instead of parking the requester forever', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
@@ -141,10 +141,10 @@ describe('durable background collaboration requests', () => {
       ts: Date.now(),
       payload: { stage: 'escalated', status: 'blocked' },
     };
-    const seq = f.store.appendEvent(event);
+    const seq = (await f.store.appendEvent(event));
     f.bus.emit({ ...event, seq });
 
-    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.status).toBe('failed');
+    await expect.poll(async () => (await f.store.getCollaborationRequest(request.id))?.status).toBe('failed');
     const settled = await vi.waitFor(() => {
       const call = (f.signals.get(f.requester.id) ?? []).find((item) => item[0] === 'collaborationSettled');
       expect(call).toBeTruthy();
@@ -154,7 +154,7 @@ describe('durable background collaboration requests', () => {
   });
 
   it('allows an accepted request to cross PR while waiting for its branch publication', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
@@ -165,10 +165,10 @@ describe('durable background collaboration requests', () => {
       ts: Date.now(),
       payload: { stage: 'pr', status: 'active' },
     };
-    const prSeq = f.store.appendEvent(prEvent);
+    const prSeq = (await f.store.appendEvent(prEvent));
     f.bus.emit({ ...prEvent, seq: prSeq });
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(f.store.getCollaborationRequest(request.id)?.status).toBe('pending');
+    expect((await f.store.getCollaborationRequest(request.id))?.status).toBe('pending');
 
     const pushEvent = {
       taskId: f.target.id,
@@ -176,30 +176,30 @@ describe('durable background collaboration requests', () => {
       ts: Date.now(),
       payload: { branch: `karmax/${f.target.id}`, repos: ['app'] },
     };
-    const pushSeq = f.store.appendEvent(pushEvent);
+    const pushSeq = (await f.store.appendEvent(pushEvent));
     f.bus.emit({ ...pushEvent, seq: pushSeq });
-    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.status).toBe('completed');
+    await expect.poll(async () => (await f.store.getCollaborationRequest(request.id))?.status).toBe('completed');
   });
 
   it('refuses a request when the target is already escalated', async () => {
-    const f = fixture();
-    const view = f.store.getTask(f.target.id)!.lastView!;
-    f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' });
+    const f = (await fixture());
+    const view = (await f.store.getTask(f.target.id))!.lastView!;
+    (await f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' }));
 
     await expect(f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
     })).rejects.toThrow(/blocked and cannot run its Do agent/);
-    expect(f.store.listCollaborationRequests()).toEqual([]);
+    expect((await f.store.listCollaborationRequests())).toEqual([]);
   });
 
   it('settles a delivery race when the target blocks while the request signal is in flight', async () => {
-    let f: ReturnType<typeof fixture>;
-    f = fixture((taskId, args) => {
+    let f: Awaited<ReturnType<typeof fixture>>;
+    f = (await fixture(async (taskId, args) => {
       if (taskId !== f.target.id || args[0] !== 'followUp') return;
-      const view = f.store.getTask(f.target.id)!.lastView!;
-      f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' });
-    });
+      const view = (await f.store.getTask(f.target.id))!.lastView!;
+      (await f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' }));
+    }));
 
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
@@ -212,14 +212,14 @@ describe('durable background collaboration requests', () => {
   });
 
   it('repairs a pending request whose target was already blocked before startup', async () => {
-    const f = fixture();
-    const request = f.store.createCollaborationRequest({
+    const f = (await fixture());
+    const request = (await f.store.createCollaborationRequest({
       requesterTaskId: f.requester.id,
       targetTaskId: f.target.id,
       action: 'publish_branch',
-    });
-    const view = f.store.getTask(f.target.id)!.lastView!;
-    f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' });
+    }));
+    const view = (await f.store.getTask(f.target.id))!.lastView!;
+    (await f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' }));
 
     // A fresh service instance reconciles durable requests before handling new
     // traffic, which is how an upgrade repairs rows orphaned by the old code.
@@ -231,7 +231,7 @@ describe('durable background collaboration requests', () => {
       bus: f.bus,
     });
 
-    await expect.poll(() => f.store.getCollaborationRequest(request.id)).toMatchObject({
+    await expect.poll(async () => (await f.store.getCollaborationRequest(request.id))).toMatchObject({
       status: 'failed',
       result: { reason: 'target task became blocked before publishing its branch' },
       notifiedAt: expect.any(Number),
@@ -241,7 +241,7 @@ describe('durable background collaboration requests', () => {
   });
 
   it('lets the requester withdraw a collaboration without cancelling the target', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
@@ -251,7 +251,7 @@ describe('durable background collaboration requests', () => {
 
     expect(cancelled).toMatchObject({ id: request.id, status: 'failed' });
     expect(cancelled.result?.reason).toMatch(/withdrawn/);
-    expect(f.store.getTask(f.target.id)?.lastView?.status).not.toBe('cancelled');
+    expect((await f.store.getTask(f.target.id))?.lastView?.status).not.toBe('cancelled');
     await vi.waitFor(() => {
       const call = (f.signals.get(f.requester.id) ?? [])
         .find((item) => item[0] === 'collaborationSettled' && item[1] === request.id);
@@ -260,19 +260,19 @@ describe('durable background collaboration requests', () => {
   });
 
   it('does not let another task withdraw a collaboration it does not own', async () => {
-    const f = fixture();
+    const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
     });
-    const other = f.store.createTask({
+    const other = (await f.store.createTask({
       projectId: f.project.id,
       title: 'Other requester',
       workflow: 'software-dev',
       workflowVersion: '1.3.0',
       params: { prompt: 'Other' },
-    });
-    const token = f.tokens.mint({
+    }));
+    const token = (await f.tokens.mint({
       taskId: other.id,
       projectId: f.project.id,
       organizationId: f.project.organizationId,
@@ -280,30 +280,30 @@ describe('durable background collaboration requests', () => {
       principal: `task-agent:${other.id}:do`,
       ceiling: ['task:conversation:message'],
       grantorCaps: ['task:conversation:message'],
-    }).token;
+    })).token;
     await expect(f.api.cancelAgentAction(token, request.id)).rejects.toThrow(/not found/);
-    expect(f.store.getCollaborationRequest(request.id)?.status).toBe('pending');
+    expect((await f.store.getCollaborationRequest(request.id))?.status).toBe('pending');
   });
 
-  it('removes collaboration records with their project', () => {
-    const f = fixture();
-    f.store.createCollaborationRequest({
+  it('removes collaboration records with their project', async () => {
+    const f = (await fixture());
+    (await f.store.createCollaborationRequest({
       requesterTaskId: f.requester.id,
       targetTaskId: f.target.id,
       action: 'publish_branch',
-    });
-    f.store.deleteProject(f.project.id);
-    expect(f.store.listCollaborationRequests()).toEqual([]);
+    }));
+    (await f.store.deleteProject(f.project.id));
+    expect((await f.store.listCollaborationRequests())).toEqual([]);
   });
 
   it('refuses a request after the target has entered its point-of-no-return stages', async () => {
-    const f = fixture();
-    const view = f.store.getTask(f.target.id)!.lastView!;
-    f.store.saveView(f.target.id, { ...view, stage: 'merge', status: 'waiting' });
+    const f = (await fixture());
+    const view = (await f.store.getTask(f.target.id))!.lastView!;
+    (await f.store.saveView(f.target.id, { ...view, stage: 'merge', status: 'waiting' }));
     await expect(f.api.requestAgentAction(f.token, {
       taskId: f.target.id,
       action: 'publish_branch',
     })).rejects.toThrow(/passed its agent-work stage/);
-    expect(f.store.listCollaborationRequests()).toEqual([]);
+    expect((await f.store.listCollaborationRequests())).toEqual([]);
   });
 });

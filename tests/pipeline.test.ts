@@ -147,15 +147,15 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
   it.each(['keep', 'cancel'] as const)('%s other attempts at first Merge admission', async (choice) => {
     const repo = await h.makeRepo(`attempts-${choice}`);
-    const project = h.store.createProject(`Attempts ${choice}`, { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
-    const first = h.store.createTask({ projectId: project.id, title: 'First', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write first.txt :: first' } });
-    const second = h.store.createTask({ projectId: project.id, title: 'Second', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write second.txt :: second' }, intentId: first.intentId });
+    const project = (await h.store.createProject(`Attempts ${choice}`, { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+    const first = (await h.store.createTask({ projectId: project.id, title: 'First', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write first.txt :: first' } }));
+    const second = (await h.store.createTask({ projectId: project.id, title: 'Second', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write second.txt :: second' }, intentId: first.intentId }));
     const handles = await Promise.all([first, second].map((task) => h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE, workflowId: task.id,
       args: [{ ...input({ taskId: task.id, projectId: project.id, repo, prompt: task.params.prompt }), intentId: first.intentId }],
     })));
     for (const handle of handles) await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
-    h.store.kvSet(`attempt-choice:${first.id}`, choice);
+    (await h.store.kvSet(`attempt-choice:${first.id}`, choice));
     await handles[0]!.signal('confirm');
     expect((await handles[0]!.result() as any).stage).toBe('done');
     if (choice === 'keep') {
@@ -172,10 +172,10 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
   it('kept siblings confirmed together own separate, serialized merge queue leases', async () => {
     const repo = await h.makeRepo('kept-sibling-queue');
-    const project = h.store.createProject('Kept queue', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
-    const first = h.store.createTask({ projectId: project.id, title: 'Queue sibling admission A', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write queued-a.txt :: A' } });
-    const second = h.store.createTask({ projectId: project.id, title: 'Queue sibling admission B', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write queued-b.txt :: B' }, intentId: first.intentId });
-    h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' });
+    const project = (await h.store.createProject('Kept queue', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+    const first = (await h.store.createTask({ projectId: project.id, title: 'Queue sibling admission A', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write queued-a.txt :: A' } }));
+    const second = (await h.store.createTask({ projectId: project.id, title: 'Queue sibling admission B', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write queued-b.txt :: B' }, intentId: first.intentId }));
+    (await h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' }));
     gatedAttemptIds.add(first.id);
     gatedAttemptIds.add(second.id);
     attemptMergeGate = new Promise<void>((resolve) => { releaseAttemptMerge = resolve; });
@@ -215,10 +215,10 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
   it('kept sibling conflicts do not overwrite the first landed attempt or retain a queue lease', async () => {
     const repo = await h.makeRepo('kept-sibling-conflict');
-    const project = h.store.createProject('Kept conflict', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
-    const first = h.store.createTask({ projectId: project.id, title: 'First edit', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write index.js :: console.log("first")' } });
-    const second = h.store.createTask({ projectId: project.id, title: 'Conflicting edit', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write index.js :: console.log("second")' }, intentId: first.intentId });
-    h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' });
+    const project = (await h.store.createProject('Kept conflict', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+    const first = (await h.store.createTask({ projectId: project.id, title: 'First edit', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write index.js :: console.log("first")' } }));
+    const second = (await h.store.createTask({ projectId: project.id, title: 'Conflicting edit', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: '@write index.js :: console.log("second")' }, intentId: first.intentId }));
+    (await h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' }));
     const handles = await Promise.all([first, second].map((task) => h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE, workflowId: task.id,
       args: [{ ...input({ taskId: task.id, projectId: project.id, repo, prompt: task.params.prompt }), intentId: first.intentId }],
@@ -238,7 +238,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
         const queue = await queueHandle.query('queue') as { current?: string; queue: string[] };
         return { current: queue.current ?? null, queue: queue.queue };
       }).toEqual({ current: null, queue: [] });
-      expect(h.store.attemptGroup(first.id)?.otherAttempts).toBe('keep');
+      expect((await h.store.attemptGroup(first.id))?.otherAttempts).toBe('keep');
     } finally {
       await handles[1]!.signal('cancel').catch(() => undefined);
       await handles[1]!.result();
@@ -276,14 +276,14 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result).toEqual({ stage: 'done' });
     const final = await view(handle);
     expect(final.reviewInfo.summary).toMatch(/no repository merge required/i);
-    expect(h.store.eventsSince(taskId, 0).some((event) => event.type === 'merge.completed')).toBe(false);
+    expect((await h.store.eventsSince(taskId, 0)).some((event) => event.type === 'merge.completed')).toBe(false);
   }, 120_000);
 
   it('v1.19 blocks Review on staged resources and wakes on an actual decision', async () => {
     const repo = await h.makeRepo('resource-candidate-review');
-    const project = h.store.createProject('Resource candidate review', { repos: [repo] });
-    const task = h.store.createTask({ projectId: project.id, title: 'Install model', workflow: 'software-dev',
-      workflowVersion: '1.19.0', params: { prompt: 'install it' } });
+    const project = (await h.store.createProject('Resource candidate review', { repos: [repo] }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Install model', workflow: 'software-dev',
+      workflowVersion: '1.19.0', params: { prompt: 'install it' } }));
     const handle = await h.client.workflow.start('softwareDev@1.19.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -293,8 +293,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
           + '@run git add .gitignore model.js && git commit -q -m "install model"\n@review Installed model' })],
     });
 
-    await expect.poll(() => h.store.currentWorld(task.id), { timeout: 30_000 }).toBeTruthy();
-    const taskWorld = h.store.currentWorld(task.id)!;
+    await expect.poll(async () => (await h.store.currentWorld(task.id)), { timeout: 30_000 }).toBeTruthy();
+    const taskWorld = (await h.store.currentWorld(task.id))!;
     fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'model.bin'), Buffer.alloc(1024, 7));
     const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
       target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
@@ -315,7 +315,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done' });
-    expect(h.store.getResourceAttachment(proposed.attachment.id)).toMatchObject({ enabled: true });
+    expect((await h.store.getResourceAttachment(proposed.attachment.id))).toMatchObject({ enabled: true });
   }, 120_000);
 
   it('v1.13 waits for input until Open PR is explicitly requested', async () => {
@@ -356,13 +356,13 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   it.each([{ authorized: true, failed: true }, { authorized: false, failed: true },
     { authorized: true, failed: false }, { authorized: false, failed: false }])('manual opening confirms only an authorized reviewer ($authorized, failed: $failed)', async ({ authorized, failed }) => {
     const repo = await h.makeRepo(`manual-confirm-${authorized}-${failed}`);
-    h.store.claimPersonalOrganization('manual-owner');
-    const project = h.store.createProject(`Manual confirmation ${authorized} ${failed}`);
-    const task = h.store.createTask({
+    (await h.store.claimPersonalOrganization('manual-owner'));
+    const project = (await h.store.createProject(`Manual confirmation ${authorized} ${failed}`));
+    const task = (await h.store.createTask({
       projectId: project.id, title: 'Manual confirmation', workflow: 'software-dev',
       workflowVersion: '1.26.0', params: { prompt: 'work' },
       createdBy: { kind: 'user', userId: 'manual-owner' },
-    });
+    }));
     const handle = await h.client.workflow.start('softwareDev@1.26.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id,
       args: [input({ taskId: task.id, projectId: project.id, repo, resolveAgentEnabled: false,
@@ -378,12 +378,12 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     if (!authorized) {
       await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
       await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
-      expect(h.store.eventsSince(task.id, 0).some((e) => e.type === 'task.confirmation-voted')).toBe(false);
+      expect((await h.store.eventsSince(task.id, 0)).some((e) => e.type === 'task.confirmation-voted')).toBe(false);
       expect((await view(handle)).stage).toBe('review');
       await handle.signal('confirm');
     }
     expect(await handle.result()).toMatchObject({ stage: 'done' });
-    expect(h.store.eventsSince(task.id, 0).filter((e) => e.type === 'task.confirmation-voted'))
+    expect((await h.store.eventsSince(task.id, 0)).filter((e) => e.type === 'task.confirmation-voted'))
       .toHaveLength(authorized ? 1 : 0);
   }, 120_000);
 
@@ -522,7 +522,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     });
 
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
-    await expect.poll(() => h.store.kvGet(`session:${taskId}:do`), { timeout: 15_000 }).toBe('restart-regression-session');
+    await expect.poll(async () => (await h.store.kvGet(`session:${taskId}:do`)), { timeout: 15_000 }).toBe('restart-regression-session');
 
     await h.restartWorker();
 
@@ -977,7 +977,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
     expect(result.stage).toBe('cancelled');
     expect(cancellationCleanupFinishedAt).toBeGreaterThan(0);
-    expect(h.store.eventsSince(taskId, 0).findLast((event) => event.type === 'view.updated')?.payload)
+    expect((await h.store.eventsSince(taskId, 0)).findLast((event) => event.type === 'view.updated')?.payload)
       .toMatchObject({ stage: 'cancelled', status: 'cancelled' });
   });
 
@@ -993,7 +993,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const v = await view(handle);
     expect(v.status).toBe('blocked');
     expect(v.error).toContain('boom goes the agent');
-    expect(h.store.eventsSince(taskId, 0).some((e) => e.type === 'resolve.auto')).toBe(true);
+    expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(true);
     expect(v.transcripts?.some((t: any) => t.role === 'resolve')).toBe(false);
     expect(v.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'cancel']));
     // a human cancels the blocked task
@@ -1175,7 +1175,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const v = await view(handle);
     const resolve = (v.transcripts ?? []).find((t: any) => t.role === 'resolve');
     expect(resolve?.messages?.length ?? 0).toBe(0);
-    const autoEvents = h.store.eventsSince(taskId, 0).filter((e) => e.type === 'resolve.auto');
+    const autoEvents = (await h.store.eventsSince(taskId, 0)).filter((e) => e.type === 'resolve.auto');
     expect(autoEvents.length).toBeGreaterThan(0);
     expect(autoEvents.every((e) => e.payload.resolved === true)).toBe(true);
     expect(autoEvents.every((e) => e.payload.source === 'provider-metadata')).toBe(true);
@@ -1212,7 +1212,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
     const v = await view(handle);
     expect((v.transcripts ?? []).find((t: any) => t.role === 'resolve')?.messages?.length ?? 0).toBe(0);
-    expect(h.store.eventsSince(taskId, 0).filter((e) => e.type === 'resolve.auto')).toEqual([
+    expect((await h.store.eventsSince(taskId, 0)).filter((e) => e.type === 'resolve.auto')).toEqual([
       expect.objectContaining({ payload: expect.objectContaining({ resolved: true, source: 'provider-metadata' }) }),
     ]);
     await expect.poll(async () => {
@@ -1252,7 +1252,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
     const v = await view(handle);
     expect((v.transcripts ?? []).find((t: any) => t.role === 'resolve')?.messages?.length ?? 0).toBe(0);
-    const auto = h.store.eventsSince(taskId, 0).filter((e) => e.type === 'resolve.auto');
+    const auto = (await h.store.eventsSince(taskId, 0)).filter((e) => e.type === 'resolve.auto');
     expect(auto).toHaveLength(1);
     expect(auto[0]?.payload).toMatchObject({ resolved: true, source: 'provider-metadata' });
     await expect.poll(async () => {
@@ -1267,9 +1267,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
   it('retries a transient transport failure in-place — session resumed, Resolve never runs', async ({ onTestFinished }) => {
     // This case verifies retry timing as well as recovery; other cases keep the installation default.
-    const previousTiming = h.store.getSettings('global', 'timing');
-    onTestFinished(() => h.store.setSettings('global', 'timing', previousTiming ?? { enabled: false }));
-    h.store.setSettings('global', 'timing', { enabled: true });
+    const previousTiming = (await h.store.getSettings('global', 'timing'));
+    onTestFinished(async () => (await h.store.setSettings('global', 'timing', previousTiming ?? { enabled: false })));
+    (await h.store.setSettings('global', 'timing', { enabled: true }));
     const repo = await h.makeRepo('app-flaky');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
@@ -1288,7 +1288,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(resolve?.messages?.length ?? 0).toBe(0);
     // …and the retry RESUMED the interrupted session (heartbeat details) instead
     // of replaying the whole turn from scratch
-    const events = h.store.eventsSince(taskId, 0);
+    const events = (await h.store.eventsSince(taskId, 0));
     expect(events.some((e) => e.type === 'turn.resumed')).toBe(true);
     const timing = timingReport(events.filter(e => e.type === 'timing').map(e => e.payload as unknown as TimingRow));
     const measured = timing.attempts.filter(a => a.attempt === 1 || a.attempt === 2);

@@ -1352,11 +1352,12 @@ export function platformToolHandlers(
       return `confirm decision recorded: ${action}`;
     },
   };
-  const trace = currentTiming();
+  const capturedTrace = currentTiming();
   return Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name,
-    (args: any) => {
+    async (args: any) => {
+      const trace = await capturedTrace;
       const execute = () => timed(name === 'search_connection_tools' ? 'tool.discovery.managed' : 'tool.execution.platform',
         () => handler(args), { operation: name });
-      return trace ? withTiming(trace, execute) : execute();
+      return trace ? (await withTiming(trace, execute)) : execute();
     }]));
 }

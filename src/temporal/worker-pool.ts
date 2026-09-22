@@ -22,6 +22,9 @@ export class WorkerManager {
   private runPromise?: Promise<void>;
   private externals: ExternalWorkflowRef[] = [];
   private refreshing?: Promise<void>;
+  private starting?: Promise<void>;
+  private stopping?: Promise<void>;
+  private stopRequested = false;
 
   /** Why the live worker stopped, if it did (see `watch`). */
   failure?: unknown;
@@ -51,9 +54,15 @@ export class WorkerManager {
 
   /** Start the initial worker (built-ins, plus any externals given). */
   async start(externals: ExternalWorkflowRef[] = []): Promise<void> {
-    this.externals = externals;
-    this.handle = await this.build(externals);
-    this.runPromise = this.watch(this.handle, this.handle.run());
+    if (this.stopRequested) throw new Error('worker manager is stopping');
+    if (this.starting || this.handle) throw new Error('worker manager already started');
+    this.starting = (async () => {
+      this.externals = externals;
+      this.handle = await this.build(externals);
+      this.runPromise = this.watch(this.handle, this.handle.run());
+    })();
+    try { await this.starting; }
+    finally { this.starting = undefined; }
   }
 
   private async build(externals: ExternalWorkflowRef[]): Promise<WorkerHandle> {
@@ -67,8 +76,10 @@ export class WorkerManager {
    * worker before draining the old so the queue is never unserved.
    */
   async refresh(externals: ExternalWorkflowRef[]): Promise<void> {
+    if (this.stopRequested) throw new Error('worker manager is stopping');
     // Chain onto any in-progress refresh so swaps stay ordered.
     const run = async () => {
+      await this.starting;
       const next = await this.build(externals);
       const old = this.handle;
       this.handle = next;
@@ -84,8 +95,15 @@ export class WorkerManager {
   }
 
   async stop(): Promise<void> {
-    await this.refreshing?.catch(() => {});
-    this.handle?.shutdown();
-    await this.runPromise?.catch(() => {});
+    // Close admission synchronously, before waiting for a build/refresh. Every
+    // already-accepted operation must finish before we drain the final handle.
+    this.stopRequested = true;
+    this.stopping ??= (async () => {
+      await this.starting?.catch(() => {});
+      await this.refreshing?.catch(() => {});
+      this.handle?.shutdown();
+      await this.runPromise?.catch(() => {});
+    })();
+    await this.stopping;
   }
 }

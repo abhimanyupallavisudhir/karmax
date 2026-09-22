@@ -30,7 +30,7 @@ describe('durable agent-turn admission', () => {
   });
 
   it('uses the capacity label only after an acknowledged request is actually queued', async () => {
-    h.store.setSettings('global', 'agent-queue', { capacity: 1 });
+    (await h.store.setSettings('global', 'agent-queue', { capacity: 1 }));
     const repo = await h.makeRepo('agent-capacity');
     const start = async (title: string) => {
       const taskId = newId('task');

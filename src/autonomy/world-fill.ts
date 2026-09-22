@@ -23,12 +23,12 @@ export async function fillInWorld(world: World, args: {
   expectDomains?: string[];
   cdpUrl: string;
   /** Resolves the secret host-side; called once, its result goes only to stdin. */
-  resolveText: () => string;
+  resolveText: () => string | Promise<string>;
   timeoutMs?: number;
 }): Promise<{ origin: string }> {
   await world.writeFile(HELPER_REL, HELPER_SOURCE);
   const res = await world.exec('node', [HELPER_REL, args.selector, (args.expectDomains ?? []).join(','), args.cdpUrl], {
-    input: args.resolveText(),
+    input: (await args.resolveText()),
     timeoutMs: args.timeoutMs ?? 30_000,
   });
   let parsed: { origin?: string; error?: string } = {};

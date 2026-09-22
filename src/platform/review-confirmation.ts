@@ -1,15 +1,15 @@
 import type { Store } from '../store/db.js';
 
 /** Journal the same human decision for direct and deferred Review confirmation. */
-export function recordHumanConfirmation(store: Store, taskId: string, userId: string): void {
-  const task = store.getTask(taskId);
+export async function recordHumanConfirmation(store: Store, taskId: string, userId: string): Promise<void> {
+  const task = (await store.getTask(taskId));
   if (!task?.lastView || task.lastView.waitingFor?.kind !== 'human') return;
   // A failed Confirm agent can expose the same human decision from its
   // escalation frame. Preserve that person's GitHub authorization too.
   const reviewConfirmation = task.lastView.stage === 'review'
     || (task.lastView.stage === 'escalated'
       && task.lastView.actions.some((action) => action.name === 'confirm' && action.enabled));
-  store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+  (await store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
     payload: {
       userId, audience: task.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
       githubMergeAuthorized: Boolean(task.lastView.prs?.length
@@ -24,5 +24,5 @@ export function recordHumanConfirmation(store: Store, taskId: string, userId: st
       githubPrHeads: (task.lastView.prs ?? []).map((ref) => ({
         slug: ref.slug, number: ref.number, headSha: ref.headSha,
       })),
-    } });
+    } }));
 }

@@ -41,11 +41,11 @@ catch { bootstrapBlocked = true; }
 // multiple-account login, project-scoped grants/filtering, denial, and logout.
 const port = await findFreePortFrom(47950);
 const httpIdentity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}` });
-const store = new Store(':memory:');
-const authorization = new AuthorizationService(store);
-const project = store.createProject('Allowed', {});
-store.createProject('Hidden', {});
-const gateway = new Gateway({
+const store = (await Store.create(':memory:'));
+const authorization = (await AuthorizationService.create(store));
+const project = (await store.createProject('Allowed', {}));
+(await store.createProject('Hidden', {}));
+const gateway = (await Gateway.create({
   api: {} as any,
   store,
   bus: new KarmaxBus(),
@@ -59,7 +59,7 @@ const gateway = new Gateway({
   identity: httpIdentity,
   authorization,
   worlds: new WorldRegistry(),
-});
+}));
 const running = await gateway.listen(port);
 const base = running.url;
 const json = (path: string, init: RequestInit = {}) => fetch(`${base}${path}`, {
@@ -93,7 +93,7 @@ if (!signupResponse.ok || !signupCookie) throw new Error(`self signup failed: ${
 const signupFirstSession = await (await json('/api/session', { headers: { cookie: signupCookie } })).json() as any;
 const signupSecondSession = await (await json('/api/session', { headers: { cookie: signupCookie } })).json() as any;
 const signupGitOnboardingOnce = signupFirstSession.gitOnboarding === true && signupSecondSession.gitOnboarding === false;
-const signupAcceptanceRecorded = store.policyAcceptances(String(signupFirstSession.user?.id ?? '')).some((acceptance) =>
+const signupAcceptanceRecorded = (await store.policyAcceptances(String(signupFirstSession.user?.id ?? ''))).some((acceptance) =>
   acceptance.context === 'signup' && acceptance.versions.terms === policyVersions('signup').terms);
 // Self-signup now lands the user in their own personal-workspace organization —
 // no "no access yet" waiting room. Projects is reachable (empty until they make
@@ -131,7 +131,7 @@ const upload = await fetch(`${base}/api/attachments?projectId=${encodeURICompone
 const image = await upload.json() as any;
 if (!upload.ok || !image.id) throw new Error('could not upload scoped attachment');
 const imageAllowed = await fetch(`${base}/api/attachments/${image.id}?projectId=${encodeURIComponent(project.id)}`, { headers: rootHeaders });
-const hiddenProject = store.listProjects().find((p) => p.name === 'Hidden')!;
+const hiddenProject = (await store.listProjects()).find((p) => p.name === 'Hidden')!;
 const imageHidden = await fetch(`${base}/api/attachments/${image.id}?projectId=${encodeURIComponent(hiddenProject.id)}`, { headers: rootHeaders });
 if (imageAllowed.status !== 200 || imageHidden.status !== 404) throw new Error('attachment project ACL failed');
 const created = await json('/api/users', {
@@ -157,7 +157,7 @@ process.stdout.write(JSON.stringify({
   passwordChangeOk: changedPassword.ok,
   oldPasswordRejected: !oldPasswordLogin.ok,
   newPasswordAccepted: newPasswordLogin.ok,
-  users: identity.listUsers().length,
+  users: (await identity.listUsers()).length,
   duplicateUserNameBlocked,
   bootstrapBlocked,
   setupRequired: setupBefore.setupRequired,

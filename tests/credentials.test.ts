@@ -120,11 +120,11 @@ describe('default policy: logins/ambient ON, API keys OFF (opt-in)', () => {
 });
 
 describe('enable / disable across scopes (task → project → global)', () => {
-  it('assigns the legacy global policy only to org_personal', () => {
+  it('assigns the legacy global policy only to org_personal', async () => {
     const values = new Map([[credPolicyKey.global(), JSON.stringify({ off: ['ambient:claude'] })]]);
-    expect(readPolicyLayers((key) => values.get(key), { organizationId: 'org_personal' }).global?.off)
+    expect((await readPolicyLayers((key) => values.get(key), { organizationId: 'org_personal' })).global?.off)
       .toEqual(['ambient:claude']);
-    expect(readPolicyLayers((key) => values.get(key), { organizationId: 'org_other' }).global)
+    expect((await readPolicyLayers((key) => values.get(key), { organizationId: 'org_other' })).global)
       .toBeUndefined();
   });
 

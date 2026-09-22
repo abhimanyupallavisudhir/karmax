@@ -24,12 +24,12 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 async function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-retention-'));
   cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }));
-  const store = new Store(path.join(root, 'state.sqlite'));
-  cleanup.push(() => store.close());
+  const store = (await Store.create(path.join(root, 'state.sqlite')));
+  cleanup.push(async () => (await store.close()));
   const objects = new LocalObjectStore(path.join(root, 'objects'));
-  const project = store.createProject('Review retention');
-  const task = store.createTask({ projectId: project.id, title: 'Report', workflow: 'just-do',
-    workflowVersion: '1.0.0', params: { prompt: 'report' } });
+  const project = (await store.createProject('Review retention'));
+  const task = (await store.createTask({ projectId: project.id, title: 'Report', workflow: 'just-do',
+    workflowVersion: '1.0.0', params: { prompt: 'report' } }));
   const worlds = new WorldRegistry();
   const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
   cleanup.push(() => world.destroy());
@@ -37,18 +37,18 @@ async function fixture() {
   const view: TaskView = { taskId: task.id, title: task.title, workflow: task.workflow,
     stage: 'review', status: 'waiting', state: {}, messages: [], actions: [], updatedAt: 1,
     world: world.handle, reviewInfo: info };
-  store.saveView(task.id, view);
+  (await store.saveView(task.id, view));
   await world.writeFile('report.md', '# Saved report');
   const core = makeCoreActivities({ store, worlds, objects, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
   const tokens = new TokenAuthority();
   const caps = ['task:read', 'task:review:execute'];
-  const token = tokens.mint({ taskId: task.id, profileId: 'test', principal: `task:${task.id}`,
-    organizationId: project.organizationId, ceiling: caps, grantorCaps: caps }).token;
-  const client = { workflow: { getHandle: () => ({ query: async () => store.getTask(task.id)?.lastView }) } } as any;
+  const token = (await tokens.mint({ taskId: task.id, profileId: 'test', principal: `task:${task.id}`,
+    organizationId: project.organizationId, ceiling: caps, grantorCaps: caps })).token;
+  const client = { workflow: { getHandle: () => ({ query: async () => (await store.getTask(task.id))?.lastView }) } } as any;
   const api = new KarmaxApi({ store, tokens, client, worlds, taskQueue: 'test' });
-  const gateway = new Gateway({ api, store, tokens, client, worlds, objects, taskQueue: 'test',
+  const gateway = (await Gateway.create({ api, store, tokens, client, worlds, objects, taskQueue: 'test',
     bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
-    staticDir: 'web', agentInfo: { provider: 'mock', reason: 'test' } });
+    staticDir: 'web', agentInfo: { provider: 'mock', reason: 'test' } }));
   const server = await gateway.listen(await findFreePortFrom(49_800));
   cleanup.push(() => server.close());
   const request = (url: string, body?: unknown) => fetch(`${server.url}${url}`, {
@@ -66,15 +66,15 @@ describe('durable Review attachments', () => {
     const { url } = await open.json() as { url: string };
     await f.core.destroyWorld(f.world.handle);
     expect(fs.existsSync(f.world.handle.root)).toBe(false);
-    f.store.saveView(f.task.id, { ...f.view, stage: 'done', status: 'done', world: undefined });
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'done', status: 'done', world: undefined }));
     const response = await f.request(url);
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toBe('application/octet-stream');
     expect(response.headers.get('content-disposition')).toContain('report.md');
     expect(response.headers.get('content-security-policy')).toContain('sandbox');
     expect(await response.text()).toBe('# Saved report');
-    const other = f.store.createTask({ projectId: f.project.id, title: 'Other', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'other' } });
+    const other = (await f.store.createTask({ projectId: f.project.id, title: 'Other', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'other' } }));
     expect((await f.request(url.replace(f.task.id, other.id))).status).not.toBe(200);
   });
 
@@ -86,12 +86,12 @@ describe('durable Review attachments', () => {
         { kind: 'open', label: 'Missing', target: 'missing.png' },
       ] })).rejects.toThrow();
       await handlers.create_review_info!(f.info);
-      expect(f.store.listPromotedArtifacts(f.task.id)).toHaveLength(1);
-      expect(f.store.getTask(f.task.id)?.lastView?.reviewInfo?.actions).toEqual(f.info.actions);
+      expect((await f.store.listPromotedArtifacts(f.task.id))).toHaveLength(1);
+      expect((await f.store.getTask(f.task.id))?.lastView?.reviewInfo?.actions).toEqual(f.info.actions);
       // Caption-only updates must not recapture or require an already saved file.
       fs.unlinkSync(path.join(f.world.handle.root, 'report.md'));
       await handlers.create_review_info!({ caption: 'Read the saved report' });
-      expect(f.store.getTask(f.task.id)?.lastView?.reviewInfo?.caption).toBe('Read the saved report');
+      expect((await f.store.getTask(f.task.id))?.lastView?.reviewInfo?.caption).toBe('Read the saved report');
       throw new Error('escalated');
     } }]]) as any;
     const core = makeCoreActivities({ store: f.store, worlds: f.worlds, objects: f.objects,
@@ -140,7 +140,7 @@ describe('durable Review attachments', () => {
     const adapters = new Map([['mock', { provider: 'mock', async runTurn(input: any, ctx: any) {
       const handlers = platformToolHandlers(input.world, ctx);
       await Promise.all([handlers.create_review_info!(f.info), handlers.create_review_info!(second)]);
-      expect(f.store.getTask(f.task.id)?.lastView?.reviewInfo?.actions)
+      expect((await f.store.getTask(f.task.id))?.lastView?.reviewInfo?.actions)
         .toEqual([...f.info.actions, ...second.actions]);
       throw new Error('escalated');
     } }]]) as any;
@@ -167,13 +167,13 @@ describe('durable Review attachments', () => {
     });
     const save = () => preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
     await Promise.all([save(), save()]);
-    const records = f.store.listPromotedArtifacts(f.task.id);
+    const records = (await f.store.listPromotedArtifacts(f.task.id));
     expect(records).toHaveLength(1);
     expect(new Set(keys).size).toBe(2);
     expect((await f.objects.get(records[0]!.objectKey)).toString()).toBe('# Saved report');
     await expect(f.objects.get(keys.find((key) => key !== records[0]!.objectKey)!)).rejects.toThrow();
-    expect(f.store.db.prepare("SELECT * FROM usage_events WHERE taskId=? AND kind='resource.storage'")
-      .all(f.task.id)).toHaveLength(1);
+    expect((await f.store.db.prepare("SELECT * FROM usage_events WHERE taskId=? AND kind='resource.storage'")
+      .all(f.task.id))).toHaveLength(1);
   });
 
   it('does not resurrect an artifact when the task is deleted during its upload', async () => {
@@ -193,11 +193,11 @@ describe('durable Review attachments', () => {
     const saving = preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
     const rejected = expect(saving).rejects.toThrow('deleted during upload');
     await started;
-    f.store.deleteTask(f.task.id);
+    (await f.store.deleteTask(f.task.id));
     release();
     await rejected;
-    expect(f.store.listPromotedArtifacts(f.task.id)).toHaveLength(0);
-    expect(f.store.kvGet(`review-artifacts:${f.task.id}`)).toBeUndefined();
+    expect((await f.store.listPromotedArtifacts(f.task.id))).toHaveLength(0);
+    expect((await f.store.kvGet(`review-artifacts:${f.task.id}`))).toBeUndefined();
     await expect(f.objects.get(uploadedKey)).rejects.toThrow();
   });
 
@@ -205,10 +205,10 @@ describe('durable Review attachments', () => {
     const f = await fixture();
     await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
     await f.world.destroy();
-    const reopened = new Store(path.join(f.root, 'state.sqlite'));
-    cleanup.push(() => reopened.close());
+    const reopened = (await Store.create(path.join(f.root, 'state.sqlite')));
+    cleanup.push(async () => (await reopened.close()));
     const objects = new LocalObjectStore(path.join(f.root, 'objects'));
-    const saved = savedReviewArtifact(reopened, f.task.id, 'report.md')!;
+    const saved = (await savedReviewArtifact(reopened, f.task.id, 'report.md'))!;
     expect((await objects.get(saved.objectKey)).toString()).toBe('# Saved report');
   });
 
@@ -216,7 +216,7 @@ describe('durable Review attachments', () => {
     const f = await fixture();
     const save = () => preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
     await save(); await save();
-    expect(f.store.listPromotedArtifacts(f.task.id)).toHaveLength(1);
+    expect((await f.store.listPromotedArtifacts(f.task.id))).toHaveLength(1);
     await f.world.writeFile('report.md', 'unreviewed changes');
     await f.core.destroyWorld(f.world.handle);
     const response = await f.request(`/api/tasks/${f.task.id}/artifact?path=report.md`);
@@ -231,7 +231,7 @@ describe('durable Review attachments', () => {
     await save();
     await f.world.writeFile('report.md', 'revised report');
     await save();
-    const saved = savedReviewArtifact(f.store, f.task.id, 'report.md')!;
+    const saved = (await savedReviewArtifact(f.store, f.task.id, 'report.md'))!;
     expect((await f.objects.get(saved.objectKey)).toString()).toBe('revised report');
     await f.objects.put(saved.objectKey, Buffer.from('corrupted'));
     const response = await f.request(`/api/tasks/${f.task.id}/artifact?path=report.md`);
@@ -254,22 +254,22 @@ describe('durable Review attachments', () => {
     const f = await fixture();
     fs.truncateSync(path.join(f.world.handle.root, 'report.md'), MAX_REVIEW_ARTIFACT_BYTES);
     await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
-    expect(savedReviewArtifact(f.store, f.task.id, 'report.md')?.bytes).toBe(MAX_REVIEW_ARTIFACT_BYTES);
+    expect((await savedReviewArtifact(f.store, f.task.id, 'report.md'))?.bytes).toBe(MAX_REVIEW_ARTIFACT_BYTES);
   });
 
   it('enforces managed quotas and releases upload reservations on failure', async () => {
     const f = await fixture();
-    f.store.saveStorageLocation({ id: 'managed-test', organizationId: f.project.organizationId!,
+    (await f.store.saveStorageLocation({ id: 'managed-test', organizationId: f.project.organizationId!,
       name: 'Managed', kind: 'managed', config: {}, isDefault: true, status: 'ready',
-      quotaBytes: 1, createdAt: Date.now(), updatedAt: Date.now() });
+      quotaBytes: 1, createdAt: Date.now(), updatedAt: Date.now() }));
     await expect(preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info))
       .rejects.toThrow('quota');
-    expect(f.store.listPromotedArtifacts(f.task.id)).toHaveLength(0);
-    f.store.saveStorageLocation({ ...f.store.getStorageLocation('managed-test')!, quotaBytes: 1024 });
+    expect((await f.store.listPromotedArtifacts(f.task.id))).toHaveLength(0);
+    (await f.store.saveStorageLocation({ ...(await f.store.getStorageLocation('managed-test'))!, quotaBytes: 1024 }));
     f.objects.put = async () => { throw new Error('offline'); };
     await expect(preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info)).rejects.toThrow('offline');
-    expect(f.store.db.prepare('SELECT * FROM storage_upload_reservations').all()).toHaveLength(0);
-    expect(savedReviewArtifact(f.store, f.task.id, 'report.md')).toBeUndefined();
+    expect((await f.store.db.prepare('SELECT * FROM storage_upload_reservations').all())).toHaveLength(0);
+    expect((await savedReviewArtifact(f.store, f.task.id, 'report.md'))).toBeUndefined();
   });
 
   it('confines relative paths, absolute paths and symlinks to the world', async () => {
@@ -285,7 +285,7 @@ describe('durable Review attachments', () => {
     const target = path.join(f.world.handle.root, 'report.md');
     await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id,
       { actions: [{ kind: 'open', label: 'absolute', target }] });
-    expect(savedReviewArtifact(f.store, f.task.id, target)).toBeDefined();
+    expect((await savedReviewArtifact(f.store, f.task.id, target))).toBeDefined();
   });
 
   it('leaves external URLs and run actions alone and removes indexes on task deletion', async () => {
@@ -297,8 +297,8 @@ describe('durable Review attachments', () => {
     ] });
     expect(put).not.toHaveBeenCalled();
     await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id, f.info);
-    f.store.deleteTask(f.task.id);
-    expect(f.store.kvGet(`review-artifacts:${f.task.id}`)).toBeUndefined();
+    (await f.store.deleteTask(f.task.id));
+    expect((await f.store.kvGet(`review-artifacts:${f.task.id}`))).toBeUndefined();
   });
 
   it('resolves targets from the agent working directory inside a multi-checkout world', async () => {
@@ -309,7 +309,7 @@ describe('durable Review attachments', () => {
     await preserveReviewArtifacts(f.store, f.objects, f.world, f.task.id,
       { actions: [{ kind: 'open', label: 'Logo', target: 'logo.png' }] });
     await f.world.destroy();
-    f.store.saveView(f.task.id, { ...f.view, stage: 'done', status: 'done', world: undefined });
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'done', status: 'done', world: undefined }));
     const response = await f.request(`/api/tasks/${f.task.id}/artifact?path=logo.png`);
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toBe('image/png');

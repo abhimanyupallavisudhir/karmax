@@ -82,24 +82,24 @@ export const projectProfileId = (projectId: string, role: AgentRole | string) =>
 
 /** Resolve the editable defaults without letting one organization's choice
  * become another's fallback: project → organization → bundled/legacy. */
-export function roleDefaultProfile(store: Store, role: AgentRole | string,
-  projectId?: string, organizationId?: string): AgentProfile | undefined {
+export async function roleDefaultProfile(store: Store, role: AgentRole | string,
+  projectId?: string, organizationId?: string): Promise<AgentProfile | undefined> {
   if (projectId) {
-    const project = store.getProfile(projectProfileId(projectId, role));
+    const project = (await store.getProfile(projectProfileId(projectId, role)));
     if (project) {
-      const parent = roleDefaultProfile(store, role, undefined, organizationId ?? store.getProject(projectId)?.organizationId);
+      const parent = (await roleDefaultProfile(store, role, undefined, organizationId ?? (await store.getProject(projectId))?.organizationId));
       return { ...project, mcpConnections: project.mcpConnections ?? parent?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }
-    organizationId ??= store.getProject(projectId)?.organizationId;
+    organizationId ??= (await store.getProject(projectId))?.organizationId;
   }
   if (organizationId) {
-    const organization = store.getProfile(organizationProfileId(organizationId, role));
+    const organization = (await store.getProfile(organizationProfileId(organizationId, role)));
     if (organization) {
-      const fallback = roleDefaultProfile(store, role);
+      const fallback = (await roleDefaultProfile(store, role));
       return { ...organization, mcpConnections: organization.mcpConnections ?? fallback?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }
   }
-  const fallback = store.getProfile(`${role}-default`);
+  const fallback = (await store.getProfile(`${role}-default`));
   return fallback ? { ...fallback, mcpConnections: fallback.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] } : undefined;
 }
 
@@ -110,13 +110,13 @@ export class ProfileResolver {
     private fallbackProvider: Provider,
   ) {}
 
-  resolve(role: AgentRole, taskProfiles?: Record<string, string>, explicitId?: string, projectId?: string): AgentProfile {
+  async resolve(role: AgentRole, taskProfiles?: Record<string, string>, explicitId?: string, projectId?: string): Promise<AgentProfile> {
     const id = explicitId ?? taskProfiles?.[role];
     if (id) {
-      const p = this.store.getProfile(id);
-      if (p) return { ...p, mcpConnections: p.mcpConnections ?? roleDefaultProfile(this.store, role, projectId)?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
+      const p = (await this.store.getProfile(id));
+      if (p) return { ...p, mcpConnections: p.mcpConnections ?? (await roleDefaultProfile(this.store, role, projectId))?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }
-    const def = roleDefaultProfile(this.store, role, projectId);
+    const def = (await roleDefaultProfile(this.store, role, projectId));
     if (def) return def;
     // Synthesize a minimal default if the store has no profile yet.
     const model = defaultModel(this.fallbackProvider);
@@ -132,8 +132,8 @@ export class ProfileResolver {
 }
 
 /** Seed the store with the default profiles for a provider (idempotent overwrite). */
-export function seedProfiles(store: Store, provider: Provider) {
+export async function seedProfiles(store: Store, provider: Provider) {
   for (const p of makeDefaultProfiles(provider)) {
-    if (!store.getProfile(p.id)) store.upsertProfile(p);
+    if (!(await store.getProfile(p.id))) (await store.upsertProfile(p));
   }
 }

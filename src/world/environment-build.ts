@@ -18,8 +18,8 @@ export interface EnvironmentBuildInput {
   projectId: string;
   digest: string;
   buildId?: string;
-  onBuilderCreated?: (id: string) => void;
-  assertActive?: () => void;
+  onBuilderCreated?: (id: string) => void | Promise<void>;
+  assertActive?: () => void | Promise<void>;
   spec: ProjectEnvironmentSpec;
   connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
   createBuilderSandbox?: (base: string | undefined, options: { apiKey?: string }) => Promise<BuilderSandbox>;
@@ -42,7 +42,7 @@ export function environmentDockerfile(spec: ProjectEnvironmentSpec): string {
 }
 
 export async function buildEnvironment(input: EnvironmentBuildInput): Promise<EnvironmentBuildResult> {
-  input.assertActive?.();
+  await input.assertActive?.();
   if (input.provider === 'worktree' || input.provider === 'memory') return { ref: 'host' };
   if (input.provider === 'container') return buildContainer(input);
   if (input.provider === 'e2b') return buildE2b(input);
@@ -86,13 +86,13 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
   const builder = await create(input.connection?.template,
     { ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}) });
   try {
-    if (builder.id) input.onBuilderCreated?.(builder.id);
+    if (builder.id) await input.onBuilderCreated?.(builder.id);
     for (const command of setupCommands(input.spec)) {
-      input.assertActive?.();
+      await input.assertActive?.();
       const result = await builder.run(command, { timeoutMs: 30 * 60_000 });
       if (result.exitCode !== 0) throw new Error(`setup "${command}" failed: ${(result.stderr || result.stdout).slice(-500)}`);
     }
-    input.assertActive?.();
+    await input.assertActive?.();
     return { ref: (await builder.createSnapshot(environmentArtifactName(input.projectId, input.digest, input.buildId))).snapshotId };
   } finally { await builder.kill(); }
 }
@@ -109,7 +109,7 @@ async function buildDaytona(input: EnvironmentBuildInput): Promise<EnvironmentBu
     const commands = setupCommands(input.spec);
     if (commands.length) image = image.runCommands(...commands);
     const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
-    input.assertActive?.();
+    await input.assertActive?.();
     await daytona.snapshot.create({ name, image }, { timeout: 45 * 60 });
     return { ref: name };
   } catch (error) {

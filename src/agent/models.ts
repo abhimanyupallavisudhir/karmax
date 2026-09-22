@@ -59,7 +59,7 @@ interface ClaudeModelDiscoveryDeps {
       description?: string;
       supportedEffortLevels?: string[];
     }>>;
-    close(): void;
+    close(): (void) | Promise<void>;
   };
   apiModels?: typeof claudeApiModels;
 }
@@ -152,7 +152,7 @@ export async function claudeModels(
     } catch (error) {
       sdkError = error;
     } finally {
-      try { session?.close(); } finally {
+      try { (await session?.close()); } finally {
         fs.rmSync(probeHome, { recursive: true, force: true });
       }
     }

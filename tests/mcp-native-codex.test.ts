@@ -17,13 +17,13 @@ const available = spawnSync(binary, ['--version'], { timeout: 5000, stdio: 'igno
 
 describe.skipIf(!available)('Native Codex MCP startup (no login or model calls)', () => {
   it('loads the actual sandbox relay and discovers its tool inventory with explicit selection', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-native-')); const store = new Store(':memory:');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-native-')); const store = (await Store.create(':memory:'));
     let cleanup: (() => Promise<void>) | undefined; let child: ReturnType<typeof spawn> | undefined;
     try {
       const world = await new WorktreeProvider(path.join(dir, 'worlds')).create({ taskId: 'native', base: 'main' });
-      const project = store.createProject('Native test');
+      const project = (await store.createProject('Native test'));
       const service = new McpConnections(store, new CredentialBroker(new Vault(path.join(dir, 'vault'))), 'org_personal');
-      const c = service.save({ label: 'Native fixture', transport: { type: 'stdio', command: process.execPath, args: [path.resolve('tests/fixtures/mcp-hostile.mjs')] } }, project.id);
+      const c = (await service.save({ label: 'Native fixture', transport: { type: 'stdio', command: process.execPath, args: [path.resolve('tests/fixtures/mcp-hostile.mjs')] } }, project.id));
       const specs = await prepareConnections(service, world, [c.id], project.id, 'native', (fn) => { cleanup = fn; });
       // A broken account baseline must be overridden, not accidentally launched.
       const legacyMarker = path.join(dir, 'legacy-started');
@@ -40,6 +40,6 @@ describe.skipIf(!available)('Native Codex MCP startup (no login or model calls)'
         return Object.keys(inventory.data.find((s: any) => s.name === c.id)?.tools ?? {});
       }, { timeout: 20_000, interval: 250 }).toContain('echo');
       expect(fs.existsSync(legacyMarker)).toBe(false);
-    } finally { child?.kill(); await cleanup?.(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { child?.kill(); await cleanup?.(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   }, 30_000);
 });

@@ -455,15 +455,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.13 opens the explicit proposal before Review and merges without a Merge agent', async () => {
     const repo = await repoWithOrigin('github-authoritative');
-    const project = h.store.createProject('GitHub authoritative', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'GitHub merge', workflow: 'software-dev',
+    const project = (await h.store.createProject('GitHub authoritative', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'GitHub merge', workflow: 'software-dev',
       workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const taskId = task.id;
     const handle = await h.client.workflow.start('softwareDev@1.13.0', {
       taskQueue: TASK_QUEUE,
@@ -497,15 +497,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
   it.each(['recorded checkpoint', 'unrecorded checkpoint'])(
     'publishes an amended %s through real Git and exposes Confirm PR', async (scenario) => {
       const repo = await repoWithOrigin(`checkpoint-${scenario.split(' ')[0]}`);
-      const project = h.store.createProject(`Checkpoint publication ${scenario}`, { repos: [repo], remote: 'pr' });
-      const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-        installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-      const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
-        owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-      h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-      const task = h.store.createTask({ projectId: project.id, title: 'Amended checkpoint', workflow: 'software-dev',
+      const project = (await h.store.createProject(`Checkpoint publication ${scenario}`, { repos: [repo], remote: 'pr' }));
+      const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+        installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+      const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+        owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+      (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+      const task = (await h.store.createTask({ projectId: project.id, title: 'Amended checkpoint', workflow: 'software-dev',
         workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-        createdBy: { kind: 'user', userId: 'a' } });
+        createdBy: { kind: 'user', userId: 'a' } }));
       let turns = 0;
       let amendedHead = '';
       publicationTurn = async (input, ctx) => {
@@ -556,34 +556,34 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       expect(review.status).toBe('waiting');
       expect(review.actions).toContainEqual(expect.objectContaining({ name: 'confirm', label: 'Confirm PR', enabled: true }));
       expect(turns).toBe(scenario === 'recorded checkpoint' ? 1 : 2);
-      expect(h.store.eventsOfType(task.id, 'resolve.auto')).toHaveLength(0);
+      expect((await h.store.eventsOfType(task.id, 'resolve.auto'))).toHaveLength(0);
       const origin = remoteBySlug.get(SLUG)!;
       const head = (await git(origin, ['rev-parse', `karmax/${task.id}`])).stdout.trim();
       expect(review.pr.headSha).toBe(head);
       expect((await git(origin, ['rev-parse', `${head}^{tree}`])).stdout.trim())
         .toBe((await git(repo, ['rev-parse', `${amendedHead}^{tree}`])).stdout.trim());
-      expect(Object.values(expectedTaskRemoteHeads(h.store, task.id))).toContain(head);
+      expect(Object.values((await expectedTaskRemoteHeads(h.store, task.id)))).toContain(head);
       await handle.signal('cancel');
       await handle.result();
     }, 120_000);
 
   it('v1.22 restores a cancelled Review by reopening the same exact PR before Review', async () => {
     const repo = await repoWithOrigin('cancelled-review-restore');
-    const project = h.store.createProject('Cancelled Review restore', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'restore-installation', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    const project = (await h.store.createProject('Cancelled Review restore', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'restore-installation', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: 'restore-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE,
-      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({
       projectId: project.id,
       title: 'Restore cancelled Review',
       workflow: 'software-dev',
       workflowVersion: '1.22.0',
       params: { prompt: 'restore it', base: 'main', target: 'main', repos: [repo], remote: 'pr', _githubAccountId: 'a-github' },
       createdBy: { kind: 'user', userId: 'a' },
-    });
+    }));
     const handle = await h.client.workflow.start('softwareDev@1.22.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -603,14 +603,14 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await handle.signal('cancel');
     expect((await handle.result()).stage).toBe('cancelled');
     expect(prs[0].state).toBe('closed');
-    expect(h.store.getTask(task.id)?.lastView?.state.recoveryWorld).toBeTruthy();
+    expect((await h.store.getTask(task.id))?.lastView?.state.recoveryWorld).toBeTruthy();
 
-    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
-    expect(h.store.effectiveProjectConfig(project).remote).toBe('pr');
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    expect((await h.store.effectiveProjectConfig(project)).remote).toBe('pr');
     const restoring = await h.api.moveTaskStage(token, task.id, 'review');
     expect(restoring).toMatchObject({ stage: 'pr', state: { restoringTo: 'review' } });
-    await expect.poll(() => {
-      const current = h.store.getTask(task.id)?.lastView;
+    await expect.poll(async () => {
+      const current = (await h.store.getTask(task.id))?.lastView;
       return `${current?.stage}/${current?.prs?.length ?? 0}/${current?.prs?.[0]?.state}`;
     }, { timeout: 30_000 }).toBe('review/1/open');
     expect(prs).toHaveLength(1);
@@ -618,7 +618,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(prs[0].head.sha).toBe(reviewed.head);
 
     await h.api.signalTask(token, task.id, 'confirm');
-    await expect.poll(() => h.store.getTask(task.id)?.lastView?.stage, { timeout: 30_000 }).toBe('done');
+    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.stage, { timeout: 30_000 }).toBe('done');
   }, 120_000);
 
   it('v1.23 keeps a manually merged PR marked merged when its task is cancelled', async () => {
@@ -651,15 +651,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.14 returns terminal CI failures to Do with failed-check context, then reviews the repaired head again', async () => {
     const repo = await repoWithOrigin('github-ci-repair');
-    const project = h.store.createProject('GitHub CI repair', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '43', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '78',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Repair failing CI', workflow: 'software-dev',
+    const project = (await h.store.createProject('GitHub CI repair', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '43', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '78',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Repair failing CI', workflow: 'software-dev',
       workflowVersion: '1.14.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.14.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -696,7 +696,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
       }] } },
     };
-    const beforeLanding = h.store.eventsSince(task.id, 0).at(-1)?.seq ?? 0;
+    const beforeLanding = (await h.store.eventsSince(task.id, 0)).at(-1)?.seq ?? 0;
     await handle.signal('confirm');
 
     await expect.poll(async () => {
@@ -704,12 +704,12 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       const context = current.messages.map((message: any) => message.text).join('\n');
       return `${current.stage}/${/web-console-ux\.test\.ts:54.*wsHadDropped.*refreshTasks/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
-    const repairViews = h.store.eventsSince(task.id, beforeLanding)
+    const repairViews = (await h.store.eventsSince(task.id, beforeLanding))
       .filter((event) => event.type === 'view.updated').map((event) => event.payload);
     expect(repairViews).toEqual(expect.arrayContaining([
       expect.objectContaining({ stage: 'do', status: 'active' }),
     ]));
-    expect(h.store.eventsSince(task.id, beforeLanding)
+    expect((await h.store.eventsSince(task.id, beforeLanding))
       .filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
     const repaired = await view(handle);
     expect(annotationReads).toBeGreaterThan(0);
@@ -723,15 +723,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('reruns one transient Actions failure on the exact PR head without asking the agent to edit code', async () => {
     const repo = await repoWithOrigin('github-transient-ci');
-    const project = h.store.createProject('Transient GitHub CI', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'transient-actions', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'transient-repo',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Retry transient CI', workflow: 'software-dev',
+    const project = (await h.store.createProject('Transient GitHub CI', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'transient-actions', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'transient-repo',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Retry transient CI', workflow: 'software-dev',
       workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.16.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: task.title,
@@ -750,7 +750,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await handle.signal('confirm');
     await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(1);
     await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 }).toBe('Waiting for CI');
-    expect(h.store.eventsSince(task.id, 0).filter((event) => event.type === 'github.ci.rerun-requested')).toHaveLength(1);
+    expect((await h.store.eventsSince(task.id, 0)).filter((event) => event.type === 'github.ci.rerun-requested')).toHaveLength(1);
     // GitHub now reports the same exact head green. No Do repair/re-review turn
     // was needed for a provider interruption.
     githubReadiness = {};
@@ -764,16 +764,16 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     ['failure', 'GitHub Actions failure needs inspection'],
   ])('projects a structured %s hold with neutral status and durable evidence', async (conclusion, summary) => {
     const repo = await repoWithOrigin(`github-${conclusion}`);
-    const project = h.store.createProject(`GitHub ${conclusion}`, { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'action-required', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    const project = (await h.store.createProject(`GitHub ${conclusion}`, { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'action-required', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: 'action-required-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE,
-      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Approve GitHub Actions', workflow: 'software-dev',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Approve GitHub Actions', workflow: 'software-dev',
       workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.21.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: task.title,
@@ -803,30 +803,30 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     // The workflow query is live state; publishView persists the projection in
     // the following activity. Wait for that durable boundary instead of racing
     // the worker immediately after the query observes the hold.
-    await expect.poll(() => h.store.getTask(task.id)?.lastView?.waitingFor, { timeout: 30_000 }).toMatchObject({
+    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.waitingFor, { timeout: 30_000 }).toMatchObject({
       kind: 'human', summary,
     });
-    const waitEvent = h.store.eventsSince(task.id, 0).findLast((event) =>
+    const waitEvent = (await h.store.eventsSince(task.id, 0)).findLast((event) =>
       event.type === 'view.updated' && event.payload?.waitingSummary === summary);
     expect(waitEvent?.payload).toMatchObject({ waitingFor: 'human', waitingSummary: summary });
 
     expect(actionsReruns).toBe(0);
-    expect(h.store.eventsSince(task.id, 0).filter(event => event.type === 'github.ci.repair-requested')).toHaveLength(0);
+    expect((await h.store.eventsSince(task.id, 0)).filter(event => event.type === 'github.ci.repair-requested')).toHaveLength(0);
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
   it('accepts a successful exact-revision replacement for superseded CI without reopening the proposal', async () => {
     const repo = await repoWithOrigin('github-superseded-ci');
-    const project = h.store.createProject('Superseded GitHub CI', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'superseded-actions', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'superseded-repo',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Ignore superseded CI', workflow: 'software-dev',
+    const project = (await h.store.createProject('Superseded GitHub CI', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'superseded-actions', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'superseded-repo',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Ignore superseded CI', workflow: 'software-dev',
       workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.16.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: task.title,
@@ -849,7 +849,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await handle.signal('confirm');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
     expect(actionsReruns).toBe(0);
-    expect(h.store.eventsSince(task.id, 0).filter((event) => event.type === 'github.ci.superseded'))
+    expect((await h.store.eventsSince(task.id, 0)).filter((event) => event.type === 'github.ci.superseded'))
       .toEqual([expect.objectContaining({ payload: expect.objectContaining({ runId: 42, supersedingRunId: 43 }) })]);
     expect((await view(handle)).messages.map((message: any) => message.text).join('\n'))
       .not.toMatch(/repair it against the newest target/i);
@@ -857,15 +857,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('lands from a newer successful check-rollup duplicate when Actions inspection is forbidden', async () => {
     const repo = await repoWithOrigin('github-actions-forbidden');
-    const project = h.store.createProject('Forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'forbidden-actions', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'forbidden-repo',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Explain missing Actions access', workflow: 'software-dev',
+    const project = (await h.store.createProject('Forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'forbidden-actions', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'forbidden-repo',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Explain missing Actions access', workflow: 'software-dev',
       workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.16.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: task.title,
@@ -895,15 +895,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('bounds a structured cancellation with no visible replacement outside landing admission', async () => {
     const repo = await repoWithOrigin('github-actions-forbidden-bounded');
-    const project = h.store.createProject('Bound forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'forbidden-actions-bounded', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'forbidden-repo-bounded',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Bound unavailable Actions inspection', workflow: 'software-dev',
+    const project = (await h.store.createProject('Bound forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'forbidden-actions-bounded', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'forbidden-repo-bounded',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Bound unavailable Actions inspection', workflow: 'software-dev',
       workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.16.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: task.title,
@@ -923,10 +923,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     };
     const key = githubRequiredCheckKey({ repository: SLUG, pullRequest: 1,
       headSha: prs[0]!.head.sha, workflowId: 0, check: 'unit tests' });
-    for (let poll = 1; poll < 20; poll++) h.store.appendEvent({
+    for (let poll = 1; poll < 20; poll++) (await h.store.appendEvent({
       taskId: task.id, type: 'github.ci.external-wait', ts: poll,
       payload: { key, slug: SLUG, number: 1, candidateHead: prs[0]!.head.sha, poll },
-    });
+    }));
     await handle.signal('confirm');
     await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
       .toMatch(/same externally blocked CI state after 20 bounded observations.*owns no admission slot/is);
@@ -940,15 +940,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.16 preserves intent authorization and automatically reviews a CI repair before landing', async () => {
     const repo = await repoWithOrigin('github-intent-repair');
-    const project = h.store.createProject('Intent-authorized CI repair', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '53', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '88',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Repair without human churn', workflow: 'software-dev',
+    const project = (await h.store.createProject('Intent-authorized CI repair', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '53', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '88',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Repair without human churn', workflow: 'software-dev',
       workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.16.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -991,15 +991,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.16 releases the krmax admission queue after GitHub accepts durable queue ownership', async () => {
     const repo = await repoWithOrigin('github-provider-queue');
-    const project = h.store.createProject('Provider-owned queue', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '54', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '89',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Queue without blocking', workflow: 'software-dev',
+    const project = (await h.store.createProject('Provider-owned queue', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '54', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '89',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Queue without blocking', workflow: 'software-dev',
       workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     useMergeQueue = true;
     const handle = await h.client.workflow.start('softwareDev@1.16.0', {
       taskQueue: TASK_QUEUE,
@@ -1025,17 +1025,17 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.26 keeps sibling PRs independently queued and cancelling one does not withdraw the other', async () => {
     const repo = await repoWithOrigin('kept-provider-attempts');
-    const project = h.store.createProject('Kept provider attempts', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'kept-attempts', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'kept-attempts',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const first = h.store.createTask({ projectId: project.id, title: 'Provider attempt A', workflow: 'software-dev', workflowVersion: '1.26.0',
-      params: { prompt: 'A', _githubAccountId: 'a-github' }, createdBy: { kind: 'user', userId: 'a' } });
-    const second = h.store.createTask({ projectId: project.id, title: 'Provider attempt B', workflow: 'software-dev', workflowVersion: '1.26.0',
-      params: { prompt: 'B', _githubAccountId: 'a-github' }, createdBy: { kind: 'user', userId: 'a' }, intentId: first.intentId });
-    h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' });
+    const project = (await h.store.createProject('Kept provider attempts', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'kept-attempts', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'kept-attempts',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const first = (await h.store.createTask({ projectId: project.id, title: 'Provider attempt A', workflow: 'software-dev', workflowVersion: '1.26.0',
+      params: { prompt: 'A', _githubAccountId: 'a-github' }, createdBy: { kind: 'user', userId: 'a' } }));
+    const second = (await h.store.createTask({ projectId: project.id, title: 'Provider attempt B', workflow: 'software-dev', workflowVersion: '1.26.0',
+      params: { prompt: 'B', _githubAccountId: 'a-github' }, createdBy: { kind: 'user', userId: 'a' }, intentId: first.intentId }));
+    (await h.store.setSettings(project.id, '__common__', { otherAttempts: 'keep' }));
     useMergeQueue = true;
     const handles = await Promise.all([first, second].map((task, index) => h.client.workflow.start('softwareDev@1.26.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id,
@@ -1057,7 +1057,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         }, { timeout: 30_000 }).toEqual(['provider:queued']);
         expect((await view(handle)).state.mergeDomains).toBeUndefined();
       }
-      const group = h.store.attemptGroup(first.id)!;
+      const group = (await h.store.attemptGroup(first.id))!;
       const cancelledIndex = group.committedAttemptId === first.id ? 0 : 1;
       const survivorIndex = 1 - cancelledIndex;
       const cancelledTask = [first, second][cancelledIndex]!;
@@ -1073,7 +1073,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       expect(providerWithdrawals).not.toContain(`dequeue:${survivingPr.node_id}`);
       expect(survivingPr.state).toBe('open');
       expect(survivingPr.queueAccepted).toBe(true);
-      expect(h.store.attemptGroup(first.id)?.principalAttemptId).toBe(survivor.id);
+      expect((await h.store.attemptGroup(first.id))?.principalAttemptId).toBe(survivor.id);
       survivingPr.state = 'closed';
       survivingPr.merged_at = new Date().toISOString();
       survivingPr.queueAccepted = false;
@@ -1090,15 +1090,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.18 keeps a repair at the front and has the same Do session verify the exact head', async () => {
     const repo = await repoWithOrigin('github-front-held-repair');
-    const project = h.store.createProject('Front-held exact landing', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '55', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '90',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Repair at the front', workflow: 'software-dev',
+    const project = (await h.store.createProject('Front-held exact landing', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '55', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '90',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Repair at the front', workflow: 'software-dev',
       workflowVersion: '1.18.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     useMergeQueue = true; // The front-held protocol deliberately ignores provider queue admission.
     githubReadiness = {
       mergeStateStatus: 'UNSTABLE',
@@ -1157,15 +1157,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.20 releases fallback admission before a CI repair and rejoins only after open_pr', async () => {
     const repo = await repoWithOrigin('github-fair-ejection');
-    const project = h.store.createProject('Fair landing ejection', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '56', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '91',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Release failed admission', workflow: 'software-dev',
+    const project = (await h.store.createProject('Fair landing ejection', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '56', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '91',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Release failed admission', workflow: 'software-dev',
       workflowVersion: '1.20.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.20.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -1212,23 +1212,23 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const slugB = 'acme/pipeline-b';
     const repoA = await repoWithOrigin('participant-a', slugA);
     const repoB = await repoWithOrigin('participant-b', slugB);
-    const project = h.store.createProject('Participant landing', { repos: [repoA, repoB], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'participant-installation', accountLogin: 'acme', accountType: 'Organization' });
+    const project = (await h.store.createProject('Participant landing', { repos: [repoA, repoB], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'participant-installation', accountLogin: 'acme', accountType: 'Organization' }));
     for (const [providerId, name, slug] of [['participant-a', 'pipeline-a', slugA], ['participant-b', 'pipeline-b', slugB]] as const) {
-      const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
         providerId, owner: 'acme', name, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main', private: true,
-        gitConnectionId: connection.id });
-      h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+        gitConnectionId: connection.id }));
+      (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
     }
     nativeQueueSlugs.add(slugA);
     githubReadinessBySlug.set(slugB, {
       mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
     });
-    const task = h.store.createTask({ projectId: project.id, title: 'Land two participants', workflow: 'software-dev',
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Land two participants', workflow: 'software-dev',
       workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const nameA = path.basename(repoA);
     const nameB = path.basename(repoB);
     const handle = await h.client.workflow.start('softwareDev@1.21.0', {
@@ -1283,22 +1283,22 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const slugB = 'acme/withdraw-b';
     const repoA = await repoWithOrigin('withdraw-a', slugA);
     const repoB = await repoWithOrigin('withdraw-b', slugB);
-    const project = h.store.createProject('Withdraw siblings', { repos: [repoA, repoB], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'withdraw-installation', accountLogin: 'acme', accountType: 'Organization' });
+    const project = (await h.store.createProject('Withdraw siblings', { repos: [repoA, repoB], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'withdraw-installation', accountLogin: 'acme', accountType: 'Organization' }));
     for (const [providerId, name, slug] of [['withdraw-a', 'withdraw-a', slugA], ['withdraw-b', 'withdraw-b', slugB]] as const) {
-      const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId,
+      const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId,
         owner: 'acme', name, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main', private: true,
-        gitConnectionId: connection.id });
-      h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+        gitConnectionId: connection.id }));
+      (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
     }
     nativeQueueSlugs.add(slugA);
     githubReadinessBySlug.set(slugB, {
       mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
     });
-    const task = h.store.createTask({ projectId: project.id, title: 'Withdraw siblings', workflow: 'software-dev',
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Withdraw siblings', workflow: 'software-dev',
       workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const nameA = path.basename(repoA);
     const nameB = path.basename(repoB);
     const handle = await h.client.workflow.start('softwareDev@1.21.0', {
@@ -1336,16 +1336,16 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('keeps large conversations out of landing polls through worker replay and successful landing', async () => {
     const repo = await repoWithOrigin('github-history-size');
-    const project = h.store.createProject('Bounded landing history', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'history-size', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    const project = (await h.store.createProject('Bounded landing history', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'history-size', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: 'history-size-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE,
-      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Large CI conversation', workflow: 'software-dev',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Large CI conversation', workflow: 'software-dev',
       workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const log = 'CI diagnostic detail '.repeat(15_000);
     const handle = await h.client.workflow.start('softwareDev@1.26.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
@@ -1357,7 +1357,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
     githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
     await handle.signal('confirm');
-    const publications = () => h.store.eventsSince(task.id, 0).filter((e) => e.type === 'view.updated').length;
+    const publications = async () => (await h.store.eventsSince(task.id, 0)).filter((e) => e.type === 'view.updated').length;
     // Drive full polling cycles explicitly. A 1ms timer can start another
     // non-heartbeating activity during shutdown; losing its completion then
     // leaves replay waiting for the five-minute activity timeout. This test
@@ -1367,15 +1367,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         const description = await h.client.workflowService.describeWorkflowExecution({
           namespace: h.client.options.namespace, execution: { workflowId: task.id },
         });
-        const current = h.store.getTask(task.id)?.lastView;
-        return publications() > previous && current?.stage === 'merge'
+        const current = (await h.store.getTask(task.id))?.lastView;
+        return (await publications()) > previous && current?.stage === 'merge'
           && current.waitingFor?.kind === 'github'
           && !description.pendingActivities?.length && !description.pendingWorkflowTask;
       }, { timeout: 30_000 }).toBe(true);
     };
     const advancePublications = async (minimum: number) => {
-      while (publications() <= minimum) {
-        const previous = publications();
+      while ((await publications()) <= minimum) {
+        const previous = (await publications());
         await handle.signal('providerChanged');
         await waitForPoll(previous);
       }
@@ -1387,7 +1387,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const live = await view(handle);
     expect(live.stage).toBe('merge');
     expect(live.messages.map((m: any) => m.text).join('\n')).toContain(log);
-    expect(h.store.getTask(task.id)?.lastView?.messages).toEqual(live.messages);
+    expect((await h.store.getTask(task.id))?.lastView?.messages).toEqual(live.messages);
     githubReadiness = {};
     await handle.signal('providerChanged');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
@@ -1412,20 +1412,20 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(JSON.stringify(events).length).toBeLessThan(10_000_000);
     // The previous protocol crossed Temporal's 50MB limit with this workload.
     expect(Buffer.byteLength(JSON.stringify(live)) * scheduled.length).toBeGreaterThan(50 * 1024 * 1024);
-    expect(h.store.getTask(task.id)?.lastView?.messages).toEqual(live.messages);
+    expect((await h.store.getTask(task.id))?.lastView?.messages).toEqual(live.messages);
   }, 240_000);
 
   it('unsticks a v1.12 execution when GitHub reports a conflict only in the merge refusal', async () => {
     const repo = await repoWithOrigin('github-legacy-conflict');
-    const project = h.store.createProject('Legacy GitHub conflict', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '45', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '80',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Unstick legacy conflict', workflow: 'software-dev',
+    const project = (await h.store.createProject('Legacy GitHub conflict', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '45', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '80',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Unstick legacy conflict', workflow: 'software-dev',
       workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.12.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -1457,15 +1457,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   it('v1.14 bounds transient GitHub errors and lets a Merge wait follow-up return to Do', async () => {
     const repo = await repoWithOrigin('github-error-recovery');
-    const project = h.store.createProject('GitHub error recovery', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '44', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '79',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Recover GitHub', workflow: 'software-dev',
+    const project = (await h.store.createProject('GitHub error recovery', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '44', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '79',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Recover GitHub', workflow: 'software-dev',
       workflowVersion: '1.14.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
+      createdBy: { kind: 'user', userId: 'a' } }));
     const handle = await h.client.workflow.start('softwareDev@1.14.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,

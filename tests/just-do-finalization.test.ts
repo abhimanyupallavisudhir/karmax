@@ -31,15 +31,15 @@ describe('just-do durable finalization', () => {
   afterAll(async () => { await h?.stop(); });
 
   async function start(repos: string[] = [], version?: string, prepare?: (project: Project) => Promise<void>) {
-    const project = h.store.createProject(newId('Finalization'), { repos, worldProvider: repos.length ? 'worktree' : 'sandbox-test', defaultBase: 'main' });
+    const project = (await h.store.createProject(newId('Finalization'), { repos, worldProvider: repos.length ? 'worktree' : 'sandbox-test', defaultBase: 'main' }));
     await prepare?.(project);
     const prompt = '@write reports/result.md :: reviewed report';
-    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
     // Current behavior must be reachable through normal API creation. Explicit
     // old pins still start directly so replay tests retain their historical input.
     const task = version
-      ? h.store.createTask({ projectId: project.id, title: 'Save report', workflow: 'just-do',
-          workflowVersion: version, params: { prompt } })
+      ? (await h.store.createTask({ projectId: project.id, title: 'Save report', workflow: 'just-do',
+          workflowVersion: version, params: { prompt } }))
       : await h.api.createTask(token, { projectId: project.id, workflow: 'just-do',
           params: { prompt, base: 'main' } });
     const handle = version
@@ -52,16 +52,16 @@ describe('just-do durable finalization', () => {
     if (!version) expect((await handle.describe()).type).toBe('justDo@1.7.0');
     await expect.poll(async () => (await handle.query<any>('view')).waitingFor?.kind,
       { timeout: 15_000 }).toBe('human');
-    return { task, handle, world: h.store.currentWorld(task.id) as WorldHandle };
+    return { task, handle, world: (await h.store.currentWorld(task.id)) as WorldHandle };
   }
 
   it('saves remote repositoryless output in a restorable checkpoint before releasing the world', async () => {
     let attachmentId = '';
     let baseRevisionId = '';
     const { task, handle, world } = await start([], undefined, async (project) => {
-      const attachment = h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      const attachment = (await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
         name: 'Read-only fixture', driver: 'volume@1', target: { kind: 'path', path: 'data/fixture' },
-        access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+        access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
       attachmentId = attachment.id;
       baseRevisionId = (await h.resources.importFiles(attachment.id,
         [{ path: 'sentinel.txt', data: Buffer.from('unchanged fixture') }])).id;
@@ -70,12 +70,12 @@ describe('just-do durable finalization', () => {
     expect(fs.existsSync(path.join(world.root, '.git'))).toBe(false);
     await handle.signal('confirm');
     expect(await handle.result()).toEqual({ stage: 'done' });
-    const saved = h.store.currentWorld(task.id)!;
+    const saved = (await h.store.currentWorld(task.id))!;
     expect(saved.checkpointId).toBeTruthy();
-    const checkpoint = h.store.getWorldCheckpoint(saved.checkpointId!)!;
+    const checkpoint = (await h.store.getWorldCheckpoint(saved.checkpointId!))!;
     expect(checkpoint.repos).toEqual([]);
     expect(checkpoint.resources).toContainEqual({ attachmentId, revisionId: baseRevisionId });
-    expect(h.store.getResourceAttachment(attachmentId)!.currentRevisionId).toBe(baseRevisionId);
+    expect((await h.store.getResourceAttachment(attachmentId))!.currentRevisionId).toBe(baseRevisionId);
     const history = await handle.fetchHistory();
     const scheduled = history.events!.flatMap(e => e.activityTaskScheduledEventAttributes?.activityType?.name ?? []);
     expect(scheduled).not.toContain('commitWork');
@@ -123,7 +123,7 @@ describe('just-do durable finalization', () => {
     try {
       await handle.signal('confirm');
       await expect(handle.result()).rejects.toThrow();
-      expect(h.store.currentWorld(task.id)!.checkpointId).toBe(prior.id);
+      expect((await h.store.currentWorld(task.id))!.checkpointId).toBe(prior.id);
       expect(fs.existsSync(path.join(world.root, 'reports/result.md'))).toBe(true);
       expect(JSON.stringify(await handle.fetchHistory())).toContain('checkpoint storage unavailable');
     } finally { failure.mockRestore(); }
@@ -131,7 +131,7 @@ describe('just-do durable finalization', () => {
 
   it('does not treat missing configured checkouts as a resource-only world', async () => {
     const { task, handle, world } = await start();
-    h.store.updateProjectConfig(task.projectId, { repos: ['/missing/configured/repository'] });
+    (await h.store.updateProjectConfig(task.projectId, { repos: ['/missing/configured/repository'] }));
     await handle.signal('confirm');
     await expect(handle.result()).rejects.toThrow();
     expect(fs.existsSync(world.root)).toBe(true);

@@ -17,11 +17,11 @@ describe('project transfer with real Temporal liveness', () => {
   afterAll(async () => { await h?.stop(); });
 
   it('refuses a running workflow with a terminal projection, then preserves history and accepts new destination work', async () => {
-    const project = h.store.createProject('Move with history');
-    const destination = h.store.createOrganization({ name: 'Receiving team', ownerUserId: 'receiver' });
-    const task = h.store.createTask({ projectId: project.id, title: 'Durable history', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'history' } });
+    const project = (await h.store.createProject('Move with history'));
+    const destination = (await h.store.createOrganization({ name: 'Receiving team', ownerUserId: 'receiver' }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Durable history', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'history' } }));
     const handle = await h.client.workflow.start(pingWorkflow, { taskQueue: TASK_QUEUE, workflowId: task.id, args: ['transfer'] });
-    h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: 'just-do', status: 'done', stage: 'done', messages: [], actions: [], state: {} } as any);
+    (await h.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: 'just-do', status: 'done', stage: 'done', messages: [], actions: [], state: {} } as any));
     const route = `${base}/api/projects/${project.id}/transfer`;
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
     const preview = await (await fetch(route + `?destinationOrganizationId=${destination.id}`, { headers })).json() as any;
@@ -30,13 +30,13 @@ describe('project transfer with real Temporal liveness', () => {
     const rejected = await move();
     expect(rejected.status).toBe(409);
     expect((await rejected.json() as any).error).toMatch(/workflow.*running/);
-    expect(h.store.getProject(project.id)?.organizationId).toBe('org_personal');
+    expect((await h.store.getProject(project.id))?.organizationId).toBe('org_personal');
     await handle.signal(finish);
     expect(await handle.result()).toMatchObject({ started: 'transfer' });
     const accepted = await move();
     expect(accepted.status, await accepted.clone().text()).toBe(200);
-    expect(h.store.getTask(task.id)?.title).toBe(task.title);
-    expect(h.store.getTask(task.id)?.num).toBe(task.num);
+    expect((await h.store.getTask(task.id))?.title).toBe(task.title);
+    expect((await h.store.getTask(task.id))?.num).toBe(task.num);
     const history = await fetch(`${base}/api/tasks/${task.id}`, { headers });
     expect(history.status).toBe(200);
     expect(await history.json()).toMatchObject({ taskId: task.id, actions: [], stageTransitions: [] });

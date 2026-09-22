@@ -62,8 +62,8 @@ async function bridgeToolNames(bridge: ControlBridge): Promise<string[]> {
 
 describe('turn-local control tools reach every rail', () => {
   const bridges: ControlBridge[] = [];
-  afterEach(() => {
-    for (const bridge of bridges.splice(0)) bridge.close();
+  afterEach(async () => {
+    for (const bridge of bridges.splice(0)) (await bridge.close());
   });
 
   const rails: Rail[] = [
@@ -96,8 +96,8 @@ describe('turn-local control tools reach every rail', () => {
 
 describe('control bridge (codex exec / ACP transport)', () => {
   const bridges: ControlBridge[] = [];
-  afterEach(() => {
-    for (const bridge of bridges.splice(0)) bridge.close();
+  afterEach(async () => {
+    for (const bridge of bridges.splice(0)) (await bridge.close());
   });
 
   async function bridgeFor(ctx: any): Promise<ControlBridge> {
@@ -161,7 +161,7 @@ describe('control bridge (codex exec / ACP transport)', () => {
   it('does not outlive the turn: close() drops the socket and its directory', async () => {
     const bridge = await bridgeFor({ signalCompletion() {}, emit() {}, emitActivity() {} });
     expect(fs.existsSync(bridge.socketPath)).toBe(true);
-    bridge.close();
+    (await bridge.close());
     expect(fs.existsSync(bridge.socketPath)).toBe(false);
     expect(fs.existsSync(path.dirname(bridge.socketPath))).toBe(false);
   });
@@ -181,8 +181,8 @@ describe('control bridge (codex exec / ACP transport)', () => {
  */
 describe('control bridge rejects a second agent on the same host', () => {
   const bridges: ControlBridge[] = [];
-  afterEach(() => {
-    for (const bridge of bridges.splice(0)) bridge.close();
+  afterEach(async () => {
+    for (const bridge of bridges.splice(0)) (await bridge.close());
   });
 
   /** A hostile client: raw NDJSON straight at the socket, no child MCP involved. */

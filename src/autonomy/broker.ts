@@ -30,7 +30,12 @@ export class CredentialBroker {
 
   /** Write back a (possibly newly created) secret under a handle. */
   registerHandle(handle: string, secret: string) {
-    this.vault.put(handle, secret);
+    return this.vault.put(handle, secret);
+  }
+
+  /** Initialize a shared encryption key without rotating a concurrent creator's key. */
+  ensureHandle(handle: string, secret: string) {
+    return this.vault.putIfAbsent(handle, secret);
   }
 
   hasHandle(handle: string): boolean {
@@ -38,16 +43,17 @@ export class CredentialBroker {
   }
 
   deleteHandle(handle: string) {
-    this.vault.delete(handle);
+    return this.vault.delete(handle);
+  }
+
+  deleteHandleIfUnchanged(handle: string, observed: string) {
+    return this.vault.deleteIfEqual(handle, observed);
   }
 
   /** Rename and/or rotate a handle without revealing its current secret to the
    * gateway. Supplying no replacement keeps the existing secret. */
   updateHandle(handle: string, nextHandle: string, replacement?: string) {
-    const secret = replacement ?? this.vault.reveal(handle);
-    if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
-    this.vault.put(nextHandle, secret);
-    if (nextHandle !== handle) this.vault.delete(handle);
+    return this.vault.move(handle, nextHandle, replacement);
   }
 
   listHandles(): string[] {

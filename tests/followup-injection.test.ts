@@ -24,7 +24,7 @@ describe('createFollowUpInjector (SDK streaming input)', () => {
     inj.push(toSdkUserMessage('three'));
     await new Promise((r) => setTimeout(r, 10));
     expect(inj.closed).toBe(false);
-    inj.close();
+    (await inj.close());
     await consumer;
     expect(seen).toEqual(['one', 'two', 'three']);
     expect(inj.closed).toBe(true);
@@ -37,7 +37,7 @@ describe('createFollowUpInjector (SDK streaming input)', () => {
       for await (const m of inj.stream) seen.push(m.message.content as string);
     })();
     await new Promise((r) => setTimeout(r, 10));
-    inj.close();
+    (await inj.close());
     inj.push(toSdkUserMessage('too-late'));
     await consumer;
     expect(seen).toEqual(['only']);

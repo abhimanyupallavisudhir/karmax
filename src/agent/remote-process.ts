@@ -1,3 +1,5 @@
+import { timed } from '../timing/index.js';
+import { mapBatches } from '../util/async-batch.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -13,14 +15,14 @@ import { publishRemoteCodexHistory } from './codex-history-remote.js';
 import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
-import { exposeRemoteNodeCommand } from './remote-node.js';
+import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
 const REMOTE_ROOT = '.karmax-injection/agent';
 const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? PINNED_CODEX_PACKAGE;
-const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? '22.16.0';
-const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? '10.9.2';
+const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? PINNED_REMOTE_NODE_VERSION;
+const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? PINNED_REMOTE_NPM_VERSION;
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
 /** Current Codex treats refresh-token *presence* as the ChatGPT login marker,
  * even with fresh ID/access tokens. Remote worlds receive this inert value so
@@ -52,13 +54,15 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
-  const runtimeBin = await ensureRemoteNode(world);
-  if (provider === 'codex') await quiesceRemoteCodexHome(world, absolute);
+  const runtimeBin = await timed('bootstrap.node', () => ensureRemoteNode(world));
+  if (provider === 'codex') await timed('bootstrap.quiesce', () => quiesceRemoteCodexHome(world, absolute));
   // A single-repo world's root is itself a checkout. Keep injected auth out of
   // `git add -A` without modifying the user's tracked .gitignore.
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
-  const existing = await remoteHomeFiles(world, absolute);
-  for (const file of configFiles(localHome, provider, session)) {
+  const existing = await timed('bootstrap.list-home', () => remoteHomeFiles(world, absolute));
+  const files = configFiles(localHome, provider, session);
+  const rollouts = files.filter(file => provider === 'codex' && codexRolloutIdentity(file.relative.split(path.sep).join('/')));
+  async function seed(file: { relative: string; content: Buffer }) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
     // Codex resolves rollout identity across the entire home, not by directory.
@@ -69,7 +73,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
       const id = path.posix.basename(file.relative).replace(/\.jsonl$/, '').match(/([0-9a-f-]{36})$/i)?.[1]
         ?? path.posix.basename(file.relative).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
       await publishRemoteCodexHistory(world, { absolute, relative, runtimeBin }, { file: file.relative, content: file.content }, id);
-      continue;
+      return;
     }
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
     const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
@@ -81,15 +85,20 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
         await world.writeFileBuffer(target, content);
     }
   }
+  // Ordinary files have distinct paths and no live reader until startup. Rollout
+  // publication reconciles shared session identity, so keep it serialized.
+  const rolloutSet = new Set(rollouts);
+  await timed('bootstrap.seed-files', () => mapBatches(files.filter(file => !rolloutSet.has(file)), seed));
+  for (const file of rollouts) await seed(file);
   // Retries may restore exclusively from the host after the source world has
   // been deleted. Repair prior duplicate copies here too, before Codex opens its
   // persistent index; live-world transfer is not guaranteed to run.
   if (provider === 'codex' && session)
-    await reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session);
+    await timed('bootstrap.reconcile-session', () => reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session));
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
-  const browserMcp = browser ? await ensureRemoteBrowser(world, browser, runtimeBin) : undefined;
-  if (provider === 'codex') await seedRemoteCodexConfig(world, localHome, home, browserMcp);
+  const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, runtimeBin)) : undefined;
+  if (provider === 'codex') await timed('bootstrap.config', () => seedRemoteCodexConfig(world, localHome, home, browserMcp));
   const permissions = await world.exec('bash', ['-lc',
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
   if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
@@ -443,7 +452,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
   kill(_signal: NodeJS.Signals = 'SIGTERM'): boolean {
     if (this.killed) return false;
     this.killed = true;
-    void this.ready.then((pty) => pty.close()).catch(() => undefined);
+    void this.ready.then(async (pty) => (await pty.close())).catch(() => undefined);
     return true;
   }
 
@@ -750,7 +759,7 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const baked = await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
   if (baked.code === 0) {
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
-      cwd: bakedRoot, env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
+      env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
         ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 30_000,
     });
     const smoke = await world.exec(nodeCommand, ['/opt/karmax/smoke.mjs'], {
@@ -768,12 +777,12 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`,
       `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`,
     ];
-    const install = await world.exec('bash', ['-lc', [
+    const install = await timed('bootstrap.browser.install', () => world.exec('bash', ['-lc', [
       ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
       `mkdir -p ${quote(absolute)} ${quote(browserCache)}`,
       `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
       `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
-    ].join(' && ')], { timeoutMs: 10 * 60_000 });
+    ].join(' && ')], { timeoutMs: 10 * 60_000 }));
     if (install.code !== 0) throw new Error(`remote browser installation failed: ${install.stderr || install.stdout}`);
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
@@ -858,14 +867,14 @@ export async function ensureRemoteNode(world: World): Promise<string> {
   const root = path.posix.join(world.handle.root, `${REMOTE_ROOT}/tools/node-${REMOTE_NODE_VERSION}`);
   const bin = path.posix.join(root, 'bin');
   const node = path.posix.join(bin, 'node');
-  const install = await world.exec('bash', ['-lc', [
+  const install = await timed('bootstrap.node.install-or-check', () => world.exec('bash', ['-lc', [
     `mkdir -p ${quote(bin)}`,
-    `test -x ${quote(node)} || npm install --prefix ${quote(root)} --no-audit --no-fund --omit=dev node@${quote(REMOTE_NODE_VERSION)} npm@${quote(REMOTE_NPM_VERSION)}`,
+    installRemoteNodeCommand(root, REMOTE_NODE_VERSION, REMOTE_NPM_VERSION),
     `ln -sfn ../node_modules/node/bin/node ${quote(node)}`,
     `ln -sfn ../node_modules/npm/bin/npm-cli.js ${quote(path.posix.join(bin, 'npm'))}`,
     `ln -sfn ../node_modules/npm/bin/npx-cli.js ${quote(path.posix.join(bin, 'npx'))}`,
     `${quote(node)} -e ${quote(acceptable)}`,
-  ].join(' && ')], { timeoutMs: 5 * 60_000 });
+  ].join(' && ')], { timeoutMs: 5 * 60_000 }));
   if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
   // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
   // at the standard sandbox location, including on resumed worlds.

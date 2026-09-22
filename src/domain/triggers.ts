@@ -114,16 +114,16 @@ export interface TriggerValidationContext {
    * that does not exist (that is what makes a dangling dep detectable), and an
    * array (possibly empty) for one that does.
    */
-  dependenciesOf?: (taskId: string) => string[] | undefined;
+  dependenciesOf?: (taskId: string) => string[] | undefined | Promise<string[] | undefined>;
 }
 
 /** Validate a trigger list, returning human-readable errors (empty ⇒ valid). */
-export function validateTriggers(triggers: TaskTrigger[], ctx: TriggerValidationContext = {}): string[] {
+export async function validateTriggers(triggers: TaskTrigger[], ctx: TriggerValidationContext = {}): Promise<string[]> {
   const errs: string[] = [];
   for (const t of triggers) {
     if (t.kind === 'dependency') {
       if (!t.tasks?.length) errs.push('dependency trigger needs at least one task id');
-      errs.push(...validateDependencyGraph(t.tasks ?? [], ctx));
+      errs.push(...(await validateDependencyGraph(t.tasks ?? [], ctx)));
     } else if (t.kind === 'schedule') {
       if (!t.cron && t.at === undefined) errs.push('schedule trigger needs a cron expression or an `at` time');
       // `cron` and `at` are alternatives, not a pair: `armSchedule` checks `at`
@@ -158,20 +158,20 @@ export function validateTriggers(triggers: TaskTrigger[], ctx: TriggerValidation
  * reported once per offending id. Without a resolver only self-reference (which
  * needs no lookup) is checked.
  */
-function validateDependencyGraph(deps: string[], ctx: TriggerValidationContext): string[] {
+async function validateDependencyGraph(deps: string[], ctx: TriggerValidationContext): Promise<string[]> {
   const errs: string[] = [];
   const self = ctx.taskId;
   for (const dep of deps) {
     if (self && dep === self) { errs.push('a task cannot depend on itself'); continue; }
     if (!ctx.dependenciesOf) continue;
-    if (ctx.dependenciesOf(dep) === undefined) { errs.push(`dependency task ${dep} does not exist`); continue; }
+    if ((await ctx.dependenciesOf(dep)) === undefined) { errs.push(`dependency task ${dep} does not exist`); continue; }
     // Walk outward; `seen` also guards against pre-existing cycles elsewhere in
     // the graph so validation itself can never loop.
     const seen = new Set<string>([dep]);
     const stack = [dep];
     let cyclic = false;
     while (stack.length && !cyclic) {
-      const next = ctx.dependenciesOf(stack.pop()!) ?? [];
+      const next = (await ctx.dependenciesOf(stack.pop()!)) ?? [];
       for (const id of next) {
         if (self && id === self) { cyclic = true; break; }
         if (!seen.has(id)) { seen.add(id); stack.push(id); }

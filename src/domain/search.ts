@@ -552,7 +552,9 @@ const DEFAULT_SORT: SortClause[] = [{ field: 'created', dir: 'desc' }];
  * can resolve: id→num (render deps as `#num`) and the reverse dependency map (`blocks:`).
  * O(n) over the candidate set — cheap at todo-list scale.
  */
-function enrichContext(tasks: SearchTask[], ctx: EvalContext): FieldContext {
+function enrichContext(tasks: SearchTask[], ctx: EvalContext, query: TaskQuery): FieldContext {
+  const fields = [...(query.filters ?? []).map(c => c.field), ...(query.sort ?? []).map(c => c.field), query.group];
+  const needsNextRun = fields.some(key => key != null && fieldByKey(key)?.key === 'nextRun');
   const idToNum = new Map<string, number>();
   for (const t of tasks) if (t.num != null) idToNum.set(t.id, t.num);
   const blockedBy = new Map<string, SearchTask[]>();
@@ -564,13 +566,14 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext): FieldContext {
     }
     // Cron scanning is the one genuinely expensive field key; compute it once per
     // task here rather than once per comparison inside the sort.
-    if (normalizeTriggers(t.params).some((x) => x.kind === 'schedule')) nextRun.set(t.id, nextRunOf(t, ctx.now));
+    if (needsNextRun && normalizeTriggers(t.params).some((x) => x.kind === 'schedule'))
+      nextRun.set(t.id, nextRunOf(t, ctx.now));
   }
   return { ...ctx, idToNum, blockedBy, nextRun };
 }
 
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {
-  const ectx = enrichContext(tasks, ctx);
+  const ectx = enrichContext(tasks, ctx, query);
   const filters = query.filters ?? [];
   let out = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ectx)));
 

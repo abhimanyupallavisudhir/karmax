@@ -49,9 +49,9 @@ function registerFakeWorld(opts: { kind: string; remote: boolean; hasBundle: boo
   return worlds;
 }
 
-function coreFor(worlds: WorldRegistry, contentDir: string) {
-  const store = new Store(':memory:');
-  store.claimPersonalOrganization('owner');
+async function coreFor(worlds: WorldRegistry, contentDir: string) {
+  const store = (await Store.create(':memory:'));
+  (await store.claimPersonalOrganization('owner'));
   return {
     store,
     core: makeCoreActivities({
@@ -80,7 +80,7 @@ describe('workflow-edit merge checks', () => {
   it('does not block a repo that carries no karmax workflow bundle', async () => {
     const execs: string[] = [];
     const worlds = registerFakeWorld({ kind: 'pkg-world', remote: false, hasBundle: false, execs });
-    const { store, core } = coreFor(worlds, tmp());
+    const { store, core } = (await coreFor(worlds, tmp()));
     try {
       const result = await core.runWorkflowChecks({
         taskId: 'task', worldHandle: { kind: 'pkg-world', id: 'task', root: '/workspace', branch: 'b', base: 'main' } as any,
@@ -89,7 +89,7 @@ describe('workflow-edit merge checks', () => {
       expect(result.detail).toMatch(/replay gate does not apply/);
       expect(result.detail).not.toMatch(/missing/);
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 
@@ -101,7 +101,7 @@ describe('workflow-edit merge checks', () => {
   it('locates the candidate bundle inside a remote world instead of on the host', async () => {
     const execs: string[] = [];
     const worlds = registerFakeWorld({ kind: 'cloud-world', remote: true, hasBundle: true, execs });
-    const { store, core } = coreFor(worlds, tmp());
+    const { store, core } = (await coreFor(worlds, tmp()));
     const leaked = () => fs.readdirSync(os.tmpdir()).filter((e) => e.startsWith('karmax-replay-')).length;
     const before = leaked();
     try {
@@ -118,7 +118,7 @@ describe('workflow-edit merge checks', () => {
       // A failed mirror must not leave a temp tree behind.
       expect(leaked()).toBe(before);
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 
@@ -126,7 +126,7 @@ describe('workflow-edit merge checks', () => {
   it('keeps reporting a genuinely missing bundle on a local world', async () => {
     const execs: string[] = [];
     const worlds = registerFakeWorld({ kind: 'local-world', remote: false, hasBundle: true, execs });
-    const { store, core } = coreFor(worlds, tmp());
+    const { store, core } = (await coreFor(worlds, tmp()));
     try {
       const result = await core.runWorkflowChecks({
         taskId: 'task', worldHandle: { kind: 'local-world', id: 'task', root: '/does-not-exist', branch: 'b', base: 'main' } as any,
@@ -135,7 +135,7 @@ describe('workflow-edit merge checks', () => {
       expect(result.passed).toBe(false);
       expect(result.detail).toMatch(/candidate workflow bundle is missing/);
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 });

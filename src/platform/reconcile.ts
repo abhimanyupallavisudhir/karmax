@@ -41,10 +41,10 @@ function stubView(t: TaskRecord): TaskView {
 export async function reconcileTasks(store: Store, client: Client): Promise<{ checked: number; settled: number }> {
   let checked = 0;
   let settled = 0;
-  for (const project of store.listProjects()) {
+  for (const project of (await store.listProjects())) {
     // Reconciliation operates on Temporal executions, not logical list rows:
     // every sibling attempt has its own workflow that must be settled.
-    for (const t of store.listTaskAttempts(project.id)) {
+    for (const t of (await store.listTaskAttempts(project.id))) {
       if (t.params?.draft) continue; // drafts are intentionally not started
       if (t.params?.triggerState === 'armed') continue; // armed triggered tasks have no workflow yet
       if (t.params?.repeatable) continue; // a series never runs its own workflow — only its runs do
@@ -67,9 +67,9 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
           if (base.stage === 'escalated' && base.error?.includes(TURN_COLLISION)
             && !base.pointOfNoReturnPassed && ['software-dev', 'goal'].includes(t.workflow)) {
             const repairKey = `repair:agent-turn-run-identity:${t.id}:${desc.runId}`;
-            const old = store.db.prepare('SELECT createdAt FROM usage_admissions WHERE id=? AND taskId=? AND projectId=?')
-              .get(`${t.id}#0`, t.id, t.projectId) as { createdAt: number } | undefined;
-            if (old && desc.startTime && old.createdAt < desc.startTime.getTime() && !store.kvGet(repairKey)) {
+            const old = (await store.db.prepare('SELECT createdAt FROM usage_admissions WHERE id=? AND taskId=? AND projectId=?')
+              .get(`${t.id}#0`, t.id, t.projectId)) as { createdAt: number } | undefined;
+            if (old && desc.startTime && old.createdAt < desc.startTime.getTime() && !(await store.kvGet(repairKey))) {
               // A failed probe/signal is transient; it must not fall into the
               // outer workflow-not-found handler and falsely fail this task.
               try {
@@ -77,7 +77,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
                 if (live.stage === 'escalated' && live.error?.includes(TURN_COLLISION)
                   && !live.state.cancelled && !live.pointOfNoReturnPassed) {
                   await withTimeout(handle.signal('retry'), DESCRIBE_TIMEOUT_MS);
-                  store.kvSet(repairKey, 'requested');
+                  (await store.kvSet(repairKey, 'requested'));
                 }
               } catch { /* Retry recovery on the next reconciliation sweep. */ }
             }
@@ -93,8 +93,8 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
               .catch(() => undefined);
             if (live?.state?.cancelled) {
               await handle.terminate('cancelled Setup did not settle').catch(() => undefined);
-              for (const lease of store.worldLeasesForTask(t.id)) store.releaseWorldLease(String(lease.id));
-              store.saveView(t.id, {
+              for (const lease of (await store.worldLeasesForTask(t.id))) (await store.releaseWorldLease(String(lease.id)));
+              (await store.saveView(t.id, {
                 ...live,
                 stage: 'cancelled',
                 status: 'cancelled',
@@ -102,7 +102,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
                 actions: [],
                 state: { ...live.state, cancelled: true, cancelledFrom: 'setup' },
                 updatedAt: Date.now(),
-              });
+              }));
               settled++;
             }
           }
@@ -126,18 +126,18 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
             : { ...base, status: 'failed', stage: 'failed', error: terminationReason
               ? `workflow terminated: ${terminationReason}`
               : base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
-        store.saveView(t.id, next);
+        (await store.saveView(t.id, next));
         settled++;
       } catch (e) {
         if (e instanceof Error && e.message === 'operation timed out') continue; // transient — don't fail a live task
         // workflow not found → lost (state reset) or never started (orphan row).
-        store.saveView(t.id, {
+        (await store.saveView(t.id, {
           ...base,
           status: 'failed',
           stage: 'failed',
           error: v ? 'workflow not found (lost on restart)' : 'workflow never started (engine was unavailable when queued)',
           updatedAt: base.updatedAt,
-        });
+        }));
         settled++;
       }
     }

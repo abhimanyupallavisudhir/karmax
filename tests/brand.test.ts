@@ -129,18 +129,18 @@ describe('branding — portable defaults and dynamic surfaces', () => {
     const gateway = read('src/gateway/server.ts');
     expect(identity).toContain('`Reset your ${brand} password`');
     expect(identity).toContain('`Confirm your ${brand} email`');
-    expect(identity).toContain('appName: siteName()');
-    expect(gateway).toContain('on ${this.siteName}');
-    expect(gateway).toContain('this.siteName)');
+    expect(identity).toContain('appName: (await siteName())');
+    expect(gateway).toContain('on ${(await this.siteName)}');
+    expect(gateway).toContain('(await this.siteName))');
   });
 
   it('uses the configured name in browser OAuth results and credential notices', () => {
     const gateway = read('src/gateway/server.ts');
-    expect(gateway).toContain('const name = escapeHtml(this.siteName);');
+    expect(gateway).toContain('const name = escapeHtml((await this.siteName));');
     expect(gateway).toContain('<title>${name} · GitHub</title>');
     expect(gateway).toContain('<title>${name} · Stripe</title>');
     expect(gateway).toContain('Return to ${name}');
-    expect(gateway).toContain('[${this.siteName} credential decision]');
+    expect(gateway).toContain('[${(await this.siteName)} credential decision]');
   });
 });
 

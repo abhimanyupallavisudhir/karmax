@@ -18,21 +18,21 @@ describe('control-plane backup', () => {
     fs.writeFileSync(path.join(home, 'worlds', 'secret-world', 'not-backed-up'), 'work');
     fs.mkdirSync(path.join(home, 'vault'), { recursive: true });
     fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'encrypted');
-    const store = new Store(path.join(home, 'state', 'karmax.db'));
-    store.kvSet('proof', 'before');
+    const store = (await Store.create(path.join(home, 'state', 'karmax.db')));
+    (await store.kvSet('proof', 'before'));
 
     const destination = path.join(root, 'snapshot');
     const result = await createBackup({ home, destination, externalTemporal: true });
     expect(result.manifest.worldsIncluded).toBe(false);
     expect(fs.existsSync(path.join(destination, 'payload', 'worlds'))).toBe(false);
-    store.kvSet('proof', 'after');
-    store.close();
+    (await store.kvSet('proof', 'after'));
+    (await store.close());
 
     await restoreBackup(destination, { home });
-    const restored = new Store(path.join(home, 'state', 'karmax.db'));
-    expect(restored.kvGet('proof')).toBe('before');
+    const restored = (await Store.create(path.join(home, 'state', 'karmax.db')));
+    expect((await restored.kvGet('proof'))).toBe('before');
     expect(fs.readFileSync(path.join(home, 'vault', 'vault.json'), 'utf8')).toBe('encrypted');
-    restored.close();
+    (await restored.close());
   });
 
   /**
@@ -117,16 +117,16 @@ describe('control-plane backup', () => {
     roots.push(root);
     const codex = path.join(home, 'config-homes', 'organizations', 'org-1', 'codex-personal');
     fs.mkdirSync(codex, { recursive: true });
-    const source = new Store(path.join(codex, 'state.sqlite'));
-    source.kvSet('proof', 'provider-state');
+    const source = (await Store.create(path.join(codex, 'state.sqlite')));
+    (await source.kvSet('proof', 'provider-state'));
     const destination = path.join(root, 'snapshot');
     await createBackup({ home, destination, externalTemporal: true });
-    source.close();
+    (await source.close());
 
     const copied = path.join(destination, 'payload', 'config-homes', 'organizations', 'org-1', 'codex-personal', 'state.sqlite');
-    const restored = new Store(copied);
-    expect(restored.kvGet('proof')).toBe('provider-state');
-    restored.close();
+    const restored = (await Store.create(copied));
+    expect((await restored.kvGet('proof'))).toBe('provider-state');
+    (await restored.close());
     expect(fs.existsSync(`${copied}-wal`)).toBe(false);
     expect(fs.existsSync(`${copied}-shm`)).toBe(false);
   });
@@ -187,16 +187,19 @@ describe('control-plane backup', () => {
     // beside the auth database — so a default backup directory is a
     // plaintext-equivalent credential bundle, not merely "portable".
     fs.writeFileSync(path.join(home, 'vault', 'vault.key'), 'KEY');
+    fs.writeFileSync(path.join(home, 'vault', 'vault.key.123.fixture.tmp'), 'CRASHED-KEY');
     fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'ciphertext');
     fs.writeFileSync(path.join(home, 'state', 'auth.db.secret'), 'AUTH');
 
     const withSecrets = await createBackup({ home, destination: path.join(root, 'a'), externalTemporal: true });
     expect(withSecrets.manifest.secretsIncluded).toBe(true);
     expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key.123.fixture.tmp'))).toBe(false);
 
     const without = await createBackup({ home, destination: path.join(root, 'b'), externalTemporal: true, excludeSecrets: true });
     expect(without.manifest.secretsIncluded).toBe(false);
     expect(fs.existsSync(path.join(root, 'b', 'payload', 'vault', 'vault.key'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'b', 'payload', 'vault', 'vault.key.123.fixture.tmp'))).toBe(false);
     expect(fs.existsSync(path.join(root, 'b', 'payload', 'state', 'auth.db.secret'))).toBe(false);
     // The ciphertext is still there, and the manifest still verifies.
     expect(without.manifest.files.map((f) => f.path)).toContain('vault/ciphertext'.replace('ciphertext', 'vault.json'));

@@ -21,16 +21,22 @@ export class KarmaxBus {
    * projection had a bug. The bus is a transport (SPEC §3.3); a broken consumer
    * is that consumer's problem.
    */
-  emit(ev: KarmaxEvent & { seq?: number }) {
+  emit(ev: KarmaxEvent & { seq?: number }): Promise<void> {
+    const pending: Promise<unknown>[] = [];
     for (const channel of ['event', `task:${ev.taskId}`]) {
-      for (const listener of this.ee.listeners(channel) as Array<(e: unknown) => void>) {
+      for (const listener of this.ee.listeners(channel) as Array<(e: unknown) => unknown>) {
         try {
-          listener(ev);
+          const result = listener(ev);
+          if (result && typeof (result as PromiseLike<unknown>).then === 'function')
+            pending.push(Promise.resolve(result).catch(error => {
+              console.error(`[bus] subscriber for "${channel}" failed:`, error);
+            }));
         } catch (error) {
           console.error(`[bus] subscriber for "${channel}" threw:`, error instanceof Error ? error.stack ?? error.message : error);
         }
       }
     }
+    return Promise.all(pending).then(() => {});
   }
   onAny(fn: (ev: KarmaxEvent & { seq?: number }) => void): () => void {
     this.ee.on('event', fn);

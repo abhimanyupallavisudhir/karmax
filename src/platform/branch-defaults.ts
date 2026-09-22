@@ -27,7 +27,7 @@ export async function repositoryBranchDefaults(
   source: string | undefined,
 ): Promise<RepositoryBranchDefaults | undefined> {
   if (!source) return undefined;
-  const linked = store.listProjectRepositories(project.id)
+  const linked = (await store.listProjectRepositories(project.id))
     .find((candidate) => sameRepository(candidate.repository.sshUrl, source));
   if (linked) {
     const base = linked.baseBranch ?? linked.repository.defaultBranch;

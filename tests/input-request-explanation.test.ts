@@ -31,8 +31,8 @@ describe('input request explanations over HTTP', () => {
 
   beforeAll(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-input-explanation-'));
-    store = new Store(':memory:');
-    const project = store.createProject('Input explanations');
+    store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Input explanations'));
     modelServer = http.createServer(async (req, res) => {
       let body = '';
       for await (const chunk of req) body += chunk;
@@ -42,19 +42,19 @@ describe('input request explanations over HTTP', () => {
     });
     await new Promise<void>((resolve) => modelServer.listen(0, '127.0.0.1', resolve));
     const address = modelServer.address() as { port: number };
-    store.setSettings(project.id, 'explanation', { endpoint: `http://127.0.0.1:${address.port}/v1/chat/completions` });
-    taskId = store.createTask({ projectId: project.id, title: 'Choose a target',
-      workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'Publish my update' } }).id;
+    (await store.setSettings(project.id, 'explanation', { endpoint: `http://127.0.0.1:${address.port}/v1/chat/completions` }));
+    taskId = (await store.createTask({ projectId: project.id, title: 'Choose a target',
+      workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'Publish my update' } })).id;
     view = { status: 'waiting', updatedAt: 1710000010000,
       waitingFor: { kind: 'human', detail: 'Choose a deployment target.' },
       actions: [{ name: 'followUp', roles: ['do'], enabled: true }] };
-    const gateway = new Gateway({ store, bus: new KarmaxBus(), tokens: new TokenAuthority(),
+    const gateway = (await Gateway.create({ store, bus: new KarmaxBus(), tokens: new TokenAuthority(),
       contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any,
       api: { taskConversation: async () => ({ messages: [{ role: 'user', text: 'Publish my update', ts: 1 }] }),
         getTaskView: async () => view } as any,
       taskQueue: 'test', staticDir: home, worlds: new WorldRegistry(),
       agentInfo: { provider: 'mock', reason: 'test' },
-    } as any);
+    } as any));
     vi.spyOn(gateway as any, 'explanationApiKey').mockReturnValue('test-only-key');
     const running = await gateway.listen(await findFreePortFrom(48_400));
     base = running.url;
@@ -66,7 +66,7 @@ describe('input request explanations over HTTP', () => {
     await close?.();
     if (modelServer) await new Promise<void>((resolve, reject) => modelServer.close((error) => error ? reject(error) : resolve()));
     vi.restoreAllMocks();
-    store?.close();
+    (await store?.close());
     fs.rmSync(home, { recursive: true, force: true });
   });
 

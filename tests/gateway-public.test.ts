@@ -82,22 +82,22 @@ describe('public gateway payloads', () => {
     expect(previewLeaseOrigin('lease-a', env)).not.toBe(previewLeaseOrigin('lease-b', env));
   });
 
-  it('allows on-demand TLS only for an active opaque preview hostname', () => {
+  it('allows on-demand TLS only for an active opaque preview hostname', async () => {
     const previous = process.env.KARMAX_PREVIEW_ORIGIN;
     process.env.KARMAX_PREVIEW_ORIGIN = 'https://preview.example.com';
     try {
-      const store = new Store(':memory:');
-      const project = store.createProject('Preview');
-      const task = store.createTask({ projectId: project.id, title: 'Run app', workflow: 'just-do',
-        workflowVersion: '1', params: { prompt: 'run it' } });
-      const lease = store.createPreviewLease({ id: 'preview-live', organizationId: project.organizationId!,
+      const store = (await Store.create(':memory:'));
+      const project = (await store.createProject('Preview'));
+      const task = (await store.createTask({ projectId: project.id, title: 'Run app', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'run it' } }));
+      const lease = (await store.createPreviewLease({ id: 'preview-live', organizationId: project.organizationId!,
         projectId: project.id, taskId: task.id, worldId: task.id, generation: 1, port: 3000, public: false,
-        provider: 'e2b', createdBy: 'owner', createdAt: Date.now(), expiresAt: Date.now() + 60_000 });
+        provider: 'e2b', createdBy: 'owner', createdAt: Date.now(), expiresAt: Date.now() + 60_000 }));
       expect(lease.hostname).toMatch(/^p-[a-f0-9]{24}\.preview\.example\.com$/);
-      expect(store.previewHostnameAllowed(lease.hostname!)).toBe(true);
-      expect(store.previewHostnameAllowed('invented.preview.example.com')).toBe(false);
-      store.revokePreviewLease(lease.id);
-      expect(store.previewHostnameAllowed(lease.hostname!)).toBe(false);
+      expect((await store.previewHostnameAllowed(lease.hostname!))).toBe(true);
+      expect((await store.previewHostnameAllowed('invented.preview.example.com'))).toBe(false);
+      (await store.revokePreviewLease(lease.id));
+      expect((await store.previewHostnameAllowed(lease.hostname!))).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.KARMAX_PREVIEW_ORIGIN;
       else process.env.KARMAX_PREVIEW_ORIGIN = previous;

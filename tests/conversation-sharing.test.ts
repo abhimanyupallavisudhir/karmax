@@ -9,16 +9,16 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { publicShare, currentShare } from '../src/gateway/conversation-sharing.js';
 
-describe('public conversation sharing over HTTP', () => {
-  const store = new Store(':memory:');
-  const project = store.createProject('Sharing');
-  const other = store.createProject('Other');
-  const task = store.createTask({ projectId: project.id, title: '<script>title</script>', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'Share test' } });
+describe('public conversation sharing over HTTP', async () => {
+  const store = (await Store.create(':memory:'));
+  const project = (await store.createProject('Sharing'));
+  const other = (await store.createProject('Other'));
+  const task = (await store.createTask({ projectId: project.id, title: '<script>title</script>', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'Share test' } }));
   const tokens = new TokenAuthority();
-  const owner = tokens.mintPrincipal('system:test', ['*']).token;
-  const developer = tokens.mintPrincipal('system:developer', ['task:*', 'project:settings:read'], project.id).token;
-  const viewer = tokens.mintPrincipal('system:viewer', ['task:read', 'task:conversation:read'], project.id).token;
-  const foreign = tokens.mintPrincipal('system:foreign', ['task:*'], other.id).token;
+  const owner = (await tokens.mintPrincipal('system:test', ['*'])).token;
+  const developer = (await tokens.mintPrincipal('system:developer', ['task:*', 'project:settings:read'], project.id)).token;
+  const viewer = (await tokens.mintPrincipal('system:viewer', ['task:read', 'task:conversation:read'], project.id)).token;
+  const foreign = (await tokens.mintPrincipal('system:foreign', ['task:*'], other.id)).token;
   const messages = [
     { id: 's', role: 'system', text: 'hidden system', ts: 1 },
     { id: 'u', role: 'user', text: '<img src=x onerror=alert(1)> hello', ts: 2, files: [{ path: 'private-file' }] },
@@ -33,15 +33,15 @@ describe('public conversation sharing over HTTP', () => {
   });
   const orgPolicy = (enabled: boolean) => request(`/api/organizations/${project.organizationId}/conversation-sharing`, 'PUT', owner, { enabled });
   beforeAll(async () => {
-    const gateway = new Gateway({ store, tokens, bus: new KarmaxBus(), contributions: new ContributionRegistry(),
+    const gateway = (await Gateway.create({ store, tokens, bus: new KarmaxBus(), contributions: new ContributionRegistry(),
       overlays: new Overlays(), client: {} as any, taskQueue: 'test', staticDir: 'web',
       api: { getTaskView: async () => ({ messages: [{ role: 'agent', text: 'wrong agent' }], transcripts: [{ role: 'merge', messages }] }) } as any,
       worlds: new WorldRegistry(), agentInfo: { provider: 'mock', reason: 'test' }, password: 'test-password',
-    } as any);
+    } as any));
     const running = await gateway.listen(await findFreePortFrom(48_700));
     base = running.url; close = running.close;
   });
-  afterAll(async () => { await close?.(); store.close(); });
+  afterAll(async () => { await close?.(); (await store.close()); });
 
   it('defaults to disabled and reserves policy management for administrators', async () => {
     expect((await request(endpoint, 'POST', developer)).status).toBe(403);
@@ -91,11 +91,11 @@ describe('public conversation sharing over HTTP', () => {
     expect(next).not.toBe(sharedUrl);
     expect(await (await fetch(`${base}${next}`)).text()).toContain('later message');
   });
-  it('removes snapshot data when its project is deleted', () => {
-    const share = currentShare(store, task.id, 'merge')!;
-    store.deleteProject(project.id);
-    expect(publicShare(store, share.id)).toBeUndefined();
-    expect(store.kvGet(`conversation-share:${share.id}`)).toBeUndefined();
+  it('removes snapshot data when its project is deleted', async () => {
+    const share = (await currentShare(store, task.id, 'merge'))!;
+    (await store.deleteProject(project.id));
+    expect((await publicShare(store, share.id))).toBeUndefined();
+    expect((await store.kvGet(`conversation-share:${share.id}`))).toBeUndefined();
   });
   it('binds sharing to its own capability', () => {
     expect(routeCapability('POST', endpoint.split('?')[0]!, new URL(`http://localhost${endpoint}`))).toBe('task:conversation:share');

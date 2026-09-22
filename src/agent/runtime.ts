@@ -64,14 +64,14 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const adapter = deps.adapters.get(input.profile.provider);
   if (!adapter) throw new Error(`no agent adapter for provider "${input.profile.provider}"`);
 
-  const trace = currentTiming();
-  trace?.mark('adapter.invoked', { provider: input.profile.provider, model: input.profile.model,
+  const trace = (await currentTiming());
+  (await trace?.mark('adapter.invoked', { provider: input.profile.provider, model: input.profile.model,
     sessionMode: input.fork ? 'forked' : input.session ? 'resumed' : 'fresh', worldKind: input.world.handle.kind,
     systemPromptChars: input.systemPrompt.length, transcriptChars: input.messages.reduce((n, m) => n + m.text.length, 0),
-    messageCount: input.messages.length });
-  const opaqueEnd = trace?.start('adapter.to-first-output.opaque');
-  const observedTools = new Map<string, ReturnType<NonNullable<typeof trace>['start']>>();
-  const outputObserved = () => { trace?.markOnce('first.output'); opaqueEnd?.(); };
+    messageCount: input.messages.length }));
+  const opaqueEnd = (await trace?.start('adapter.to-first-output.opaque'));
+  const observedTools = new Map<string, Awaited<ReturnType<NonNullable<typeof trace>['start']>>>();
+  const outputObserved = async () => { await Promise.all([trace?.markOnce('first.output'), opaqueEnd?.()]); };
   let completed = false;
   let openPrRequested = false;
   let reviewInfo: ReviewInfo | undefined;
@@ -188,30 +188,33 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       return deps.platformRequest(method, path, body);
     },
     fillPaymentCard: deps.fillPaymentCard,
-    emit(text, source) {
-      if (text.trim()) outputObserved();
+    async emit(text, source) {
+      const output = text.trim() ? outputObserved() : undefined;
+      const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
       deps.onEmit?.(text, source);
-      if (source === 'assistant' && text.trim()) trace?.markOnce('first.text');
+      await Promise.all([output, firstText]);
     },
-    emitActivity(activity) {
-      outputObserved();
-      if (trace?.enabled() && ['tool', 'command', 'search', 'file', 'subagent'].includes(activity.kind)) {
+    async emitActivity(activity) {
+      const output = outputObserved();
+      const firstText = activity.kind === 'message' && activity.title?.trim() ? trace?.markOnce('first.text') : undefined;
+      deps.onActivity?.(activity);
+      await Promise.all([output, firstText]);
+      if ((await trace?.enabled()) && ['tool', 'command', 'search', 'file', 'subagent'].includes(activity.kind)) {
         if (activity.phase === 'started' && !observedTools.has(activity.id) && trace)
-          observedTools.set(activity.id, trace.start('tool.provider-observed', { itemId: activity.id, operation: activity.kind }));
+          observedTools.set(activity.id, (await trace.start('tool.provider-observed', { itemId: activity.id, operation: activity.kind })));
         if (activity.phase === 'completed' || activity.phase === 'failed') {
-          observedTools.get(activity.id)?.(activity.phase === 'failed' ? 'failed' : 'ok');
+          (await observedTools.get(activity.id)?.(activity.phase === 'failed' ? 'failed' : 'ok'));
           observedTools.delete(activity.id);
         }
       }
-      deps.onActivity?.(activity);
-      if (activity.kind === 'message' && activity.title?.trim()) trace?.markOnce('first.text');
+
     },
     onSession: deps.onSession,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
     pullFollowUps: deps.pullFollowUps ? async (fromIndex) => {
       const messages = await deps.pullFollowUps!(fromIndex);
-      for (const message of messages) trace?.markOnce('followup.offered', { requestId: `${trace.context.taskId}:${message.id}` }, `followup:${message.id}`);
+      for (const message of messages) (await trace?.markOnce('followup.offered', { requestId: `${trace.context.taskId}:${message.id}` }, `followup:${message.id}`));
       return messages;
     } : undefined,
   };
@@ -250,7 +253,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     if (turn.termination?.kind !== 'success') {
       throw new Error('agent provider ended without a verified successful terminal event');
     }
-    trace?.mark('provider.completed', turn.usage);
+    (await trace?.mark('provider.completed', turn.usage));
     deps.onActivity?.({
       id: 'turn',
       kind: 'turn',

@@ -6,26 +6,26 @@ import { KarmaxBus } from '../src/contrib/bus.js';
 
 describe('conversation message events', () => {
   it.each([false, true])('journals and broadcasts a follow-up as soon as its workflow signal is accepted (timing enabled: %s)', async (enabled) => {
-    const store = new Store(':memory:');
-    onTestFinished(() => store.close());
-    if (enabled) store.setSettings('global', 'timing', { enabled: true });
+    const store = (await Store.create(':memory:'));
+    onTestFinished(async () => (await store.close()));
+    if (enabled) (await store.setSettings('global', 'timing', { enabled: true }));
     const tokens = new TokenAuthority();
-    const token = tokens.mint({
+    const token = (await tokens.mint({
       taskId: 'operator',
       profileId: 'do',
       principal: 'user:test',
       ceiling: ['read-task', 'signal-task'],
       grantorCaps: ['read-task', 'signal-task'],
-    }).token;
-    const project = store.createProject('Conversation');
-    const task = store.createTask({
+    })).token;
+    const project = (await store.createProject('Conversation'));
+    const task = (await store.createTask({
       projectId: project.id,
       title: 'Running task',
       workflow: 'software-dev',
       workflowVersion: '1.2.0',
       params: { prompt: 'start' },
-    });
-    store.saveView(task.id, {
+    }));
+    (await store.saveView(task.id, {
       taskId: task.id,
       title: task.title,
       workflow: task.workflow,
@@ -35,7 +35,7 @@ describe('conversation message events', () => {
       actions: [],
       state: {},
       updatedAt: 1,
-    });
+    }));
 
     const signal = vi.fn(async () => undefined);
     const client = { workflow: { getHandle: () => ({ signal }) } } as any;
@@ -48,7 +48,7 @@ describe('conversation message events', () => {
 
     expect(signal).toHaveBeenCalledWith('followUp', message, 'do');
     expect(message).toMatchObject({ role: 'user', text: 'One more requirement' });
-    const journal = store.eventsSince(task.id, 0);
+    const journal = (await store.eventsSince(task.id, 0));
     const events = journal.filter(event => event.type === 'conversation.message');
     const timing = journal.filter(event => event.type === 'timing').map(event => event.payload);
     expect(timing).toEqual(enabled ? [
@@ -64,6 +64,6 @@ describe('conversation message events', () => {
     expect(broadcast).toEqual(events);
     // The workflow owns its replay-sensitive snapshot; the event bridges the UI
     // until that snapshot is naturally published at the next lifecycle boundary.
-    expect(store.getTask(task.id)?.lastView?.messages).toHaveLength(1);
+    expect((await store.getTask(task.id))?.lastView?.messages).toHaveLength(1);
   });
 });

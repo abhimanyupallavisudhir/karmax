@@ -131,7 +131,7 @@ configure() {
 wait_ready() {
   note 'Waiting for the Karmax control plane to become ready…'
   attempt=0
-  until dc exec -T app node -e "fetch('http://127.0.0.1:4505/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; do
+  until dc exec -T app node -e "fetch('http://127.0.0.1:4505/api/health/ready',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 90 ]; then
       dc ps
@@ -306,6 +306,19 @@ cmd_restore() {
   print_finish
 }
 
+# A data epoch is a code-only rollback compatibility boundary, not a schema
+# version. Missing markers are legacy epoch 1; malformed markers fail closed.
+data_epoch() {
+  if git -C "$ROOT_DIR" cat-file -e "$1:deploy/data-epoch" 2>/dev/null; then
+    epoch=$(git -C "$ROOT_DIR" show "$1:deploy/data-epoch") || return 1
+  else
+    epoch=1
+  fi
+  case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$epoch" -ge 1 ] 2>/dev/null || return 1
+  printf '%s\n' "$epoch"
+}
+
 cmd_update() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
@@ -337,6 +350,10 @@ cmd_update() {
   git -C "$ROOT_DIR" merge-base --is-ancestor "$previous" "$target" \
     || [ "$previous" = "$target" ] \
     || die "deployment source $previous and requested revision $target have diverged"
+
+  previous_epoch=$(data_epoch "$previous") || die "invalid data epoch in $previous"
+  target_epoch=$(data_epoch "$target") || die "invalid data epoch in $target"
+  [ "$target_epoch" -ge "$previous_epoch" ] || die "refusing data epoch downgrade $previous_epoch -> $target_epoch"
 
   # A domain migration can be staged in the environment without changing the
   # running service. The first validated update that understands these keys
@@ -399,6 +416,15 @@ cmd_update() {
     migration_backup=''
     note "Update complete at $target."
     return 0
+  fi
+
+  # Candidate startup can change durable data and advance Temporal histories.
+  # Reverting only code across an incompatible boundary would hide or overwrite
+  # data. Preserve the candidate/data and stop serving instead; recovery must
+  # repair forward or explicitly restore a coordinated pre-update backup.
+  if [ "$previous_epoch" != "$target_epoch" ]; then
+    dc stop app || die "deployment $target failed across data epochs; could not stop the app; manual recovery required"
+    die "deployment $target failed across data epochs $previous_epoch -> $target_epoch; app stopped, data retained, code-only rollback refused. Repair forward or restore the pre-update backup at $destination with its matching code and Temporal history"
   fi
 
   # The previous image may have been replaced under the Compose service tag, so

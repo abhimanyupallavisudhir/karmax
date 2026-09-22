@@ -52,31 +52,31 @@ describe('vault credential ordering', () => {
     ], new Set(), now).map((item: any) => item.id)).toEqual(['newer', 'older']);
   });
 
-  it('carries historical usage through vault metadata JSON into the displayed ordering', () => {
-    const store = new Store(':memory:');
+  it('carries historical usage through vault metadata JSON into the displayed ordering', async () => {
+    const store = (await Store.create(':memory:'));
     try {
       const now = Date.now();
       const month = 30 * 24 * 60 * 60 * 1000;
       const vault = new VaultItems(store);
-      const old = vault.save({ type: 'login', label: 'Alpha' });
-      const recent = vault.save({ type: 'login', label: 'Zulu' });
-      const frequent = vault.save({ type: 'login', label: 'Most used' });
-      const unused = vault.save({ type: 'login', label: 'Beta' });
-      store.kvSet('vault:items:org_personal', JSON.stringify(vault.list().map((item) => {
+      const old = (await vault.save({ type: 'login', label: 'Alpha' }));
+      const recent = (await vault.save({ type: 'login', label: 'Zulu' }));
+      const frequent = (await vault.save({ type: 'login', label: 'Most used' }));
+      const unused = (await vault.save({ type: 'login', label: 'Beta' }));
+      (await store.kvSet('vault:items:org_personal', JSON.stringify((await vault.list()).map((item) => {
         const { frecencyScore, frecencyUpdatedAt, ...legacy } = item;
         return legacy;
-      })));
+      }))));
       for (const [item, count, ts] of [[old, 8, now - 4 * month], [recent, 2, now], [frequent, 12, now - month]] as const) {
-        for (let i = 0; i < count; i++) store.appendAudit({ ts, principalId: 'system',
-          action: 'vault.used', detail: { itemId: item.id } });
+        for (let i = 0; i < count; i++) (await store.appendAudit({ ts, principalId: 'system',
+          action: 'vault.used', detail: { itemId: item.id } }));
       }
       // This is the metadata payload returned by GET /api/vault/items.
-      const payload = JSON.parse(JSON.stringify(vault.list()));
+      const payload = JSON.parse(JSON.stringify((await vault.list())));
       expect(sortVaultItems(payload, new Set(), Date.now()).map((item: any) => item.id))
         .toEqual([frequent.id, recent.id, old.id, unused.id]);
       expect(sortVaultItems(payload, new Set([old.id]), Date.now()).map((item: any) => item.id))
         .toEqual([old.id, frequent.id, recent.id, unused.id]);
-    } finally { store.close(); }
+    } finally { (await store.close()); }
   });
 
 });

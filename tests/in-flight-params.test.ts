@@ -144,16 +144,16 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     const repo = await h.makeRepo('paramedit-responder');
     // The owner re-routing their own task: who answers a question is a reviewer's
     // decision, so the token carries `review:approve` (a maintainer-level grant).
-    const token = h.tokens.mint({
+    const token = (await h.tokens.mint({
       taskId: 't-responder',
       profileId: 'do',
       principal: 'user:a',
       ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
       grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
-    }).token;
-    const project = h.store.createProject('Responder edits', {
+    })).token;
+    const project = (await h.store.createProject('Responder edits', {
       repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false,
-    });
+    }));
     const task = await h.api.createTask(token, {
       projectId: project.id,
       workflow: 'software-dev',
@@ -173,7 +173,7 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
       responder: { kind: 'agent', provider: 'mock', prompt: 'Answer this open question now.' },
     });
     expect(applied).toEqual({ applied: ['responder'] });
-    expect(h.store.getTask(task.id)?.params.responder).toMatchObject({ kind: 'agent', provider: 'mock' });
+    expect((await h.store.getTask(task.id))?.params.responder).toMatchObject({ kind: 'agent', provider: 'mock' });
 
     // The edit wakes the existing pause. No human follow-up is sent: the newly
     // selected response agent answers it, and the Do conversation resumes.
@@ -258,13 +258,13 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
   it('a re-route through the api validates the audience and re-shares it with every attempt', async () => {
     const repo = await h.makeRepo('reroute-api');
     // assertHumanRoutes only bites once the organization actually has people.
-    const organization = h.store.createOrganization({ name: 'Acme reroute', ownerUserId: 'owner' });
-    const project = h.store.createProject('P', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }, organization.id);
-    const token = h.tokens.mint({
+    const organization = (await h.store.createOrganization({ name: 'Acme reroute', ownerUserId: 'owner' }));
+    const project = (await h.store.createProject('P', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }, organization.id));
+    const token = (await h.tokens.mint({
       taskId: 't', profileId: 'do', principal: 'user:owner',
       ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
       grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task', 'review:approve'],
-    }).token;
+    })).token;
     const task = await h.api.createTask(token, {
       projectId: project.id, workflow: 'software-dev', prompt: '@write s.txt :: hi\n@review ok',
     });
@@ -283,7 +283,7 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     const applied = await h.api.updateParams(token, task.id, { confirm: { layers: [] } });
     expect(applied.applied).toEqual(['confirm']);
     // The route belongs to the logical task, so the shared snapshot moved with it.
-    expect(h.store.attemptGroup(task.id)?.confirmer).toEqual({ layers: [] });
+    expect((await h.store.attemptGroup(task.id))?.confirmer).toEqual({ layers: [] });
 
     expect((await handle.result()).stage).toBe('done');
   });
@@ -305,14 +305,14 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
 
   it('the assembler carries windows so an api-created task accepts target edits and errors on frozen', async () => {
     const repo = await h.makeRepo('paramedit3');
-    const token = h.tokens.mint({
+    const token = (await h.tokens.mint({
       taskId: 't',
       profileId: 'do',
       principal: 'user:a',
       ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task'],
       grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task'],
-    }).token;
-    const project = h.store.createProject('P', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false });
+    })).token;
+    const project = (await h.store.createProject('P', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
     const task = await h.api.createTask(token, {
       projectId: project.id,
       workflow: 'software-dev',

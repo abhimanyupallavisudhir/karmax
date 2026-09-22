@@ -39,10 +39,10 @@ afterAll(async () => { for (const close of closers) await close().catch(() => {}
 async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
   const port = await findFreePortFrom(47990);
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}`, ...opts });
-  const store = new Store(':memory:');
+  const store = (await Store.create(':memory:'));
   const tokens = new TokenAuthority();
-  const authorization = new AuthorizationService(store);
-  const gateway = new Gateway({
+  const authorization = (await AuthorizationService.create(store));
+  const gateway = (await Gateway.create({
     api: {} as any,
     store,
     bus: new KarmaxBus(),
@@ -56,18 +56,18 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
     identity,
     authorization,
     worlds: new WorldRegistry(),
-  });
+  }));
   const running = await gateway.listen(port);
   closers.push(() => running.close());
   return { identity, store, tokens, authorization, base: running.url };
 }
 
 /** Delegate the caller's authority; setup users default to God. */
-function delegatedHeaders(tokens: TokenAuthority, userId: string, capabilities: string[] = ['*']): { authorization: string } {
-  const human = tokens.mintPrincipal(`user:${userId}`, capabilities);
-  const delegation = tokens.delegateHuman(human.token, { taskId: 'self-service' })!;
-  const agent = tokens.mint({ taskId: 'self-service', profileId: 'do', role: 'do',
-    principal: `task:self-service`, ceiling: capabilities, grantorCaps: capabilities, delegationId: delegation.id });
+async function delegatedHeaders(tokens: TokenAuthority, userId: string, capabilities: string[] = ['*']): Promise<{ authorization: string }> {
+  const human = (await tokens.mintPrincipal(`user:${userId}`, capabilities));
+  const delegation = (await tokens.delegateHuman(human.token, { taskId: 'self-service' }))!;
+  const agent = (await tokens.mint({ taskId: 'self-service', profileId: 'do', role: 'do',
+    principal: `task:self-service`, ceiling: capabilities, grantorCaps: capabilities, delegationId: delegation.id }));
   return { authorization: `Bearer ${agent.token}` };
 }
 
@@ -90,11 +90,11 @@ describe('user data export', () => {
       body: JSON.stringify({ name: 'Alice', email: 'alice@example.com', password: 'long-enough-password' }),
     });
     const cookie = signup.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
-    const user = identity.listUsers().find((candidate) => candidate.email === 'alice@example.com')!;
-    const organization = store.listOrganizations(user.id)[0]!;
-    store.createProject('Alice project', {}, organization.id);
+    const user = (await identity.listUsers()).find((candidate) => candidate.email === 'alice@example.com')!;
+    const organization = (await store.listOrganizations(user.id))[0]!;
+    (await store.createProject('Alice project', {}, organization.id));
 
-    const headers = actor === 'agent' ? delegatedHeaders(tokens, user.id) : { cookie };
+    const headers = actor === 'agent' ? (await delegatedHeaders(tokens, user.id)) : { cookie };
     const response = await fetch(`${base}/api/user/export`, { headers });
     const text = await response.text();
     const exported = JSON.parse(text);
@@ -125,8 +125,8 @@ describe('user data export', () => {
 
   it('rejects self-service export without a verified user subject', async () => {
     const { store, tokens, base } = await boot();
-    const project = store.createProject('Agent project');
-    const token = tokens.mintPrincipal('user:somebody', ['*'], project.id).token;
+    const project = (await store.createProject('Agent project'));
+    const token = (await tokens.mintPrincipal('user:somebody', ['*'], project.id)).token;
     const response = await fetch(`${base}/api/user/export`, {
       headers: { authorization: `Bearer ${token}` },
     });
@@ -146,16 +146,16 @@ describe('default organization preference', () => {
       body: JSON.stringify({ name: 'Alice', email: 'alice@example.com', password: 'long-enough-password' }),
     });
     const cookie = signup.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
-    const user = identity.listUsers().find((candidate) => candidate.email === 'alice@example.com')!;
-    const personal = store.listOrganizations(user.id).find((organization) => organization.kind === 'personal')!;
-    const newest = store.createOrganization({ name: 'Newest team', ownerUserId: user.id });
+    const user = (await identity.listUsers()).find((candidate) => candidate.email === 'alice@example.com')!;
+    const personal = (await store.listOrganizations(user.id)).find((organization) => organization.kind === 'personal')!;
+    const newest = (await store.createOrganization({ name: 'Newest team', ownerUserId: user.id }));
 
     // Setup grants God globally. Remove only that grant for the ordinary-member
     // cases, retaining ownership of the personal and newly created organizations.
-    if (!operator) store.deletePrincipalGrant(`user:${user.id}`, 'global');
-    const capabilities = authorization.capabilities(`user:${user.id}`);
+    if (!operator) (await store.deletePrincipalGrant(`user:${user.id}`, 'global'));
+    const capabilities = (await authorization.capabilities(`user:${user.id}`));
     expect(capabilities.includes('*')).toBe(operator);
-    const headers = actor === 'agent' ? delegatedHeaders(tokens, user.id, capabilities) : { cookie };
+    const headers = actor === 'agent' ? (await delegatedHeaders(tokens, user.id, capabilities)) : { cookie };
     const initial = await fetch(`${base}/api/user/default-organization`, { headers });
     expect(initial.status).toBe(200);
     expect(await initial.json()).toEqual({ organizationId: personal.id });
@@ -166,11 +166,11 @@ describe('default organization preference', () => {
     });
     expect(changed.status).toBe(200);
     expect(await changed.json()).toEqual({ organizationId: newest.id });
-    expect(store.defaultOrganization(user.id)?.id).toBe(newest.id);
+    expect((await store.defaultOrganization(user.id))?.id).toBe(newest.id);
 
-    const other = store.createOrganization({ name: 'Not mine', ownerUserId: 'someone-else' });
+    const other = (await store.createOrganization({ name: 'Not mine', ownerUserId: 'someone-else' }));
     // Even public name discovery must not let ordinary nonmembers set a default.
-    store.setOrganizationNameVisibility(other.id, 'public');
+    (await store.setOrganizationNameVisibility(other.id, 'public'));
     const response = await fetch(`${base}/api/user/default-organization`, {
       method: 'PUT', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ organizationId: other.id }),
@@ -179,19 +179,19 @@ describe('default organization preference', () => {
     const expected = operator ? other.id : newest.id;
     expect(await (await fetch(`${base}/api/user/default-organization`, { headers })).json())
       .toEqual({ organizationId: expected });
-    expect(store.defaultOrganization(user.id, operator)?.id).toBe(expected);
+    expect((await store.defaultOrganization(user.id, operator))?.id).toBe(expected);
 
     const missing = await fetch(`${base}/api/user/default-organization`, {
       method: 'PUT', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ organizationId: 'org_does_not_exist' }),
     });
     expect(missing.status).toBe(400);
-    expect(store.defaultOrganization(user.id, operator)?.id).toBe(expected);
+    expect((await store.defaultOrganization(user.id, operator))?.id).toBe(expected);
   });
 
   it('rejects reading or changing a preference without a verified user subject', async () => {
     const { tokens, base } = await boot();
-    const token = tokens.mintPrincipal('user:alice', ['*']).token;
+    const token = (await tokens.mintPrincipal('user:alice', ['*'])).token;
     for (const method of ['GET', 'PUT']) {
       const response = await fetch(`${base}/api/user/default-organization`, {
         method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -262,16 +262,16 @@ describe('GitHub sign-in when configured', () => {
       name: 'Octo Cat', email: 'octo@example.com', password: 'long-enough-password',
     });
     const signedUp = await created.clone().json() as any;
-    new GitProfiles(store, undefined, undefined, userGitScope(String(signedUp.user.id)))
-      .saveGithubIdentity({ id: '42', login: 'octocat', name: 'Octo Cat' });
+    (await new GitProfiles(store, undefined, undefined, userGitScope(String(signedUp.user.id)))
+      .saveGithubIdentity({ id: '42', login: 'octocat', name: 'Octo Cat' }));
     const cookie = created.headers.get('set-cookie')?.split(';', 1)[0];
     expect(cookie).toBeTruthy();
     const session = await (await fetch(`${base}/api/session`, { headers: { cookie: cookie! } })).json() as any;
     expect(session.authenticated).toBe(true);
     expect(session.gitOnboarding).toBe(true);
-    const [personal] = store.listOrganizations(session.user.id);
+    const [personal] = (await store.listOrganizations(session.user.id));
     expect(personal).toBeTruthy();
-    expect(new GitProfiles(store, undefined, undefined, personal!.id).resolve(undefined)).toMatchObject({
+    expect((await new GitProfiles(store, undefined, undefined, personal!.id).resolve(undefined))).toMatchObject({
       github: { id: '42', login: 'octocat' },
       source: { kind: 'user', userId: session.user.id, profile: 'github' },
     });
@@ -330,9 +330,9 @@ describe('Google sign-in when configured', () => {
     // and never verifies the address, so the collision case above is reachable
     // and has to be explained to the user rather than 500-ing at them.
     await identity.signUp({ name: 'Ada', email: 'ada@example.com', password: 'long-enough-password' });
-    const user = identity.listUsers().find((u) => u.email === 'ada@example.com');
+    const user = (await identity.listUsers()).find((u) => u.email === 'ada@example.com');
     expect(user).toBeTruthy();
-    expect(identity.providersForUser(user!.id)).toEqual(['credential']);
+    expect((await identity.providersForUser(user!.id))).toEqual(['credential']);
   });
 
   // Because that collision is reachable, the failure must land back on karmax's

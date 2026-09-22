@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
@@ -15,12 +16,11 @@ import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
 import { sameRepository } from './repository-identity.js';
 
-const gzip = promisify(zlib.gzip);
+import type { PortableDelta } from './checkpoint-encoding.js';
+import { encodeEncryptedCheckpoint, type CheckpointFile } from './checkpoint-executor.js';
 const gunzip = promisify(zlib.gunzip);
 export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
-interface DeltaFile { repo: string; path: string; deleted?: boolean; data?: string }
-interface PortableDelta { version: 1; files: DeltaFile[] }
 
 /** How a restoring activity keeps its runner-lease wait alive and cancellable. */
 export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void }
@@ -64,21 +64,19 @@ export class WorldCheckpointService {
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
     private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
     private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService) {
-    if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
-      broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
     this.runners = runners ?? new RunnerPoolService(store);
   }
 
   async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean } = {}): Promise<WorldCheckpoint> {
-    const handle = (this.store.currentWorld(handleInput.id) ?? handleInput) as WorldHandle;
-    this.store.assertCurrentWorld(handle);
+    const handle = ((await this.store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
+    (await this.store.assertCurrentWorld(handle));
     const projectId = String(handle.meta?.projectId ?? '');
-    const project = this.store.getProject(projectId);
+    const project = (await this.store.getProject(projectId));
     if (!project?.organizationId) throw new Error('world checkpoint has no owning project');
     const world = await this.worlds.open(handle);
-    const linked = this.store.listProjectRepositories(projectId);
-    const organizationRepositories = this.store.listRepositories(project.organizationId);
-    const files: DeltaFile[] = [];
+    const linked = (await this.store.listProjectRepositories(projectId));
+    const organizationRepositories = (await this.store.listRepositories(project.organizationId));
+    const files: Array<{ repo: string; path: string; deleted?: boolean; readPath?: string }> = [];
     const repos: WorldCheckpoint['repos'] = [];
     const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
     const ignored = await this.resources?.ignoredInventory(handle.id).catch(() => undefined);
@@ -98,8 +96,7 @@ export class WorldCheckpointService {
           || resourcePaths.some((target) => relative === target || relative.startsWith(`${target}/`))) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
-          const data = await world.readFileBuffer(relative);
-          files.push({ repo: repo.name, path: change.path, data: data.toString('base64') });
+          files.push({ repo: repo.name, path: change.path, readPath: relative });
         }
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
@@ -120,54 +117,57 @@ export class WorldCheckpointService {
         if (!safeDeltaPath(file) || file === '.env' || file.startsWith('.karmax-injection/')
           || ephemeralPaths.has(file)
           || resourcePaths.some((target) => target === '.' || file === target || file.startsWith(`${target}/`))) continue;
-        files.push({ repo: '', path: file, data: (await world.readFileBuffer(file)).toString('base64') });
+        files.push({ repo: '', path: file, readPath: file });
       }
     }
-    const delta: PortableDelta = { version: 1, files };
-    const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
-    const encrypted = this.encrypt(compressed);
+    async function* contents(): AsyncGenerator<CheckpointFile> {
+      for (const { readPath, ...file } of files) {
+        yield readPath === undefined ? file : { ...file, data: await world.readFileBuffer(readPath) };
+      }
+    }
+    const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), await this.key());
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
-    const managedStorage = this.store.listStorageLocations(project.organizationId)
+    const managedStorage = (await this.store.listStorageLocations(project.organizationId))
       .find((location) => location.kind === 'managed');
-    if (managedStorage) this.store.reserveStorageUpload(`checkpoint:${checkpointId}`, project.organizationId,
-      managedStorage.id, encrypted.length, Date.now() + 60 * 60_000);
+    if (managedStorage) (await this.store.reserveStorageUpload(`checkpoint:${checkpointId}`, project.organizationId,
+      managedStorage.id, encrypted.length, Date.now() + 60 * 60_000));
     try { await this.objects.put(objectKey, encrypted); }
     catch (error) {
-      if (managedStorage) this.store.releaseStorageUpload(`checkpoint:${checkpointId}`);
+      if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`));
       throw error;
     }
     const checkpoint: WorldCheckpoint = {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
-      repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
+      repos, filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
       ...(resourceRefs.length ? { resources: resourceRefs } : {}),
       ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
-      ...snapshotProjectRuntime(this.store, projectId),
+      ...(await snapshotProjectRuntime(this.store, projectId)),
       createdAt: Date.now(),
     };
-    try { this.store.saveWorldCheckpoint(checkpoint); }
+    try { (await this.store.saveWorldCheckpoint(checkpoint)); }
     catch (error) { await this.objects.delete(objectKey).catch(() => undefined); throw error; }
-    finally { if (managedStorage) this.store.releaseStorageUpload(`checkpoint:${checkpointId}`); }
-    this.store.attachWorldCheckpoint(handle, checkpoint.id);
-    this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
+    finally { if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`)); }
+    (await this.store.attachWorldCheckpoint(handle, checkpoint.id));
+    (await this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
       provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte', costMicros: 0,
       fundingSource: 'managed',
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
-      metadata: { checkpointId, generation: checkpoint.generation } });
+      metadata: { checkpointId, generation: checkpoint.generation } }));
     if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
     return checkpoint;
   }
 
   async restore(checkpointId: string, provider?: WorldKind, options?: RestoreOptions): Promise<WorldHandle> {
-    const checkpoint = this.store.getWorldCheckpoint(checkpointId);
+    const checkpoint = (await this.store.getWorldCheckpoint(checkpointId));
     if (!checkpoint?.filesystemDelta) throw new Error('checkpoint has no portable filesystem delta');
-    const project = this.store.getProject(checkpoint.projectId);
+    const project = (await this.store.getProject(checkpoint.projectId));
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
-    const executionConfig = this.store.effectiveProjectConfig(project);
+    const executionConfig = (await this.store.effectiveProjectConfig(project));
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     // A checkpoint must be restorable after its sandbox disappears even when a
     // checkout is not a normal project enrollment (the project wiki is the
@@ -176,23 +176,23 @@ export class WorldCheckpointService {
     // that field existed, the durable handle still contains the exact checkout
     // list used to create the vanished generation; project config is the final
     // compatibility fallback for still older single-repo handles.
-    const previousHandle = this.store.currentWorld(checkpoint.worldId) as WorldHandle | undefined;
+    const previousHandle = (await this.store.currentWorld(checkpoint.worldId)) as WorldHandle | undefined;
     const previousRepos = previousHandle ? worldRepos(previousHandle) : [];
     const previousFor = (repo: WorldCheckpoint['repos'][number], index: number) =>
       repo.checkoutPath === '.' ? previousRepos[index]
         : previousRepos.find((candidate) => candidate.name === repo.checkoutPath) ?? previousRepos[index];
-    const sources = checkpoint.repos.map((repo, index) => this.store.getRepository(repo.repositoryId)?.sshUrl
+    const sources = (await __asyncCollections.map(checkpoint.repos, async (repo, index) => (await this.store.getRepository(repo.repositoryId))?.sshUrl
       ?? repo.source ?? (previousFor(repo, index) ? worldRepoSource(previousFor(repo, index)!) : undefined)
-      ?? project.config.repos?.[index]);
+      ?? project.config.repos?.[index]));
     if (sources.some((source) => !source)) throw new Error('checkpoint repository enrollment is missing');
-    const organizationRepositories = this.store.listRepositories(project.organizationId);
-    const repositories = checkpoint.repos.map((repo, index) => this.store.getRepository(repo.repositoryId)
-      ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, sources[index]!)));
+    const organizationRepositories = (await this.store.listRepositories(project.organizationId));
+    const repositories = (await __asyncCollections.map(checkpoint.repos, async (repo, index) => (await this.store.getRepository(repo.repositoryId))
+      ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, sources[index]!))));
     const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
-    const environment = selectProjectEnvironment(this.store, checkpoint.projectId, selected,
-      executionConfig.environment, checkpoint.environment);
+    const environment = (await selectProjectEnvironment(this.store, checkpoint.projectId, selected,
+      executionConfig.environment, checkpoint.environment));
     const primary = checkpoint.repos[0];
-    const linked = this.store.listProjectRepositories(checkpoint.projectId);
+    const linked = (await this.store.listProjectRepositories(checkpoint.projectId));
     const repositoryBranches = Object.fromEntries(checkpoint.repos.map((repo, index) => {
       const source = sources[index]!;
       const previous = previousFor(repo, index);
@@ -225,7 +225,7 @@ export class WorldCheckpointService {
     const hooks = options ?? ambientActivityHooks();
     const acquired = remote
       ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
-        provider: selected, priority: Number(this.store.getTask(checkpoint.worldId)?.params.priority ?? 0),
+        provider: selected, priority: Number((await this.store.getTask(checkpoint.worldId))?.params.priority ?? 0),
         signal: hooks.signal, heartbeat: hooks.heartbeat })
       : undefined;
     let world: World;
@@ -240,7 +240,7 @@ export class WorldCheckpointService {
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
         network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     } catch (error) {
-      if (acquired) this.runners.release(acquired.leaseId, selected);
+      if (acquired) (await this.runners.release(acquired.leaseId, selected));
       throw error;
     }
     try {
@@ -277,16 +277,16 @@ export class WorldCheckpointService {
       // Stamped exactly as createWorld does, so `destroyWorld` finds the lease to
       // release and the world's cost is attributed to the right pool.
       if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
-      const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
+      const registered = (await this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
         { runnerPoolId: acquired?.runnerPoolId ?? checkpoint.runnerPoolId,
-          environmentDigest: environment.digest ?? checkpoint.environmentDigest }) as WorldHandle;
+          environmentDigest: environment.digest ?? checkpoint.environmentDigest })) as WorldHandle;
       world.handle = registered;
       return registered;
     } catch (error) {
       await this.resources?.release(world.handle).catch(() => undefined);
       await destroyWorldServices(checkpoint.worldId).catch(() => undefined);
       await world.destroy().catch(() => undefined);
-      if (acquired) this.runners.release(acquired.leaseId, selected);
+      if (acquired) (await this.runners.release(acquired.leaseId, selected));
       throw error;
     }
   }
@@ -294,13 +294,13 @@ export class WorldCheckpointService {
   /** Apply saved work to a freshly provisioned, independent task. Never registers
    * a new generation of the source world or reuses its branches/resource leases. */
   async applyFork(checkpointId: string, world: World, projectId: string): Promise<void> {
-    const checkpoint = this.store.getWorldCheckpoint(checkpointId);
+    const checkpoint = (await this.store.getWorldCheckpoint(checkpointId));
     if (!checkpoint?.filesystemDelta || checkpoint.projectId !== projectId)
       throw new Error('fork checkpoint is unavailable in this project');
     if (checkpoint.worldId === world.handle.id) throw new Error('fork requires an independent world');
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     const destinations = new Map<string, WorldRepo>();
     for (const repo of checkpoint.repos) {
@@ -332,20 +332,15 @@ export class WorldCheckpointService {
     }
   }
 
-  private key(): Buffer {
+  private async key(): Promise<Buffer> {
+    if (!this.broker.hasHandle(CHECKPOINT_KEY_HANDLE))
+      await this.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
     return Buffer.from(this.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
   }
 
-  private encrypt(plain: Buffer): Buffer {
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', this.key(), iv);
-    const body = Buffer.concat([cipher.update(plain), cipher.final()]);
-    return Buffer.concat([Buffer.from('KMX1'), iv, cipher.getAuthTag(), body]);
-  }
-
-  private decrypt(blob: Buffer): Buffer {
+  private async decrypt(blob: Buffer): Promise<Buffer> {
     if (blob.subarray(0, 4).toString() !== 'KMX1') throw new Error('invalid checkpoint envelope');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', this.key(), blob.subarray(4, 16));
+    const decipher = crypto.createDecipheriv('aes-256-gcm', await this.key(), blob.subarray(4, 16));
     decipher.setAuthTag(blob.subarray(16, 32));
     return Buffer.concat([decipher.update(blob.subarray(32)), decipher.final()]);
   }

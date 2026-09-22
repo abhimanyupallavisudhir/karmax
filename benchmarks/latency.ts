@@ -56,7 +56,7 @@ export async function benchmarkLatency(repeats = 5, live?: ReturnType<typeof liv
   } };
   try {
     h = await bootHarness('mock', live ? live.adapter(connectionIds) : adapter);
-    const project = h.store.createProject('Latency fixture', { worldProvider: 'worktree', openGithubPr: false });
+    const project = (await h.store.createProject('Latency fixture', { worldProvider: 'worktree', openGithubPr: false }));
     let account = 0;
     const backend: ConnectionBackend = {
       catalog: async () => [{ slug: 'fixture', name: 'Fixture' }],
@@ -74,7 +74,7 @@ export async function benchmarkLatency(repeats = 5, live?: ReturnType<typeof liv
     }
     const gateway = await h.startGateway({ serviceConnections: service });
     process.env.KARMAX_GATEWAY_URL = gateway.internalUrl;
-    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
     const api = async (route: string, body?: unknown) => {
       const response = await fetch(gateway.internalUrl + route, { method: body === undefined ? 'GET' : 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -86,30 +86,30 @@ export async function benchmarkLatency(repeats = 5, live?: ReturnType<typeof liv
     const wait = async (taskId: string, count: number) => {
       const deadline = performance.now() + (live ? 180_000 : 30_000);
       while (performance.now() < deadline) {
-        const report = timingReport(h!.store.eventsOfType(taskId, 'timing').map(e => e.payload as unknown as TimingRow));
-        const view = h!.store.getTask(taskId)?.lastView;
+        const report = timingReport((await h!.store.eventsOfType(taskId, 'timing')).map(e => e.payload as unknown as TimingRow));
+        const view = (await h!.store.getTask(taskId))?.lastView;
         if (report.attempts.filter(a => a.status === 'ok').length >= count && view?.stage === 'review') return report;
         if (live && (view?.status === 'failed' || report.attempts.some(a => a.status === 'failed'))) { live.checkpoint({samples,report}); throw Error(`benchmark task failed: ${taskId}`); }
         if (view?.status === 'failed') throw Error(`fixture task failed: ${taskId}`);
         await new Promise(r => setTimeout(r, 25));
       }
-      live?.checkpoint({samples,report:timingReport(h!.store.eventsOfType(taskId, 'timing').map(e => e.payload as unknown as TimingRow))});
+      live?.checkpoint({samples,report:timingReport((await h!.store.eventsOfType(taskId, 'timing')).map(e => e.payload as unknown as TimingRow))});
       throw Error(`fixture turn timed out: ${taskId}`);
     };
     let disabledRecordingRows: number | undefined;
     if (!live) {
       const task = await api(`/api/projects/${project.id}/tasks`, {projectId:project.id,workflow:'just-do',title:'Default-off probe',prompt:'conversation',params:{worldProvider:'worktree',doProvider:'mock'}});
       const deadline = performance.now()+30_000;
-      while (h.store.getTask(task.id)?.lastView?.stage !== 'review') {
+      while ((await h.store.getTask(task.id))?.lastView?.stage !== 'review') {
         if (performance.now()>deadline) throw Error('disabled probe failed');
         await new Promise(r=>setTimeout(r,25));
       }
-      disabledRecordingRows = h.store.eventsOfType(task.id,'timing').length;
+      disabledRecordingRows = (await h.store.eventsOfType(task.id,'timing')).length;
       if (disabledRecordingRows !== 0) throw Error('default-off recorded timing');
       await api(`/api/tasks/${task.id}/signal`,{signal:'cancel'});
       await h.client.workflow.getHandle(task.id).result().catch(()=>{});
     }
-    h.store.setSettings('global', 'timing', { enabled: true });
+    (await h.store.setSettings('global', 'timing', { enabled: true }));
     for (let repeat = 0; repeat < repeats; repeat++) {
       // Rotate scenario order to avoid giving one scenario every initial warmup.
       for (let offset = 0; offset < scenarios.length; offset++) {

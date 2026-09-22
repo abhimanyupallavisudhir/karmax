@@ -104,7 +104,7 @@ async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fet
   const { WorldRegistry } = await import('../src/world/registry.js');
   const { ProfileResolver } = await import('../src/agent/profiles.js');
   const { makeCoreActivities } = await import('../src/activities/core.js');
-  const store = new Store(dbPath);
+  const store = (await Store.create(dbPath));
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
   const core = makeCoreActivities({ store, worlds, adapters: new Map(),
@@ -120,7 +120,7 @@ async function remoteCoreFor(github: { options: { apiBase?: string; fetch?: type
   const { WorldRegistry } = await import('../src/world/registry.js');
   const { ProfileResolver } = await import('../src/agent/profiles.js');
   const { makeCoreActivities } = await import('../src/activities/core.js');
-  const store = new Store(':memory:');
+  const store = (await Store.create(':memory:'));
   const worlds = new WorldRegistry();
   const backing = new WorktreeProvider(path.join(tmp, 'remote-worlds'));
   const active = new Map<string, any>();
@@ -518,10 +518,10 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Provider mirror');
-    const task = core.store.createTask({ projectId: project.id, title: 'Mirror me', workflow: 'software-dev',
-      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Provider mirror'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Mirror me', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const handle = {
       id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_mirror', base: 'main',
       repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', repo, root: repo,
@@ -535,7 +535,7 @@ describe('GitHub-authoritative merge activity', () => {
     });
     expect((await gitOrThrow(repo, ['rev-parse', 'main'])).trim()).toBe(landedSha);
     expect(fs.readFileSync(path.join(repo, 'landed.txt'), 'utf8')).toBe('landed by GitHub\n');
-    expect(core.store.eventsSince(task.id, 0).map((event: any) => event.type)).toEqual(
+    expect((await core.store.eventsSince(task.id, 0)).map((event: any) => event.type)).toEqual(
       expect.arrayContaining(['checkout.synced', 'merge.result']),
     );
   });
@@ -568,15 +568,15 @@ describe('GitHub-authoritative merge activity', () => {
       brokerCredentials: async () => ({ env: {} }),
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Wiki divergence');
-    const wiki = core.store.upsertRepository({
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Wiki divergence'));
+    const wiki = (await core.store.upsertRepository({
       organizationId: project.organizationId!, provider: 'github', providerId: 'wiki-93',
       owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
-    });
-    core.store.setProjectWikiRepository(project.id, wiki.id);
-    const task = core.store.createTask({ projectId: project.id, title: 'Merge wiki memory', workflow: 'software-dev',
-      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    }));
+    (await core.store.setProjectWikiRepository(project.id, wiki.id));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Merge wiki memory', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const handle = {
       id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_wiki', base: 'main',
       repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', role: 'project-wiki', repo, root: repo,
@@ -593,7 +593,7 @@ describe('GitHub-authoritative merge activity', () => {
     const origin = path.join(tmp, 'wiki-divergence-after-merge-origin.git');
     expect((await gitOrThrow(origin, ['show', 'main:canonical-memory.md'])).trim()).toBe('saved through the live wiki');
     expect((await gitOrThrow(origin, ['show', 'main:task-memory.md'])).trim()).toBe('landed through Review');
-    const events = core.store.eventsSince(task.id, 0).map((event: any) => event.type);
+    const events = (await core.store.eventsSince(task.id, 0)).map((event: any) => event.type);
     expect(events).toEqual(expect.arrayContaining(['checkout.synced', 'merge.result']));
     expect(events).not.toContain('checkout.sync-blocked');
   });
@@ -622,10 +622,10 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Dirty provider mirror');
-    const task = core.store.createTask({ projectId: project.id, title: 'Preserve local work', workflow: 'software-dev',
-      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Dirty provider mirror'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Preserve local work', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const handle = {
       id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_dirty_mirror', base: 'main',
       repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', repo, root: repo,
@@ -640,7 +640,7 @@ describe('GitHub-authoritative merge activity', () => {
     });
     expect((await gitOrThrow(repo, ['rev-parse', 'main'])).trim()).toBe(localBefore);
     expect(fs.readFileSync(path.join(repo, 'operator-work.txt'), 'utf8')).toBe('preserve me\n');
-    expect(core.store.eventsSince(task.id, 0).map((event: any) => event.type)).toContain('checkout.sync-blocked');
+    expect((await core.store.eventsSince(task.id, 0)).map((event: any) => event.type)).toContain('checkout.sync-blocked');
   });
 
   it('uses an eligible confirming human and refuses to move beyond the reviewed head', async () => {
@@ -666,16 +666,16 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async (userId: string) => `${userId}-token`,
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Merge authorization');
-    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
-    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
-    const task = core.store.createTask({ projectId: project.id, title: 'Merge me', workflow: 'software-dev',
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Merge authorization'));
+    (await core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member'));
+    (await core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Merge me', workflow: 'software-dev',
       workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
-      createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+      createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
       payload: { userId: 'reviewer', satisfied: true, githubMergeAuthorized: true,
-        githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'reviewed-head' }] } });
+        githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'reviewed-head' }] } }));
     const result = await core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_merge',
       base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 7,
       url: 'https://github.test/acme/widgets/pull/7', state: 'open', headSha: 'reviewed-head' }]);
@@ -692,9 +692,9 @@ describe('GitHub-authoritative merge activity', () => {
     const unapprovedReplacement = await core.mergeGithubPrs({ id: task.id, kind: 'worktree',
       branch: 'karmax/task_merge', base: 'main', repo: tmp, root: tmp } as any, stale.prs);
     expect(unapprovedReplacement).toMatchObject({ status: 'needs-authorizer', eligibleUserIds: ['reviewer'] });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 2,
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 2,
       payload: { userId: 'reviewer', satisfied: true, githubMergeAuthorized: true,
-        githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'replacement-head' }] } });
+        githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'replacement-head' }] } }));
     await expect(core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_merge',
       base: 'main', repo: tmp, root: tmp } as any, stale.prs)).resolves.toMatchObject({
         status: 'merged', actorUserId: 'reviewer',
@@ -723,15 +723,15 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'reviewer-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Conflicting GitHub proposal');
-    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
-    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
-    const task = core.store.createTask({ projectId: project.id, title: 'Repair me', workflow: 'software-dev',
-      workflowVersion: '1.13.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Conflicting GitHub proposal'));
+    (await core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member'));
+    (await core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Repair me', workflow: 'software-dev',
+      workflowVersion: '1.13.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
       payload: { userId: 'reviewer', satisfied: true, githubMergeAuthorized: true,
-        githubPrHeads: [{ slug: SLUG, number: 17, headSha: 'reviewed-head' }] } });
+        githubPrHeads: [{ slug: SLUG, number: 17, headSha: 'reviewed-head' }] } }));
 
     await expect(core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_conflict',
       base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 17,
@@ -768,11 +768,11 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('GitHub policy classification');
-    const task = core.store.createTask({ projectId: project.id, title: 'Classify me', workflow: 'software-dev',
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('GitHub policy classification'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Classify me', workflow: 'software-dev',
       workflowVersion: '1.14.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
-      createdBy: { kind: 'user', userId: 'owner' } });
+      createdBy: { kind: 'user', userId: 'owner' } }));
     const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_policy', base: 'main', repo: tmp, root: tmp } as any;
     const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 21, nodeId: 'PR_policy',
       url: 'https://github.test/acme/widgets/pull/21', state: 'open', headSha: 'reviewed-head' }];
@@ -879,21 +879,21 @@ describe('GitHub-authoritative merge activity', () => {
     };
     const dbPath = path.join(tmp, 'restart-safe.sqlite');
     let core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, dbPath);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Superseded PR CI', { landingAuthority: 'auto' });
-    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'preempted', accountLogin: 'acme', accountType: 'Organization' });
-    const repository = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Superseded PR CI', { landingAuthority: 'auto' }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'preempted', accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: 'preempted-repo', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main',
-      private: true, gitConnectionId: connection.id });
-    core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
-    const task = core.store.createTask({ projectId: project.id, title: 'Do not reopen', workflow: 'software-dev',
+      private: true, gitConnectionId: connection.id }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Do not reopen', workflow: 'software-dev',
       workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
-      createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
       userId: 'owner', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
       githubPrHeads: [{ slug: SLUG, number: 113, headSha: 'pr-head' }],
-    } });
+    } }));
     const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_preempted', base: 'main', repo: tmp, root: tmp } as any;
     const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 113, nodeId: 'PR_preempted',
       url: 'https://github.test/acme/widgets/pull/113', state: 'open', headSha: 'pr-head' }];
@@ -906,7 +906,7 @@ describe('GitHub-authoritative merge activity', () => {
     expect(repeated).toMatchObject({ status: 'waiting',
       detail: 'Waiting for CI' });
     expect(repeated).not.toHaveProperty('releaseAdmission');
-    expect(core.store.eventsSince(task.id, 0)
+    expect((await core.store.eventsSince(task.id, 0))
       .filter((event) => event.type === 'github.ci.terminal-observed')).toHaveLength(1);
     expect(reruns).toBe(1);
 
@@ -934,7 +934,7 @@ describe('GitHub-authoritative merge activity', () => {
     const bounded = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
     expect(bounded).toMatchObject({ status: 'waiting', detail: expect.stringMatching(/bounded exact-head reconciliation/i) });
     expect(reruns).toBe(1);
-    core.store.close();
+    (await core.store.close());
     core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, dbPath);
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
       status: 'waiting', detail: 'Waiting for CI',
@@ -966,7 +966,7 @@ describe('GitHub-authoritative merge activity', () => {
         expect(outcome.waitReason).not.toMatch(/billing|approval/);
       }
     }
-    expect(core.store.eventsSince(task.id, 0).filter(event => event.type === 'github.ci.repair-requested')).toHaveLength(0);
+    expect((await core.store.eventsSince(task.id, 0)).filter(event => event.type === 'github.ci.repair-requested')).toHaveLength(0);
     readiness.statusCheckRollup.contexts.nodes = [{ __typename: 'CheckRun', name: 'CI',
       status: 'COMPLETED', conclusion: 'CANCELLED', detailsUrl: `https://github.com/${SLUG}/actions/runs/44` }];
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
@@ -1057,14 +1057,14 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Legacy GitHub conflict');
-    const task = core.store.createTask({ projectId: project.id, title: 'Unstick me', workflow: 'software-dev',
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Legacy GitHub conflict'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Unstick me', workflow: 'software-dev',
       workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
-      createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+      createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
       payload: { userId: 'owner', satisfied: true, githubMergeAuthorized: true,
-        githubPrHeads: [{ slug: SLUG, number: 23, headSha: 'reviewed-head' }] } });
+        githubPrHeads: [{ slug: SLUG, number: 23, headSha: 'reviewed-head' }] } }));
     const ref = { repo: 'widgets', slug: SLUG, number: 23, nodeId: 'PR_legacy_conflict',
       url: 'https://github.test/acme/widgets/pull/23', state: 'open', headSha: 'reviewed-head' } as TaskPullRequest;
     const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_legacy_conflict', base: 'main', repo: tmp, root: tmp } as any;
@@ -1126,16 +1126,16 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'reviewer-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Intent-authorized landing');
-    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
-    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
-    const task = core.store.createTask({ projectId: project.id, title: 'Land me', workflow: 'software-dev',
-      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Intent-authorized landing'));
+    (await core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member'));
+    (await core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Land me', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
       userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
       githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
-    } });
+    } }));
     const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_landing', base: 'main', repo: tmp, root: tmp } as any;
     const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 31, nodeId: 'PR_landing',
       url: 'https://github.test/acme/widgets/pull/31', state: 'open', headSha: 'reviewed-head' }];
@@ -1156,10 +1156,10 @@ describe('GitHub-authoritative merge activity', () => {
     });
 
     // A new full Review restores intent authorization after CHANGES_REQUESTED.
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 2, payload: {
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 2, payload: {
       userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
       githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
-    } });
+    } }));
     readiness = { mergeStateStatus: 'BEHIND', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'submit' })).resolves.toMatchObject({
       status: 'queued', providerQueue: { state: 'queued' },
@@ -1213,12 +1213,12 @@ describe('GitHub-authoritative merge activity', () => {
     liveHead = 'reviewed-head';
     readiness = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
     refUpdateMessage = undefined;
-    const task17 = core.store.createTask({ projectId: project.id, title: 'Front-held landing', workflow: 'software-dev',
-      workflowVersion: '1.17.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task17.id, type: 'task.confirmation-voted', ts: 3, payload: {
+    const task17 = (await core.store.createTask({ projectId: project.id, title: 'Front-held landing', workflow: 'software-dev',
+      workflowVersion: '1.17.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task17.id, type: 'task.confirmation-voted', ts: 3, payload: {
       userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
       githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
-    } });
+    } }));
     const handle17 = { ...handle, id: task17.id };
     const enqueueBefore = requests.filter((request) => request.query?.includes('enqueuePullRequest')).length;
     const patchBefore = requests.filter((request) => request.method === 'PATCH').length;
@@ -1300,16 +1300,16 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'reviewer-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Fair landing', { landingAuthority: 'auto' });
-    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
-    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
-    const task = core.store.createTask({ projectId: project.id, title: 'Land fairly', workflow: 'software-dev',
-      workflowVersion: '1.20.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Fair landing', { landingAuthority: 'auto' }));
+    (await core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member'));
+    (await core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Land fairly', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
       userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
       githubPrHeads: [{ slug: SLUG, number: 40, headSha: 'reviewed-head' }],
-    } });
+    } }));
     const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_fair', base: 'main', repo: tmp, root: tmp } as any;
     const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 40, nodeId: 'PR_fair',
       url: 'https://github.test/acme/widgets/pull/40', state: 'open', headSha: 'reviewed-head' }];
@@ -1343,9 +1343,9 @@ describe('GitHub-authoritative merge activity', () => {
     expect(failed).not.toHaveProperty('landingOwner');
 
     const enqueuedAt = Date.now();
-    core.store.appendEvent({ taskId: task.id, type: 'github.pr.queued', ts: enqueuedAt, payload: {
+    (await core.store.appendEvent({ taskId: task.id, type: 'github.pr.queued', ts: enqueuedAt, payload: {
       slug: SLUG, number: 40, headSha: 'mechanically-updated-head',
-    } });
+    } }));
     readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
       timelineItems: { nodes: [{ createdAt: new Date(enqueuedAt + 1_000).toISOString(),
@@ -1405,10 +1405,10 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('External landing', { landingAuthority: 'external' });
-    const task = core.store.createTask({ projectId: project.id, title: 'Observe me', workflow: 'software-dev',
-      workflowVersion: '1.20.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('External landing', { landingAuthority: 'external' }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Observe me', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const ref = { repo: 'widgets', slug: SLUG, number: 41, nodeId: 'PR_external',
       url: 'https://github.test/acme/widgets/pull/41', state: 'open', headSha: 'external-head' } as TaskPullRequest;
 
@@ -1470,17 +1470,17 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Participant landing', { landingAuthority: 'auto' });
-    const task = core.store.createTask({ projectId: project.id, title: 'Land both', workflow: 'software-dev',
-      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Participant landing', { landingAuthority: 'auto' }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Land both', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const refs: TaskPullRequest[] = [51, 52].map((number) => ({ repo: `service-${number}`, slug: slugFor(number), number,
       nodeId: `PR_${number}`, url: `https://github.test/${slugFor(number)}/pull/${number}`,
       state: 'open', headSha: headFor(number) }));
-    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
       userId: 'owner', satisfied: true, githubMergeIntentAuthorized: true,
       githubPrHeads: refs.map(({ slug, number, headSha }) => ({ slug, number, headSha })),
-    } });
+    } }));
 
     const failed = await core.mergeGithubPrs({ id: task.id } as any, refs, { mode: 'preflight', authority: 'auto' });
     expect(failed).toMatchObject({ status: 'needs-revision', repair: { kind: 'ci' } });
@@ -1522,16 +1522,16 @@ describe('GitHub-authoritative merge activity', () => {
     fs.writeFileSync(path.join(localRepo, 'base.txt'), 'base\n');
     await git(localRepo, ['add', '-A']);
     await git(localRepo, ['commit', '-q', '-m', 'init']);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Hybrid fail closed', { repos: [githubRepo, localRepo], remote: 'pr' });
-    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: 'hybrid-installation', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Hybrid fail closed', { repos: [githubRepo, localRepo], remote: 'pr' }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'hybrid-installation', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: 'hybrid-repo', owner: 'acme', name: 'hybrid', sshUrl: 'git@github.com:acme/hybrid.git',
-      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = core.store.createTask({ projectId: project.id, title: 'Hybrid', workflow: 'software-dev',
-      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Hybrid', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repos: [githubRepo, localRepo],
       base: 'main', target: 'main', kind: 'worktree' });
     for (const repo of handle.repos!.filter((candidate: any) => candidate.role !== 'project-wiki')) {
@@ -1555,10 +1555,10 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('GitHub error classification');
-    const task = core.store.createTask({ projectId: project.id, title: 'Retry me', workflow: 'software-dev',
-      workflowVersion: '1.14.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('GitHub error classification'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Retry me', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const ref = { repo: 'widgets', slug: SLUG, number: 22, url: 'https://github.test/acme/widgets/pull/22',
       state: 'open', headSha: 'reviewed-head' } as TaskPullRequest;
     const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_error', base: 'main', repo: tmp, root: tmp } as any;
@@ -1596,11 +1596,11 @@ describe('GitHub-authoritative merge activity', () => {
       userAccessToken: async () => 'owner-token',
     };
     const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Auto merge');
-    const task = core.store.createTask({ projectId: project.id, title: 'Auto merge me', workflow: 'software-dev',
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Auto merge'));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Auto merge me', workflow: 'software-dev',
       workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
-      createdBy: { kind: 'user', userId: 'owner' } });
+      createdBy: { kind: 'user', userId: 'owner' } }));
     await expect(core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_auto',
       base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 8,
       url: 'https://github.test/acme/widgets/pull/8', state: 'open', headSha: 'exact-head' }]))
@@ -1711,16 +1711,16 @@ describe('PR stage (remote policy "pr")', () => {
       },
       async repositoryCloneToken() { return 'clone-token'; },
     });
-    core.store.claimPersonalOrganization('jane');
-    const project = core.store.createProject('Connected', { repos: [repo] });
-    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    (await core.store.claimPersonalOrganization('jane'));
+    const project = (await core.store.createProject('Connected', { repos: [repo] }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
-      gitConnectionId: connection.id });
-    core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = core.store.createTask({ projectId: project.id, title: 'Connected PR', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } });
+      gitConnectionId: connection.id }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Connected PR', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } }));
 
     const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
       base: 'main', target: 'main', kind: 'worktree' });
@@ -1758,16 +1758,16 @@ describe('PR stage (remote policy "pr")', () => {
       repositoryCloneToken: async () => 'clone-token',
       brokerCredentials: transport,
     });
-    core.store.claimPersonalOrganization('jane');
-    const project = core.store.createProject('Missing human identity', { repos: [repo] });
-    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    const enrolled = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    (await core.store.claimPersonalOrganization('jane'));
+    const project = (await core.store.createProject('Missing human identity', { repos: [repo] }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
-      gitConnectionId: connection.id });
-    core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
-    const task = core.store.createTask({ projectId: project.id, title: 'Missing identity', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } });
+      gitConnectionId: connection.id }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Missing identity', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } }));
     const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
       base: 'main', target: 'main', kind: 'worktree' });
     await fs.promises.writeFile(path.join(handle.root, 'change.txt'), 'x');
@@ -1796,16 +1796,16 @@ describe('PR stage (remote policy "pr")', () => {
         return { httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' } };
       },
     });
-    core.store.claimPersonalOrganization('jane');
-    const project = core.store.createProject('Connected local', { repos: [repo] });
-    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+    (await core.store.claimPersonalOrganization('jane'));
+    const project = (await core.store.createProject('Connected local', { repos: [repo] }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
       providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
-      gitConnectionId: connection.id });
-    expect(core.store.listProjectRepositories(project.id)).toHaveLength(0);
-    const task = core.store.createTask({ projectId: project.id, title: 'Connected local PR', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } });
+      gitConnectionId: connection.id }));
+    expect((await core.store.listProjectRepositories(project.id))).toHaveLength(0);
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Connected local PR', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } }));
 
     const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
       base: 'main', target: 'main', kind: 'worktree' });
@@ -1865,19 +1865,19 @@ describe('PR stage (remote policy "pr")', () => {
         return { env: {} };
       },
     }, content);
-    core.store.claimPersonalOrganization('owner');
-    const project = core.store.createProject('Local source', { repos: [app], worldProvider: 'fake-remote' });
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Local source', { repos: [app], worldProvider: 'fake-remote' }));
     const wikiRoot = ensureProjectWikiRepository(content, project.id);
     await gitOrThrow(tmp, ['init', '-q', '--bare', '-b', 'main', wikiOrigin]);
     await gitOrThrow(wikiRoot, ['remote', 'add', 'origin', wikiRemote]);
     await gitOrThrow(wikiRoot, ['config', `url.${wikiOrigin}.insteadOf`, wikiRemote]);
     await gitOrThrow(wikiRoot, ['push', '-q', 'origin', 'main']);
     await gitOrThrow(wikiRoot, ['config', '--unset-all', `url.${wikiOrigin}.insteadOf`]);
-    const wiki = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
-      owner: 'acme', name: 'project-wiki', sshUrl: wikiRemote, defaultBranch: 'main', private: true });
-    core.store.setProjectWikiRepository(project.id, wiki.id);
-    const task = core.store.createTask({ projectId: project.id, title: 'Cloud PR', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } });
+    const wiki = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      owner: 'acme', name: 'project-wiki', sshUrl: wikiRemote, defaultBranch: 'main', private: true }));
+    (await core.store.setProjectWikiRepository(project.id, wiki.id));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Cloud PR', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } }));
     const handle = await core.createWorld({ taskId: task.id, repo: app, base: 'main', target: 'main', kind: 'fake-remote' });
     for (const [index, repo] of handle.repos!.entries()) {
       await fs.promises.writeFile(path.join(repo.root, `change-${index}.txt`), 'x');
@@ -1945,8 +1945,8 @@ describe('PR stage (remote policy "pr")', () => {
     const core = await coreFor(gh);
     // An organization other than the migrated personal one never borrows the
     // host's login (PLAN-git-config §2.3), so with no profile there is no token.
-    const org = core.store.createOrganization({ name: 'Acme' });
-    const project = core.store.createProject('Org project', {}, org.id);
+    const org = (await core.store.createOrganization({ name: 'Acme' }));
+    const project = (await core.store.createProject('Org project', {}, org.id));
     const repo = await repoWithGithubOrigin('nocred');
     const handle = await core.createWorld({ taskId: 'task_pr3', projectId: project.id, repo,
       base: 'main', target: 'main', kind: 'worktree' });

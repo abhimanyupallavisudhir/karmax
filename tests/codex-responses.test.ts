@@ -75,6 +75,25 @@ describe('CodexAdapter Responses API path (API key)', () => {
     expect(seen[1].previous_response_id).toBe('resp_1');
   });
 
+  it('acknowledges completion tool outputs before returning a resumable session at the turn cap', async () => {
+    queue = [
+      completed('resp_complete_call', '', [{ type: 'function_call', call_id: 'finish', name: 'signal_completion', arguments: '{}' }]),
+      completed('resp_ack', 'Finished'),
+      completed('resp_resumed', 'Continued'),
+    ];
+    let completions = 0;
+    const ctx = { emit: () => {}, signalCompletion: () => { completions++; } } as any;
+    const result = await adapter.runTurn(makeInput({ maxTurns: 1 }) as any, ctx);
+    expect(completions).toBe(1);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({ previous_response_id: 'resp_complete_call', tool_choice: 'none',
+      input: [{ type: 'function_call_output', call_id: 'finish' }] });
+    expect(result.session).toBe('resp_ack');
+    expect(result.termination).toMatchObject({ kind: 'success', reason: 'signal_completion' });
+    await adapter.runTurn(makeInput({ session: result.session }) as any, ctx);
+    expect(seen[2].previous_response_id).toBe('resp_ack');
+  });
+
   it('sends the system prompt when RESUMING a prior session', async () => {
     queue = [completed('resp_9', 'resumed')];
     await adapter.runTurn(makeInput({ session: 'resp_prior' }) as any, { emit: () => {} } as any);

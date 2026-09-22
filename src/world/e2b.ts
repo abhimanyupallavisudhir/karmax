@@ -1,3 +1,4 @@
+import { timed } from '../timing/index.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type {
@@ -99,7 +100,7 @@ export class E2BWorldProvider implements WorldProvider {
     private factory: E2BFactory = defaultE2BFactory(),
     private idleMs = envPositiveInt('KARMAX_E2B_IDLE_MS', DEFAULT_IDLE_MS),
     private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_TEMPLATE,
-    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection,
+    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
   ) {
     // Hosted deployments must set KARMAX_WORLD_REF_KEY. E2B_API_KEY is a stable
@@ -111,7 +112,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   async create(spec: WorldSpec): Promise<World> {
-    const connection = this.connection(spec.organizationId);
+    const connection = (await this.connection(spec.organizationId));
     const flavor = spec.environment?.flavor ?? 'headless';
     const selectedTemplate = flavor === 'desktop'
       ? spec.environment?.template ?? spec.environment?.snapshot ?? connection?.config.desktopTemplate ?? this.desktopTemplate
@@ -222,11 +223,11 @@ export class E2BWorldProvider implements WorldProvider {
     const sandboxId = reference.sandboxId;
     let sandbox = this.sandboxes.get(sandboxId);
     if (!sandbox || this.states.get(sandboxId) === 'parked') {
-      const connection = this.connection(reference.organizationId);
-      sandbox = await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
+      const connection = await this.connection(reference.organizationId);
+      sandbox = await timed('e2b.connect', () => this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
         requestTimeoutMs: envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
         ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
-        ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
+        ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) }));
       this.sandboxes.set(sandboxId, sandbox);
     }
     this.states.set(sandboxId, 'ready');
@@ -237,12 +238,12 @@ export class E2BWorldProvider implements WorldProvider {
     const reference = this.refOf(handle);
     const sandboxId = reference.sandboxId;
     if (this.states.get(sandboxId) === 'parked') return handle;
-    const connection = this.connection(reference.organizationId);
+    const connection = (await this.connection(reference.organizationId));
     const sandbox = this.sandboxes.get(sandboxId) ?? await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
       requestTimeoutMs: envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
       ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
-    await sandbox.pause();
+    await timed('e2b.pause', () => sandbox.pause());
     this.sandboxes.set(sandboxId, sandbox);
     this.states.set(sandboxId, 'parked');
     return handle;
@@ -259,7 +260,7 @@ export class E2BWorldProvider implements WorldProvider {
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
     if (!this.factory.info) return undefined;
     const reference = this.refOf(handle);
-    const connection = this.connection(reference.organizationId);
+    const connection = (await this.connection(reference.organizationId));
     try {
       const info = await this.factory.info(reference.sandboxId, connection?.apiKey ? { apiKey: connection.apiKey } : {});
       const state = String(info?.state ?? '').toLowerCase();
@@ -277,7 +278,7 @@ export class E2BWorldProvider implements WorldProvider {
    * shared E2B account's other tenants are never even enumerated. */
   async listSandboxes(organizationId?: string): Promise<ProviderSandboxRef[]> {
     if (!this.factory.list) return [];
-    const connection = this.connection(organizationId);
+    const connection = (await this.connection(organizationId));
     const apiKey = connection?.apiKey ? { apiKey: connection.apiKey } : {};
     const listed = await this.factory.list({ ...apiKey, metadata: { karmaxHome: serviceHomeLabel() } });
     return listed.map((sandbox) => ({
@@ -301,7 +302,7 @@ export class E2BWorldProvider implements WorldProvider {
    * admission capacity and can outlive an auto-paused sandbox by days. */
   async listUsageEvents(organizationId: string): Promise<ProviderUsageEvent[]> {
     if (!this.factory.events) return [];
-    const connection = this.connection(organizationId);
+    const connection = (await this.connection(organizationId));
     const events = await this.factory.events(connection?.apiKey ? { apiKey: connection.apiKey } : {});
     const home = serviceHomeLabel();
     const normalized: ProviderUsageEvent[] = [];
@@ -392,8 +393,8 @@ export class E2BWorldProvider implements WorldProvider {
     return this.factory.connect(matches[0]!.sandboxId, options);
   }
 
-  private connection(organizationId: string | undefined): ResolvedWorldProviderConnection | undefined {
-    if (this.resolveConnection) return this.resolveConnection(organizationId, this.kind);
+  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection | undefined> {
+    if (this.resolveConnection) return (await this.resolveConnection(organizationId, this.kind));
     return process.env.E2B_API_KEY ? { organizationId, provider: this.kind, apiKey: process.env.E2B_API_KEY,
       config: { template: this.template, desktopTemplate: this.desktopTemplate } } : undefined;
   }

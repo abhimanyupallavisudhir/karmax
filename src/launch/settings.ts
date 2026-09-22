@@ -80,20 +80,20 @@ export class PaidLaunchSettingsService {
   constructor(private store: Pick<Store, 'kvGet' | 'kvSet'>, private broker: CredentialBroker,
     private env: NodeJS.ProcessEnv = process.env) {}
 
-  stored(): StoredPaidLaunchSettings {
+  async stored(): Promise<StoredPaidLaunchSettings> {
     try {
-      const value = JSON.parse(this.store.kvGet(PAID_LAUNCH_SETTINGS_KEY) ?? '{}');
+      const value = JSON.parse((await this.store.kvGet(PAID_LAUNCH_SETTINGS_KEY)) ?? '{}');
       return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
     } catch { return {}; }
   }
 
-  launchConfig() { return launchConfig(this.env, this.stored()); }
-  publicLaunchInfo(siteName?: string) { return publicLaunchInfo(this.env, this.stored(), siteName); }
-  assertReady() { return assertPaidLaunchReady(this.env, this.stored()); }
-  policyDocument(slug: string, siteName?: string) { return policyDocument(slug, this.env, this.stored(), siteName); }
+  async launchConfig() { return launchConfig(this.env, (await this.stored())); }
+  async publicLaunchInfo(siteName?: string) { return publicLaunchInfo(this.env, (await this.stored()), siteName); }
+  async assertReady() { return assertPaidLaunchReady(this.env, (await this.stored())); }
+  async policyDocument(slug: string, siteName?: string) { return policyDocument(slug, this.env, (await this.stored()), siteName); }
 
-  subscriptionConfig(): SubscriptionRuntimeConfig {
-    const stripe = this.stored().stripe ?? {};
+  async subscriptionConfig(): Promise<SubscriptionRuntimeConfig> {
+    const stripe = (await this.stored()).stripe ?? {};
     const secret = (handle: string, fallback: string | undefined) => this.broker.hasHandle(handle)
       ? this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }) : clean(fallback);
     return {
@@ -108,10 +108,10 @@ export class PaidLaunchSettingsService {
     };
   }
 
-  status(publicUrl: string) {
-    const stored = this.stored();
-    const launch = this.launchConfig();
-    const stripe = this.subscriptionConfig();
+  async status(publicUrl: string) {
+    const stored = (await this.stored());
+    const launch = (await this.launchConfig());
+    const stripe = (await this.subscriptionConfig());
     const billingMissing = [
       ['Stripe secret key', stripe.secretKey], ['Stripe webhook signing secret', stripe.webhookSecret],
       ['Individual price ID', stripe.individualPriceId], ['Team base price ID', stripe.teamBasePriceId],
@@ -143,12 +143,12 @@ export class PaidLaunchSettingsService {
       completedTasks: (stored.completedTasks ?? []).filter((id) => taskIds.has(id)),
       tasks: FOUNDER_TASKS,
       canEnable: launch.ready && billingMissing.length === 0,
-      source: this.store.kvGet(PAID_LAUNCH_SETTINGS_KEY) ? 'installation-settings' : 'environment-bootstrap',
+      source: (await this.store.kvGet(PAID_LAUNCH_SETTINGS_KEY)) ? 'installation-settings' : 'environment-bootstrap',
     };
   }
 
-  configure(input: Record<string, unknown>, publicUrl: string) {
-    const current = this.stored();
+  async configure(input: Record<string, unknown>, publicUrl: string) {
+    const current = (await this.stored());
     const stripeInput = input.stripe && typeof input.stripe === 'object' && !Array.isArray(input.stripe)
       ? input.stripe as Record<string, unknown> : {};
     const contactsInput = input.contacts && typeof input.contacts === 'object' && !Array.isArray(input.contacts)
@@ -166,8 +166,8 @@ export class PaidLaunchSettingsService {
       throw new Error('Stripe secret key must be an sk_test_… or sk_live_… key');
     if (webhookSecret && !/^whsec_\S+$/.test(webhookSecret))
       throw new Error('Stripe webhook signing secret must start with whsec_');
-    if (secretKey) this.broker.registerHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey);
-    if (webhookSecret) this.broker.registerHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret);
+    if (secretKey) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey));
+    if (webhookSecret) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret));
     const next: StoredPaidLaunchSettings = {
       paidLaunch: input.paidLaunch === true,
       founderReviewedPolicyVersion: input.founderReviewed === true ? POLICY_VERSION : undefined,
@@ -189,10 +189,10 @@ export class PaidLaunchSettingsService {
         ? [...new Set(input.completedTasks.filter((value): value is string => typeof value === 'string' && taskIds.has(value)))]
         : current.completedTasks ?? [],
     };
-    this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify(next));
-    const status = this.status(publicUrl);
+    (await this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify(next)));
+    const status = (await this.status(publicUrl));
     if (next.paidLaunch && !status.canEnable) {
-      this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify({ ...next, paidLaunch: false }));
+      (await this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify({ ...next, paidLaunch: false })));
       throw new Error(`Paid checkout cannot be enabled yet: ${[...status.missing, ...status.stripe.missing].join(', ')}`);
     }
     return status;

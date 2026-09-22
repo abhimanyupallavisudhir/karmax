@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { describe, it, expect } from 'vitest';
 import {
   AgentMail,
@@ -17,7 +18,7 @@ import {
 
 function memStore(): AgentMailStore {
   const kv = new Map<string, string>();
-  return { kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v) };
+  return { transaction: memoryTransaction(kv), kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v) };
 }
 
 describe('agent mail code/link extraction (§8)', () => {
@@ -35,31 +36,31 @@ describe('agent mail code/link extraction (§8)', () => {
 });
 
 describe('AgentMail inbox (per-organization tenancy)', () => {
-  it('mints one stable address per organization (agent.local without a domain)', () => {
+  it('mints one stable address per organization (agent.local without a domain)', async () => {
     const store = memStore();
     const mail = new AgentMail(store);
-    const a = mail.address('org_a');
-    const b = mail.address('org_b');
+    const a = (await mail.address('org_a'));
+    const b = (await mail.address('org_b'));
     expect(a).toMatch(/^agent-[0-9a-f]{12}@agent\.local$/);
-    expect(mail.address('org_a')).toBe(a); // stable
+    expect((await mail.address('org_a'))).toBe(a); // stable
     expect(b).not.toBe(a); // distinct per tenant
     expect(mail.configured()).toBe(false);
     expect(new AgentMail(store, 'agents.example.com').configured()).toBe(true);
   });
 
-  it('routes ingest by recipient and keeps tenants isolated', () => {
+  it('routes ingest by recipient and keeps tenants isolated', async () => {
     const mail = new AgentMail(memStore());
-    const a = mail.address('org_a');
-    const b = mail.address('org_b');
-    expect(mail.ingest({ from: 'noreply@github.com', to: a, subject: 'Confirm', text: 'code 112233\nhttps://github.com/verify/x' }).delivered).toBe(true);
-    expect(mail.ingest({ from: 'noreply@vercel.com', to: b, subject: 'Welcome', text: 'code 445566' }).delivered).toBe(true);
+    const a = (await mail.address('org_a'));
+    const b = (await mail.address('org_b'));
+    expect((await mail.ingest({ from: 'noreply@github.com', to: a, subject: 'Confirm', text: 'code 112233\nhttps://github.com/verify/x' })).delivered).toBe(true);
+    expect((await mail.ingest({ from: 'noreply@vercel.com', to: b, subject: 'Welcome', text: 'code 445566' })).delivered).toBe(true);
     // subaddress tags route to the base mailbox
-    expect(mail.ingest({ from: 'x@y.com', to: a.replace('@', '+github@'), text: 'tagged' }).delivered).toBe(true);
+    expect((await mail.ingest({ from: 'x@y.com', to: a.replace('@', '+github@'), text: 'tagged' })).delivered).toBe(true);
     // unknown recipients are dropped, not leaked into any tenant
-    expect(mail.ingest({ from: 'x@y.com', to: 'stranger@agent.local', text: 'code 999999' }).delivered).toBe(false);
+    expect((await mail.ingest({ from: 'x@y.com', to: 'stranger@agent.local', text: 'code 999999' })).delivered).toBe(false);
 
-    const inboxA = mail.recent('org_a');
-    const inboxB = mail.recent('org_b');
+    const inboxA = (await mail.recent('org_a'));
+    const inboxB = (await mail.recent('org_b'));
     expect(inboxA.map((m) => m.from)).toEqual(['x@y.com', 'noreply@github.com']);
     expect(inboxB.map((m) => m.from)).toEqual(['noreply@vercel.com']);
     expect(inboxA.find((m) => m.from.includes('github'))!.code).toBe('112233');
@@ -69,37 +70,37 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     expect(JSON.stringify(inboxB)).not.toContain('112233');
   });
 
-  it('domain-free hosted path: orgs ride +tags on one fixed provider address', () => {
+  it('domain-free hosted path: orgs ride +tags on one fixed provider address', async () => {
     const store = memStore();
     const mail = new AgentMail(store, 'inbound.postmarkapp.com', 'ab12cd');
-    const a = mail.address('org_a');
+    const a = (await mail.address('org_a'));
     expect(a).toMatch(/^ab12cd\+agent-[0-9a-f]{12}@inbound\.postmarkapp\.com$/);
     // routes on the exact local, and on the tag alone (provider may rewrite base)
-    expect(mail.ownerOf(a)).toBe('org_a');
-    expect(mail.ownerOf(a.replace('ab12cd+', 'whatever+'))).toBe('org_a');
-    expect(mail.ingest({ from: 'x@y.com', to: a, text: 'code 123456' }).delivered).toBe(true);
+    expect((await mail.ownerOf(a))).toBe('org_a');
+    expect((await mail.ownerOf(a.replace('ab12cd+', 'whatever+')))).toBe('org_a');
+    expect((await mail.ingest({ from: 'x@y.com', to: a, text: 'code 123456' })).delivered).toBe(true);
   });
 
-  it('provider switch migrates the address, preserving the org token', () => {
+  it('provider switch migrates the address, preserving the org token', async () => {
     const store = memStore();
-    const before = new AgentMail(store, undefined).address('org_a');
+    const before = (await new AgentMail(store, undefined).address('org_a'));
     const token = before.match(/agent-[0-9a-f]+/)![0];
-    const after = new AgentMail(store, 'agents.myco.com').address('org_a');
+    const after = (await new AgentMail(store, 'agents.myco.com').address('org_a'));
     expect(after).toBe(`${token}@agents.myco.com`);
-    const fixed = new AgentMail(store, 'inbound.svc.com', 'base1').address('org_a');
+    const fixed = (await new AgentMail(store, 'inbound.svc.com', 'base1').address('org_a'));
     expect(fixed).toBe(`base1+${token}@inbound.svc.com`);
     // mail addressed to ANY historical form still routes to the org
-    expect(new AgentMail(store).ownerOf(before)).toBe('org_a');
-    expect(new AgentMail(store).ownerOf(fixed)).toBe('org_a');
+    expect((await new AgentMail(store).ownerOf(before))).toBe('org_a');
+    expect((await new AgentMail(store).ownerOf(fixed))).toBe('org_a');
   });
 
-  it('filters by match and since', () => {
+  it('filters by match and since', async () => {
     const mail = new AgentMail(memStore());
-    const a = mail.address('org_a');
-    mail.ingest({ from: 'noreply@github.com', to: a, text: 'one', receivedAt: 1000 });
-    mail.ingest({ from: 'noreply@vercel.com', to: a, text: 'two', receivedAt: 2000 });
-    expect(mail.recent('org_a', { match: 'github' })).toHaveLength(1);
-    expect(mail.recent('org_a', { since: 1500 }).map((m) => m.from)).toEqual(['noreply@vercel.com']);
+    const a = (await mail.address('org_a'));
+    (await mail.ingest({ from: 'noreply@github.com', to: a, text: 'one', receivedAt: 1000 }));
+    (await mail.ingest({ from: 'noreply@vercel.com', to: a, text: 'two', receivedAt: 2000 }));
+    expect((await mail.recent('org_a', { match: 'github' }))).toHaveLength(1);
+    expect((await mail.recent('org_a', { since: 1500 })).map((m) => m.from)).toEqual(['noreply@vercel.com']);
   });
 });
 
@@ -157,25 +158,25 @@ describe('webhook body parsers + secret + worker script', () => {
     expect(fields.text).toBe('code 456789');
     expect(fields.file).toBeUndefined();
   });
-  it('mints a stable per-organization ingest secret that only reaches that organization', () => {
+  it('mints a stable per-organization ingest secret that only reaches that organization', async () => {
     const store = memStore();
-    const s = ingestSecret(store, 'org_a');
+    const s = (await ingestSecret(store, 'org_a'));
     expect(s.length).toBeGreaterThan(15);
-    expect(ingestSecret(store, 'org_a')).toBe(s);
-    expect(ingestSecret(store, 'org_b')).not.toBe(s);
-    expect(ingestScope(store, s)).toEqual({ organizationId: 'org_a' });
-    expect(ingestScope(store, 'nope')).toBeUndefined();
-    expect(ingestScope(store, undefined)).toBeUndefined();
+    expect((await ingestSecret(store, 'org_a'))).toBe(s);
+    expect((await ingestSecret(store, 'org_b'))).not.toBe(s);
+    expect((await ingestScope(store, s))).toEqual({ organizationId: 'org_a' });
+    expect((await ingestScope(store, 'nope'))).toBeUndefined();
+    expect((await ingestScope(store, undefined))).toBeUndefined();
     // the installation-wide secret earlier releases minted keeps working, for every organization
-    store.kvSet('agent-mail:secret', 'legacy-secret');
-    expect(ingestScope(store, 'legacy-secret')).toEqual({});
-    expect(ingestScope(store, 'env-secret', 'env-secret')).toEqual({});
+    (await store.kvSet('agent-mail:secret', 'legacy-secret'));
+    expect((await ingestScope(store, 'legacy-secret'))).toEqual({});
+    expect((await ingestScope(store, 'env-secret', 'env-secret'))).toEqual({});
     // a message for org_b's address is dropped when delivered with org_a's secret
     const mail = new AgentMail(store);
-    const b = mail.address('org_b');
-    expect(mail.ingest({ from: 'x@y.z', to: b, text: 'code 123456' }, 'org_a').delivered).toBe(false);
-    expect(mail.ingest({ from: 'x@y.z', to: b, text: 'code 123456' }, 'org_b').delivered).toBe(true);
-    expect(mail.ingest({ from: 'x@y.z', to: b, text: 'code 654321' }).delivered).toBe(true);
+    const b = (await mail.address('org_b'));
+    expect((await mail.ingest({ from: 'x@y.z', to: b, text: 'code 123456' }, 'org_a')).delivered).toBe(false);
+    expect((await mail.ingest({ from: 'x@y.z', to: b, text: 'code 123456' }, 'org_b')).delivered).toBe(true);
+    expect((await mail.ingest({ from: 'x@y.z', to: b, text: 'code 654321' })).delivered).toBe(true);
   });
   it('the Cloudflare worker script embeds the full webhook URL and relays raw MIME', () => {
     const script = cloudflareWorkerScript('https://kx.example/api/agent-mail/ingest?secret=abc');

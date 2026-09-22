@@ -109,6 +109,11 @@ export async function createBackup(options: {
       if (component === 'temporal' || component === 'objects' || component === 'state') continue;
       if (component === 'config-homes')
         await copyConfigHomes(path.join(home, component), path.join(payload, component));
+      else if (component === 'vault')
+        // A crash during atomic key publication may leave a private temporary
+        // key. Never export it, including when excludeSecrets is requested.
+        copyTree(path.join(home, component), path.join(payload, component),
+          file => !/^vault\.key\..*\.tmp$/.test(path.basename(file)));
       else copyTree(path.join(home, component), path.join(payload, component));
     }
 

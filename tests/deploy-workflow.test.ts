@@ -20,6 +20,10 @@ describe('post-push deployment to the public instance', () => {
     expect(ciSource).toContain('unexpected key "queue"');
   });
 
+  it('includes standalone UI and browser regressions in the required CI job', () => {
+    expect(ci.jobs.test.steps.some((step: any) => step.run === 'node --test --test-concurrency=1 web/*.test.cjs')).toBe(true);
+  });
+
   it('exists, so a landed commit reaches the VPS without anyone SSHing in by hand', () => {
     expect(deploy).toBeDefined();
     expect(script).toContain('deploy/.karmax-update update');

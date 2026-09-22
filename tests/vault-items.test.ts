@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { Store } from '../src/store/db.js';
 import { VAULT_USAGE_HALF_LIFE_MS } from '../src/util/vault-usage.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -22,6 +23,7 @@ function memStore(): VaultItemStore & { audit: any[] } {
   const kv = new Map<string, string>();
   const audit: any[] = [];
   return {
+    transaction: memoryTransaction(kv, audit),
     kvGet: (k) => kv.get(k),
     kvSet: (k, v) => void kv.set(k, v),
     appendAudit: (e) => audit.push(e),
@@ -57,193 +59,193 @@ describe('TOTP (RFC 6238)', () => {
 });
 
 describe('vault items: CRUD + write-only secrets', () => {
-  it('stores metadata in kv and secrets in the vault, never echoing them', () => {
+  it('stores metadata in kv and secrets in the vault, never echoing them', async () => {
     const { items, broker } = makeService();
-    const saved = items.save({
+    const saved = (await items.save({
       type: 'login',
       label: 'GitHub (alice)',
       domains: ['github.com'],
       username: 'alice',
       secrets: { password: 'hunter2', totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' },
-    });
+    }));
     expect(saved.fields.sort()).toEqual(['password', 'totp']);
     expect(JSON.stringify(saved)).not.toContain('hunter2');
     expect(broker.hasHandle(itemHandle(saved.id, 'password'))).toBe(true);
     // update without secrets keeps the stored ones
-    const updated = items.save({ id: saved.id, type: 'login', label: 'GitHub — alice' });
+    const updated = (await items.save({ id: saved.id, type: 'login', label: 'GitHub — alice' }));
     expect(updated.fields.sort()).toEqual(['password', 'totp']);
-    expect(items.resolveField(updated, 'password', { mode: 'reveal' })).toBe('hunter2');
+    expect((await items.resolveField(updated, 'password', { mode: 'reveal' }))).toBe('hunter2');
     // delete removes the vault handles too
-    items.delete(saved.id);
-    expect(items.get(saved.id)).toBeUndefined();
+    (await items.delete(saved.id));
+    expect((await items.get(saved.id))).toBeUndefined();
     expect(broker.hasHandle(itemHandle(saved.id, 'password'))).toBe(false);
   });
 
-  it('computes a live TOTP code from the stored seed (never returning the seed)', () => {
+  it('computes a live TOTP code from the stored seed (never returning the seed)', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'x', secrets: { totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } });
-    expect(items.totp(item, {})).toMatch(/^\d{6}$/);
+    const item = (await items.save({ type: 'login', label: 'x', secrets: { totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } }));
+    expect((await items.totp(item, {}))).toMatch(/^\d{6}$/);
   });
 });
 
 describe('vault usage frequency', () => {
-  it('persists successful accesses without treating usage as an edit', () => {
+  it('persists successful accesses without treating usage as an edit', async () => {
     const { items, store, broker, dir } = makeService();
-    const item = items.save({ type: 'login', label: 'Login', secrets: { password: 'secret' } });
-    items.resolveField(item, 'password', { mode: 'use' });
-    items.resolveField(item, 'password', { mode: 'reveal' });
+    const item = (await items.save({ type: 'login', label: 'Login', secrets: { password: 'secret' } }));
+    (await items.resolveField(item, 'password', { mode: 'use' }));
+    (await items.resolveField(item, 'password', { mode: 'reveal' }));
     // Reusing the original object must not lose increments.
-    expect(items.get(item.id)).toMatchObject({ useCount: 2, updatedAt: item.updatedAt });
-    expect(items.save({ id: item.id, type: 'login', label: 'Renamed' }).useCount).toBe(2);
+    expect((await items.get(item.id))).toMatchObject({ useCount: 2, updatedAt: item.updatedAt });
+    expect((await items.save({ id: item.id, type: 'login', label: 'Renamed' })).useCount).toBe(2);
     const reopened = new VaultItems(store, broker, path.join(dir, 'state'));
-    expect(reopened.get(item.id)?.useCount).toBe(2);
-    expect(new VaultItems(store, broker, path.join(dir, 'state'), 'other').list()).toEqual([]);
+    expect((await reopened.get(item.id))?.useCount).toBe(2);
+    expect((await new VaultItems(store, broker, path.join(dir, 'state'), 'other').list())).toEqual([]);
   });
 
-  it('counts legacy items from zero and excludes reads of metadata, internal reads, and failed accesses', () => {
+  it('counts legacy items from zero and excludes reads of metadata, internal reads, and failed accesses', async () => {
     const { items, store, broker } = makeService();
-    const item = items.save({ type: 'login', label: 'Legacy', secrets: { password: 'secret' } });
+    const item = (await items.save({ type: 'login', label: 'Legacy', secrets: { password: 'secret' } }));
     delete item.useCount;
     delete item.frecencyScore;
     delete item.frecencyUpdatedAt;
-    store.kvSet('vault:items:org_personal', JSON.stringify([item]));
-    items.list();
-    items.get(item.id);
+    (await store.kvSet('vault:items:org_personal', JSON.stringify([item])));
+    (await items.list());
+    (await items.get(item.id));
     items.readSecret(item, 'password');
-    expect(() => items.resolveField(item, 'totp', { mode: 'use' })).toThrow();
-    expect(items.get(item.id)?.useCount).toBe(0);
-    items.resolveField(item, 'password', { mode: 'use' });
-    expect(items.get(item.id)?.useCount).toBe(1);
-    broker.deleteHandle(itemHandle(item.id, 'password'));
-    expect(() => items.resolveField(item, 'password', { mode: 'use' })).toThrow();
-    expect(items.get(item.id)?.useCount).toBe(1);
+    await expect((async () => (await items.resolveField(item, 'totp', { mode: 'use' })))()).rejects.toThrow();
+    expect((await items.get(item.id))?.useCount).toBe(0);
+    (await items.resolveField(item, 'password', { mode: 'use' }));
+    expect((await items.get(item.id))?.useCount).toBe(1);
+    (await broker.deleteHandle(itemHandle(item.id, 'password')));
+    await expect((async () => (await items.resolveField(item, 'password', { mode: 'use' })))()).rejects.toThrow();
+    expect((await items.get(item.id))?.useCount).toBe(1);
   });
 });
 
 describe('vault frecency', () => {
-  it('decays previous accesses, adds new ones, and preserves usage through edits', () => {
+  it('decays previous accesses, adds new ones, and preserves usage through edits', async () => {
     const clock = vi.spyOn(Date, 'now');
     try {
       const at = 1_800_000_000_000;
       clock.mockReturnValue(at);
       const { items } = makeService();
-      const item = items.save({ type: 'login', label: 'Login', secrets: { password: 'secret' } });
-      items.resolveField(item, 'password', { mode: 'use' });
-      items.resolveField(item, 'password', { mode: 'use' });
+      const item = (await items.save({ type: 'login', label: 'Login', secrets: { password: 'secret' } }));
+      (await items.resolveField(item, 'password', { mode: 'use' }));
+      (await items.resolveField(item, 'password', { mode: 'use' }));
       clock.mockReturnValue(at + VAULT_USAGE_HALF_LIFE_MS);
-      items.resolveField(item, 'password', { mode: 'reveal' });
+      (await items.resolveField(item, 'password', { mode: 'reveal' }));
       const usage = { useCount: 3, frecencyScore: 2, frecencyUpdatedAt: Date.now(), lastUsedAt: Date.now() };
-      expect(items.get(item.id)).toMatchObject({ ...usage, updatedAt: at });
-      expect(items.save({ id: item.id, type: 'login', label: 'Renamed', secrets: { password: 'rotated' } }))
+      expect((await items.get(item.id))).toMatchObject({ ...usage, updatedAt: at });
+      expect((await items.save({ id: item.id, type: 'login', label: 'Renamed', secrets: { password: 'rotated' } })))
         .toMatchObject(usage);
     } finally { clock.mockRestore(); }
   });
 
-  it('backfills all historical accesses once, isolates organizations, and does not double count the next access', () => {
+  it('backfills all historical accesses once, isolates organizations, and does not double count the next access', async () => {
     const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     try {
       const { broker, dir } = makeService();
       const items = new VaultItems(store, broker, dir, 'one');
-      const legacy = items.save({ type: 'login', label: 'Historical', secrets: { password: 'secret' } });
+      const legacy = (await items.save({ type: 'login', label: 'Historical', secrets: { password: 'secret' } }));
       delete legacy.frecencyScore;
       delete legacy.frecencyUpdatedAt;
       legacy.useCount = 1; // Old tracking had only counted accesses since release.
-      store.kvSet('vault:items:one', JSON.stringify([legacy]));
+      (await store.kvSet('vault:items:one', JSON.stringify([legacy])));
       // Cross the audit query's page boundary; denied requests never count.
-      for (let i = 0; i < 1001; i++) store.appendAudit({ ts: Date.now() - VAULT_USAGE_HALF_LIFE_MS,
-        principalId: 'system', action: 'vault.used', detail: { itemId: legacy.id } });
-      store.appendAudit({ principalId: 'system', action: 'vault.revealed', detail: { itemId: legacy.id } });
-      store.appendAudit({ principalId: 'system', action: 'vault.requested', detail: { itemId: legacy.id } });
-      store.appendAudit({ principalId: 'system', action: 'vault.used', detail: { itemId: 'other-org-item' } });
+      for (let i = 0; i < 1001; i++) (await store.appendAudit({ ts: Date.now() - VAULT_USAGE_HALF_LIFE_MS,
+        principalId: 'system', action: 'vault.used', detail: { itemId: legacy.id } }));
+      (await store.appendAudit({ principalId: 'system', action: 'vault.revealed', detail: { itemId: legacy.id } }));
+      (await store.appendAudit({ principalId: 'system', action: 'vault.requested', detail: { itemId: legacy.id } }));
+      (await store.appendAudit({ principalId: 'system', action: 'vault.used', detail: { itemId: 'other-org-item' } }));
       const history = vi.spyOn(store, 'vaultUsageHistory');
       // Resolve directly from a legacy object: migration must precede the new audit entry.
-      items.resolveField(legacy, 'password', { mode: 'use' });
-      expect(items.get(legacy.id)).toMatchObject({ useCount: 1003, frecencyScore: 502.5,
+      (await items.resolveField(legacy, 'password', { mode: 'use' }));
+      expect((await items.get(legacy.id))).toMatchObject({ useCount: 1003, frecencyScore: 502.5,
         lastUsedAt: Date.now(), updatedAt: legacy.updatedAt });
       const reopened = new VaultItems(store, broker, dir, 'one');
-      expect(reopened.list()[0]?.frecencyScore).toBe(502.5);
+      expect((await reopened.list())[0]?.frecencyScore).toBe(502.5);
       expect(history).toHaveBeenCalledTimes(1);
       expect(history).toHaveBeenCalledWith([legacy.id], Date.now());
-      expect(new VaultItems(store, broker, dir, 'two').list()).toEqual([]);
-      expect(store.vaultUsageHistory([], Date.now())).toEqual({});
-    } finally { store.close(); clock.mockRestore(); }
+      expect((await new VaultItems(store, broker, dir, 'two').list())).toEqual([]);
+      expect((await store.vaultUsageHistory([], Date.now()))).toEqual({});
+    } finally { (await store.close()); clock.mockRestore(); }
   });
 });
 
 describe('organization isolation (tenant boundary)', () => {
-  it('items and requests are scoped per organization', () => {
+  it('items and requests are scoped per organization', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-org-'));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const store = memStore(); // one shared store, two orgs
     const a = new VaultItems(store, broker, path.join(dir, 'state'), 'org_a');
     const b = new VaultItems(store, broker, path.join(dir, 'state'), 'org_b');
-    const itemA = a.save({ type: 'login', label: 'A secret', secrets: { password: 'pa' } });
-    b.save({ type: 'login', label: 'B secret', secrets: { password: 'pb' } });
+    const itemA = (await a.save({ type: 'login', label: 'A secret', secrets: { password: 'pa' } }));
+    (await b.save({ type: 'login', label: 'B secret', secrets: { password: 'pb' } }));
     // neither org sees the other's items
-    expect(a.list().map((i) => i.label)).toEqual(['A secret']);
-    expect(b.list().map((i) => i.label)).toEqual(['B secret']);
-    expect(b.get(itemA.id)).toBeUndefined();
+    expect((await a.list()).map((i) => i.label)).toEqual(['A secret']);
+    expect((await b.list()).map((i) => i.label)).toEqual(['B secret']);
+    expect((await b.get(itemA.id))).toBeUndefined();
     // a parked request in org A is invisible to org B
-    a.request({ taskId: 't1', caps: [], domain: 'x.com', mode: 'use', why: 'x' });
-    expect(a.requests({ status: 'pending' })).toHaveLength(1);
-    expect(b.requests({ status: 'pending' })).toHaveLength(0);
+    (await a.request({ taskId: 't1', caps: [], domain: 'x.com', mode: 'use', why: 'x' }));
+    expect((await a.requests({ status: 'pending' }))).toHaveLength(1);
+    expect((await b.requests({ status: 'pending' }))).toHaveLength(0);
   });
 });
 
 describe('grants + access policy (§§5–6)', () => {
-  it('grants by item, tag, and domain wildcards', () => {
+  it('grants by item, tag, and domain wildcards', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', domains: ['github.com'], tags: ['staging'], secrets: { password: 'p' } });
+    const item = (await items.save({ type: 'login', label: 'gh', domains: ['github.com'], tags: ['staging'], secrets: { password: 'p' } }));
     expect(itemCaps(item)).toContain(`use-credential:item:${item.id}`);
-    expect(items.access([`use-credential:item:${item.id}`], 't1', item, 'use').status).toBe('granted');
-    expect(items.access(['use-credential:tag:staging'], 't1', item, 'use').status).toBe('granted');
-    expect(items.access(['use-credential:domain:github.com'], 't1', item, 'use').status).toBe('granted');
-    expect(items.access(['use-credential:*'], 't1', item, 'use').status).toBe('granted');
-    expect(items.access(['use-credential:item:other'], 't1', item, 'use').status).toBe('needs_approval');
-    expect(items.access([], 't1', item, 'use').status).toBe('needs_approval');
+    expect((await items.access([`use-credential:item:${item.id}`], 't1', item, 'use')).status).toBe('granted');
+    expect((await items.access(['use-credential:tag:staging'], 't1', item, 'use')).status).toBe('granted');
+    expect((await items.access(['use-credential:domain:github.com'], 't1', item, 'use')).status).toBe('granted');
+    expect((await items.access(['use-credential:*'], 't1', item, 'use')).status).toBe('granted');
+    expect((await items.access(['use-credential:item:other'], 't1', item, 'use')).status).toBe('needs_approval');
+    expect((await items.access([], 't1', item, 'use')).status).toBe('needs_approval');
   });
 
-  it('enforces per-item policy: use ask, reveal ask/never', () => {
+  it('enforces per-item policy: use ask, reveal ask/never', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'p' } });
+    const item = (await items.save({ type: 'login', label: 'gh', policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'p' } }));
     const caps = [`use-credential:item:${item.id}`];
-    expect(items.access(caps, 't1', item, 'use').status).toBe('needs_approval');
-    expect(items.access(caps, 't1', item, 'reveal').status).toBe('denied');
-    items.setPolicy(item.id, { use: 'auto', reveal: 'ask' });
-    expect(items.access(caps, 't1', items.get(item.id)!, 'use').status).toBe('granted');
-    expect(items.access(caps, 't1', items.get(item.id)!, 'reveal').status).toBe('needs_approval');
+    expect((await items.access(caps, 't1', item, 'use')).status).toBe('needs_approval');
+    expect((await items.access(caps, 't1', item, 'reveal')).status).toBe('denied');
+    (await items.setPolicy(item.id, { use: 'auto', reveal: 'ask' }));
+    expect((await items.access(caps, 't1', (await items.get(item.id))!, 'use')).status).toBe('granted');
+    expect((await items.access(caps, 't1', (await items.get(item.id))!, 'reveal')).status).toBe('needs_approval');
   });
 
-  it('layers sparse policy overrides per task without changing organization defaults', () => {
+  it('layers sparse policy overrides per task without changing organization defaults', async () => {
     const { items } = makeService();
-    const item = items.save({
+    const item = (await items.save({
       type: 'login',
       label: 'gh',
       policy: { use: 'ask', reveal: 'never' },
       secrets: { password: 'p' },
-    });
+    }));
     const caps = [`use-credential:item:${item.id}`];
-    items.setTaskPolicies('t1', { [item.id]: { use: 'auto', reveal: 'ask' } });
+    (await items.setTaskPolicies('t1', { [item.id]: { use: 'auto', reveal: 'ask' } }));
 
-    expect(items.effectivePolicy('t1', item)).toEqual({ use: 'auto', reveal: 'ask' });
-    expect(items.access(caps, 't1', item, 'use').status).toBe('granted');
-    expect(items.access(caps, 't1', item, 'reveal').status).toBe('needs_approval');
-    expect(items.access(caps, 't2', item, 'use').status).toBe('needs_approval');
-    expect(items.access(caps, 't2', item, 'reveal').status).toBe('denied');
+    expect((await items.effectivePolicy('t1', item))).toEqual({ use: 'auto', reveal: 'ask' });
+    expect((await items.access(caps, 't1', item, 'use')).status).toBe('granted');
+    expect((await items.access(caps, 't1', item, 'reveal')).status).toBe('needs_approval');
+    expect((await items.access(caps, 't2', item, 'use')).status).toBe('needs_approval');
+    expect((await items.access(caps, 't2', item, 'reveal')).status).toBe('denied');
 
     // Missing dimensions keep inheriting the live organization default.
-    items.setTaskPolicies('t1', { [item.id]: { use: 'auto' } });
-    items.setPolicy(item.id, { reveal: 'auto' });
-    expect(items.effectivePolicy('t1', items.get(item.id)!)).toEqual({ use: 'auto', reveal: 'auto' });
+    (await items.setTaskPolicies('t1', { [item.id]: { use: 'auto' } }));
+    (await items.setPolicy(item.id, { reveal: 'auto' }));
+    expect((await items.effectivePolicy('t1', (await items.get(item.id))!))).toEqual({ use: 'auto', reveal: 'auto' });
   });
 
-  it('drops malformed persisted task policy values instead of weakening access', () => {
+  it('drops malformed persisted task policy values instead of weakening access', async () => {
     const { items, store } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', policy: { reveal: 'never' }, secrets: { password: 'p' } });
-    store.kvSet('vault:task-policy:t1', JSON.stringify({ [item.id]: { use: 'yes', reveal: 'always' } }));
-    expect(items.taskPolicies('t1')).toEqual({});
-    expect(items.access([`use-credential:item:${item.id}`], 't1', item, 'reveal').status).toBe('denied');
+    const item = (await items.save({ type: 'login', label: 'gh', policy: { reveal: 'never' }, secrets: { password: 'p' } }));
+    (await store.kvSet('vault:task-policy:t1', JSON.stringify({ [item.id]: { use: 'yes', reveal: 'always' } })));
+    expect((await items.taskPolicies('t1'))).toEqual({});
+    expect((await items.access([`use-credential:item:${item.id}`], 't1', item, 'reveal')).status).toBe('denied');
   });
 
   it('domain matching covers subdomains but not lookalikes', () => {
@@ -254,104 +256,104 @@ describe('grants + access policy (§§5–6)', () => {
 });
 
 describe('the pull model: requests + human resolutions (§7)', () => {
-  it('parks a not-in-vault request, binds it to a later-added item, and grants for the task', () => {
+  it('parks a not-in-vault request, binds it to a later-added item, and grants for the task', async () => {
     const { items } = makeService();
-    const r = items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'log in' });
+    const r = (await items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'log in' }));
     expect(r.status).toBe('not_in_vault');
-    expect(items.requests({ status: 'pending' })).toHaveLength(1);
+    expect((await items.requests({ status: 'pending' }))).toHaveLength(1);
     // duplicate asks dedupe onto the same pending request
-    expect(items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'still' }).requestId).toBe(r.requestId);
+    expect((await items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'still' })).requestId).toBe(r.requestId);
 
-    const item = items.save({ type: 'login', label: 'gh', domains: ['github.com'], secrets: { password: 'p' } });
+    const item = (await items.save({ type: 'login', label: 'gh', domains: ['github.com'], secrets: { password: 'p' } }));
     // a grant action without a bound item is rejected
-    expect(() => items.resolve(r.requestId!, { action: 'task', by: 'user:alice' })).not.toThrow;
-    const resolved = items.resolve(r.requestId!, { action: 'task', by: 'user:alice', itemId: item.id });
+    await expect(items.resolve(r.requestId!, { action: 'task', by: 'user:alice' })).rejects.toThrow('bind this request');
+    const resolved = (await items.resolve(r.requestId!, { action: 'task', by: 'user:alice', itemId: item.id }));
     expect(resolved.status).toBe('granted');
     // the task grant extension is durable and covers the item
-    expect(items.extensionCaps('t1')).toContain(`use-credential:item:${item.id}`);
-    expect(items.access([], 't1', item, 'use').status).toBe('granted');
+    expect((await items.extensionCaps('t1'))).toContain(`use-credential:item:${item.id}`);
+    expect((await items.access([], 't1', item, 'use')).status).toBe('granted');
     // other tasks gained nothing
-    expect(items.access([], 't2', item, 'use').status).toBe('needs_approval');
+    expect((await items.access([], 't2', item, 'use')).status).toBe('needs_approval');
   });
 
-  it('"once" grants exactly one consumed use', () => {
+  it('"once" grants exactly one consumed use', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', domains: ['gh.com'], policy: { use: 'ask' }, secrets: { password: 'p' } });
-    const r = items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' });
+    const item = (await items.save({ type: 'login', label: 'gh', domains: ['gh.com'], policy: { use: 'ask' }, secrets: { password: 'p' } }));
+    const r = (await items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' }));
     expect(r.status).toBe('needs_approval');
-    items.resolve(r.requestId!, { action: 'once', by: 'user:alice' });
-    expect(items.access([], 't1', item, 'use', { consume: true }).status).toBe('granted');
-    expect(items.access([], 't1', item, 'use', { consume: true }).status).toBe('needs_approval');
+    (await items.resolve(r.requestId!, { action: 'once', by: 'user:alice' }));
+    expect((await items.access([], 't1', item, 'use', { consume: true })).status).toBe('granted');
+    expect((await items.access([], 't1', item, 'use', { consume: true })).status).toBe('needs_approval');
   });
 
-  it('"always" flips the item policy to auto for the requested mode', () => {
+  it('"always" flips the item policy to auto for the requested mode', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', domains: ['gh.com'], policy: { use: 'ask' }, secrets: { password: 'p' } });
-    const r = items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' });
-    items.resolve(r.requestId!, { action: 'always', by: 'user:alice' });
-    expect(items.get(item.id)!.policy.use).toBe('auto');
+    const item = (await items.save({ type: 'login', label: 'gh', domains: ['gh.com'], policy: { use: 'ask' }, secrets: { password: 'p' } }));
+    const r = (await items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' }));
+    (await items.resolve(r.requestId!, { action: 'always', by: 'user:alice' }));
+    expect((await items.get(item.id))!.policy.use).toBe('auto');
     // metadata (domains) survives the policy flip
-    expect(items.get(item.id)!.domains).toEqual(['gh.com']);
+    expect((await items.get(item.id))!.domains).toEqual(['gh.com']);
   });
 
-  it('an item covered by the grant with auto policy needs no request at all', () => {
+  it('an item covered by the grant with auto policy needs no request at all', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', secrets: { password: 'p' } });
-    const r = items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' });
+    const item = (await items.save({ type: 'login', label: 'gh', secrets: { password: 'p' } }));
+    const r = (await items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' }));
     expect(r.status).toBe('granted');
-    expect(items.requests({ status: 'pending' })).toHaveLength(0);
+    expect((await items.requests({ status: 'pending' }))).toHaveLength(0);
   });
 
-  it('lets a task use its own credential while preserving the reveal policy', () => {
+  it('lets a task use its own credential while preserving the reveal policy', async () => {
     const { items } = makeService();
-    const item = items.save({
+    const item = (await items.save({
       type: 'login',
       label: 'account created by t1',
       policy: { use: 'auto', reveal: 'ask' },
       secrets: { password: 'generated' },
       provenance: { source: 'task:t1', taskId: 't1' },
-    });
-    expect(items.access([], 't1', item, 'use').status).toBe('granted');
-    expect(items.access([], 't1', item, 'reveal').status).toBe('needs_approval');
-    expect(items.access([], 't2', item, 'use').status).toBe('needs_approval');
+    }));
+    expect((await items.access([], 't1', item, 'use')).status).toBe('granted');
+    expect((await items.access([], 't1', item, 'reveal')).status).toBe('needs_approval');
+    expect((await items.access([], 't2', item, 'use')).status).toBe('needs_approval');
   });
 
-  it('a reset report always parks, even when the task is fully granted (the secret is wrong)', () => {
+  it('a reset report always parks, even when the task is fully granted (the secret is wrong)', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', secrets: { password: 'stale' } });
+    const item = (await items.save({ type: 'login', label: 'gh', secrets: { password: 'stale' } }));
     const caps = [`use-credential:item:${item.id}`]; // covered + policy auto → access would be granted
-    const r = items.request({ taskId: 't1', caps, itemId: item.id, kind: 'reset', why: 'site rejected the stored password' });
+    const r = (await items.request({ taskId: 't1', caps, itemId: item.id, kind: 'reset', why: 'site rejected the stored password' }));
     expect(r.status).toBe('needs_approval');
-    const req = items.requests({ status: 'pending' })[0]!;
+    const req = (await items.requests({ status: 'pending' }))[0]!;
     expect(req.kind).toBe('reset');
     // the human fixes the secret, then grants retry — the pass unblocks a re-fill
-    items.save({ id: item.id, type: 'login', secrets: { password: 'fresh' } });
-    items.resolve(req.id, { action: 'once', by: 'user:alice' });
-    expect(items.access(caps, 't1', items.get(item.id)!, 'use', { consume: true }).status).toBe('granted');
-    expect(items.resolveField(items.get(item.id)!, 'password', { mode: 'reveal' })).toBe('fresh');
+    (await items.save({ id: item.id, type: 'login', secrets: { password: 'fresh' } }));
+    (await items.resolve(req.id, { action: 'once', by: 'user:alice' }));
+    expect((await items.access(caps, 't1', (await items.get(item.id))!, 'use', { consume: true })).status).toBe('granted');
+    expect((await items.resolveField((await items.get(item.id))!, 'password', { mode: 'reveal' }))).toBe('fresh');
   });
 
-  it('denied requests do not grant and record the resolution', () => {
+  it('denied requests do not grant and record the resolution', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'login', label: 'gh', policy: { use: 'ask' }, secrets: { password: 'p' } });
-    const r = items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' });
-    const resolved = items.resolve(r.requestId!, { action: 'deny', by: 'user:alice' });
+    const item = (await items.save({ type: 'login', label: 'gh', policy: { use: 'ask' }, secrets: { password: 'p' } }));
+    const r = (await items.request({ taskId: 't1', caps: [`use-credential:item:${item.id}`], itemId: item.id, mode: 'use', why: 'x' }));
+    const resolved = (await items.resolve(r.requestId!, { action: 'deny', by: 'user:alice' }));
     expect(resolved.status).toBe('denied');
-    expect(items.access([], 't1', item, 'use').status).toBe('needs_approval');
+    expect((await items.access([], 't1', item, 'use')).status).toBe('needs_approval');
   });
 });
 
 describe('spawn-time materialization (§5A)', () => {
-  it('injects env bags, api keys under envVar, and ssh keys as 0600 files', () => {
+  it('injects env bags, api keys under envVar, and ssh keys as 0600 files', async () => {
     const { items } = makeService();
     const caps = ['use-credential:*'];
-    items.save({ type: 'env', label: 'proj env', secrets: { env: '# comment\nFOO=bar\nexport QUOTED="a b"\nbad line\n' } });
-    items.save({ type: 'api-key', label: 'openai', envVar: 'OPENAI_API_KEY', secrets: { secret: 'sk-123' } });
-    const ssh = items.save({ type: 'ssh-key', label: 'deploy', envVar: 'DEPLOY_KEY_FILE', secrets: { privateKey: 'PRIVATE' } });
+    (await items.save({ type: 'env', label: 'proj env', secrets: { env: '# comment\nFOO=bar\nexport QUOTED="a b"\nbad line\n' } }));
+    (await items.save({ type: 'api-key', label: 'openai', envVar: 'OPENAI_API_KEY', secrets: { secret: 'sk-123' } }));
+    const ssh = (await items.save({ type: 'ssh-key', label: 'deploy', envVar: 'DEPLOY_KEY_FILE', secrets: { privateKey: 'PRIVATE' } }));
     // an `ask` item never injects ambiently
-    items.save({ type: 'api-key', label: 'guarded', envVar: 'GUARDED', policy: { use: 'ask' }, secrets: { secret: 'nope' } });
+    (await items.save({ type: 'api-key', label: 'guarded', envVar: 'GUARDED', policy: { use: 'ask' }, secrets: { secret: 'nope' } }));
 
-    const env = items.envFor('t1', caps);
+    const env = (await items.envFor('t1', caps));
     expect(env.FOO).toBe('bar');
     expect(env.QUOTED).toBe('a b');
     expect(env.OPENAI_API_KEY).toBe('sk-123');
@@ -360,27 +362,27 @@ describe('spawn-time materialization (§5A)', () => {
     expect(fs.statSync(env.DEPLOY_KEY_FILE!).mode & 0o777).toBe(0o600);
     expect(env.DEPLOY_KEY_FILE).toContain(ssh.id);
     // ungranted task gets nothing
-    expect(Object.keys(items.envFor('t2', []))).toHaveLength(0);
+    expect(Object.keys((await items.envFor('t2', [])))).toHaveLength(0);
   });
 
-  it('a one-shot "once" approval never becomes standing env injection', () => {
+  it('a one-shot "once" approval never becomes standing env injection', async () => {
     const { items } = makeService();
-    const item = items.save({ type: 'api-key', label: 'stripe', envVar: 'STRIPE_KEY', policy: { use: 'ask' }, secrets: { secret: 'sk-live' } });
+    const item = (await items.save({ type: 'api-key', label: 'stripe', envVar: 'STRIPE_KEY', policy: { use: 'ask' }, secrets: { secret: 'sk-live' } }));
     // The task was never granted this credential, so it parks for a human…
-    const asked = items.request({ taskId: 't1', caps: [], itemId: item.id, mode: 'use', why: 'charge once' });
+    const asked = (await items.request({ taskId: 't1', caps: [], itemId: item.id, mode: 'use', why: 'charge once' }));
     expect(asked.status).toBe('needs_approval');
     // …who approves exactly one use. NOT `task`, which is the action that means
     // "for the rest of this task" and grants a durable capability extension.
-    items.resolve(asked.requestId!, { action: 'once', by: 'user:alice', itemId: item.id });
+    (await items.resolve(asked.requestId!, { action: 'once', by: 'user:alice', itemId: item.id }));
 
     // envFor runs on EVERY agent turn. It used to see the un-consumed one-shot pass
     // and inject the secret each time — for the task's whole life — turning a
     // deliberately single-use approval into a permanent ambient grant.
-    expect(items.envFor('t1', []).STRIPE_KEY).toBeUndefined();
-    expect(items.envFor('t1', []).STRIPE_KEY).toBeUndefined();
+    expect((await items.envFor('t1', [])).STRIPE_KEY).toBeUndefined();
+    expect((await items.envFor('t1', [])).STRIPE_KEY).toBeUndefined();
     // …and the pass is still intact for the one explicit use it was granted for.
-    expect(items.access([], 't1', item, 'use', { consume: true }).status).toBe('granted');
-    expect(items.access([], 't1', item, 'use', { consume: true }).status).toBe('needs_approval');
+    expect((await items.access([], 't1', item, 'use', { consume: true })).status).toBe('granted');
+    expect((await items.access([], 't1', item, 'use', { consume: true })).status).toBe('needs_approval');
   });
 });
 

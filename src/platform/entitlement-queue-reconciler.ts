@@ -1,3 +1,4 @@
+import { AsyncInterval } from '../util/async-interval.js';
 import type { Client } from '@temporalio/client';
 import {
   QRY_AGENT_QUEUE,
@@ -18,8 +19,8 @@ interface AgentQueueView {
   current: AgentQueueItem[];
 }
 
-function hasDurableTurnIdentity(store: Store, taskId: string): boolean {
-  const task = store.getTask(taskId);
+async function hasDurableTurnIdentity(store: Store, taskId: string): Promise<boolean> {
+  const task = (await store.getTask(taskId));
   if (!task) return true;
   const [major = 0, minor = 0] = task.workflowVersion.split('.').map(Number);
   if (major > 1) return true;
@@ -51,21 +52,21 @@ export class EntitlementQueueReconciler {
   private readonly intervalMs: number;
   private readonly requested = new Set<string>();
   private unsubscribe?: () => void;
-  private timer?: ReturnType<typeof setInterval>;
+  private timer?: AsyncInterval;
   private draining?: Promise<void>;
 
   constructor(private readonly options: EntitlementQueueReconcilerOptions) {
     this.intervalMs = Math.max(0, Math.floor(options.intervalMs ?? 60_000));
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (!this.options.store.hosted || this.unsubscribe) return;
     this.unsubscribe = this.options.store.onOrganizationEntitlementsChanged((organizationId) => {
       this.request(organizationId);
     });
-    this.requestAll();
+    (await this.requestAll());
     if (this.intervalMs > 0) {
-      this.timer = setInterval(() => this.requestAll(), this.intervalMs);
+      this.timer = new AsyncInterval(() => this.requestAll(), this.intervalMs);
       this.timer.unref?.();
     }
   }
@@ -73,7 +74,7 @@ export class EntitlementQueueReconciler {
   async stop(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
-    if (this.timer) clearInterval(this.timer);
+    await this.timer?.stop();
     this.timer = undefined;
     this.requested.clear();
     // The Temporal client must remain open until a signal/query already in
@@ -82,8 +83,8 @@ export class EntitlementQueueReconciler {
     await this.draining;
   }
 
-  private requestAll(): void {
-    for (const organization of this.options.store.listOrganizations()) this.request(organization.id);
+  private async requestAll(): Promise<void> {
+    for (const organization of (await this.options.store.listOrganizations())) this.request(organization.id);
   }
 
   private request(organizationId: string): void {
@@ -115,8 +116,8 @@ export class EntitlementQueueReconciler {
   }
 
   async reconcileOrganization(organizationId: string): Promise<void> {
-    if (!this.options.store.hosted || !this.options.store.getOrganization(organizationId)) return;
-    const entitlements = this.options.store.organizationEntitlements(organizationId);
+    if (!this.options.store.hosted || !(await this.options.store.getOrganization(organizationId))) return;
+    const entitlements = (await this.options.store.organizationEntitlements(organizationId));
     const capacity = entitlements.agentRunAdmissionAllowed
       ? entitlements.maxActiveAgentRuns
       : 0;
@@ -156,10 +157,10 @@ export class EntitlementQueueReconciler {
     // residue that can otherwise consume Free's only slot forever. Pre-durable
     // workflow versions did not expose stable turn ownership in their views, so
     // preserve those admissions rather than mistaking an old shape for staleness.
-    for (const admission of this.options.store.activeAgentUsageAdmissions(organizationId)) {
-      if (hasDurableTurnIdentity(this.options.store, admission.taskId)
+    for (const admission of (await this.options.store.activeAgentUsageAdmissions(organizationId))) {
+      if ((await hasDurableTurnIdentity(this.options.store, admission.taskId))
         && !(await stillOwned(admission.taskId, admission.id)))
-        this.options.store.finishUsageAdmission(admission.id, false);
+        (await this.options.store.finishUsageAdmission(admission.id, false));
     }
 
     let view: AgentQueueView;

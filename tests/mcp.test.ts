@@ -24,7 +24,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   let worlds: WorldRegistry;
 
   beforeEach(async () => {
-    store = new Store(':memory:');
+    store = (await Store.create(':memory:'));
     tokens = new TokenAuthority();
     contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
     const providerConnections = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(path.join(contentDir, 'vault'))));
@@ -292,8 +292,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   });
 
   it('lets an authorized agent connect and disconnect a provider without reading its secret', async () => {
-    const organization = store.createOrganization({ name: 'Automation', ownerUserId: 'a' });
-    currentToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, organization.id).token;
+    const organization = (await store.createOrganization({ name: 'Automation', ownerUserId: 'a' }));
+    currentToken = (await tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, organization.id)).token;
     const connected: any = await client.callTool({ name: 'connect_world_provider', arguments: {
       organizationId: organization.id, provider: 'e2b', apiKey: 'write-only-secret', template: 'node-22',
     } });
@@ -326,8 +326,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
    * a cosmetic one.
    */
   it('applies set_execution_policy sparsely instead of erasing unrelated fields', async () => {
-    const organization = store.createOrganization({ name: 'Sparse', ownerUserId: 'a' });
-    currentToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, organization.id).token;
+    const organization = (await store.createOrganization({ name: 'Sparse', ownerUserId: 'a' }));
+    currentToken = (await tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, organization.id)).token;
     const call = async (args: any) => {
       const res: any = await client.callTool({ name: 'set_execution_policy', arguments: { organizationId: organization.id, ...args } });
       expect(res.isError, res.content?.[0]?.text).toBeFalsy();
@@ -361,18 +361,18 @@ describe('platform MCP server (capability-checked tool calls)', () => {
    * CapabilityError, so an in-process NotFoundError read as a generic `error:`.
    */
   it('distinguishes denied from not-found in the agent-visible error text', async () => {
-    currentToken = tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a',
-      ceiling: ['task:*'], grantorCaps: ['task:*'] }).token;
+    currentToken = (await tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a',
+      ceiling: ['task:*'], grantorCaps: ['task:*'] })).token;
     const missing: any = await client.callTool({ name: 'tag_task', arguments: { taskId: 'task_missing', add: ['bug'] } });
     expect(missing.isError).toBe(true);
     expect(missing.content[0].text).toMatch(/HTTP 404/);
     expect(missing.content[0].text).not.toMatch(/permission denied/);
 
-    const pid = store.createProject('Errors').id;
-    const task = store.createTask({ projectId: pid, title: 'Real', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
-    currentToken = tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a',
-      ceiling: ['signal-completion'], grantorCaps: ['signal-completion'] }).token;
+    const pid = (await store.createProject('Errors')).id;
+    const task = (await store.createTask({ projectId: pid, title: 'Real', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any }));
+    currentToken = (await tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a',
+      ceiling: ['signal-completion'], grantorCaps: ['signal-completion'] })).token;
     const refused: any = await client.callTool({ name: 'tag_task', arguments: { taskId: task.id, add: ['bug'] } });
     expect(refused.content[0].text).toMatch(/permission denied/);
   });
@@ -380,13 +380,13 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   it('lets an agent tag, prioritize, and search tasks by attribute', async () => {
     // Seed a project + two tasks directly in the store (createTask via MCP would start a
     // workflow, which this harness's mock client can't do).
-    const pid = store.createProject('Acme').id;
-    const a = store.createTask({ projectId: pid, title: 'Fix web login', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x', base: 'main' } as any });
-    const b = store.createTask({ projectId: pid, title: 'Write docs', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y', base: 'develop' } as any });
-    currentToken = tokens.mint({
+    const pid = (await store.createProject('Acme')).id;
+    const a = (await store.createTask({ projectId: pid, title: 'Fix web login', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x', base: 'main' } as any }));
+    const b = (await store.createTask({ projectId: pid, title: 'Write docs', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y', base: 'develop' } as any }));
+    currentToken = (await tokens.mint({
       taskId: 't1', profileId: 'do', principal: 'user:a',
       ceiling: ['read-task', 'edit-task'], grantorCaps: ['read-task', 'edit-task'],
-    }).token;
+    })).token;
 
     const raw = async (name: string, args: any) => {
       const res: any = await client.callTool({ name, arguments: args });
@@ -421,12 +421,12 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   });
 
   it('lets an agent find scheduled / dependency-blocked tasks via search_tasks', async () => {
-    const pid = store.createProject('Ops').id;
+    const pid = (await store.createProject('Ops')).id;
     // A nightly cron series (armed) and a task blocked on a dependency.
-    const nightly = store.createTask({ projectId: pid, title: 'Nightly backup', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: '0 3 * * *' }], triggerState: 'armed', repeatable: true } as any });
-    const build = store.createTask({ projectId: pid, title: 'Build', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y' } as any });
-    const deploy = store.createTask({ projectId: pid, title: 'Deploy', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'z', triggers: [{ kind: 'dependency', tasks: [build.id] }], triggerState: 'armed' } as any });
-    currentToken = tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a', ceiling: ['read-task'], grantorCaps: ['read-task'] }).token;
+    const nightly = (await store.createTask({ projectId: pid, title: 'Nightly backup', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: '0 3 * * *' }], triggerState: 'armed', repeatable: true } as any }));
+    const build = (await store.createTask({ projectId: pid, title: 'Build', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y' } as any }));
+    const deploy = (await store.createTask({ projectId: pid, title: 'Deploy', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'z', triggers: [{ kind: 'dependency', tasks: [build.id] }], triggerState: 'armed' } as any }));
+    currentToken = (await tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a', ceiling: ['read-task'], grantorCaps: ['read-task'] })).token;
     const call = async (query: string) => {
       const res: any = await client.callTool({ name: 'search_tasks', arguments: { projectId: pid, query } });
       expect(res.isError, res.content?.[0]?.text).toBeFalsy();
@@ -441,23 +441,23 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   });
 
   it('denies search_tasks when the token lacks read-task', async () => {
-    currentToken = tokens.mint({
+    currentToken = (await tokens.mint({
       taskId: 't1', profileId: 'do', principal: 'user:a',
       ceiling: ['signal-completion'], grantorCaps: ['signal-completion'],
-    }).token;
+    })).token;
     const res: any = await client.callTool({ name: 'search_tasks', arguments: { projectId: 'p', query: '' } });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/permission denied/i);
   });
 
   it('permits a tool call when the token carries the capability', async () => {
-    currentToken = tokens.mint({
+    currentToken = (await tokens.mint({
       taskId: 't1',
       profileId: 'do',
       principal: 'user:a',
       ceiling: ['save-skill'],
       grantorCaps: ['save-skill'],
-    }).token;
+    })).token;
     const res: any = await client.callTool({ name: 'save_skill', arguments: { name: 'greet', content: '# hi' } });
     expect(res.isError).toBeFalsy();
     // Saved under the calling tenant's directory, never the installation-wide one.
@@ -465,13 +465,13 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   });
 
   it('denies a tool call when the token lacks the capability', async () => {
-    currentToken = tokens.mint({
+    currentToken = (await tokens.mint({
       taskId: 't1',
       profileId: 'do',
       principal: 'user:a',
       ceiling: ['signal-completion'], // no save-skill
       grantorCaps: ['signal-completion'],
-    }).token;
+    })).token;
     const res: any = await client.callTool({ name: 'save_skill', arguments: { name: 'x', content: 'y' } });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/permission denied/i);
