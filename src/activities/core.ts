@@ -9,7 +9,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -157,6 +157,13 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   // their retryable infrastructure classification through this outer boundary.
   if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
+  }
+  if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {
+    const failure = err instanceof ProviderPolicyFailure ? err : new ProviderPolicyFailure(err, provider);
+    return ApplicationFailure.create({
+      message: failure.message, type: 'agent-policy', nonRetryable: true, cause: failure,
+      details: [failure.diagnostic],
+    });
   }
   const { classification: cls, metadata } = classifyProviderTurnError(err, provider);
   if (cls.limited) {

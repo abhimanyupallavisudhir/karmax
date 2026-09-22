@@ -11,6 +11,7 @@ import { classifyLimitError, type LimitClassification, type ProviderFailureMetad
  *                  from heartbeat details (a "continue", not a re-run)
  *   'agent-limit'  usage/session/billing limit — non-retryable; typed metadata in
  *                  details tells account leasing whether to rotate/park/escalate
+ *   'agent-policy' provider safety rejection — non-retryable, task-local human escalation
  *   'agent-error'  everything else — non-retryable; the Resolve path
  *   'world-infra'  cloud world create/connect transport failure — retryable;
  *                  setup uses the same outage backoff instead of Resolve

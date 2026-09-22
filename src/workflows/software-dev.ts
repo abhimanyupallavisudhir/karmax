@@ -1475,6 +1475,13 @@ async function softwareDevImpl(
           return await fn();
         } catch (err) {
           if (cancelled || isCancellation(err)) throw err; // mid-turn cancel: don't resolve/retry
+          // This new failure type has no historical command sequence. A safety
+          // decision is task-local: never rotate accounts or ask Resolve to retry.
+          if (failureHasType(err, 'agent-policy')) {
+            lastError = describeError(err);
+            error = lastError;
+            break;
+          }
           // Repository/App permission changes are genuine human decisions. A
           // Resolve agent cannot grant them and retrying the same Git push only
           // repeats GitHub's rejection. New histories therefore park directly

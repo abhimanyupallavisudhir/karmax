@@ -15,6 +15,40 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
   beforeAll(async () => { h = await bootHarness('mock'); }, 60_000);
   afterAll(async () => { await h?.stop(); });
 
+  it('escalates a safety block once while another task can use the same account', async () => {
+    const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
+    const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coord.registerAccounts([{ id: 'mock:policy', configHome: '/tmp/mock-policy', provider: 'mock', maxConcurrent: 1 }]);
+    const cw = h.client.workflow.getHandle(accountCoordinatorId());
+    const repo = await h.makeRepo('policy');
+    const start = async (prompt: string) => {
+      const taskId = newId('task');
+      return h.client.workflow.start('softwareDev@1.26.0', {
+        taskQueue: TASK_QUEUE, workflowId: taskId,
+        args: [{ taskId, projectId: 'p1', title: 'Policy regression', prompt,
+          base: 'main', target: 'main',
+          project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } }],
+      });
+    };
+    const blocked = await start('@fail misalignmentPolicyViolation HTTP 401: This request was blocked by our safety systems. Reason: Potentially unintended activity.');
+    try {
+      await expect.poll(async () => (await blocked.query('view') as any).stage, { timeout: 30_000 }).toBe('escalated');
+      const view = await blocked.query('view') as any;
+      expect(JSON.stringify(view)).toContain('Potentially unintended activity');
+      const history = await blocked.fetchHistory();
+      expect(history.events!.filter(e => e.activityTaskScheduledEventAttributes?.activityType?.name === 'runAgentTurn')).toHaveLength(1);
+      const account = ((await cw.query('accounts')) as any).accounts.find((a: any) => a.id === 'mock:policy');
+      expect(account.status).toBe('available');
+      const healthy = await start('@review done');
+      try {
+        await expect.poll(async () => (await healthy.query('view') as any).stage, { timeout: 30_000 }).toBe('review');
+      } finally { await healthy.terminate('test complete'); }
+    } finally {
+      await blocked.terminate('test complete');
+      await cw.terminate('test complete');
+    }
+  });
+
   it('gives replacement executions distinct turn IDs without changing activity retry identity', async () => {
     const repo = await h.makeRepo('replacement-turn');
     const taskId = newId('task');

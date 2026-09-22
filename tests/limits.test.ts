@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ProviderFailure,
+  classifyProviderTurnError,
   classifyLimitError,
   isTransportError,
   isResourceKill,
@@ -12,6 +13,13 @@ import {
 } from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
+  it('keeps safety blocks task-local even when the envelope says unauthorized', () => {
+    const message = 'misalignmentPolicyViolation HTTP 401 unauthorized: This request was blocked by our safety systems. Reason: Potentially unintended activity.';
+    expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });
+    expect(classifyProviderTurnError(new Error(message), 'codex').classification.limited).toBe(false);
+    expect(isTransportError(message + ' request 503')).toBe(false);
+  });
+
   it('classifies a Claude session-limit string + extracts the reset hint', () => {
     const c = classifyLimitError("You've hit your session limit · resets 3:45pm");
     expect(c.limited).toBe(true);

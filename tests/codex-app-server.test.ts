@@ -49,6 +49,13 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       } });
       send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
     }
+    else if (mode === 'policy-block') {
+      send({ method: 'error', params: {
+        error: { message: 'This request was blocked by our safety systems. Reason: Potentially unintended activity.',
+          codexErrorInfo: 'misalignmentPolicyViolation', status: 401 },
+        willRetry: false,
+      } });
+    }
     else if (mode === 'expired-model-token') {
       send({ method: 'error', params: {
         error: {
@@ -196,6 +203,14 @@ describe('CodexAdapter app-server security policy', () => {
 
   it('does not quarantine the Codex login when the optional Apps MCP token expires', async () => {
     await expect(run(undefined, 'expired-app-token')).resolves.toEqual(expect.any(Array));
+  });
+
+  it('reports a safety block without rejecting the shared credential', async () => {
+    await expect(run(undefined, 'policy-block')).rejects.toMatchObject({
+      name: 'ProviderPolicyFailure',
+      message: expect.stringMatching(/Codex safety rejection.*misalignmentPolicyViolation.*Potentially unintended activity/),
+      diagnostic: { code: 'misalignmentPolicyViolation', model: 'gpt-5.5' },
+    });
   });
 
   it('preserves safe native diagnostics for a model credential rejection', async () => {
