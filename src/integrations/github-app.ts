@@ -709,6 +709,42 @@ export class GitHubAppService {
     return active;
   }
 
+  /** Only offer installations this human can administer. App credentials alone
+   * must never allow linking an arbitrary installation into another tenant. */
+  async connectableInstallations(userId: string): Promise<Array<{ id: string; accountLogin: string; accountType: string }>> {
+    const accountId = await this.activeUserAccountId(userId);
+    const identity = await this.userIdentity(userId, accountId);
+    const result: Array<{ id: string; accountLogin: string; accountType: string }> = [];
+    for (let page = 1; page <= MAX_REPOSITORY_PAGES; page++) {
+      const response = await this.userRequest<{ installations: Array<GitHubInstallationPayload> }>(userId,
+        `/user/installations?per_page=100&page=${page}`, {}, accountId);
+      if (!Array.isArray(response.installations)) throw new Error('GitHub returned no installation list');
+      for (const installation of response.installations) {
+        if (installation.suspended_at) continue;
+        const account = installation.account;
+        let allowed = account.type === 'User' && account.login.toLowerCase() === identity.login.toLowerCase();
+        if (account.type === 'Organization') {
+          try {
+            const membership = await this.userRequest<{ state: string; role: string }>(userId,
+              `/user/memberships/orgs/${encodeURIComponent(account.login)}`, {}, accountId);
+            allowed = membership.state === 'active' && membership.role === 'admin';
+          } catch (error) {
+            if (!/404/.test(String(error))) throw error;
+          }
+        }
+        if (allowed) result.push({ id: String(installation.id), accountLogin: account.login, accountType: account.type! });
+      }
+      if (response.installations.length < 100) return result;
+    }
+    throw new Error('GitHub installation list exceeded the pagination limit');
+  }
+
+  async connectExistingInstallation(organizationId: string, userId: string, installationId: string) {
+    if (!(await this.connectableInstallations(userId)).some(installation => installation.id === installationId))
+      throw new Error('This GitHub installation is not available to this account');
+    return this.connectInstallation(organizationId, installationId);
+  }
+
   installationUrl(state: string): string {
     if (!this.configured()) throw new Error('GitHub App is not configured');
     const slug = this.options.appSlug?.trim();
