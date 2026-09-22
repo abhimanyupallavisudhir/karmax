@@ -3532,7 +3532,7 @@ function connectWs() {
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
-      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.endsWith('.approval-dismissed')) {
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask();
       } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -7523,6 +7523,7 @@ function renderTaskPage() {
     wireResourceInventory(v);
   } else if (tab === 'checkin') {
     wireReviewActions(v);
+    wireTaskApprovalRequests(v);
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
@@ -7694,6 +7695,19 @@ function approvalRequestsTab(v) {
       })}
     </div>
   </div>`;
+}
+
+// Keep decisions in the conversation only while they still need attention.
+// Dismissal silences a notification; it does not resolve the underlying request.
+function conversationApprovalRequests() {
+  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending');
+  const connections = (S.connections || []).filter((connection) =>
+    ['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending);
+  const rows = connectionRows(connections, true)
+    + permissionRequestRows(pending(S.permissionRequests))
+    + authorizationRequestRows(pending(S.authorizationRequests))
+    + credentialRequestRows(pending(S.approvalRequests), S.approvalItems, { showEmpty: false });
+  return rows ? `<div class="msg agent" id="task-approval-requests"><div class="role">Approval requests</div><div class="approval-list">${rows}</div></div>` : '';
 }
 
 function wireTaskApprovalRequests(v) {
@@ -8257,12 +8271,20 @@ async function wireResourceInventory(v, force = false) {
     wrap.querySelector('[data-inventory-retry]')?.addEventListener('click', () => wireResourceInventory(v, true));
   }
 }
+function resourceReviewNeedsAction(item) {
+  if (item.candidate) return ['pending', 'discarding'].includes(item.candidate.state);
+  if (item.discarded) return false;
+  if (item.error) return true;
+  return item.resource.publish === 'review' && !item.summary.promoted
+    && item.summary.added + item.summary.modified + item.summary.deleted > 0;
+}
+
 async function wireResourceReview(v, force = false) {
   const wrap = document.getElementById('review-resources');
   if (!wrap || v.stage !== 'review') return;
   const isCurrent = beginAsyncElementRender(wrap);
   try {
-    const items = await loadResourceReview(v, force);
+    const items = (await loadResourceReview(v, force)).filter(resourceReviewNeedsAction);
     if (!isCurrent()) return;
     if (!items.length) {
       wrap.classList.add('hidden');
@@ -8783,7 +8805,7 @@ function conversationPane(v, t) {
       ${copy}
       ${conversationFullscreenButton()}
     </div>
-    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationReviewInfo(v)}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationApprovalRequests()}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
 }
 

@@ -25,7 +25,7 @@ function fn(name) {
       window.$ = (s) => document.querySelector(s);
       window.S = { view: { taskId: 'a', title: 'Conversation', actions: [] }, taskTab: 'checkin' };
       window.TASK_TABS = [];
-      for (const name of ['taskRecord', 'parentTaskContext', 'stageIndicator', 'workflowLabel', 'customBranch', 'mergeQueueBadge', 'pullRequestLinks', 'taskAttempts', 'taskActions', 'captureFocus', 'captureFollowupFocus', 'captureThreadSelection', 'restoreThreadSelection', 'restoreFocus', 'restoreFollowupFocus', 'closeTask', 'wireAttempts', 'wireStageTransitions', 'wireWorkflowMode', 'wireTiming', 'wireNotes', 'wireResourceInventory', 'wireActions', 'wireTaskOrg', 'wireResourceReview', 'wireReviewActions', 'wireCheckinSidebar', 'wireFollowups', 'wireTerminal', 'wireExplainMessages', 'wireCopyButtons', 'wireMessageCopies', 'typesetMath', 'shouldFocusTaskBody']) window[name] = () => '';
+      for (const name of ['taskRecord', 'parentTaskContext', 'stageIndicator', 'workflowLabel', 'customBranch', 'mergeQueueBadge', 'pullRequestLinks', 'taskAttempts', 'taskActions', 'captureFocus', 'captureFollowupFocus', 'captureThreadSelection', 'restoreThreadSelection', 'restoreFocus', 'restoreFollowupFocus', 'closeTask', 'wireAttempts', 'wireStageTransitions', 'wireWorkflowMode', 'wireTiming', 'wireNotes', 'wireResourceInventory', 'wireActions', 'wireTaskOrg', 'wireResourceReview', 'wireReviewActions', 'wireTaskApprovalRequests', 'wireCheckinSidebar', 'wireFollowups', 'wireTerminal', 'wireExplainMessages', 'wireCopyButtons', 'wireMessageCopies', 'typesetMath', 'shouldFocusTaskBody']) window[name] = () => '';
       window.esc = (s) => String(s ?? '');
       window.taskUrl = () => '/task/a';
       window.role = 'do'; window.count = 30; window.extra = 0;

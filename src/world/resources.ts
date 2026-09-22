@@ -823,6 +823,23 @@ export class ProjectResourceService {
     const base = lease.revisionId ? await this.engine.manifest((await this.store.getResourceRevision(lease.revisionId))!) : emptyManifest(attachment.id);
     const current = await manifestFromWorld(attachment, world, target);
     const summary = compareManifests(attachment.id, lease.revisionId, base, current);
+    // Keep the lease's original baseline (and its publication CAS fence), but
+    // stop asking for a decision on bytes this task has already published.
+    let publishedId = attachment.currentRevisionId;
+    const visited = new Set<string>();
+    while (publishedId && publishedId !== lease.revisionId && !visited.has(publishedId)) {
+      visited.add(publishedId);
+      const published = await this.store.getResourceRevision(publishedId);
+      if (!published) break;
+      if (published.createdByTaskId === taskId) {
+        const reviewed = compareManifests(attachment.id, published.id, await this.engine.manifest(published), current);
+        summary.promoted = reviewed.added + reviewed.modified + reviewed.deleted === 0;
+        break;
+      }
+      // Follow only published ancestry: failed CAS captures and checkpoints do
+      // not count. Later promotions by other tasks must not revive this card.
+      publishedId = published.parentRevisionId;
+    }
     (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:inspect',
       scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, summary } }));
     return summary;

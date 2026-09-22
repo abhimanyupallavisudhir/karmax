@@ -691,6 +691,8 @@ export interface ResourceLease {
 }
 
 export interface ResourceChangeSummary {
+  /** Current task bytes already match its published revision. */
+  promoted?: boolean;
   attachmentId: string;
   baseRevisionId?: string;
   added: number;

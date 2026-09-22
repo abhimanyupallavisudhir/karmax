@@ -102,6 +102,10 @@ describe('project resources', () => {
     const promoted = await resources.promote(task.id, volume.id);
     expect(promoted.revision.parentRevisionId).toBe(initial.id);
     expect((await store.getResourceAttachment(volume.id))?.currentRevisionId).toBe(promoted.revision.id);
+    expect((await resources.summarize(task.id, volume.id)).promoted).toBe(true);
+    await world.writeFileBuffer!('resources/model/model.bin', Buffer.from('further edits'));
+    expect((await resources.summarize(task.id, volume.id)).promoted).not.toBe(true);
+    await world.writeFileBuffer!('resources/model/model.bin', tunedBytes);
 
     const consumer = (await store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'evaluate' } }));
@@ -109,6 +113,9 @@ describe('project resources', () => {
     consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
     consumerWorld.handle = (await store.registerWorld(consumerWorld.handle, project.id)) as typeof consumerWorld.handle;
     expect(await consumerWorld.readFileBuffer('resources/model/model.bin')).toEqual(tunedBytes);
+    await consumerWorld.writeFileBuffer!('resources/model/model.bin', Buffer.from('next baseline'));
+    await resources.promote(consumer.id, volume.id);
+    expect((await resources.summarize(task.id, volume.id)).promoted).toBe(true);
 
     // This generation is still pinned to its original lease. A second publish
     // cannot overwrite a baseline that moved since the task forked.
