@@ -195,7 +195,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/github\/app-manifest$/.test(p)) return 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/github\/app$/.test(p)) return read ? 'repository:read' : 'settings:write';
-  if (/^\/api\/organizations\/[^/]+\/github\/(?:authorize|install-url|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:authorize|install-url|connect-existing|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
@@ -1629,12 +1629,14 @@ export class Gateway {
           (await new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(identity.user.id))
             .setActiveGithub(activeAccountId));
         }
-        for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === pending.organizationId))
-          await this.ensureProjectWiki(project, identity.user.id);
+        if (pending.returnTo !== 'installation') {
+          for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === pending.organizationId))
+            await this.ensureProjectWiki(project, identity.user.id);
+        }
         const destination = pending.returnTo === 'profile'
           ? (await userProfilePath(this.deps.store, pending.organizationId))
           : (await organizationSettingsPath(this.deps.store, pending.organizationId));
-        res.writeHead(303, { location: `${destination}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        res.writeHead(303, { location: `${destination}?github=${pending.returnTo === 'installation' ? 'choose-installation' : 'ready'}&organizationId=${encodeURIComponent(pending.organizationId)}${pending.returnTo === 'installation' ? '#settings-code' : ''}` });
         return void res.end();
       } catch (error) {
         return (await this.githubCallbackPage(res, 502, `GitHub authorization failed: ${error instanceof Error ? error.message : String(error)}`));
@@ -2651,7 +2653,7 @@ export class Gateway {
           reconnectLogin = account.login;
         }
         const state = (await store.createGithubInstallState(githubAuthorize[1]!, subject.userId,
-          b.returnTo === 'profile' ? { returnTo: 'profile', githubAccountId: reconnectAccountId,
+          b.returnTo === 'profile' || b.returnTo === 'installation' ? { returnTo: b.returnTo, githubAccountId: reconnectAccountId,
             githubLogin: reconnectLogin, selectAccount: b.mode === 'add' } : {}));
         try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, (await this.githubPublicUrl(req)), {
           login: reconnectLogin, selectAccount: b.mode === 'add',
@@ -2661,9 +2663,36 @@ export class Gateway {
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
       if (githubInstallUrl && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        const githubApp = this.deps.githubApp;
+        if (!githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         const state = (await store.createGithubInstallState(githubInstallUrl[1]!, subject.userId));
-        return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
+        const status = await githubApp.status(subject.userId);
+        const authorize = async () => {
+          const oauthState = await store.createGithubInstallState(githubInstallUrl[1]!, subject.userId, { returnTo: 'installation' });
+          return this.json(res, 200, { url: githubApp.userAuthorizationUrl(oauthState, await this.githubPublicUrl(req)) });
+        };
+        if (!status.userAuthorized && status.oauthConfigured) return authorize();
+        try {
+          const installations = status.userAuthorized ? await githubApp.connectableInstallations(subject.userId) : [];
+          return this.json(res, 200, { url: githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured });
+        } catch (error) {
+          // A revoked/expired user token may be removed during discovery. Resume
+          // authorization instead of sending an existing installation to GitHub's dead end.
+          if (status.oauthConfigured && !(await githubApp.status(subject.userId)).userAuthorized) return authorize();
+          throw error;
+        }
+      }
+      const githubConnectExisting = p.match(/^\/api\/organizations\/([^/]+)\/github\/connect-existing$/);
+      if (githubConnectExisting && method === 'POST') {
+        const subject = requireHumanSubject(callerIdentity);
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        if (!(await store.organizationMembership(githubConnectExisting[1]!, subject.userId)))
+          return this.json(res, 403, { error: 'user is not an organization member' });
+        const body = await this.body(req);
+        try {
+          return this.json(res, 200, await this.deps.githubApp.connectExistingInstallation(
+            githubConnectExisting[1]!, subject.userId, String(body.installationId ?? '')));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubRefresh = p.match(/^\/api\/organizations\/([^/]+)\/github\/refresh$/);
       if (githubRefresh && method === 'POST') {
