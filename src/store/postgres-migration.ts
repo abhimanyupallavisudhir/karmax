@@ -11,8 +11,8 @@ export interface SqliteImportResult {
 
 const quote = (identifier: string): string => `"${identifier.replace(/"/g, '""')}"`;
 
-function count(db: SqlDatabase, table: string): number {
-  return Number((db.prepare(`SELECT COUNT(*) AS n FROM ${quote(table)}`).get() as any)?.n ?? 0);
+async function count(db: SqlDatabase, table: string): Promise<number> {
+  return Number(((await db.prepare(`SELECT COUNT(*) AS n FROM ${quote(table)}`).get()) as any)?.n ?? 0);
 }
 
 function convert(value: unknown, dataType: string | undefined): unknown {
@@ -28,15 +28,15 @@ function convert(value: unknown, dataType: string | undefined): unknown {
   return value;
 }
 
-function dependencyOrder(tables: string[], target: SqlDatabase): string[] {
+async function dependencyOrder(tables: string[], target: SqlDatabase): Promise<string[]> {
   const wanted = new Set(tables);
   const parents = new Map<string, Set<string>>(tables.map((table) => [table, new Set()]));
-  for (const row of target.prepare(`SELECT child.relname AS child, parent.relname AS parent
+  for (const row of (await target.prepare(`SELECT child.relname AS child, parent.relname AS parent
     FROM pg_constraint constraint_row
     JOIN pg_class child ON child.oid=constraint_row.conrelid
     JOIN pg_class parent ON parent.oid=constraint_row.confrelid
     JOIN pg_namespace namespace_row ON namespace_row.oid=child.relnamespace
-    WHERE constraint_row.contype='f' AND namespace_row.nspname=current_schema()`).all() as any[]) {
+    WHERE constraint_row.contype='f' AND namespace_row.nspname=current_schema()`).all()) as any[]) {
     const child = String(row.child), parent = String(row.parent);
     if (wanted.has(child) && wanted.has(parent) && child !== parent) parents.get(child)!.add(parent);
   }
@@ -57,25 +57,26 @@ function dependencyOrder(tables: string[], target: SqlDatabase): string[] {
  * advisory lock makes concurrent rolling starts serialize on the same import,
  * while a durable marker makes every later boot a constant-time no-op.
  */
-export function importSqliteDatabase(sourceFile: string, target: SqlDatabase, scope: string,
+export async function importSqliteDatabase(sourceFile: string, target: SqlDatabase, scope: string,
   options: {
     sentinelTable: string;
     allowedSeedRows?: number;
     transformRows?: (table: string, rows: Record<string, unknown>[]) => Record<string, unknown>[];
-  } = { sentinelTable: 'tasks' }): SqliteImportResult {
+  } = { sentinelTable: 'tasks' }): Promise<SqliteImportResult> {
   if (target.dialect !== 'postgres') throw new Error('SQLite import target must be PostgreSQL');
-  target.exec(`CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
+  (await target.exec(`CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
     key TEXT PRIMARY KEY, completed_at BIGINT NOT NULL, source TEXT NOT NULL,
     tables INTEGER NOT NULL, rows BIGINT NOT NULL
-  )`);
+  )`));
+  return target.transaction(async () => {
   const marker = `sqlite-import:${scope}:v1`;
-  target.prepare('SELECT pg_advisory_lock(hashtext(?))').get(`karmax:${marker}`);
+  (await target.prepare('SELECT pg_advisory_xact_lock(hashtext(?))').get(`karmax:${marker}`));
   try {
-    if (target.prepare(`SELECT 1 FROM ${MIGRATION_TABLE} WHERE key=?`).get(marker))
+    if ((await target.prepare(`SELECT 1 FROM ${MIGRATION_TABLE} WHERE key=?`).get(marker)))
       return { imported: false, tables: 0, rows: 0 };
     if (!fs.existsSync(sourceFile)) return { imported: false, tables: 0, rows: 0 };
 
-    const existing = count(target, options.sentinelTable);
+    const existing = (await count(target, options.sentinelTable));
     if (existing > (options.allowedSeedRows ?? 0)) {
       throw new Error(`refusing SQLite import into non-empty PostgreSQL ${scope} database `
         + `(${options.sentinelTable} contains ${existing} rows and no migration marker exists)`);
@@ -85,33 +86,33 @@ export function importSqliteDatabase(sourceFile: string, target: SqlDatabase, sc
     let tableCount = 0;
     let rowCount = 0;
     try {
-      const targetTables = new Set((target.prepare(`SELECT table_name AS name FROM information_schema.tables
-        WHERE table_schema=current_schema() AND table_type='BASE TABLE'`).all() as any[]).map((row) => String(row.name)));
-      const discoveredTables = (source.prepare(`SELECT name FROM sqlite_master
-        WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all() as any[])
+      const targetTables = new Set(((await target.prepare(`SELECT table_name AS name FROM information_schema.tables
+        WHERE table_schema=current_schema() AND table_type='BASE TABLE'`).all()) as any[]).map((row) => String(row.name)));
+      const discoveredTables = ((await source.prepare(`SELECT name FROM sqlite_master
+        WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all()) as any[])
         .map((row) => String(row.name)).filter((name) => targetTables.has(name));
-      const sourceTables = dependencyOrder(discoveredTables, target);
+      const sourceTables = (await dependencyOrder(discoveredTables, target));
 
-      target.exec('BEGIN');
+      (await target.exec('BEGIN'));
       try {
         for (const table of sourceTables) {
           try {
-            const sourceColumns = (source.prepare(`PRAGMA table_info(${quote(table)})`).all() as any[])
+            const sourceColumns = ((await source.prepare(`PRAGMA table_info(${quote(table)})`).all()) as any[])
               .map((column) => String(column.name));
-            const targetColumns = new Map((target.prepare(`SELECT column_name AS name, data_type AS dataType
+            const targetColumns = new Map(((await target.prepare(`SELECT column_name AS name, data_type AS dataType
               FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=?
-              ORDER BY ordinal_position`).all(table) as any[])
+              ORDER BY ordinal_position`).all(table)) as any[])
               .map((column) => [String(column.name), String(column.dataType)]));
             const columns = sourceColumns.filter((column) => targetColumns.has(column));
             if (!columns.length) continue;
-            const sourceRows = source.prepare(`SELECT ${columns.map(quote).join(',')} FROM ${quote(table)}`)
-              .all() as unknown as Record<string, unknown>[];
+            const sourceRows = (await source.prepare(`SELECT ${columns.map(quote).join(',')} FROM ${quote(table)}`)
+              .all()) as unknown as Record<string, unknown>[];
             const rows = options.transformRows?.(table, sourceRows) ?? sourceRows;
             const placeholders = columns.map(() => '?').join(',');
             const insert = target.prepare(`INSERT INTO ${quote(table)} (${columns.map(quote).join(',')})
               VALUES (${placeholders}) ON CONFLICT DO NOTHING`);
-            for (const row of rows) insert.run(...columns.map((column) => convert(row[column], targetColumns.get(column))));
-            const after = count(target, table);
+            for (const row of rows) (await insert.run(...columns.map((column) => convert(row[column], targetColumns.get(column)))));
+            const after = (await count(target, table));
             if (after !== rows.length)
               throw new Error(`expected ${rows.length} rows, found ${after}`);
             tableCount++;
@@ -122,21 +123,22 @@ export function importSqliteDatabase(sourceFile: string, target: SqlDatabase, sc
         }
         for (const table of ['events', 'audit_log']) {
           if (!targetTables.has(table)) continue;
-          target.prepare(`SELECT setval(pg_get_serial_sequence(?, 'seq'),
+          (await target.prepare(`SELECT setval(pg_get_serial_sequence(?, 'seq'),
             COALESCE((SELECT MAX(seq) FROM ${quote(table)}), 1),
-            EXISTS (SELECT 1 FROM ${quote(table)}))`).get(table);
+            EXISTS (SELECT 1 FROM ${quote(table)}))`).get(table));
         }
-        target.prepare(`INSERT INTO ${MIGRATION_TABLE} (key, completed_at, source, tables, rows)
+        (await target.prepare(`INSERT INTO ${MIGRATION_TABLE} (key, completed_at, source, tables, rows)
           VALUES (?, ?, ?, ?, ?)`)
-          .run(marker, Date.now(), sourceFile, tableCount, rowCount);
-        target.exec('COMMIT');
+          .run(marker, Date.now(), sourceFile, tableCount, rowCount));
+        (await target.exec('COMMIT'));
       } catch (error) {
-        target.exec('ROLLBACK');
+        (await target.exec('ROLLBACK'));
         throw error;
       }
-    } finally { source.close(); }
+    } finally { (await source.close()); }
     return { imported: true, tables: tableCount, rows: rowCount };
   } finally {
-    target.prepare('SELECT pg_advisory_unlock(hashtext(?))').get(`karmax:${marker}`);
+    // Transaction-scoped advisory lock releases with commit or rollback.
   }
+  });
 }

@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../util/async-collections.js';
 import { resolvePaymentPolicy, validatePaymentPolicy } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
@@ -105,12 +106,12 @@ export class ValidationError extends Error {
  * boot's re-arm (the store is the durable source of truth).
  */
 export interface TriggerArmer {
-  arm(task: TaskRecord): void;
+  arm(task: TaskRecord): unknown;
   disarm(taskId: string): void;
   /** Graph-aware validation (self-dependency, cycles, dangling dependency ids).
    *  Only the armer can do this half — it needs the store to resolve dependency
    *  ids — so `armStoredTask` asks for it before mutating anything. */
-  validationErrors?(task: TaskRecord): string[];
+  validationErrors?(task: TaskRecord): string[] | Promise<string[]>;
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
@@ -344,8 +345,8 @@ export class KarmaxApi {
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
-  private workflowHandle(taskId: string): any {
-    const runId = this.deps.store.getTask(taskId)?.params?._workflowRunId;
+  private async workflowHandle(taskId: string, metadata?: TaskRecord | null): Promise<any> {
+    const runId = (metadata === undefined ? (await this.deps.store.taskMetadata(taskId)) : metadata)?.params?._workflowRunId;
     return this.deps.client.workflow.getHandle(taskId,
       typeof runId === 'string' && runId ? runId : undefined);
   }
@@ -371,21 +372,21 @@ export class KarmaxApi {
     this.armer = armer;
   }
 
-  private collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
-    const caller = this.require(token, tool);
+  private async collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
+    const caller = (await this.require(token, tool));
     if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
-    const task = this.deps.store.getTask(caller.taskId);
+    const task = (await this.deps.store.getTask(caller.taskId));
     if (!task) throw new Error('calling task not found');
-    const project = this.deps.store.getProject(task.projectId);
+    const project = (await this.deps.store.getProject(task.projectId));
     if (!project?.organizationId) throw new Error('calling task project is unavailable');
-    const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+    const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
     if (!handle) throw new Error('calling task has no recoverable world');
     return { task, project, handle };
   }
 
-  private gitBrokerAuth(projectId: string): GitBrokerAuth {
-    const linked = this.deps.store.listProjectRepositories(projectId);
-    const wiki = this.deps.store.projectWiki(projectId)?.repository;
+  private async gitBrokerAuth(projectId: string): Promise<GitBrokerAuth> {
+    const linked = (await this.deps.store.listProjectRepositories(projectId));
+    const wiki = (await this.deps.store.projectWiki(projectId))?.repository;
     return async (repo) => {
       if (!this.deps.githubApp) throw new Error('Connect GitHub in organization settings, then try again.');
       const source = worldRepoSource(repo);
@@ -401,15 +402,15 @@ export class KarmaxApi {
    * is a replay-safe snapshot, so collaboration operations must close that gap
    * before they can truthfully claim every checkout was published/imported. */
   private async enrollProjectRepositories(task: TaskRecord, world: import('../world/types.js').World): Promise<string[]> {
-    const linked = this.deps.store.listProjectRepositories(task.projectId);
-    const added = await enrollWorldRepositories(world, linked, this.gitBrokerAuth(task.projectId), async (enrolled) => {
-      const current = (this.deps.store.currentWorld(task.id) ?? world.handle) as WorldHandle;
-      const durable = this.deps.store.updateWorldCheckouts(current, world.handle.repos!);
+    const linked = (await this.deps.store.listProjectRepositories(task.projectId));
+    const added = await enrollWorldRepositories(world, linked, (await this.gitBrokerAuth(task.projectId)), async (enrolled) => {
+      const current = ((await this.deps.store.currentWorld(task.id)) ?? world.handle) as WorldHandle;
+      const durable = (await this.deps.store.updateWorldCheckouts(current, world.handle.repos!));
       world.handle = durable as WorldHandle;
       const event = { taskId: task.id, type: 'world.repository-enrolled', ts: Date.now(), payload: {
         repo: enrolled.name, source: worldRepoSource(enrolled), branch: enrolled.branch,
       } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
     });
     return added.map((repo) => repo.name);
@@ -422,17 +423,17 @@ export class KarmaxApi {
   async attachProjectRepository(token: string, input: {
     projectId: string; repositoryId: string; baseBranch?: string; targetBranch?: string; order?: number;
   }) {
-    const project = this.deps.store.getProject(input.projectId);
+    const project = (await this.deps.store.getProject(input.projectId));
     if (!project) throw new NotFoundError('project not found');
-    const caller = this.require(token, 'repository:write', {
+    const caller = (await this.require(token, 'repository:write', {
       projectId: input.projectId, organizationId: project.organizationId,
-    });
-    const previous = this.deps.store.listProjectRepositories(input.projectId)
+    }));
+    const previous = (await this.deps.store.listProjectRepositories(input.projectId))
       .find((candidate) => candidate.repositoryId === input.repositoryId);
-    const attached = this.deps.store.attachProjectRepository(input);
-    const task = caller.actor.kind === 'task-agent' ? this.deps.store.getTask(caller.actor.taskId) : undefined;
+    const attached = (await this.deps.store.attachProjectRepository(input));
+    const task = caller.actor.kind === 'task-agent' ? (await this.deps.store.getTask(caller.actor.taskId)) : undefined;
     const handle = task?.projectId === input.projectId
-      ? this.deps.store.currentWorld(task.id) as WorldHandle | undefined
+      ? (await this.deps.store.currentWorld(task.id)) as WorldHandle | undefined
       : undefined;
     if (!task || !handle) return attached;
     try {
@@ -442,14 +443,14 @@ export class KarmaxApi {
         return { ...attached, ...(enrolled.length ? { enrollment: { taskId: task.id, checkouts: enrolled } } : {}) };
       } finally { await access.release(); }
     } catch (error) {
-      if (previous) this.deps.store.attachProjectRepository({
+      if (previous) (await this.deps.store.attachProjectRepository({
         projectId: previous.projectId,
         repositoryId: previous.repositoryId,
         baseBranch: previous.baseBranch,
         targetBranch: previous.targetBranch,
         order: previous.order,
-      });
-      else this.deps.store.detachProjectRepository(input.projectId, input.repositoryId);
+      }));
+      else (await this.deps.store.detachProjectRepository(input.projectId, input.repositoryId));
       throw new Error(`repository attachment was rolled back because the running task checkout could not be enrolled: ${unwrapCause(error)}. Retry the task after fixing the repository or world configuration.`);
     }
   }
@@ -460,11 +461,11 @@ export class KarmaxApi {
     return { world: await this.deps.worlds.open(handle), handle, release: async () => {} };
   }
 
-  private collaborationCaller(token: string) {
-    const caller = this.require(token, 'request_agent_action');
+  private async collaborationCaller(token: string) {
+    const caller = (await this.require(token, 'request_agent_action'));
     if (!caller.taskId || caller.taskId === '*')
       throw new CapabilityError('request_agent_action requires a task-agent token');
-    const task = this.deps.store.getTask(caller.taskId);
+    const task = (await this.deps.store.getTask(caller.taskId));
     if (!task) throw new Error('calling task not found');
     return task;
   }
@@ -480,8 +481,8 @@ export class KarmaxApi {
     action: 'publish_branch';
     message?: string;
   }): Promise<CollaborationRequest> {
-    const requester = this.collaborationCaller(token);
-    const target = this.deps.store.getTask(input.taskId);
+    const requester = (await this.collaborationCaller(token));
+    const target = (await this.deps.store.getTask(input.taskId));
     if (!target || target.projectId !== requester.projectId)
       throw new Error('target task must belong to the same project');
     if (target.id === requester.id) throw new Error('a task cannot request collaboration from itself');
@@ -489,12 +490,12 @@ export class KarmaxApi {
     const unavailable = collaborationTargetIssue(target.lastView, 'admission');
     if (unavailable) throw new Error(unavailable.admission);
 
-    const request = this.deps.store.createCollaborationRequest({
+    const request = (await this.deps.store.createCollaborationRequest({
       requesterTaskId: requester.id,
       targetTaskId: target.id,
       targetRole: input.role ?? 'do',
       action: input.action,
-    });
+    }));
 
     // New software-dev workers understand this signal and hold the requester in
     // Do at its turn boundary. Other workflow types still receive the eventual
@@ -503,7 +504,7 @@ export class KarmaxApi {
       await this.deps.client.workflow.getHandle(requester.id)
         .signal(SIG.collaborationRequested, request.id);
     } catch (error) {
-      this.deps.store.deleteCollaborationRequest(request.id);
+      (await this.deps.store.deleteCollaborationRequest(request.id));
       throw new Error(`could not register collaboration with the requesting workflow: ${unwrapCause(error)}`);
     }
 
@@ -516,28 +517,28 @@ export class KarmaxApi {
     try {
       await this.deliverWorkflowMessage(target.id, instruction, input.role ?? 'do');
     } catch (error) {
-      const failed = this.deps.store.settleCollaborationRequest(request.id, 'failed', {
+      const failed = (await this.deps.store.settleCollaborationRequest(request.id, 'failed', {
         requestId: request.id,
         reason: `could not deliver the request: ${unwrapCause(error)}`,
-      });
+      }));
       if (failed) await this.notifyCollaborationRequest(failed);
-      return this.deps.store.getCollaborationRequest(request.id) ?? request;
+      return (await this.deps.store.getCollaborationRequest(request.id)) ?? request;
     }
     // The target can cross into a blocked/terminal state between the admission
     // check and signal delivery. Re-read the durable view after delivery so that
     // race cannot strand the requester waiting for an event that already fired.
     const raced = collaborationTargetIssue(
-      this.deps.store.getTask(target.id)?.lastView,
+      (await this.deps.store.getTask(target.id))?.lastView,
       'pending',
     );
     if (raced) {
-      const failed = this.deps.store.settleCollaborationRequest(request.id, 'failed', {
+      const failed = (await this.deps.store.settleCollaborationRequest(request.id, 'failed', {
         requestId: request.id,
         reason: raced.result,
-      });
+      }));
       if (failed) await this.notifyCollaborationRequest(failed);
     }
-    return this.deps.store.getCollaborationRequest(request.id) ?? request;
+    return (await this.deps.store.getCollaborationRequest(request.id)) ?? request;
   }
 
   /** Withdraw one background collaboration owned by the calling task. A
@@ -545,25 +546,25 @@ export class KarmaxApi {
    * example, when the target is escalated), otherwise its Do-stage join is a
    * permanent circular dependency. */
   async cancelAgentAction(token: string, requestId: string): Promise<CollaborationRequest> {
-    const requester = this.collaborationCaller(token);
-    const request = this.deps.store.getCollaborationRequest(requestId);
+    const requester = (await this.collaborationCaller(token));
+    const request = (await this.deps.store.getCollaborationRequest(requestId));
     if (!request || request.requesterTaskId !== requester.id)
       throw new Error('collaboration request not found for the calling task');
     if (request.status !== 'pending') return request;
 
-    const settled = this.deps.store.settleCollaborationRequest(request.id, 'failed', {
+    const settled = (await this.deps.store.settleCollaborationRequest(request.id, 'failed', {
       reason: 'request withdrawn by the requesting task',
-    });
-    if (!settled) return this.deps.store.getCollaborationRequest(request.id) ?? request;
+    }));
+    if (!settled) return (await this.deps.store.getCollaborationRequest(request.id)) ?? request;
     await this.notifyCollaborationRequest(settled);
-    return this.deps.store.getCollaborationRequest(request.id) ?? settled;
+    return (await this.deps.store.getCollaborationRequest(request.id)) ?? settled;
   }
 
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
     const message: Message = { id: `u${randomUUID()}`, role: 'user', text, ts: now };
-    await this.workflowHandle(taskId).signal(SIG.followUp, message, role);
-    this.publishConversationMessage(taskId, role, message);
+    await (await this.workflowHandle(taskId)).signal(SIG.followUp, message, role);
+    (await this.publishConversationMessage(taskId, role, message));
     return message;
   }
 
@@ -576,7 +577,7 @@ export class KarmaxApi {
   async resumeAfterCredentialDecision(taskId: string, text: string, role = 'do'): Promise<
     { resumed: true; messageId: string } | { resumed: false; reason: string }
   > {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) return { resumed: false, reason: 'task no longer exists' };
     if (['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
       return { resumed: false, reason: `task is already ${task.lastView!.status}` };
@@ -589,7 +590,7 @@ export class KarmaxApi {
   }
 
   async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
-    const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
+    const { task, handle } = (await this.collaborationTask(token, 'publish_task_branch'));
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
       await this.enrollProjectRepositories(task, access.world);
@@ -603,15 +604,15 @@ export class KarmaxApi {
       if (Object.keys(ancestry.errors).length)
         throw new Error(`could not publish ${Object.entries(ancestry.errors).map(([repo, detail]) => `${repo}: ${detail}`).join('; ')}`);
       for (const repair of ancestry.repaired) {
-        this.deps.store.appendEvent({ taskId: task.id, type: 'branch.ancestry-repaired', ts: Date.now(), payload: repair });
+        (await this.deps.store.appendEvent({ taskId: task.id, type: 'branch.ancestry-repaired', ts: Date.now(), payload: repair }));
       }
-      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId),
-        expectedTaskRemoteHeads(this.deps.store, task.id), recordTaskPublication(this.deps.store, task.id));
+      const result = await brokerPublishBranch(access.world, (await this.gitBrokerAuth(task.projectId)),
+        (await expectedTaskRemoteHeads(this.deps.store, task.id)), recordTaskPublication(this.deps.store, task.id));
       if (!result.pushed.length || result.skipped.length)
         throw new Error(`could not publish ${result.skipped.length ? describePublishFailures(result) : 'task branch'}`);
       const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
         branch: access.handle.branch, repos: result.pushed, reason: 'agent-collaboration' } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
       await this.routeCollaborationEvent({ ...event, seq });
       return { branch: access.handle.branch, pushed: result.pushed };
@@ -626,10 +627,10 @@ export class KarmaxApi {
     access?: ResourceAccess;
     publish?: 'discard' | 'review';
   }) {
-    const caller = this.require(token, 'propose_project_resource');
+    const caller = (await this.require(token, 'propose_project_resource'));
     if (!caller.taskId || caller.taskId === '*') throw new CapabilityError('propose_project_resource requires a task-agent token');
     if (!this.deps.resources) throw new Error('project resources are unavailable');
-    const task = this.deps.store.getTask(caller.taskId);
+    const task = (await this.deps.store.getTask(caller.taskId));
     if (!task) throw new NotFoundError('calling task not found');
     const resourceReviewMinor = task.workflow === 'software-dev' || task.workflow === 'goal' ? 19
       : task.workflow === 'just-do' ? 5 : undefined;
@@ -638,11 +639,11 @@ export class KarmaxApi {
       && Number.isFinite(taskMinor) && (taskMajor! > 1 || (taskMajor === 1 && taskMinor! >= resourceReviewMinor));
     if (!supportsResourceReview)
       throw new ValidationError('this task workflow version does not support review-gated project resource adoption');
-    const project = this.deps.store.getProject(task.projectId);
+    const project = (await this.deps.store.getProject(task.projectId));
     if (!project?.organizationId) throw new NotFoundError('calling task project is unavailable');
-    this.require(token, 'propose_project_resource', { taskId: task.id, projectId: task.projectId,
-      organizationId: project.organizationId });
-    const current = this.deps.store.currentWorld(task.id) as WorldHandle | undefined;
+    (await this.require(token, 'propose_project_resource', { taskId: task.id, projectId: task.projectId,
+      organizationId: project.organizationId }));
+    const current = (await this.deps.store.currentWorld(task.id)) as WorldHandle | undefined;
     if (caller.worldGeneration == null || current?.generation == null || caller.worldGeneration !== current.generation)
       throw new CapabilityError('project resource proposals require a token for the task’s current world generation');
     if (input.source.kind === 'path') {
@@ -654,7 +655,7 @@ export class KarmaxApi {
     }
     if (!this.deps.broker) throw new Error('credential broker is unavailable');
     const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, project.organizationId);
-    const item = vault.get(input.source.itemId);
+    const item = (await vault.get(input.source.itemId));
     if (!item) throw new NotFoundError('vault item not found');
     // The narrow vault:store capability lets an agent preserve credentials it
     // created, not silently repurpose somebody else's credential as a project
@@ -676,49 +677,49 @@ export class KarmaxApi {
   }
 
   async adoptProjectResource(token: string, taskId: string, candidateId: string) {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError('task not found');
-    const project = this.deps.store.getProject(task.projectId);
-    const caller = this.require(token, 'adopt_project_resource', { taskId, projectId: task.projectId,
-      organizationId: project?.organizationId });
+    const project = (await this.deps.store.getProject(task.projectId));
+    const caller = (await this.require(token, 'adopt_project_resource', { taskId, projectId: task.projectId,
+      organizationId: project?.organizationId }));
     if (!this.deps.resources) throw new Error('project resources are unavailable');
-    const result = this.deps.resources.adoptCandidate(taskId, candidateId, caller.principal);
+    const result = (await this.deps.resources.adoptCandidate(taskId, candidateId, caller.principal));
     // The durable store transition is authoritative. The signal only wakes a
     // Review workflow that is currently parked on this decision; if the workflow
     // has already closed, the adopted resource must remain adopted.
-    try { await this.workflowHandle(taskId).signal(SIG.resourceResolved); }
+    try { await (await this.workflowHandle(taskId)).signal(SIG.resourceResolved); }
     catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
     return result;
   }
 
   async discardProjectResource(token: string, taskId: string, candidateId: string) {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError('task not found');
-    const project = this.deps.store.getProject(task.projectId);
-    const caller = this.require(token, 'discard_project_resource', { taskId, projectId: task.projectId,
-      organizationId: project?.organizationId });
+    const project = (await this.deps.store.getProject(task.projectId));
+    const caller = (await this.require(token, 'discard_project_resource', { taskId, projectId: task.projectId,
+      organizationId: project?.organizationId }));
     if (!this.deps.resources) throw new Error('project resources are unavailable');
     const result = await this.deps.resources.discardCandidate(taskId, candidateId, caller.principal);
-    try { await this.workflowHandle(taskId).signal(SIG.resourceResolved); }
+    try { await (await this.workflowHandle(taskId)).signal(SIG.resourceResolved); }
     catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
     return result;
   }
 
   async importTaskBranch(token: string, sourceTaskId: string) {
-    const { task, handle } = this.collaborationTask(token, 'import_task_branch');
-    const source = this.deps.store.getTask(sourceTaskId);
+    const { task, handle } = (await this.collaborationTask(token, 'import_task_branch'));
+    const source = (await this.deps.store.getTask(sourceTaskId));
     if (!source || source.projectId !== task.projectId) throw new Error('source task must belong to the same project');
-    const sourceHandle = (this.deps.store.currentWorld(sourceTaskId) ?? source.lastView?.world) as WorldHandle | undefined;
+    const sourceHandle = ((await this.deps.store.currentWorld(sourceTaskId)) ?? source.lastView?.world) as WorldHandle | undefined;
     if (!sourceHandle) throw new Error('source task has no published world branch');
-    const requiredSourceRepos = this.deps.store.listProjectRepositories(task.projectId).flatMap((attachment) => {
+    const requiredSourceRepos = (await this.deps.store.listProjectRepositories(task.projectId)).flatMap((attachment) => {
       const checkout = worldRepos(sourceHandle).find((repo) => sameRepository(worldRepoSource(repo), attachment.repository.sshUrl));
       return checkout ? [checkout.name] : [];
     });
-    const sourceMissing = this.deps.store.listProjectRepositories(task.projectId)
+    const sourceMissing = (await this.deps.store.listProjectRepositories(task.projectId))
       .filter((attachment) => !worldRepos(sourceHandle)
         .some((repo) => sameRepository(worldRepoSource(repo), attachment.repository.sshUrl)));
     if (sourceMissing.length) throw new Error(`source task is missing newly attached checkout(s): ${sourceMissing.map((entry) => entry.repository.name).join(', ')}; ask its agent to call publish_task_branch to enroll and publish them`);
-    const published = this.deps.store.eventsSince(sourceTaskId, 0).some((event) => {
+    const published = (await this.deps.store.eventsSince(sourceTaskId, 0)).some((event) => {
       if (event.type !== 'push.branch') return false;
       const payload = event.payload as { branch?: string; repos?: string[] } | undefined;
       return payload?.branch === sourceHandle.branch
@@ -729,29 +730,29 @@ export class KarmaxApi {
     try {
       await this.enrollProjectRepositories(task, access.world);
       const refs = await brokerImportTaskBranch(access.world, sourceHandle, sourceTaskId,
-        this.gitBrokerAuth(task.projectId));
+        (await this.gitBrokerAuth(task.projectId)));
       return { sourceTaskId, refs };
     } finally { await access.release(); }
   }
 
   async refreshUpstream(token: string, branch?: string) {
-    const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
+    const { task, handle } = (await this.collaborationTask(token, 'refresh_upstream'));
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
-      const project = this.deps.store.getProject(task.projectId);
-      const targetAuthority = remotePolicyOf(project ? this.deps.store.effectiveProjectConfig(project) : undefined) === 'pr'
+      const project = (await this.deps.store.getProject(task.projectId));
+      const targetAuthority = remotePolicyOf(project ? (await this.deps.store.effectiveProjectConfig(project)) : undefined) === 'pr'
         ? 'origin'
         : 'project';
-      return await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch, targetAuthority);
+      return await brokerRefreshUpstream(access.world, (await this.gitBrokerAuth(task.projectId)), branch, targetAuthority);
     } finally { await access.release(); }
   }
 
-  listWorldProviderConnections(token: string, organizationId: string) {
-    this.require(token, 'organization:read', { organizationId });
-    return this.deps.providerConnections?.list(organizationId) ?? [];
+  async listWorldProviderConnections(token: string, organizationId: string) {
+    (await this.require(token, 'organization:read', { organizationId }));
+    return (await this.deps.providerConnections?.list(organizationId)) ?? [];
   }
 
-  saveWorldProviderConnection(token: string, input: {
+  async saveWorldProviderConnection(token: string, input: {
     organizationId: string;
     provider: string;
     apiKey?: string;
@@ -759,73 +760,73 @@ export class KarmaxApi {
     config?: import('../domain/types.js').WorldProviderConnection['config'];
     enabled?: boolean;
   }) {
-    this.require(token, 'organization:edit', { organizationId: input.organizationId });
+    (await this.require(token, 'organization:edit', { organizationId: input.organizationId }));
     if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
-    return this.deps.providerConnections.save(input);
+    return (await this.deps.providerConnections.save(input));
   }
 
   async testWorldProviderConnection(token: string, organizationId: string, provider: string) {
-    this.require(token, 'organization:edit', { organizationId });
+    (await this.require(token, 'organization:edit', { organizationId }));
     if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
     return this.deps.providerConnections.test(organizationId, provider);
   }
 
-  deleteWorldProviderConnection(token: string, organizationId: string, provider: string) {
-    this.require(token, 'organization:edit', { organizationId });
+  async deleteWorldProviderConnection(token: string, organizationId: string, provider: string) {
+    (await this.require(token, 'organization:edit', { organizationId }));
     if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
-    const active = this.deps.store.organizationResources(organizationId).worlds
+    const active = (await this.deps.store.organizationResources(organizationId)).worlds
       .filter((handle) => (handle.provider ?? handle.kind) === provider);
     if (active.length) throw new Error(`${active.length} task world(s) still use ${provider}; finish or delete them first`);
-    return { deleted: Boolean(this.deps.providerConnections.delete(organizationId, provider)) };
+    return { deleted: Boolean((await this.deps.providerConnections.delete(organizationId, provider))) };
   }
 
-  getExecutionPolicy(token: string, input: { organizationId: string; projectId?: string }) {
+  async getExecutionPolicy(token: string, input: { organizationId: string; projectId?: string }) {
     if (!input.projectId) {
-      this.require(token, 'organization:read', { organizationId: input.organizationId });
-      return { organization: this.deps.store.getOrganizationExecutionPolicy(input.organizationId) };
+      (await this.require(token, 'organization:read', { organizationId: input.organizationId }));
+      return { organization: (await this.deps.store.getOrganizationExecutionPolicy(input.organizationId)) };
     }
-    const project = this.deps.store.getProject(input.projectId);
+    const project = (await this.deps.store.getProject(input.projectId));
     if (!project || project.organizationId !== input.organizationId) throw new Error('project does not belong to this organization');
-    this.require(token, 'project:settings:read', { organizationId: input.organizationId, projectId: project.id });
+    (await this.require(token, 'project:settings:read', { organizationId: input.organizationId, projectId: project.id }));
     return {
-      organization: this.deps.store.getOrganizationExecutionPolicy(input.organizationId),
+      organization: (await this.deps.store.getOrganizationExecutionPolicy(input.organizationId)),
       override: executionConfigOf(project.config),
-      effective: executionConfigOf(this.deps.store.effectiveProjectConfig(project)),
+      effective: executionConfigOf((await this.deps.store.effectiveProjectConfig(project))),
     };
   }
 
-  setExecutionPolicy(token: string, input: { organizationId: string; projectId?: string;
+  async setExecutionPolicy(token: string, input: { organizationId: string; projectId?: string;
     policy: Partial<OrganizationExecutionPolicy> & Record<string, unknown> }) {
-    const project = input.projectId ? this.deps.store.getProject(input.projectId) : undefined;
+    const project = input.projectId ? (await this.deps.store.getProject(input.projectId)) : undefined;
     if (input.projectId && (!project || project.organizationId !== input.organizationId))
       throw new Error('project does not belong to this organization');
-    this.require(token, project ? 'project:settings:write' : 'organization:edit',
-      { organizationId: input.organizationId, ...(project ? { projectId: project.id } : {}) });
+    (await this.require(token, project ? 'project:settings:write' : 'organization:edit',
+      { organizationId: input.organizationId, ...(project ? { projectId: project.id } : {}) }));
     // Null means "inherit" for project overrides. At organization scope it
     // means "restore the built-in default", so never persist null policy values.
     const policy = project ? input.policy
       : Object.fromEntries(Object.entries(input.policy).map(([key, value]) => [key, value == null ? undefined : value]));
     const candidate = project
-      ? this.deps.store.effectiveProjectConfig({ ...project, config: applyExecutionConfig(project.config, policy) })
+      ? (await this.deps.store.effectiveProjectConfig({ ...project, config: applyExecutionConfig(project.config, policy) }))
       : policy;
     const provider = typeof candidate.worldProvider === 'string' ? candidate.worldProvider : undefined;
     if (provider && !['worktree', 'container', 'memory'].includes(provider)
-      && !this.deps.providerConnections?.available(input.organizationId, provider))
+      && !(await this.deps.providerConnections?.available(input.organizationId, provider)))
       throw new Error(`${provider} is not connected and verified`);
     const runnerPoolId = typeof candidate.runnerPoolId === 'string' ? candidate.runnerPoolId : undefined;
     if (runnerPoolId) {
-      const pool = this.deps.store.getRunnerPool(runnerPoolId);
+      const pool = (await this.deps.store.getRunnerPool(runnerPoolId));
       if (!pool || pool.organizationId !== input.organizationId) throw new Error('runner pool does not belong to this organization');
       if (provider && pool.provider !== provider) throw new Error('runner pool provider must match the execution provider');
     }
-    if (project) this.deps.store.setProjectExecutionPolicy(project.id, policy);
-    else this.deps.store.setOrganizationExecutionPolicy(input.organizationId, policy as OrganizationExecutionPolicy);
-    return this.getExecutionPolicy(token, input);
+    if (project) (await this.deps.store.setProjectExecutionPolicy(project.id, policy));
+    else (await this.deps.store.setOrganizationExecutionPolicy(input.organizationId, policy as OrganizationExecutionPolicy));
+    return (await this.getExecutionPolicy(token, input));
   }
 
-  private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string; organizationId?: string }) {
+  private async require(token: string, tool: string, scope?: { projectId?: string; taskId?: string; organizationId?: string }) {
     const cap = TOOL_CAPABILITY[tool] ?? tool;
-    const r = this.deps.tokens.check(token, cap, scope);
+    const r = (await this.deps.tokens.check(token, cap, scope));
     if (!r.ok) throw new CapabilityError(r.reason ?? `denied: ${cap}`);
     return r.record!;
   }
@@ -846,7 +847,7 @@ export class KarmaxApi {
    * already models the intended check; this closes the same door on the raw
    * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
    */
-  private validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
+  private async validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): Promise<void> {
     for (const [key, value] of Object.entries(params ?? {})) {
       if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const resumeFrom = (value as Record<string, unknown>).resumeFrom;
@@ -860,22 +861,22 @@ export class KarmaxApi {
         throw new ValidationError('provider conversation IDs are available only on a host-local Karmax; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
-      const source = this.deps.store.getTask(sourceId);
+      const source = (await this.deps.store.getTask(sourceId));
       if (!source) throw new NotFoundError(`no task ${sourceId} to resume from`);
-      this.require(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId });
+      (await this.require(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId }));
     }
   }
 
   /** Carry file handles across task-agent forks. A provider session remembers the
    * old prompt text, including old world paths; copying the refs onto the new task
    * lets every generation rematerialize them at its own current path. */
-  private inheritedResumeFiles(params: Record<string, unknown> | undefined): FileRef[] {
+  private async inheritedResumeFiles(params: Record<string, unknown> | undefined): Promise<FileRef[]> {
     const files: FileRef[] = [];
     for (const [key, value] of Object.entries(params ?? {})) {
       if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const resumeFrom = (value as Record<string, any>).resumeFrom;
       if (!resumeFrom?.taskId) continue;
-      const source = this.deps.store.getTask(String(resumeFrom.taskId));
+      const source = (await this.deps.store.getTask(String(resumeFrom.taskId)));
       if (!source) continue;
       files.push(...((source.params.files as FileRef[] | undefined) ?? []));
       const view = source.lastView;
@@ -889,7 +890,7 @@ export class KarmaxApi {
     return uniqueFileRefs(files);
   }
 
-  private validatePromptFiles(projectId: string, files: FileRef[]): void {
+  private async validatePromptFiles(projectId: string, files: FileRef[]): Promise<void> {
     if (files.length > MAX_FILES_PER_MESSAGE) throw new Error(`a prompt can attach at most ${MAX_FILES_PER_MESSAGE} files`);
     const total = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
     if (total > MAX_FILES_BYTES_PER_MESSAGE)
@@ -900,7 +901,7 @@ export class KarmaxApi {
         || !/^[a-z0-9][a-z0-9!#$&^_.+\-]*\/[a-z0-9][a-z0-9!#$&^_.+\-]*$/.test(file.mediaType)
         || !Number.isInteger(file.bytes) || file.bytes <= 0 || file.bytes > MAX_FILE_BYTES)
         throw new Error('invalid file attachment reference');
-      if (!this.deps.store.attachmentAllowed(file.id, projectId))
+      if (!(await this.deps.store.attachmentAllowed(file.id, projectId)))
         throw new Error(`file attachment is not available in this project: ${file.name}`);
     }
   }
@@ -919,13 +920,13 @@ export class KarmaxApi {
     }
   }
 
-  private assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
+  private async assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return;
     const repositories = effectiveRepos(resolved, project.config);
     if (!repositories.length) return;
     if (this.deps.hosted) {
-      const linked = this.deps.store.listProjectRepositories(project.id);
+      const linked = (await this.deps.store.listProjectRepositories(project.id));
       if (!linked.length) {
         throw new Error('Please connect GitHub in organization settings, then add a git repo in project settings.');
       }
@@ -939,46 +940,46 @@ export class KarmaxApi {
   /** Resolve every Avatar referenced by the task's role fields and Review-agent
    * layers. Invocation is checked against the human who initiated the calling
    * chain, not against an arbitrary task-agent id. */
-  private validateTaskAvatars(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap) {
+  private async validateTaskAvatars(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap) {
     const callerUserId = caller.humanSubject?.userId
-      ?? (caller.taskId !== '*' ? this.deps.store.taskCreatorUserId(caller.taskId) : undefined);
+      ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined);
     const selected: Array<{ avatar: import('../domain/types.js').Avatar; role: string }> = [];
-    const add = (spec: unknown, role: string) => {
+    const add = async (spec: unknown, role: string) => {
       const record = spec && typeof spec === 'object' && !Array.isArray(spec)
         ? spec as Record<string, unknown> : undefined;
       const avatarId = record?.avatarId;
       if (typeof avatarId !== 'string' || !avatarId) return;
-      const avatar = this.deps.store.getAvatar(avatarId);
+      const avatar = (await this.deps.store.getAvatar(avatarId));
       if (!avatar || avatar.projectId !== project.id) throw new ValidationError('the selected Avatar is not available in this project');
-      if (!avatarEnabled(this.deps.store, avatar)) throw new ValidationError(`Avatar "${avatar.name}" is disabled`);
+      if (!(await avatarEnabled(this.deps.store, avatar))) throw new ValidationError(`Avatar "${avatar.name}" is disabled`);
       const purpose = typeof record?.avatarPurpose === 'string' ? record.avatarPurpose : role;
       if (avatar.roles.length && !avatar.roles.includes(purpose))
         throw new ValidationError(`Avatar "${avatar.name}" cannot be used for the ${purpose} role`);
-      if (!callerUserId || !avatarCallableBy(this.deps.store, avatar, callerUserId))
+      if (!callerUserId || !(await avatarCallableBy(this.deps.store, avatar, callerUserId)))
         throw new CapabilityError(`you are not allowed to call Avatar "${avatar.name}"`);
       selected.push({ avatar, role });
     };
     for (const field of manifest.params) {
-      if (field.type === 'agent') add(resolved[field.name], field.role ?? field.name.replace(/^agent:/, ''));
+      if (field.type === 'agent') (await add(resolved[field.name], field.role ?? field.name.replace(/^agent:/, '')));
       if (field.type === 'confirmer') {
-        for (const layer of confirmLayersOf(resolved[field.name] as any)) if (layer.kind === 'agent') add(layer, field.role ?? 'confirm');
+        for (const layer of confirmLayersOf(resolved[field.name] as any)) if (layer.kind === 'agent') (await add(layer, field.role ?? 'confirm'));
       }
     }
     return selected;
   }
 
-  private prepareForkWorld(projectId: string, params: ValueMap, previous?: ValueMap): void {
+  private async prepareForkWorld(projectId: string, params: ValueMap, previous?: ValueMap): Promise<void> {
     // Never accept a caller-supplied checkpoint or repository manifest.
     delete params._forkWorld;
     const spec = (params['agent:do'] ?? params['agent:unified']) as AgentSpec | undefined;
     const sourceId = spec?.resumeFrom?.taskId;
     if (!sourceId) return;
-    const source = this.deps.store.getTask(sourceId);
+    const source = (await this.deps.store.getTask(sourceId));
     // Cross-project conversation reuse does not grant access to private worlds.
     if (!source || source.projectId !== projectId) return;
     const retained = previous?._forkWorld as ForkWorldSource | undefined;
     const start = retained?.taskId === sourceId ? retained
-      : forkWorldSource(source, this.deps.store.currentWorld(sourceId) as WorldHandle | undefined);
+      : forkWorldSource(source, (await this.deps.store.currentWorld(sourceId)) as WorldHandle | undefined);
     if (!start) return;
     params._forkWorld = start;
     if (!previous && params.base === undefined) params.base = start.base;
@@ -1038,32 +1039,33 @@ export class KarmaxApi {
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
     },
-    receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined,
+    receivedAt?: { monoMs: number; wallMs: number },
   ): Promise<TaskRecord> {
-    const caller = this.require(token, 'create_task', { projectId: args.projectId });
-    const project = this.deps.store.getProject(args.projectId);
+    receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
+    const caller = (await this.require(token, 'create_task', { projectId: args.projectId }));
+    const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
-    const start = this.resolveStart(workflow, this.workflowPinFor(args.projectId, workflow), project.organizationId);
+    const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
     if (!start) throw new Error(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
     const requestedAuthorization = args.authorization ?? args.authorizationProfile;
-    const grantorCaps = this.authorizationGrantorCaps(token, caller, requestedAuthorization, project.organizationId ?? 'org_personal');
+    const grantorCaps = (await this.authorizationGrantorCaps(token, caller, requestedAuthorization, project.organizationId ?? 'org_personal'));
     const authorization = this.deps.authorization
-      ? this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps)
+      ? (await this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps))
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
     if (args.authorization && profileAttenuated
       && !(args.draft && args.allowAttenuation) && !args.acceptAttenuation)
       throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
-    const orgVault = this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault') ?? {};
-    const projectVault = this.deps.store.getSettings(project.id, 'vault') ?? {};
+    const orgVault = (await this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault')) ?? {};
+    const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
     const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
     const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
     this.applyCredentialGrants(authorization, grants, caller.caps);
-    const credentialPolicies = this.credentialPolicyOverrides(
+    const credentialPolicies = await this.credentialPolicyOverrides(
       project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
     );
 
@@ -1085,36 +1087,36 @@ export class KarmaxApi {
     // top-level arg (MCP/API) is folded in like the form sends it via `params`.
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     if (taskOverrides.paymentPolicy !== undefined) {
-      validatePaymentPolicy(this.deps.store, project.id, project.organizationId ?? 'org_personal', taskOverrides.paymentPolicy);
-      if (JSON.stringify(taskOverrides.paymentPolicy) !== JSON.stringify(resolvePaymentPolicy(this.deps.store, project.id)))
-        this.require(token, 'manage_payments', { projectId: project.id });
+      (await validatePaymentPolicy(this.deps.store, project.id, project.organizationId ?? 'org_personal', taskOverrides.paymentPolicy));
+      if (JSON.stringify(taskOverrides.paymentPolicy) !== JSON.stringify((await resolvePaymentPolicy(this.deps.store, project.id))))
+        (await this.require(token, 'manage_payments', { projectId: project.id }));
     }
-    taskOverrides.paymentPolicy ??= resolvePaymentPolicy(this.deps.store, project.id);
+    taskOverrides.paymentPolicy ??= (await resolvePaymentPolicy(this.deps.store, project.id));
     this.assertBranchParams(taskOverrides);
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
-    this.validateAndAuthorizeResumeSources(token, taskOverrides);
-    this.prepareForkWorld(args.projectId, taskOverrides);
-    const inheritedFiles = this.inheritedResumeFiles(taskOverrides);
+    (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
+    (await this.prepareForkWorld(args.projectId, taskOverrides));
+    const inheritedFiles = (await this.inheritedResumeFiles(taskOverrides));
     // Resume authorization above grants conversation-read authority. Extend each
     // inherited content hash into the destination project before validating it.
-    for (const file of inheritedFiles) this.deps.store.grantAttachment(file.id, args.projectId);
+    for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, args.projectId));
     const promptFiles = uniqueFileRefs([
       ...((taskOverrides.files as FileRef[] | undefined) ?? []),
       ...inheritedFiles,
     ]);
     if (promptFiles.length) {
-      this.validatePromptFiles(args.projectId, promptFiles);
+      (await this.validatePromptFiles(args.projectId, promptFiles));
       taskOverrides.files = promptFiles;
     }
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
-    const selectedAvatars = this.validateTaskAvatars(caller, project, manifest, resolved);
+    const selectedAvatars = (await this.validateTaskAvatars(caller, project, manifest, resolved));
     for (const { avatar } of selectedAvatars) {
       if (avatar.credentialPolicies) Object.assign(credentialPolicies, avatar.credentialPolicies);
     }
     // Validate any repository selection after resolution so this sees the exact
     // effective list the world will. An empty list is a supported zero-repo run.
-    if (!args.draft) this.assertRepositoriesValid(manifest, project, resolved);
+    if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     const callerRef = principalRefOf(caller.principal, caller.kind);
@@ -1122,7 +1124,7 @@ export class KarmaxApi {
     // persist it as an organization principal (which would also auto-subscribe
     // an outsider); claimed/current installations always retain the creator.
     const createdBy = callerRef?.kind === 'user'
-      && !this.deps.store.organizationMembership(project.organizationId ?? 'org_personal', callerRef.userId)
+      && !(await this.deps.store.organizationMembership(project.organizationId ?? 'org_personal', callerRef.userId))
       ? undefined : callerRef;
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
@@ -1131,7 +1133,7 @@ export class KarmaxApi {
     const githubAccountId = avatarGithubAccountId ?? (caller.kind === 'agent'
       ? caller.externalIdentities?.githubAccountId
       : caller.humanSubject
-        ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
+        ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId))
         : undefined);
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
@@ -1146,59 +1148,63 @@ export class KarmaxApi {
     // finally queued (createTask below for immediate start, queueTask for drafts).
     // Resolution may await external policy. Do not persist a task prepared
     // against an organization that changed while we were awaiting it.
-    this.require(token, 'create_task', { projectId: args.projectId });
-    if (this.deps.store.getProject(project.id)?.organizationId !== project.organizationId)
-      throw new ValidationError('Project moved while preparing this task. Reload and retry.');
-    let task = this.deps.store.createTask({
-      projectId: args.projectId,
-      title,
-      workflow,
-      workflowVersion: manifest.version,
-      params: {
-        ...taskOverrides,
-        prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
-        // Once an immediate task is queued, branch policy is execution state,
-        // not an inheritable form default. Persist the exact pair provisioning
-        // receives so recovery/fork/retarget paths cannot reconstruct a
-        // different base from changed project settings.
-        ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
-        ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
-        [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
-        profiles: args.profiles,
-        draft: !!args.draft,
-        _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
-          ...(profileAttenuated ? { attenuationAccepted: args.acceptAttenuation === true } : {}) },
-        ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
-        ...(repeatable ? { repeatable: true } : {}),
-      },
-      confirmer: (() => {
-        const field = manifest.params.find((f) => f.type === 'confirmer');
-        return field ? resolved[field.name] : undefined;
-      })(),
-      createdBy,
-      assignee: args.assignee,
-      delegate: args.delegate,
-      confirmationPolicy,
+    let { task, delegation } = await this.deps.store.transaction(async () => {
+      await this.require(token, 'create_task', { projectId: args.projectId });
+      if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId)
+        throw new ValidationError('Project moved while preparing this task. Reload and retry.');
+      let task = (await this.deps.store.createTask({
+        projectId: args.projectId,
+        title,
+        workflow,
+        workflowVersion: manifest.version,
+        params: {
+          ...taskOverrides,
+          prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
+          // Once an immediate task is queued, branch policy is execution state,
+          // not an inheritable form default. Persist the exact pair provisioning
+          // receives so recovery/fork/retarget paths cannot reconstruct a
+          // different base from changed project settings.
+          ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
+          ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+          profiles: args.profiles,
+          draft: !!args.draft,
+          _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
+            ...(profileAttenuated ? { attenuationAccepted: args.acceptAttenuation === true } : {}) },
+          ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
+          ...(repeatable ? { repeatable: true } : {}),
+        },
+        confirmer: (() => {
+          const field = manifest.params.find((f) => f.type === 'confirmer');
+          return field ? resolved[field.name] : undefined;
+        })(),
+        createdBy,
+        assignee: args.assignee,
+        delegate: args.delegate,
+        confirmationPolicy,
+      }));
+      const authorizationScope = authorization as typeof authorization & {
+        scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
+      };
+      const delegation = (await this.delegateTaskHuman(token, caller, {
+        taskId: task.id,
+        projectId: authorizationScope.scope ? undefined : task.projectId,
+        projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
+        organizationId: authorizationScope.scope === 'global' ? undefined
+          : (authorizationScope.organizationId ?? project.organizationId),
+        externalIdentities: githubAccountId ? { githubAccountId } : undefined,
+      }));
+      if (delegation) {
+        (await this.deps.store.updateTaskParams(task.id, {
+          ...task.params,
+          _authorization: { ...(task.params._authorization as object), delegationId: delegation.id },
+        }));
+        task = (await this.deps.store.getTask(task.id))!;
+      }
+      (await this.persistTaskCredentialPolicies(task));
+
+      return { task, delegation };
     });
-    const authorizationScope = authorization as typeof authorization & {
-      scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
-    };
-    const delegation = this.delegateTaskHuman(token, caller, {
-      taskId: task.id,
-      projectId: authorizationScope.scope ? undefined : task.projectId,
-      projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
-      organizationId: authorizationScope.scope === 'global' ? undefined
-        : (authorizationScope.organizationId ?? project.organizationId),
-      externalIdentities: githubAccountId ? { githubAccountId } : undefined,
-    });
-    if (delegation) {
-      this.deps.store.updateTaskParams(task.id, {
-        ...task.params,
-        _authorization: { ...(task.params._authorization as object), delegationId: delegation.id },
-      });
-      task = this.deps.store.getTask(task.id)!;
-    }
-    this.persistTaskCredentialPolicies(task);
     // Advisory only: GitHub is an external policy authority, so this can become
     // stale and is always revalidated at Merge. Still, catching the common
     // missing-reviewer setup at queue time is much kinder than discovering it
@@ -1206,9 +1212,9 @@ export class KarmaxApi {
     // task—the creator may intentionally arrange the reviewer later.
     if (!args.draft && String(resolved.remote ?? project.config.remote ?? 'none') === 'pr'
       && createdBy?.kind === 'user' && this.deps.githubApp) {
-      const wikiRepository = this.deps.store.projectWiki(project.id)?.repository;
+      const wikiRepository = (await this.deps.store.projectWiki(project.id))?.repository;
       const slugs = [...new Set([
-        ...this.deps.store.listProjectRepositories(project.id)
+        ...(await this.deps.store.listProjectRepositories(project.id))
           .map((linked) => `${linked.repository.owner}/${linked.repository.name}`),
         ...(wikiRepository ? [`${wikiRepository.owner}/${wikiRepository.name}`] : []),
       ])];
@@ -1219,11 +1225,10 @@ export class KarmaxApi {
       if (!creatorCanMerge && slugs.length) {
         const confirmer = manifest.params.find((field) => field.type === 'confirmer');
         const layers = confirmer ? confirmLayersOf(resolved[confirmer.name] as any) : [];
-        const routedUsers = [...new Set(layers.filter((layer) => layer.kind === 'human')
-          .flatMap((layer) => this.deps.store.humanAudience(task.id, layer.audience)))];
+        const routedUsers = [...new Set((await __asyncCollections.flatMap(layers.filter((layer) => layer.kind === 'human'), async (layer) => (await this.deps.store.humanAudience(task.id, layer.audience)))))];
         let routedEligible = false;
         for (const userId of routedUsers) {
-          const reviewerAccount = this.deps.githubApp.activeUserAccountId(userId);
+          const reviewerAccount = (await this.deps.githubApp.activeUserAccountId(userId));
           if (!reviewerAccount) continue;
           const permissions = await Promise.all(slugs.map((slug) =>
             this.deps.githubApp!.repositoryPermission(userId, slug, reviewerAccount).catch(() => undefined)));
@@ -1231,35 +1236,35 @@ export class KarmaxApi {
         }
         if (!routedEligible) {
           const warning = 'The task creator cannot merge every GitHub repository and no selected human Review step currently routes to a connected person who can. The task may proceed, but it will stop at Merge for an eligible human.';
-          this.deps.store.appendEvent({ taskId: task.id, type: 'github.merge.preflight-warning', ts: Date.now(),
-            payload: { warning, repositories: slugs } });
+          (await this.deps.store.appendEvent({ taskId: task.id, type: 'github.merge.preflight-warning', ts: Date.now(),
+            payload: { warning, repositories: slugs } }));
           (task as TaskRecord & { warnings?: string[] }).warnings = [warning];
         }
       }
     }
     if (!args.draft) {
-      try { this.assertHumanRoutes(task, manifest, resolved); }
-      catch (error) { this.deps.store.deleteTask(task.id); throw error; }
+      try { (await this.assertHumanRoutes(task, manifest, resolved)); }
+      catch (error) { (await this.deps.store.deleteTask(task.id)); throw error; }
     }
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
     // same way whether the task is queued now or saved as a draft.
     if (typeof args.notes === 'string') {
-      this.deps.store.setTaskNotes(task.id, args.notes);
+      (await this.deps.store.setTaskNotes(task.id, args.notes));
       task.notes = args.notes || undefined;
     }
     // Organizational metadata supplied WITH the create, applied here under the
     // caller's `task:create` rather than as follow-up `task:edit` calls. Both
     // are set before the task can be queued, so a created task is never briefly
     // visible without the priority/tags it was asked for.
-    if (args.priority) this.deps.store.setTaskPriority(task.id, args.priority);
-    if (args.tags?.length) this.applyTagPatch(task.id, task.projectId, { add: args.tags });
+    if (args.priority) (await this.deps.store.setTaskPriority(task.id, args.priority));
+    if (args.tags?.length) (await this.applyTagPatch(task.id, task.projectId, { add: args.tags }));
     // Materialize up-front alternates before the first workflow can start. Draft
     // creation keeps all of them editable; immediate creation queues all of them.
     const createdAlternates: TaskRecord[] = [];
     const attemptCount = Math.max(1, Math.min(8, Math.floor(args.attempts ?? 1)));
     if (repeatable && attemptCount > 1) {
-      this.deps.store.deleteTask(task.id);
+      (await this.deps.store.deleteTask(task.id));
       throw new Error('repeatable task templates cannot have alternate attempts; each spawned run is already a separate execution');
     }
     if (!repeatable) {
@@ -1268,27 +1273,27 @@ export class KarmaxApi {
       const { triggerState: _triggerState, repeatable: _repeatable, runOf: _runOf,
         archived: _archived, draft: _draft, ...copied } = task.params;
       for (let n = 1; n < attemptCount; n++) {
-        let alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
+        let alt = (await this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
           parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
-          assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy });
+          assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy }));
         if (delegation) {
-          const alternateDelegation = this.deps.tokens.deriveHumanDelegation(delegation.id, {
+          const alternateDelegation = (await this.deps.tokens.deriveHumanDelegation(delegation.id, {
             taskId: alt.id, projectId: delegation.projectId, projectIds: delegation.projectIds,
             organizationId: delegation.organizationId,
-          });
-          this.deps.store.updateTaskParams(alt.id, { ...alt.params,
-            _authorization: { ...(alt.params._authorization as object), delegationId: alternateDelegation.id } });
-          alt = this.deps.store.getTask(alt.id)!;
+          }));
+          (await this.deps.store.updateTaskParams(alt.id, { ...alt.params,
+            _authorization: { ...(alt.params._authorization as object), delegationId: alternateDelegation.id } }));
+          alt = (await this.deps.store.getTask(alt.id))!;
         }
-        this.persistTaskCredentialPolicies(alt);
-        if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
+        (await this.persistTaskCredentialPolicies(alt));
+        if (task.notes) (await this.deps.store.setTaskNotes(alt.id, task.notes));
         createdAlternates.push(alt);
       }
     }
-    const undoCreation = () => {
-      for (const alt of [...createdAlternates].reverse()) this.deps.store.deleteTask(alt.id);
-      this.deps.store.deleteTask(task.id);
+    const undoCreation = async () => {
+      for (const alt of [...createdAlternates].reverse()) (await this.deps.store.deleteTask(alt.id));
+      (await this.deps.store.deleteTask(task.id));
     };
     const queueCreatedAlternates = async () => Promise.all(createdAlternates.map(async (alternate) => {
       try {
@@ -1297,12 +1302,12 @@ export class KarmaxApi {
         // The principal is already durable and cannot be rolled back. Preserve a
         // failed sibling as a draft and leave an actionable audit event instead of
         // falsely reporting that the entire logical task was never created.
-        this.deps.store.appendEvent({
+        (await this.deps.store.appendEvent({
           taskId: alternate.id,
           type: 'attempt.queue-failed',
           ts: Date.now(),
           payload: { error: e instanceof Error ? e.message : String(e) },
-        });
+        }));
       }
     }));
     if (args.draft) return task; // stored but not queued
@@ -1312,7 +1317,7 @@ export class KarmaxApi {
     // it arms below (each fire spawns a run — see fireTriggeredTask/'clone').
     if (task.params.repeatable && !hasActiveTriggers(task.params)) {
       await this.spawnRun(token, task.id);
-      return this.deps.store.getTask(task.id)!;
+      return (await this.deps.store.getTask(task.id))!;
     }
 
     // Triggered tasks are stored-not-started and *armed* (SPEC §3.3): the
@@ -1321,12 +1326,12 @@ export class KarmaxApi {
     // it does, so it applies to any task with any workflow.
     if (hasActiveTriggers(task.params)) {
       try {
-        const armed = this.armStoredTask(task.id);
+        const armed = (await this.armStoredTask(task.id));
         await queueCreatedAlternates();
         if (typeof args.notes === 'string') armed.notes = args.notes || undefined;
         return armed;
       } catch (e) {
-        undoCreation(); // undo the whole logical task on an invalid trigger
+        (await undoCreation()); // undo the whole logical task on an invalid trigger
         throw e;
       }
     }
@@ -1335,7 +1340,7 @@ export class KarmaxApi {
       taskId: task.id,
       projectId: args.projectId,
       title,
-      project: this.deps.store.effectiveProjectConfig(project),
+      project: (await this.deps.store.effectiveProjectConfig(project)),
     });
     input.createdAt = task.createdAt;
     input.workflow = workflow;
@@ -1351,11 +1356,11 @@ export class KarmaxApi {
     const initialFiles = taskOverrides.files as FileRef[] | undefined;
     if (initialFiles?.length) input.files = initialFiles;
 
-    const requestTiming = installationTiming(this.deps.store, { taskId: task.id, requestIds: [`${task.id}:m0`] }, row => {
-      this.deps.store.appendEvent({ taskId: task.id, type: 'timing', ts: row.wallMs, payload: { ...row } });
-    });
-    requestTiming.mark('request.received', { requestId: `${task.id}:m0` }, receivedAt);
-    const dispatchEnd = requestTiming.start('workflow.dispatch');
+    const requestTiming = (await installationTiming(this.deps.store, { taskId: task.id, requestIds: [`${task.id}:m0`] }, async row => {
+      (await this.deps.store.appendEvent({ taskId: task.id, type: 'timing', ts: row.wallMs, payload: { ...row } }));
+    }));
+    (await requestTiming.mark('request.received', { requestId: `${task.id}:m0` }, receivedAt));
+    const dispatchEnd = (await requestTiming.start('workflow.dispatch'));
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
     // Bounded + compensated: if the engine won't accept it (wedged/unreachable),
@@ -1367,14 +1372,14 @@ export class KarmaxApi {
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      undoCreation();
+      (await undoCreation());
       throw new Error(
         `Could not start "${title}": the durable engine didn't accept the task (${e instanceof Error ? e.message : String(e)}). ` +
           `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
-    dispatchEnd();
-    this.saveAgentSnapshot(task.id, manifest, input);
+    (await dispatchEnd());
+    (await this.saveAgentSnapshot(task.id, manifest, input));
     // These attempts were explicitly requested as part of creation, so start all
     // of them. addAttempt() remains intentionally different: it creates one draft
     // for inspection/editing and never queues it implicitly.
@@ -1389,13 +1394,13 @@ export class KarmaxApi {
    * unqueued task inherits any default change made after it was saved.
    */
   private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, quick = false): Promise<ValueMap> {
-    const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
-    const projectVals = projectSettingsFor(getSettings, project, manifest.name);
-    const globalVals = globalSettingsFor(getSettings, manifest.name, project.organizationId);
+    const getSettings = async (s: string, w: string) => (await this.deps.store.getSettings(s, w));
+    const projectVals = (await projectSettingsFor(getSettings, project, manifest.name));
+    const globalVals = (await globalSettingsFor(getSettings, manifest.name, project.organizationId));
     // Quick tasks layer the quick-task defaults (project-quick → global-quick) above
     // the general defaults; a full-form task skips them entirely (SPEC §10.4).
     const layers: (ValueMap | undefined)[] = quick
-      ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId), projectVals, globalVals]
+      ? [taskOverrides, (await quickProjectSettingsFor(getSettings, project.id, manifest.name)), (await quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId)), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
     // `none` means a completed merge may remain only in its local world. That is
@@ -1405,7 +1410,7 @@ export class KarmaxApi {
     // already-running Temporal execution keeps its recorded input unchanged.
     if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
       resolved.remote = 'pr';
-    this.materializeUnifiedAgents(resolved, project.id);
+    (await this.materializeUnifiedAgents(resolved, project.id));
 
     // Auto-detect the repo's branch policy when base/target weren't set anywhere,
     // instead of guessing "main" (which would make hosted task views disagree
@@ -1426,24 +1431,24 @@ export class KarmaxApi {
 
   /** Resolve one full-form field without materializing agents or probing repository
    * defaults. Used by sparse reset handling, where only the inherited value matters. */
-  private resolveTaskField(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, field: string): unknown {
-    const getSettings = (scope: string, workflow: string) => this.deps.store.getSettings(scope, workflow);
+  private async resolveTaskField(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, field: string): Promise<unknown> {
+    const getSettings = async (scope: string, workflow: string) => (await this.deps.store.getSettings(scope, workflow));
     return resolveParamsLayers(manifest, [
       taskOverrides,
-      projectSettingsFor(getSettings, project, manifest.name),
-      globalSettingsFor(getSettings, manifest.name, project.organizationId),
+      (await projectSettingsFor(getSettings, project, manifest.name)),
+      (await globalSettingsFor(getSettings, manifest.name, project.organizationId)),
     ])[field];
   }
 
   /** Turn the compact Agent setting into concrete per-role input. Profile defaults
    * live outside parameter settings, so this final materialization must happen
    * after the parameter overlays have selected the child scope's form shape. */
-  private materializeUnifiedAgents(resolved: ValueMap, projectId: string): void {
+  private async materializeUnifiedAgents(resolved: ValueMap, projectId: string): Promise<void> {
     if (resolved.separateAgents !== false) return;
     let spec = resolved['agent:do'] as AgentSpec | undefined;
     if (!spec?.provider) {
       const resumeFrom = spec?.resumeFrom;
-      const profile = roleDefaultProfile(this.deps.store, 'do', projectId);
+      const profile = (await roleDefaultProfile(this.deps.store, 'do', projectId));
       const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
       const model = profile?.model ?? defaultModel(provider);
       const effort = profile?.effort ?? defaultEffort(provider);
@@ -1465,7 +1470,7 @@ export class KarmaxApi {
    * will use for every declared agent role. This is execution metadata, kept in
    * KV rather than task params: task params remain sparse/inheritable until queue,
    * while a queued task's UI and audit trail stay pinned to what actually ran. */
-  private effectiveAgents(manifest: WorkflowManifest, input: TaskInput): Record<string, AgentSpec> {
+  private async effectiveAgents(manifest: WorkflowManifest, input: TaskInput): Promise<Record<string, AgentSpec>> {
     const resolver = new ProfileResolver(this.deps.store, this.deps.defaultAgentProvider ?? defaultProvider().provider);
     const out: Record<string, AgentSpec> = {};
     const seen = new Set<string>();
@@ -1474,8 +1479,8 @@ export class KarmaxApi {
       seen.add(field.role);
       const role = field.role as AgentRole;
       const selected = input.agents?.[role];
-      const base = resolver.resolve(role, input.profiles, undefined, input.projectId);
-      const avatar = selected?.avatarId ? this.deps.store.getAvatar(selected.avatarId) : undefined;
+      const base = (await resolver.resolve(role, input.profiles, undefined, input.projectId));
+      const avatar = selected?.avatarId ? (await this.deps.store.getAvatar(selected.avatarId)) : undefined;
       const profile = applyAvatarProfile(base, selected, avatar);
       out[role] = {
         provider: profile.provider,
@@ -1490,13 +1495,13 @@ export class KarmaxApi {
     return out;
   }
 
-  private saveAgentSnapshot(taskId: string, manifest: WorkflowManifest, input: TaskInput): void {
-    const agents = this.effectiveAgents(manifest, input);
-    if (Object.keys(agents).length) this.deps.store.kvSet(agentSnapshotKey(taskId), JSON.stringify(agents));
+  private async saveAgentSnapshot(taskId: string, manifest: WorkflowManifest, input: TaskInput): Promise<void> {
+    const agents = (await this.effectiveAgents(manifest, input));
+    if (Object.keys(agents).length) (await this.deps.store.kvSet(agentSnapshotKey(taskId), JSON.stringify(agents)));
   }
 
-  private readAgentSnapshot(taskId: string): Record<string, AgentSpec> | undefined {
-    const raw = this.deps.store.kvGet(agentSnapshotKey(taskId));
+  private async readAgentSnapshot(taskId: string): Promise<Record<string, AgentSpec> | undefined> {
+    const raw = (await this.deps.store.kvGet(agentSnapshotKey(taskId)));
     if (!raw) return undefined;
     try {
       const parsed = JSON.parse(raw);
@@ -1508,18 +1513,18 @@ export class KarmaxApi {
 
   /** `_discardProgress` is serialized into one accepted start only. Keeping it on
    * the record would make a later cancellation recovery delete the new work. */
-  private consumeDiscardProgress(taskId: string): void {
-    const task = this.deps.store.getTask(taskId);
+  private async consumeDiscardProgress(taskId: string): Promise<void> {
+    const task = (await this.deps.store.getTask(taskId));
     if (!task?.params._discardProgress) return;
     const { _discardProgress: _used, ...params } = task.params as Record<string, unknown>;
-    this.deps.store.updateTaskParams(taskId, params as any);
+    (await this.deps.store.updateTaskParams(taskId, params as any));
   }
 
   /** Keep the execution snapshot aligned with a workflow-accepted in-flight
    * agent retune. Rejected fields never reach here, so the stored display cannot
    * claim a change that the running workflow refused. */
-  private updateAgentSnapshot(taskId: string, patch: Record<string, unknown>, applied: string[]): void {
-    const agents = this.readAgentSnapshot(taskId);
+  private async updateAgentSnapshot(taskId: string, patch: Record<string, unknown>, applied: string[]): Promise<void> {
+    const agents = (await this.readAgentSnapshot(taskId));
     if (!agents) return; // legacy task: the UI still has the stored-override fallback
     let changed = false;
     for (const name of applied) {
@@ -1546,7 +1551,7 @@ export class KarmaxApi {
       };
       changed = true;
     }
-    if (changed) this.deps.store.kvSet(agentSnapshotKey(taskId), JSON.stringify(agents));
+    if (changed) (await this.deps.store.kvSet(agentSnapshotKey(taskId), JSON.stringify(agents)));
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
@@ -1559,30 +1564,30 @@ export class KarmaxApi {
   }
 
   /** The version a project pins `workflow` to, or undefined for latest. */
-  private workflowPinFor(projectId: string, workflow: string): string | undefined {
-    const v = this.deps.store.kvGet(this.pinKey(projectId, workflow));
+  private async workflowPinFor(projectId: string, workflow: string): Promise<string | undefined> {
+    const v = (await this.deps.store.kvGet(this.pinKey(projectId, workflow)));
     return v || undefined;
   }
 
   /** Pin a project to a version of a workflow for new tasks (§21d); empty clears to latest. */
-  pinWorkflow(token: string, args: { projectId: string; workflow: string; version?: string }): { workflow: string; version: string } {
-    const project = this.deps.store.getProject(args.projectId);
+  async pinWorkflow(token: string, args: { projectId: string; workflow: string; version?: string }): Promise<{ workflow: string; version: string }> {
+    const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
-    this.require(token, 'edit_workflow', { projectId: args.projectId, organizationId: project.organizationId });
+    (await this.require(token, 'edit_workflow', { projectId: args.projectId, organizationId: project.organizationId }));
     if (!this.resolveStart(args.workflow, args.version && args.version !== 'latest' ? args.version : undefined, project.organizationId))
       throw new Error(`workflow "${args.workflow}" is not available to this organization`);
     const v = args.version && args.version !== 'latest' ? args.version : '';
-    this.deps.store.kvSet(this.pinKey(args.projectId, args.workflow), v);
+    (await this.deps.store.kvSet(this.pinKey(args.projectId, args.workflow), v));
     return { workflow: args.workflow, version: v || 'latest' };
   }
 
   /** The version each installed/built-in workflow is pinned to for a project (else 'latest'). */
-  workflowPins(token: string, projectId: string): Record<string, string> {
-    const project = this.deps.store.getProject(projectId);
+  async workflowPins(token: string, projectId: string): Promise<Record<string, string>> {
+    const project = (await this.deps.store.getProject(projectId));
     if (!project) throw new NotFoundError(`no project ${projectId}`);
-    this.require(token, 'list_workflows', { projectId, organizationId: project.organizationId });
+    (await this.require(token, 'list_workflows', { projectId, organizationId: project.organizationId }));
     const out: Record<string, string> = {};
-    for (const w of this.deps.workflows?.list(project.organizationId) ?? []) out[w.name] = this.workflowPinFor(projectId, w.name) ?? 'latest';
+    for (const w of this.deps.workflows?.list(project.organizationId) ?? []) out[w.name] = (await this.workflowPinFor(projectId, w.name)) ?? 'latest';
     return out;
   }
 
@@ -1593,7 +1598,7 @@ export class KarmaxApi {
    * Meta fields (profiles/draft/archived/triggers) aren't workflow overrides.
    */
   private async buildStart(task: TaskRecord, migrateToLatest = false, caller?: ScopedToken): Promise<{ startType: string; input: TaskInput; version: string }> {
-    const project = this.deps.store.getProject(task.projectId);
+    const project = (await this.deps.store.getProject(task.projectId));
     const start = this.resolveStart(task.workflow, migrateToLatest ? undefined : task.workflowVersion, project?.organizationId);
     if (!project || !start) throw new Error(`cannot start task ${task.id}`);
     const { manifest, startType } = start;
@@ -1603,31 +1608,31 @@ export class KarmaxApi {
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, files, _authorization,
       _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
-    if (caller) this.validateTaskAvatars(caller, project, manifest, resolved);
+    if (caller) (await this.validateTaskAvatars(caller, project, manifest, resolved));
     // Drafts re-resolve at queue time. Stamp that the resulting common branch
     // values already include repository fallback so provisioning must not apply
     // the repository default again over a project/task override.
     // Concurrent lifecycle requests can arrive here with the same old snapshot.
     // A slower preparation must not overwrite the winner's _workflowRunId even
     // if its own subsequent Temporal start is rejected as already running.
-    this.deps.store.patchTaskParams(task.id, {
+    (await this.deps.store.patchTaskParams(task.id, {
       ...(typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
       ...(typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
-    });
+    }));
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
     // once prevents attempts queued days apart from inheriting different reviewers.
-    const group = this.deps.store.attemptGroup(task.id);
+    const group = (await this.deps.store.attemptGroup(task.id));
     const confirmerField = manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
-    this.assertHumanRoutes(task, manifest, resolved);
+    (await this.assertHumanRoutes(task, manifest, resolved));
     // Same guard as createTask, on the resolved effective repos, before we clear the draft.
-    this.assertRepositoriesValid(manifest, project, resolved);
+    (await this.assertRepositoriesValid(manifest, project, resolved));
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
       title: task.title,
-      project: this.deps.store.effectiveProjectConfig(project),
+      project: (await this.deps.store.effectiveProjectConfig(project)),
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
@@ -1642,15 +1647,15 @@ export class KarmaxApi {
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     if ((files as FileRef[] | undefined)?.length) input.files = files as FileRef[];
     if (_discardProgress === true) input.discardProgress = true;
-    const transferLock = this.deps.store.kvGet(`project-transfer-lock:${project.id}`);
-    if (this.deps.store.getProject(project.id)?.organizationId !== project.organizationId
+    const transferLock = await this.deps.store.kvGet(`project-transfer-lock:${project.id}`);
+    if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId
       || transferLock && JSON.parse(transferLock).expiresAt > Date.now()
-      || this.deps.store.kvGet(`project-transfer-history:${task.id}`))
+      || await this.deps.store.kvGet(`project-transfer-history:${task.id}`))
       throw new ValidationError('Project moved or is moving. Reload and start a new task.');
     return { startType, input, version: manifest.version };
   }
 
-  private assertHumanRoutes(task: TaskRecord, manifest: WorkflowManifest, resolved: ValueMap): void {
+  private async assertHumanRoutes(task: TaskRecord, manifest: WorkflowManifest, resolved: ValueMap): Promise<void> {
     const routes: { label: string; audience: string[] }[] = [];
     const confirmer = manifest.params.find((candidate) => candidate.type === 'confirmer');
     const confirmValue = confirmer && resolved[confirmer.name];
@@ -1670,14 +1675,14 @@ export class KarmaxApi {
     }
     for (const route of routes) {
       const audience = route.audience;
-      if (!this.deps.store.humanAudience(task.id, audience).length) {
-        const project = this.deps.store.getProject(task.projectId);
+      if (!(await this.deps.store.humanAudience(task.id, audience)).length) {
+        const project = (await this.deps.store.getProject(task.projectId));
         // A pre-collaboration/local database can contain historical tasks before
         // its personal organization is claimed. Do not make those tasks
         // unrecoverable; once an organization has people, every route must
         // resolve before new work can run.
         if (project?.organizationId
-          && this.deps.store.listOrganizationMemberships(project.organizationId).length === 0) continue;
+          && (await this.deps.store.listOrganizationMemberships(project.organizationId)).length === 0) continue;
         throw new Error(`${route.label} ${audience.join(', ')} does not resolve to a human in this organization`);
       }
     }
@@ -1689,23 +1694,23 @@ export class KarmaxApi {
    * "create with triggers" and "save draft → queue" paths gate correctly.
    * Clears any draft flag — an armed task is live (waiting), not a draft.
    */
-  private armStoredTask(taskId: string): TaskRecord {
-    const task = this.deps.store.getTask(taskId)!;
+  private async armStoredTask(taskId: string): Promise<TaskRecord> {
+    const task = (await this.deps.store.getTask(taskId))!;
     // Validate BEFORE any mutation, and prefer the armer's graph-aware check.
     // Two bugs here: the pure `validateTriggers` cannot see self-dependencies,
     // cycles, or dangling dependency ids (it has no store), so those only surfaced
     // later inside `arm()` — by which point `clearDraft` and `triggerState: armed`
     // had already been persisted, leaving a rejected task marked armed but never
     // registered with the dispatcher, i.e. waiting forever with nothing to fire it.
-    const errs = this.armer?.validationErrors?.(task) ?? validateTriggers(normalizeTriggers(task.params));
+    const errs = (await this.armer?.validationErrors?.(task)) ?? (await validateTriggers(normalizeTriggers(task.params)));
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     // Arming is the queue transition for triggered work, so this also assigns
     // the logical task's human-facing number if it has never been queued before.
-    this.deps.store.clearDraft(taskId);
-    const queued = this.deps.store.getTask(taskId)!;
-    this.deps.store.updateTaskParams(taskId, { ...queued.params, triggerState: 'armed' });
-    const armed = this.deps.store.getTask(taskId)!;
-    this.armer?.arm(armed);
+    (await this.deps.store.clearDraft(taskId));
+    const queued = (await this.deps.store.getTask(taskId))!;
+    (await this.deps.store.updateTaskParams(taskId, { ...queued.params, triggerState: 'armed' }));
+    const armed = (await this.deps.store.getTask(taskId))!;
+    (await this.armer?.arm(armed));
     return armed;
   }
 
@@ -1716,15 +1721,15 @@ export class KarmaxApi {
    * prompt via `task:edit` — must themselves be able to grant every capability
    * in it; otherwise an administrator's draft is a privilege-escalation template.
    */
-  private assertStoredGrantQueueable(token: string, caller: ScopedToken, task: TaskRecord): void {
+  private async assertStoredGrantQueueable(token: string, caller: ScopedToken, task: TaskRecord): Promise<void> {
     if (!this.deps.authorization || caller.kind === 'system') return;
     const stored = task.params?._authorization as { principal?: string; capabilities?: string[] } | undefined;
     if (!stored?.capabilities?.length || stored.principal === caller.principal) return;
     const { authorization: selection } = previousTaskGrants(task);
     if (!selection) return;
-    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
-    const grantorCaps = this.authorizationGrantorCaps(token, caller, selection, organizationId);
-    const held = this.deps.authorization.taskGrant(caller.principal, task.projectId, selection, grantorCaps).capabilities;
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+    const grantorCaps = (await this.authorizationGrantorCaps(token, caller, selection, organizationId));
+    const held = (await this.deps.authorization.taskGrant(caller.principal, task.projectId, selection, grantorCaps)).capabilities;
     const missing = stored.capabilities.filter((capability) => !allows(held, capability));
     if (missing.length) {
       throw new AuthorizationGrantError(`this task was authorized by ${stored.principal ?? 'another principal'}; `
@@ -1734,17 +1739,17 @@ export class KarmaxApi {
 
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
-    const receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
-    const task = this.deps.store.getTask(taskId);
+    const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
+    const task = await this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
+    const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const storedAuthorization = task.params?._authorization as {
       profileAttenuated?: boolean; attenuationAccepted?: boolean;
     } | undefined;
     if (storedAuthorization?.profileAttenuated && !storedAuthorization.attenuationAccepted)
       throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
-    this.assertStoredGrantQueueable(token, caller, task);
-    const group = this.deps.store.attemptGroup(taskId);
+    (await this.assertStoredGrantQueueable(token, caller, task));
+    const group = (await this.deps.store.attemptGroup(taskId));
     if (group?.committedAttemptId && group.otherAttempts !== 'keep' && group.committedAttemptId !== taskId) {
       throw new Error('another attempt has entered Merge; this task is committed and no other attempt can be queued');
     }
@@ -1752,28 +1757,28 @@ export class KarmaxApi {
     // than starting now — otherwise a triggered draft would start immediately and
     // its triggers would be pointless. `fired` tasks have already started.
     if (hasActiveTriggers(task.params) && task.params.triggerState !== 'fired') {
-      return this.armStoredTask(taskId);
+      return (await this.armStoredTask(taskId));
     }
     // A repeatable series never runs its own workflow — queueing it spawns a run.
     if (task.params.repeatable) {
-      this.deps.store.clearDraft(taskId);
+      (await this.deps.store.clearDraft(taskId));
       await this.spawnRun(token, taskId);
-      return this.deps.store.getTask(taskId)!;
+      return (await this.deps.store.getTask(taskId))!;
     }
     // Pin to the version stamped when the draft was created, not whatever is
     // current now — queueing a draft after an upgrade must not silently swap code.
     const { startType, input } = await this.buildStart(task, false, caller);
     const hadNumber = task.num != null;
-    this.deps.store.clearDraft(taskId);
-    const requestTiming = installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:m0`] }, row => {
-      this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
+    await this.deps.store.clearDraft(taskId);
+    const requestTiming = await installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:m0`] }, async row => {
+      await this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
     });
     // Draft creation is not a request to run. Start the initial-request clock
     // when it is queued; an idempotent queue retry must not restart that clock.
-    if (requestTiming.enabled() && task.params.draft && !task.params._workflowRunId
-      && !this.deps.store.eventsOfType(taskId, 'timing').some(event => event.payload?.name === 'request.received'))
-      requestTiming.mark('request.received', { requestId: `${taskId}:m0` }, receivedAt);
-    const dispatchEnd = requestTiming.start('workflow.dispatch');
+    if ((await requestTiming.enabled()) && task.params.draft && !task.params._workflowRunId
+      && !(await this.deps.store.eventsOfType(taskId, 'timing')).some(event => event.payload?.name === 'request.received'))
+      await requestTiming.mark('request.received', { requestId: `${taskId}:m0` }, receivedAt);
+    const dispatchEnd = await requestTiming.start('workflow.dispatch');
     // Bounded + compensated: on a wedged engine, restore the draft and release a
     // number minted by this failed transition. Previously established permalinks
     // remain stable when already-numbered work is queued again.
@@ -1793,7 +1798,7 @@ export class KarmaxApi {
       );
       const runId = (started as any)?.firstExecutionRunId ?? (started as any)?.runId;
       if (typeof runId === 'string' && runId) {
-        this.deps.store.patchTaskParams(taskId, { _workflowRunId: runId });
+        (await this.deps.store.patchTaskParams(taskId, { _workflowRunId: runId }));
       }
     } catch (e) {
       // A start acknowledgement can be lost after Temporal durably accepted the
@@ -1801,20 +1806,20 @@ export class KarmaxApi {
       // acceptance for this task's unique workflow ID, not a queue failure.
       // Keep the task queued and repair the stale draft metadata.
       if (!(e instanceof WorkflowExecutionAlreadyStartedError)) {
-        dispatchEnd('failed');
-        this.deps.store.restoreDraft(taskId, !hadNumber);
+        await dispatchEnd('failed');
+        await this.deps.store.restoreDraft(taskId, !hadNumber);
         throw new Error(
           `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
             `It's still saved as a draft — check that Temporal is healthy and try again.`,
         );
       }
     }
-    dispatchEnd();
+    await dispatchEnd();
     const started = this.resolveStart(task.workflow, task.workflowVersion,
-      this.deps.store.getProject(task.projectId)?.organizationId);
-    if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
-    this.consumeDiscardProgress(taskId);
-    return this.deps.store.getTask(taskId)!;
+      (await this.deps.store.getProject(task.projectId))?.organizationId);
+    if (started) (await this.saveAgentSnapshot(task.id, started.manifest, input));
+    (await this.consumeDiscardProgress(taskId));
+    return (await this.deps.store.getTask(taskId))!;
   }
 
   /**
@@ -1840,19 +1845,19 @@ export class KarmaxApi {
     }
   }
 
-  private credentialPolicyOverrides(
+  private async credentialPolicyOverrides(
     organizationId: string,
     requested: VaultTaskPolicyOverrides | undefined,
     callerCaps: Capability[],
     authorization: { attenuated: boolean },
-  ): VaultTaskPolicyOverrides {
+  ): Promise<VaultTaskPolicyOverrides> {
     const vault = new VaultItems(this.deps.store, undefined, undefined, organizationId);
     const out: VaultTaskPolicyOverrides = {};
     const canAdminister = allows(callerCaps, 'credential:write');
     const useRank: Record<VaultItemPolicy['use'], number> = { auto: 0, ask: 1 };
     const revealRank: Record<VaultItemPolicy['reveal'], number> = { auto: 0, ask: 1, never: 2 };
     for (const [itemId, raw] of Object.entries(requested ?? {})) {
-      const item = vault.get(itemId);
+      const item = (await vault.get(itemId));
       if (!item || (!canAdminister && !allows(callerCaps, `use-credential:item:${itemId}`))) {
         authorization.attenuated = true;
         continue;
@@ -1871,25 +1876,25 @@ export class KarmaxApi {
     return out;
   }
 
-  private persistTaskCredentialPolicies(task: TaskRecord): void {
-    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
+  private async persistTaskCredentialPolicies(task: TaskRecord): Promise<void> {
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
     const authorization = task.params?._authorization as { credentialPolicies?: VaultTaskPolicyOverrides } | undefined;
-    new VaultItems(this.deps.store, undefined, undefined, organizationId)
-      .setTaskPolicies(task.id, authorization?.credentialPolicies ?? {});
+    (await new VaultItems(this.deps.store, undefined, undefined, organizationId)
+      .setTaskPolicies(task.id, authorization?.credentialPolicies ?? {}));
   }
 
-  private inheritTaskDelegation(source: TaskRecord, target: TaskRecord): TaskRecord {
+  private async inheritTaskDelegation(source: TaskRecord, target: TaskRecord): Promise<TaskRecord> {
     const sourceAuthorization = source.params?._authorization as { delegationId?: string } | undefined;
     if (!sourceAuthorization?.delegationId) return target;
-    const parent = this.deps.tokens.deriveHumanDelegation(sourceAuthorization.delegationId, {
+    const parent = (await this.deps.tokens.deriveHumanDelegation(sourceAuthorization.delegationId, {
       taskId: target.id, projectId: target.projectId,
-      organizationId: this.deps.store.getProject(target.projectId)?.organizationId,
-    });
-    this.deps.store.updateTaskParams(target.id, { ...target.params,
+      organizationId: (await this.deps.store.getProject(target.projectId))?.organizationId,
+    }));
+    (await this.deps.store.updateTaskParams(target.id, { ...target.params,
       _authorization: { ...(target.params._authorization as object), delegationId: parent.id },
       ...(parent.externalIdentities?.githubAccountId
-        ? { _githubAccountId: parent.externalIdentities.githubAccountId } : {}) });
-    return this.deps.store.getTask(target.id)!;
+        ? { _githubAccountId: parent.externalIdentities.githubAccountId } : {}) }));
+    return (await this.deps.store.getTask(target.id))!;
   }
 
   /** Change the job-shaped grant on a task — before it starts, or in-flight while
@@ -1906,17 +1911,17 @@ export class KarmaxApi {
     credentialPolicies?: VaultTaskPolicyOverrides,
     options: { allowAttenuation?: boolean; acceptAttenuation?: boolean; preserveCredentialGrants?: boolean } = {},
   ): Promise<TaskRecord> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     // Drafts, armed triggers, and repeatable series have no running workflow — edit
     // their stored authorization in place. Everything else routes through the live
     // workflow update below (frozen only once it's cancelled/terminal).
     const editInPlace = !!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable;
-    const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
-    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
-    const grantorCaps = this.authorizationGrantorCaps(token, caller, requested, organizationId);
+    const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+    const grantorCaps = (await this.authorizationGrantorCaps(token, caller, requested, organizationId));
     const authorization = this.deps.authorization
-      ? this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps)
+      ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps))
       : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
     this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
@@ -1931,12 +1936,12 @@ export class KarmaxApi {
     const priorPolicies = priorAuthorization?.credentialPolicies;
     const policies = credentialPolicies === undefined
       ? (priorPolicies ?? {})
-      : this.credentialPolicyOverrides(
-        this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal',
+      : (await this.credentialPolicyOverrides(
+        (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal',
         credentialPolicies,
         caller.caps,
         authorization,
-      );
+      ));
     const sameSelection = typeof requested === 'string'
       ? requested === priorAuthorization?.level
       : requested.level === priorAuthorization?.level
@@ -1965,16 +1970,16 @@ export class KarmaxApi {
       ?? (caller.kind === 'agent'
         ? caller.externalIdentities?.githubAccountId
         : caller.humanSubject
-          ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
+          ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId))
           : undefined);
-    const delegation = this.delegateTaskHuman(token, caller, {
+    const delegation = (await this.delegateTaskHuman(token, caller, {
       taskId,
       projectId: authorizationScope.scope ? undefined : task.projectId,
       projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
       organizationId: authorizationScope.scope === 'global' ? undefined
         : (authorizationScope.organizationId ?? organizationId),
       externalIdentities: delegatedGithubAccountId ? { githubAccountId: delegatedGithubAccountId } : undefined,
-    });
+    }));
     if (!editInPlace) {
       // The workflow validator is the single source of truth for the in-flight
       // window; if it rejects (cancelled / past the point of no return / already
@@ -1992,33 +1997,33 @@ export class KarmaxApi {
       }
     }
     const { delegationId: _staleDelegationId, ...priorAuthorizationWithoutDelegation } = priorAuthorization ?? {};
-    this.deps.store.patchTaskParams(taskId, {
+    (await this.deps.store.patchTaskParams(taskId, {
       _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization, profileAttenuated,
         principal: caller.principal, credentialPolicies: policies,
         ...(delegation ? { delegationId: delegation.id } : {}),
         ...(profileAttenuated ? { attenuationAccepted } : { attenuationAccepted: undefined }) },
       ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
-    });
-    const updated = this.deps.store.getTask(taskId)!;
-    this.persistTaskCredentialPolicies(updated);
+    }));
+    const updated = (await this.deps.store.getTask(taskId))!;
+    (await this.persistTaskCredentialPolicies(updated));
     const requests = new PermissionRequests(this.deps.store, organizationId);
-    for (const request of requests.requests({ taskId, status: 'pending' })) {
+    for (const request of (await requests.requests({ taskId, status: 'pending' }))) {
       // A manual decision may itself be updating the task's scope.
       if (this.resolvingPermissions.has(`${organizationId}:${request.id}`)) continue;
-      if (requests.requests().find((candidate) => candidate.id === request.id)?.status !== 'pending') continue;
-      if (this.permissionRequestSatisfied(this.deps.store.getTask(taskId)!, request))
+      if ((await requests.requests()).find((candidate) => candidate.id === request.id)?.status !== 'pending') continue;
+      if ((await this.permissionRequestSatisfied((await this.deps.store.getTask(taskId))!, request)))
         await this.finishPermissionDecision(requests, request, 'approve', caller.principal, true);
     }
     return updated;
   }
 
-  private authorizationGrantorCaps(
+  private async authorizationGrantorCaps(
     token: string,
     caller: ScopedToken,
     requested: string | AuthorizationSelection | undefined,
     organizationId: string,
-  ): Capability[] | undefined {
+  ): Promise<Capability[] | undefined> {
     // An authenticated human's durable grants are evaluated independently for
     // every selected project. A task/system bearer must use only its immediate
     // token: looking up the named human would turn it into a confused deputy.
@@ -2026,7 +2031,7 @@ export class KarmaxApi {
     if (!requested || typeof requested === 'string') return caller.caps;
     if (requested.scope === 'projects') {
       for (const projectId of requested.projectIds ?? []) {
-        const checked = this.deps.tokens.check(token, 'task:create', { projectId, organizationId });
+        const checked = (await this.deps.tokens.check(token, 'task:create', { projectId, organizationId }));
         if (!checked.ok) throw new CapabilityError(`you cannot delegate access to project ${projectId}: ${checked.reason}`);
       }
     } else if (requested.scope === 'organization') {
@@ -2042,10 +2047,10 @@ export class KarmaxApi {
    * the selected scope. Preserve that wider authorization when the browser's
    * short-lived API token is intentionally narrowed to the current route's
    * project; non-human callers still attenuate strictly from their bearer. */
-  private delegateTaskHuman(token: string, caller: ScopedToken, args: HumanDelegationArgs) {
+  private async delegateTaskHuman(token: string, caller: ScopedToken, args: HumanDelegationArgs) {
     return this.deps.authorization && caller.kind === 'human' && caller.principal.startsWith('user:')
-      ? this.deps.tokens.delegateAuthorizedInteractiveHuman(token, args)
-      : this.deps.tokens.delegateHuman(token, args);
+      ? (await this.deps.tokens.delegateAuthorizedInteractiveHuman(token, args))
+      : (await this.deps.tokens.delegateHuman(token, args));
   }
 
   /**
@@ -2055,13 +2060,13 @@ export class KarmaxApi {
    * each trigger fire of a repeatable series, and by "Run again".
    */
   async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
-    const series = this.deps.store.getTask(seriesId);
+    const series = (await this.deps.store.getTask(seriesId));
     // Scope the check to the series' own project (the run inherits it), so a
     // project-scoped token cannot spawn a run from another project's series.
-    const caller = this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId });
+    const caller = (await this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId }));
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
-    this.assertStoredGrantQueueable(token, caller, series);
-    let run = this.deps.store.createTask({
+    (await this.assertStoredGrantQueueable(token, caller, series));
+    let run = (await this.deps.store.createTask({
       projectId: series.projectId,
       listId: series.listId,
       title: series.title,
@@ -2073,9 +2078,9 @@ export class KarmaxApi {
       assignee: series.assignee,
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
-    });
-    run = this.inheritTaskDelegation(series, run);
-    this.persistTaskCredentialPolicies(run);
+    }));
+    run = (await this.inheritTaskDelegation(series, run));
+    (await this.persistTaskCredentialPolicies(run));
     const { startType, input } = await this.buildStart(run);
     try {
       await withTimeout(
@@ -2083,12 +2088,12 @@ export class KarmaxApi {
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.deleteTask(run.id); // no orphan run row on a wedged engine
+      (await this.deps.store.deleteTask(run.id)); // no orphan run row on a wedged engine
       throw e;
     }
     const started = this.resolveStart(run.workflow, run.workflowVersion,
-      this.deps.store.getProject(run.projectId)?.organizationId);
-    if (started) this.saveAgentSnapshot(run.id, started.manifest, input);
+      (await this.deps.store.getProject(run.projectId))?.organizationId);
+    if (started) (await this.saveAgentSnapshot(run.id, started.manifest, input));
     return run;
   }
 
@@ -2105,15 +2110,15 @@ export class KarmaxApi {
    * start failure so a fire is never silently lost.
    */
   async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone'): Promise<{ startedTaskId: string }> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'create_task', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'create_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId)).id };
 
     const fired: Record<string, unknown> = { ...(task.params as Record<string, unknown>), triggerState: 'fired' };
     delete fired.triggerPending;
-    this.deps.store.updateTaskParams(taskId, fired as any);
+    (await this.deps.store.updateTaskParams(taskId, fired as any));
     try {
       const { startType, input } = await this.buildStart({ ...task, params: fired as any });
       await withTimeout(
@@ -2121,9 +2126,9 @@ export class KarmaxApi {
         START_TIMEOUT_MS,
       );
       const started = this.resolveStart(task.workflow, task.workflowVersion,
-        this.deps.store.getProject(task.projectId)?.organizationId);
-      if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
-      this.consumeDiscardProgress(taskId);
+        (await this.deps.store.getProject(task.projectId))?.organizationId);
+      if (started) (await this.saveAgentSnapshot(task.id, started.manifest, input));
+      (await this.consumeDiscardProgress(taskId));
     } catch (e) {
       // "Already started" is not a failure to compensate for: the execution IS
       // running under this task's workflow id (a duplicate fire, a retried
@@ -2131,7 +2136,7 @@ export class KarmaxApi {
       // workflow runs, and `src/platform/reconcile.ts` then excludes it from
       // reconciliation forever — the task is permanently invisible to recovery.
       if (e instanceof WorkflowExecutionAlreadyStartedError) return { startedTaskId: taskId };
-      this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any);
+      (await this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any));
       throw e;
     }
     return { startedTaskId: taskId };
@@ -2143,7 +2148,7 @@ export class KarmaxApi {
    * is disarmed.
    */
   async runArmedNow(token: string, taskId: string): Promise<{ startedTaskId: string }> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (task?.params?.repeatable) return this.runAgain(token, taskId);
     this.armer?.disarm(taskId); // take it off the dispatcher so no later event double-fires
     return this.fireTriggeredTask(token, taskId, 'self');
@@ -2151,8 +2156,8 @@ export class KarmaxApi {
 
   /** Cancel a task's triggers: disarm it and keep it as an editable draft. */
   async cancelTrigger(token: string, taskId: string): Promise<TaskRecord> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.armer?.disarm(taskId);
     // Drop dispatcher bookkeeping along with the armed state. Keeping
@@ -2161,8 +2166,8 @@ export class KarmaxApi {
     // occurrence — so it fired once immediately on being re-queued. Pausing is
     // not missing: a task that was deliberately not armed has nothing to catch up.
     const { triggerState: _s, triggerLastFiredAt: _f, triggerPending: _p, ...rest } = task.params as Record<string, unknown>;
-    this.deps.store.updateTaskParams(taskId, { ...rest, draft: true } as any);
-    return this.deps.store.getTask(taskId)!;
+    (await this.deps.store.updateTaskParams(taskId, { ...rest, draft: true } as any));
+    return (await this.deps.store.getTask(taskId))!;
   }
 
   /**
@@ -2177,25 +2182,25 @@ export class KarmaxApi {
     params: Record<string, unknown>,
     opts: { replace?: boolean; keepArmed?: boolean } = {},
   ): Promise<TaskRecord> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     if (params.paymentPolicy !== undefined && JSON.stringify(params.paymentPolicy) !== JSON.stringify((task.params as any).paymentPolicy)) {
-      this.require(token, 'manage_payments', { projectId: task.projectId, taskId });
-      validatePaymentPolicy(this.deps.store, task.projectId, this.deps.store.getProject(task.projectId)!.organizationId ?? 'org_personal', params.paymentPolicy);
+      (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
+      (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', params.paymentPolicy));
     }
     this.assertBranchParams(params);
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
-    this.validateAndAuthorizeResumeSources(token, params);
-    const inheritedFiles = this.inheritedResumeFiles(params);
-    for (const file of inheritedFiles) this.deps.store.grantAttachment(file.id, task.projectId);
+    (await this.validateAndAuthorizeResumeSources(token, params));
+    const inheritedFiles = (await this.inheritedResumeFiles(params));
+    for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, task.projectId));
     const promptFiles = uniqueFileRefs([
       ...((params.files as FileRef[] | undefined) ?? []),
       ...inheritedFiles,
     ]);
     if (promptFiles.length) {
-      this.validatePromptFiles(task.projectId, promptFiles);
+      (await this.validatePromptFiles(task.projectId, promptFiles));
       params.files = promptFiles;
     }
     const { archived, profiles, priority, _authorization } = task.params;
@@ -2207,7 +2212,7 @@ export class KarmaxApi {
       ...(_authorization !== undefined ? { _authorization } : {}),
     };
     const start = this.resolveStart(task.workflow, task.workflowVersion,
-      this.deps.store.getProject(task.projectId)?.organizationId);
+      (await this.deps.store.getProject(task.projectId))?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField) {
       let confirmer = Object.prototype.hasOwnProperty.call(params, confirmerField.name)
@@ -2218,39 +2223,39 @@ export class KarmaxApi {
       // snapshot shared by all attempts, so refresh that snapshot from the current
       // defaults instead of leaving a previously autosaved partial value behind.
       if (confirmer === undefined && opts.replace && start) {
-        const project = this.deps.store.getProject(task.projectId);
-        if (project) confirmer = this.resolveTaskField(start.manifest, project, params as ValueMap, confirmerField.name);
+        const project = (await this.deps.store.getProject(task.projectId));
+        if (project) confirmer = (await this.resolveTaskField(start.manifest, project, params as ValueMap, confirmerField.name));
       }
       if (confirmer !== undefined) {
-        this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer);
+        (await this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer));
       }
     }
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
-    this.prepareForkWorld(task.projectId, base, task.params);
+    (await this.prepareForkWorld(task.projectId, base, task.params));
     // Authorization is platform metadata, never a workflow-form field.
     if (_authorization !== undefined) base._authorization = _authorization;
     delete base.triggerState; // lifecycle flags are managed below, never taken from the form
     delete base.draft;
     // Keep the display title tracking the (edited) prompt — the title was derived
     // from the prompt at creation, so an edit should carry through (SPEC §10).
-    if (typeof base.prompt === 'string' && base.prompt.trim()) this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt)));
+    if (typeof base.prompt === 'string' && base.prompt.trim()) (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
     // A repeatable series stays a series when saved: persist, then arm it if it
     // has triggers (each fire spawns a run) or leave it as a manual template.
     if (base.repeatable && opts.keepArmed !== false) {
-      this.deps.store.updateTaskParams(taskId, base as any);
-      if (hasActiveTriggers(base)) return this.armStoredTask(taskId);
+      (await this.deps.store.updateTaskParams(taskId, base as any));
+      if (hasActiveTriggers(base)) return (await this.armStoredTask(taskId));
       this.armer?.disarm(taskId);
-      return this.deps.store.getTask(taskId)!;
+      return (await this.deps.store.getTask(taskId))!;
     }
     if (opts.keepArmed !== false && hasActiveTriggers(base)) {
-      this.deps.store.updateTaskParams(taskId, base as any);
-      return this.armStoredTask(taskId); // re-validate + re-arm (disarm old, arm new)
+      (await this.deps.store.updateTaskParams(taskId, base as any));
+      return (await this.armStoredTask(taskId)); // re-validate + re-arm (disarm old, arm new)
     }
     this.armer?.disarm(taskId);
-    this.deps.store.updateTaskParams(taskId, { ...base, draft: true } as any);
-    return this.deps.store.getTask(taskId)!;
+    (await this.deps.store.updateTaskParams(taskId, { ...base, draft: true } as any));
+    return (await this.deps.store.getTask(taskId))!;
   }
 
   async getTaskView(
@@ -2258,20 +2263,19 @@ export class KarmaxApi {
     taskId: string,
     opts?: { live?: boolean },
   ): Promise<TaskView | undefined> {
-    const rec = this.deps.store.getTask(taskId);
-    this.require(token, 'get_task', { projectId: rec?.projectId, taskId });
-    const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
+    const rec = await this.deps.store.taskMetadataAsync(taskId);
+    (await this.require(token, 'get_task', { projectId: rec?.projectId, taskId }));
+    const snapshot = () => this.deps.store.taskSnapshotAsync(taskId);
     // Cosmetic notes and the queue-time effective agent snapshot live outside the
     // workflow history, so mirror both onto whichever view we return. Keeping the
     // agent snapshot platform-side avoids changing immutable workflow replay payloads.
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
-      view = this.deps.store.withPendingReviewInfo(taskId, view);
-      if (this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
+      view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-
       // Existing parked executions recorded only "account". Read the small
       // coordinator projection to explain that wait without replaying the task
       // or restarting its agent. New lease results already carry this detail.
@@ -2287,17 +2291,22 @@ export class KarmaxApi {
           } };
         } catch { /* A coordinator outage must not block reading the task. */ }
       }
-      const agents = this.readAgentSnapshot(taskId);
-      const task = this.deps.store.getTask(taskId);
+      const rawAgents = await this.deps.store.kvGetAsync(agentSnapshotKey(taskId));
+      let agents: Record<string, AgentSpec> | undefined;
+      try { const parsed = rawAgents ? JSON.parse(rawAgents) : undefined;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) agents = parsed;
+      } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
+      const task = await this.deps.store.taskMetadataAsync(taskId);
+      const group = await this.deps.store.attemptCommitAsync(taskId);
       return {
         ...view,
         notes: task?.notes,
         ...(agents ? { agents } : {}),
-        ...(task ? { stageTransitions: this.availableStageTransitions(task, view) } : {}),
+        ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
         ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
           : { actions: this.lifecycleActions(view) }),
-        ...(this.deps.store.kvGet(`project-transfer-history:${taskId}`)
+        ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
       };
     };
@@ -2311,14 +2320,14 @@ export class KarmaxApi {
     // the authoritative query for the few callers that must not read a lagging snapshot
     // (post-`updateParams` responses, review-action resolution). We also fall through to
     // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
-    const snap = snapshot();
+    const snap = await snapshot();
     // softwareDev@1.0.0 could persist "waiting for account" immediately before
     // scheduling a turn, then clear it only in workflow memory after the grant.
     // It cannot add a publish at that point without breaking replay. Treat that
     // one legacy shape as stale-prone and query its authoritative live state;
     // current workflows carry agentTurn and remain snapshot-fast.
     const legacyAccountWait =
-      this.deps.store.getTask(taskId)?.workflowVersion === '1.0.0' &&
+      rec?.workflowVersion === '1.0.0' &&
       snap?.waitingFor?.kind === 'account' &&
       !snap.agentTurn;
     if (snap && !opts?.live && !legacyAccountWait) return enrich(snap);
@@ -2326,12 +2335,15 @@ export class KarmaxApi {
     // loop) makes a query hang without rejecting, which would otherwise freeze the
     // caller. Fall back fast to whatever snapshot we have.
     try {
-      const q = this.workflowHandle(taskId).query('view') as Promise<TaskView>;
+      // Async snapshot reads may overlap a lifecycle replacement. Resolve the
+      // currently pinned run immediately before querying, not the earlier record.
+      const current = await this.deps.store.taskMetadataAsync(taskId);
+      const q = (await this.workflowHandle(taskId, current ?? null)).query('view') as Promise<TaskView>;
       q.catch(() => undefined); // swallow the late rejection if we time out first
       const view = await withTimeout(q, QUERY_TIMEOUT_MS);
-      return enrich((view as TaskView) ?? snapshot());
+      return enrich((view as TaskView) ?? await snapshot());
     } catch {
-      return enrich(snapshot());
+      return enrich(await snapshot());
     }
   }
 
@@ -2344,28 +2356,39 @@ export class KarmaxApi {
   private async transitionSourceView(task: TaskRecord): Promise<TaskView> {
     const snapshot = task.lastView;
     if (!snapshot) throw new Error('task has no lifecycle state yet');
-    if (['done', 'cancelled', 'failed'].includes(snapshot.status)) return this.deps.store.withPendingReviewInfo(task.id, snapshot);
+    if (['done', 'cancelled', 'failed'].includes(snapshot.status)) return (await this.deps.store.withPendingReviewInfo(task.id, snapshot));
     try {
-      const query = this.workflowHandle(task.id).query('view') as Promise<TaskView>;
+      const query = (await this.workflowHandle(task.id)).query('view') as Promise<TaskView>;
       query.catch(() => undefined);
       const view = await withTimeout(query, QUERY_TIMEOUT_MS);
       if (!view || typeof view !== 'object' || !view.stage || !view.status)
         throw new Error('the workflow returned no lifecycle view');
-      return this.deps.store.withPendingReviewInfo(task.id, view);
+      return (await this.deps.store.withPendingReviewInfo(task.id, view));
     } catch (error) {
       throw new Error(`Cannot move ${task.title}: the live workflow stage is unavailable (${unwrapCause(error)}). Try again once the worker is healthy.`);
     }
   }
 
   /** Drawer-only projection for an unqueued attempt, which has no workflow view. */
-  getDraftView(
+  async getDraftView(
     token: string,
     taskId: string,
     group?: { committedAttemptId?: string },
-  ): TaskView | undefined {
-    this.require(token, 'get_task');
-    const record = this.deps.store.getTask(taskId);
+  ): Promise<TaskView | undefined> {
+    (await this.require(token, 'get_task'));
+    const record = (await this.deps.store.getTask(taskId));
     if (!record?.params?.draft) return undefined;
+    return (await this.projectDraftView(record, group));
+  }
+
+  async getDraftViewAsync(token: string, taskId: string): Promise<TaskView | undefined> {
+    (await this.require(token, 'get_task'));
+    const record = await this.deps.store.taskMetadataAsync(taskId);
+    (await this.require(token, 'get_task', { projectId: record?.projectId, taskId }));
+    return record?.params?.draft ? (await this.projectDraftView(record, {})) : undefined;
+  }
+
+  private async projectDraftView(record: TaskRecord, group?: { committedAttemptId?: string }): Promise<TaskView> {
     const view: TaskView = {
       taskId: record.id,
       title: record.title,
@@ -2380,36 +2403,41 @@ export class KarmaxApi {
       state: { draft: true },
       updatedAt: record.createdAt,
     };
-    view.stageTransitions = this.availableStageTransitions(record, view, group);
+    view.stageTransitions = (await this.availableStageTransitions(record, view, group));
     return view;
   }
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
-    this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listTasks(projectId);
+    (await this.require(token, 'list_tasks', { projectId }));
+    return this.deps.store.listTasksAsync(projectId);
   }
 
   async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
-    this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listTaskSummaries(projectId);
+    (await this.require(token, 'list_tasks', { projectId }));
+    return this.deps.store.listTasksAsync(projectId, false);
+  }
+
+  async taskSummaryPage(token: string, projectId: string, options: { includeArchived?: boolean; limit?: number; offset?: number }) {
+    (await this.require(token, 'list_tasks', { projectId }));
+    return this.deps.store.taskSummaryPage(projectId, options);
   }
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
   async addAttempt(token: string, sourceTaskId: string): Promise<TaskRecord> {
-    const source = this.deps.store.getTask(sourceTaskId);
-    const caller = this.require(token, 'create_task', { projectId: source?.projectId, taskId: sourceTaskId });
+    const source = (await this.deps.store.getTask(sourceTaskId));
+    const caller = (await this.require(token, 'create_task', { projectId: source?.projectId, taskId: sourceTaskId }));
     if (!source) throw new NotFoundError(`no task ${sourceTaskId}`);
-    this.assertStoredGrantQueueable(token, caller, source);
-    const group = this.deps.store.attemptGroup(sourceTaskId);
+    (await this.assertStoredGrantQueueable(token, caller, source));
+    const group = (await this.deps.store.attemptGroup(sourceTaskId));
     if (!group) throw new Error('task has no attempt group');
     if (group.committedAttemptId) throw new Error('no more attempts can be added after an attempt enters Merge');
     const { archived: _archived, draft: _draft, triggers: _triggers, triggerState: _triggerState,
       repeatable: _repeatable, runOf: _runOf, ...workflowParams } = source.params;
     const start = this.resolveStart(source.workflow, source.workflowVersion,
-      this.deps.store.getProject(source.projectId)?.organizationId);
+      (await this.deps.store.getProject(source.projectId))?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group.confirmer !== undefined) workflowParams[confirmerField.name] = group.confirmer;
-    let attempt = this.deps.store.createTask({
+    let attempt = (await this.deps.store.createTask({
       projectId: source.projectId,
       listId: source.listId,
       title: source.title,
@@ -2422,48 +2450,48 @@ export class KarmaxApi {
       assignee: source.assignee,
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
-    });
-    attempt = this.inheritTaskDelegation(source, attempt);
-    this.persistTaskCredentialPolicies(attempt);
-    if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
-    if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
+    }));
+    attempt = (await this.inheritTaskDelegation(source, attempt));
+    (await this.persistTaskCredentialPolicies(attempt));
+    if (source.notes) (await this.deps.store.setTaskNotes(attempt.id, source.notes));
+    if (source.tags?.length) (await this.deps.store.setTaskTags(attempt.id, source.tags));
     // If the former principal is cancelled/failed, the new draft naturally takes over.
-    this.deps.store.electPrincipal(group.intentId);
-    return this.deps.store.getTask(attempt.id)!;
+    (await this.deps.store.electPrincipal(group.intentId));
+    return (await this.deps.store.getTask(attempt.id))!;
   }
 
-  setPrincipalAttempt(token: string, taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+  async setPrincipalAttempt(token: string, taskId: string) {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    this.deps.store.setPrincipalAttempt(taskId);
-    return this.deps.store.attemptGroup(taskId);
+    (await this.deps.store.setPrincipalAttempt(taskId));
+    return (await this.deps.store.attemptGroup(taskId));
   }
 
-  private attemptsReachMerge(task: TaskRecord): boolean {
+  private async attemptsReachMerge(task: TaskRecord): Promise<boolean> {
     return !!this.resolveStart(task.workflow, task.workflowVersion,
-      this.deps.store.getProject(task.projectId)?.organizationId)?.manifest.stages?.some((stage) => stage.key === 'merge');
+      (await this.deps.store.getProject(task.projectId))?.organizationId)?.manifest.stages?.some((stage) => stage.key === 'merge');
   }
 
-  attemptGroup(token: string, taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'get_task', { projectId: task?.projectId, taskId });
-    const group = this.deps.store.attemptGroup(taskId);
+  async attemptGroup(token: string, taskId: string) {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'get_task', { projectId: task?.projectId, taskId }));
+    const group = (await this.deps.store.attemptGroup(taskId));
     if (!group) return group;
     return {
       ...group,
-      otherAttemptsChoiceAvailable: !!task && this.attemptsReachMerge(task),
-      otherAttemptsDefault: this.deps.store.otherAttemptsDefault(taskId),
-      canSaveOtherAttemptsDefault: this.deps.tokens.check(token, 'project:settings:write', { projectId: task?.projectId }).ok,
-      attempts: group.attempts.map((attempt) => attempt.params.draft
-        ? { ...attempt, lastView: this.getDraftView(token, attempt.id, group) }
+      otherAttemptsChoiceAvailable: !!task && (await this.attemptsReachMerge(task)),
+      otherAttemptsDefault: (await this.deps.store.otherAttemptsDefault(taskId)),
+      canSaveOtherAttemptsDefault: (await this.deps.tokens.check(token, 'project:settings:write', { projectId: task?.projectId })).ok,
+      attempts: (await __asyncCollections.map(group.attempts, async (attempt) => attempt.params.draft
+        ? { ...attempt, lastView: (await this.getDraftView(token, attempt.id, group)) }
         : attempt.lastView
           ? { ...attempt, lastView: {
               ...attempt.lastView,
               actions: this.lifecycleActions(attempt.lastView),
-              stageTransitions: this.availableStageTransitions(attempt, attempt.lastView, group),
+              stageTransitions: (await this.availableStageTransitions(attempt, attempt.lastView, group)),
             } }
-          : attempt),
+          : attempt)),
     };
   }
 
@@ -2545,12 +2573,12 @@ export class KarmaxApi {
 
   /** The single transition policy shared by the selected task header, every
    * attempt row, and the mutation endpoint. */
-  private availableStageTransitions(
+  private async availableStageTransitions(
     task: TaskRecord,
     view: TaskView,
     knownGroup?: { committedAttemptId?: string },
-  ): StageTransition[] {
-    const group = knownGroup ?? this.deps.store.attemptGroup(task.id);
+  ): Promise<StageTransition[]> {
+    const group = knownGroup ?? (await this.deps.store.attemptGroup(task.id));
     const jayadratha = !!group?.committedAttemptId;
     const resumable = task.workflow === 'software-dev' || task.workflow === 'goal';
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
@@ -2642,17 +2670,17 @@ export class KarmaxApi {
     return result;
   }
 
-  private transitionCheckpoint(
+  private async transitionCheckpoint(
     view: TaskView,
     resumeStage: Stage,
     pausedForHuman = false,
     humanWait?: { audience: string[]; detail: string },
     reviewConfirmed = false,
-  ): TaskRecoveryCheckpoint {
+  ): Promise<TaskRecoveryCheckpoint> {
     const saved = view.state?.transitionCheckpoint as TaskRecoveryCheckpoint | undefined;
     const viewWorld = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
     const recoverableWorld = view.status === 'cancelled'
-      && this.deps.store.worldState(view.taskId) === 'released'
+      && (await this.deps.store.worldState(view.taskId)) === 'released'
       ? undefined
       : viewWorld;
     const source = saved ?? {
@@ -2692,11 +2720,11 @@ export class KarmaxApi {
     // conversation. Resume the Do provider session when its credential home can
     // be leased again; the copied transcript remains the provider-independent
     // fallback when it cannot.
-    const session = source.session ?? (this.deps.store.kvGet(`session:${view.taskId}:do`) || undefined);
+    const session = source.session ?? ((await this.deps.store.kvGet(`session:${view.taskId}:do`)) || undefined);
     let sessionHome = source.sessionHome;
     if (!sessionHome) {
       try {
-        const meta = JSON.parse(this.deps.store.kvGet(`sessionmeta:${view.taskId}:do`) ?? '{}');
+        const meta = JSON.parse((await this.deps.store.kvGet(`sessionmeta:${view.taskId}:do`)) ?? '{}');
         sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
       } catch {
         /* malformed legacy metadata: the transcript still preserves context */
@@ -2770,16 +2798,16 @@ export class KarmaxApi {
     disposition: 'replace' | 'cancel' | 'discard' = 'replace',
     gracefulTimeoutMs = 30_000,
   ): Promise<void> {
-    const handle = this.workflowHandle(task.id);
+    const handle = (await this.workflowHandle(task.id));
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
     let stoppedGracefully = false;
     if (minor >= 22 && disposition !== 'discard' && typeof (handle as any).result === 'function') {
       if (disposition === 'replace') {
         const runId = task.params?._workflowRunId;
-        this.deps.store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({
+        (await this.deps.store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({
           ...(typeof runId === 'string' && runId ? { runId } : {}),
           requestedAt: Date.now(),
-        }));
+        })));
       }
       try {
         await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
@@ -2842,10 +2870,10 @@ export class KarmaxApi {
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
    * ever published. Reclaim by durable task ownership instead of relying on an
    * in-memory activity finally block that may never run after failover. */
-  private releaseTaskRunnerLeases(taskId: string): void {
-    for (const lease of this.deps.store.worldLeasesForTask(taskId)) {
-      if (this.deps.runners) this.deps.runners.release(String(lease.id), 'unknown');
-      else this.deps.store.releaseWorldLease(String(lease.id));
+  private async releaseTaskRunnerLeases(taskId: string): Promise<void> {
+    for (const lease of (await this.deps.store.worldLeasesForTask(taskId))) {
+      if (this.deps.runners) (await this.deps.runners.release(String(lease.id), 'unknown'));
+      else (await this.deps.store.releaseWorldLease(String(lease.id)));
     }
   }
 
@@ -2858,25 +2886,25 @@ export class KarmaxApi {
     reviewConfirmed = false,
   ): Promise<TaskView> {
     const { startType, input, version } = await this.buildStart(task, true);
-    input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman, humanWait, reviewConfirmed);
+    input.recovery = (await this.transitionCheckpoint(view, resumeStage, pausedForHuman, humanWait, reviewConfirmed));
     const started = await withTimeout(this.deps.client.workflow.start(startType, {
       taskQueue: this.deps.taskQueue,
       workflowId: task.id,
       workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE,
       args: [input],
     }), START_TIMEOUT_MS);
-    this.deps.store.setTaskWorkflowVersion(task.id, version);
-    this.deps.store.setTaskExecutionWorkflow(task.id, task.workflow);
+    (await this.deps.store.setTaskWorkflowVersion(task.id, version));
+    (await this.deps.store.setTaskExecutionWorkflow(task.id, task.workflow));
     const runId = (started as any)?.firstExecutionRunId ?? (started as any)?.runId;
-    this.deps.store.patchTaskParams(task.id, {
+    (await this.deps.store.patchTaskParams(task.id, {
       archived: false,
       draft: false,
       ...(typeof runId === 'string' && runId ? { _workflowRunId: runId } : {}),
-    });
+    }));
     // The new run is now durable and its run id (when available) is pinned. Its
     // first view may race this platform-side projection, but neither belongs to
     // the stopped run, so the old-run terminal suppression is no longer needed.
-    this.deps.store.kvDelete(lifecycleReplacementKey(task.id));
+    (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
     const {
       manuallyDoneFrom: _manuallyDoneFrom,
       manuallyDoneView: _manuallyDoneView,
@@ -2911,22 +2939,22 @@ export class KarmaxApi {
       },
       updatedAt: Date.now(),
     };
-    this.deps.store.saveView(task.id, starting);
+    (await this.deps.store.saveView(task.id, starting));
     return {
       ...starting,
       actions: this.lifecycleActions(starting),
-      stageTransitions: this.availableStageTransitions(this.deps.store.getTask(task.id)!, starting),
+      stageTransitions: (await this.availableStageTransitions((await this.deps.store.getTask(task.id))!, starting)),
     };
   }
 
   /** Move one attempt to an explicitly advertised lifecycle destination. */
   async moveTaskStage(token: string, taskId: string, target: string): Promise<TaskView> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'signal_task', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'signal_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    const view = task.params.draft ? this.getDraftView(token, taskId) : await this.transitionSourceView(task);
+    const view = task.params.draft ? (await this.getDraftView(token, taskId)) : await this.transitionSourceView(task);
     if (!view) throw new Error('task has no lifecycle state yet');
-    const move = this.availableStageTransitions(task, view).find((candidate) => candidate.target === target);
+    const move = (await this.availableStageTransitions(task, view)).find((candidate) => candidate.target === target);
     if (!move) throw new Error(`cannot move this attempt from ${stageName(view.stage)} to ${stageName(target)}`);
 
     if (task.params.draft && target === 'do') {
@@ -2936,10 +2964,10 @@ export class KarmaxApi {
 
     if (target === 'done') {
       const from = task.params.draft ? 'draft' : view.state?.humanPauseOrigin ? 'human' : view.stage;
-      const checkpoint = task.params.draft ? undefined : this.transitionCheckpoint(view, view.stage);
+      const checkpoint = task.params.draft ? undefined : (await this.transitionCheckpoint(view, view.stage));
       if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status))
         await this.stopTaskActivity(task, view, 'Task marked done manually', 'cancel');
-      if (task.params.draft) this.deps.store.clearDraft(taskId);
+      if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       const done: TaskView = {
         ...view,
         stage: 'done',
@@ -2956,22 +2984,22 @@ export class KarmaxApi {
         },
         updatedAt: Date.now(),
       };
-      this.deps.store.saveView(taskId, done);
-      return { ...done, stageTransitions: this.availableStageTransitions(this.deps.store.getTask(taskId)!, done) };
+      (await this.deps.store.saveView(taskId, done));
+      return { ...done, stageTransitions: (await this.availableStageTransitions((await this.deps.store.getTask(taskId))!, done)) };
     }
 
     const manuallyDoneFrom = view.state?.manuallyDoneFrom as Stage | 'draft' | 'human' | undefined;
     if (view.status === 'done' && manuallyDoneFrom === 'draft' && target === 'draft') {
-      this.deps.store.updateTaskParams(taskId, { ...task.params, draft: true, archived: false });
-      return this.getDraftView(token, taskId)!;
+      (await this.deps.store.updateTaskParams(taskId, { ...task.params, draft: true, archived: false }));
+      return (await this.getDraftView(token, taskId))!;
     }
     if (view.status === 'done' && (target === 'cancelled' || target === 'failed')) {
       const previous = view.state?.manuallyDoneView as TaskView | undefined;
       if (!previous || previous.stage !== target) throw new Error(`the prior ${target} state is unavailable`);
       const restored = { ...previous, updatedAt: Date.now() };
-      this.deps.store.saveView(taskId, restored);
-      this.deps.store.updateTaskParams(taskId, { ...task.params, archived: false });
-      return { ...restored, stageTransitions: this.availableStageTransitions(this.deps.store.getTask(taskId)!, restored) };
+      (await this.deps.store.saveView(taskId, restored));
+      (await this.deps.store.updateTaskParams(taskId, { ...task.params, archived: false }));
+      return { ...restored, stageTransitions: (await this.availableStageTransitions((await this.deps.store.getTask(taskId))!, restored)) };
     }
     if (view.status === 'done' && manuallyDoneFrom === 'human' && target === 'human') {
       const checkpoint = view.state?.transitionCheckpoint as TaskRecoveryCheckpoint | undefined;
@@ -2988,21 +3016,21 @@ export class KarmaxApi {
         const opened = await this.deps.worlds.open(world).catch(() => undefined);
         await opened?.destroy().catch(() => undefined);
       }
-      this.deps.store.kvDelete(`attempt-choice:${taskId}`);
+      (await this.deps.store.kvDelete(`attempt-choice:${taskId}`));
       const draftParams = { ...task.params };
       delete (draftParams as any)._workflowRunId;
-      this.deps.store.updateTaskParams(taskId, {
+      (await this.deps.store.updateTaskParams(taskId, {
         ...draftParams,
         draft: true,
         archived: false,
         _discardProgress: true,
-      });
-      this.deps.store.electPrincipal(task.intentId ?? task.id);
-      return this.getDraftView(token, taskId)!;
+      }));
+      (await this.deps.store.electPrincipal(task.intentId ?? task.id));
+      return (await this.getDraftView(token, taskId))!;
     }
 
     if (view.state?.humanPauseOrigin === target) {
-      await this.workflowHandle(taskId).signal(SIG.retry);
+      await (await this.workflowHandle(taskId)).signal(SIG.retry);
       return (await this.getTaskView(token, taskId, { live: true }))!;
     }
 
@@ -3021,37 +3049,37 @@ export class KarmaxApi {
     token: string,
     args: { taskId?: string; audience: string[]; message: string; urgency?: Urgency },
   ): Promise<TaskView> {
-    const caller = this.require(token, 'escalate_to_human');
+    const caller = (await this.require(token, 'escalate_to_human'));
     const taskId = args.taskId ?? (caller.taskId !== '*' ? caller.taskId : undefined);
     if (!taskId) throw new Error('taskId is required for a non-task caller');
     if (caller.taskId !== '*' && caller.taskId !== taskId)
       throw new CapabilityError('a task agent may only escalate its own task');
 
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId }));
     if (!task) throw new Error(`no task ${taskId}`);
     const view = await this.transitionSourceView(task);
-    if (!this.availableStageTransitions(task, view).some((move) => move.target === 'human'))
+    if (!(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
     if (!audience.length) throw new Error('choose at least one person, team, or Avatar');
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const avatarRecipients: import('../domain/types.js').Avatar[] = [];
-    const initiatingUserId = this.deps.store.taskCreatorUserId(task.id);
+    const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
     for (const selector of audience) {
       if (selector.startsWith('avatar:')) {
-        const avatar = this.deps.store.getAvatar(selector.slice(7));
-        if (!avatar || avatar.projectId !== task.projectId || !avatarEnabled(this.deps.store, avatar))
+        const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
+        if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
           throw new Error(`Avatar route ${selector} is not available in this project`);
         if (avatar.roles.length && !avatar.roles.includes('respond'))
           throw new Error(`Avatar "${avatar.name}" is not configured to respond to tasks`);
-        if (!initiatingUserId || !avatarCallableBy(this.deps.store, avatar, initiatingUserId))
+        if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
           throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
         avatarRecipients.push(avatar);
         continue;
       }
-      if (!this.deps.store.humanAudience(task.id, [selector]).length)
+      if (!(await this.deps.store.humanAudience(task.id, [selector])).length)
         throw new Error(`Human route ${selector} does not resolve to a human in this organization`);
     }
     const detail = String(args.message ?? '').trim();
@@ -3070,7 +3098,7 @@ export class KarmaxApi {
       payload: { audience, detail, requestedBy, originStage: view.stage,
         urgency: normalizeUrgency(args.urgency, DEFAULT_URGENCY.escalated) },
     };
-    const seq = this.deps.store.appendEvent(event);
+    const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
     for (const avatar of avatarRecipients) {
       try {
@@ -3096,7 +3124,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
       } catch (error) {
         const failed = { taskId: task.id, type: 'avatar.response-dispatch-failed', ts: Date.now(),
           payload: { avatarId: avatar.id, error: error instanceof Error ? error.message : String(error) } };
-        const failedSeq = this.deps.store.appendEvent(failed);
+        const failedSeq = (await this.deps.store.appendEvent(failed));
         this.deps.bus?.emit({ ...failed, seq: failedSeq });
       }
     }
@@ -3110,12 +3138,12 @@ Act according to your Avatar instructions. When ready, call signal_task for task
     token: string,
     args: { capabilities: string[]; projectIds?: string[]; audience: string[]; reason: string; urgency?: Urgency },
   ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; projectIds?: string[]; audience?: string[] }> {
-    const caller = this.require(token, 'request_permission');
+    const caller = (await this.require(token, 'request_permission'));
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
-    const task = this.deps.store.getTask(caller.taskId);
-    this.require(token, 'request_permission', { projectId: task?.projectId, taskId: caller.taskId });
+    const task = (await this.deps.store.getTask(caller.taskId));
+    (await this.require(token, 'request_permission', { projectId: task?.projectId, taskId: caller.taskId }));
     if (!task) throw new Error(`no task ${caller.taskId}`);
-    const project = this.deps.store.getProject(task.projectId);
+    const project = (await this.deps.store.getProject(task.projectId));
     if (!project?.organizationId) throw new Error('task project has no organization');
 
     const capabilities = [...new Set((args.capabilities ?? []).map(exactCapability))];
@@ -3126,7 +3154,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
     if (requestedProjects.length > 32) throw new ValidationError('at most 32 projects may be requested');
     if (!capabilities.length && !requestedProjects.length) throw new Error('choose at least one capability or project');
     for (const id of requestedProjects) {
-      if (this.deps.store.getProject(id)?.organizationId !== project.organizationId)
+      if ((await this.deps.store.getProject(id))?.organizationId !== project.organizationId)
         throw new ValidationError('requested projects must exist in the task organization');
     }
     const projectIds = requestedProjects.filter((id) => caller.projectId ? caller.projectId !== id
@@ -3145,29 +3173,29 @@ Act according to your Avatar instructions. When ready, call signal_task for task
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
-    const initiatingUserId = this.deps.store.taskCreatorUserId(task.id);
+    const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
     for (const selector of audience) {
       if (selector.startsWith('avatar:')) {
-        const avatar = this.deps.store.getAvatar(selector.slice(7));
-        if (!avatar || avatar.projectId !== task.projectId || !avatarEnabled(this.deps.store, avatar))
+        const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
+        if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
           throw new Error(`Avatar route ${selector} is not available in this project`);
         if (avatar.roles.length && !avatar.roles.includes('authorize'))
           throw new Error(`Avatar "${avatar.name}" is not configured to decide authorizations`);
-        if (!initiatingUserId || !avatarCallableBy(this.deps.store, avatar, initiatingUserId))
+        if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
           throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
         avatarRecipients.add(avatar.id);
         continue;
       }
-      const resolved = this.deps.store.humanAudience(task.id, [selector]);
+      const resolved = (await this.deps.store.humanAudience(task.id, [selector]));
       if (!resolved.length) throw new Error(`Human route ${selector} does not resolve to a human in this organization`);
       resolved.forEach((userId) => recipients.add(userId));
     }
     const service = new PermissionRequests(this.deps.store, project.organizationId);
     const role = caller.role
-      ?? this.deps.store.getProfile(caller.profileId)?.role
+      ?? (await this.deps.store.getProfile(caller.profileId))?.role
       ?? caller.profileId.replace(/-default$/, '');
-    const prior = new Set(service.requests({ taskId: task.id, status: 'pending' }).map((request) => request.id));
-    const request = service.request({
+    const prior = new Set((await service.requests({ taskId: task.id, status: 'pending' })).map((request) => request.id));
+    const request = (await service.request({
       taskId: task.id,
       projectId: task.projectId,
       role,
@@ -3178,7 +3206,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
       avatarRecipients: [...avatarRecipients],
       reason: args.reason,
       requestedBy: `task-agent:${task.id}:${caller.profileId}`,
-    });
+    }));
     if (!prior.has(request.id)) {
       const event = {
         taskId: task.id,
@@ -3199,7 +3227,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
           urgency: normalizeUrgency(args.urgency, DEFAULT_URGENCY['approval-requested']),
         },
       };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
       // A scoped token is immutable. End the requesting turn and park the exact
       // workflow stage so an approval can wake this role in a fresh turn whose
@@ -3213,7 +3241,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
         });
       }
       for (const avatarId of avatarRecipients) {
-        const avatar = this.deps.store.getAvatar(avatarId)!;
+        const avatar = (await this.deps.store.getAvatar(avatarId))!;
         try {
           await this.createTask(token, {
             projectId: task.projectId,
@@ -3238,7 +3266,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         } catch (error) {
           const failed = { taskId: task.id, type: 'avatar.authorization-dispatch-failed', ts: Date.now(),
             payload: { requestId: request.id, avatarId, error: error instanceof Error ? error.message : String(error) } };
-          const failedSeq = this.deps.store.appendEvent(failed);
+          const failedSeq = (await this.deps.store.appendEvent(failed));
           this.deps.bus?.emit({ ...failed, seq: failedSeq });
         }
       }
@@ -3252,10 +3280,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     };
   }
 
-  authorizationEscalationTargets(
+  async authorizationEscalationTargets(
     token: string,
     input: { projectId: string; authorization: AuthorizationSelection },
-  ): {
+  ): Promise<{
     projectId: string;
     authorization: AuthorizationSelection;
     requestedCapabilities: Capability[];
@@ -3264,41 +3292,38 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     teams: Array<{ id: string; name: string; slug: string; selector: string; eligibleUserIds: string[] }>;
     special: Array<{ selector: '@all' | '@owners'; eligibleUserIds: string[] }>;
     avatars: Array<{ id: string; name: string; purpose?: string; selector: string }>;
-  } {
-    const caller = this.require(token, 'create_task', { projectId: input.projectId });
+  }> {
+    const caller = (await this.require(token, 'create_task', { projectId: input.projectId }));
     const subject = requireHumanSubject(caller);
-    const project = this.deps.store.getProject(input.projectId);
+    const project = (await this.deps.store.getProject(input.projectId));
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
     const authorization = this.deps.authorization;
     if (!authorization) throw new Error('authorization service is unavailable');
-    const requestedCapabilities = authorization.requestedCapabilities(input.projectId, input.authorization);
+    const requestedCapabilities = (await authorization.requestedCapabilities(input.projectId, input.authorization));
     const missingCapabilities = caller.kind === 'human'
-      ? authorization.missingCapabilities(caller.principal, input.projectId, input.authorization)
+      ? (await authorization.missingCapabilities(caller.principal, input.projectId, input.authorization))
       : requestedCapabilities.filter((capability) => !allows(caller.caps, capability));
-    const memberIds = this.deps.store.listOrganizationMemberships(project.organizationId).map((member) => member.userId);
-    const eligibleUserIds = memberIds.filter((userId) =>
-      allows(authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId), 'task:create')
-      && authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization));
+    const memberIds = (await this.deps.store.listOrganizationMemberships(project.organizationId)).map((member) => member.userId);
+    const eligibleUserIds = (await __asyncCollections.filter(memberIds, async (userId) =>
+      allows((await authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId)), 'task:create')
+      && (await authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization))));
     const users = eligibleUserIds.map((id) => ({ id, selector: `user:${id}` }));
     const eligible = new Set(eligibleUserIds);
-    const teams = this.deps.store.listTeams(project.organizationId, input.projectId)
-      .map((team) => ({ ...team, eligibleUserIds: this.deps.store.listTeamMemberships(team.id)
-        .map((member) => member.userId).filter((id) => eligible.has(id)) }))
+    const teams = (await __asyncCollections.map((await this.deps.store.listTeams(project.organizationId, input.projectId)), async (team) => ({ ...team, eligibleUserIds: (await this.deps.store.listTeamMemberships(team.id))
+        .map((member) => member.userId).filter((id) => eligible.has(id)) })))
       .filter((team) => team.eligibleUserIds.length)
       .map((team) => ({ id: team.id, name: team.name, slug: team.slug,
         selector: `@team:${team.slug}`, eligibleUserIds: team.eligibleUserIds }));
-    const ownerIds = this.deps.store.listOrganizationMemberships(project.organizationId)
+    const ownerIds = (await this.deps.store.listOrganizationMemberships(project.organizationId))
       .filter((member) => member.role === 'owner' && eligible.has(member.userId)).map((member) => member.userId);
     const initiatingUserId = subject.userId;
-    const avatars = this.deps.store.listAvatars(input.projectId)
-      .filter((avatar) => avatarEnabled(this.deps.store, avatar)
+    const avatars = (await __asyncCollections.filter((await __asyncCollections.filter((await this.deps.store.listAvatars(input.projectId)), async (avatar) => (await avatarEnabled(this.deps.store, avatar))
         && (!avatar.roles.length || avatar.roles.includes('authorize'))
-        && avatarCallableBy(this.deps.store, avatar, initiatingUserId))
-      .filter((avatar) => {
-        const effective = avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, input.projectId);
+        && (await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))), async (avatar) => {
+        const effective = (await avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, input.projectId));
         return allows(effective, 'task:create')
           && requestedCapabilities.every((capability) => allows(effective, capability));
-      })
+      }))
       .map((avatar) => ({ id: avatar.id, name: avatar.name,
         ...(avatar.purpose ? { purpose: avatar.purpose } : {}), selector: `avatar:${avatar.id}` }));
     return {
@@ -3323,27 +3348,27 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       reason?: string;
     },
   ): Promise<AuthorizationRequest> {
-    const caller = this.require(token, 'create_task', { projectId: input.projectId });
+    const caller = (await this.require(token, 'create_task', { projectId: input.projectId }));
     const subject = requireHumanSubject(caller);
-    const project = this.deps.store.getProject(input.projectId);
+    const project = (await this.deps.store.getProject(input.projectId));
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
     const requesterId = subject.userId;
     if (input.target.kind === 'task') {
-      const task = this.deps.store.getTask(input.target.taskId);
+      const task = (await this.deps.store.getTask(input.target.taskId));
       if (!task || task.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
       if (!task.params?.draft && task.params?.triggerState !== 'armed' && !task.params?.repeatable)
         throw new ValidationError('authorization must be approved before this task starts');
-      if (this.deps.store.taskCreatorUserId(task.id) !== requesterId)
+      if ((await this.deps.store.taskCreatorUserId(task.id)) !== requesterId)
         throw new CapabilityError('only the task creator can route its initial authorization request');
     } else {
-      const avatar = this.deps.store.getAvatar(input.target.avatarId);
+      const avatar = (await this.deps.store.getAvatar(input.target.avatarId));
       if (!avatar || avatar.projectId !== input.projectId) throw new NotFoundError('Avatar not found in this project');
       if (avatar.ownerUserId !== requesterId)
         throw new CapabilityError('only the Avatar owner can route its authorization request');
     }
-    const targets = this.authorizationEscalationTargets(token, {
+    const targets = (await this.authorizationEscalationTargets(token, {
       projectId: input.projectId, authorization: input.authorization,
-    });
+    }));
     if (!targets.missingCapabilities.length)
       throw new ValidationError('you already have the requested authorization');
     const eligibleUsers = new Set(targets.users.map((user) => user.id));
@@ -3375,39 +3400,39 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     }
     const service = new AuthorizationRequests(this.deps.store, project.organizationId);
     const existing = input.target.kind === 'task'
-      ? service.requests({ status: 'pending', taskId: input.target.taskId })[0]
-      : service.requests({ status: 'pending', avatarId: input.target.avatarId })[0];
+      ? (await service.requests({ status: 'pending', taskId: input.target.taskId }))[0]
+      : (await service.requests({ status: 'pending', avatarId: input.target.avatarId }))[0];
     // A repeated click must not fan out duplicate Avatar decision tasks or route
     // a second audience that is not recorded on the durable request.
     if (existing) return existing;
-    const request = service.request({
+    const request = (await service.request({
       projectId: input.projectId, target: input.target, authorization: input.authorization,
       capabilities: targets.requestedCapabilities, missingCapabilities: targets.missingCapabilities,
       audience, recipients: [...recipients], avatarRecipients: [...avatarRecipients],
       reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization to this ${input.target.kind}.`,
       requestedBy: caller.principal,
-    });
+    }));
     if (input.target.kind === 'task') {
       const event = { taskId: input.target.taskId, type: 'authorization.approval-requested', ts: Date.now(), payload: {
         requestId: request.id, recipients: request.recipients, audience: request.audience,
         authorization: request.authorization, missingCapabilities: request.missingCapabilities,
         urgency: normalizeUrgency(undefined, DEFAULT_URGENCY['approval-requested']),
       } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
     } else {
-      this.deps.store.addAuthorizationInbox(project.organizationId, request.recipients, {
+      (await this.deps.store.addAuthorizationInbox(project.organizationId, request.recipients, {
         kind: 'avatar-authorization', avatarId: input.target.avatarId,
         projectId: input.projectId, requestId: request.id,
-      }, request.createdAt);
+      }, request.createdAt));
       const event = { taskId: `avatar:${input.target.avatarId}`, type: 'authorization.approval-requested',
         ts: request.createdAt, payload: { requestId: request.id, recipients: request.recipients,
           audience: request.audience, authorization: request.authorization } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
     }
     for (const avatarId of avatarRecipients) {
-      const avatar = this.deps.store.getAvatar(avatarId)!;
+      const avatar = (await this.deps.store.getAvatar(avatarId))!;
       try {
         await this.createTask(token, {
           projectId: input.projectId, workflow: 'just-do',
@@ -3422,7 +3447,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           type: 'avatar.authorization-dispatch-failed', ts: Date.now(),
           payload: { requestId: request.id, avatarId, error: error instanceof Error ? error.message : String(error) } };
         if (input.target.kind === 'task') {
-          const seq = this.deps.store.appendEvent(failed);
+          const seq = (await this.deps.store.appendEvent(failed));
           this.deps.bus?.emit({ ...failed, seq });
         }
       }
@@ -3430,16 +3455,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return request;
   }
 
-  listAuthorizationRequests(
+  async listAuthorizationRequests(
     token: string,
     input: { organizationId: string; status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string },
-  ): AuthorizationRequest[] {
-    const projectId = input.taskId ? this.deps.store.getTask(input.taskId)?.projectId
-      : input.avatarId ? this.deps.store.getAvatar(input.avatarId)?.projectId : undefined;
+  ): Promise<AuthorizationRequest[]> {
+    const projectId = input.taskId ? (await this.deps.store.getTask(input.taskId))?.projectId
+      : input.avatarId ? (await this.deps.store.getAvatar(input.avatarId))?.projectId : undefined;
     if (!projectId) throw new ValidationError('taskId or avatarId is required');
-    this.require(token, 'task:read', { projectId, organizationId: input.organizationId,
-      ...(input.taskId ? { taskId: input.taskId } : {}) });
-    return new AuthorizationRequests(this.deps.store, input.organizationId).requests(input);
+    (await this.require(token, 'task:read', { projectId, organizationId: input.organizationId,
+      ...(input.taskId ? { taskId: input.taskId } : {}) }));
+    return (await new AuthorizationRequests(this.deps.store, input.organizationId).requests(input));
   }
 
   async resolveAuthorizationRequest(
@@ -3447,9 +3472,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
   ): Promise<AuthorizationRequest & { queued?: boolean }> {
     const service = new AuthorizationRequests(this.deps.store, input.organizationId);
-    const request = service.requests().find((candidate) => candidate.id === input.requestId);
+    const request = (await service.requests()).find((candidate) => candidate.id === input.requestId);
     if (!request) throw new NotFoundError(`no authorization request ${input.requestId}`);
-    const caller = this.require(token, 'task:read', { projectId: request.projectId, organizationId: input.organizationId });
+    const caller = (await this.require(token, 'task:read', { projectId: request.projectId, organizationId: input.organizationId }));
     const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:') ? caller.principal.slice(7) : undefined;
     const humanUserId = avatarId ? undefined : caller.humanSubject?.userId;
     if (!humanUserId && !avatarId) throw new CapabilityError('a routed human or Avatar is required to resolve this request');
@@ -3457,73 +3482,73 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this authorization request was not routed to you');
     if (input.action === 'dismiss') {
-      const dismissed = service.dismiss(request.id, caller.principal);
-      this.deps.store.removeAuthorizationInbox(request.id);
+      const dismissed = (await service.dismiss(request.id, caller.principal));
+      (await this.deps.store.removeAuthorizationInbox(request.id));
       const event = { taskId: request.target.kind === 'task' ? request.target.taskId : `avatar:${request.target.avatarId}`,
         type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
       return dismissed;
     }
     let queued = false;
     if (input.action === 'approve') {
-      const grantorCaps = this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId);
-      const authorization = this.deps.authorization?.taskGrant(caller.principal, request.projectId, request.authorization, grantorCaps);
+      const grantorCaps = (await this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId));
+      const authorization = (await this.deps.authorization?.taskGrant(caller.principal, request.projectId, request.authorization, grantorCaps));
       if (!authorization || authorization.attenuated)
         throw new CapabilityError('you can no longer grant the complete requested authorization');
       if (request.target.kind === 'task') {
-        const group = this.deps.store.attemptGroup(request.target.taskId);
-        const attempts = group?.attempts?.length ? group.attempts : [this.deps.store.getTask(request.target.taskId)!];
+        const group = (await this.deps.store.attemptGroup(request.target.taskId));
+        const attempts = group?.attempts?.length ? group.attempts : [(await this.deps.store.getTask(request.target.taskId))!];
         for (const attempt of attempts) await this.setTaskAuthorization(
           token, attempt.id, request.authorization, undefined, undefined,
           { acceptAttenuation: false, preserveCredentialGrants: true });
         if (request.target.queueAfterApproval) {
-          for (const attempt of attempts) if (this.deps.store.getTask(attempt.id)?.params?.draft)
+          for (const attempt of attempts) if ((await this.deps.store.getTask(attempt.id))?.params?.draft)
             await this.queueTask(token, attempt.id);
           queued = true;
         }
       } else {
-        const avatar = this.deps.store.getAvatar(request.target.avatarId);
+        const avatar = (await this.deps.store.getAvatar(request.target.avatarId));
         if (!avatar || avatar.projectId !== request.projectId) throw new NotFoundError('Avatar no longer exists');
         for (const capability of avatar.authorization.capabilities) {
           if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
             authorization.capabilities.push(capability);
         }
-        this.deps.store.upsertAvatar({ ...avatar, enabled: request.target.enableAfterApproval ? true : avatar.enabled,
-          authorization: { ...authorization, principal: caller.principal }, updatedAt: Date.now() });
+        (await this.deps.store.upsertAvatar({ ...avatar, enabled: request.target.enableAfterApproval ? true : avatar.enabled,
+          authorization: { ...authorization, principal: caller.principal }, updatedAt: Date.now() }));
       }
     }
-    const resolved = service.resolve(request.id, input.action, caller.principal);
+    const resolved = (await service.resolve(request.id, input.action, caller.principal));
     if (request.target.kind === 'task') {
       const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
         requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
       } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
     } else {
-      this.deps.store.removeAuthorizationInbox(request.id);
+      (await this.deps.store.removeAuthorizationInbox(request.id));
       const event = { taskId: `avatar:${request.target.avatarId}`, type: 'authorization.approval-resolved',
         ts: Date.now(), payload: { requestId: request.id, action: input.action, resolvedBy: caller.principal } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
     }
     return { ...resolved, ...(queued ? { queued } : {}) };
   }
 
-  listPermissionRequests(
+  async listPermissionRequests(
     token: string,
     input: { organizationId: string; taskId: string; status?: PermissionRequest['status'] },
-  ): PermissionRequest[] {
-    const task = this.deps.store.getTask(input.taskId);
-    const project = task && this.deps.store.getProject(task.projectId);
-    this.require(token, 'task:read', {
+  ): Promise<PermissionRequest[]> {
+    const task = (await this.deps.store.getTask(input.taskId));
+    const project = task && (await this.deps.store.getProject(task.projectId));
+    (await this.require(token, 'task:read', {
       taskId: input.taskId,
       projectId: task?.projectId,
       organizationId: input.organizationId,
-    });
+    }));
     if (!task || project?.organizationId !== input.organizationId) return [];
-    return new PermissionRequests(this.deps.store, input.organizationId)
-      .requests({ taskId: input.taskId, status: input.status })
+    return (await new PermissionRequests(this.deps.store, input.organizationId)
+      .requests({ taskId: input.taskId, status: input.status }))
       .map((request) => ({
         ...request,
         task: {
@@ -3554,14 +3579,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const service = new PermissionRequests(this.deps.store, input.organizationId);
-    const request = service.requests().find((candidate) => candidate.id === input.requestId);
+    const request = (await service.requests()).find((candidate) => candidate.id === input.requestId);
     if (!request) throw new NotFoundError(`no permission request ${input.requestId}`);
-    const task = this.deps.store.getTask(request.taskId);
-    const caller = this.require(token, 'task:read', {
+    const task = (await this.deps.store.getTask(request.taskId));
+    const caller = (await this.require(token, 'task:read', {
       taskId: request.taskId,
       projectId: request.projectId,
       organizationId: input.organizationId,
-    });
+    }));
     const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:')
       ? caller.principal.slice(7) : undefined;
     const humanUserId = avatarId ? undefined : caller.humanSubject?.userId;
@@ -3572,14 +3597,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new CapabilityError('this permission request was not routed to you');
     if (request.status !== 'pending') throw new ValidationError(`request ${request.id} is already ${request.status}`);
     if (input.action === 'dismiss') {
-      const dismissed = service.dismiss(request.id, caller.principal);
+      const dismissed = (await service.dismiss(request.id, caller.principal));
       const event = { taskId: request.taskId, type: 'permission.approval-dismissed',
         ts: Date.now(), payload: { requestId: request.id } };
-      const seq = this.deps.store.appendEvent(event);
+      const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
       return { ...dismissed, resume: { resumed: false, reason: 'Dismissed without notifying the agent' } };
     }
-    if (input.action === 'approve' && !(task && this.permissionRequestSatisfied(task, request))) {
+    if (input.action === 'approve' && !(task && (await this.permissionRequestSatisfied(task, request)))) {
       let expanded: AuthorizationSelection | undefined;
       if (request.projectIds?.length) {
         if (!task || !this.deps.authorization) throw new ValidationError('task authorization is unavailable');
@@ -3588,19 +3613,19 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           || JSON.stringify(current) !== JSON.stringify(request.baseAuthorization))
           throw new ValidationError('task authorization changed; submit a new project access request');
         expanded = { ...current, projectIds: [...new Set([...(current.projectIds ?? []), ...request.projectIds])] };
-        this.deps.authorization.requestedCapabilities(task.projectId, expanded);
+        (await this.deps.authorization.requestedCapabilities(task.projectId, expanded));
         // Scope applies to every role, including earlier approved extensions.
         // Check durable human grants per project; delegated agents are limited
         // to their immediate bearer, never their backing human's authority.
         const existingCaps = [
           ...((task.params?._authorization as { capabilities?: string[] })?.capabilities ?? []),
-          ...service.extensionCaps(task.id),
-          ...new VaultItems(this.deps.store, this.deps.broker, undefined, input.organizationId).extensionCaps(task.id),
+          ...(await service.extensionCaps(task.id)),
+          ...(await new VaultItems(this.deps.store, this.deps.broker, undefined, input.organizationId).extensionCaps(task.id)),
         ];
         for (const projectId of expanded.projectIds!) for (const capability of [...existingCaps, ...request.capabilities]) {
           const held = caller.kind === 'human'
-            ? allows(this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId), capability)
-            : this.deps.tokens.check(token, capability, { projectId, organizationId: input.organizationId }).ok;
+            ? allows((await this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId)), capability)
+            : (await this.deps.tokens.check(token, capability, { projectId, organizationId: input.organizationId })).ok;
           if (!held) throw new CapabilityError(`you cannot grant ${capability} in project ${projectId}`);
         }
       }
@@ -3609,10 +3634,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         for (const projectId of selectedProjects?.length ? selectedProjects : [request.projectId]) {
           // Later capability requests also apply throughout an expanded scope.
           const checked = caller.kind === 'human' && this.deps.authorization && selectedProjects && selectedProjects.length > 1
-            ? { ok: allows(this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId), capability), reason: 'permission denied' }
-            : this.deps.tokens.check(token, capability, {
+            ? { ok: allows((await this.deps.authorization.capabilities(caller.principal, projectId, input.organizationId)), capability), reason: 'permission denied' }
+            : (await this.deps.tokens.check(token, capability, {
               taskId: request.taskId, projectId, organizationId: input.organizationId,
-            });
+            }));
           if (!checked.ok)
             throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'} (project ${projectId})`);
         }
@@ -3621,16 +3646,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         { acceptAttenuation: false, preserveCredentialGrants: true });
     }
     return this.finishPermissionDecision(service, request, input.action, caller.principal,
-      input.action === 'approve' && !!task && this.permissionRequestSatisfied(task, request));
+      input.action === 'approve' && !!task && (await this.permissionRequestSatisfied(task, request)));
   }
 
   /** Only reconcile from the persisted grant, never from the requested level. */
-  private permissionRequestSatisfied(task: TaskRecord, request: PermissionRequest): boolean {
+  private async permissionRequestSatisfied(task: TaskRecord, request: PermissionRequest): Promise<boolean> {
     const authorization = task.params?._authorization as { capabilities?: Capability[] } | undefined;
     if (!authorization?.capabilities) return false;
     const service = new PermissionRequests(this.deps.store,
-      this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal');
-    const caps = [...authorization.capabilities, ...service.extensionCaps(task.id, request.role)];
+      (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal');
+    const caps = [...authorization.capabilities, ...(await service.extensionCaps(task.id, request.role))];
     if (!request.capabilities.every((cap) => allows(caps, cap))) return false;
     if (!request.projectIds?.length) return true;
     const current = previousTaskGrants(task).authorization;
@@ -3639,8 +3664,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (current.scope === 'projects' && !projects.every((id) => current.projectIds?.includes(id))) return false;
     // Scope-only asks promise the original authorization across the added projects.
     try {
-      const required = this.deps.authorization.requestedCapabilities(task.projectId,
-        { ...request.baseAuthorization, scope: 'projects', projectIds: projects });
+      const required = (await this.deps.authorization.requestedCapabilities(task.projectId,
+        { ...request.baseAuthorization, scope: 'projects', projectIds: projects }));
       return required.every((cap) => allows(authorization.capabilities!, cap));
     } catch {
       // An obsolete profile or deleted project must not block an unrelated edit.
@@ -3652,7 +3677,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     service: PermissionRequests, request: PermissionRequest, action: 'approve' | 'deny',
     principal: string, alreadyAuthorized = false,
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
-    const resolved = service.resolve(request.id, { action, by: principal, alreadyAuthorized });
+    const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized }));
     const message = action === 'approve'
       ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
       : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
@@ -3671,7 +3696,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         resumed: resume.resumed,
       },
     };
-    const seq = this.deps.store.appendEvent(event);
+    const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
     return { ...resolved, resume };
   }
@@ -3679,26 +3704,25 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Discover only the people and teams that can receive an escalation for the
    * calling task. Kept behind the same narrow capability so Merge/Confirm and
    * custom roles do not need broad organization-directory access. */
-  humanEscalationTargets(token: string): {
+  async humanEscalationTargets(token: string): Promise<{
     taskId: string;
     users: Array<{ id: string; selector: string }>;
     teams: Array<{ id: string; name: string; slug: string; selector: string }>;
     special: Array<{ selector: string; description: string }>;
     avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
-  } {
-    const caller = this.require(token, 'escalate_to_human');
+  }> {
+    const caller = (await this.require(token, 'escalate_to_human'));
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
-    const task = this.deps.store.getTask(caller.taskId);
-    this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId: caller.taskId });
+    const task = (await this.deps.store.getTask(caller.taskId));
+    (await this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId: caller.taskId }));
     if (!task) throw new Error(`no task ${caller.taskId}`);
-    const project = this.deps.store.getProject(task.projectId);
+    const project = (await this.deps.store.getProject(task.projectId));
     if (!project?.organizationId) throw new Error('task project has no organization');
 
-    const projectUsers = this.deps.store.humanAudience(task.id, ['@project']);
+    const projectUsers = (await this.deps.store.humanAudience(task.id, ['@project']));
     const users = projectUsers.map((id) => ({ id, selector: `user:${id}` }));
-    const teams = this.deps.store.listTeams(project.organizationId, project.id)
-      .filter((team) => this.deps.store.listTeamMemberships(team.id)
-        .some((member) => projectUsers.includes(member.userId)))
+    const teams = (await __asyncCollections.filter((await this.deps.store.listTeams(project.organizationId, project.id)), async (team) => (await this.deps.store.listTeamMemberships(team.id))
+        .some((member) => projectUsers.includes(member.userId))))
       .map((team) => ({ id: team.id, name: team.name, slug: team.slug, selector: `@team:${team.slug}` }));
     const descriptions: Record<string, string> = {
       '@creator': 'The human who initiated this task (following its parent chain).',
@@ -3706,14 +3730,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       '@project': 'Everyone with access to this project.',
       '@all': 'Every member of this organization.',
     };
-    const special = Object.entries(descriptions)
-      .filter(([selector]) => this.deps.store.humanAudience(task.id, [selector]).length > 0)
+    const special = (await __asyncCollections.filter(Object.entries(descriptions), async ([selector]) => (await this.deps.store.humanAudience(task.id, [selector])).length > 0))
       .map(([selector, description]) => ({ selector, description }));
-    const creatorUserId = this.deps.store.taskCreatorUserId(task.id);
-    const avatars = this.deps.store.listAvatars(task.projectId)
-      .filter((avatar) => avatarEnabled(this.deps.store, avatar)
+    const creatorUserId = (await this.deps.store.taskCreatorUserId(task.id));
+    const avatars = (await __asyncCollections.filter((await this.deps.store.listAvatars(task.projectId)), async (avatar) => (await avatarEnabled(this.deps.store, avatar))
         && (!avatar.roles.length || avatar.roles.includes('authorize') || avatar.roles.includes('respond'))
-        && Boolean(creatorUserId && avatarCallableBy(this.deps.store, avatar, creatorUserId)))
+        && Boolean(creatorUserId && (await avatarCallableBy(this.deps.store, avatar, creatorUserId)))))
       .map((avatar) => ({ id: avatar.id, name: avatar.name, ...(avatar.purpose ? { purpose: avatar.purpose } : {}),
         selector: `avatar:${avatar.id}`, roles: avatar.roles }));
     return { taskId: task.id, users, teams, special, avatars };
@@ -3721,34 +3743,35 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   /** Resolve the human-facing project-local number (#100) without guessing ids. */
   async findTask(token: string, projectId: string, num: number): Promise<TaskRecord | undefined> {
-    this.require(token, 'find_task', { projectId });
-    return this.deps.store.getTaskByNum(projectId, num);
+    (await this.require(token, 'find_task', { projectId }));
+    const pointer = await this.deps.store.taskPointerByNumAsync(projectId, num);
+    return pointer ? this.deps.store.getTaskAsync(pointer.id) : undefined;
   }
 
   /** Every durable agent conversation attached to a task, including sessions. */
   async listTaskAgents(token: string, taskId: string): Promise<Array<{ role: string; label: string; session?: string; provider?: string; messageCount: number }>> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'list_agents', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'list_agents', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const view = await this.getTaskView(token, taskId);
     const transcripts = view?.transcripts?.length
       ? view.transcripts
       : [{ role: 'do', label: 'Agent', messages: view?.messages ?? [] }];
-    return transcripts.map((t) => {
-      const session = this.deps.store.kvGet(`session:${taskId}:${t.role}`) || undefined;
+    return (await __asyncCollections.map(transcripts, async (t) => {
+      const session = (await this.deps.store.kvGet(`session:${taskId}:${t.role}`)) || undefined;
       let provider: string | undefined;
-      try { provider = JSON.parse(this.deps.store.kvGet(`sessionmeta:${taskId}:${t.role}`) ?? '{}').provider; } catch { /* legacy */ }
+      try { provider = JSON.parse((await this.deps.store.kvGet(`sessionmeta:${taskId}:${t.role}`)) ?? '{}').provider; } catch { /* legacy */ }
       return { role: t.role, label: t.label, session, provider, messageCount: t.messages.length };
-    });
+    }));
   }
 
   async taskConversation(token: string, taskId: string, role = 'do'): Promise<{ role: string; session?: string; messages: Message[] }> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'get_conversation', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'get_conversation', { projectId: task?.projectId, taskId }));
     const view = await this.getTaskView(token, taskId);
     if (!view) throw new Error(`task ${taskId} has no conversation yet`);
     const transcript = role === 'do' ? undefined : view.transcripts?.find((t) => t.role === role);
-    return { role, session: this.deps.store.kvGet(`session:${taskId}:${role}`) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
+    return { role, session: (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
   }
 
   /** Branch a source agent into an independent task/session; the source is never mutated.
@@ -3764,11 +3787,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string;
     base?: string; target?: string; authorizationProfile?: string; reauthorize?: boolean; provider?: Provider; model?: string;
     effort?: AgentSpec['effort'] }): Promise<TaskRecord> {
-    const source = this.deps.store.getTask(args.taskId);
-    this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
+    const source = (await this.deps.store.getTask(args.taskId));
+    (await this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId }));
     if (!source) throw new NotFoundError(`no task ${args.taskId}`);
     const role = args.role ?? 'do';
-    if (!this.deps.store.kvGet(`session:${args.taskId}:${role}`) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
+    if (!(await this.deps.store.kvGet(`session:${args.taskId}:${role}`)) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
     const previous = args.reauthorize ? previousTaskGrants(source) : undefined;
     return this.createTask(token, {
@@ -3797,29 +3820,29 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async taskTiming(token: string, taskId: string) {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'list_events', { projectId: task?.projectId, taskId });
-    if (!timingEnabled(this.deps.store)) throw new Error('Timing is disabled for this installation');
-    return timingReport(this.deps.store.eventsOfType(taskId, 'timing').map(e => e.payload as unknown as import('../timing/index.js').TimingRow));
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'list_events', { projectId: task?.projectId, taskId }));
+    if (!(await timingEnabled(this.deps.store))) throw new Error('Timing is disabled for this installation');
+    return timingReport((await this.deps.store.eventsOfType(taskId, 'timing')).map(e => e.payload as unknown as import('../timing/index.js').TimingRow));
   }
 
   async taskEvents(token: string, taskId: string, since = 0, limit?: number) {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'list_events', { projectId: task?.projectId, taskId });
-    return this.deps.store.eventsSince(taskId, since, limit, !timingEnabled(this.deps.store));
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'list_events', { projectId: task?.projectId, taskId }));
+    return (await this.deps.store.eventsSince(taskId, since, limit, !(await timingEnabled(this.deps.store))));
   }
 
   /** Resolve an Actions request through the calling task's project attachment.
    * Repository names supplied in prompts are never an authority source. */
-  private githubActionsTask(token: string, tool: 'list_github_actions_workflows' | 'list_github_actions_runs' | 'inspect_github_actions_run'
+  private async githubActionsTask(token: string, tool: 'list_github_actions_workflows' | 'list_github_actions_runs' | 'inspect_github_actions_run'
     | 'manage_github_actions_run' | 'dispatch_github_actions_workflow', repositoryRef?: string) {
-    const caller = this.require(token, tool);
+    const caller = (await this.require(token, tool));
     if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
-    const task = this.deps.store.getTask(caller.taskId);
+    const task = (await this.deps.store.getTask(caller.taskId));
     if (!task) throw new NotFoundError('calling task not found');
-    this.require(token, tool, { projectId: task.projectId, taskId: task.id });
+    (await this.require(token, tool, { projectId: task.projectId, taskId: task.id }));
     if (!this.deps.githubApp) throw new Error('Connect GitHub in organization settings, then try again.');
-    const linked = this.deps.store.listProjectRepositories(task.projectId).map((entry) => entry.repository)
+    const linked = (await this.deps.store.listProjectRepositories(task.projectId)).map((entry) => entry.repository)
       .filter((repository) => repository.provider === 'github' && repository.gitConnectionId);
     if (!linked.length) throw new Error('This project has no attached GitHub repository with an active App installation.');
     const selector = repositoryRef?.trim().toLowerCase();
@@ -3832,44 +3855,44 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!matches.length) throw new NotFoundError('repository is not attached to the calling task’s project');
     if (matches.length > 1) throw new Error('repository name is ambiguous; use owner/name or the repository id');
     const repository = matches[0]!;
-    return { task, repository, api: this.deps.githubApp.actions(repository) };
+    return { task, repository, api: (await this.deps.githubApp.actions(repository)) };
   }
 
-  private githubActionsEvent(taskId: string, type: string, payload: Record<string, unknown>): void {
+  private async githubActionsEvent(taskId: string, type: string, payload: Record<string, unknown>): Promise<void> {
     const event = { taskId, type, ts: Date.now(), payload };
-    const seq = this.deps.store.appendEvent(event);
+    const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
   }
 
   async listGithubActionsRuns(token: string, input: { repository?: string; branch?: string; event?: string;
     status?: GithubActionsStatus; workflow?: string | number; page?: number; perPage?: number }) {
-    const { task, repository, api } = this.githubActionsTask(token, 'list_github_actions_runs', input.repository);
+    const { task, repository, api } = (await this.githubActionsTask(token, 'list_github_actions_runs', input.repository));
     const result = await api.listRuns(`${repository.owner}/${repository.name}`, input);
-    this.githubActionsEvent(task.id, 'github.actions.runs-read', {
+    (await this.githubActionsEvent(task.id, 'github.actions.runs-read', {
       repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`,
       page: result.page, returned: result.runs.length,
       ...(input.branch ? { branch: input.branch } : {}), ...(input.workflow ? { workflow: input.workflow } : {}),
-    });
+    }));
     return result;
   }
 
   async listGithubActionsWorkflows(token: string, input: { repository?: string; page?: number; perPage?: number }) {
-    const { task, repository, api } = this.githubActionsTask(token, 'list_github_actions_workflows', input.repository);
+    const { task, repository, api } = (await this.githubActionsTask(token, 'list_github_actions_workflows', input.repository));
     const result = await api.listWorkflows(`${repository.owner}/${repository.name}`, input);
-    this.githubActionsEvent(task.id, 'github.actions.workflows-read', {
+    (await this.githubActionsEvent(task.id, 'github.actions.workflows-read', {
       repositoryId: repository.id, page: result.page, returned: result.workflows.length,
-    });
+    }));
     return result;
   }
 
   async inspectGithubActionsRun(token: string, input: { repository?: string; runId: number } & GithubActionsInspectOptions) {
-    const { task, repository, api } = this.githubActionsTask(token, 'inspect_github_actions_run', input.repository);
+    const { task, repository, api } = (await this.githubActionsTask(token, 'inspect_github_actions_run', input.repository));
     const { repository: _repository, runId, ...options } = input;
     const result = await api.inspectRun(`${repository.owner}/${repository.name}`, runId, options);
-    this.githubActionsEvent(task.id, 'github.actions.run-inspected', {
+    (await this.githubActionsEvent(task.id, 'github.actions.run-inspected', {
       repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`, runId,
       view: input.view ?? 'failure', attempt: input.attempt, jobId: input.jobId, page: input.page,
-    });
+    }));
     return result;
   }
 
@@ -3878,14 +3901,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }) {
     if (!['rerun-failed', 'rerun', 'cancel'].includes(input.action))
       throw new Error('action must be rerun-failed, rerun, or cancel');
-    const { task, repository, api } = this.githubActionsTask(token, 'manage_github_actions_run', input.repository);
+    const { task, repository, api } = (await this.githubActionsTask(token, 'manage_github_actions_run', input.repository));
     const slug = `${repository.owner}/${repository.name}`;
     const result = input.action === 'cancel'
       ? await api.cancel(slug, input.runId)
       : await api.rerun(slug, input.runId, input.action === 'rerun-failed');
-    this.githubActionsEvent(task.id, 'github.actions.run-operated', {
+    (await this.githubActionsEvent(task.id, 'github.actions.run-operated', {
       repositoryId: repository.id, slug, runId: input.runId, action: input.action,
-    });
+    }));
     return result;
   }
 
@@ -3893,13 +3916,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     repository?: string; workflow: string | number; ref: string;
     inputs?: Record<string, string | number | boolean>;
   }) {
-    const { task, repository, api } = this.githubActionsTask(token, 'dispatch_github_actions_workflow', input.repository);
+    const { task, repository, api } = (await this.githubActionsTask(token, 'dispatch_github_actions_workflow', input.repository));
     const slug = `${repository.owner}/${repository.name}`;
     const result = await api.dispatch(slug, input.workflow, input.ref, input.inputs);
-    this.githubActionsEvent(task.id, 'github.actions.workflow-dispatched', {
+    (await this.githubActionsEvent(task.id, 'github.actions.workflow-dispatched', {
       repositoryId: repository.id, slug, workflow: input.workflow, ref: input.ref,
       inputNames: Object.keys(input.inputs ?? {}).sort(),
-    });
+    }));
     return result;
   }
 
@@ -3907,8 +3930,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   // A *view* is a saved *query*: every list surface (including the default one) is the
   // result of evaluating a `TaskQuery` — free text + structured filters + sort + group —
   // against the project's tasks. The evaluator is pure (src/domain/search.ts); it runs
-  // in-memory over the store's `listTasks` (cheap at todo-list scale), whose records
-  // already carry the cached `lastView` (status/stage/pr) and hydrated `tags`.
+  // over asynchronously loaded pages carrying compact status and hydrated tags.
+  // Only explicit conversation filters request historical message payloads.
 
   /**
    * Evaluate a query against a project's tasks. `query` may be a raw query string
@@ -3916,35 +3939,42 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * `TaskQuery`. Returns the filtered+sorted list, optional groups, and total.
    */
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
-    const caller = this.require(token, 'search_tasks', { projectId });
+    const caller = (await this.require(token, 'search_tasks', { projectId }));
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
     // Conversation search is intentionally explicit. Every other query uses the
     // compact projection so routine list filtering never parses all transcripts.
     const needsConversation = q.filters?.some((clause) =>
       clause.field === 'conversation' || clause.field === 'says') ?? false;
-    const tasks = needsConversation
-      ? this.deps.store.listTasks(projectId)
-      : this.deps.store.listTaskSummaries(projectId);
-    const tags = this.deps.store.listTags(projectId);
+    // Preserve the evaluator's relational semantics: dependency fields need the
+    // full project index, including archived dependencies. Ordinary active-list
+    // searches can discard archived rows in SQL before reading any JSON.
+    const fields = [...(q.filters ?? []).map(c => c.field), ...(q.sort ?? []).map(c => c.field), q.group];
+    const activeOnly = !fields.some(field => field === 'dependsOn' || field === 'blocks')
+      && q.filters?.some(c => c.field === 'is' && c.negate && c.values.length === 1 && c.values[0] === 'archived');
+    const tasks: TaskRecord[] = [];
+    for await (const page of this.deps.store.taskReadPages(projectId, {
+      includeArchived: !activeOnly, includeConversation: needsConversation,
+    })) tasks.push(...page);
+    const tags = await this.deps.store.listTagsAsync(projectId);
     const principal = principalRefOf(caller.principal);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
-  searchFields(token: string) {
-    this.require(token, 'search_fields');
+  async searchFields(token: string) {
+    (await this.require(token, 'search_fields'));
     return fieldCatalogue();
   }
 
   // ─── Tags ────────────────────────────────────────────────────────────────────
   async listTags(token: string, projectId: string): Promise<Tag[]> {
-    this.require(token, 'list_tags', { projectId });
-    return this.deps.store.listTags(projectId);
+    (await this.require(token, 'list_tags', { projectId }));
+    return this.deps.store.listTagsAsync(projectId);
   }
 
   async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Promise<Tag> {
-    this.require(token, 'manage_tag', { projectId: input.projectId });
-    return this.deps.store.createTag(input);
+    (await this.require(token, 'manage_tag', { projectId: input.projectId }));
+    return (await this.deps.store.createTag(input));
   }
 
   // `/api/tags/:id` and `/api/views/:id` carry no project in the path, so the
@@ -3953,23 +3983,23 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   // this, any token with `task:edit` could rename or delete a tag or a saved
   // view in any project of any organization.
   async updateTag(token: string, id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | 'flag' | null; description?: string | null }): Promise<Tag | undefined> {
-    const tag = this.deps.store.getTag(id);
-    this.require(token, 'manage_tag', { projectId: tag?.projectId });
-    return this.deps.store.updateTag(id, patch);
+    const tag = (await this.deps.store.getTag(id));
+    (await this.require(token, 'manage_tag', { projectId: tag?.projectId }));
+    return (await this.deps.store.updateTag(id, patch));
   }
 
   async deleteTag(token: string, id: string): Promise<void> {
-    const tag = this.deps.store.getTag(id);
-    this.require(token, 'manage_tag', { projectId: tag?.projectId });
-    this.deps.store.deleteTag(id);
+    const tag = (await this.deps.store.getTag(id));
+    (await this.require(token, 'manage_tag', { projectId: tag?.projectId }));
+    (await this.deps.store.deleteTag(id));
   }
 
   /** Replace the full tag set on a task (organization only — never reaches the agent). */
   async setTaskTags(token: string, taskId: string, tagIds: string[]): Promise<string[]> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'set_task_tags', { projectId: task?.projectId, taskId });
-    this.deps.store.setTaskTags(taskId, tagIds);
-    return this.deps.store.tagsFor(taskId);
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'set_task_tags', { projectId: task?.projectId, taskId }));
+    (await this.deps.store.setTaskTags(taskId, tagIds));
+    return (await this.deps.store.tagsFor(taskId));
   }
 
   /**
@@ -3979,10 +4009,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * paths. This is what the platform MCP exposes so agents can label tasks they touch.
    */
   async tagTask(token: string, taskId: string, patch: { add?: string[]; remove?: string[] }): Promise<{ tags: string[] }> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no such task ${taskId}`);
-    this.require(token, 'set_task_tags', { projectId: task.projectId, taskId });
-    return this.applyTagPatch(task.id, task.projectId, patch);
+    (await this.require(token, 'set_task_tags', { projectId: task.projectId, taskId }));
+    return (await this.applyTagPatch(task.id, task.projectId, patch));
   }
 
   /**
@@ -3996,10 +4026,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * task left behind. Creating a task with its metadata is one act of creation,
    * not a create plus an edit.
    */
-  private applyTagPatch(taskId: string, projectId: string, patch: { add?: string[]; remove?: string[] }): { tags: string[] } {
+  private async applyTagPatch(taskId: string, projectId: string, patch: { add?: string[]; remove?: string[] }): Promise<{ tags: string[] }> {
     const task = { id: taskId, projectId };
-    const resolve = () => {
-      const tags = this.deps.store.listTags(task.projectId);
+    const resolve = async () => {
+      const tags = (await this.deps.store.listTags(task.projectId));
       const byId = new Map(tags.map((t) => [t.id, t]));
       const find = (s: string) => {
         const v = s.trim().toLowerCase();
@@ -4007,70 +4037,70 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       };
       return { tags, byId, find };
     };
-    const cur = new Set(this.deps.store.tagsFor(taskId));
+    const cur = new Set((await this.deps.store.tagsFor(taskId)));
     for (const name of patch.add ?? []) {
       if (!name.trim()) continue;
-      const found = resolve().find(name);
-      const id = found ? found.id : this.deps.store.createTag({ projectId: task.projectId, name }).id;
+      const found = (await resolve()).find(name);
+      const id = found ? found.id : (await this.deps.store.createTag({ projectId: task.projectId, name })).id;
       cur.add(id);
     }
     for (const name of patch.remove ?? []) {
-      const found = resolve().find(name);
+      const found = (await resolve()).find(name);
       if (found) cur.delete(found.id);
     }
-    this.deps.store.setTaskTags(taskId, [...cur]);
-    const { byId } = resolve();
-    return { tags: this.deps.store.tagsFor(taskId).map((id) => (byId.get(id) ? tagPath(byId.get(id)!, byId) : id)) };
+    (await this.deps.store.setTaskTags(taskId, [...cur]));
+    const { byId } = (await resolve());
+    return { tags: (await this.deps.store.tagsFor(taskId)).map((id) => (byId.get(id) ? tagPath(byId.get(id)!, byId) : id)) };
   }
 
   /** Set the organizational priority (0–4) — editable at any lifecycle stage. */
   async setTaskPriority(token: string, taskId: string, priority: number): Promise<void> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     // Refuse a missing task explicitly. `task?.projectId` on a nonexistent id
     // passes `undefined` as the scope, and an omitted scope is not a partial
     // check but NO check — the tenant guard goes inert and the write silently
     // no-ops instead of reporting that the id was wrong.
     if (!task) throw new NotFoundError(`no such task ${taskId}`);
-    this.require(token, 'set_task_priority', { projectId: task.projectId, taskId });
-    this.deps.store.setTaskPriority(taskId, priority);
+    (await this.require(token, 'set_task_priority', { projectId: task.projectId, taskId }));
+    (await this.deps.store.setTaskPriority(taskId, priority));
   }
 
   // ─── Saved views (a view is a saved query) ───────────────────────────────────
   async listViews(token: string, projectId: string): Promise<SavedView[]> {
-    this.require(token, 'list_views', { projectId });
-    return this.deps.store.listViews(projectId);
+    (await this.require(token, 'list_views', { projectId }));
+    return (await this.deps.store.listViews(projectId));
   }
 
   async createView(token: string, input: { projectId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
-    this.require(token, 'manage_view', { projectId: input.projectId });
-    return this.deps.store.createView(input);
+    (await this.require(token, 'manage_view', { projectId: input.projectId }));
+    return (await this.deps.store.createView(input));
   }
 
   // As with tags: `/api/views/:id` has no project in the path, so the view is
   // resolved first and its project supplied as the scope to check against.
   async updateView(token: string, id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
-    const view = this.deps.store.getView(id);
-    this.require(token, 'manage_view', { projectId: view?.projectId });
-    return this.deps.store.updateView(id, patch);
+    const view = (await this.deps.store.getView(id));
+    (await this.require(token, 'manage_view', { projectId: view?.projectId }));
+    return (await this.deps.store.updateView(id, patch));
   }
 
   async reorderView(token: string, id: string, ord: number): Promise<void> {
-    const view = this.deps.store.getView(id);
-    this.require(token, 'manage_view', { projectId: view?.projectId });
-    this.deps.store.reorderView(id, ord);
+    const view = (await this.deps.store.getView(id));
+    (await this.require(token, 'manage_view', { projectId: view?.projectId }));
+    (await this.deps.store.reorderView(id, ord));
   }
 
   async deleteView(token: string, id: string): Promise<void> {
-    const view = this.deps.store.getView(id);
-    this.require(token, 'manage_view', { projectId: view?.projectId });
-    this.deps.store.deleteView(id);
+    const view = (await this.deps.store.getView(id));
+    (await this.require(token, 'manage_view', { projectId: view?.projectId }));
+    (await this.deps.store.deleteView(id));
   }
 
   /** Restart a terminally failed software-dev execution without running Setup.
    * Setup's createWorld deliberately replaces stale worktrees; doing that here
    * would erase the exact dirty work a recovery exists to preserve. */
   private async recoverFailedTask(taskId: string): Promise<void> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     const view = task?.lastView;
     if (!task || !view) throw new Error(`no failed task ${taskId}`);
     if (!RECOVERABLE_WORKFLOWS.has(task.workflow) || view.status !== 'failed')
@@ -4120,10 +4150,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       text: `Krmax recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
       ts: messages.length,
     });
-    const session = this.deps.store.kvGet(`session:${taskId}:do`) || undefined;
+    const session = (await this.deps.store.kvGet(`session:${taskId}:do`)) || undefined;
     let sessionHome: string | undefined;
     try {
-      const meta = JSON.parse(this.deps.store.kvGet(`sessionmeta:${taskId}:do`) ?? '{}');
+      const meta = JSON.parse((await this.deps.store.kvGet(`sessionmeta:${taskId}:do`)) ?? '{}');
       sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
     } catch {
       /* malformed legacy metadata: conversation still recovers without session resume */
@@ -4148,29 +4178,29 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }),
       START_TIMEOUT_MS,
     );
-    this.deps.store.setTaskWorkflowVersion(taskId, version);
-    this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
+    (await this.deps.store.setTaskWorkflowVersion(taskId, version));
+    (await this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow));
     const runId = (execution as any)?.firstExecutionRunId ?? (execution as any)?.runId;
     if (typeof runId === 'string' && runId) {
-      this.deps.store.patchTaskParams(taskId, { _workflowRunId: runId });
+      (await this.deps.store.patchTaskParams(taskId, { _workflowRunId: runId }));
     }
     // A failed workflow recovery starts a new Temporal history, so replay cannot
     // reconstruct collaborationRequested signals from the old execution. Restore
     // the durable join set before the recovered Do turn can advance to Review.
-    for (const request of this.deps.store.listCollaborationRequests({
+    for (const request of (await this.deps.store.listCollaborationRequests({
       requesterTaskId: taskId,
       status: 'pending',
-    })) {
-      await this.workflowHandle(taskId)
+    }))) {
+      await (await this.workflowHandle(taskId))
         .signal(SIG.collaborationRequested, request.id)
         .catch(() => undefined);
     }
     const started = this.resolveStart(task.workflow, version,
-      this.deps.store.getProject(task.projectId)?.organizationId);
-    if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
+      (await this.deps.store.getProject(task.projectId))?.organizationId);
+    if (started) (await this.saveAgentSnapshot(taskId, started.manifest, input));
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
-    this.deps.store.saveView(taskId, {
+    (await this.deps.store.saveView(taskId, {
       ...view,
       stage: 'do',
       status: 'active',
@@ -4179,17 +4209,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       waitingFor: undefined,
       actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
       state: { ...view.state, recoveryWorld: world },
-    });
+    }));
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt = timingEnabled(this.deps.store) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined): Promise<Message | undefined> {
-    const scopedTask = this.deps.store.getTask(taskId);
-    const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
-    if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number }): Promise<Message | undefined> {
+    receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
+    const scopedTask = (await this.deps.store.getTask(taskId));
+    const caller = (await this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId }));
+    if (files?.length && scopedTask) (await this.validatePromptFiles(scopedTask.projectId, files));
     if (attemptChoice?.otherAttempts !== undefined && !['keep', 'cancel'].includes(attemptChoice.otherAttempts))
       throw new ValidationError('otherAttempts must be keep or cancel');
     if (attemptChoice?.saveOtherAttemptsDefault) {
-      this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId });
+      (await this.require(token, 'project:settings:write', { projectId: scopedTask?.projectId, taskId }));
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
     }
     const heldView = scopedTask?.lastView;
@@ -4221,11 +4252,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
-    const attemptGroup = scopedTask && this.deps.store.attemptGroup(taskId);
+    const attemptGroup = scopedTask && (await this.deps.store.attemptGroup(taskId));
     const confirmsProposal = signal === SIG.confirm || (signal === SIG.openPr && !!caller.humanSubject);
-    const needsAttemptChoice = confirmsProposal && scopedTask && this.attemptsReachMerge(scopedTask) && attemptGroup && !attemptGroup.committedAttemptId
+    const needsAttemptChoice = confirmsProposal && scopedTask && (await this.attemptsReachMerge(scopedTask)) && attemptGroup && !attemptGroup.committedAttemptId
       && attemptGroup.attempts.some((a) => a.id !== taskId && !['done', 'cancelled', 'failed'].includes(a.lastView?.status ?? ''));
-    if (needsAttemptChoice && this.deps.store.otherAttemptsDefault(taskId) === 'ask' && !attemptChoice?.otherAttempts)
+    if (needsAttemptChoice && (await this.deps.store.otherAttemptsDefault(taskId)) === 'ask' && !attemptChoice?.otherAttempts)
       throw new ValidationError('Choose whether to keep or cancel the other attempts when confirming this proposal.');
     if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
@@ -4237,28 +4268,28 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const delegatedReviewer = !userId && caller.kind === 'agent' && allows(caller.caps, 'review:approve');
       if (!userId && !delegatedReviewer)
         throw new CapabilityError('only a human selected by this workflow step, or an agent authorized with review:approve, can confirm');
-      if (userId && !this.deps.store.humanMayAct(taskId, userId))
+      if (userId && !(await this.deps.store.humanMayAct(taskId, userId)))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
       // Opening a proposal defers its confirmation until Review is ready.
       // Only a direct Confirm decision is journalled at this point.
       if (signal === SIG.confirm) {
-        recordHumanConfirmation(this.deps.store, taskId, userId ?? caller.principal);
+        (await recordHumanConfirmation(this.deps.store, taskId, userId ?? caller.principal));
       }
     } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
       const userId = caller.humanSubject?.userId;
       if (!userId) throw new CapabilityError('only an explicitly targeted human can satisfy this confirmation policy');
-      const vote = this.deps.store.voteConfirmation(taskId, userId);
+      const vote = (await this.deps.store.voteConfirmation(taskId, userId));
       if (!vote.authorized) throw new CapabilityError('you are not a reviewer for this task');
-      this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
-        payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } });
+      (await this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+        payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } }));
       if (!vote.satisfied) return;
     }
-    const chosenOtherAttempts = attemptChoice?.otherAttempts ?? (needsAttemptChoice ? this.deps.store.otherAttemptsDefault(taskId) : undefined);
+    const chosenOtherAttempts = attemptChoice?.otherAttempts ?? (needsAttemptChoice ? (await this.deps.store.otherAttemptsDefault(taskId)) : undefined);
     if (confirmsProposal && scopedTask && (chosenOtherAttempts === 'keep' || chosenOtherAttempts === 'cancel')) {
-      this.deps.store.kvSet(`attempt-choice:${taskId}`, chosenOtherAttempts);
+      (await this.deps.store.kvSet(`attempt-choice:${taskId}`, chosenOtherAttempts));
       if (attemptChoice?.saveOtherAttemptsDefault) {
-        const defaults = this.deps.store.getSettings(scopedTask.projectId, '__common__') ?? {};
-        this.deps.store.setSettings(scopedTask.projectId, '__common__', { ...defaults, otherAttempts: chosenOtherAttempts });
+        const defaults = (await this.deps.store.getSettings(scopedTask.projectId, '__common__')) ?? {};
+        (await this.deps.store.setSettings(scopedTask.projectId, '__common__', { ...defaults, otherAttempts: chosenOtherAttempts }));
       }
     }
     // Setup is the one stage where the projected view has no WorldHandle yet.
@@ -4270,22 +4301,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (signal === SIG.cancel && scopedTask && heldView?.stage === 'setup'
       && !['done', 'cancelled', 'failed'].includes(heldView.status)) {
       await this.stopTaskActivity(scopedTask, heldView, 'Setup cancellation did not stop', 'cancel', 5_000);
-      this.releaseTaskRunnerLeases(taskId);
-      const latest = this.deps.store.getTask(taskId)?.lastView ?? heldView;
+      (await this.releaseTaskRunnerLeases(taskId));
+      const latest = (await this.deps.store.getTask(taskId))?.lastView ?? heldView;
       if (!['done', 'cancelled', 'failed'].includes(latest.status)) {
-        this.deps.store.saveView(taskId, {
+        (await this.deps.store.saveView(taskId, {
           ...latest,
           stage: 'cancelled',
           status: 'cancelled',
           waitingFor: undefined,
           actions: [],
           state: { ...latest.state, cancelled: true, cancelledFrom: 'setup' },
-        });
+        }));
       }
       return;
     }
 
-    const terminal = this.deps.store.getTask(taskId)?.lastView;
+    const terminal = (await this.deps.store.getTask(taskId))?.lastView;
     if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) {
         await this.recoverFailedTask(taskId);
@@ -4298,19 +4329,19 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
-        this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() });
-        this.publishConversationMessage(taskId, role, msg);
+        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() }));
+        (await this.publishConversationMessage(taskId, role, msg));
         return msg;
       }
       if (signal === SIG.cancel) {
-        this.deps.store.saveView(taskId, {
+        (await this.deps.store.saveView(taskId, {
           ...terminal,
           stage: 'cancelled',
           status: 'cancelled',
           waitingFor: undefined,
           actions: [],
           state: { ...terminal.state, cancelled: true },
-        });
+        }));
         return;
       }
     }
@@ -4338,7 +4369,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const nextView = this.withConversationMessage(heldView, 'do', message);
       await this.stopTaskActivity(scopedTask, heldView, 'Retrying authorized Landing failure on same-Do protocol');
       await this.startTransitionReplacement(scopedTask, nextView, 'do');
-      this.publishConversationMessage(taskId, 'do', message);
+      (await this.publishConversationMessage(taskId, 'do', message));
       return message;
     }
 
@@ -4371,7 +4402,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         ? 'do'
         : heldOrigin;
       await this.startTransitionReplacement(scopedTask, nextView, resumeStage);
-      this.publishConversationMessage(taskId, holdRole, followUp);
+      (await this.publishConversationMessage(taskId, holdRole, followUp));
       return followUp;
     }
 
@@ -4442,7 +4473,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       return;
     }
 
-    const handle = this.workflowHandle(taskId);
+    const handle = (await this.workflowHandle(taskId));
     let followUp: Message | undefined;
     try {
       if (signal === SIG.followUp) {
@@ -4457,16 +4488,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        const trace = installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:${followUp.id}`] }, row => {
-          this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } });
-        });
-        trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt);
+        const trace = (await installationTiming(this.deps.store, { taskId, requestIds: [`${taskId}:${followUp.id}`] }, async row => {
+          (await this.deps.store.appendEvent({ taskId, type: 'timing', ts: row.wallMs, payload: { ...row } }));
+        }));
+        (await trace.mark('request.received', { requestId: `${taskId}:${followUp.id}` }, receivedAt));
         await trace.measure('workflow.dispatch', () => handle.signal(SIG.followUp, followUp, role));
         // A signal mutates workflow memory immediately, but workflows deliberately
         // publish their full cached view only at lifecycle boundaries. Journal the
         // accepted message separately so every open conversation can render it
         // mid-turn without changing replay-sensitive workflow command histories.
-        this.publishConversationMessage(taskId, role, followUp);
+        (await this.publishConversationMessage(taskId, role, followUp));
       } else if (signal === SIG.openPr && caller.humanSubject) {
         // The same verified reviewer may defer confirmation whether acting
         // through a browser or a delegated agent. task:signal was checked above;
@@ -4485,18 +4516,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       // publish one), but preserve an already-terminal result such as `done`.
       // Other signals must still report stale/invalid actions.
       if (signal === SIG.cancel && e instanceof WorkflowNotFoundError) {
-        const task = this.deps.store.getTask(taskId);
+        const task = (await this.deps.store.getTask(taskId));
         if (!task) throw e;
         const view = task.lastView;
         if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
-          this.deps.store.saveView(taskId, {
+          (await this.deps.store.saveView(taskId, {
             ...view,
             stage: 'cancelled',
             status: 'cancelled',
             actions: [],
             state: { ...view.state, cancelled: true },
             waitingFor: undefined,
-          });
+          }));
         }
         return;
       }
@@ -4505,14 +4536,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return followUp;
   }
 
-  private publishConversationMessage(taskId: string, role: string | undefined, message: Message): void {
+  private async publishConversationMessage(taskId: string, role: string | undefined, message: Message): Promise<void> {
     const event = {
       taskId,
       type: 'conversation.message',
       ts: message.ts,
       payload: { role: role ?? 'do', message },
     };
-    const seq = this.deps.store.appendEvent(event);
+    const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
   }
 
@@ -4526,19 +4557,19 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     let settled: CollaborationRequest[] = [];
     if (event.type === 'push.branch') {
       const payload = (event.payload ?? {}) as Record<string, unknown>;
-      settled = this.deps.store.settleCollaborationRequests(event.taskId, 'completed', {
+      settled = (await this.deps.store.settleCollaborationRequests(event.taskId, 'completed', {
         branch: payload.branch,
         repos: payload.repos,
         eventSeq: event.seq,
-      }, event.seq);
+      }, event.seq));
     } else if (event.type === 'view.updated') {
-      const current = this.deps.store.getTask(event.taskId)?.lastView;
+      const current = (await this.deps.store.getTask(event.taskId))?.lastView;
       const issue = collaborationTargetIssueFromViewEvent(event.payload, current);
       if (issue) {
-        settled = this.deps.store.settleCollaborationRequests(event.taskId, 'failed', {
+        settled = (await this.deps.store.settleCollaborationRequests(event.taskId, 'failed', {
           reason: issue.result,
           eventSeq: event.seq,
-        }, event.seq);
+        }, event.seq));
       }
     }
     for (const request of settled) await this.notifyCollaborationRequest(request);
@@ -4546,7 +4577,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   private async notifyCollaborationRequest(request: CollaborationRequest, attempt = 0): Promise<void> {
     if (request.status === 'pending' || request.notifiedAt) return;
-    const target = this.deps.store.getTask(request.targetTaskId);
+    const target = (await this.deps.store.getTask(request.targetTaskId));
     const label = target?.num ? `#${target.num}` : request.targetTaskId;
     const result = request.result ?? {};
     const text = request.status === 'completed'
@@ -4579,17 +4610,17 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       this.scheduleCollaborationNotification(request.id, attempt + 1);
       return;
     }
-    this.publishConversationMessage(request.requesterTaskId, 'do', message);
-    this.deps.store.markCollaborationRequestNotified(request.id);
+    (await this.publishConversationMessage(request.requesterTaskId, 'do', message));
+    (await this.deps.store.markCollaborationRequestNotified(request.id));
     this.collaborationNotificationRetries.delete(request.id);
   }
 
   private scheduleCollaborationNotification(requestId: string, attempt: number): void {
     if (this.collaborationNotificationRetries.has(requestId)) return;
     this.collaborationNotificationRetries.set(requestId, attempt);
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       this.collaborationNotificationRetries.delete(requestId);
-      const request = this.deps.store.getCollaborationRequest(requestId);
+      const request = (await this.deps.store.getCollaborationRequest(requestId));
       if (request && request.status !== 'pending' && !request.notifiedAt)
         void this.notifyCollaborationRequest(request, attempt);
     }, Math.min(30_000, 500 * 2 ** Math.min(attempt, 6)));
@@ -4597,8 +4628,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   private async reconcileCollaborationRequests(): Promise<void> {
-    for (const request of this.deps.store.listCollaborationRequests({ status: 'pending' })) {
-      const relevant = this.deps.store.eventsSince(request.targetTaskId, request.afterSeq)
+    for (const request of (await this.deps.store.listCollaborationRequests({ status: 'pending' }))) {
+      const relevant = (await this.deps.store.eventsSince(request.targetTaskId, request.afterSeq))
         .find((event) => event.type === 'push.branch'
           || (event.type === 'view.updated'
             && collaborationTargetIssueFromViewEvent(event.payload)));
@@ -4607,43 +4638,43 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         continue;
       }
       const issue = collaborationTargetIssue(
-        this.deps.store.getTask(request.targetTaskId)?.lastView,
+        (await this.deps.store.getTask(request.targetTaskId))?.lastView,
         'pending',
       );
       if (issue) {
-        const settled = this.deps.store.settleCollaborationRequests(request.targetTaskId, 'failed', {
+        const settled = (await this.deps.store.settleCollaborationRequests(request.targetTaskId, 'failed', {
           reason: issue.result,
-        });
+        }));
         for (const item of settled) await this.notifyCollaborationRequest(item);
       }
     }
     for (const status of ['completed', 'failed'] as const) {
-      for (const request of this.deps.store.listCollaborationRequests({ status, unnotified: true }))
+      for (const request of (await this.deps.store.listCollaborationRequests({ status, unnotified: true })))
         await this.notifyCollaborationRequest(request);
     }
   }
 
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     this.assertBranchParams({ target: branch });
     let accepted: boolean;
     try {
-      accepted = (await this.workflowHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
+      accepted = (await (await this.workflowHandle(taskId)).executeUpdate('setTarget', { args: [branch] })) as boolean;
     } catch {
       return false;
     }
-    if (accepted) this.persistAcceptedTarget(taskId, branch);
+    if (accepted) (await this.persistAcceptedTarget(taskId, branch));
     return accepted;
   }
 
   async setTaskPaymentPolicy(token: string, taskId: string, value: unknown): Promise<void> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    this.require(token, 'manage_payments', { projectId: task.projectId, taskId });
+    (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
     if (['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')) throw new Error('Payments are read-only after a task finishes');
-    validatePaymentPolicy(this.deps.store, task.projectId, this.deps.store.getProject(task.projectId)!.organizationId ?? 'org_personal', value);
-    this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any);
+    (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', value));
+    (await this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any));
   }
 
   /**
@@ -4654,14 +4685,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * re-derive the window.
    */
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>): Promise<{ applied: string[] }> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    const caller = this.require(token, 'edit_task', { projectId: task.projectId, taskId });
+    const caller = (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
     if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
     this.assertBranchParams(patch);
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
-    this.validateAndAuthorizeResumeSources(token, patch);
+    (await this.validateAndAuthorizeResumeSources(token, patch));
     // Human routes are the fields whose validity the deterministic sandbox cannot
     // judge: "does @qa resolve to a human here?" is a store question. Assert them
     // up front so a re-route can never park a gate or input pause invisibly.
@@ -4671,30 +4702,30 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // An agent whose authorization carries `review:approve` (maintainer and
     // above) may re-route, like the human it stands in for.
     const mayRoute = caller.kind !== 'agent' || allows(caller.caps, 'review:approve');
-    const confirmer = this.confirmerFieldOf(task);
+    const confirmer = (await this.confirmerFieldOf(task));
     if (confirmer && patch[confirmer.field.name] !== undefined) {
       if (!mayRoute) throw new CapabilityError('changing who reviews a task needs review:approve (a maintainer-level authorization)');
-      this.assertHumanRoutes(task, confirmer.manifest, { [confirmer.field.name]: patch[confirmer.field.name] } as ValueMap);
+      (await this.assertHumanRoutes(task, confirmer.manifest, { [confirmer.field.name]: patch[confirmer.field.name] } as ValueMap));
     }
-    const responder = this.responderFieldOf(task);
+    const responder = (await this.responderFieldOf(task));
     if (responder && patch[responder.field.name] !== undefined) {
       if (!mayRoute) throw new CapabilityError('changing who answers a task\'s questions needs review:approve (a maintainer-level authorization)');
-      this.assertHumanRoutes(task, responder.manifest, { [responder.field.name]: patch[responder.field.name] } as ValueMap);
+      (await this.assertHumanRoutes(task, responder.manifest, { [responder.field.name]: patch[responder.field.name] } as ValueMap));
     }
     try {
-      const result = (await this.workflowHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
-      this.updateAgentSnapshot(taskId, patch, result.applied);
+      const result = (await (await this.workflowHandle(taskId)).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+      (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
-        this.persistAcceptedTarget(taskId, patch.target);
+        (await this.persistAcceptedTarget(taskId, patch.target));
       // Unlike target (published in the live view) and agents (kept in their
       // effective snapshot), the Responder has no separate projection. Persist an
       // accepted route so refreshes and later edits show the route actually in play.
       if (responder && result.applied.includes(responder.field.name)) {
-        const current = this.deps.store.getTask(taskId);
-        if (current) this.deps.store.updateTaskParams(taskId, {
+        const current = (await this.deps.store.getTask(taskId));
+        if (current) (await this.deps.store.updateTaskParams(taskId, {
           ...current.params,
           [responder.field.name]: patch[responder.field.name],
-        });
+        }));
       }
       if (confirmer && result.applied.includes(confirmer.field.name))
         await this.shareConfirmerAcrossAttempts(task!, confirmer.field.name, patch[confirmer.field.name]);
@@ -4707,25 +4738,25 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Keep the workflow's accepted destination, stored task snapshot, and durable
    * world handle coherent. The immutable base/baseSha deliberately do not move:
    * retargeting changes where work lands, not where its custody chain began. */
-  private persistAcceptedTarget(taskId: string, target: string): void {
-    const task = this.deps.store.getTask(taskId);
-    if (task) this.deps.store.updateTaskParams(taskId, { ...task.params, target,
-      [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true });
-    const world = this.deps.store.currentWorld(taskId);
-    if (world) this.deps.store.updateCurrentWorldTarget(taskId, target);
+  private async persistAcceptedTarget(taskId: string, target: string): Promise<void> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (task) (await this.deps.store.updateTaskParams(taskId, { ...task.params, target,
+      [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true }));
+    const world = (await this.deps.store.currentWorld(taskId));
+    if (world) (await this.deps.store.updateCurrentWorldTarget(taskId, target));
   }
 
   /** The task's Review-route field (if its workflow has one) with the manifest it came from. */
-  private confirmerFieldOf(task: TaskRecord): { field: FieldSpec; manifest: WorkflowManifest } | undefined {
-    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId;
+  private async confirmerFieldOf(task: TaskRecord): Promise<{ field: FieldSpec; manifest: WorkflowManifest } | undefined> {
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
     const start = this.resolveStart(task.workflow, task.workflowVersion, organizationId);
     const field = start?.manifest.params.find((f) => f.type === 'confirmer');
     return start && field ? { field, manifest: start.manifest } : undefined;
   }
 
   /** The task's ordinary-input route, resolved from its pinned workflow package. */
-  private responderFieldOf(task: TaskRecord): { field: FieldSpec; manifest: WorkflowManifest } | undefined {
-    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId;
+  private async responderFieldOf(task: TaskRecord): Promise<{ field: FieldSpec; manifest: WorkflowManifest } | undefined> {
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
     const start = this.resolveStart(task.workflow, task.workflowVersion, organizationId);
     const field = start?.manifest.params.find((f) => f.type === 'responder');
     return start && field ? { field, manifest: start.manifest } : undefined;
@@ -4739,8 +4770,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * own gate (or its point of no return); it keeps the route it actually used.
    */
   private async shareConfirmerAcrossAttempts(task: TaskRecord, field: string, confirmer: unknown): Promise<void> {
-    this.deps.store.setIntentConfirmer(task.intentId ?? task.id, field, confirmer, { inFlight: true });
-    for (const sibling of this.deps.store.attemptGroup(task.intentId ?? task.id)?.attempts ?? []) {
+    (await this.deps.store.setIntentConfirmer(task.intentId ?? task.id, field, confirmer, { inFlight: true }));
+    for (const sibling of (await this.deps.store.attemptGroup(task.intentId ?? task.id))?.attempts ?? []) {
       if (sibling.id === task.id || sibling.params?.draft) continue;
       try {
         await this.deps.client.workflow.getHandle(sibling.id).executeUpdate('updateParams', { args: [{ [field]: confirmer }] });
@@ -4758,8 +4789,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     taskId: string,
     workflow: string,
   ): Promise<{ workflow: 'software-dev' | 'goal'; task?: TaskRecord }> {
-    const task = this.deps.store.getTask(taskId);
-    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
@@ -4768,11 +4799,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // task metadata. Re-pin it to the target definition in place: identity, notes,
     // tags, authorization and sparse parameters all survive the form change.
     if (task.params?.draft) {
-      const project = this.deps.store.getProject(task.projectId);
-      const start = this.resolveStart(workflow, this.workflowPinFor(task.projectId, workflow), project?.organizationId);
+      const project = (await this.deps.store.getProject(task.projectId));
+      const start = this.resolveStart(workflow, (await this.workflowPinFor(task.projectId, workflow)), project?.organizationId);
       if (!start) throw new Error(`workflow "${workflow}" is not available to this organization`);
-      this.deps.store.setDraftWorkflow(taskId, workflow, start.manifest.version);
-      return { workflow, task: this.deps.store.getTask(taskId)! };
+      (await this.deps.store.setDraftWorkflow(taskId, workflow, start.manifest.version));
+      return { workflow, task: (await this.deps.store.getTask(taskId))! };
     }
     const heldView = task.lastView;
     const heldOrigin =
@@ -4785,7 +4816,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const result = (await this.deps.client.workflow
         .getHandle(taskId)
         .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
-      this.deps.store.setTaskWorkflow(taskId, result.workflow);
+      (await this.deps.store.setTaskWorkflow(taskId, result.workflow));
       // "Goal" is itself an instruction to continue autonomously. If the task
       // was held in Do/Review, release the hold and carry that instruction into a
       // fresh latest-version execution. This also repairs pre-1.7 held histories.
@@ -4794,7 +4825,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         const message: Message = { id: `mode-${now}`, role: 'user', text: GOAL_RESUME_MESSAGE, ts: now };
         const resumedView = this.withConversationMessage(heldView, 'do', message);
         await this.stopTaskActivity(task, heldView, 'Goal mode supplied autonomous direction for a human hold');
-        const updatedTask = this.deps.store.getTask(taskId)!;
+        const updatedTask = (await this.deps.store.getTask(taskId))!;
         await this.startTransitionReplacement(updatedTask, resumedView, 'do');
       }
       return result;
@@ -4804,9 +4835,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async reorderQueue(token: string, domain: string, taskId: string): Promise<void> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    this.require(token, 'reorder_queue', { projectId: task.projectId, taskId });
+    (await this.require(token, 'reorder_queue', { projectId: task.projectId, taskId }));
     assertInMergeDomain(task, domain);
     await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
       workflowId: mergeQueueId(domain),
@@ -4822,11 +4853,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * immediately before `beforeTaskId`, or at the end when no anchor is given.
    */
   async moveQueueItem(token: string, domain: string, taskId: string, beforeTaskId?: string): Promise<void> {
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    this.require(token, 'reorder_queue', { projectId: task.projectId, taskId });
+    (await this.require(token, 'reorder_queue', { projectId: task.projectId, taskId }));
     assertInMergeDomain(task, domain);
-    if (beforeTaskId && this.deps.store.getTask(beforeTaskId)?.projectId !== task.projectId)
+    if (beforeTaskId && (await this.deps.store.getTask(beforeTaskId))?.projectId !== task.projectId)
       throw new Error('cannot reorder across project authorization boundaries');
     await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
       workflowId: mergeQueueId(domain),
@@ -4838,7 +4869,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async queueView(token: string, domain: string, projectId?: string): Promise<{ queue: string[]; current?: string }> {
-    const caller = this.require(token, 'queue:read', projectId ? { projectId } : undefined);
+    const caller = (await this.require(token, 'queue:read', projectId ? { projectId } : undefined));
     // A merge-queue domain spans whatever tasks were enqueued into it. With no
     // explicit project the raw view leaks other projects' task ids, so a
     // project-scoped token filters to its own project by default.
@@ -4846,8 +4877,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     try {
       const view = (await this.deps.client.workflow.getHandle(mergeQueueId(domain)).query('queue')) as { queue: string[]; current?: string };
       if (!scopedTo) return view;
-      const belongs = (id: string | undefined) => !!id && this.deps.store.getTask(id)?.projectId === scopedTo;
-      return { queue: view.queue.filter((id) => belongs(id)), ...(belongs(view.current) ? { current: view.current } : {}) };
+      const belongs = async (id: string | undefined) => !!id && (await this.deps.store.getTask(id))?.projectId === scopedTo;
+      return { queue: (await __asyncCollections.filter(view.queue, async (id) => (await belongs(id)))), ...((await belongs(view.current)) ? { current: view.current } : {}) };
     } catch {
       return { queue: [] };
     }
@@ -4857,18 +4888,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // The host agent-queue is a queue surface, not a task read: bind it to the
     // same `queue:read`/`queue:write` pair the gateway route uses, so a
     // maintainer (queue:*) is not refused by one layer and allowed by the other.
-    const caller = this.require(token, 'queue:read', requestedOrganizationId
+    const caller = (await this.require(token, 'queue:read', requestedOrganizationId
       ? { organizationId: requestedOrganizationId }
-      : undefined);
+      : undefined));
     const organizationId = requestedOrganizationId
       ?? caller.organizationId
-      ?? (caller.projectId ? this.deps.store.getProject(caller.projectId)?.organizationId : undefined);
+      ?? (caller.projectId ? (await this.deps.store.getProject(caller.projectId))?.organizationId : undefined);
     if (this.deps.store.hosted && !organizationId)
       throw new CapabilityError('hosted agent queues require an organization scope');
     if (organizationId && !requestedOrganizationId)
-      this.require(token, 'queue:read', { organizationId });
+      (await this.require(token, 'queue:read', { organizationId }));
     if (this.deps.store.hosted) {
-      const entitlements = this.deps.store.organizationEntitlements(organizationId!);
+      const entitlements = (await this.deps.store.organizationEntitlements(organizationId!));
       const fallback = entitlements.agentRunAdmissionAllowed
         ? entitlements.maxActiveAgentRuns ?? 0
         : 0;
@@ -4878,7 +4909,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         return { capacity: fallback, queue: [], current: [] };
       }
     }
-    const saved = Number(this.deps.store.getSettings('global', 'agent-queue')?.capacity);
+    const saved = Number((await this.deps.store.getSettings('global', 'agent-queue'))?.capacity);
     const fallback = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3;
     try {
       return (await this.deps.client.workflow.getHandle(agentQueueId()).query(QRY_AGENT_QUEUE)) as any;
@@ -4889,16 +4920,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   async moveAgentQueueItem(token: string, turnId: string, beforeTurnId?: string,
     requestedOrganizationId?: string): Promise<void> {
-    const caller = this.require(token, 'reorder_queue', requestedOrganizationId
+    const caller = (await this.require(token, 'reorder_queue', requestedOrganizationId
       ? { organizationId: requestedOrganizationId }
-      : undefined);
+      : undefined));
     const organizationId = requestedOrganizationId
       ?? caller.organizationId
-      ?? (caller.projectId ? this.deps.store.getProject(caller.projectId)?.organizationId : undefined);
+      ?? (caller.projectId ? (await this.deps.store.getProject(caller.projectId))?.organizationId : undefined);
     if (this.deps.store.hosted && !organizationId)
       throw new CapabilityError('hosted agent queues require an organization scope');
     if (organizationId && !requestedOrganizationId)
-      this.require(token, 'reorder_queue', { organizationId });
+      (await this.require(token, 'reorder_queue', { organizationId }));
     await this.deps.client.workflow.getHandle(agentQueueId(this.deps.store.hosted ? organizationId : undefined))
       .signal(SIG_REORDER, { turnId, beforeTurnId });
   }
@@ -4908,7 +4939,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    *  drives it is bound to — this used to be the one queue mutation with no
    *  token and no check at all. */
   async setAgentCapacity(token: string, capacity: number): Promise<void> {
-    this.require(token, 'set_settings');
+    (await this.require(token, 'set_settings'));
     const value = Number.isFinite(capacity) && capacity > 0 ? Math.floor(capacity) : 3;
     await this.deps.client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
       workflowId: agentQueueId(),
@@ -4920,11 +4951,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async saveSkill(token: string, args: { name: string; content: string }): Promise<{ path: string }> {
-    const caller = this.require(token, 'save_skill');
+    const caller = (await this.require(token, 'save_skill'));
     // Skills are tenant knowledge: an agent's saved resolution is indexed into
     // its own organization's Resolve prompts, never another tenant's.
     const organizationId = caller.organizationId
-      ?? (caller.projectId ? this.deps.store.getProject(caller.projectId)?.organizationId : undefined)
+      ?? (caller.projectId ? (await this.deps.store.getProject(caller.projectId))?.organizationId : undefined)
       ?? 'org_personal';
     const skillsDir = organizationSkillsDir(this.deps.contentDir ?? paths().content, organizationId);
     // Preserve namespacing subdirs (e.g. "resolve/<slug>" → resolve/<slug>.md,
@@ -4952,35 +4983,35 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * such a page is administering the organization, not saving a skill — so it
    * needs `organization:edit`, which every Do agent's `skill:write` is not.
    */
-  private assertOrganizationWikiAuthority(token: string, organizationId: string,
-    paths: Array<string | undefined>, entries: Array<{ labels?: string[] } | undefined>): void {
+  private async assertOrganizationWikiAuthority(token: string, organizationId: string,
+    paths: Array<string | undefined>, entries: Array<{ labels?: string[] } | undefined>): Promise<void> {
     const privileged = paths.some((p) => p?.startsWith(`${BUILTIN_WIKI_PREFIX}/`))
       || entries.some((entry) => entry && isDefaultDelivered(entry));
-    if (privileged) this.require(token, 'organization:edit', { organizationId });
+    if (privileged) (await this.require(token, 'organization:edit', { organizationId }));
   }
 
   /** Resolve + authorize one wiki scope. Project wikis default to the caller
    * task's checkout; humans may explicitly select another task or branch. */
-  private wikiScope(
+  private async wikiScope(
     token: string,
     scope: string,
     id: string,
     write: boolean,
     selector: { taskId?: string; branch?: string } = {},
-  ): { root: string; branch?: string; taskId?: string; writable: boolean; principal: string } {
+  ): Promise<{ root: string; branch?: string; taskId?: string; writable: boolean; principal: string }> {
     if (scope !== 'organization' && scope !== 'project') throw new Error('wiki scope must be organization or project');
     let caller;
     if (scope === 'project') {
-      const project = this.deps.store.getProject(id);
+      const project = (await this.deps.store.getProject(id));
       if (!project) throw new NotFoundError(`no project ${id}`);
-      caller = this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId });
+      caller = (await this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId }));
       const canonical = ensureProjectWikiRepository(this.deps.contentDir ?? paths().content, id);
       const requestedTask = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
       if (requestedTask) {
-        const task = this.deps.store.getTask(requestedTask);
+        const task = (await this.deps.store.getTask(requestedTask));
         if ((!task || task.projectId !== id) && selector.taskId) throw new Error('wiki task must belong to this project');
         const handle = task
-          ? (this.deps.store.currentWorld(requestedTask) ?? task.lastView?.world) as WorldHandle | undefined
+          ? ((await this.deps.store.currentWorld(requestedTask)) ?? task.lastView?.world) as WorldHandle | undefined
           : undefined;
         const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
         if (repo && fs.existsSync(repo.root))
@@ -4998,7 +5029,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
       return { root: canonical, branch: PROJECT_WIKI_BRANCH, writable: true, principal: caller.principal };
     } else {
-      caller = this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id });
+      caller = (await this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id }));
       return { root: wikiRoot(this.deps.contentDir ?? paths().content, scope, id), writable: true, principal: caller.principal };
     }
   }
@@ -5009,8 +5040,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    *  task) and `tocText`, the exact rendered table of contents agents receive
    *  (importance order, [more…] folds). The organization tree includes the
    *  built-ins, resolved through their on-disk overrides when edited. */
-  readWiki(token: string, scope: WikiScope, id: string, rel = '', selector: { taskId?: string; branch?: string } = {}) {
-    const view = this.wikiScope(token, scope, id, false, selector);
+  async readWiki(token: string, scope: WikiScope, id: string, rel = '', selector: { taskId?: string; branch?: string } = {}) {
+    const view = (await this.wikiScope(token, scope, id, false, selector));
     const root = view.root;
     const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
     const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
@@ -5037,22 +5068,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   /** Rank pages, labels, and folders of one scope against a typed query — what
    *  the task-form wiki-reference dropdown searches. */
-  suggestWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
-    const root = this.wikiScope(token, scope, id, false, selector).root;
+  async suggestWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
+    const root = (await this.wikiScope(token, scope, id, false, selector)).root;
     return { scope, id, query, suggestions: suggestWiki(root, query) };
   }
 
   /** Create (`create` guards against overwriting), update, or — via `prevPath`
    *  — rename an entry. `kind` picks SKILL.md vs MEMORY.md; passing one that
    *  differs from an existing entry's converts it (skill ⇄ memory) in place. */
-  saveWikiPage(
+  async saveWikiPage(
     token: string,
     scope: WikiScope,
     id: string,
     args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
     selector: { taskId?: string; branch?: string } = {},
   ) {
-    const view = this.wikiScope(token, scope, id, true, selector);
+    const view = (await this.wikiScope(token, scope, id, true, selector));
     const root = view.root;
     const previousPath = args.prevPath ? safeWikiPath(args.prevPath) : undefined;
     const nextPath = safeWikiPath(args.path);
@@ -5060,9 +5091,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const baselinePath = previousPath ?? nextPath;
       const existing = readWikiPage(root, baselinePath)
         ?? resolveBuiltins(root).find((entry) => entry.path === baselinePath);
-      this.assertOrganizationWikiAuthority(token, id, [nextPath, previousPath], [parseFrontmatter(args.content), existing]);
+      (await this.assertOrganizationWikiAuthority(token, id, [nextPath, previousPath], [parseFrontmatter(args.content), existing]));
       if (existing && !(args.create && !previousPath))
-        this.deps.store.recordOrganizationWikiVersion({
+        (await this.deps.store.recordOrganizationWikiVersion({
           organizationId: id,
           path: baselinePath,
           operation: 'baseline',
@@ -5070,7 +5101,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           content: existing.content,
           principal: view.principal,
           ifEmpty: true,
-        });
+        }));
     }
     if (previousPath && previousPath !== nextPath) moveWikiPage(root, previousPath, nextPath);
     const page = writeWikiPage(root, args.path, args.content, args.kind, { create: args.create });
@@ -5083,10 +5114,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (scope === 'project')
       commitProjectWiki(root, `wiki: update ${page.path}`,
         previousPath && previousPath !== nextPath ? [page.path, previousPath] : [page.path]);
-    else this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
+    else (await this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
       operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
       content: page.content, principal: view.principal,
-      previousPath: previousPath && previousPath !== nextPath ? previousPath : undefined });
+      previousPath: previousPath && previousPath !== nextPath ? previousPath : undefined }));
     return page;
   }
 
@@ -5102,16 +5133,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * removed, and `recursive` is passed through deliberately so the wiki layer's
    * "this is a section, confirm" guard still stands for an unqualified call.
    */
-  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string,
+  async deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string,
     selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
-    const view = this.wikiScope(token, scope, id, true, selector);
+    const view = (await this.wikiScope(token, scope, id, true, selector));
     const root = view.root;
     const safe = safeWikiPath(rel);
     const doomed = this.wikiPagesUnder(root, safe);
     if (scope === 'organization') {
-      this.assertOrganizationWikiAuthority(token, id, [safe], doomed.map((page) => parseFrontmatter(page.content)));
+      (await this.assertOrganizationWikiAuthority(token, id, [safe], doomed.map((page) => parseFrontmatter(page.content))));
       for (const page of doomed)
-        this.deps.store.recordOrganizationWikiVersion({
+        (await this.deps.store.recordOrganizationWikiVersion({
           organizationId: id,
           path: page.path,
           operation: 'baseline',
@@ -5119,15 +5150,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           content: page.content,
           principal: view.principal,
           ifEmpty: true,
-        });
+        }));
     }
     const deleted = deleteWikiPage(root, rel, { recursive: selector.recursive });
     if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safe}`, [safe]);
     if (deleted && scope === 'organization') {
-      for (const page of doomed) this.deps.store.recordOrganizationWikiVersion({
+      for (const page of doomed) (await this.deps.store.recordOrganizationWikiVersion({
         organizationId: id, path: page.path, operation: 'delete', kind: page.kind,
         content: page.content, principal: view.principal,
-      });
+      }));
     }
     return { deleted, removed: doomed.map((page) => page.path) };
   }
@@ -5146,26 +5177,26 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return out;
   }
 
-  searchWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
-    const root = this.wikiScope(token, scope, id, false, selector).root;
+  async searchWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
+    const root = (await this.wikiScope(token, scope, id, false, selector)).root;
     return { scope, id, query, hits: searchWiki(root, query) };
   }
 
-  wikiViews(token: string, projectId: string) {
-    const view = this.wikiScope(token, 'project', projectId, false);
+  async wikiViews(token: string, projectId: string) {
+    const view = (await this.wikiScope(token, 'project', projectId, false));
     const branches = projectWikiBranches(view.root);
-    const tasks = this.deps.store.listTasks(projectId).flatMap((task) => {
-      const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+    const tasks = (await __asyncCollections.flatMap((await this.deps.store.listTasks(projectId)), async (task) => {
+      const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
       if (!handle || !worldRepos(handle).some((repo) => repo.role === 'project-wiki') && !branches.includes(handle.branch)) return [];
       return [{ id: task.id, num: task.num, title: task.title, branch: handle.branch,
         status: task.lastView?.status ?? (task.params.draft ? 'draft' : 'queued') }];
-    });
+    }));
     return { defaultBranch: PROJECT_WIKI_BRANCH, branches, tasks };
   }
 
-  organizationWikiHistory(token: string, organizationId: string, rel?: string) {
-    this.wikiScope(token, 'organization', organizationId, false);
-    return { versions: this.deps.store.organizationWikiHistory(organizationId, rel ? safeWikiPath(rel) : undefined) };
+  async organizationWikiHistory(token: string, organizationId: string, rel?: string) {
+    (await this.wikiScope(token, 'organization', organizationId, false));
+    return { versions: (await this.deps.store.organizationWikiHistory(organizationId, rel ? safeWikiPath(rel) : undefined)) };
   }
 
   /** Provider-aware variants used at the HTTP/MCP edge. Local worlds stay on
@@ -5174,7 +5205,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async readWikiResolved(token: string, scope: WikiScope, id: string, rel = '',
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
-    if (!remote) return this.readWiki(token, scope, id, rel, selector);
+    if (!remote) return (await this.readWiki(token, scope, id, rel, selector));
     try {
       return this.readWikiFromRoot(scope, id, rel, remote.root, {
         branch: remote.repo.branch, taskId: remote.taskId, writable: true,
@@ -5185,7 +5216,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async searchWikiResolved(token: string, scope: WikiScope, id: string, query: string,
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
-    if (!remote) return this.searchWiki(token, scope, id, query, selector);
+    if (!remote) return (await this.searchWiki(token, scope, id, query, selector));
     try { return { scope, id, query, hits: searchWiki(remote.root, query) }; }
     finally { await remote.release(); }
   }
@@ -5193,7 +5224,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async suggestWikiResolved(token: string, scope: WikiScope, id: string, query: string,
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
-    if (!remote) return this.suggestWiki(token, scope, id, query, selector);
+    if (!remote) return (await this.suggestWiki(token, scope, id, query, selector));
     try { return { scope, id, query, suggestions: suggestWiki(remote.root, query) }; }
     finally { await remote.release(); }
   }
@@ -5203,16 +5234,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
     if (!remote) {
-      if (scope !== 'project') return this.saveWikiPage(token, scope, id, args, selector);
-      const view = this.wikiScope(token, scope, id, true, selector);
+      if (scope !== 'project') return (await this.saveWikiPage(token, scope, id, args, selector));
+      const view = (await this.wikiScope(token, scope, id, true, selector));
       // The default branch is the user-facing canonical wiki. Publish that
       // commit immediately when the project owns a GitHub remote. Live task
       // checkouts stay on their task branch and land through Review/Merge.
       if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
         return mutateAndPublishProjectWiki(view.root,
-          () => this.saveWikiPage(token, scope, id, args, selector),
+          async () => (await this.saveWikiPage(token, scope, id, args, selector)),
           () => this.projectWikiPublishTarget(id));
-      return this.saveWikiPage(token, scope, id, args, selector);
+      return (await this.saveWikiPage(token, scope, id, args, selector));
     }
     try {
       if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path))
@@ -5227,13 +5258,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
     if (!remote) {
-      if (scope !== 'project') return this.deleteWikiPage(token, scope, id, rel, selector);
-      const view = this.wikiScope(token, scope, id, true, selector);
+      if (scope !== 'project') return (await this.deleteWikiPage(token, scope, id, rel, selector));
+      const view = (await this.wikiScope(token, scope, id, true, selector));
       if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
         return mutateAndPublishProjectWiki(view.root,
-          () => this.deleteWikiPage(token, scope, id, rel, selector),
+          async () => (await this.deleteWikiPage(token, scope, id, rel, selector)),
           () => this.projectWikiPublishTarget(id));
-      return this.deleteWikiPage(token, scope, id, rel, selector);
+      return (await this.deleteWikiPage(token, scope, id, rel, selector));
     }
     try {
       const deleted = deleteWikiPage(remote.root, rel, { recursive: selector.recursive });
@@ -5245,7 +5276,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Resolve a fresh, repository-scoped App credential for one canonical wiki
    * publish. No linked remote means the local repository remains authoritative. */
   private async projectWikiPublishTarget(projectId: string) {
-    const repository = this.deps.store.projectWiki(projectId)?.repository;
+    const repository = (await this.deps.store.projectWiki(projectId))?.repository;
     if (!repository) return undefined;
     if (!this.deps.githubApp) throw new Error('the GitHub App is unavailable for this linked project wiki');
     return {
@@ -5277,18 +5308,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   private async remoteWikiSnapshot(token: string, projectId: string, write: boolean,
     selector: { taskId?: string; branch?: string }) {
-    const project = this.deps.store.getProject(projectId);
+    const project = (await this.deps.store.getProject(projectId));
     if (!project) throw new NotFoundError(`no project ${projectId}`);
-    const caller = this.require(token, write ? 'skill:write' : 'project:read',
-      { projectId, organizationId: project.organizationId });
+    const caller = (await this.require(token, write ? 'skill:write' : 'project:read',
+      { projectId, organizationId: project.organizationId }));
     const taskId = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
     if (!taskId || selector.branch) return undefined;
-    const task = this.deps.store.getTask(taskId);
+    const task = (await this.deps.store.getTask(taskId));
     if (!task || task.projectId !== projectId) {
       if (selector.taskId) throw new Error('wiki task must belong to this project');
       return undefined;
     }
-    const handle = (this.deps.store.currentWorld(taskId) ?? task.lastView?.world) as WorldHandle | undefined;
+    const handle = ((await this.deps.store.currentWorld(taskId)) ?? task.lastView?.world) as WorldHandle | undefined;
     const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
     if (!handle || !repo || fs.existsSync(repo.root)) return undefined;
     const access = await this.openCollaborationWorld(taskId, handle);
@@ -5347,9 +5378,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     token: string,
     args: { projectId: string; title: string; repo: string; branch: string; target: string },
   ): Promise<TaskRecord> {
-    const caller = this.require(token, 'edit_workflow', { projectId: args.projectId });
+    const caller = (await this.require(token, 'edit_workflow', { projectId: args.projectId }));
     if (this.deps.hosted) throw new CapabilityError('Workflow code editing is disabled in hosted deployments; built-ins change only with a platform release');
-    const project = this.deps.store.getProject(args.projectId);
+    const project = (await this.deps.store.getProject(args.projectId));
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const mergeOnly = MANIFESTS.find((m) => m.name === 'merge-only');
     if (!mergeOnly) throw new Error('bundled merge-only manifest is missing');
@@ -5358,11 +5389,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required`);
     // The merge lands with the project's git credentials: on a hosted cell the
     // repository must be one enrolled in this project, exactly as for a task.
-    this.assertRepositoriesValid(mergeOnly, project, { repos: [args.repo] } as ValueMap);
+    (await this.assertRepositoriesValid(mergeOnly, project, { repos: [args.repo] } as ValueMap));
     const authorization = this.deps.authorization
-      ? this.deps.authorization.taskGrant(caller.principal, args.projectId, undefined, caller.caps)
+      ? (await this.deps.authorization.taskGrant(caller.principal, args.projectId, undefined, caller.caps))
       : { profileId: 'caller', capabilities: caller.caps, attenuated: false };
-    let task = this.deps.store.createTask({
+    let task = (await this.deps.store.createTask({
       projectId: args.projectId,
       title: args.title,
       workflow: 'merge-only',
@@ -5373,17 +5404,17 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         _authorization: { ...authorization, principal: caller.principal },
       },
       createdBy: principalRefOf(caller.principal),
-    });
-    const workflowDelegation = this.deps.tokens.delegateHuman(token, {
+    }));
+    const workflowDelegation = (await this.deps.tokens.delegateHuman(token, {
       taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,
       externalIdentities: caller.externalIdentities,
-    });
+    }));
     if (workflowDelegation) {
-      this.deps.store.updateTaskParams(task.id, { ...task.params,
+      (await this.deps.store.updateTaskParams(task.id, { ...task.params,
         _authorization: { ...(task.params._authorization as object), delegationId: workflowDelegation.id },
         ...(workflowDelegation.externalIdentities?.githubAccountId
-          ? { _githubAccountId: workflowDelegation.externalIdentities.githubAccountId } : {}) });
-      task = this.deps.store.getTask(task.id)!;
+          ? { _githubAccountId: workflowDelegation.externalIdentities.githubAccountId } : {}) }));
+      task = (await this.deps.store.getTask(task.id))!;
     }
     const input = {
       taskId: task.id,
@@ -5393,7 +5424,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       prompt: args.title,
       branch: args.branch,
       target: args.target,
-      project: { ...this.deps.store.effectiveProjectConfig(project), repos: [args.repo] },
+      project: { ...(await this.deps.store.effectiveProjectConfig(project)), repos: [args.repo] },
       workflowEdit: true,
       grant: authorization.capabilities,
       grantPrincipal: caller.principal,
@@ -5410,21 +5441,21 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.deleteTask(task.id);
+      (await this.deps.store.deleteTask(task.id));
       throw new Error(
         `Could not start the workflow-edit task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
         `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
     const started = this.resolveStart(task.workflow, task.workflowVersion,
-      this.deps.store.getProject(task.projectId)?.organizationId);
-    if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
+      (await this.deps.store.getProject(task.projectId))?.organizationId);
+    if (started) (await this.saveAgentSnapshot(task.id, started.manifest, input));
     return task;
   }
 
   /** Installed + built-in workflows, with versions (§21d). */
-  listWorkflows(token: string, organizationId = 'org_personal'): WorkflowSummary[] {
-    this.require(token, 'list_workflows', { organizationId });
+  async listWorkflows(token: string, organizationId = 'org_personal'): Promise<WorkflowSummary[]> {
+    (await this.require(token, 'list_workflows', { organizationId }));
     return this.deps.workflows?.list(organizationId) ?? [];
   }
 
@@ -5472,7 +5503,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * Requires a configured workflow manager; refuses to shadow a built-in name.
    */
   async installWorkflow(token: string, args: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
-    this.require(token, 'install_workflow', { organizationId });
+    (await this.require(token, 'install_workflow', { organizationId }));
     if (this.deps.hosted) throw new CapabilityError('External workflow code is disabled in hosted deployments');
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args, organizationId);

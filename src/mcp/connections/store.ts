@@ -1,3 +1,4 @@
+import * as __asyncCollections from '../../util/async-collections.js';
 import crypto from 'node:crypto';
 import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
@@ -47,94 +48,103 @@ export function validateSecrets(input: unknown, environment = false): Record<str
 export class McpConnections {
   constructor(private store: Store, private broker: CredentialBroker, readonly organizationId: string) {}
   private key() { return `mcp-connections:${this.organizationId}`; }
-  private all(): McpConnection[] { return this.store.getSettings(this.key(), 'mcp')?.connections as McpConnection[] ?? []; }
-  list(projectId?: string): McpConnection[] { return this.all().filter((c) => !c.projectId || c.projectId === projectId); }
-  get(id: string, projectId?: string): McpConnection {
-    const c = this.list(projectId).find((v) => v.id === id);
+  private async all(): Promise<McpConnection[]> { return (await this.store.getSettings(this.key(), 'mcp'))?.connections as McpConnection[] ?? []; }
+  async list(projectId?: string): Promise<McpConnection[]> { return (await this.all()).filter((c) => !c.projectId || c.projectId === projectId); }
+  async get(id: string, projectId?: string): Promise<McpConnection> {
+    const c = (await this.list(projectId)).find((v) => v.id === id);
     if (!c) throw new Error('MCP connection not found in this scope');
     return c;
   }
   private handle(id: string) { return `mcp:${this.organizationId}:${id}`; }
-  save(input: any, projectId?: string): McpConnection {
-    if (projectId && this.store.getProject(projectId)?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
-    const prior = input.id ? this.get(input.id, projectId) : undefined;
-    if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
-    if (!prior && this.all().length >= 200) throw new Error('Connection limit reached (200 per organization)');
-    const transport = validateTransport(input.transport);
-    const auth = input.auth ?? 'none';
-    if (!['none', 'secrets', 'oauth'].includes(auth) || (auth === 'oauth' && transport.type === 'stdio')) throw new Error('Invalid authentication method');
-    const changed = prior && (JSON.stringify(prior.transport) !== JSON.stringify(transport) || prior.auth !== auth);
-    let oauthData: any;
-    let oauthClient = changed ? undefined : prior?.oauthClient;
-    if (input.oauthClient !== undefined) {
-      if (auth !== 'oauth') throw new Error('OAuth client details require OAuth authentication');
-      oauthData = {};
-      oauthClient = undefined;
-      if (input.oauthClient !== null) {
-        const v = input.oauthClient;
-        if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Invalid OAuth client details');
-        const clientId = bounded(v.clientId, 2048, 'OAuth client ID').trim();
-        const method = v.tokenEndpointAuthMethod ?? 'none';
-        if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) throw new Error('Unsupported OAuth client authentication method');
-        const previous = prior && !changed ? this.secret(prior).manualClient : undefined;
-        const secret = v.clientSecret === undefined && previous?.client_id === clientId && previous?.token_endpoint_auth_method === method
-          ? previous.client_secret : v.clientSecret;
-        if (method !== 'none' && (typeof secret !== 'string' || !secret || secret.length > 16384 || /[\r\n\0]/.test(secret)))
-          throw new Error('A client secret is required for this authentication method');
-        oauthData.manualClient = { client_id: clientId, token_endpoint_auth_method: method,
-          ...(method !== 'none' ? { client_secret: secret } : {}) };
-        oauthClient = { clientId, tokenEndpointAuthMethod: method, hasSecret: method !== 'none' };
-        if (previous && JSON.stringify(previous) === JSON.stringify(oauthData.manualClient)) oauthData = undefined;
+  async save(input: any, projectId?: string): Promise<McpConnection> {
+    return this.store.transaction(async () => {
+      if (projectId && (await this.store.getProject(projectId))?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
+      const prior = input.id ? (await this.get(input.id, projectId)) : undefined;
+      if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
+      if (!prior && (await this.all()).length >= 200) throw new Error('Connection limit reached (200 per organization)');
+      const transport = validateTransport(input.transport);
+      const auth = input.auth ?? 'none';
+      if (!['none', 'secrets', 'oauth'].includes(auth) || (auth === 'oauth' && transport.type === 'stdio')) throw new Error('Invalid authentication method');
+      const changed = prior && (JSON.stringify(prior.transport) !== JSON.stringify(transport) || prior.auth !== auth);
+      let oauthData: any;
+      let oauthClient = changed ? undefined : prior?.oauthClient;
+      if (input.oauthClient !== undefined) {
+        if (auth !== 'oauth') throw new Error('OAuth client details require OAuth authentication');
+        oauthData = {};
+        oauthClient = undefined;
+        if (input.oauthClient !== null) {
+          const v = input.oauthClient;
+          if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Invalid OAuth client details');
+          const clientId = bounded(v.clientId, 2048, 'OAuth client ID').trim();
+          const method = v.tokenEndpointAuthMethod ?? 'none';
+          if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) throw new Error('Unsupported OAuth client authentication method');
+          const previous = prior && !changed ? this.secret(prior).manualClient : undefined;
+          const secret = v.clientSecret === undefined && previous?.client_id === clientId && previous?.token_endpoint_auth_method === method
+            ? previous.client_secret : v.clientSecret;
+          if (method !== 'none' && (typeof secret !== 'string' || !secret || secret.length > 16384 || /[\r\n\0]/.test(secret)))
+            throw new Error('A client secret is required for this authentication method');
+          oauthData.manualClient = { client_id: clientId, token_endpoint_auth_method: method,
+            ...(method !== 'none' ? { client_secret: secret } : {}) };
+          oauthClient = { clientId, tokenEndpointAuthMethod: method, hasSecret: method !== 'none' };
+          if (previous && JSON.stringify(previous) === JSON.stringify(oauthData.manualClient)) oauthData = undefined;
+        }
       }
-    }
-    const connection: McpConnection = {
-      id: prior?.id ?? `mcp_${crypto.randomBytes(12).toString('hex')}`,
-      organizationId: this.organizationId, ...(projectId ? { projectId } : {}),
-      label: bounded(input.label, 120, 'connection name'), transport, enabled: input.enabled !== false,
-      ...(oauthClient ? { oauthClient } : {}),
-      auth, secretNames: prior?.secretNames ?? [], revision: crypto.randomUUID(), createdAt: prior?.createdAt ?? Date.now(),
-      ...(input.registry ? { registry: { name: bounded(input.registry.name, 256, 'registry name'), version: bounded(input.registry.version, 128, 'registry version') } } : {}),
-    };
-    let secrets: Record<string, string> | undefined;
-    if (input.secrets !== undefined && auth === 'secrets') {
-      secrets = validateSecrets(input.secrets, transport.type === 'stdio');
-      if (input.mergeSecrets && prior && !changed && prior.auth === 'secrets') {
-        const old = this.secret(prior);
-        const keep = Array.isArray(input.retainSecretNames) ? input.retainSecretNames : Object.keys(old);
-        secrets = validateSecrets({ ...Object.fromEntries(Object.entries(old).filter(([key]) => keep.includes(key))), ...secrets }, transport.type === 'stdio');
+      const connection: McpConnection = {
+        id: prior?.id ?? `mcp_${crypto.randomBytes(12).toString('hex')}`,
+        organizationId: this.organizationId, ...(projectId ? { projectId } : {}),
+        label: bounded(input.label, 120, 'connection name'), transport, enabled: input.enabled !== false,
+        ...(oauthClient ? { oauthClient } : {}),
+        auth, secretNames: prior?.secretNames ?? [], revision: crypto.randomUUID(), createdAt: prior?.createdAt ?? Date.now(),
+        ...(input.registry ? { registry: { name: bounded(input.registry.name, 256, 'registry name'), version: bounded(input.registry.version, 128, 'registry version') } } : {}),
+      };
+      let secrets: Record<string, string> | undefined;
+      if (input.secrets !== undefined && auth === 'secrets') {
+        secrets = validateSecrets(input.secrets, transport.type === 'stdio');
+        if (input.mergeSecrets && prior && !changed && prior.auth === 'secrets') {
+          const old = this.secret(prior);
+          const keep = Array.isArray(input.retainSecretNames) ? input.retainSecretNames : Object.keys(old);
+          secrets = validateSecrets({ ...Object.fromEntries(Object.entries(old).filter(([key]) => keep.includes(key))), ...secrets }, transport.type === 'stdio');
+        }
       }
-    }
-    if (changed || auth === 'none') { this.broker.deleteHandle(this.handle(connection.id)); connection.secretNames = []; }
-    if (secrets) {
-      this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets));
-      connection.secretNames = Object.keys(secrets);
-    }
-    const connections = this.all().filter((c) => c.id !== connection.id);
-    if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization)');
-    this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] });
-    if (oauthData !== undefined) this.setSecret(connection, oauthData);
-    return connection;
+      if (changed || auth === 'none') { (await this.broker.deleteHandle(this.handle(connection.id))); connection.secretNames = []; }
+      if (secrets) {
+        (await this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets)));
+        connection.secretNames = Object.keys(secrets);
+      }
+      const connections = (await this.all()).filter((c) => c.id !== connection.id);
+      if (connections.length >= 200) throw new Error('Connection limit reached (200 per organization)');
+      (await this.store.setSettings(this.key(), 'mcp', { connections: [...connections, connection] }));
+      if (oauthData !== undefined) await this.setSecret(connection, oauthData);
+      return connection;
+    });
   }
-  remove(id: string, projectId?: string) {
-    const c = this.get(id, projectId);
-    if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
-    this.store.setSettings(this.key(), 'mcp', { connections: this.all().filter((v) => v.id !== id) });
-    this.broker.deleteHandle(this.handle(id));
+
+  async remove(id: string, projectId?: string) {
+    return this.store.transaction(async () => {
+      const c = (await this.get(id, projectId));
+      if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
+      (await this.store.setSettings(this.key(), 'mcp', { connections: (await this.all()).filter((v) => v.id !== id) }));
+      (await this.broker.deleteHandle(this.handle(id)));
+    });
   }
+
   secret(c: McpConnection, taskId?: string): any {
     const handle = this.handle(c.id);
     if (!this.broker.hasHandle(handle)) return {};
     return JSON.parse(this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
   }
-  setSecret(c: McpConnection, value: unknown) {
-    if (this.get(c.id, c.projectId).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
-    this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)); }
-  selected(ids: string[], projectId: string): McpConnection[] {
+  async setSecret(c: McpConnection, value: unknown) {
+    await this.store.transaction(async () => {
+      if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
+      (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)));
+    });
+  }
+  async selected(ids: string[], projectId: string): Promise<McpConnection[]> {
     validateMcpSelection(ids);
-    return ids.filter((id) => !BUILTIN_MCPS.includes(id as any) && !id.startsWith('composio:')).map((id) => {
-      const c = this.get(id, projectId);
+    return (await __asyncCollections.map(ids.filter((id) => !BUILTIN_MCPS.includes(id as any) && !id.startsWith('composio:')), async (id) => {
+      const c = (await this.get(id, projectId));
       if (!c.enabled) throw new Error(`MCP connection “${c.label}” is disabled. Update the Agent tools selection.`);
       return c;
-    });
+    }));
   }
 }

@@ -85,7 +85,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // lost its reasoning effort here (the old fallback, claude-sonnet-4-5, is real
     // but not effort-capable, so `claudeMessagesEffort` returned undefined for it).
     const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
-    currentTiming()?.mark('provider.selected', { provider: 'claude', model });
+    (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
     const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
@@ -162,12 +162,12 @@ export class ClaudeAdapter implements AgentAdapter {
           throw providerErrorFromMessage('claude', message, 'structured');
         }
         const data = (await res.json()) as any;
-        currentTiming()?.markOnce('first.output');
+        (await (await currentTiming())?.markOnce('first.output'));
         return data;
       });
       // Usage accounting is required even when timing collection is absent.
       const roundUsage = reportedUsage.add(data.usage, 'claude');
-      currentTiming()?.mark('provider.usage', roundUsage);
+      (await (await currentTiming())?.mark('provider.usage', roundUsage));
       messages.push({ role: 'assistant', content: data.content });
       const toolUses = (data.content ?? []).filter((b: any) => b.type === 'tool_use');
       const text = (data.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
@@ -510,7 +510,7 @@ export class ClaudeAdapter implements AgentAdapter {
       settleDeadline ??= Date.now() + settleGraceMs;
       return Date.now() < settleDeadline;
     };
-    const startupEnd = currentTiming()?.start('process.sdk-startup.opaque');
+    const startupEnd = (await (await currentTiming())?.start('process.sdk-startup.opaque'));
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -630,8 +630,8 @@ export class ClaudeAdapter implements AgentAdapter {
     let publishedSession = false;
     try {
       for await (const message of iterator) {
-        startupEnd?.();
-        currentTiming()?.markOnce('provider.first-event');
+        (await startupEnd?.());
+        (await (await currentTiming())?.markOnce('provider.first-event'));
         if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {
           const inventory = (message as any).mcp_servers ?? [];
           const missing = (input.agentMcp ?? []).filter((s) => !inventory.some((c: any) => c.name === s.name && c.status === 'connected'));
@@ -848,7 +848,7 @@ export class ClaudeAdapter implements AgentAdapter {
           // harness still has work in flight that will drive the agent again, in which
           // case the input stream (and with it the control channel) stays open.
           if ((completionSeen || !(await drainFollowUps())) && !harnessStillWorking()) {
-            injector.close();
+            (await injector.close());
           }
         }
       }
@@ -866,7 +866,7 @@ export class ClaudeAdapter implements AgentAdapter {
     } finally {
       if (hb) clearInterval(hb);
       if (followPoll) clearInterval(followPoll);
-      injector.close(); // release the input stream so the SDK subprocess can't wedge open
+      (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {
         const failure = await syncRemoteAgentHomeBestEffort(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);

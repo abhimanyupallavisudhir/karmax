@@ -35,12 +35,12 @@ const key = (organizationId: string) => `authorization:requests:${organizationId
  * Unlike agent permission requests these never elevate the requester: approval
  * is applied directly to the named task or Avatar. */
 export class AuthorizationRequests {
-  constructor(private store: Pick<Store, 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
 
-  requests(filter: { status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string } = {}): AuthorizationRequest[] {
+  async requests(filter: { status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string } = {}): Promise<AuthorizationRequest[]> {
     let all: AuthorizationRequest[] = [];
     try {
-      const raw = this.store.kvGet(key(this.organizationId));
+      const raw = (await this.store.kvGet(key(this.organizationId)));
       all = raw ? JSON.parse(raw) : [];
     } catch { all = []; }
     return all.filter((request) => (!filter.status || request.status === filter.status)
@@ -48,13 +48,14 @@ export class AuthorizationRequests {
       && (!filter.avatarId || request.target.kind === 'avatar' && request.target.avatarId === filter.avatarId));
   }
 
-  request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt'>): AuthorizationRequest {
+  async request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt'>): Promise<AuthorizationRequest> {
+    return this.store.transaction(async () => {
     const audience = [...new Set(input.audience.map(String).map((value) => value.trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
     const avatarRecipients = [...new Set((input.avatarRecipients ?? []).map(String).filter(Boolean))];
     if (!audience.length || (!recipients.length && !avatarRecipients.length))
       throw new Error('choose at least one eligible person, team, or Avatar');
-    const all = this.requests();
+    const all = (await this.requests());
     const targetKey = input.target.kind === 'task' ? `task:${input.target.taskId}` : `avatar:${input.target.avatarId}`;
     const existing = all.find((request) => request.status === 'pending'
       && (request.target.kind === 'task' ? `task:${request.target.taskId}` : `avatar:${request.target.avatarId}`) === targetKey);
@@ -65,47 +66,55 @@ export class AuthorizationRequests {
       audience, recipients, ...(avatarRecipients.length ? { avatarRecipients } : {}),
       status: 'pending', createdAt: Date.now(),
     };
-    this.save([...all, request]);
-    this.store.appendAudit({
+    (await this.save([...all, request]));
+    (await this.store.appendAudit({
       principalId: input.requestedBy,
       action: 'authorization.requested',
       scopeKey: `project:${input.projectId}`,
       detail: { requestId: request.id, target: request.target, authorization: request.authorization,
         missingCapabilities: request.missingCapabilities, audience, recipients, avatarRecipients },
-    });
+    }));
     return request;
+
+    });
   }
 
-  resolve(id: string, action: 'approve' | 'deny', by: string): AuthorizationRequest {
-    const all = this.requests();
+  async resolve(id: string, action: 'approve' | 'deny', by: string): Promise<AuthorizationRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
     request.status = action === 'approve' ? 'granted' : 'denied';
     request.resolution = { action, by, at: Date.now() };
-    this.save(all);
-    this.store.appendAudit({
+    (await this.save(all));
+    (await this.store.appendAudit({
       principalId: by,
       action: 'authorization.request.resolved',
       scopeKey: `project:${request.projectId}`,
       detail: { requestId: request.id, target: request.target, authorization: request.authorization, action },
-    });
+    }));
     return request;
+
+    });
   }
 
-  dismiss(id: string, by: string): AuthorizationRequest {
-    const all = this.requests();
+  async dismiss(id: string, by: string): Promise<AuthorizationRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
     request.dismissed ??= { by, at: Date.now() };
-    this.save(all);
-    this.store.appendAudit({ principalId: by, action: 'authorization.request.dismissed',
-      scopeKey: `project:${request.projectId}`, detail: { requestId: id } });
+    (await this.save(all));
+    (await this.store.appendAudit({ principalId: by, action: 'authorization.request.dismissed',
+      scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
+
+    });
   }
 
-  private save(requests: AuthorizationRequest[]): void {
-    this.store.kvSet(key(this.organizationId), JSON.stringify(requests));
+  private async save(requests: AuthorizationRequest[]): Promise<void> {
+    (await this.store.kvSet(key(this.organizationId), JSON.stringify(requests)));
   }
 }

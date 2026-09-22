@@ -88,19 +88,13 @@ describe.skipIf(!claudeSub)('LIVE Claude — subscription (Agent SDK)', () => {
 });
 
 describe.skipIf(!codexKey)('LIVE Codex — API key (Responses API)', () => {
-  it('reaches the Responses API (text, or a billing/quota error if the key has no credits)', async () => {
-    try {
-      const r = await new CodexAdapter().runTurn(
-        { profile: profile({ provider: 'codex', model: 'gpt-5.5' }), world: await makeWorld(), messages: [{ id: 'm', role: 'user', text: 'Reply with exactly: READY', ts: 0 }], systemPrompt: SYS, role: 'do', resolvedAuth: { apiKey: process.env.OPENAI_API_KEY } } as any,
-        ctx(),
-      );
-      expect(r.output.toUpperCase()).toContain('READY');
-    } catch (e) {
-      // The wiring is verified if we actually reached OpenAI and got a proper
-      // account-state rejection (this key has no credits). A code/transport bug
-      // would look different (network error, 400 bad-request, auth failure).
-      expect(String(e)).toMatch(/insufficient_quota|exceeded your current quota|billing|Responses API 429/i);
-    }
+  it('runs a real Responses API turn and returns text', async () => {
+    const r = await new CodexAdapter().runTurn(
+      { profile: profile({ provider: 'codex', model: 'gpt-5.5' }), world: await makeWorld(), messages: [{ id: 'm', role: 'user', text: 'Reply with exactly: READY', ts: 0 }], systemPrompt: SYS, role: 'do', resolvedAuth: { apiKey: process.env.OPENAI_API_KEY } } as any,
+      ctx(),
+    );
+    // Quota/auth failures establish reachability, not a working model turn.
+    expect(r.output.toUpperCase()).toContain('READY');
   }, 120_000);
 });
 

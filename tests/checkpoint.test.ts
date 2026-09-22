@@ -29,10 +29,10 @@ describe('portable world checkpoints', () => {
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
 
-    const store = new Store(':memory:');
-    const project = store.createProject('Portable', { repos: [repo], defaultBase: 'main', worldProvider: 'worktree' });
-    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Portable', { repos: [repo], defaultBase: 'main', worldProvider: 'worktree' }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } }));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
@@ -41,7 +41,7 @@ describe('portable world checkpoints', () => {
     const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources);
     const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main' });
     world.handle.meta = { projectId: project.id, ephemeralPaths: ['private.bin'] };
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     const stale = { ...world.handle };
     await world.writeFileBuffer!('binary.dat', Buffer.from([0, 1, 2, 255]));
     await world.writeFileBuffer!('ignored-data/model.bin', Buffer.alloc(321, 9));
@@ -64,10 +64,10 @@ describe('portable world checkpoints', () => {
     expect(await restored.readFile('renamed.txt')).toBe('after\n');
     expect([...await restored.readFileBuffer('binary.dat')]).toEqual([0, 1, 2, 255]);
     await expect(restored.readFile('private.bin')).rejects.toThrow();
-    expect(() => store.assertCurrentWorld(stale)).toThrow(/stale world generation/);
+    await expect((async () => (await store.assertCurrentWorld(stale)))()).rejects.toThrow(/stale world generation/);
 
     await restored.destroy();
-    store.close();
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -81,10 +81,10 @@ describe('portable world checkpoints', () => {
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
 
-    const store = new Store(':memory:');
-    const project = store.createProject('Recover', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' });
-    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Recover', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } }));
 
     // A mock REMOTE provider backed by real worktrees. `vanished` flips on to
     // simulate the provider losing the gen-1 sandbox: open() throws and probe()
@@ -110,7 +110,7 @@ describe('portable world checkpoints', () => {
 
     const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
     world.handle.meta = { projectId: project.id };
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.writeFile('tracked.txt', 'edited in the sandbox\n'); // dirty work, captured by the checkpoint
     await checkpoints.checkpoint(world.handle); // attaches checkpointId onto the current world
     const vanishedHandle = { ...world.handle };
@@ -125,12 +125,12 @@ describe('portable world checkpoints', () => {
     const result = await core.commitWork(vanishedHandle, 'after recovery');
     expect(result.committed).toBe(true);
     // A fresh generation was provisioned from the checkpoint...
-    expect((store.currentWorld(task.id) as { generation?: number } | undefined)?.generation).toBe(2);
+    expect(((await store.currentWorld(task.id)) as { generation?: number } | undefined)?.generation).toBe(2);
     // ...and it carries the sandbox's edited files (same work continues).
-    const restored = await worlds.open(store.currentWorld(task.id) as any);
+    const restored = await worlds.open((await store.currentWorld(task.id)) as any);
     expect(await restored.readFile('tracked.txt')).toBe('edited in the sandbox\n');
     await restored.destroy();
-    store.close();
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -149,19 +149,19 @@ describe('portable world checkpoints', () => {
     const development = await makeRepo('development');
     const wiki = await makeRepo('wiki', 'project-wiki');
 
-    const store = new Store(':memory:');
-    const project = store.createProject('Companion restore', { repos: [development], defaultBase: 'main' });
-    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Companion restore', { repos: [development], defaultBase: 'main' }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } }));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
     const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources);
-    const ledger = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const ledger = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Ledger', driver: 'object-tree@1', target: { kind: 'path', path: 'runs/spend.sqlite' },
-      access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
+      access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' }));
     await resources.importFiles(ledger.id, [{ path: 'spend.sqlite', data: Buffer.from('original') }]);
 
     const world = await worlds.create('worktree', { taskId: task.id, repos: [development, wiki], base: 'main',
@@ -174,7 +174,7 @@ describe('portable world checkpoints', () => {
     world.handle = await resources.materialize(project.id, task.id, world);
     await world.writeFile('runs/spend.sqlite', 'historical ledger');
     world.handle.workdir = world.handle.repos![0]!.root;
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.writeFile('wiki/unpublished.md', 'portable wiki edit\n');
     const checkpoint = await checkpoints.checkpoint(world.handle);
     expect(checkpoint.repos[1]).toMatchObject({ source: wiki, base: 'project-wiki',
@@ -188,7 +188,7 @@ describe('portable world checkpoints', () => {
       const { source: _source, base: _base, target: _target, targetPinned: _targetPinned, role: _role, ...old } = entry;
       return old;
     }) };
-    store.saveWorldCheckpoint(legacy);
+    (await store.saveWorldCheckpoint(legacy));
     await world.destroy();
 
     const restoredHandle = await checkpoints.restore(legacy.id, 'worktree');
@@ -203,7 +203,7 @@ describe('portable world checkpoints', () => {
     expect(await resources.summarize(task.id, ledger.id)).toMatchObject({ added: 0, modified: 0, deleted: 0 });
 
     await restored.destroy();
-    store.close();
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -217,12 +217,12 @@ describe('portable world checkpoints', () => {
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
 
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Restore', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' },
-      organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Restore', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Cloud', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' },
+      organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } }));
 
     const worlds = new WorldRegistry();
     const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
@@ -250,7 +250,7 @@ describe('portable world checkpoints', () => {
 
     const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
     world.handle.meta = { projectId: project.id };
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.writeFile('tracked.txt', 'edited in the sandbox\n');
     const checkpoint = await checkpoints.checkpoint(world.handle);
     await world.destroy();
@@ -262,22 +262,22 @@ describe('portable world checkpoints', () => {
     expect(createSpecs[1]).toMatchObject({ organizationId: organization.id, generation: 2 });
     const leaseId = restored.meta?.worldLeaseId as string | undefined;
     expect(typeof leaseId).toBe('string');
-    expect(store.worldLease(leaseId!)?.state).toBe('active');
-    expect(store.activeWorldLeaseCount(task.id)).toBe(1);
+    expect((await store.worldLease(leaseId!))?.state).toBe('active');
+    expect((await store.activeWorldLeaseCount(task.id))).toBe(1);
 
     // …and releasing it produces the `world.active` usage row cost attribution reads.
-    runners.release(leaseId!, 'sandbox-test');
-    expect(store.worldLease(leaseId!)?.state).toBe('released');
-    expect(store.usageSummary(organization.id).byKind['world.active']).toBeGreaterThanOrEqual(0);
-    expect(Object.keys(store.usageSummary(organization.id).byKind)).toContain('world.active');
+    (await runners.release(leaseId!, 'sandbox-test'));
+    expect((await store.worldLease(leaseId!))?.state).toBe('released');
+    expect((await store.usageSummary(organization.id)).byKind['world.active']).toBeGreaterThanOrEqual(0);
+    expect(Object.keys((await store.usageSummary(organization.id)).byKind)).toContain('world.active');
     await (await worlds.open(restored)).destroy();
 
     // The lease is also the budget gate: an exhausted organization budget must
     // stop a silent re-provision instead of billing past it.
-    store.setOrganizationExecutionPolicy(organization.id, { monthlyBudgetMicros: 0 });
+    (await store.setOrganizationExecutionPolicy(organization.id, { monthlyBudgetMicros: 0 }));
     await expect(checkpoints.restore(checkpoint.id, 'sandbox-test')).rejects.toThrow(/budget/);
 
-    store.close();
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -291,17 +291,17 @@ describe('portable world checkpoints', () => {
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
 
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Saturated', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' },
-      organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Saturated', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Cloud', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' },
+      organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } }));
     // A pool with room for exactly one world, so the restore's lease must queue.
-    const pool = store.createRunnerPool({ id: `${organization.id}:tiny`, organizationId: organization.id,
+    const pool = (await store.createRunnerPool({ id: `${organization.id}:tiny`, organizationId: organization.id,
       name: 'Tiny', provider: 'sandbox-test', mode: 'managed',
-      capacity: { activeWorlds: 1, cpu: 40, memoryMb: 81_920, gpu: 0 }, enabled: true });
-    store.setProjectExecutionPolicy(project.id, { runnerPoolId: pool.id });
+      capacity: { activeWorlds: 1, cpu: 40, memoryMb: 81_920, gpu: 0 }, enabled: true }));
+    (await store.setProjectExecutionPolicy(project.id, { runnerPoolId: pool.id }));
 
     const worlds = new WorldRegistry();
     const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
@@ -327,17 +327,17 @@ describe('portable world checkpoints', () => {
 
     const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
     world.handle.meta = { projectId: project.id };
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.writeFile('tracked.txt', 'edited in the sandbox\n');
     const checkpoint = await checkpoints.checkpoint(world.handle);
     await world.destroy();
 
     // Saturate the pool: the restore below cannot be granted until this is released.
-    const other = store.createTask({ projectId: project.id, title: 'Other', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'other' } as any });
-    const occupant = await runners.acquire({ project: store.getProject(project.id)!, taskId: other.id,
+    const other = (await store.createTask({ projectId: project.id, title: 'Other', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'other' } as any }));
+    const occupant = await runners.acquire({ project: (await store.getProject(project.id))!, taskId: other.id,
       worldId: other.id, provider: 'sandbox-test' });
-    expect(store.worldLease(occupant.leaseId)?.state).toBe('active');
+    expect((await store.worldLease(occupant.leaseId))?.state).toBe('active');
 
     // `restore` is reached from an activity, and `RunnerPoolService.acquire` polls
     // a ~1s loop that only gives the queued lease row back when the signal aborts.
@@ -356,14 +356,14 @@ describe('portable world checkpoints', () => {
       expect(outcome).toMatch(/^rejected/);
       expect(beats.length).toBeGreaterThan(0); // it heartbeats while it waits
       // Nothing left holding pool capacity except the occupant we created.
-      expect(store.listWorldLeases(pool.id).map((lease: any) => lease.id)).toEqual([occupant.leaseId]);
+      expect((await store.listWorldLeases(pool.id)).map((lease: any) => lease.id)).toEqual([occupant.leaseId]);
     } finally {
       clearTimeout(timer);
       // Free the pool so any still-spinning acquire finishes rather than leaking
       // a poll loop into the rest of the run.
-      runners.release(occupant.leaseId, 'sandbox-test');
+      (await runners.release(occupant.leaseId, 'sandbox-test'));
       await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 5000))]);
-      store.close();
+      (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -390,15 +390,15 @@ esac
     process.env.PATH = `${bin}:${oldPath}`;
     process.env.KARMAX_TEST_DOCKER_LOG = dockerLog;
     try {
-      const store = new Store(':memory:');
-      const project = store.createProject('Runtime restore', { repos: [repo], defaultBase: 'main' });
-      const task = store.createTask({ projectId: project.id, title: 'Restore', workflow: 'software-dev',
-        workflowVersion: '1.0.0', params: { prompt: 'restore' } });
+      const store = (await Store.create(':memory:'));
+      const project = (await store.createProject('Runtime restore', { repos: [repo], defaultBase: 'main' }));
+      const task = (await store.createTask({ projectId: project.id, title: 'Restore', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'restore' } }));
       const environments = new ProjectEnvironment(store);
-      const pinned = environments.setSpec(project.id, { boot: ['printf pinned-runtime > runtime-marker'] });
-      new ProjectServices(store).save(project.id, { name: 'database', kind: 'per-world',
+      const pinned = (await environments.setSpec(project.id, { boot: ['printf pinned-runtime > runtime-marker'] }));
+      (await new ProjectServices(store).save(project.id, { name: 'database', kind: 'per-world',
         image: 'postgres:16', containerPort: 5432, urlEnv: 'DATABASE_URL',
-        urlTemplate: 'postgres://app@{host}:{port}/app' });
+        urlTemplate: 'postgres://app@{host}:{port}/app' }));
 
       const worlds = new WorldRegistry();
       const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
@@ -418,16 +418,16 @@ esac
       const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
       world.handle.meta = { projectId: project.id };
       world.handle.environmentDigest = environments.digest(pinned);
-      world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+      world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
       const checkpoint = await checkpoints.checkpoint(world.handle);
       expect(checkpoint.environment).toEqual(pinned);
       expect(checkpoint.services?.[0]?.image).toBe('postgres:16');
       await world.destroy();
 
       // Later settings edits must not rewrite the topology of this checkpoint.
-      environments.setSpec(project.id, { boot: ['printf changed-runtime > runtime-marker'] });
-      new ProjectServices(store).save(project.id, { name: 'database', kind: 'per-world',
-        image: 'redis:7', containerPort: 6379, urlEnv: 'REDIS_URL', urlTemplate: 'redis://{host}:{port}' });
+      (await environments.setSpec(project.id, { boot: ['printf changed-runtime > runtime-marker'] }));
+      (await new ProjectServices(store).save(project.id, { name: 'database', kind: 'per-world',
+        image: 'redis:7', containerPort: 6379, urlEnv: 'REDIS_URL', urlTemplate: 'redis://{host}:{port}' }));
       const restoredHandle = await checkpoints.restore(checkpoint.id, 'sandbox-test');
       const restored = await worlds.open(restoredHandle);
       expect(await restored.readFile('runtime-marker')).toBe('pinned-runtime');
@@ -435,7 +435,7 @@ esac
       expect(calls).toContain('postgres:16');
       expect(calls).not.toContain('redis:7');
       expect(JSON.stringify(restoredHandle)).not.toContain('postgres://app@172.17.0.8');
-      const wrapped = resources.withEnvironment(restored);
+      const wrapped = (await resources.withEnvironment(restored));
       expect((await wrapped.exec('bash', ['-lc', 'printf %s "$DATABASE_URL"'])).stdout)
         .toBe('postgres://app@172.17.0.8:5432/app');
       const serviceHandle = Object.values(restoredHandle.meta?.serviceEnvironmentHandles as Record<string, string>)[0]!;
@@ -443,7 +443,7 @@ esac
       await resources.release(restoredHandle);
       expect(broker.hasHandle(serviceHandle)).toBe(false);
       await restored.destroy();
-      store.close();
+      (await store.close());
     } finally {
       process.env.PATH = oldPath;
       if (oldLog === undefined) delete process.env.KARMAX_TEST_DOCKER_LOG;

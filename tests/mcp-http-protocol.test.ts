@@ -17,7 +17,7 @@ describe('MCP HTTP and SSE wire protocols', () => {
   let dir: string, store: Store, service: McpConnections, server: http.Server, sse: http.ServerResponse | undefined;
   let origin: string, hostileEndpoint: boolean, seen: { method: string; url: string; authorization?: string; cookie?: string }[];
   beforeEach(async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-http-protocol-')); store = new Store(':memory:');
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-http-protocol-')); store = (await Store.create(':memory:'));
     service = new McpConnections(store, new CredentialBroker(new Vault(dir)), 'org_personal'); seen = []; hostileEndpoint = false;
     server = http.createServer(async (req, res) => {
       seen.push({ method: req.method!, url: req.url!, authorization: req.headers.authorization, cookie: req.headers.cookie });
@@ -44,16 +44,16 @@ describe('MCP HTTP and SSE wire protocols', () => {
       return fetch(new Request(origin + url.pathname + url.search, request));
     });
   });
-  afterEach(async () => { vi.restoreAllMocks(); sse?.end(); sse = undefined; server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  afterEach(async () => { vi.restoreAllMocks(); sse?.end(); sse = undefined; server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
   it.each(['http', 'sse'] as const)('%s initializes, discovers tools, sends only scoped authentication, and closes', async (type) => {
-    const connection = service.save({ label: 'Remote', transport: { type, url: `https://tools.example/${type}` }, auth: 'secrets', secrets: { Authorization: 'Bearer scoped-test-key' } });
+    const connection = (await service.save({ label: 'Remote', transport: { type, url: `https://tools.example/${type}` }, auth: 'secrets', secrets: { Authorization: 'Bearer scoped-test-key' } }));
     expect(await probeConnection(service, connection)).toMatchObject({ ok: true, tools: 1 });
     expect(seen.filter((r) => r.method === 'POST').length).toBeGreaterThanOrEqual(3);
     expect(seen.every((r) => r.authorization === 'Bearer scoped-test-key' && r.cookie === undefined)).toBe(true);
   });
   it('rejects a cross-origin SSE endpoint before forwarding credentials', async () => {
     hostileEndpoint = true;
-    const connection = service.save({ label: 'Hostile', transport: { type: 'sse', url: 'https://tools.example/sse' }, auth: 'secrets', secrets: { Authorization: 'Bearer scoped-test-key' } });
+    const connection = (await service.save({ label: 'Hostile', transport: { type: 'sse', url: 'https://tools.example/sse' }, auth: 'secrets', secrets: { Authorization: 'Bearer scoped-test-key' } }));
     await expect(probeConnection(service, connection)).rejects.toThrow(/Could not connect/);
     expect(seen).toHaveLength(1);
     expect(vi.mocked(network.publicStreamFetch).mock.calls.every(([request]) => new URL(new Request(request).url).origin === 'https://tools.example')).toBe(true);

@@ -103,17 +103,17 @@ export function parseBitwardenExport(value: unknown): BitwardenImportResult {
 }
 
 /** Save a parsed export as an idempotent, one-way import into Krmax's vault. */
-export function importBitwardenExport(
+export async function importBitwardenExport(
   vault: VaultItems,
   value: unknown,
   policy?: Partial<VaultItemPolicy>,
-): BitwardenVaultImportResult {
+): Promise<BitwardenVaultImportResult> {
   const parsed = parseBitwardenExport(value);
   let created = 0;
   let updated = 0;
   for (const item of parsed.items) {
-    const existing = vault.findByExternal('import:bitwarden', item.externalId);
-    vault.save({
+    const existing = (await vault.findByExternal('import:bitwarden', item.externalId));
+    (await vault.save({
       id: existing?.id,
       type: item.type,
       label: item.label,
@@ -125,7 +125,7 @@ export function importBitwardenExport(
       } : {}),
       secrets: item.secrets,
       provenance: { source: 'import:bitwarden', externalId: item.externalId },
-    });
+    }));
     if (existing) updated++;
     else created++;
   }

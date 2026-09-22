@@ -175,7 +175,7 @@ try {
   });
   assert.equal(setup.status, 200);
   const admin = (await setup.json()) as { user: { id: string } };
-  const org = harness.store.createOrganization({ name: 'Vault Staging', ownerUserId: admin.user.id });
+  const org = (await harness.store.createOrganization({ name: 'Vault Staging', ownerUserId: admin.user.id }));
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
   const errors: string[] = [];

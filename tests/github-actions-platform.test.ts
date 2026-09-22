@@ -5,23 +5,23 @@ import { KarmaxApi, CapabilityError, NotFoundError } from '../src/platform/api.j
 
 describe('task-scoped GitHub Actions authority', () => {
   it('allows bounded reads only for attached repositories, audits them, and separates mutations', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const tokens = new TokenAuthority();
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Application', {}, organization.id);
-    const other = store.createProject('Other', {}, organization.id);
-    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
-      installationId: '9', accountLogin: 'acme', accountType: 'Organization' });
-    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '11',
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Application', {}, organization.id));
+    const other = (await store.createProject('Other', {}, organization.id));
+    const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '9', accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '11',
       owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true,
-      gitConnectionId: connection.id });
-    const outside = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '12',
+      gitConnectionId: connection.id }));
+    const outside = (await store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '12',
       owner: 'acme', name: 'outside', sshUrl: 'git@github.com:acme/outside.git', defaultBranch: 'main', private: true,
-      gitConnectionId: connection.id });
-    store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
-    store.attachProjectRepository({ projectId: other.id, repositoryId: outside.id });
-    const task = store.createTask({ projectId: project.id, title: 'Repair deploy', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'diagnose it' } });
+      gitConnectionId: connection.id }));
+    (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    (await store.attachProjectRepository({ projectId: other.id, repositoryId: outside.id }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Repair deploy', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'diagnose it' } }));
     const actions = {
       listWorkflows: vi.fn(async () => ({ page: 1, workflows: [] })),
       listRuns: vi.fn(async () => ({ total: 1, page: 1, perPage: 30, runs: [{ id: 42 }] })),
@@ -32,8 +32,8 @@ describe('task-scoped GitHub Actions authority', () => {
     };
     const githubApp = { actions: vi.fn(() => actions) } as any;
     const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'test', tokens, githubApp });
-    const read = tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
-      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] }).token;
+    const read = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
+      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] })).token;
 
     await expect(api.listGithubActionsRuns(read, { repository: 'acme/app', branch: 'main' }))
       .resolves.toMatchObject({ total: 1, runs: [{ id: 42 }] });
@@ -43,13 +43,13 @@ describe('task-scoped GitHub Actions authority', () => {
     await expect(api.listGithubActionsRuns(read, { repository: 'acme/outside' })).rejects.toBeInstanceOf(NotFoundError);
     await expect(api.manageGithubActionsRun(read, { repository: 'app', runId: 42, action: 'rerun-failed' }))
       .rejects.toBeInstanceOf(CapabilityError);
-    expect(store.eventsSince(task.id, 0).map((event) => event.type)).toEqual([
+    expect((await store.eventsSince(task.id, 0)).map((event) => event.type)).toEqual([
       'github.actions.runs-read', 'github.actions.run-inspected',
     ]);
-    expect(JSON.stringify(store.eventsSince(task.id, 0))).not.toContain('token');
+    expect(JSON.stringify((await store.eventsSince(task.id, 0)))).not.toContain('token');
 
-    const write = tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
-      ceiling: ['github:actions:write'], grantorCaps: ['github:actions:write'] }).token;
+    const write = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
+      ceiling: ['github:actions:write'], grantorCaps: ['github:actions:write'] })).token;
     await expect(api.manageGithubActionsRun(write, { repository: 'app', runId: 42, action: 'rerun-failed' }))
       .resolves.toMatchObject({ accepted: true });
     await expect(api.dispatchGithubActionsWorkflow(write, {
@@ -57,7 +57,7 @@ describe('task-scoped GitHub Actions authority', () => {
     })).resolves.toMatchObject({ accepted: true });
     expect(actions.rerun).toHaveBeenCalledWith('acme/app', 42, true);
     expect(actions.dispatch).toHaveBeenCalledWith('acme/app', 'deploy.yml', 'main', { environment: 'production' });
-    expect(store.eventsSince(task.id, 0).map((event) => event.type)).toEqual([
+    expect((await store.eventsSince(task.id, 0)).map((event) => event.type)).toEqual([
       'github.actions.runs-read', 'github.actions.run-inspected',
       'github.actions.run-operated', 'github.actions.workflow-dispatched',
     ]);
@@ -70,33 +70,33 @@ describe('task-scoped GitHub Actions authority', () => {
     await api.listGithubActionsWorkflows(read, { page: 1 });
     await expect(api.listGithubActionsWorkflows(write, {})).rejects.toBeInstanceOf(CapabilityError);
     await expect(api.listGithubActionsWorkflows(read, { repository: 'acme/outside' })).rejects.toBeInstanceOf(NotFoundError);
-    const wrongProject = tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: other.id,
-      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] }).token;
+    const wrongProject = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: other.id,
+      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] })).token;
     await expect(api.inspectGithubActionsRun(wrongProject, { runId: 42, view: 'log', jobId: 99 })).rejects.toBeInstanceOf(CapabilityError);
-    expect(JSON.stringify(store.eventsSince(task.id, 0))).not.toMatch(/excerpt|failedJobs|installation-secret/);
-    store.close();
+    expect(JSON.stringify((await store.eventsSince(task.id, 0)))).not.toMatch(/excerpt|failedJobs|installation-secret/);
+    (await store.close());
   });
 
   it('requires an explicit repository when a task project has several attachments', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const tokens = new TokenAuthority();
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Multi', {}, organization.id);
-    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
-      installationId: '9', accountLogin: 'acme', accountType: 'Organization' });
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Multi', {}, organization.id));
+    const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '9', accountLogin: 'acme', accountType: 'Organization' }));
     for (const [id, name] of [['1', 'one'], ['2', 'two']] as Array<[string, string]>) {
-      const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: id,
+      const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: id,
         owner: 'acme', name, sshUrl: `git@github.com:acme/${name}.git`, defaultBranch: 'main', private: true,
-        gitConnectionId: connection.id });
-      store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+        gitConnectionId: connection.id }));
+      (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
     }
-    const task = store.createTask({ projectId: project.id, title: 'Choose repo', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x' } });
-    const token = tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
-      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] }).token;
+    const task = (await store.createTask({ projectId: project.id, title: 'Choose repo', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const token = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
+      ceiling: ['github:actions:read'], grantorCaps: ['github:actions:read'] })).token;
     const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'test', tokens,
       githubApp: { actions: () => ({ listRuns: async () => ({}) }) } as any });
     await expect(api.listGithubActionsRuns(token, {})).rejects.toThrow('repository is required');
-    store.close();
+    (await store.close());
   });
 });

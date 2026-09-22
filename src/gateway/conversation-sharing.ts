@@ -2,11 +2,11 @@ import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
 import type { Message } from '../domain/types.js';
 
-export function sharingPolicy(store: Store, projectId: string) {
-  const project = store.getProject(projectId);
+export async function sharingPolicy(store: Store, projectId: string) {
+  const project = (await store.getProject(projectId));
   if (!project) throw new Error('project not found');
-  const organization = store.kvGet(`conversation-sharing:organization:${project.organizationId}`) === 'enabled';
-  const value = store.kvGet(`conversation-sharing:project:${projectId}`) === 'disabled' ? 'disabled' : 'inherit';
+  const organization = (await store.kvGet(`conversation-sharing:organization:${project.organizationId}`)) === 'enabled';
+  const value = (await store.kvGet(`conversation-sharing:project:${projectId}`)) === 'disabled' ? 'disabled' : 'inherit';
   return { organization, value, effective: organization && value !== 'disabled' };
 }
 
@@ -15,36 +15,42 @@ export interface ConversationShare {
   messages: Array<Pick<Message, 'role' | 'text'>>;
 }
 const indexKey = (taskId: string, role: string) => `conversation-share-index:${taskId}:${role}`;
-export function currentShare(store: Store, taskId: string, role: string): ConversationShare | undefined {
-  const id = store.kvGet(indexKey(taskId, role));
-  const raw = id && store.kvGet(`conversation-share:${id}`);
+export async function currentShare(store: Store, taskId: string, role: string): Promise<ConversationShare | undefined> {
+  const id = (await store.kvGet(indexKey(taskId, role)));
+  const raw = id && (await store.kvGet(`conversation-share:${id}`));
   return raw ? JSON.parse(raw) : undefined;
 }
-export function revokeShare(store: Store, taskId: string, role: string) {
-  const old = currentShare(store, taskId, role);
-  if (old) store.kvDelete(`conversation-share:${old.id}`);
-  store.kvDelete(indexKey(taskId, role));
+export async function revokeShare(store: Store, taskId: string, role: string) {
+  return store.transaction(async () => {
+  const old = (await currentShare(store, taskId, role));
+  if (old) (await store.kvDelete(`conversation-share:${old.id}`));
+  (await store.kvDelete(indexKey(taskId, role)));
+
+  });
 }
-export function createShare(store: Store, taskId: string, role: string, messages: Message[]) {
-  const task = store.getTask(taskId);
-  if (!task || !sharingPolicy(store, task.projectId).effective) throw new Error('Public conversation sharing is disabled');
-  const existing = currentShare(store, taskId, role);
+export async function createShare(store: Store, taskId: string, role: string, messages: Message[]) {
+  return store.transaction(async () => {
+  const task = (await store.getTask(taskId));
+  if (!task || !(await sharingPolicy(store, task.projectId)).effective) throw new Error('Public conversation sharing is disabled');
+  const existing = (await currentShare(store, taskId, role));
   if (existing) return existing;
   const share: ConversationShare = { id: crypto.randomBytes(32).toString('base64url'), taskId,
     projectId: task.projectId, role, title: task.title, createdAt: Date.now(),
     messages: messages.filter(m => m.role === 'user' || m.role === 'agent').map(m => ({ role: m.role, text: m.text })) };
-  store.kvSet(`conversation-share:${share.id}`, JSON.stringify(share));
-  store.kvSet(indexKey(taskId, role), share.id);
+  (await store.kvSet(`conversation-share:${share.id}`, JSON.stringify(share)));
+  (await store.kvSet(indexKey(taskId, role), share.id));
   return share;
+
+  });
 }
-export function publicShare(store: Store, id: string): ConversationShare | undefined {
+export async function publicShare(store: Store, id: string): Promise<ConversationShare | undefined> {
   if (!/^[A-Za-z0-9_-]{43}$/.test(id)) return;
-  const raw = store.kvGet(`conversation-share:${id}`);
+  const raw = (await store.kvGet(`conversation-share:${id}`));
   if (!raw) return;
   const share: ConversationShare = JSON.parse(raw);
-  const task = store.getTask(share.taskId);
-  if (!task || task.projectId !== share.projectId || !store.getProject(share.projectId)
-    || !sharingPolicy(store, share.projectId).effective) return;
+  const task = (await store.getTask(share.taskId));
+  if (!task || task.projectId !== share.projectId || !(await store.getProject(share.projectId))
+    || !(await sharingPolicy(store, share.projectId)).effective) return;
   return share;
 }
 const escape = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);

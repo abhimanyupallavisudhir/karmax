@@ -36,9 +36,9 @@ const key = projected.tokens.access_token;
 process.env.KARMAX_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-probe-'));
 const home = process.env.KARMAX_HOME;
 fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-const store = new Store(':memory:');
-const project = store.createProject('Isolated E2B candidate check', { worldProvider: 'e2b' });
-const task = store.createTask({ projectId: project.id, title: 'Candidate check', workflow: 'just-do', workflowVersion: '1.7.0', params: { prompt: 'test' } });
+const store = await Store.create(':memory:');
+const project = await store.createProject('Isolated E2B candidate check', { worldProvider: 'e2b' });
+const task = await store.createTask({ projectId: project.id, title: 'Candidate check', workflow: 'just-do', workflowVersion: '1.7.0', params: { prompt: 'test' } });
 const rows = [];
 const report = { taskId: task.id, template, scope: 'isolated process; real E2B/native Codex/browser; not gateway dispatch', rows, startedAt: Date.now(), checks: {} };
 const save = () => fs.writeFileSync(output, JSON.stringify(report), { mode: 0o600 });
@@ -59,7 +59,7 @@ try {
     await withTiming(trace, async () => {
         world = await trace.measure('world.prepare', () => worlds.create('e2b', { taskId: task.id, organizationId: 'org_personal', repos: [], base: 'main', signal: controller.signal }));
         world.handle.meta = { ...world.handle.meta, projectId: project.id };
-        world.handle = store.registerWorld(world.handle, project.id);
+        world.handle = await store.registerWorld(world.handle, project.id);
         const agentMcp = await trace.measure('tool.connection.prepare', () => prepareConnections(undefined, world, ['browser:chrome-devtools'], project.id, task.id, () => { }));
         let toolEvents = 0;
         const forbidden = () => { throw new Error('Platform side effects are disabled in this fixture'); };
@@ -81,14 +81,14 @@ try {
         let inject = true;
         checkpoints.checkpoint = async (h) => { saved = await original(h); if (inject) {
             inject = false;
-            store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(), payload: { role: 'do', message: { id: 'followup', role: 'user', text: 'Continue' } } });
+            await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(), payload: { role: 'do', message: { id: 'followup', role: 'user', text: 'Continue' } } });
         } return saved; };
         const core = makeCoreActivities({ store, worlds, checkpoints, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
         const view = { taskId: task.id, title: task.title, workflow: 'just-do', stage: 'review', status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1, state: {}, world: world.handle };
         await trace.measure('test.review-with-followup', () => core.publishView(task.id, view));
         report.checks.checkpointSaved = !!saved?.id;
         report.checks.followupRetainsReadyWorld = (await worlds.status(world.handle)) === 'ready';
-        report.checks.parkingDeferred = store.eventsOfType(task.id, 'world.park-deferred').length === 1;
+        report.checks.parkingDeferred = (await store.eventsOfType(task.id, 'world.park-deferred')).length === 1;
         if (!report.checks.checkpointSaved || !report.checks.followupRetainsReadyWorld || !report.checks.parkingDeferred)
             throw new Error('Follow-up parking invariant failed');
         await trace.measure('test.review-without-followup', () => core.publishView(task.id, view));
@@ -119,7 +119,7 @@ finally {
     }
     finally {
         report.endedAt = Date.now();
-        store.close();
+        await store.close();
         fs.rmSync(home, { recursive: true, force: true });
         save();
     }

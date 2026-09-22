@@ -26,7 +26,7 @@ describe('metered provider API terminal outcomes', () => {
       profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
     } as any, ctx);
-    const turn = await (tracing ? withTiming(new TimingTrace({ taskId: 'fixture' }, row => rows.push(row)), invoke) : invoke());
+    const turn = await (tracing ? (await withTiming(new TimingTrace({ taskId: 'fixture' }, row => rows.push(row)), invoke)) : invoke());
     expect(rows.filter(row => row.name === 'provider.usage')).toHaveLength(tracing ? 1 : 0);
     expect(turn.termination).toEqual({ kind: 'success', status: 'end_turn', reason: 'end_turn' });
     expect(turn.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 4, cacheWriteTokens: 2,
@@ -71,7 +71,7 @@ describe('metered provider API terminal outcomes', () => {
       profile: { id: 'p', name: 'o', provider: 'codex', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
     } as any, ctx);
-    const turn = await (tracing ? withTiming(new TimingTrace({ taskId: 'fixture' }, row => rows.push(row)), invoke) : invoke());
+    const turn = await (tracing ? (await withTiming(new TimingTrace({ taskId: 'fixture' }, row => rows.push(row)), invoke)) : invoke());
     expect(rows.filter(row => row.name === 'provider.usage')).toHaveLength(tracing ? 1 : 0);
     expect(turn.termination).toEqual({ kind: 'success', status: 'completed' });
     expect(turn.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 6,

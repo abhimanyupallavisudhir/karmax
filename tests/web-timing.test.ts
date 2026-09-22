@@ -6,11 +6,11 @@ import { timingReport, TimingTrace } from '../src/timing/index.js';
 const source = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
 const helpers = source.slice(source.indexOf('const timingReports = new Map();'));
 describe('Timing task tab', () => {
-  it('renders unknowns, percentiles and escaped labels without requiring conversation events', () => {
+  it('renders unknowns, percentiles and escaped labels without requiring conversation events', async () => {
     const rows: any[] = [];
     const trace = new TimingTrace({ taskId: 't', turnId: 'x', attempt: 1 }, r => rows.push(r));
-    const end = trace.start('agent.attempt');
-    trace.mark('adapter.invoked', { provider: 'mock', model: '<img onerror=bad>' }); end();
+    const end = (await trace.start('agent.attempt'));
+    (await trace.mark('adapter.invoked', { provider: 'mock', model: '<img onerror=bad>' })); (await end());
     const context = vm.createContext({
       esc: (s: unknown) => String(s).replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
       report: timingReport(rows), S: { meta: {timingEnabled:true} },

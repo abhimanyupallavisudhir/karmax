@@ -14,16 +14,17 @@ export const environmentBuildRevision = (build: EnvironmentBuildRecord): string 
   crypto.createHash('sha256').update(JSON.stringify(build)).digest('hex');
 
 export interface ProjectEnvironmentStore {
-  kvGet(key: string): string | undefined;
-  kvSet(key: string, value: string): void;
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
+  kvGet(key: string): (string | undefined) | Promise<string | undefined>;
+  kvSet(key: string, value: string): (void) | Promise<void>;
   getProject?: Store['getProject'];
 }
 
 export class ProjectEnvironment {
   constructor(private store: ProjectEnvironmentStore) {}
 
-  spec(projectId: string): ProjectEnvironmentSpec | undefined {
-    const raw = this.store.kvGet(KV_SPEC + projectId);
+  async spec(projectId: string): Promise<ProjectEnvironmentSpec | undefined> {
+    const raw = (await this.store.kvGet(KV_SPEC + projectId));
     if (!raw) return undefined;
     try {
       const parsed = JSON.parse(raw) as ProjectEnvironmentSpec;
@@ -31,14 +32,14 @@ export class ProjectEnvironment {
     } catch { return undefined; }
   }
 
-  setSpec(projectId: string, spec: ProjectEnvironmentSpec): ProjectEnvironmentSpec {
+  async setSpec(projectId: string, spec: ProjectEnvironmentSpec): Promise<ProjectEnvironmentSpec> {
     const clean: ProjectEnvironmentSpec = {
       ...(spec.image?.trim() ? { image: spec.image.trim() } : {}),
       ...(spec.setup?.length ? { setup: spec.setup.map((value) => value.trim()).filter(Boolean) } : {}),
       ...(spec.boot?.length ? { boot: spec.boot.map((value) => value.trim()).filter(Boolean) } : {}),
       ...(spec.includeDocker ? { includeDocker: true } : {}),
     };
-    this.store.kvSet(KV_SPEC + projectId, JSON.stringify(clean));
+    (await this.store.kvSet(KV_SPEC + projectId, JSON.stringify(clean)));
     return clean;
   }
 
@@ -48,33 +49,35 @@ export class ProjectEnvironment {
     })).digest('hex').slice(0, 16);
   }
 
-  builds(projectId: string): EnvironmentBuildRecord[] {
-    try { return JSON.parse(this.store.kvGet(KV_BUILDS + projectId) ?? '[]') as EnvironmentBuildRecord[]; }
+  async builds(projectId: string): Promise<EnvironmentBuildRecord[]> {
+    const raw = await this.store.kvGet(KV_BUILDS + projectId);
+    try { return JSON.parse(raw ?? '[]') as EnvironmentBuildRecord[]; }
     catch { return []; }
   }
 
-  recordBuild(projectId: string, value: Omit<EnvironmentBuildRecord, 'createdAt' | 'updatedAt'>): EnvironmentBuildRecord {
-    const builds = this.builds(projectId);
-    const prior = builds.find((candidate) => candidate.provider === value.provider && candidate.digest === value.digest);
-    const next = { ...value, createdAt: prior?.createdAt ?? Date.now(), updatedAt: Date.now() };
-    // A pre-upgrade gateway may still call this unscoped API after recovery.
-    // Its callback must not replace the recovered record or a newer attempt.
-    if (!value.buildId && this.store.kvGet(recoveryKey(projectId, value.provider, value.digest))) return next;
-    this.store.kvSet(KV_BUILDS + projectId, JSON.stringify([
-      ...builds.filter((candidate) => candidate.provider !== value.provider || candidate.digest !== value.digest), next,
-    ]));
-    return next;
+  async recordBuild(projectId: string, value: Omit<EnvironmentBuildRecord, 'createdAt' | 'updatedAt'>): Promise<EnvironmentBuildRecord> {
+    return this.store.transaction(async () => {
+      const builds = await this.builds(projectId);
+      const prior = builds.find((candidate) => candidate.provider === value.provider && candidate.digest === value.digest);
+      const next = { ...value, createdAt: prior?.createdAt ?? Date.now(), updatedAt: Date.now() };
+      // A recovered build cannot be replaced by a pre-upgrade unscoped callback.
+      if (!value.buildId && await this.store.kvGet(recoveryKey(projectId, value.provider, value.digest))) return next;
+      await this.store.kvSet(KV_BUILDS + projectId, JSON.stringify([
+        ...builds.filter((candidate) => candidate.provider !== value.provider || candidate.digest !== value.digest), next,
+      ]));
+      return next;
+    });
   }
 
-  readyBuild(projectId: string, provider: string, digest: string): EnvironmentBuildRecord | undefined {
-    const record = this.builds(projectId).find((candidate) =>
+  async readyBuild(projectId: string, provider: string, digest: string): Promise<EnvironmentBuildRecord | undefined> {
+    const record = (await this.builds(projectId)).find((candidate) =>
       candidate.provider === provider && candidate.digest === digest);
-    if (!record?.buildId && this.store.kvGet(recoveryKey(projectId, provider, digest))) return undefined;
-    const generation = this.store.kvGet(`project-transfer-current:${projectId}`);
+    if (!record?.buildId && await this.store.kvGet(recoveryKey(projectId, provider, digest))) return undefined;
+    const generation = await this.store.kvGet(`project-transfer-current:${projectId}`);
     // Legacy unscoped builds are usable only before the first transfer. Never
     // let a late legacy callback recreate selectable source-owned artifacts.
     if (record?.organizationId) {
-      if (this.store.getProject?.(projectId)?.organizationId !== record.organizationId
+      if ((await this.store.getProject?.(projectId))?.organizationId !== record.organizationId
         || (generation ?? '') !== record.transferGeneration) return undefined;
     } else if (generation) return undefined;
     return record?.status === 'ready' && record.ref ? record : undefined;
@@ -91,31 +94,28 @@ export type EnvironmentBuildAttempt = EnvironmentBuildScope & {
 
 /** Serialize build admission/completion with transfer cutover across gateways.
  * No transaction is held while the provider builds the artifact. */
-function buildTransaction<T>(store: Store, projectId: string, work: () => T): T {
-  store.db.exec('BEGIN IMMEDIATE');
-  try {
+async function buildTransaction<T>(store: Store, projectId: string, work: () => Promise<T>): Promise<T> {
+  return store.transaction(async () => {
     if (store.db.dialect === 'postgres')
-      store.db.prepare('SELECT id FROM projects WHERE id=? FOR UPDATE').get(projectId);
-    const result = work();
-    store.db.exec('COMMIT');
-    return result;
-  } catch (error) { store.db.exec('ROLLBACK'); throw error; }
+      await store.db.prepare('SELECT id FROM projects WHERE id=? FOR UPDATE').get(projectId);
+    return work();
+  });
 }
-function sameBuildScope(store: Store, projectId: string, scope: EnvironmentBuildScope): boolean {
-  return store.getProject(projectId)?.organizationId === scope.organizationId
-    && (store.kvGet(`project-transfer-current:${projectId}`) ?? '') === scope.transferGeneration;
+async function sameBuildScope(store: Store, projectId: string, scope: EnvironmentBuildScope): Promise<boolean> {
+  return (await store.getProject(projectId))?.organizationId === scope.organizationId
+    && ((await store.kvGet(`project-transfer-current:${projectId}`)) ?? '') === scope.transferGeneration;
 }
 
-export function beginEnvironmentBuild(store: Store, projectId: string, scope: EnvironmentBuildScope,
-  provider: string, digest: string): EnvironmentBuildAttempt {
-  return buildTransaction(store, projectId, () => {
-    store.assertProjectOrganization(projectId, scope.organizationId);
-    if (!sameBuildScope(store, projectId, scope)) throw new Error('Project moved while preparing the build. Reload and retry.');
+export async function beginEnvironmentBuild(store: Store, projectId: string, scope: EnvironmentBuildScope,
+  provider: string, digest: string): Promise<EnvironmentBuildAttempt> {
+  return buildTransaction(store, projectId, async () => {
+    await store.assertProjectOrganization(projectId, scope.organizationId);
+    if (!await sameBuildScope(store, projectId, scope)) throw new Error('Project moved while preparing the build. Reload and retry.');
     const environments = new ProjectEnvironment(store);
-    if (environments.builds(projectId).some(b => b.provider === provider && b.digest === digest && b.status === 'building'))
+    if ((await environments.builds(projectId)).some(b => b.provider === provider && b.digest === digest && b.status === 'building'))
       throw new Error('This environment is already building. Wait for it to finish.');
     const attempt = { ...scope, projectId, provider, digest, buildId: crypto.randomUUID() };
-    environments.recordBuild(projectId, { ...scope, provider, digest, buildId: attempt.buildId,
+    await environments.recordBuild(projectId, { ...scope, provider, digest, buildId: attempt.buildId,
       artifactName: environmentArtifactName(projectId, digest, attempt.buildId), buildHost: os.hostname(), status: 'building' });
     return attempt;
   });
@@ -123,15 +123,15 @@ export function beginEnvironmentBuild(store: Store, projectId: string, scope: En
 
 /** Success and failure use the same fence. A deleted/superseded attempt cannot
  * recreate build metadata or overwrite a newer destination build. */
-export function finishEnvironmentBuild(store: Store, attempt: EnvironmentBuildAttempt,
-  result: { status: 'ready'; ref: string } | { status: 'failed'; error: string }): boolean {
-  return buildTransaction(store, attempt.projectId, () => {
-    if (!sameBuildScope(store, attempt.projectId, attempt)) return false;
+export async function finishEnvironmentBuild(store: Store, attempt: EnvironmentBuildAttempt,
+  result: { status: 'ready'; ref: string } | { status: 'failed'; error: string }): Promise<boolean> {
+  return buildTransaction(store, attempt.projectId, async () => {
+    if (!await sameBuildScope(store, attempt.projectId, attempt)) return false;
     const environments = new ProjectEnvironment(store);
-    const current = environments.builds(attempt.projectId).find(b => b.provider === attempt.provider && b.digest === attempt.digest);
+    const current = (await environments.builds(attempt.projectId)).find(b => b.provider === attempt.provider && b.digest === attempt.digest);
     if (current?.status !== 'building' || current.buildId !== attempt.buildId) return false;
     const { projectId, ...record } = attempt;
-    environments.recordBuild(projectId, { ...current, ...record, ...result });
+    await environments.recordBuild(projectId, { ...current, ...record, ...result });
     return true;
   });
 }
@@ -139,39 +139,39 @@ export function finishEnvironmentBuild(store: Store, attempt: EnvironmentBuildAt
 /** The operator must stop the provider operation and remove its artifact first.
  * Age alone is not proof of abandonment in a multi-gateway installation. The
  * revision binds their cleanup confirmation to exactly the record inspected. */
-export function recoverEnvironmentBuild(store: Store, projectId: string, scope: EnvironmentBuildScope,
-  input: { provider: string; digest: string; revision: string; cleanupConfirmed: boolean; cleanupNote: string }, principal: string): void {
+export async function recoverEnvironmentBuild(store: Store, projectId: string, scope: EnvironmentBuildScope,
+  input: { provider: string; digest: string; revision: string; cleanupConfirmed: boolean; cleanupNote: string }, principal: string): Promise<void> {
   if (input.cleanupConfirmed !== true || !input.cleanupNote?.trim())
     throw new Error('Stop the builder and remove its provider artifacts, then confirm cleanup with a note.');
-  buildTransaction(store, projectId, () => {
-    store.assertProjectOrganization(projectId, scope.organizationId);
-    if (!sameBuildScope(store, projectId, scope)) throw new Error('Project moved. Reload before recovering the build.');
+  await buildTransaction(store, projectId, async () => {
+    await store.assertProjectOrganization(projectId, scope.organizationId);
+    if (!await sameBuildScope(store, projectId, scope)) throw new Error('Project moved. Reload before recovering the build.');
     const environments = new ProjectEnvironment(store);
-    const current = environments.builds(projectId).find(b => b.provider === input.provider && b.digest === input.digest);
+    const current = (await environments.builds(projectId)).find(b => b.provider === input.provider && b.digest === input.digest);
     if (current?.status === 'failed' && current.recoveredFrom === input.revision) return;
     if (current?.status !== 'building' || environmentBuildRevision(current) !== input.revision)
       throw new Error('The build changed. Reload and inspect the current attempt before recovering it.');
     // Keep a permanent fence for legacy callbacks, including after project
     // transfers. The attempt check also fences callbacks from other gateways.
-    environments.recordBuild(projectId, { ...current, buildId: current.buildId ?? crypto.randomUUID(),
+    await environments.recordBuild(projectId, { ...current, buildId: current.buildId ?? crypto.randomUUID(),
       status: 'failed', ref: undefined, recoveredFrom: input.revision, error: 'Abandoned build invalidated after confirmed provider cleanup. Rebuild when ready.' });
-    store.kvSet(recoveryKey(projectId, input.provider, input.digest), input.revision);
-    store.appendAudit({ principalId: principal, action: 'project.environment-build.recovered', scopeKey: `project:${projectId}`,
+    await store.kvSet(recoveryKey(projectId, input.provider, input.digest), input.revision);
+    await store.appendAudit({ principalId: principal, action: 'project.environment-build.recovered', scopeKey: `project:${projectId}`,
       detail: { organizationId: scope.organizationId, transferGeneration: scope.transferGeneration,
         build: current, cleanupNote: input.cleanupNote.trim().slice(0, 2000) } });
   });
 }
 
-export function environmentBuildIsActive(store: Store, attempt: EnvironmentBuildAttempt): boolean {
-  if (!sameBuildScope(store, attempt.projectId, attempt)) return false;
-  return new ProjectEnvironment(store).builds(attempt.projectId).some(b => b.buildId === attempt.buildId && b.status === 'building');
+export async function environmentBuildIsActive(store: Store, attempt: EnvironmentBuildAttempt): Promise<boolean> {
+  if (!await sameBuildScope(store, attempt.projectId, attempt)) return false;
+  return (await new ProjectEnvironment(store).builds(attempt.projectId)).some(b => b.buildId === attempt.buildId && b.status === 'building');
 }
-export function recordEnvironmentBuilder(store: Store, attempt: EnvironmentBuildAttempt, builderId: string): void {
-  buildTransaction(store, attempt.projectId, () => {
-    if (!environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.');
+export async function recordEnvironmentBuilder(store: Store, attempt: EnvironmentBuildAttempt, builderId: string): Promise<void> {
+  await buildTransaction(store, attempt.projectId, async () => {
+    if (!await environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.');
     const environments = new ProjectEnvironment(store);
-    const current = environments.builds(attempt.projectId).find(b => b.buildId === attempt.buildId)!;
-    environments.recordBuild(attempt.projectId, { ...current, builderId });
+    const current = (await environments.builds(attempt.projectId)).find(b => b.buildId === attempt.buildId)!;
+    await environments.recordBuild(attempt.projectId, { ...current, builderId });
   });
 }
 

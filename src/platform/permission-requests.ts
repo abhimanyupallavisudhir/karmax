@@ -50,12 +50,12 @@ export function exactCapability(raw: string): Capability {
  * axes of the next turn's scoped token. Nothing mutates a human/profile grant.
  */
 export class PermissionRequests {
-  constructor(private store: Pick<Store, 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
 
-  requests(filter: { taskId?: string; status?: PermissionRequest['status'] } = {}): PermissionRequest[] {
+  async requests(filter: { taskId?: string; status?: PermissionRequest['status'] } = {}): Promise<PermissionRequest[]> {
     let all: PermissionRequest[] = [];
     try {
-      const raw = this.store.kvGet(requestsKey(this.organizationId));
+      const raw = (await this.store.kvGet(requestsKey(this.organizationId)));
       all = raw ? JSON.parse(raw) : [];
     } catch {
       all = [];
@@ -64,9 +64,9 @@ export class PermissionRequests {
       && (!filter.status || request.status === filter.status));
   }
 
-  extensionCaps(taskId: string, role?: string): Capability[] {
+  async extensionCaps(taskId: string, role?: string): Promise<Capability[]> {
     try {
-      const raw = this.store.kvGet(extensionsKey(taskId));
+      const raw = (await this.store.kvGet(extensionsKey(taskId)));
       const grants = raw ? JSON.parse(raw) : {};
       // Compatibility with the short-lived development representation.
       if (Array.isArray(grants)) return grants.map(String);
@@ -78,7 +78,7 @@ export class PermissionRequests {
     }
   }
 
-  request(input: {
+  async request(input: {
     taskId: string;
     projectId: string;
     role: string;
@@ -90,7 +90,8 @@ export class PermissionRequests {
     avatarRecipients?: string[];
     reason: string;
     requestedBy: string;
-  }): PermissionRequest {
+  }): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
     const capabilities = [...new Set(input.capabilities.map(exactCapability))];
     const projectIds = [...new Set((input.projectIds ?? []).map(String))];
     if (!capabilities.length && !projectIds.length) throw new Error('choose at least one capability or project');
@@ -103,7 +104,7 @@ export class PermissionRequests {
     if (!reason) throw new Error('reason is required');
     if ([...reason].length > 4_000) throw new Error('reason must be at most 4000 characters');
 
-    const all = this.requests();
+    const all = (await this.requests());
     const fingerprint = (values: string[]) => [...values].sort().join('\0');
     const existing = all.find((request) => request.status === 'pending'
       && request.taskId === input.taskId
@@ -130,56 +131,64 @@ export class PermissionRequests {
       status: 'pending',
       createdAt: Date.now(),
     };
-    this.save([...all, request]);
-    this.store.appendAudit({
+    (await this.save([...all, request]));
+    (await this.store.appendAudit({
       principalId: input.requestedBy,
       action: 'permission.requested',
       scopeKey: `project:${input.projectId}`,
       detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, projectIds, baseAuthorization: input.baseAuthorization, audience, recipients, avatarRecipients },
-    });
+    }));
     return request;
+
+    });
   }
 
-  resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean }): PermissionRequest {
-    const all = this.requests();
+  async resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean }): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === requestId);
     if (!request) throw new Error(`no permission request ${requestId}`);
     if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
     if (input.action === 'approve' && !input.alreadyAuthorized) {
       let grants: Record<string, Capability[]> = {};
       try {
-        const raw = this.store.kvGet(extensionsKey(request.taskId));
+        const raw = (await this.store.kvGet(extensionsKey(request.taskId)));
         const parsed = raw ? JSON.parse(raw) : {};
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) grants = parsed;
       } catch {}
       grants[request.role] = [...new Set([...(grants[request.role] ?? []), ...request.capabilities])];
-      this.store.kvSet(extensionsKey(request.taskId), JSON.stringify(grants));
+      (await this.store.kvSet(extensionsKey(request.taskId), JSON.stringify(grants)));
     }
     request.status = input.action === 'approve' ? 'granted' : 'denied';
     request.resolution = { action: input.action, by: input.by, at: Date.now() };
-    this.save(all);
-    this.store.appendAudit({
+    (await this.save(all));
+    (await this.store.appendAudit({
       principalId: input.by,
       action: 'permission.request.resolved',
       scopeKey: `project:${request.projectId}`,
       detail: { requestId, taskId: request.taskId, role: request.role, capabilities: request.capabilities, projectIds: request.projectIds, action: input.action },
-    });
+    }));
     return request;
+
+    });
   }
 
-  dismiss(id: string, by: string): PermissionRequest {
-    const all = this.requests();
+  async dismiss(id: string, by: string): Promise<PermissionRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no permission request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
     request.dismissed ??= { by, at: Date.now() };
-    this.save(all);
-    this.store.appendAudit({ principalId: by, action: 'permission.request.dismissed',
-      scopeKey: `project:${request.projectId}`, detail: { requestId: id } });
+    (await this.save(all));
+    (await this.store.appendAudit({ principalId: by, action: 'permission.request.dismissed',
+      scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
+
+    });
   }
 
-  private save(requests: PermissionRequest[]): void {
-    this.store.kvSet(requestsKey(this.organizationId), JSON.stringify(requests));
+  private async save(requests: PermissionRequest[]): Promise<void> {
+    (await this.store.kvSet(requestsKey(this.organizationId), JSON.stringify(requests)));
   }
 }

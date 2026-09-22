@@ -16,6 +16,6 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["src", "tests", "benchmarks"],
+  "include": ["src", "tests", "benchmarks", "scripts"],
   "exclude": ["node_modules", ".karmax-data"]
 }

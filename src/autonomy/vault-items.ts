@@ -124,10 +124,12 @@ export interface CredentialAccessRequest {
 }
 
 export interface VaultItemStore {
-  vaultUsageHistory?(itemIds: string[], now: number): Record<string, VaultUsage>;
-  kvGet(k: string): string | undefined;
-  kvSet(k: string, v: string): void;
-  appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): number;
+  /** Serialize compound reads and writes on the same transaction connection. */
+  transaction<T>(operation: () => Promise<T>): Promise<T>;
+  vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
+  kvGet(k: string): (string | undefined) | Promise<string | undefined>;
+  kvSet(k: string, v: string): (void) | Promise<void>;
+  appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): (number) | Promise<number>;
 }
 
 // Items and access requests are ORGANIZATION resources (the tenant boundary):
@@ -224,8 +226,9 @@ export class VaultItems {
   ) {}
 
   // ── items ──
-  list(): VaultItem[] {
-    const raw = this.store.kvGet(kvItems(this.organizationId));
+  async list(): Promise<VaultItem[]> {
+    return this.store.transaction(async () => {
+    const raw = (await this.store.kvGet(kvItems(this.organizationId)));
     if (!raw) return [];
     let items: VaultItem[];
     try {
@@ -236,7 +239,7 @@ export class VaultItems {
     const legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
     if (legacy.length) {
       const now = Date.now();
-      const history = this.store.vaultUsageHistory?.(legacy.map((item) => item.id), now) ?? {};
+      const history = (await this.store.vaultUsageHistory?.(legacy.map((item) => item.id), now)) ?? {};
       for (const item of legacy) {
         // Prefer dated audit evidence. Without it, preserve the old count as
         // the initial score, but do not invent a last-use timestamp.
@@ -244,23 +247,25 @@ export class VaultItems {
           useCount: item.useCount ?? 0, frecencyScore: item.useCount ?? 0, frecencyUpdatedAt: now,
         });
       }
-      this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items));
+      (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
     }
     return items;
+
+    });
   }
 
-  get(id: string): VaultItem | undefined {
-    return this.list().find((i) => i.id === id);
+  async get(id: string): Promise<VaultItem | undefined> {
+    return (await this.list()).find((i) => i.id === id);
   }
 
   /** Items whose `domains` cover `host` (subdomains match). */
-  findByDomain(host: string): VaultItem[] {
-    return this.list().filter((i) => (i.domains ?? []).some((d) => domainMatches(host, d)));
+  async findByDomain(host: string): Promise<VaultItem[]> {
+    return (await this.list()).filter((i) => (i.domains ?? []).some((d) => domainMatches(host, d)));
   }
 
   /** The item a connector previously mirrored for `externalId`, if any (§9). */
-  findByExternal(source: string, externalId: string): VaultItem | undefined {
-    return this.list().find((i) => i.provenance.source === source && i.provenance.externalId === externalId);
+  async findByExternal(source: string, externalId: string): Promise<VaultItem | undefined> {
+    return (await this.list()).find((i) => i.provenance.source === source && i.provenance.externalId === externalId);
   }
 
   /** Internal: read a stored secret WITHOUT the capability/policy gate — for
@@ -277,7 +282,7 @@ export class VaultItems {
    * absent leaves it untouched — mirrors GitProfiles.save), and on update an
    * omitted metadata field keeps its stored value (clear with '' / []).
    */
-  save(args: {
+  async save(args: {
     id?: string;
     type: VaultItemType;
     label?: string;
@@ -290,9 +295,10 @@ export class VaultItems {
     /** Internal connector snapshot: remove fields absent from the source. */
     replaceSecrets?: boolean;
     provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; connectorFormatVersion?: number; syncedAt?: number; sourceRevision?: string };
-  }): VaultItem {
+  }): Promise<VaultItem> {
+    return this.store.transaction(async () => {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
-    const prior = args.id ? this.get(args.id) : undefined;
+    const prior = args.id ? (await this.get(args.id)) : undefined;
     if (args.id && !prior) throw new Error(`no vault item ${args.id}`);
     if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
     const label = args.label?.trim() || prior?.label;
@@ -301,7 +307,7 @@ export class VaultItems {
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
       if (args.secrets?.[field] === undefined || (field !== 'note' && !args.secrets[field]?.trim())) {
-        this.requireBroker().deleteHandle(itemHandle(id, field));
+        (await this.requireBroker().deleteHandle(itemHandle(id, field)));
         fields.delete(field);
       }
     }
@@ -309,12 +315,12 @@ export class VaultItems {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
       if (field === 'note' && value !== undefined) {
-        this.requireBroker().registerHandle(itemHandle(id, field), value);
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
         fields.add(field);
         continue;
       }
       if (value?.trim()) {
-        this.requireBroker().registerHandle(itemHandle(id, field), value);
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
         fields.add(field);
       }
     }
@@ -347,20 +353,23 @@ export class VaultItems {
       // Also serves as an optimistic revision for in-flight connector pulls.
       updatedAt: Math.max(Date.now(), (prior?.updatedAt ?? 0) + 1),
     };
-    this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...(await this.list()).filter((i) => i.id !== id), item])));
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
     return item;
+
+    });
   }
 
   /** Bind an item to a connector's external id (write-back round-trips, §9).
    *  The two-argument form preserves legacy callers/data; new write-back code
    *  supplies `connector` so multiple enabled stores retain distinct bindings.
    *  Provenance is otherwise birth-data and never mutated by `save`. */
-  setExternalId(id: string, externalId: string): VaultItem;
-  setExternalId(id: string, connector: string, externalId: string): VaultItem;
-  setExternalId(id: string, connectorOrExternalId: string, boundExternalId?: string): VaultItem {
-    const all = this.list();
+  setExternalId(id: string, externalId: string): Promise<VaultItem>;
+  setExternalId(id: string, connector: string, externalId: string): Promise<VaultItem>;
+  async setExternalId(id: string, connectorOrExternalId: string, boundExternalId?: string): Promise<VaultItem> {
+    return this.store.transaction(async () => {
+    const all = (await this.list());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
     const connector = boundExternalId === undefined ? undefined : connectorOrExternalId;
@@ -375,34 +384,42 @@ export class VaultItems {
         : {}),
     };
     item.updatedAt = Math.max(Date.now(), item.updatedAt + 1);
-    this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all)));
     return item;
+
+    });
   }
 
-  setPolicy(id: string, patch: Partial<VaultItemPolicy>): VaultItem {
-    const all = this.list();
+  async setPolicy(id: string, patch: Partial<VaultItemPolicy>): Promise<VaultItem> {
+    return this.store.transaction(async () => {
+    const all = (await this.list());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
     item.policy = { ...item.policy, ...patch };
     item.updatedAt = Math.max(Date.now(), item.updatedAt + 1);
-    this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all)));
     return item;
+
+    });
   }
 
-  delete(id: string) {
-    const item = this.get(id);
-    deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id);
-    this.store.kvSet(kvItems(this.organizationId), JSON.stringify(this.list().filter((i) => i.id !== id)));
-    for (const field of item?.fields ?? []) this.broker?.deleteHandle(itemHandle(id, field));
+  async delete(id: string) {
+    return this.store.transaction(async () => {
+    const item = (await this.get(id));
+    (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
+    for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
+
+    });
   }
 
   // ── grants: task extensions + one-shot passes (human-resolved escalations) ──
 
   /** Caps a human granted this task after creation (§7 approve-for-task),
    *  merged into the workflow grant at every subsequent token mint. */
-  extensions(taskId: string): { cap: Capability; grantedBy: string; at: number }[] {
-    const raw = this.store.kvGet(kvGrant(taskId));
+  async extensions(taskId: string): Promise<{ cap: Capability; grantedBy: string; at: number }[]> {
+    const raw = (await this.store.kvGet(kvGrant(taskId)));
     if (!raw) return [];
     try {
       return JSON.parse(raw);
@@ -411,19 +428,22 @@ export class VaultItems {
     }
   }
 
-  extensionCaps(taskId: string): Capability[] {
-    return this.extensions(taskId).map((e) => e.cap);
+  async extensionCaps(taskId: string): Promise<Capability[]> {
+    return (await this.extensions(taskId)).map((e) => e.cap);
   }
 
-  private extend(taskId: string, cap: Capability, grantedBy: string) {
-    const cur = this.extensions(taskId);
+  private async extend(taskId: string, cap: Capability, grantedBy: string) {
+    return this.store.transaction(async () => {
+    const cur = (await this.extensions(taskId));
     if (!cur.some((e) => e.cap === cap)) {
-      this.store.kvSet(kvGrant(taskId), JSON.stringify([...cur, { cap, grantedBy, at: Date.now() }]));
+      (await this.store.kvSet(kvGrant(taskId), JSON.stringify([...cur, { cap, grantedBy, at: Date.now() }])));
     }
+
+    });
   }
 
-  private passes(taskId: string): { itemId: string; mode: AccessMode }[] {
-    const raw = this.store.kvGet(kvPasses(taskId));
+  private async passes(taskId: string): Promise<{ itemId: string; mode: AccessMode }[]> {
+    const raw = (await this.store.kvGet(kvPasses(taskId)));
     if (!raw) return [];
     try {
       return JSON.parse(raw);
@@ -432,26 +452,32 @@ export class VaultItems {
     }
   }
 
-  private addPass(taskId: string, itemId: string, mode: AccessMode) {
-    this.store.kvSet(kvPasses(taskId), JSON.stringify([...this.passes(taskId), { itemId, mode }]));
+  private async addPass(taskId: string, itemId: string, mode: AccessMode) {
+    return this.store.transaction(async () => {
+    (await this.store.kvSet(kvPasses(taskId), JSON.stringify([...(await this.passes(taskId)), { itemId, mode }])));
+
+    });
   }
 
-  private takePass(taskId: string, itemId: string, mode: AccessMode, consume: boolean): boolean {
-    const all = this.passes(taskId);
+  private async takePass(taskId: string, itemId: string, mode: AccessMode, consume: boolean): Promise<boolean> {
+    return this.store.transaction(async () => {
+    const all = (await this.passes(taskId));
     // A reveal pass also covers non-revealing use of the same item.
     const idx = all.findIndex((p) => p.itemId === itemId && (p.mode === mode || p.mode === 'reveal'));
     if (idx < 0) return false;
     if (consume) {
       all.splice(idx, 1);
-      this.store.kvSet(kvPasses(taskId), JSON.stringify(all));
+      (await this.store.kvSet(kvPasses(taskId), JSON.stringify(all)));
     }
     return true;
+
+    });
   }
 
   /** Sparse task-local policy overrides. Invalid persisted values are ignored so
    * a damaged/migrated KV entry cannot accidentally weaken a credential policy. */
-  taskPolicies(taskId: string): VaultTaskPolicyOverrides {
-    const raw = this.store.kvGet(kvTaskPolicies(taskId));
+  async taskPolicies(taskId: string): Promise<VaultTaskPolicyOverrides> {
+    const raw = (await this.store.kvGet(kvTaskPolicies(taskId)));
     if (!raw) return {};
     try {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -470,7 +496,7 @@ export class VaultItems {
     }
   }
 
-  setTaskPolicies(taskId: string, policies: VaultTaskPolicyOverrides): VaultTaskPolicyOverrides {
+  async setTaskPolicies(taskId: string, policies: VaultTaskPolicyOverrides): Promise<VaultTaskPolicyOverrides> {
     const clean: VaultTaskPolicyOverrides = {};
     for (const [itemId, policy] of Object.entries(policies ?? {})) {
       const next: Partial<VaultItemPolicy> = {};
@@ -478,23 +504,23 @@ export class VaultItems {
       if (policy?.reveal === 'auto' || policy?.reveal === 'ask' || policy?.reveal === 'never') next.reveal = policy.reveal;
       if (Object.keys(next).length) clean[itemId] = next;
     }
-    this.store.kvSet(kvTaskPolicies(taskId), JSON.stringify(clean));
+    (await this.store.kvSet(kvTaskPolicies(taskId), JSON.stringify(clean)));
     return clean;
   }
 
-  effectivePolicy(taskId: string | undefined, item: VaultItem): VaultItemPolicy {
-    const override = taskId ? this.taskPolicies(taskId)[item.id] : undefined;
+  async effectivePolicy(taskId: string | undefined, item: VaultItem): Promise<VaultItemPolicy> {
+    const override = taskId ? (await this.taskPolicies(taskId))[item.id] : undefined;
     return { ...item.policy, ...override };
   }
 
   // ── access decision (§5/§7): capability coverage, then item policy ──
 
-  covered(caps: Capability[], taskId: string | undefined, item: VaultItem): boolean {
+  async covered(caps: Capability[], taskId: string | undefined, item: VaultItem): Promise<boolean> {
     // A task owns credentials it creates. This is deliberately only grant
     // coverage: the item's use/reveal policy still applies, so a same-task
     // credential with reveal=ask remains approval-gated for plaintext access.
     if (taskId && item.provenance.taskId === taskId) return true;
-    const all = taskId ? [...caps, ...this.extensionCaps(taskId)] : caps;
+    const all = taskId ? [...caps, ...(await this.extensionCaps(taskId))] : caps;
     return itemCaps(item).some((c) => allows(all, c));
   }
 
@@ -511,34 +537,35 @@ export class VaultItems {
    * `resolve`'s `task` action is the one that means "for the rest of this task",
    * and it grants a durable capability extension that `covered()` picks up here.
    */
-  access(
+  async access(
     caps: Capability[], taskId: string | undefined, item: VaultItem, mode: AccessMode,
     opts: { consume?: boolean; ambient?: boolean } = {},
-  ): { status: AccessStatus; reason?: string } {
+  ): Promise<{ status: AccessStatus; reason?: string }> {
     // `never` is absolute: it is checked before a one-shot pass so an approval
     // that was parked for another reason (a reset report, a mode the human did
     // not look at) can never be spent on plaintext.
-    const policyForTask = this.effectivePolicy(taskId, item);
+    const policyForTask = (await this.effectivePolicy(taskId, item));
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
-    if (taskId && !opts.ambient && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
-    if (!this.covered(caps, taskId, item)) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
+    if (taskId && !opts.ambient && (await this.takePass(taskId, item.id, mode, opts.consume ?? false))) return { status: 'granted' };
+    if (!(await this.covered(caps, taskId, item))) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
     const policy = mode === 'reveal' ? policyForTask.reveal : policyForTask.use;
     if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (${taskId ? 'task' : 'item'} policy)` };
     return { status: 'granted' };
   }
 
   /** Resolve a secret field AFTER an access decision granted it. Audited. */
-  resolveField(item: VaultItem, field: VaultFieldName, ctx: { taskId?: string; principal?: string; mode: AccessMode }): string {
+  async resolveField(item: VaultItem, field: VaultFieldName, ctx: { taskId?: string; principal?: string; mode: AccessMode }): Promise<string> {
+    return this.store.transaction(async () => {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
     const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
     // Migrate history before appending this access so it is counted only once.
-    const items = this.list();
-    this.store.appendAudit({
+    const items = (await this.list());
+    (await this.store.appendAudit({
       principalId: ctx.principal ?? (ctx.taskId ? `task:${ctx.taskId}` : 'system'),
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',
       detail: { itemId: item.id, label: item.label, field, ...(ctx.taskId ? { taskId: ctx.taskId } : {}) },
-    });
+    }));
     // Read fresh metadata: callers may reuse an item across several fields.
     // Usage must not move updatedAt, which connector sync uses for edits.
     const current = items.find((candidate) => candidate.id === item.id);
@@ -548,14 +575,16 @@ export class VaultItems {
       current.frecencyScore = decayVaultUsage(current.frecencyScore ?? 0, current.frecencyUpdatedAt ?? now, now) + 1;
       current.frecencyUpdatedAt = now;
       current.lastUsedAt = now;
-      this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items));
+      (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
     }
     return secret;
+
+    });
   }
 
   /** The current TOTP code for a login item (never the seed). */
-  totp(item: VaultItem, ctx: { taskId?: string; principal?: string }): string {
-    return totpCode(this.resolveField(item, 'totp', { ...ctx, mode: 'use' }));
+  async totp(item: VaultItem, ctx: { taskId?: string; principal?: string }): Promise<string> {
+    return totpCode((await this.resolveField(item, 'totp', { ...ctx, mode: 'use' })));
   }
 
   // ── spawn-time materialization (§5A) ──
@@ -565,27 +594,27 @@ export class VaultItems {
    * `envVar`, `ssh-key` items a 0600 key file path under `envVar`. `ask` items
    * and unattached items never inject ambiently.
    */
-  envFor(taskId: string, caps: Capability[]): Record<string, string> {
+  async envFor(taskId: string, caps: Capability[]): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
-    for (const item of this.list()) {
+    for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
-      if (this.access(caps, taskId, item, 'use', { ambient: true }).status !== 'granted') continue;
+      if ((await this.access(caps, taskId, item, 'use', { ambient: true })).status !== 'granted') continue;
       try {
         if (item.type === 'env' && item.fields.includes('env')) {
-          for (const line of this.resolveField(item, 'env', { taskId, mode: 'use' }).split('\n')) {
+          for (const line of (await this.resolveField(item, 'env', { taskId, mode: 'use' })).split('\n')) {
             const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
             if (!m || line.trim().startsWith('#')) continue;
             env[m[1]!] = m[2]!.replace(/^(["'])(.*)\1$/, '$2');
           }
         } else if (item.type === 'api-key' && item.envVar && item.fields.includes('secret')) {
-          env[item.envVar] = this.resolveField(item, 'secret', { taskId, mode: 'use' });
+          env[item.envVar] = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
         } else if (item.type === 'ssh-key' && item.envVar && item.fields.includes('privateKey')) {
-          env[item.envVar] = this.materializeKey(item, { taskId });
+          env[item.envVar] = (await this.materializeKey(item, { taskId }));
         }
       } catch (e) {
         // One corrupted/missing secret must not block every turn granted to it;
         // the failure is audited instead of silently skipped.
-        this.store.appendAudit({ principalId: `task:${taskId}`, action: 'vault.inject.failed', detail: { itemId: item.id, error: e instanceof Error ? e.message : String(e) } });
+        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'vault.inject.failed', detail: { itemId: item.id, error: e instanceof Error ? e.message : String(e) } }));
       }
     }
     return env;
@@ -593,8 +622,8 @@ export class VaultItems {
 
   // ── access requests (§7 — the request_spend-shaped escalation) ──
 
-  requests(filter: { taskId?: string; status?: CredentialAccessRequest['status'] } = {}): CredentialAccessRequest[] {
-    const raw = this.store.kvGet(kvRequests(this.organizationId));
+  async requests(filter: { taskId?: string; status?: CredentialAccessRequest['status'] } = {}): Promise<CredentialAccessRequest[]> {
+    const raw = (await this.store.kvGet(kvRequests(this.organizationId)));
     let all: CredentialAccessRequest[] = [];
     try {
       all = raw ? JSON.parse(raw) : [];
@@ -604,8 +633,8 @@ export class VaultItems {
     return all.filter((r) => (!filter.taskId || r.taskId === filter.taskId) && (!filter.status || r.status === filter.status));
   }
 
-  private saveRequests(all: CredentialAccessRequest[]) {
-    this.store.kvSet(kvRequests(this.organizationId), JSON.stringify(all));
+  private async saveRequests(all: CredentialAccessRequest[]) {
+    (await this.store.kvSet(kvRequests(this.organizationId), JSON.stringify(all)));
   }
 
   /**
@@ -614,37 +643,38 @@ export class VaultItems {
    * (no matching item; parked with the domain so the human can add one or say
    * "create it yourself") | denied (hard policy no).
    */
-  request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string }): { status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string } {
+  async request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string }): Promise<{ status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string }> {
     const mode: AccessMode = args.mode === 'reveal' ? 'reveal' : 'use';
     const kind = args.kind === 'reset' ? 'reset' : 'access';
     const item = args.itemId
-      ? this.get(args.itemId)
+      ? (await this.get(args.itemId))
       : args.domain
-        ? this.findByDomain(args.domain)[0]
+        ? (await this.findByDomain(args.domain))[0]
         : undefined;
     if (!item) {
       if (!args.itemId && !args.domain) throw new Error('itemId or domain required');
-      const parked = this.park({ ...args, mode, kind, itemId: undefined });
-      this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } });
+      const parked = (await this.park({ ...args, mode, kind, itemId: undefined }));
+      (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } }));
       return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id };
     }
     // A reset report ALWAYS parks for the human — the whole point is that the
     // stored secret failed, so "granted" access to a wrong password is useless.
     if (kind !== 'reset') {
-      const decision = this.access(args.caps, args.taskId, item, mode);
+      const decision = (await this.access(args.caps, args.taskId, item, mode));
       if (decision.status === 'granted') return { status: 'granted', itemId: item.id };
       if (decision.status === 'denied') {
-        this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, status: 'denied' } });
+        (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, status: 'denied' } }));
         return { status: 'denied', reason: decision.reason, itemId: item.id };
       }
     }
-    const parked = this.park({ ...args, mode, kind, itemId: item.id });
-    this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, kind, status: 'needs_approval' } });
+    const parked = (await this.park({ ...args, mode, kind, itemId: item.id }));
+    (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, kind, status: 'needs_approval' } }));
     return { status: 'needs_approval', reason: kind === 'reset' ? `reported invalid: "${item.label}" — the human will update it (or send a reset code)` : undefined, requestId: parked.id, itemId: item.id };
   }
 
-  private park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string }): CredentialAccessRequest {
-    const all = this.requests();
+  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string }): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
     const existing = all.find((r) => r.status === 'pending' && r.taskId === args.taskId && r.mode === args.mode
       && (r.kind ?? 'access') === (args.kind ?? 'access')
       && (args.itemId ? r.itemId === args.itemId : !r.itemId && r.domain === args.domain));
@@ -662,8 +692,10 @@ export class VaultItems {
       status: 'pending',
       createdAt: Date.now(),
     };
-    this.saveRequests([...all, req]);
+    (await this.saveRequests([...all, req]));
     return req;
+
+    });
   }
 
   /**
@@ -673,34 +705,37 @@ export class VaultItems {
    * for that mode), or `deny`. A not-in-vault request must be bound to an item
    * (created meanwhile) via `itemId` before a grant action.
    */
-  resolve(requestId: string, args: { action: 'once' | 'task' | 'always' | 'deny'; by: string; itemId?: string }): CredentialAccessRequest {
-    const all = this.requests();
+  async resolve(requestId: string, args: { action: 'once' | 'task' | 'always' | 'deny'; by: string; itemId?: string }): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
     if (!req) throw new Error(`no credential request ${requestId}`);
     if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
     if (args.action !== 'deny') {
       const itemId = req.itemId ?? args.itemId;
-      const item = itemId ? this.get(itemId) : undefined;
+      const item = itemId ? (await this.get(itemId)) : undefined;
       if (!item) throw new Error('bind this request to a vault item first (add the item, then resolve with its itemId)');
       req.itemId = item.id;
-      this.addPass(req.taskId, item.id, req.mode);
-      if (args.action === 'task' || args.action === 'always') this.extend(req.taskId, `use-credential:item:${item.id}`, args.by);
+      (await this.addPass(req.taskId, item.id, req.mode));
+      if (args.action === 'task' || args.action === 'always') (await this.extend(req.taskId, `use-credential:item:${item.id}`, args.by));
       if (args.action === 'always') {
-        this.setPolicy(item.id, req.mode === 'reveal' ? { reveal: 'auto' } : { use: 'auto' });
+        (await this.setPolicy(item.id, req.mode === 'reveal' ? { reveal: 'auto' } : { use: 'auto' }));
       }
     }
     req.status = args.action === 'deny' ? 'denied' : 'granted';
     req.resolution = { action: args.action, by: args.by, at: Date.now() };
-    this.saveRequests(all);
-    this.store.appendAudit({ principalId: args.by, action: 'vault.request.resolved', detail: { requestId, taskId: req.taskId, itemId: req.itemId, action: args.action } });
+    (await this.saveRequests(all));
+    (await this.store.appendAudit({ principalId: args.by, action: 'vault.request.resolved', detail: { requestId, taskId: req.taskId, itemId: req.itemId, action: args.action } }));
     return req;
+
+    });
   }
 
   /** Write a key to a 0600 file (idempotent per save) and return its path. */
-  private materializeKey(item: VaultItem, ctx: { taskId?: string }): string {
+  private async materializeKey(item: VaultItem, ctx: { taskId?: string }): Promise<string> {
     const file = path.join(this.keyDir(item.id), 'key');
     if (!fs.existsSync(file)) {
-      const secret = this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' });
+      const secret = (await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' }));
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
       fs.writeFileSync(file, secret.endsWith('\n') ? secret : `${secret}\n`, { mode: 0o600 });
     }

@@ -31,9 +31,9 @@ describe('MCP task workflow end to end', () => {
   afterAll(async () => { await harness?.stop(); });
   it('selects a project connection, invokes it, enters Review, and keeps its secret out of history', async () => {
     const repo = await harness.makeRepo('mcp-workflow');
-    const project = harness.store.createProject('MCP workflow', { repos: [repo] });
+    const project = (await harness.store.createProject('MCP workflow', { repos: [repo] }));
     const service = new McpConnections(harness.store, harness.broker, project.organizationId ?? 'org_personal');
-    const connection = service.save({ label: 'Workflow fixture', transport: { type: 'stdio', command: process.execPath, args: [path.resolve('tests/fixtures/mcp-hostile.mjs')] }, auth: 'secrets', secrets: { FIXTURE_SECRET: 'workflow-vault-only' } }, project.id);
+    const connection = (await service.save({ label: 'Workflow fixture', transport: { type: 'stdio', command: process.execPath, args: [path.resolve('tests/fixtures/mcp-hostile.mjs')] }, auth: 'secrets', secrets: { FIXTURE_SECRET: 'workflow-vault-only' } }, project.id));
     const taskId = newId('task');
     const handle = await harness.client.workflow.start('softwareDev', { taskQueue: TASK_QUEUE, workflowId: taskId, args: [{
       taskId, projectId: project.id, title: 'MCP workflow', prompt: '@review MCP complete', base: 'main', target: 'main',

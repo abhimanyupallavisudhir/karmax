@@ -19,7 +19,7 @@ import type { WorldHandle } from '../src/world/types.js';
 describe('fork world initialization', () => {
   it.each(['parked', 'done', 'cancelled', 'failed'] as const)('restores exact commits, dirty files and private resources from a %s source; changing base uses normal state', async (state) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-world-'));
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const repo = path.join(dir, 'repo');
@@ -29,20 +29,20 @@ describe('fork world initialization', () => {
     fs.writeFileSync(path.join(repo, 'file.txt'), 'main');
     await gitOrThrow(repo, ['add', '.']);
     await gitOrThrow(repo, ['commit', '-qm', 'initial']);
-    const project = store.createProject('Fork', { repos: [repo], defaultBase: 'main' });
-    const sourceTask = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'source' } });
+    const project = (await store.createProject('Fork', { repos: [repo], defaultBase: 'main' }));
+    const sourceTask = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'source' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
     const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources);
-    const volume = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const volume = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Data', driver: 'volume@1', target: { kind: 'path', path: 'data' }, access: 'write',
-      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
     await resources.importFiles(volume.id, [{ path: 'value.txt', data: Buffer.from('promoted') }]);
     const source = await worlds.create('worktree', { taskId: sourceTask.id, repo, base: 'main', target: 'main' });
     source.handle = await resources.materialize(project.id, sourceTask.id, source);
-    source.handle = store.registerWorld(source.handle, project.id) as WorldHandle;
+    source.handle = (await store.registerWorld(source.handle, project.id)) as WorldHandle;
     const created: WorldHandle[] = [];
     try {
       const olderCheckpoint = await checkpoints.checkpoint(source.handle, { scrubSecrets: false });
@@ -62,11 +62,11 @@ describe('fork world initialization', () => {
       // destroyed before setup runs, and a fresh provider can still report ready.
       const finished = state !== 'parked';
       if (finished) {
-        store.saveView(sourceTask.id, { status: state } as any);
+        (await store.saveView(sourceTask.id, { status: state } as any));
         await source.destroy();
-        store.setWorldState(source.handle, 'released');
+        (await store.setWorldState(source.handle, 'released'));
         // A stale durable handle must not make us restore an older snapshot.
-        store.attachWorldCheckpoint(source.handle, olderCheckpoint.id);
+        (await store.attachWorldCheckpoint(source.handle, olderCheckpoint.id));
       }
       const capture = vi.spyOn(checkpoints, 'checkpoint');
       const open = worlds.open.bind(worlds);
@@ -80,12 +80,12 @@ describe('fork world initialization', () => {
       const core = makeCoreActivities({ store, worlds, adapters: new Map(), resources, checkpoints,
         profiles: new ProfileResolver(store, 'mock'), contentDir: path.join(dir, 'content') });
       const create = async (base: string, reuse: boolean) => {
-        const task = store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
-          workflowVersion: '1.0.0', params: { prompt: 'fork', base, _forkWorld: plan } });
+        const task = (await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+          workflowVersion: '1.0.0', params: { prompt: 'fork', base, _forkWorld: plan } }));
         const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
           base, target: 'main', kind: 'worktree' });
         created.push(handle);
-        if (reuse) expect(store.kvGet(`fork-checkpoint:${task.id}`)).toBe(checkpoint.id);
+        if (reuse) expect((await store.kvGet(`fork-checkpoint:${task.id}`))).toBe(checkpoint.id);
         return worlds.open(handle);
       };
       const fork = await create(plan.base, true);
@@ -109,7 +109,7 @@ describe('fork world initialization', () => {
       expect(await resources.summarize(fork.handle.id, volume.id)).toMatchObject({ added: 0, modified: 1, deleted: 0 });
       if (!finished) expect(await source.readFile('data/value.txt')).toBe('unpublished resource');
       if (finished) expect(opened.mock.calls.some(([handle]) => handle.id === sourceTask.id)).toBe(false);
-      expect(store.currentWorld(sourceTask.id)?.generation).toBe(source.handle.generation);
+      expect((await store.currentWorld(sourceTask.id))?.generation).toBe(source.handle.generation);
       expect(capture).not.toHaveBeenCalled();
 
       const fresh = await create('main', false);
@@ -124,23 +124,23 @@ describe('fork world initialization', () => {
     } finally {
       for (const handle of created) await (await worlds.open(handle)).destroy();
       if (state === 'parked') await source.destroy();
-      store.close();
+      (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it.each(['missing', 'older-generation'] as const)('refuses a finished source with a %s checkpoint instead of opening it or dropping files', async (scenario) => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
-    const project = store.createProject('Fork');
-    const source = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'source' } });
-    const handle = store.registerWorld({ id: source.id, kind: 'worktree', root: '/unavailable',
-      branch: 'karmax/source', base: 'main', target: 'main' }, project.id) as WorldHandle;
+    const project = (await store.createProject('Fork'));
+    const source = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'source' } }));
+    const handle = (await store.registerWorld({ id: source.id, kind: 'worktree', root: '/unavailable',
+      branch: 'karmax/source', base: 'main', target: 'main' }, project.id)) as WorldHandle;
     const plan = forkWorldSource(source, handle)!;
-    store.saveView(source.id, { status: 'done' } as any);
-    const task = store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'fork', _forkWorld: plan } });
+    (await store.saveView(source.id, { status: 'done' } as any));
+    const task = (await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'fork', _forkWorld: plan } }));
     if (scenario === 'older-generation') vi.spyOn(store, 'latestWorldCheckpoint').mockReturnValue({
       id: 'old', worldId: source.id, projectId: project.id, generation: 0,
     } as any);
@@ -153,21 +153,21 @@ describe('fork world initialization', () => {
       await expect(core.createWorld({ taskId: task.id, projectId: project.id, base: plan.base,
         target: 'main', kind: 'worktree' })).rejects.toThrow('without a checkpoint for its current generation');
       expect(opened).not.toHaveBeenCalled();
-      expect(store.currentWorld(task.id)).toBeUndefined();
-    } finally { store.close(); }
+      expect((await store.currentWorld(task.id))).toBeUndefined();
+    } finally { (await store.close()); }
   });
 
   it('copies repositoryless output files without copying injected secrets', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-plain-'));
-    const store = new Store(':memory:');
-    const project = store.createProject('Documents');
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Documents'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const checkpoints = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const source = await worlds.create('worktree', { taskId: 'source', base: 'main' });
     source.handle.meta = { ephemeralPaths: ['credential.txt'] };
-    source.handle = store.registerWorld(source.handle, project.id) as WorldHandle;
+    source.handle = (await store.registerWorld(source.handle, project.id)) as WorldHandle;
     const fork = await worlds.create('worktree', { taskId: 'fork', base: 'main' });
     try {
       await source.writeFile('reports/result.txt', 'saved output');
@@ -184,14 +184,14 @@ describe('fork world initialization', () => {
     } finally {
       await fork.destroy();
       await source.destroy();
-      store.close();
+      (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it('preserves separate repository branches and commits', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-repos-'));
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const repositories = ['one', 'two'].map((name) => path.join(dir, name));
     for (const repo of repositories) {
       fs.mkdirSync(repo);
@@ -201,15 +201,15 @@ describe('fork world initialization', () => {
       await gitOrThrow(repo, ['add', '.']);
       await gitOrThrow(repo, ['commit', '-qm', 'initial']);
     }
-    const project = store.createProject('Repos', { repos: repositories });
-    const task = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'source' } });
+    const project = (await store.createProject('Repos', { repos: repositories }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'source' } }));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const checkpoints = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const source = await worlds.create('worktree', { taskId: task.id, repos: repositories, base: 'main', target: 'main' });
-    source.handle = store.registerWorld(source.handle, project.id) as WorldHandle;
+    source.handle = (await store.registerWorld(source.handle, project.id)) as WorldHandle;
     const fork = await worlds.create('worktree', { taskId: 'fork', repos: repositories, base: 'main' });
     try {
       for (const repo of source.handle.repos!) {
@@ -224,12 +224,12 @@ describe('fork world initialization', () => {
         expect(await fork.readFile(`${repo.name}/dirty`)).toBe(`dirty ${repo.name}`);
         expect(repo.baseSha).toBe(checkpoint.repos.find((entry) => entry.checkoutPath === repo.name)?.headSha);
       }
-      store.saveView(task.id, { status: 'done', targetBranch: 'main' } as any);
-      expect(forkWorldSource(store.getTask(task.id)!, source.handle)?.repos.map((repo) => repo.base)).toEqual(['main', 'main']);
+      (await store.saveView(task.id, { status: 'done', targetBranch: 'main' } as any));
+      expect(forkWorldSource((await store.getTask(task.id))!, source.handle)?.repos.map((repo) => repo.base)).toEqual(['main', 'main']);
     } finally {
       await fork.destroy();
       await source.destroy();
-      store.close();
+      (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -50,7 +50,7 @@ describe('WorktreeProvider (real git)', () => {
   });
 
   it('tags remote sandbox transport failures for outage-tolerant workflow backoff', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
     worlds.register({
       kind: 'fake-remote',
@@ -69,18 +69,18 @@ describe('WorktreeProvider (real git)', () => {
       expect(failure).toBeInstanceOf(ApplicationFailure);
       expect(failure).toMatchObject({ type: 'world-infra', nonRetryable: false });
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 
   it('parks a remote world when its task escalates as blocked', async () => {
-    const store = new Store(':memory:');
-    const project = store.createProject('Blocked remote', {});
-    const task = store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
-    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id,
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Blocked remote', {}));
+    const task = (await store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any }));
+    const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id,
       generation: 1, root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`,
-      base: 'main', meta: { projectId: project.id } }, project.id) as any;
+      base: 'main', meta: { projectId: project.id } }, project.id)) as any;
     let parked = false;
     const worlds = new WorldRegistry();
     worlds.register({
@@ -97,24 +97,24 @@ describe('WorktreeProvider (real git)', () => {
         pointOfNoReturnPassed: false, editableParams: [], updatedAt: 1,
       } as any);
       expect(parked).toBe(true);
-      expect(store.worldState(task.id)).toBe('parked');
+      expect((await store.worldState(task.id))).toBe('parked');
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 
   it('does not publish the old run as cancelled during a lifecycle replacement', async () => {
-    const store = new Store(':memory:');
-    const project = store.createProject('Replacement', {});
-    const task = store.createTask({ projectId: project.id, title: 'Still alive', workflow: 'software-dev',
-      workflowVersion: '1.22.0', params: { prompt: 'x' } as any });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Replacement', {}));
+    const task = (await store.createTask({ projectId: project.id, title: 'Still alive', workflow: 'software-dev',
+      workflowVersion: '1.22.0', params: { prompt: 'x' } as any }));
     const active = {
       taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'do', status: 'active',
       messages: [], actions: [], state: {}, updatedAt: 1,
     } as any;
-    store.saveView(task.id, active);
-    store.appendEvent({ taskId: task.id, type: 'agent.output', ts: 1, payload: { text: 'preserve me' } });
-    store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({ requestedAt: Date.now() }));
+    (await store.saveView(task.id, active));
+    (await store.appendEvent({ taskId: task.id, type: 'agent.output', ts: 1, payload: { text: 'preserve me' } }));
+    (await store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({ requestedAt: Date.now() })));
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock') });
 
@@ -124,23 +124,23 @@ describe('WorktreeProvider (real git)', () => {
         state: { cancelled: true, cancelledFrom: 'do' }, updatedAt: 2,
       });
 
-      expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'do', status: 'active' });
-      expect(store.getTask(task.id)?.params.archived).not.toBe(true);
-      expect(store.eventsSince(task.id, 0)).toEqual(expect.arrayContaining([
+      expect((await store.getTask(task.id))?.lastView).toMatchObject({ stage: 'do', status: 'active' });
+      expect((await store.getTask(task.id))?.params.archived).not.toBe(true);
+      expect((await store.eventsSince(task.id, 0))).toEqual(expect.arrayContaining([
         expect.objectContaining({ type: 'agent.output', payload: { text: 'preserve me' } }),
       ]));
-      expect(store.eventsSince(task.id, 0).some((event) =>
+      expect((await store.eventsSince(task.id, 0)).some((event) =>
         event.type === 'view.updated' && event.payload.status === 'cancelled')).toBe(false);
 
       // A real cancellation has no replacement marker and remains terminal.
-      store.kvDelete(lifecycleReplacementKey(task.id));
+      (await store.kvDelete(lifecycleReplacementKey(task.id)));
       await core.publishView(task.id, {
         ...active, stage: 'cancelled', status: 'cancelled',
         state: { cancelled: true, cancelledFrom: 'do' }, updatedAt: 3,
       });
-      expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'cancelled', status: 'cancelled' });
+      expect((await store.getTask(task.id))?.lastView).toMatchObject({ stage: 'cancelled', status: 'cancelled' });
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 
@@ -212,7 +212,7 @@ describe('WorktreeProvider (real git)', () => {
 
   it.each([false, true])('restores resources beside the agent with a companion wiki (multiple development repos: %s)', async (multiple) => {
     const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const sources = [repo];
     if (multiple) {
       const extra = path.join(contentDir, 'extra'); fs.mkdirSync(extra);
@@ -220,28 +220,28 @@ describe('WorktreeProvider (real git)', () => {
       await gitOrThrow(extra, ['commit', '--allow-empty', '-q', '-m', 'init']);
       sources.push(extra);
     }
-    const project = store.createProject('Wiki world', { repos: sources, defaultBase: 'main', defaultTarget: 'main' });
-    const task = store.createTask({ projectId: project.id, title: 'Edit both', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const project = (await store.createProject('Wiki world', { repos: sources, defaultBase: 'main', defaultTarget: 'main' }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Edit both', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } }));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(home));
     const broker = new CredentialBroker(new Vault(path.join(contentDir, 'vault')));
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(contentDir, 'objects')), broker), broker);
-    const ledger = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const ledger = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Ledger', driver: 'object-tree@1', target: { kind: 'path', path: 'runs/spend.sqlite' },
-      access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
+      access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' }));
     // Larger than a snapshot chunk exercises append as well as the initial write.
     const bytes = Buffer.alloc(5 * 1024 * 1024 + 17, 0x71);
     await resources.importFiles(ledger.id, [{ path: 'spend.sqlite', data: bytes }]);
-    const dataset = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const dataset = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Dataset', driver: 'volume@1', target: { kind: 'path', path: 'data' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
     await resources.importFiles(dataset.id, [{ path: 'packets.jsonl', data: Buffer.from('dataset') }]);
-    broker.registerHandle('resource:wiki-test', 'private-token');
-    store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    (await broker.registerHandle('resource:wiki-test', 'private-token'));
+    (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'File secret', driver: 'secret@1', target: { kind: 'path', path: '.env.local' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:wiki-test'], publish: 'discard' });
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:wiki-test'], publish: 'discard' }));
     const core = makeCoreActivities({ store, worlds, adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock'), contentDir, resources });
     try {
@@ -280,16 +280,16 @@ describe('WorktreeProvider (real git)', () => {
       await worlds.open(handle).then((world) => world.destroy());
     } finally {
       fs.rmSync(contentDir, { recursive: true, force: true });
-      store.close();
+      (await store.close());
     }
   });
 
   it('preserves the wiki destination when a fork inherits a different task target', async () => {
     const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-target-'));
-    const store = new Store(':memory:');
-    const project = store.createProject('Fork targets', { repos: [repo], defaultBase: 'main' });
-    const source = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x', target: 'master' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Fork targets', { repos: [repo], defaultBase: 'main' }));
+    const source = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x', target: 'master' } }));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(home));
     const core = makeCoreActivities({ store, worlds, adapters: new Map(),
@@ -302,8 +302,8 @@ describe('WorktreeProvider (real git)', () => {
       const plan = forkWorldSource(source, original)!;
       // Published Git state is sufficient for this branch-policy regression.
       plan.unpublished = false;
-      const task = store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
-        workflowVersion: '1.0.0', params: { prompt: 'x', base: plan.base, target: 'master', _forkWorld: plan } });
+      const task = (await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'x', base: plan.base, target: 'master', _forkWorld: plan } }));
       const fork = await core.createWorld({ taskId: task.id, repos: [repo], base: plan.base, target: 'master', kind: 'worktree' });
       handles.push(fork);
       expect(fork.repos!.find((r) => r.role === 'project-wiki')).toMatchObject({
@@ -315,16 +315,16 @@ describe('WorktreeProvider (real git)', () => {
     } finally {
       for (const handle of handles.reverse()) await worlds.open(handle).then((world) => world.destroy());
       fs.rmSync(contentDir, { recursive: true, force: true });
-      store.close();
+      (await store.close());
     }
   });
 
   it('keeps repository-less project work outside Git even when the project has a wiki', async () => {
     const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
-    const store = new Store(':memory:');
-    const project = store.createProject('Wiki scratch', { repos: [], defaultBase: 'main', defaultTarget: 'main' });
-    const task = store.createTask({ projectId: project.id, title: 'Scratch task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Wiki scratch', { repos: [], defaultBase: 'main', defaultTarget: 'main' }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Scratch task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } }));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(home));
     const core = makeCoreActivities({ store, worlds, adapters: new Map(),
@@ -339,12 +339,12 @@ describe('WorktreeProvider (real git)', () => {
       await opened.destroy();
     } finally {
       fs.rmSync(contentDir, { recursive: true, force: true });
-      store.close();
+      (await store.close());
     }
   });
 
   it('reports only this branch\'s changes when the base branch advances mid-task', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(home));
     const core = makeCoreActivities({ store, worlds, adapters: new Map(),
@@ -371,7 +371,7 @@ describe('WorktreeProvider (real git)', () => {
 
       await worlds.open(handle).then((world) => world.destroy());
     } finally {
-      store.close();
+      (await store.close());
     }
   });
 

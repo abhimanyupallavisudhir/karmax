@@ -10,22 +10,22 @@ import { beginOAuth, finishOAuth, connectionHeaders, mcpClientMetadata } from '.
 import * as network from '../src/mcp/connections/http.js';
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
-function fixture() {
+async function fixture() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-registration-'));
-  const store = new Store(':memory:');
+  const store = await Store.create(':memory:');
   const service = new McpConnections(store, new CredentialBroker(new Vault(home)), 'org_personal');
   const input = { label: 'Server', transport: { type: 'http', url: 'https://resource.example/mcp' }, auth: 'oauth' };
-  return { service, input, close() { store.close(); fs.rmSync(home, { recursive: true, force: true }); } };
+  return { service, input, async close() { (await store.close()); fs.rmSync(home, { recursive: true, force: true }); } };
 
 }
 
 describe('MCP client registration interoperability', () => {
   it.each(['cimd', 'dcr', 'client_secret_basic', 'client_secret_post', 'none'])('authorizes and refreshes with %s', async mode => {
-    const f = fixture();
+    const f = (await fixture());
     vi.stubEnv('KARMAX_PUBLIC_URL', 'https://tavya.example');
     const manual = !['cimd', 'dcr'].includes(mode);
-    const c = f.service.save({ ...f.input, ...(manual ? { oauthClient: { clientId: 'registered-client', tokenEndpointAuthMethod: mode,
-      ...(mode !== 'none' ? { clientSecret: 'private-client-secret' } : {}) } } : {}) });
+    const c = (await f.service.save({ ...f.input, ...(manual ? { oauthClient: { clientId: 'registered-client', tokenEndpointAuthMethod: mode,
+      ...(mode !== 'none' ? { clientSecret: 'private-client-secret' } : {}) } } : {}) }));
     const calls: Request[] = [];
     vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
       const req = new Request(input, init); calls.push(req.clone());
@@ -52,38 +52,38 @@ describe('MCP client registration interoperability', () => {
       expect(url.searchParams.get('client_id')).toBe(manual ? 'registered-client' : mode === 'cimd' ? 'https://tavya.example/api/mcp-client-metadata' : 'dynamic-client');
       expect(url.searchParams.get('code_challenge_method')).toBe('S256');
       await finishOAuth(f.service, c, 'user:alice', url.searchParams.get('state')!, 'code');
-      f.service.setSecret(c, { ...f.service.secret(c), expiresAt: 0 });
+      (await f.service.setSecret(c, { ...f.service.secret(c), expiresAt: 0 }));
       expect(await connectionHeaders(f.service, c)).toEqual({ Authorization: 'Bearer access' });
       expect(calls.filter(r => r.url.endsWith('/register'))).toHaveLength(mode === 'dcr' ? 1 : 0);
-      expect(JSON.stringify(f.service.list())).not.toContain('private-client-secret');
-      expect(JSON.stringify(f.service.list())).not.toContain('refresh');
-    } finally { f.close(); }
+      expect(JSON.stringify((await f.service.list()))).not.toContain('private-client-secret');
+      expect(JSON.stringify((await f.service.list()))).not.toContain('refresh');
+    } finally { (await f.close()); }
   });
-  it('keeps preregistration secrets on an unchanged edit, clears tokens on replacement, and cannot carry credentials to another server', () => {
-    const f = fixture();
+  it('keeps preregistration secrets on an unchanged edit, clears tokens on replacement, and cannot carry credentials to another server', async () => {
+    const f = (await fixture());
     try {
-      let c = f.service.save({ ...f.input, oauthClient: { clientId: 'id', clientSecret: 'secret', tokenEndpointAuthMethod: 'client_secret_basic' } });
-      f.service.setSecret(c, { ...f.service.secret(c), tokens: { access_token: 'old' } });
-      c = f.service.save({ ...c, label: 'Renamed' });
+      let c = (await f.service.save({ ...f.input, oauthClient: { clientId: 'id', clientSecret: 'secret', tokenEndpointAuthMethod: 'client_secret_basic' } }));
+      (await f.service.setSecret(c, { ...f.service.secret(c), tokens: { access_token: 'old' } }));
+      c = (await f.service.save({ ...c, label: 'Renamed' }));
       expect(f.service.secret(c).tokens.access_token).toBe('old');
-      c = f.service.save({ ...c, oauthClient: { clientId: 'id', tokenEndpointAuthMethod: 'client_secret_basic' } });
+      c = (await f.service.save({ ...c, oauthClient: { clientId: 'id', tokenEndpointAuthMethod: 'client_secret_basic' } }));
       expect(f.service.secret(c).manualClient.client_secret).toBe('secret');
       expect(f.service.secret(c).tokens.access_token).toBe('old');
-      c = f.service.save({ ...c, oauthClient: { clientId: 'id', clientSecret: 'replacement', tokenEndpointAuthMethod: 'client_secret_basic' } });
+      c = (await f.service.save({ ...c, oauthClient: { clientId: 'id', clientSecret: 'replacement', tokenEndpointAuthMethod: 'client_secret_basic' } }));
       expect(f.service.secret(c).tokens).toBeUndefined();
-      expect(() => f.service.save({ ...c, transport: { type: 'http', url: 'https://other.example/mcp' } })).toThrow(/secret/);
-      c = f.service.save({ ...c, oauthClient: null });
+      await expect(f.service.save({ ...c, transport: { type: 'http', url: 'https://other.example/mcp' } })).rejects.toThrow(/secret/);
+      c = (await f.service.save({ ...c, oauthClient: null }));
       expect(f.service.secret(c)).toEqual({});
       expect(c.oauthClient).toBeUndefined();
-    } finally { f.close(); }
+    } finally { (await f.close()); }
   });
   it('does not expose provider errors that could echo client credentials', async () => {
-    const f = fixture();
+    const f = (await fixture());
     try {
-      const c = f.service.save({ ...f.input, oauthClient: { clientId: 'id', clientSecret: 'do-not-return', tokenEndpointAuthMethod: 'client_secret_basic' } });
+      const c = (await f.service.save({ ...f.input, oauthClient: { clientId: 'id', clientSecret: 'do-not-return', tokenEndpointAuthMethod: 'client_secret_basic' } }));
       vi.spyOn(network, 'publicFetch').mockRejectedValue(new Error('Provider echoed do-not-return'));
       await expect(beginOAuth(f.service, c, 'user:alice', 'https://tavya.example/mcp-callback')).rejects.toThrow(/^MCP authorization failed\./);
-    } finally { f.close(); }
+    } finally { (await f.close()); }
   });
   it('publishes only configured public HTTPS identity with a fixed callback', () => {
     expect(mcpClientMetadata('http://localhost:3000')).toBeUndefined();

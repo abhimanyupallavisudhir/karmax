@@ -17,48 +17,48 @@ export const worldProviderCredentialHandle = (organizationId: string, provider: 
 export class WorldProviderConnectionService {
   constructor(private store: Store, private broker: CredentialBroker) {}
 
-  list(organizationId: string): Array<WorldProviderConnection & { credentialConfigured: boolean }> {
-    return this.store.listWorldProviderConnections(organizationId).map((value) => ({
+  async list(organizationId: string): Promise<Array<WorldProviderConnection & { credentialConfigured: boolean }>> {
+    return (await this.store.listWorldProviderConnections(organizationId)).map((value) => ({
       ...value,
       credentialConfigured: this.broker.hasHandle(value.credentialHandle),
     }));
   }
 
-  get(organizationId: string, provider: string): (WorldProviderConnection & { credentialConfigured: boolean }) | undefined {
-    const value = this.store.getWorldProviderConnection(organizationId, provider);
+  async get(organizationId: string, provider: string): Promise<(WorldProviderConnection & { credentialConfigured: boolean }) | undefined> {
+    const value = (await this.store.getWorldProviderConnection(organizationId, provider));
     return value ? { ...value, credentialConfigured: this.broker.hasHandle(value.credentialHandle) } : undefined;
   }
 
-  save(input: {
+  async save(input: {
     organizationId: string;
     provider: string;
     apiKey?: string;
     name?: string;
     config?: WorldProviderConnection['config'];
     enabled?: boolean;
-  }): WorldProviderConnection & { credentialConfigured: boolean } {
+  }): Promise<WorldProviderConnection & { credentialConfigured: boolean }> {
     if (!['e2b', 'daytona'].includes(input.provider)) throw new Error(`unsupported world provider: ${input.provider}`);
-    const existing = this.store.getWorldProviderConnection(input.organizationId, input.provider);
+    const existing = (await this.store.getWorldProviderConnection(input.organizationId, input.provider));
     const handle = existing?.credentialHandle ?? worldProviderCredentialHandle(input.organizationId, input.provider);
     // Validate every non-secret field before rotating the vault handle. A bad
     // endpoint must leave the previous working credential/config untouched.
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) });
     const key = input.apiKey?.trim();
-    if (key) this.broker.registerHandle(handle, key);
+    if (key) (await this.broker.registerHandle(handle, key));
     if (!key && !this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
-    const value = this.store.upsertWorldProviderConnection({
+    const value = (await this.store.upsertWorldProviderConnection({
       organizationId: input.organizationId,
       provider: input.provider,
       name: input.name,
       credentialHandle: handle,
       config,
       enabled: input.enabled,
-    });
+    }));
     return { ...value, credentialConfigured: true };
   }
 
-  resolve(organizationId: string | undefined, provider: string): ResolvedWorldProviderConnection {
-    const value = organizationId ? this.store.getWorldProviderConnection(organizationId, provider) : undefined;
+  async resolve(organizationId: string | undefined, provider: string): Promise<ResolvedWorldProviderConnection> {
+    const value = organizationId ? (await this.store.getWorldProviderConnection(organizationId, provider)) : undefined;
     if (value?.enabled && this.broker.hasHandle(value.credentialHandle)) {
       return {
         organizationId,
@@ -80,13 +80,13 @@ export class WorldProviderConnectionService {
     return { organizationId, provider, apiKey, config: environmentConfig(provider) };
   }
 
-  available(organizationId: string | undefined, provider: string): boolean {
-    try { this.resolve(organizationId, provider); return true; }
+  async available(organizationId: string | undefined, provider: string): Promise<boolean> {
+    try { (await this.resolve(organizationId, provider)); return true; }
     catch { return false; }
   }
 
   async test(organizationId: string, provider: string): Promise<WorldProviderConnection & { credentialConfigured: boolean }> {
-    const connection = this.resolve(organizationId, provider);
+    const connection = (await this.resolve(organizationId, provider));
     try {
       if (provider === 'e2b') {
         const { Sandbox } = await import('e2b');
@@ -100,29 +100,29 @@ export class WorldProviderConnectionService {
       } else {
         throw new Error(`unsupported world provider: ${provider}`);
       }
-      this.store.setWorldProviderConnectionStatus(organizationId, provider, 'ready');
+      (await this.store.setWorldProviderConnectionStatus(organizationId, provider, 'ready'));
     } catch (error) {
       const unsafe = error instanceof Error ? error.message : String(error);
       const message = unsafe.split(connection.apiKey).join('[redacted]').slice(0, 2_000);
-      this.store.setWorldProviderConnectionStatus(organizationId, provider, 'error', message);
+      (await this.store.setWorldProviderConnectionStatus(organizationId, provider, 'error', message));
       throw new Error(`${providerName(provider)} connection failed: ${message}`);
     }
-    return this.get(organizationId, provider)!;
+    return (await this.get(organizationId, provider))!;
   }
 
-  delete(organizationId: string, provider: string): WorldProviderConnection | undefined {
-    const value = this.store.deleteWorldProviderConnection(organizationId, provider);
-    if (value) this.broker.deleteHandle(value.credentialHandle);
+  async delete(organizationId: string, provider: string): Promise<WorldProviderConnection | undefined> {
+    const value = (await this.store.deleteWorldProviderConnection(organizationId, provider));
+    if (value) (await this.broker.deleteHandle(value.credentialHandle));
     return value;
   }
 
   /** Move legacy boot-time credentials into the installation owner's encrypted
    * connection exactly once. It keeps upgraded installs working while making
    * subsequent rotation possible from the UI. */
-  importEnvironment(organizationId = 'org_personal'): void {
+  async importEnvironment(organizationId = 'org_personal'): Promise<void> {
     for (const [provider, apiKey] of [['e2b', process.env.E2B_API_KEY], ['daytona', process.env.DAYTONA_API_KEY]] as const) {
-      if (!apiKey || this.store.getWorldProviderConnection(organizationId, provider)) continue;
-      this.save({ organizationId, provider, apiKey, config: environmentConfig(provider) });
+      if (!apiKey || (await this.store.getWorldProviderConnection(organizationId, provider))) continue;
+      (await this.save({ organizationId, provider, apiKey, config: environmentConfig(provider) }));
     }
   }
 }

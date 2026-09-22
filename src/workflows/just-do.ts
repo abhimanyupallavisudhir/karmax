@@ -1,3 +1,4 @@
+import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -157,7 +158,7 @@ async function justDoImpl(
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
-  const publish = async () => core.publishView(taskId, view());
+  const publish = async () => publishTaskView(core, taskId, view());
   const leaser = managedTurns
     ? createAgentTurnLeaser(core, coordinator, {
         taskId,

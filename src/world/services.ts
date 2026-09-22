@@ -87,13 +87,13 @@ function dockerFor(world: World | undefined): (args: string[], timeout: number) 
  * host-only: a remote world's service containers live and die inside its
  * sandbox, which the world orphan sweep in `WorldLifecycleManager` destroys as
  * a unit — there is nothing on this host to find for them. */
-export async function sweepOrphanedServiceContainers(worldState: (taskId: string) => string | undefined): Promise<number> {
+export async function sweepOrphanedServiceContainers(worldState: (taskId: string) => string | undefined | Promise<string | undefined>): Promise<number> {
   const listed = await hostDocker(['ps', '-aq', '--filter', `label=karmax.home=${serviceHomeLabel()}`], 10_000);
   let reaped = 0;
   for (const id of listed.stdout.split('\n').map((value) => value.trim()).filter(Boolean)) {
     const inspected = await hostDocker(['inspect', '--format', '{{index .Config.Labels "karmax.task"}}', id], 10_000);
     const taskId = inspected.stdout.trim();
-    if (!taskId || (worldState(taskId) && worldState(taskId) !== 'released')) continue;
+    if (!taskId || ((await worldState(taskId)) && (await worldState(taskId)) !== 'released')) continue;
     if ((await hostDocker(['rm', '-f', id], 60_000)).code === 0) reaped++;
   }
   return reaped;

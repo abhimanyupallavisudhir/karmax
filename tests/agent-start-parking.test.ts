@@ -6,10 +6,10 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import type { TaskView } from '../src/domain/types.js';
 
 describe('parking during agent admission', () => {
-  it.each(['status', 'checkpoint'])('defers idle parking when a follow-up arrives during %s', async boundary => {
-    const store = new Store(':memory:');
-    const project = store.createProject('Follow-up');
-    const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+  it.each([['status', false], ['checkpoint', false], ['status', true], ['checkpoint', true]] as const)('defers idle parking during %s (separate lifecycle: %s)', async (boundary, separateLifecycle) => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Follow-up');
+    const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
       workflowVersion: '1.26.0', params: { prompt: 'work' } });
     const handle = { id: task.id, kind: 'container', root: '/workspace', branch: 'task', base: 'main' };
     let release!: () => void;
@@ -27,27 +27,29 @@ describe('parking during agent admission', () => {
       waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,
       state: {}, world: handle } as TaskView;
     try {
-      const publication = core.publishView(task.id, view);
+      const publication = separateLifecycle
+        ? core.publishView(task.id, view, undefined, { separateLifecycle: true }).then(fence => core.parkWaitingWorld(task.id, view, fence!))
+        : core.publishView(task.id, view);
       await atBoundary;
-      store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(),
+      await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(),
         payload: { role: 'do', message: { id: 'new', role: 'user', text: 'Continue' } } });
       release();
       await publication;
       expect(worlds.park).not.toHaveBeenCalled();
       expect(checkpoint).toHaveBeenCalledTimes(boundary === 'checkpoint' ? 1 : 0);
-      expect(store.eventsOfType(task.id, 'world.park-deferred')).toHaveLength(1);
+      expect((await store.eventsOfType(task.id, 'world.park-deferred'))).toHaveLength(1);
       // The next real wait still parks; an old accepted message is no longer
       // grounds to defer another publication indefinitely.
       await core.publishView(task.id, view);
       expect(worlds.park).toHaveBeenCalledTimes(1);
-    } finally { release(); store.close(); }
+    } finally { release(); await store.close(); }
   });
 
   it.each([false, true])('publishes startup without checkpointing or parking (recovery handle: %s)', async recovery => {
-    const store = new Store(':memory:');
-    const project = store.createProject('Admission');
-    const task = store.createTask({ projectId: project.id, title: 'Start', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Admission'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Start', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } }));
     const handle = { id: task.id, kind: 'e2b', root: '/workspace', branch: 'task', base: 'main' };
     let parked = false;
     const worlds = { get: () => ({ parkable: true }),
@@ -61,7 +63,7 @@ describe('parking during agent admission', () => {
       state: recovery ? { recoveryWorld: handle } : {}, ...(recovery ? {} : { world: handle }) } as TaskView;
     try {
       await core.publishView(task.id, view);
-      expect(store.getTask(task.id)?.lastView?.waitingFor).toEqual(view.waitingFor);
+      expect((await store.getTask(task.id))?.lastView?.waitingFor).toEqual(view.waitingFor);
       expect(worlds.status).not.toHaveBeenCalled();
       expect(worlds.park).not.toHaveBeenCalled();
       expect(checkpoint).not.toHaveBeenCalled();
@@ -76,17 +78,17 @@ describe('parking during agent admission', () => {
         expect(parked).toBe(true);
       }
       expect(worlds.park).toHaveBeenCalledTimes(3);
-    } finally { store.close(); }
+    } finally { (await store.close()); }
   });
 
   it.each(['heartbeat', 'durable'])('heartbeats slow world setup with the %s retry session and clears its timer on failure', async source => {
-    const store = new Store(':memory:');
-    const project = store.createProject('Slow setup');
-    const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Slow setup'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } }));
     const heartbeat = vi.fn();
     const turnId = `${task.id}#1`;
-    store.kvSet(`turnsession:${turnId}`, 'prior-session');
+    (await store.kvSet(`turnsession:${turnId}`, 'prior-session'));
     const context = vi.spyOn(Context, 'current').mockReturnValue({ heartbeat,
       cancellationSignal: new AbortController().signal,
       info: { attempt: 2, workflowExecution: { runId: 'run', workflowId: task.id }, activityId: '1',
@@ -113,6 +115,6 @@ describe('parking during agent admission', () => {
       const beats = heartbeat.mock.calls.length;
       await vi.advanceTimersByTimeAsync(5_000);
       expect(heartbeat).toHaveBeenCalledTimes(beats);
-    } finally { vi.useRealTimers(); context.mockRestore(); store.close(); }
+    } finally { vi.useRealTimers(); context.mockRestore(); (await store.close()); }
   });
 });

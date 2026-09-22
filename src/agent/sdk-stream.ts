@@ -37,7 +37,7 @@ export interface FollowUpInjector {
   push(msg: SdkUserMessage): void;
   /** End the input stream — the SDK drains any queued input, finishes, and the
    *  query iterator ends (the turn boundary). Idempotent. */
-  close(): void;
+  close(): (void) | Promise<void>;
   /** True once {@link close} has been called. */
   readonly closed: boolean;
 }

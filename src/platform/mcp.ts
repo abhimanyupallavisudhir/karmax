@@ -139,17 +139,17 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     importTaskBranch: (sourceTaskId) => api.importTaskBranch(getToken(), sourceTaskId),
     refreshUpstream: (branch) => api.refreshUpstream(getToken(), branch),
     proposeProjectResource: (a) => api.proposeProjectResource(getToken(), a),
-    listWorldProviders: (organizationId) => Promise.resolve(api.listWorldProviderConnections(getToken(), organizationId)),
-    connectWorldProvider: (a) => Promise.resolve(api.saveWorldProviderConnection(getToken(), {
+    listWorldProviders: async (organizationId) => Promise.resolve((await api.listWorldProviderConnections(getToken(), organizationId))),
+    connectWorldProvider: async (a) => Promise.resolve((await api.saveWorldProviderConnection(getToken(), {
       organizationId: a.organizationId, provider: a.provider, apiKey: a.apiKey, name: a.name,
       config: { template: a.template, snapshot: a.snapshot, image: a.image,
         desktopTemplate: a.desktopTemplate, desktopSnapshot: a.desktopSnapshot, desktopImage: a.desktopImage,
         apiUrl: a.apiUrl, target: a.target },
-    })),
+    }))),
     testWorldProvider: (organizationId, provider) => api.testWorldProviderConnection(getToken(), organizationId, provider),
-    disconnectWorldProvider: (organizationId, provider) => Promise.resolve(api.deleteWorldProviderConnection(getToken(), organizationId, provider)),
-    getExecutionPolicy: (organizationId, projectId) => Promise.resolve(api.getExecutionPolicy(getToken(), { organizationId, projectId })),
-    setExecutionPolicy: (a) => Promise.resolve(api.setExecutionPolicy(getToken(), a)),
+    disconnectWorldProvider: async (organizationId, provider) => Promise.resolve((await api.deleteWorldProviderConnection(getToken(), organizationId, provider))),
+    getExecutionPolicy: async (organizationId, projectId) => Promise.resolve((await api.getExecutionPolicy(getToken(), { organizationId, projectId }))),
+    setExecutionPolicy: async (a) => Promise.resolve((await api.setExecutionPolicy(getToken(), a))),
     platformRequest: async () => { throw new Error('generic administration requires the gateway-backed platform MCP'); },
   };
 }
@@ -322,7 +322,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'list_world_providers',
     { description: 'List the cloud sandbox providers connected to an organization. Credentials are write-only and are never returned.', inputSchema: { organizationId: z.string() } },
-    async (a) => wrap(() => ops.listWorldProviders(a.organizationId)),
+    async (a) => wrap(async () => (await ops.listWorldProviders(a.organizationId))),
   );
   server.registerTool(
     'connect_world_provider',
@@ -335,24 +335,24 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         apiUrl: z.string().url().optional(), target: z.string().optional(),
       },
     },
-    async (a) => wrap(() => ops.connectWorldProvider(a)),
+    async (a) => wrap(async () => (await ops.connectWorldProvider(a))),
   );
   server.registerTool(
     'test_world_provider',
     { description: 'Verify an organization cloud provider credential without creating a billable task world.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
-    async (a) => wrap(() => ops.testWorldProvider(a.organizationId, a.provider)),
+    async (a) => wrap(async () => (await ops.testWorldProvider(a.organizationId, a.provider))),
   );
   server.registerTool(
     'disconnect_world_provider',
     { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
-    async (a) => wrap(() => ops.disconnectWorldProvider(a.organizationId, a.provider)),
+    async (a) => wrap(async () => (await ops.disconnectWorldProvider(a.organizationId, a.provider))),
   );
   server.registerTool(
     'get_execution_policy',
     { description: 'Read an organization execution policy, or a project override plus its effective inherited policy.', inputSchema: {
       organizationId: z.string(), projectId: z.string().optional(),
     } },
-    async (a) => wrap(() => ops.getExecutionPolicy(a.organizationId, a.projectId)),
+    async (a) => wrap(async () => (await ops.getExecutionPolicy(a.organizationId, a.projectId))),
   );
   server.registerTool(
     'set_execution_policy',
@@ -410,19 +410,19 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           policy.network = network;
         }
       }
-      return ops.setExecutionPolicy({ organizationId: a.organizationId, projectId: a.projectId, policy });
+      return (await ops.setExecutionPolicy({ organizationId: a.organizationId, projectId: a.projectId, policy }));
     }),
   );
   server.registerTool(
     'find_task',
     { description: 'Resolve a human-facing project-local task number (for example projectId + #100) to its canonical id. Returns a pointer `{id, num, projectId}` — pass that id to get_task for the task itself.', inputSchema: { projectId: z.string(), number: z.number().int().positive() } },
-    async (a) => wrap(() => ops.findTask(a.projectId, a.number)),
+    async (a) => wrap(async () => (await ops.findTask(a.projectId, a.number))),
   );
-  server.registerTool('list_agents', { description: 'Discover every agent role/session attached to a task and its conversation size.', inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.listAgents(a.taskId)));
+  server.registerTool('list_agents', { description: 'Discover every agent role/session attached to a task and its conversation size.', inputSchema: { taskId: z.string() } }, async (a) => wrap(async () => (await ops.listAgents(a.taskId))));
   server.registerTool(
     'get_conversation',
     { description: `Read the durable message history for one agent attached to a task (${AGENT_ROLE_NAMES.join(', ')}). Call list_agents first to see which roles this task actually has.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do') } },
-    async (a) => wrap(() => ops.getConversation(a.taskId, a.role)),
+    async (a) => wrap(async () => (await ops.getConversation(a.taskId, a.role))),
   );
   server.registerTool(
     'fork_agent',
@@ -458,7 +458,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
     },
-    async (a) => wrap(() => ops.escalateToHuman(a)),
+    async (a) => wrap(async () => (await ops.escalateToHuman(a))),
   );
   server.registerTool(
     'request_permission',
@@ -478,7 +478,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
     },
-    async (a) => wrap(() => ops.requestPermission(a)),
+    async (a) => wrap(async () => (await ops.requestPermission(a))),
   );
   server.registerTool(
     'request_agent_action',
@@ -489,7 +489,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         action: z.literal('publish_branch'), message: z.string().optional(),
       },
     },
-    async (a) => wrap(() => ops.requestAgentAction(a)),
+    async (a) => wrap(async () => (await ops.requestAgentAction(a))),
   );
   server.registerTool(
     'cancel_agent_action',
@@ -497,9 +497,9 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       description: 'Withdraw one pending background collaboration requested by this task. Use this when the target is blocked or its result is no longer needed; the target task itself is not cancelled.',
       inputSchema: { requestId: z.string() },
     },
-    async (a) => wrap(() => ops.cancelAgentAction(a.requestId)),
+    async (a) => wrap(async () => (await ops.cancelAgentAction(a.requestId))),
   );
-  server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
+  server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(async () => (await ops.listEvents(a.taskId, a.since))));
   server.registerTool('list_github_actions_runs', {
     description: 'List GitHub Actions workflow runs for a repository attached to the calling task’s project. The GitHub credential remains in the control plane.',
     inputSchema: {
@@ -509,12 +509,12 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       workflow: z.union([z.string(), z.number().int().positive()]).optional(),
       page: z.number().int().min(1).max(1000).optional(), perPage: z.number().int().min(1).max(100).optional(),
     },
-  }, async (a) => wrap(() => ops.listGithubActionsRuns(a)));
+  }, async (a) => wrap(async () => (await ops.listGithubActionsRuns(a))));
   server.registerTool('list_github_actions_workflows', {
     description: 'Discover workflow ids, paths and enabled states for an attached repository. Requires github:actions:read.',
     inputSchema: { repository: z.string().optional(), page: z.number().int().min(1).max(1000).optional(),
       perPage: z.number().int().min(1).max(100).optional() },
-  }, async (a) => wrap(() => ops.listGithubActionsWorkflows(a)));
+  }, async (a) => wrap(async () => (await ops.listGithubActionsWorkflows(a))));
   server.registerTool('inspect_github_actions_run', {
     description: 'Inspect Actions evidence with read authority. Default failure diagnostics; jobs/artifacts are paginated. log selects any job conclusion by jobId and attempt, returning bounded tail output; annotations selects job check diagnostics; pending-deployments shows current approval waits. Check tailComplete/truncation flags. Run headSha or success/skipped does not prove deployment; correlate explicit target, readiness, completion and rollback evidence. Tokens and signed URLs never returned.',
     inputSchema: { repository: z.string().optional(), runId: z.number().int().positive(),
@@ -524,33 +524,33 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       offsetLines: z.number().int().min(0).max(1000000).optional(),
       tailLines: z.number().int().min(1).max(500).optional(), maxChars: z.number().int().min(256).max(32000).optional(),
     },
-  }, async (a) => wrap(() => ops.inspectGithubActionsRun(a)));
+  }, async (a) => wrap(async () => (await ops.inspectGithubActionsRun(a))));
   server.registerTool('manage_github_actions_run', {
     description: 'Rerun failed jobs, rerun an entire run, or cancel a run in a repository attached to this task’s project. Requires separately approved GitHub Actions write authority.',
     inputSchema: { repository: z.string().optional(), runId: z.number().int().positive(), action: z.enum(['rerun-failed', 'rerun', 'cancel']) },
-  }, async (a) => wrap(() => ops.manageGithubActionsRun(a)));
+  }, async (a) => wrap(async () => (await ops.manageGithubActionsRun(a))));
   server.registerTool('dispatch_github_actions_workflow', {
     description: 'Dispatch a workflow on a ref in a repository attached to this task’s project. Requires separately approved GitHub Actions write authority.',
     inputSchema: { repository: z.string().optional(), workflow: z.union([z.string(), z.number().int().positive()]),
       ref: z.string(), inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional() },
-  }, async (a) => wrap(() => ops.dispatchGithubActionsWorkflow(a)));
+  }, async (a) => wrap(async () => (await ops.dispatchGithubActionsWorkflow(a))));
   server.registerTool('publish_task_branch', {
     description: 'Publish this task’s clean, committed branch through Karmax’s trusted Git broker so another agent can import it.', inputSchema: {},
-  }, async () => wrap(() => ops.publishTaskBranch()));
+  }, async () => wrap(async () => (await ops.publishTaskBranch())));
   server.registerTool('import_task_branch', {
     description: 'Fetch another task’s published branch into namespaced refs in this world. Inspect/test/cherry-pick or merge it locally afterward.',
     inputSchema: { sourceTaskId: z.string() },
-  }, async (a) => wrap(() => ops.importTaskBranch(a.sourceTaskId)));
+  }, async (a) => wrap(async () => (await ops.importTaskBranch(a.sourceTaskId))));
   server.registerTool('refresh_upstream', {
     description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world. Returns refreshed refs plus per-repository skipped/errors diagnostics for any partial failure.',
     inputSchema: { branch: z.string().optional() },
-  }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
+  }, async (a) => wrap(async () => (await ops.refreshUpstream(a.branch))));
   server.registerTool('verify_resource_revision', {
     description: 'Read and decrypt an exact historical project resource snapshot on the server. Requires project:settings:read for projectId. Returns validated root digest/totals and bounded per-file SHA256/byte evidence; no keys, object refs or plaintext. Reads at most 1000 files and 256 MiB per page (default 100 files). Follow nextOffset on the same revision; status complete means the entire tree was byte-verified in this call, partial covers only returned files, failed means unreadable/corrupt storage or invalid offset. A byte-limit with no progress requires another verification facility for that oversized file. Does not change the resource head or leases.',
     inputSchema: { projectId: z.string(), resourceId: z.string(), revisionId: z.string(),
       offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(1000).optional() },
-  }, async (a) => wrap(() => ops.platformRequest('GET',
-    `/api/projects/${encodeURIComponent(a.projectId)}/resources/${encodeURIComponent(a.resourceId)}/revisions/${encodeURIComponent(a.revisionId)}/verify?offset=${a.offset ?? 0}&limit=${a.limit ?? 100}`)));
+  }, async (a) => wrap(async () => (await ops.platformRequest('GET',
+    `/api/projects/${encodeURIComponent(a.projectId)}/resources/${encodeURIComponent(a.resourceId)}/revisions/${encodeURIComponent(a.revisionId)}/verify?offset=${a.offset ?? 0}&limit=${a.limit ?? 100}`))));
   server.registerTool('propose_project_resource', {
     description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
     inputSchema: {
@@ -560,18 +560,18 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       targetEnvironment: z.string().optional(), targetService: z.string().optional(),
       access: z.enum(['read', 'write']).optional(), publish: z.enum(['discard', 'review']).optional(),
     },
-  }, async (a) => wrap(() => {
+  }, async (a) => wrap(async () => {
     const sources = Number(Boolean(a.path)) + Number(Boolean(a.vaultItemId));
     const targets = Number(Boolean(a.targetPath)) + Number(Boolean(a.targetEnvironment)) + Number(Boolean(a.targetService));
     if (sources !== 1) throw new Error('provide exactly one of path or vaultItemId');
     if (targets !== 1) throw new Error('provide exactly one targetPath, targetEnvironment, or targetService');
-    return ops.proposeProjectResource({
+    return (await ops.proposeProjectResource({
       source: a.path ? { kind: 'path', path: a.path } : { kind: 'vault-item', itemId: a.vaultItemId!, field: a.field },
       name: a.name, driver: a.driver, access: a.access, publish: a.publish,
       target: a.targetPath ? { kind: 'path', path: a.targetPath }
         : a.targetService ? { kind: 'service', name: a.targetService }
           : { kind: 'environment', name: a.targetEnvironment! },
-    });
+    }));
   }));
   // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's
   // /api/vault surface so the pull model is first-class, not buried behind
@@ -579,19 +579,19 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   // apiOps embedding reports the same platform_request limitation.
   server.registerTool('list_connections', {
     description: 'List app accounts explicitly shared with this task or project. Prefer these connections to requesting passwords. Tokens stay server-side.', inputSchema: {},
-  }, async () => wrap(() => ops.platformRequest('GET', '/api/connections')));
+  }, async () => wrap(async () => (await ops.platformRequest('GET', '/api/connections'))));
   server.registerTool('request_connection', {
     description: 'Use the optional Composio fallback when no suitable native MCP connection is available. Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in the task; it resumes automatically after authorization. Continue independent work, but do not finish the task while the connection is pending. Reuse connected accounts from list_connections.',
     inputSchema: { toolkit: z.string(), why: z.string() },
-  }, async a => wrap(() => ops.platformRequest('POST', '/api/connections/request', a)));
+  }, async a => wrap(async () => (await ops.platformRequest('POST', '/api/connections/request', a))));
   server.registerTool('search_connection_tools', {
     description: 'Search the tools and input schemas available for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
     inputSchema: { connectionId: z.string(), search: z.string() },
-  }, async a => wrap(() => ops.platformRequest('GET', `/api/connections/${encodeURIComponent(a.connectionId)}/tools?search=${encodeURIComponent(a.search)}`)));
+  }, async a => wrap(async () => (await ops.platformRequest('GET', `/api/connections/${encodeURIComponent(a.connectionId)}/tools?search=${encodeURIComponent(a.search)}`))));
   server.registerTool('execute_connection_tool', {
     description: 'Execute one app tool on the exact connected account, within the user’s task instructions. Search its schema first. Read/write actions take effect immediately; authorization to connect an account does not authorize unrelated actions. Do not blindly retry a failed write: check whether it succeeded first.',
     inputSchema: { connectionId: z.string(), tool: z.string(), arguments: z.record(z.string(), z.unknown()) },
-  }, async a => wrap(() => ops.platformRequest('POST', `/api/connections/${encodeURIComponent(a.connectionId)}/execute`, { tool: a.tool, arguments: a.arguments })));
+  }, async a => wrap(async () => (await ops.platformRequest('POST', `/api/connections/${encodeURIComponent(a.connectionId)}/execute`, { tool: a.tool, arguments: a.arguments }))));
   server.registerTool(
     'list_credentials',
     {
@@ -599,7 +599,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
       inputSchema: {},
     },
-    async () => wrap(() => ops.platformRequest('GET', '/api/vault/available')),
+    async () => wrap(async () => (await ops.platformRequest('GET', '/api/vault/available'))),
   );
   server.registerTool(
     'request_credential',
@@ -608,7 +608,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) that list_credentials does not show, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string(), urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/requests', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/requests', a))),
   );
   server.registerTool(
     'fill_credential',
@@ -617,7 +617,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Type a vault credential into the page open in your browser WITHOUT the secret entering your context — karmax resolves and types it over CDP after verifying the page origin matches the credential\'s domains. Call once per field (username, password, then totp for a one-time code). The karmax browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/fill', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/fill', a))),
   );
   server.registerTool(
     'get_credential',
@@ -626,7 +626,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/resolve', a))),
   );
   server.registerTool(
     'store_credential',
@@ -639,7 +639,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         secrets: z.record(z.string(), z.string()).optional(),
       },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/store', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/store', a))),
   );
   server.registerTool(
     'check_agent_mail',
@@ -649,7 +649,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       inputSchema: { organizationId: z.string(), match: z.string().optional(),
         since: z.number().optional(), limit: z.number().int().positive().optional() },
     },
-    async (a) => wrap(() => {
+    async (a) => wrap(async () => {
       // `since` and `limit` are compared against undefined, not truthiness:
       // `since: 0` ("everything since the epoch") is a legitimate value that a
       // truthiness test silently dropped.
@@ -657,7 +657,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       if (a.match !== undefined) q.set('match', a.match);
       if (a.since !== undefined) q.set('since', String(a.since));
       if (a.limit !== undefined) q.set('limit', String(a.limit));
-      return ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${q.toString() ? `?${q}` : ''}`);
+      return (await ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${q.toString() ? `?${q}` : ''}`));
     }),
   );
   server.registerTool(
@@ -667,7 +667,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Enroll a NEW passkey belonging to karmax on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). karmax preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
       inputSchema: { domain: z.string(), cdpUrl: z.string().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/enroll', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/enroll', a))),
   );
   server.registerTool(
     'save_passkey',
@@ -675,7 +675,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       description: 'After triggering the site\'s passkey-create button (see enroll_passkey), store the newly created credential in the vault as a passkey item.',
       inputSchema: { authenticatorId: z.string(), label: z.string().optional(), domains: z.array(z.string()).optional(), username: z.string().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/save', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/save', a))),
   );
   server.registerTool(
     'use_passkey',
@@ -684,7 +684,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), cdpUrl: z.string().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/login', a)),
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
   );
   server.registerTool(
     'describe_platform',
@@ -704,15 +704,15 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         body: z.union([z.record(z.string(), z.unknown()), z.array(z.unknown()), z.string()]).optional(),
       },
     },
-    async (a) => wrap(() => {
+    async (a) => wrap(async () => {
       // Enforced at the tool boundary as well as inside httpOps, so the refusal
       // is identical whichever ops implementation is wired underneath.
       const rejected = platformRequestPathError(a.path);
       if (rejected) throw new Error(rejected);
-      return ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body));
+      return (await ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body)));
     }),
   );
-  server.registerTool('get_task', { description: "Get a task's current view-model.", inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.getTask(a.taskId)));
+  server.registerTool('get_task', { description: "Get a task's current view-model.", inputSchema: { taskId: z.string() } }, async (a) => wrap(async () => (await ops.getTask(a.taskId))));
   // Kept for compatibility, but strictly dominated by search_tasks (which returns
   // status/stage/priority/tags and accepts a query). Point callers there.
   server.registerTool('list_tasks', { description: 'List every task in a project as bare {id, title, workflow}. Prefer search_tasks — it takes a query, and its result carries num/status/stage/priority/tags. Pass an empty query for the same "everything" listing.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));
@@ -769,7 +769,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool('save_skill', {
     description: 'Save a reusable skill (markdown) for future tasks. This writes INSTALLATION-WIDE global state — the skill is visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     inputSchema: { name: z.string(), content: z.string() },
-  }, async (a) => wrap(() => ops.saveSkill(a)));
+  }, async (a) => wrap(async () => (await ops.saveSkill(a))));
   server.registerTool(
     'read_wiki',
     {
@@ -777,7 +777,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Navigate an organization or project wiki (skills, memories, prompts). No path → the full table of contents (this also expands any [more…] fold); a section path → that section listed in full; a skill/memory path → its complete markdown plus attached files. Your prompt names the scope ids that apply to your task.',
       inputSchema: { scope: z.enum(['organization', 'project']), id: z.string(), path: z.string().optional() },
     },
-    async (a) => wrap(() => ops.readWiki(a.scope, a.id, a.path)),
+    async (a) => wrap(async () => (await ops.readWiki(a.scope, a.id, a.path))),
   );
   server.registerTool(
     'search_wiki',
@@ -785,7 +785,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       description: 'Grep every page of an organization or project wiki with a case-insensitive regular expression; returns file:line matches. Works from any world, including cloud sandboxes.',
       inputSchema: { scope: z.enum(['organization', 'project']), id: z.string(), query: z.string() },
     },
-    async (a) => wrap(() => ops.searchWiki(a.scope, a.id, a.query)),
+    async (a) => wrap(async () => (await ops.searchWiki(a.scope, a.id, a.query))),
   );
   server.registerTool(
     'propose_workflow_edit',

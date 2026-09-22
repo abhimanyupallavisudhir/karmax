@@ -20,22 +20,22 @@ describe('MCP across complete API agent turns', () => {
   let dir: string, store: Store, endpoint: http.Server | undefined;
   let cleanup: (() => Promise<void>) | undefined;
   const savedEnv = new Map<string, string | undefined>();
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-agent-turn-')); store = new Store(':memory:'); });
+  beforeEach(async () => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-agent-turn-')); store = (await Store.create(':memory:')); });
   afterEach(async () => {
     if (endpoint) { endpoint.closeAllConnections(); await new Promise<void>((resolve) => endpoint!.close(() => resolve())); }
     endpoint = undefined; await cleanup?.(); cleanup = undefined;
     for (const [key, value] of savedEnv) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } savedEnv.clear();
-    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
   function setEnv(key: string, value: string) { savedEnv.set(key, process.env[key]); process.env[key] = value; }
   for (const provider of ['claude', 'codex'] as const) {
     for (const failure of [false, true]) it(`${provider}: ${failure ? 'cleans up when the model endpoint fails' : 'returns MCP tool and resource results to the model and completes'}`, async () => {
-      const project = store.createProject('Test');
+      const project = (await store.createProject('Test'));
       const service = new McpConnections(store, new CredentialBroker(new Vault(path.join(dir, 'vault'))), 'org_personal');
       const world = await new WorktreeProvider(path.join(dir, 'worlds')).create({ taskId: 'turn', base: 'main' });
       const pidFile = path.join(dir, 'server.pid');
-      const connection = service.save({ label: 'Fixture', transport: { type: 'stdio', command: process.execPath,
-        args: [path.resolve('tests/fixtures/mcp-connection.mjs')], env: { FIXTURE_PID_FILE: pidFile } } }, project.id);
+      const connection = (await service.save({ label: 'Fixture', transport: { type: 'stdio', command: process.execPath,
+        args: [path.resolve('tests/fixtures/mcp-connection.mjs')], env: { FIXTURE_PID_FILE: pidFile } } }, project.id));
       const servers = await prepareConnections(service, world, [connection.id], project.id, 'turn', (fn) => { cleanup = fn; });
       const requests: any[] = [];
       endpoint = http.createServer(async (req, res) => {
@@ -56,9 +56,9 @@ describe('MCP across complete API agent turns', () => {
       const adapter = provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
       const timingRows: any[] = [];
       const trace = new TimingTrace({ taskId: 'turn', turnId: 'turn-1', attempt: 1 }, row => timingRows.push(row));
-      const turn = withTiming(trace, () => trace.measure('agent.attempt', () => adapter.runTurn({ profile: { id: 'test', name: 'test', role: 'do', provider, mcpConnections: [connection.id] }, world, agentMcp: servers,
+      const turn = (withTiming(trace, () => trace.measure('agent.attempt', () => adapter.runTurn({ profile: { id: 'test', name: 'test', role: 'do', provider, mcpConnections: [connection.id] }, world, agentMcp: servers,
         role: 'do', systemPrompt: 'Test only', messages: [{ id: 'one', ts: 0, role: 'user', text: 'Use MCP' }], resolvedAuth: { apiKey: 'test-model-key' }, maxTurns: 4 },
-      { emit() {}, emitActivity() {} } as any)));
+      { emit() {}, emitActivity() {} } as any))));
       if (failure) await expect(turn).rejects.toThrow(/500/);
       else {
         expect((await turn).output).toBe('MCP verified'); expect(requests).toHaveLength(3);

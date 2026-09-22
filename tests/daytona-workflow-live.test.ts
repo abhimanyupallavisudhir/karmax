@@ -20,7 +20,7 @@ describe.skipIf(process.env.KARMAX_DAYTONA_LIVE_WORKFLOW !== '1')('Daytona task 
       return result;
     } }, { checkpoints: true });
     h.worlds.register(provider);
-    const project = h.store.createProject('Daytona live workflow', { worldProvider: 'daytona', repos: [] });
+    const project = (await h.store.createProject('Daytona live workflow', { worldProvider: 'daytona', repos: [] }));
     const taskId = `live-daytona-workflow-${Date.now()}`;
     let task: Awaited<ReturnType<typeof h.client.workflow.start>> | undefined;
     try {
@@ -38,7 +38,7 @@ describe.skipIf(process.env.KARMAX_DAYTONA_LIVE_WORKFLOW !== '1')('Daytona task 
       await task.signal('confirm');
       expect((await completion as any).stage).toBe('done');
       expect(observed).toBeDefined();
-      expect(h.store.latestWorldCheckpoint(observed!.id)?.filesystemDelta?.bytes).toBeGreaterThan(0);
+      expect((await h.store.latestWorldCheckpoint(observed!.id))?.filesystemDelta?.bytes).toBeGreaterThan(0);
       expect(await provider.probe(observed!)).toBe('missing');
       expect(JSON.stringify(await task.fetchHistory())).not.toContain(process.env.DAYTONA_API_KEY);
     } finally {

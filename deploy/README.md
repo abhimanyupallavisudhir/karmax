@@ -185,6 +185,23 @@ Karmax and Temporal databases, reapplies the current Temporal schema, and retain
 destination's domain. It requires typing `RESTORE` and will not delete Docker
 volumes as part of ordinary `down` or `update` operations.
 
+### Rollback compatibility
+
+`deploy/data-epoch` marks compatibility for automatic code-only rollback. Builds
+without a marker are epoch 1. Epoch 2 separates task conversation storage and
+introduces new durable workflow activity histories. If an update crosses epochs
+and then fails readiness, the updater stops the app and preserves the candidate
+code and current data; it does **not** start the incompatible previous image.
+This deliberately trades availability for avoiding a misleading or destructive
+rollback. Same-epoch readiness failures retain the existing automatic rollback.
+Build and backup failures still leave the previous app running.
+
+Recover a failed epoch transition by repairing forward, or restore the pre-update
+backup with its matching application revision **and Temporal history**. Restoring
+a snapshot can discard work performed after it was taken. Do not run an older
+release against the migrated database or restore only one database. Validate this
+procedure on an isolated deployment before the production epoch transition.
+
 ## Cost and idle-world behavior
 
 Karmax owns lifecycle policy, not the operator. Workflow waits park provider

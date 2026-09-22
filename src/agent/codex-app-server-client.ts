@@ -49,7 +49,7 @@ export class CodexAppServerClient {
   /** Register the handler for server→client requests (approvals). Its return value
    *  is sent back as the JSON-RPC result; throwing / undefined sends `{}`. Every
    *  server request MUST get a response or the server stalls waiting on it. */
-  onServerRequest(cb: (method: string, params: any) => any | Promise<any>): void {
+  onServerRequest(cb: (method: string, params: any) => any | Promise<any> | Promise<any | Promise<any>>): void {
     this.serverRequestHandler = cb;
   }
 

@@ -1,3 +1,4 @@
+import { memoryTransaction } from './helpers/memory-transaction.js';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -151,7 +152,7 @@ describe('age and mounted Git password stores', () => {
     const f = fixture();
     const kv = new Map<string, string>();
     const db = {
-      kvGet: (k: string) => kv.get(k),
+      transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k),
       kvSet: (k: string, v: string) => {
         kv.set(k, v);
       },
@@ -217,7 +218,7 @@ describe('age and mounted Git password stores', () => {
     const c = connector(f.config, f.root);
     const kv = new Map<string, string>();
     const db = {
-      kvGet: (key: string) => kv.get(key),
+      transaction: memoryTransaction(kv), kvGet: (key: string) => kv.get(key),
       kvSet: (key: string, value: string) => {
         kv.set(key, value);
       },
@@ -237,18 +238,18 @@ describe('age and mounted Git password stores', () => {
       return result;
     };
     service.register(c);
-    service.setConfig('pass-git', { writeBack: true });
-    const item = items.save({ type: 'api-key', label: 'original label', secrets: { secret: 'original-secret' } });
+    (await service.setConfig('pass-git', { writeBack: true }));
+    const item = (await items.save({ type: 'api-key', label: 'original label', secrets: { secret: 'original-secret' } }));
     expect((await service.writeBackCreated(item.id))[0]?.error).toBeTruthy();
-    const snapshot = service.pendingWrites()[0]!.snapshotHandle!;
-    items.save({ id: item.id, type: 'api-key', label: 'renamed', secrets: { secret: 'rotated-secret' } });
+    const snapshot = (await service.pendingWrites())[0]!.snapshotHandle!;
+    (await items.save({ id: item.id, type: 'api-key', label: 'renamed', secrets: { secret: 'rotated-secret' } }));
     const freshBroker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
     const fresh = new Connectors(db, new VaultItems(db, freshBroker, path.join(f.root, 'items')), freshBroker);
     fresh.register(connector(f.config, f.root));
     expect((await fresh.retryWrites())[0]?.error).toBeUndefined();
-    expect(fresh.pendingWrites()).toEqual([]);
+    expect((await fresh.pendingWrites())).toEqual([]);
     expect(freshBroker.hasHandle(snapshot)).toBe(false);
-    const externalId = items.get(item.id)!.provenance.externalIds!['pass-git']!;
+    const externalId = (await items.get(item.id))!.provenance.externalIds!['pass-git']!;
     expect((await c.pull([externalId])).items[0]?.secrets.secret).toBe('rotated-secret');
     expect(await c.list()).toHaveLength(2);
   });
@@ -271,12 +272,12 @@ it('keeps healthy mounts available when another repository disappears', async ()
   const config = { ...f.config, mounts: [{ ...mount.config, name: 'work' }] };
   const c = connector(config, f.root);
   const kv = new Map<string, string>();
-  const db = { kvGet: (key: string) => kv.get(key), kvSet: (key: string, value: string) => { kv.set(key, value); }, appendAudit: () => 0 };
+  const db = { transaction: memoryTransaction(kv), kvGet: (key: string) => kv.get(key), kvSet: (key: string, value: string) => { kv.set(key, value); }, appendAudit: () => 0 };
   const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
   const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
   const service = new Connectors(db, items, broker); service.register(c);
   await service.connect('pass-git', JSON.stringify(config));
-  service.setAutoSync('pass-git', { keepUpdated: true, importNew: true, externalIds: [] });
+  (await service.setAutoSync('pass-git', { keepUpdated: true, importNew: true, externalIds: [] }));
   await c.list(); fs.rmSync(mount.remote, { recursive: true });
   const catalog = await c.catalog();
   expect(catalog.items.map(item => item.externalId)).toEqual(['example']);
@@ -292,7 +293,7 @@ it('keeps healthy mounts available when another repository disappears', async ()
 it('persists failed write-back, blocks remote conflicts and imports an explicitly accepted remote value', async () => {
   const f = fixture();
   const kv = new Map<string, string>();
-  const db = { kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
+  const db = { transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
   const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
   const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
   const makeService = () => {
@@ -304,7 +305,7 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   await service.connect('pass-git', JSON.stringify(f.config));
   const synced = await service.sync('pass-git', ['example'], { writeBack: true });
   const id = synced.itemIds[0]!;
-  items.save({ id, type: 'login', secrets: { password: 'local-new' } });
+  (await items.save({ id, type: 'login', secrets: { password: 'local-new' } }));
   const hook = path.join(f.remote, 'hooks', 'pre-receive');
   fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
   expect((await service.propagate(id, ['password']))?.error).toContain('pending retry');
@@ -319,17 +320,17 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   expect((await service.retryWrites())[0]?.error).toContain('review the remote value');
   const blocked = await service.sync('pass-git', ['example']);
   expect(blocked.failures).toHaveLength(1);
-  expect(items.readSecret(items.get(id)!, 'password')).toBe('local-new');
+  expect(items.readSecret((await items.get(id))!, 'password')).toBe('local-new');
   await service.acceptRemote(id);
-  expect(items.readSecret(items.get(id)!, 'password')).toBe('remote-new');
+  expect(items.readSecret((await items.get(id))!, 'password')).toBe('remote-new');
   expect((await service.describe())[0]?.pendingWrites).toEqual([]);
-  items.save({ id, type: 'login', secrets: { password: 'retry-new', totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } });
+  (await items.save({ id, type: 'login', secrets: { password: 'retry-new', totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } }));
   fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
   expect((await service.propagate(id, ['password', 'totp']))?.error).toContain('pending retry');
-  service.setConfig('pass-git', { writeBack: false });
+  (await service.setConfig('pass-git', { writeBack: false }));
   expect(await service.retryWrites()).toEqual([]);
   expect(await service.retryWriteBack(id)).toBeUndefined();
-  service.setConfig('pass-git', { writeBack: true });
+  (await service.setConfig('pass-git', { writeBack: true }));
   fs.rmSync(hook);
   expect(await makeService().retryWrites()).toEqual([{ connector: 'pass-git', itemId: id }]);
   expect((await connector(f.config, f.root).pull(['example'])).items[0]?.secrets.password).toBe('retry-new');
@@ -340,25 +341,25 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   const originalPull = active.pull.bind(active);
   active.pull = async ids => {
     const stale = await originalPull(ids);
-    items.save({ id, type: 'login', secrets: { password: 'concurrent-local' } });
+    (await items.save({ id, type: 'login', secrets: { password: 'concurrent-local' } }));
     await service.propagate(id, ['password']);
     return stale;
   };
   const raced = await service.sync('pass-git', ['example']);
   expect(raced.failures[0]?.error).toContain('changed during import');
-  expect(items.readSecret(items.get(id)!, 'password')).toBe('concurrent-local');
+  expect(items.readSecret((await items.get(id))!, 'password')).toBe('concurrent-local');
 
   expect((await service.describe())[0]?.pendingWrites).toEqual([]);
   active.pull = originalPull;
-  items.save({ id, type: 'login', secrets: { password: 'dismiss-local' } });
+  (await items.save({ id, type: 'login', secrets: { password: 'dismiss-local' } }));
   fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
   expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
-  expect(service.discardWrites('pass-git')).toBe(1);
+  expect((await service.discardWrites('pass-git'))).toBe(1);
   expect((await service.describe())[0]?.pendingWrites).toEqual([]);
-  expect(items.readSecret(items.get(id)!, 'password')).toBe('dismiss-local');
+  expect(items.readSecret((await items.get(id))!, 'password')).toBe('dismiss-local');
   expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
-  service.setConfig('pass-git', { writeBack: false });
-  items.delete(id);
+  (await service.setConfig('pass-git', { writeBack: false }));
+  (await items.delete(id));
   expect(JSON.parse(kv.get(`pass-writeback:org_personal:${id}`)!).fields).toEqual({});
 });
 

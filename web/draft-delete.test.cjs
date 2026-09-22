@@ -110,6 +110,26 @@ const has = (id) => S.tasks.some((t) => t.id === id);
   ok(!toasts.some((t) => t.err), 'deleting an already-removed draft surfaces no error toast');
   ok(!has('task_d3'), 'the stale draft is dropped locally too');
 
+  // Fetch every bounded page, but abandon an old project's in-flight refresh.
+  const calls = [];
+  global.api = async (url) => {
+    calls.push(url);
+    const offset = Number(new URL(url, 'http://fixture').searchParams.get('offset'));
+    return { total: 205, tasks: Array.from({ length: offset ? 5 : 200 }, (_, i) =>
+      ({ id: `paged_${offset + i}`, params: {} })) };
+  };
+  await loadTasks();
+  ok(S.tasks.length === 205, 'all bounded pages loaded');
+  ok(calls.length === 2 && calls[1].includes('offset=200'), 'requests advance by the page size');
+  let release;
+  global.api = () => new Promise(resolve => { release = resolve; });
+  const previous = S.tasks;
+  const obsolete = loadTasks();
+  S.projectId = 'different';
+  release({ total: 1000, tasks: [d1] });
+  ok(await obsolete === false, 'old project refresh stops after its current page');
+  ok(S.tasks === previous, 'old project page cannot overwrite new project state');
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

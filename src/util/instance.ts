@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { paths } from '../config/paths.js';
+import { acquireFileLock } from './file-lock.js';
 
 /**
  * Duplicate app-instance detection (karmax#4). The July-5 OOM had 14 concurrent
@@ -184,4 +185,48 @@ export function registerAppInstance(): InstanceRegistration {
       unlock?.();
     },
   };
+}
+
+/** Exclusive same-home ownership shared by combined and supervised workers.
+ * Keep this descriptor until execution has drained; never unlink its lock file. */
+export async function claimWorkerOwnership(home: string): Promise<() => void> {
+  const release = await acquireFileLock(path.join(paths(home).state, 'instances', 'worker.lock'), { waitMs: 0 });
+  if (!release) throw new Error('another execution worker is still running for this home');
+  return release;
+}
+
+/** Admit a supervised execution child only under the registered primary for
+ * this home. This is a local process-coordination guard, not a security boundary
+ * against another program running as the same OS user. Install the independent
+ * parent-lifetime guardian before calling it, and keep the returned worker lock
+ * until all activity services have drained.
+ */
+export async function admitWorkerProcess(home: string): Promise<() => void> {
+  if (process.platform !== 'linux' || !process.connected || !process.send)
+    throw new Error('worker admission requires Linux and supervisor IPC');
+  const parent = process.ppid;
+  const dir = path.join(paths(home).state, 'instances');
+  const verifyParent = () => {
+    if (!process.connected || process.ppid !== parent) throw new Error('worker supervisor is gone');
+    let record: ProcessIdentity & { pid?: number; home?: string; processLock?: boolean };
+    try { record = JSON.parse(fs.readFileSync(pidFile(dir, parent), 'utf8')); }
+    catch { throw new Error('worker supervisor is not registered for this home'); }
+    const current = processIdentity(parent);
+    if (!record || record.pid !== parent || record.processLock !== true
+      || typeof record.home !== 'string' || fs.realpathSync(record.home) !== fs.realpathSync(home)
+      || !record.pidStart || !record.bootId || record.pidStart !== current.pidStart || record.bootId !== current.bootId)
+      throw new Error('worker supervisor registration does not match its live identity');
+  };
+  verifyParent();
+  // A stale registration must never license bypassing the primary lock. This
+  // probe is nonblocking and releases immediately if no primary holds it.
+  const primary = await acquireFileLock(path.join(dir, 'app.lock'), { waitMs: 0 });
+  if (primary) {
+    primary();
+    throw new Error('worker supervisor does not hold the application lock');
+  }
+  const release = await claimWorkerOwnership(home);
+  try { verifyParent(); }
+  catch (error) { release(); throw error; }
+  return release;
 }

@@ -18,11 +18,11 @@ describe('Stripe Issuing organization rail', () => {
     STRIPE_WEBHOOK_SECRET: 'whsec_test',
   };
 
-  beforeEach(() => {
-    store = new Store(':memory:');
-    organizationId = store.createOrganization({ name: 'Tenant A' }).id;
-    projectId = store.createProject('Payments', {}, organizationId).id;
-    store.setSettings(`organization:${organizationId}`, 'payments', { budget: null });
+  beforeEach(async () => {
+    store = (await Store.create(':memory:'));
+    organizationId = (await store.createOrganization({ name: 'Tenant A' })).id;
+    projectId = (await store.createProject('Payments', {}, organizationId)).id;
+    (await store.setSettings(`organization:${organizationId}`, 'payments', { budget: null }));
     fetcher = vi.fn(async (url: string, init?: RequestInit) => {
       if (url === 'https://connect.stripe.com/oauth/token')
         return json({ stripe_user_id: 'acct_tenant_a', livemode: false });
@@ -75,18 +75,18 @@ describe('Stripe Issuing organization rail', () => {
       resolve: (handle: string) => secrets.get(handle),
     };
     const managed = new StripeIssuingProvider(store, fetcher as any, {}, broker as any);
-    expect(managed.platformStatus()).toMatchObject({
+    expect((await managed.platformStatus())).toMatchObject({
       configured: false, secretKeyConfigured: false, webhookConfigured: false, source: 'none',
     });
-    expect(managed.configurePlatform({
+    expect((await managed.configurePlatform({
       clientId: 'ca_ui_managed',
       secretKey: 'sk_test_ui_managed',
       webhookSecret: 'whsec_ui_managed',
-    })).toMatchObject({
+    }))).toMatchObject({
       configured: true, clientId: 'ca_ui_managed', secretKeyConfigured: true,
       webhookConfigured: true, source: 'ui',
     });
-    expect(JSON.stringify(store.exportOrganization(organizationId))).not.toContain('sk_test_ui_managed');
+    expect(JSON.stringify((await store.exportOrganization(organizationId)))).not.toContain('sk_test_ui_managed');
 
     const started = await managed.connect({
       organizationId,
@@ -106,7 +106,7 @@ describe('Stripe Issuing organization rail', () => {
     expect(managed.webhookSignatureValid(raw, `t=${timestamp},v1=${signature}`)).toBe(true);
   });
 
-  it('validates UI-managed Stripe platform credentials without replacing retained secrets', () => {
+  it('validates UI-managed Stripe platform credentials without replacing retained secrets', async () => {
     const secrets = new Map<string, string>();
     const broker = {
       hasHandle: (handle: string) => secrets.has(handle),
@@ -114,11 +114,10 @@ describe('Stripe Issuing organization rail', () => {
       resolve: (handle: string) => secrets.get(handle),
     };
     const managed = new StripeIssuingProvider(store, fetcher as any, {}, broker as any);
-    expect(() => managed.configurePlatform({ clientId: 'not-a-client-id', secretKey: 'sk_test_ok' }))
-      .toThrow(/client ID/);
-    managed.configurePlatform({ clientId: 'ca_first', secretKey: 'sk_test_retained' });
-    managed.configurePlatform({ clientId: 'ca_updated' });
-    expect(managed.platformStatus()).toMatchObject({
+    await expect((async () => (await managed.configurePlatform({ clientId: 'not-a-client-id', secretKey: 'sk_test_ok' })))()).rejects.toThrow(/client ID/);
+    (await managed.configurePlatform({ clientId: 'ca_first', secretKey: 'sk_test_retained' }));
+    (await managed.configurePlatform({ clientId: 'ca_updated' }));
+    expect((await managed.platformStatus())).toMatchObject({
       configured: true, clientId: 'ca_updated', secretKeyConfigured: true,
     });
     expect([...secrets.values()]).toContain('sk_test_retained');
@@ -126,13 +125,13 @@ describe('Stripe Issuing organization rail', () => {
 
   it('stores a separate connected account and balance for the organization', async () => {
     await connect();
-    expect(store.getPaymentConnection(organizationId, 'stripe')).toMatchObject({
+    expect((await store.getPaymentConnection(organizationId, 'stripe'))).toMatchObject({
       accountId: 'acct_tenant_a',
       status: 'ready',
     });
-    expect(stripe.describe({ organizationId }).connected).toBe(true);
-    const other = store.createOrganization({ name: 'Tenant B' });
-    expect(stripe.describe({ organizationId: other.id }).connected).toBe(false);
+    expect((await stripe.describe({ organizationId })).connected).toBe(true);
+    const other = (await store.createOrganization({ name: 'Tenant B' }));
+    expect((await stripe.describe({ organizationId: other.id })).connected).toBe(false);
     expect(await stripe.balance(organizationId)).toMatchObject({ available: 25_000, currency: 'usd' });
     expect(fetcher.mock.calls.find(([url]) => url === 'https://api.stripe.com/v1/balance')?.[1]?.headers)
       .toMatchObject({ 'stripe-account': 'acct_tenant_a' });
@@ -172,8 +171,8 @@ describe('Stripe Issuing organization rail', () => {
     expect(await stripe.retrieveCardDetails(card.id)).toEqual({
       number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2030,
     });
-    expect(JSON.stringify(store.getCard(card.id))).not.toContain('4242424242424242');
-    expect(JSON.stringify(store.exportOrganization(organizationId))).not.toContain('4242424242424242');
+    expect(JSON.stringify((await store.getCard(card.id)))).not.toContain('4242424242424242');
+    expect(JSON.stringify((await store.exportOrganization(organizationId)))).not.toContain('4242424242424242');
   });
 
   it('reserves a spend, approves only the matching real-time authorization, and reconciles capture', async () => {
@@ -199,11 +198,11 @@ describe('Stripe Issuing organization rail', () => {
         currency: 'usd', merchant_data: { name: 'shop.example' }, created: 1_700_000_000,
       } },
     });
-    expect(stripe.handleWebhook(authorization.raw, authorization.signature)).toMatchObject({
+    expect((await stripe.handleWebhook(authorization.raw, authorization.signature))).toMatchObject({
       status: 200, body: { approved: true },
     });
-    expect(stripe.handleWebhook(authorization.raw, authorization.signature).body).toEqual({ approved: true });
-    expect(store.getPaymentSpendRequest(spend.requestId!).status).toBe('consumed');
+    expect((await stripe.handleWebhook(authorization.raw, authorization.signature)).body).toEqual({ approved: true });
+    expect((await store.getPaymentSpendRequest(spend.requestId!)).status).toBe('consumed');
 
     const capture = signed({
       id: 'evt_capture', account: 'acct_tenant_a', type: 'issuing_transaction.created',
@@ -212,9 +211,9 @@ describe('Stripe Issuing organization rail', () => {
         amount: 2_500, currency: 'usd', merchant_data: { name: 'shop.example' }, created: 1_700_000_010,
       } },
     });
-    expect(stripe.handleWebhook(capture.raw, capture.signature).status).toBe(200);
-    expect(store.getPaymentSpendRequest(spend.requestId!).status).toBe('settled');
-    expect(store.listPaymentTransactions(organizationId).map((value) => value.kind).sort())
+    expect((await stripe.handleWebhook(capture.raw, capture.signature)).status).toBe(200);
+    expect((await store.getPaymentSpendRequest(spend.requestId!)).status).toBe('settled');
+    expect((await store.listPaymentTransactions(organizationId)).map((value) => value.kind).sort())
       .toEqual(['authorization', 'transaction']);
   });
 
@@ -257,13 +256,13 @@ describe('Stripe Issuing organization rail', () => {
     it('reconciles the reservation down to the authorized and captured amount', async () => {
       const { card, budget, spend } = await reserved();
       const auth = authorize(4_000);
-      expect(stripe.handleWebhook(auth.raw, auth.signature).body).toEqual({ approved: true });
-      expect(store.cardPaymentSpent(card.id)).toBe(4_000);
-      expect(store.paymentSpent('task_a')).toBe(4_000);
+      expect((await stripe.handleWebhook(auth.raw, auth.signature)).body).toEqual({ approved: true });
+      expect((await store.cardPaymentSpent(card.id))).toBe(4_000);
+      expect((await store.paymentSpent('task_a'))).toBe(4_000);
 
       const capture = settle('itxn_1', 'capture', -4_000);
-      expect(stripe.handleWebhook(capture.raw, capture.signature).status).toBe(200);
-      expect(store.getPaymentSpendRequest(spend.requestId!)).toMatchObject({ status: 'settled', amount: 4_000 });
+      expect((await stripe.handleWebhook(capture.raw, capture.signature)).status).toBe(200);
+      expect((await store.getPaymentSpendRequest(spend.requestId!))).toMatchObject({ status: 'settled', amount: 4_000 });
       // The 60 dollars the merchant never took are spendable again.
       expect((await budget.request({ organizationId, projectId, taskId: 'task_b' },
         { amount: 8_000, cardId: card.id, why: 'second' })).status).toBe('granted');
@@ -272,17 +271,17 @@ describe('Stripe Issuing organization rail', () => {
     it('frees only the refunded part of a settled spend', async () => {
       const { card, spend } = await reserved(4_000);
       const auth = authorize(4_000);
-      stripe.handleWebhook(auth.raw, auth.signature);
+      (await stripe.handleWebhook(auth.raw, auth.signature));
       const capture = settle('itxn_1', 'capture', -4_000);
-      stripe.handleWebhook(capture.raw, capture.signature);
+      (await stripe.handleWebhook(capture.raw, capture.signature));
       const partial = settle('itxn_2', 'refund', 1_500);
-      stripe.handleWebhook(partial.raw, partial.signature);
-      expect(store.getPaymentSpendRequest(spend.requestId!)).toMatchObject({ status: 'settled', amount: 2_500 });
-      expect(store.cardPaymentSpent(card.id)).toBe(2_500);
+      (await stripe.handleWebhook(partial.raw, partial.signature));
+      expect((await store.getPaymentSpendRequest(spend.requestId!))).toMatchObject({ status: 'settled', amount: 2_500 });
+      expect((await store.cardPaymentSpent(card.id))).toBe(2_500);
       const rest = settle('itxn_3', 'refund', 2_500);
-      stripe.handleWebhook(rest.raw, rest.signature);
-      expect(store.getPaymentSpendRequest(spend.requestId!).status).toBe('reversed');
-      expect(store.cardPaymentSpent(card.id)).toBe(0);
+      (await stripe.handleWebhook(rest.raw, rest.signature));
+      expect((await store.getPaymentSpendRequest(spend.requestId!)).status).toBe('reversed');
+      expect((await store.cardPaymentSpent(card.id))).toBe(0);
     });
 
     it('re-counts the cap when a queued spend is approved on the webhook rail', async () => {
@@ -294,7 +293,7 @@ describe('Stripe Issuing organization rail', () => {
       const registry = new PaymentRegistry(store);
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
-      store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', budget: 1_000 });
+      (await store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', budget: 1_000 }));
       const ctx = { organizationId, projectId, taskId: 'task_gate' };
       const first = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'first' });
       const second = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'second' });
@@ -304,7 +303,7 @@ describe('Stripe Issuing organization rail', () => {
       // this could be caught — and it was not looking. 16 000 on a 12 345 card.
       expect(await budget.approve(second.requestId!, 'user:a'))
         .toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
-      expect(store.cardPaymentSpent(card.id)).toBe(8_000);
+      expect((await store.cardPaymentSpent(card.id))).toBe(8_000);
     });
   });
 
@@ -319,8 +318,8 @@ describe('Stripe Issuing organization rail', () => {
       data: { object: { id: 'iauth_none', card: 'ic_tenant_a', pending_request: { amount: 99 },
         currency: 'usd', merchant_data: { name: 'shop.example' } } },
     });
-    expect(stripe.handleWebhook(event.raw, 'bad').status).toBe(400);
-    expect(stripe.handleWebhook(event.raw, event.signature).body).toEqual({ approved: false });
+    expect((await stripe.handleWebhook(event.raw, 'bad')).status).toBe(400);
+    expect((await stripe.handleWebhook(event.raw, event.signature)).body).toEqual({ approved: false });
   });
 
   it('revokes project cards before disconnecting the organization account', async () => {
@@ -330,8 +329,8 @@ describe('Stripe Issuing organization rail', () => {
       cap: 12_345, cardholderId: 'ich_tenant_a',
     });
     await stripe.disconnect(organizationId);
-    expect(store.getCard(card.id)).toMatchObject({ status: 'canceled', available: 0 });
-    expect(store.getPaymentConnection(organizationId, 'stripe')).toBeUndefined();
+    expect((await store.getCard(card.id))).toMatchObject({ status: 'canceled', available: 0 });
+    expect((await store.getPaymentConnection(organizationId, 'stripe'))).toBeUndefined();
     expect(fetcher.mock.calls.some(([url, init]) =>
       url === 'https://api.stripe.com/v1/issuing/cards/ic_tenant_a'
       && init?.method === 'POST')).toBe(true);

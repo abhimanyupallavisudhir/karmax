@@ -1,3 +1,4 @@
+import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -1046,13 +1047,13 @@ async function softwareDevImpl(
   }
 
   const publishConversation = conversationPublisher(workflowInfo().runId,
-    (view, reference) => core.publishView(taskId, view, reference));
+    (view, reference) => publishTaskView(core, taskId, view, reference));
   async function publish() {
     // Apply at the live edge of existing executions as well as new task pins.
     if (patched('software-dev-conversation-publication-v1')) {
       await publishConversation(buildView());
     } else {
-      await core.publishView(taskId, buildView());
+      await publishTaskView(core, taskId, buildView());
     }
   }
 

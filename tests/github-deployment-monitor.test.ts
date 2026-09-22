@@ -9,10 +9,10 @@ import {
   observeDeploymentWorkflowRun,
 } from '../src/integrations/github-deployment-monitor.js';
 
-function repositoryFixture(store: Store) {
-  const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-  const project = store.createProject('App', {}, organization.id);
-  const repository = store.upsertRepository({
+async function repositoryFixture(store: Store) {
+  const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+  const project = (await store.createProject('App', {}, organization.id));
+  const repository = (await store.upsertRepository({
     organizationId: organization.id,
     provider: 'github',
     providerId: '99',
@@ -21,8 +21,8 @@ function repositoryFixture(store: Store) {
     sshUrl: 'git@github.com:acme/app.git',
     defaultBranch: 'master',
     private: true,
-  });
-  store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+  }));
+  (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
   return { project, repository };
 }
 
@@ -50,10 +50,10 @@ function githubWithRuns(runs: any[] = []) {
 
 describe('missing GitHub deployment runs', () => {
   it('reports no Deploy run after successful master CI and the bounded grace period', async () => {
-    const store = new Store(':memory:');
-    const { project, repository } = repositoryFixture(store);
+    const store = (await Store.create(':memory:'));
+    const { project, repository } = (await repositoryFixture(store));
     const observedAt = 1_000_000;
-    observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: observedAt });
+    (await observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: observedAt }));
     const { github } = githubWithRuns();
 
     const findings = await new GitHubDeploymentMonitor(store, github as any)
@@ -75,15 +75,15 @@ describe('missing GitHub deployment runs', () => {
         }),
       }),
     })]);
-    store.close();
+    (await store.close());
   });
 
   it('accepts a delayed Deploy run found by polling even when its webhook did not arrive', async () => {
-    const store = new Store(':memory:');
-    const { repository } = repositoryFixture(store);
+    const store = (await Store.create(':memory:'));
+    const { repository } = (await repositoryFixture(store));
     const observedAt = 2_000_000;
     const ci = successfulCi();
-    observeDeploymentWorkflowRun(store, repository, ci, { now: observedAt });
+    (await observeDeploymentWorkflowRun(store, repository, ci, { now: observedAt }));
     const { github, listRuns } = githubWithRuns([{
       id: 701,
       name: 'Deploy',
@@ -96,34 +96,34 @@ describe('missing GitHub deployment runs', () => {
     expect(await new GitHubDeploymentMonitor(store, github as any)
       .reconcile(observedAt + DEPLOYMENT_RUN_GRACE_MS + 1)).toEqual([]);
     expect(listRuns).toHaveBeenCalledOnce();
-    expect(store.kvEntries('github:deployment-expectation:')).toEqual([]);
-    store.close();
+    expect((await store.kvEntries('github:deployment-expectation:'))).toEqual([]);
+    (await store.close());
   });
 
-  it('does not extend the deadline or duplicate state across repeated observations', () => {
-    const store = new Store(':memory:');
-    const { repository } = repositoryFixture(store);
+  it('does not extend the deadline or duplicate state across repeated observations', async () => {
+    const store = (await Store.create(':memory:'));
+    const { repository } = (await repositoryFixture(store));
     const ci = successfulCi();
-    observeDeploymentWorkflowRun(store, repository, ci, { now: 3_000_000 });
-    observeDeploymentWorkflowRun(store, repository, ci, { now: 4_000_000 });
+    (await observeDeploymentWorkflowRun(store, repository, ci, { now: 3_000_000 }));
+    (await observeDeploymentWorkflowRun(store, repository, ci, { now: 4_000_000 }));
 
-    const entries = store.kvEntries('github:deployment-expectation:');
+    const entries = (await store.kvEntries('github:deployment-expectation:'));
     expect(entries).toHaveLength(1);
     expect(JSON.parse(entries[0]!.value)).toMatchObject({
       observedAt: 3_000_000,
       deadlineAt: 3_000_000 + DEPLOYMENT_RUN_GRACE_MS,
     });
-    store.close();
+    (await store.close());
   });
 
   it('reports a deployment workflow file that disappears after the repository was monitored', async () => {
-    const store = new Store(':memory:');
-    const { repository } = repositoryFixture(store);
-    observeDeploymentWorkflowRun(store, repository, {
+    const store = (await Store.create(':memory:'));
+    const { repository } = (await repositoryFixture(store));
+    (await observeDeploymentWorkflowRun(store, repository, {
       id: 699, name: 'Deploy', status: 'completed', conclusion: 'success',
       head_branch: 'master', head_sha: 'b'.repeat(40),
-    });
-    observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: 4_500_000 });
+    }));
+    (await observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: 4_500_000 }));
     const { github } = githubWithRuns();
     github.repositoryFileStatus.mockResolvedValue({ status: 'missing' } as any);
 
@@ -135,29 +135,29 @@ describe('missing GitHub deployment runs', () => {
       workflowFile: { status: 'missing' },
       interpretation: expect.stringContaining('previously exposed'),
     });
-    store.close();
+    (await store.close());
   });
 
   it('recovers persisted expectations after restart and stays idempotent after reporting', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deployment-monitor-'));
     const database = path.join(dir, 'state.db');
-    const first = new Store(database);
-    const { repository } = repositoryFixture(first);
-    observeDeploymentWorkflowRun(first, repository, successfulCi(), { now: 5_000_000 });
-    first.close();
+    const first = (await Store.create(database));
+    const { repository } = (await repositoryFixture(first));
+    (await observeDeploymentWorkflowRun(first, repository, successfulCi(), { now: 5_000_000 }));
+    (await first.close());
 
-    const restarted = new Store(database);
+    const restarted = (await Store.create(database));
     const { github } = githubWithRuns();
     const monitor = new GitHubDeploymentMonitor(restarted, github as any);
     const findings = await monitor.reconcile(5_000_000 + DEPLOYMENT_RUN_GRACE_MS);
     expect(findings).toHaveLength(1);
-    monitor.markReported(findings[0]!);
-    restarted.close();
+    (await monitor.markReported(findings[0]!));
+    (await restarted.close());
 
-    const again = new Store(database);
+    const again = (await Store.create(database));
     expect(await new GitHubDeploymentMonitor(again, github as any)
       .reconcile(6_000_000)).toEqual([]);
-    again.close();
+    (await again.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });

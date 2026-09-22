@@ -15,7 +15,7 @@ import { canonicalRepositoryIdentity } from './repository-identity.js';
 export interface GitBrokerCredential extends GitCredential {}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
 /** Called with the immutable tip actually transported, never a later world HEAD. */
-export type OriginPublicationRecorder = (repo: WorldRepo, headSha: string) => void;
+export type OriginPublicationRecorder = (repo: WorldRepo, headSha: string) => void | Promise<void>;
 export interface GitBrokerPublishResult {
   pushed: string[];
   skipped: string[];
@@ -331,7 +331,7 @@ async function pushBranchToOrigin(
       }
     }
     if (result.code !== 0) throw new Error(describeGitPushError(repo, result.stderr || result.stdout || 'push failed'));
-    onPublished?.(repo, tip.stdout.trim());
+    await onPublished?.(repo, tip.stdout.trim());
   });
 }
 

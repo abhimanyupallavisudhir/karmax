@@ -34,13 +34,13 @@ describe('workflow code trust boundary', () => {
   });
 
   it('rejects hosted API installation and edit proposals even with full capabilities', async () => {
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     try {
-      store.claimPersonalOrganization('owner');
-      const project = store.createProject('P', {});
+      (await store.claimPersonalOrganization('owner'));
+      const project = (await store.createProject('P', {}));
       const tokens = new TokenAuthority();
-      const token = tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:owner',
-        ceiling: ['*'], grantorCaps: ['*'] }).token;
+      const token = (await tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:owner',
+        ceiling: ['*'], grantorCaps: ['*'] })).token;
       const install = vi.fn();
       const start = vi.fn();
       const api = new KarmaxApi({ store, tokens, hosted: true, taskQueue: 'test',
@@ -51,8 +51,8 @@ describe('workflow code trust boundary', () => {
         repo: '/evil', branch: 'change', target: 'main' })).rejects.toThrow(/disabled.*hosted/);
       expect(install).not.toHaveBeenCalled();
       expect(start).not.toHaveBeenCalled();
-      expect(store.listTasks(project.id)).toEqual([]);
-    } finally { store.close(); }
+      expect((await store.listTasks(project.id))).toEqual([]);
+    } finally { (await store.close()); }
   });
 
   it.each(['manifest.mjs', 'manifest.js', 'manifest.ts'])('never executes %s during inspection', async (name) => {

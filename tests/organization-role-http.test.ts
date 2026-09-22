@@ -25,10 +25,10 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 describe('organization role HTTP API', () => {
   it('enforces scope and delegation and returns persisted roles to the selector catalog', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-parity-'));
-    const store = new Store(':memory:');
-    store.claimPersonalOrganization('me');
-    const project = store.createProject('Parity');
-    store.kvSet(`avatars:project:${project.id}`, 'enabled');
+    const store = (await Store.create(':memory:'));
+    (await store.claimPersonalOrganization('me'));
+    const project = (await store.createProject('Parity'));
+    (await store.kvSet(`avatars:project:${project.id}`, 'enabled'));
     const tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
@@ -36,17 +36,17 @@ describe('organization role HTTP API', () => {
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
     const client = { workflow: { getHandle: () => ({}) } } as any;
     const api = new KarmaxApi({ store, tokens, client, worlds, resources, broker, taskQueue: 'test' });
-    const authorization = new AuthorizationService(store);
-    const gateway = new Gateway({ authorization, api, store, tokens, client, worlds, resources, broker, objects,
+    const authorization = (await AuthorizationService.create(store));
+    const gateway = (await Gateway.create({ authorization, api, store, tokens, client, worlds, resources, broker, objects,
       taskQueue: 'test', staticDir: 'web', bus: new KarmaxBus(), contributions: new ContributionRegistry(),
-      overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'authorization parity test' } });
+      overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'authorization parity test' } }));
     const server = await gateway.listen(await findFreePortFrom(nextPort += 10));
-    cleanups.push(async () => { await server.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+    cleanups.push(async () => { await server.close(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
 
 
     const session = await (await fetch(`${server.url}/api/session`)).json() as { token: string };
     const humanToken = (gateway as any).sessions.get(session.token).apiToken as string;
-    const principal = tokens.verify(humanToken)!;
+    const principal = (await tokens.verify(humanToken))!;
     principal.organizationId = project.organizationId;
     principal.caps = [...DEFAULT_AUTHORIZATION_PROFILES.find((p) => p.id === 'administrator')!.capabilities];
     const request = (path: string, body?: unknown) => fetch(`${server.url}${path}`, {
@@ -70,7 +70,7 @@ describe('organization role HTTP API', () => {
     expect((await request(url, payload)).status).toBe(400);
     expect((await request(url, { ...payload, name: 'Global', capabilities: ['settings:write'] })).status).toBe(403);
     expect((await request(url, { ...payload, capabilities: ['invented'] })).status).toBe(400);
-    const foreign = store.createOrganization({ name: 'Foreign' });
+    const foreign = (await store.createOrganization({ name: 'Foreign' }));
     expect((await request(`/api/organizations/${foreign.id}/roles`)).status).toBe(403);
     principal.caps = ['organization:read'];
     expect((await request(url, { ...payload, name: 'Denied' })).status).toBe(403);

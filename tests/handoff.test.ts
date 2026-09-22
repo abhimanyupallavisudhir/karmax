@@ -15,70 +15,70 @@ describe('hosted/local Git handoff', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-open-'));
     const file = path.join(dir, 'result.txt');
     fs.writeFileSync(file, 'done\n');
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Scripts', {}, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Run script', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Scripts', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Run script', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
     const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
       actions: [], state: {}, messages: [], worldPath: dir, updatedAt: 1 } as any;
-    store.saveView(task.id, view);
-    store.registerWorld({ kind: 'worktree', id: task.id, root: dir, branch: 'main', base: 'main' }, project.id);
+    (await store.saveView(task.id, view));
+    (await store.registerWorld({ kind: 'worktree', id: task.id, root: dir, branch: 'main', base: 'main' }, project.id));
 
     const opened = await new WorldHandoffService(store, new WorldRegistry(), {} as any).openFile(task.id, view, 'result.txt', 2);
     expect(opened).toEqual({ path: file, command: `code --goto '${file}:2'`, materialized: false });
 
-    store.close();
+    (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('produces a secret-free SSH checkout plan for every attached repository', () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Platform', { worldProvider: 'e2b' }, organization.id);
-    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github', installationId: '42',
-      accountLogin: 'acme', accountType: 'Organization' });
-    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7',
+  it('produces a secret-free SSH checkout plan for every attached repository', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Platform', { worldProvider: 'e2b' }, organization.id));
+    const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github', installationId: '42',
+      accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7',
       owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true,
-      gitConnectionId: connection.id });
-    store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
-    const task = store.createTask({ projectId: project.id, title: 'Fix auth', workflow: 'software-dev', workflowVersion: '1.0.0',
-      params: { prompt: 'fix auth' } as any });
+      gitConnectionId: connection.id }));
+    (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Fix auth', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'fix auth' } as any }));
     const branch = `karmax/${task.id}`;
-    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
-      actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any);
-    store.registerWorld({ kind: 'e2b', id: task.id, root: '/workspace', branch, base: 'main', repo: repository.sshUrl,
-      repos: [{ name: 'app', repo: repository.sshUrl, root: '/workspace', branch, base: 'main', target: 'main' }] }, project.id);
+    (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
+      actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any));
+    (await store.registerWorld({ kind: 'e2b', id: task.id, root: '/workspace', branch, base: 'main', repo: repository.sshUrl,
+      repos: [{ name: 'app', repo: repository.sshUrl, root: '/workspace', branch, base: 'main', target: 'main' }] }, project.id));
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => { throw new Error('unused'); },
       open: async () => { throw new Error('unused'); }, destroy: async () => {} } as any);
     const handoff = new WorldHandoffService(store, worlds, {} as any);
-    expect(() => handoff.checkout(task.id)).toThrow(/has not reached GitHub/);
-    store.appendEvent({ taskId: task.id, type: 'push.branch', ts: Date.now(), payload: { branch } });
-    const plan = handoff.checkout(task.id);
+    await expect((async () => (await handoff.checkout(task.id)))()).rejects.toThrow(/has not reached GitHub/);
+    (await store.appendEvent({ taskId: task.id, type: 'push.branch', ts: Date.now(), payload: { branch } }));
+    const plan = (await handoff.checkout(task.id));
     expect(plan.repositories).toEqual([expect.objectContaining({ name: 'app', sshUrl: repository.sshUrl, branch })]);
     expect(plan.cloneScript).toContain(`git clone --branch '${branch}' --single-branch 'git@github.com:acme/app.git' 'app'`);
     expect(plan.pushScript).toContain(`git -C 'app' push origin '${branch}'`);
     expect(JSON.stringify(plan)).not.toMatch(/token|private.key|credential/i);
-    store.close();
+    (await store.close());
   });
 
-  it('produces a default-branch checkout plan for a hosted project', () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Platform Tools', { worldProvider: 'e2b' }, organization.id);
-    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7',
-      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'trunk', private: true });
-    store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id, baseBranch: 'release' });
+  it('produces a default-branch checkout plan for a hosted project', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Platform Tools', { worldProvider: 'e2b' }, organization.id));
+    const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7',
+      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'trunk', private: true }));
+    (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id, baseBranch: 'release' }));
 
-    const plan = new WorldHandoffService(store, new WorldRegistry(), {} as any).projectCheckout(project.id);
+    const plan = (await new WorldHandoffService(store, new WorldRegistry(), {} as any).projectCheckout(project.id));
 
     expect(plan.workspace).toBe('karmax-platform-tools');
     expect(plan.repositories).toEqual([expect.objectContaining({ name: 'app', branch: 'trunk' })]);
     expect(plan.cloneScript).toContain("git clone --branch 'trunk' --single-branch 'git@github.com:acme/app.git' 'app'");
     expect(plan.updateScript).toContain("git -C 'app' merge --ff-only 'origin/trunk'");
     expect(JSON.stringify(plan)).not.toMatch(/token|private.key|credential/i);
-    store.close();
+    (await store.close());
   });
 
   it('imports a pushed branch through a credential-free bundle and only fast-forwards the cloud checkout', async () => {
@@ -150,23 +150,23 @@ describe('hosted/local Git handoff', () => {
     // Use real filesystem/process operations while retaining the remote kind:
     // handoff must exercise the broker, including bounded binary transfers.
     const world = await new WorktreeProvider().open(handle);
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Platform', { worldProvider: 'e2b' }, organization.id);
-    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github', installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7', owner: 'acme', name: 'app', sshUrl, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
-    const task = store.createTask({ projectId: project.id, title: 'Cloud work', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Platform', { worldProvider: 'e2b' }, organization.id));
+    const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github', installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7', owner: 'acme', name: 'app', sshUrl, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Cloud work', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
     handle.id = task.id;
     const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting', actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any;
-    store.saveView(task.id, view); store.registerWorld(handle, project.id);
+    (await store.saveView(task.id, view)); (await store.registerWorld(handle, project.id));
     // Review is precisely when humans run verification commands or open a
     // terminal. Those processes keep the cloud world alive, but must not block
     // publishing the committed task ref into a separate local checkout.
-    store.createExecution({ id: 'review-server', organizationId: organization.id, projectId: project.id,
+    (await store.createExecution({ id: 'review-server', organizationId: organization.id, projectId: project.id,
       taskId: task.id, worldId: task.id, generation: 1, kind: 'review-action', label: 'Preview',
-      command: 'npm start', server: true, openUrls: [] });
-    store.setExecutionRunning('review-server');
+      command: 'npm start', server: true, openUrls: [] }));
+    (await store.setExecutionRunning('review-server'));
     const worlds = new WorldRegistry();
     let worldOpens = 0;
     worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world,
@@ -178,20 +178,20 @@ describe('hosted/local Git handoff', () => {
     expect(result.command).toBe(`code --goto '${path.join(localRoot, task.id, 'app', 'cloud.txt')}:7'`);
     expect(result.materialized).toBe(true);
     expect(fs.readFileSync(result.path, 'utf8')).toBe('from E2B\n');
-    expect(store.eventsOfType(task.id, 'push.head').at(-1)?.payload.headSha)
+    expect((await store.eventsOfType(task.id, 'push.head')).at(-1)?.payload.headSha)
       .toBe((await git(cloud, ['rev-parse', 'HEAD'])).stdout.trim());
-    expect(store.eventsSince(task.id, 0).some((event) => event.type === 'push.branch')).toBe(true);
+    expect((await store.eventsSince(task.id, 0)).some((event) => event.type === 'push.branch')).toBe(true);
 
-    const portable = new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
-      .fileCheckout(task.id, view, `${cloud}/cloud.txt`, 7);
+    const portable = (await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .fileCheckout(task.id, view, `${cloud}/cloud.txt`, 7));
     expect(portable.file).toEqual({ repository: 'app', relativePath: 'cloud.txt', line: 7 });
     expect(portable.openScript).toContain(`if [ -d 'app/.git' ]; then`);
     expect(portable.openScript).toContain(`git -C 'app' merge --ff-only 'origin/${branch}'`);
     expect(portable.openScript).toContain(`code --goto 'app/cloud.txt:7'`);
-    expect(() => new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
-      .fileCheckout(task.id, { ...view, status: 'active' }, `${cloud}/cloud.txt`, 7)).toThrow(/reach a checkpoint/);
-    expect(() => new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
-      .fileCheckout(task.id, view, '/etc/passwd')).toThrow(/outside the task repositories/);
+    await expect((async () => (await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .fileCheckout(task.id, { ...view, status: 'active' }, `${cloud}/cloud.txt`, 7)))()).rejects.toThrow(/reach a checkpoint/);
+    await expect((async () => (await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .fileCheckout(task.id, view, '/etc/passwd')))()).rejects.toThrow(/outside the task repositories/);
 
     const materialized = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
       .materialize(task.id, view);
@@ -200,7 +200,7 @@ describe('hosted/local Git handoff', () => {
       expect.objectContaining({ name: 'app', path: path.join(localRoot, task.id, 'app'), branch }),
     ]);
     expect(worldOpens).toBe(1);
-    expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'push.branch')).toHaveLength(1);
+    expect((await store.eventsSince(task.id, 0)).filter((event) => event.type === 'push.branch')).toHaveLength(1);
 
     await ensureIdentity(cloud);
     fs.writeFileSync(path.join(cloud, 'after-review.txt'), 'new task work\n');
@@ -210,12 +210,12 @@ describe('hosted/local Git handoff', () => {
       .materialize(task.id, { ...view, updatedAt: 2 });
     expect(worldOpens).toBe(2);
     expect(fs.readFileSync(path.join(refreshed.cwd, 'after-review.txt'), 'utf8')).toBe('new task work\n');
-    expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'push.branch')).toHaveLength(2);
+    expect((await store.eventsSince(task.id, 0)).filter((event) => event.type === 'push.branch')).toHaveLength(2);
 
     // The final task view no longer advertises a live world, and provider
     // compute has been released. Its published checkpoint still materializes
     // without attempting to reopen the destroyed sandbox.
-    store.setWorldState(handle, 'released');
+    (await store.setWorldState(handle, 'released'));
     const releasedRoot = path.join(dir, 'released-local');
     const released = await new WorldHandoffService(store, worlds, github, undefined, undefined, releasedRoot)
       .openFile(task.id, { ...view, stage: 'done', status: 'done', updatedAt: 3 }, `${cloud}/after-review.txt`, 9);
@@ -223,7 +223,7 @@ describe('hosted/local Git handoff', () => {
     expect(released.command).toBe(`code --goto '${path.join(releasedRoot, task.id, 'app', 'after-review.txt')}:9'`);
     expect(fs.readFileSync(released.path, 'utf8')).toBe('new task work\n');
     expect(worldOpens).toBe(2);
-    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('materializes a cloud branch backed by a local repository without a project GitHub attachment', async () => {
@@ -253,15 +253,15 @@ describe('hosted/local Git handoff', () => {
     // Use real filesystem/process operations while retaining the remote kind:
     // handoff must exercise the broker, including bounded binary transfers.
     const world = await new WorktreeProvider().open(handle);
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
-    const project = store.createProject('Platform', { worldProvider: 'e2b', repos: [source] }, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Cloud work', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Platform', { worldProvider: 'e2b', repos: [source] }, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Cloud work', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
     handle.id = task.id;
     const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
       actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any;
-    store.saveView(task.id, view); store.registerWorld(handle, project.id);
+    (await store.saveView(task.id, view)); (await store.registerWorld(handle, project.id));
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world,
       open: async () => world, destroy: async () => {} } as any);
@@ -273,6 +273,6 @@ describe('hosted/local Git handoff', () => {
     expect(result.cwd).toBe(path.join(localRoot, task.id, 'app'));
     expect(fs.readFileSync(path.join(result.cwd, 'cloud.txt'), 'utf8')).toBe('from cloud\n');
     expect((await git(source, ['rev-parse', branch])).stdout.trim()).toBe((await git(cloud, ['rev-parse', 'HEAD'])).stdout.trim());
-    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 });

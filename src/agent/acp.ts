@@ -343,7 +343,7 @@ export class AcpAdapter implements AgentAdapter {
     const control = await startControlBridge(platformToolHandlers(input.world, ctx));
     const custody = createCustodyEnv(spec.env);
     spec.env = custody.env;
-    const startupEnd = currentTiming()?.start('process.acp-startup');
+    const startupEnd = (await (await currentTiming())?.start('process.acp-startup'));
     const child = spawn(spec.command, spec.args, {
       cwd: input.world.handle.root,
       env: spec.env,
@@ -464,9 +464,9 @@ export class AcpAdapter implements AgentAdapter {
         terminals.delete(params.terminalId);
         return {};
       })
-      .onNotification(methods.client.session.update, ({ params }) => {
+      .onNotification(methods.client.session.update, async ({ params }) => {
         if (sessionId && params.sessionId !== sessionId) return;
-        currentTiming()?.markOnce('provider.first-event');
+        (await (await currentTiming())?.markOnce('provider.first-event'));
         const update = params.update;
         if (update.sessionUpdate === 'agent_message_chunk') {
           finalText += textOf(update.content);
@@ -497,7 +497,7 @@ export class AcpAdapter implements AgentAdapter {
           clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
           clientInfo: { name: 'karmax', version: '1.0.0' },
         });
-        startupEnd?.();
+        (await startupEnd?.());
         if (init.protocolVersion !== PROTOCOL_VERSION) {
           throw new Error(`${this.provider} ACP protocol ${init.protocolVersion} is incompatible with ${PROTOCOL_VERSION}`);
         }
@@ -595,14 +595,14 @@ export class AcpAdapter implements AgentAdapter {
             })(), 1200)
           : undefined;
         let result;
-        const roundEnd = currentTiming()?.start('provider.acp-roundtrip.opaque');
+        const roundEnd = (await (await currentTiming())?.start('provider.acp-roundtrip.opaque'));
         try {
           result = await agent.request(methods.agent.session.prompt, {
             sessionId,
             prompt: promptBlocks,
           }, { cancellationSignal: ctx.signal });
         } finally {
-          roundEnd?.(ctx.signal?.aborted || result?.stopReason === 'cancelled' ? 'cancelled' : result?.stopReason === 'end_turn' ? 'ok' : 'failed');
+          (await roundEnd?.(ctx.signal?.aborted || result?.stopReason === 'cancelled' ? 'cancelled' : result?.stopReason === 'end_turn' ? 'ok' : 'failed'));
           if (followPoll) clearInterval(followPoll);
         }
         // The SDK dispatches notifications independently from request responses.
@@ -614,7 +614,7 @@ export class AcpAdapter implements AgentAdapter {
       if (ctx.signal?.aborted) throw new Error(`${this.provider} ACP turn cancelled`);
       if (response.stopReason === 'cancelled') {
         if (steered) {
-          currentTiming()?.mark('provider.interrupted', { operation: 'followup-steering' });
+          (await (await currentTiming())?.mark('provider.interrupted', { operation: 'followup-steering' }));
           // Cancelled to hand a mid-turn follow-up to the next turn — a clean
           // boundary, not a failure. `delivered` is unchanged, so the workflow
           // loops back to Do and delivers the follow-up (software-dev §5.6).
@@ -644,7 +644,7 @@ export class AcpAdapter implements AgentAdapter {
       throw new Error(`${this.provider} ACP turn failed: ${message}${detail ? `: ${detail.slice(-800)}` : ''}`, { cause: error });
     } finally {
       if (heartbeat) clearInterval(heartbeat);
-      control?.close();
+      (await control?.close());
       ctx.signal?.removeEventListener('abort', abort);
       try { child.stdin?.end(); } catch { /* closed */ }
       for (const terminal of terminals.values()) {

@@ -281,7 +281,7 @@ export interface WorldPty {
   onExit(listener: (code: number | null) => void): () => void;
   write(data: string): void | Promise<void>;
   resize(cols: number, rows: number): void | Promise<void>;
-  close(): void | Promise<void>;
+  close(): (void | Promise<void>) | Promise<void | Promise<void>>;
 }
 
 export interface WorldPtySpec {

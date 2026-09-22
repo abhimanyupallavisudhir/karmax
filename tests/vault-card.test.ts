@@ -21,12 +21,12 @@ describe('VaultCardProvider — the universal rail', () => {
   let projectId: string;
   const details = { number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2031 };
 
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-card-'));
-    store = new Store(':memory:');
+    store = (await Store.create(':memory:'));
     broker = new CredentialBroker(new Vault(dir));
     provider = new VaultCardProvider(store, broker);
-    projectId = store.createProject('P', {}).id;
+    projectId = (await store.createProject('P', {})).id;
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
@@ -40,7 +40,7 @@ describe('VaultCardProvider — the universal rail', () => {
 
   it('stores the PAN in the vault and only the last4 in the store', async () => {
     const card = await provision();
-    const row = store.getCard(card.id);
+    const row = (await store.getCard(card.id));
     expect(row.last4).toBe('4242');
     expect(JSON.stringify(row)).not.toContain('4242424242424242');
     // NOT `JSON.stringify(row)).not.toContain('123')`. The row carries a 13-digit
@@ -95,7 +95,7 @@ describe('VaultCardProvider — the universal rail', () => {
     const card = await provision();
     await provider.revoke(card.id);
     expect(broker.hasHandle(cardSecretHandle(card.id))).toBe(false);
-    expect(store.getCard(card.id).status).toBe('canceled');
+    expect((await store.getCard(card.id)).status).toBe('canceled');
     await expect(provider.retrieveCardDetails(card.id)).rejects.toThrow(/not active/i);
   });
 
@@ -121,13 +121,13 @@ describe('BudgetService over the vault-card rail', () => {
   let projectId: string;
   const details = { number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2031 };
 
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-budget-'));
-    store = new Store(':memory:');
+    store = (await Store.create(':memory:'));
     provider = new VaultCardProvider(store, new CredentialBroker(new Vault(dir)));
     budget = new BudgetService(store, provider);
-    projectId = store.createProject('P', {}).id;
-    store.setSettings(projectId, 'payments', { budget: null });
+    projectId = (await store.createProject('P', {})).id;
+    (await store.setSettings(projectId, 'payments', { budget: null }));
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
@@ -153,10 +153,10 @@ describe('BudgetService over the vault-card rail', () => {
 });
 
 describe('secure fill is provider-agnostic', () => {
-  it('every rail that can be filled at checkout exposes retrieveCardDetails', () => {
+  it('every rail that can be filled at checkout exposes retrieveCardDetails', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fill-'));
     try {
-      const store = new Store(':memory:');
+      const store = (await Store.create(':memory:'));
       const broker = new CredentialBroker(new Vault(dir));
       const registry = new PaymentRegistry(store);
       registry.register(new MockPaymentProvider(store));

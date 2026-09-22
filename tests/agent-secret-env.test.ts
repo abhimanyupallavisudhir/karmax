@@ -21,19 +21,19 @@ describe('agent project-secret delivery', () => {
     process.env.KARMAX_HOME = dir;
     process.env.KARMAX_AGENT_MIN_FREE_MB = '0';
     process.env.KARMAX_AGENT_MAX_LOAD_FACTOR = '0';
-    const store = new Store(':memory:');
-    const project = store.createProject('Secret agent');
-    const task = store.createTask({ projectId: project.id, title: 'Use the service', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'work' } });
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Secret agent'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Use the service', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const credential = 'resource:test:agent-token';
-    broker.registerHandle(credential, 'secret-project-token');
-    const initial = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    (await broker.registerHandle(credential, 'secret-project-token'));
+    const initial = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Agent token', driver: 'secret@1', target: { kind: 'environment', name: 'PROJECT_TOKEN' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: [credential], publish: 'discard' });
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [credential], publish: 'discard' }));
 
     let received: TurnInput | undefined;
     const adapter = {
@@ -46,10 +46,10 @@ describe('agent project-secret delivery', () => {
     const core = makeCoreActivities({ store, worlds, resources, broker,
       adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });
     let handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
-    const serviceHandle = resources.registerServiceEnvironment(handle, { DATABASE_URL: 'postgres://task-service' });
-    handle = store.updateWorldMeta(handle, {
+    const serviceHandle = await resources.registerServiceEnvironment(handle, { DATABASE_URL: 'postgres://task-service' });
+    handle = (await store.updateWorldMeta(handle, {
       serviceEnvironmentHandles: serviceHandle.meta?.serviceEnvironmentHandles,
-    });
+    }));
     try {
       await core.runAgentTurn({
         taskId: task.id,
@@ -64,33 +64,33 @@ describe('agent project-secret delivery', () => {
       });
       // A resumed turn opens the same world, without materializing its files again.
       const lateHandle = 'resource:test:late-token';
-      broker.registerHandle(lateHandle, 'late-project-token');
-      const late = store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      (await broker.registerHandle(lateHandle, 'late-project-token'));
+      const late = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
         name: 'Late token', driver: 'secret@1', target: { kind: 'environment', name: 'LATE_TOKEN' },
-        access: 'read', isolation: 'fork', source: {}, credentialHandles: [lateHandle], publish: 'discard' });
+        access: 'read', isolation: 'fork', source: {}, credentialHandles: [lateHandle], publish: 'discard' }));
       const resume = () => core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle,
         messages: [{ id: 'm2', role: 'user', text: 'continue', ts: 1 }],
         task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any });
       await resume();
       expect(received?.secretEnv?.LATE_TOKEN).toBe('late-project-token');
-      const leases = store.listResourceLeases(handle.id, handle.generation);
+      const leases = (await store.listResourceLeases(handle.id, handle.generation));
       expect(leases.filter((lease) => lease.attachmentId === late.id && lease.state === 'active')).toHaveLength(1);
       await resume();
-      expect(store.listResourceLeases(handle.id, handle.generation)).toEqual(leases);
-      store.updateResourceAttachment(initial.id, { enabled: false });
-      broker.registerHandle(lateHandle, 'rotated-project-token');
+      expect((await store.listResourceLeases(handle.id, handle.generation))).toEqual(leases);
+      (await store.updateResourceAttachment(initial.id, { enabled: false }));
+      (await broker.registerHandle(lateHandle, 'rotated-project-token'));
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service', LATE_TOKEN: 'rotated-project-token' });
-      store.updateResourceLease(leases.find((lease) => lease.attachmentId === late.id)!.id, 'released');
+      (await store.updateResourceLease(leases.find((lease) => lease.attachmentId === late.id)!.id, 'released'));
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service' });
-      expect(JSON.stringify(store.currentWorld(task.id))).not.toContain('late-project-token');
-      expect(JSON.stringify(store.currentWorld(task.id))).not.toContain('postgres://task-service');
-      expect(JSON.stringify(store.currentWorld(task.id))).not.toContain('secret-project-token');
+      expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('late-project-token');
+      expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('postgres://task-service');
+      expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('secret-project-token');
     } finally {
       await core.destroyWorld(handle);
       await resources.deleteProject(project.id);
-      store.close();
+      (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
       restoreEnv('KARMAX_HOME', previousHome);
       restoreEnv('KARMAX_AGENT_MIN_FREE_MB', previousMemoryFloor);

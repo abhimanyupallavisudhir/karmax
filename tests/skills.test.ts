@@ -53,17 +53,17 @@ describe('renderSkillsIndex', () => {
 });
 
 describe('saveSkill → listResolveSkills round-trip', () => {
-  const api = () => {
+  const api = async () => {
     const contentDir = tmp();
     const tokens = new TokenAuthority();
-    const store = new Store(':memory:');
+    const store = (await Store.create(':memory:'));
     const k = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir } as any);
-    const token = tokens.mint({ taskId: 't', profileId: 'resolve', principal: 'user:a', ceiling: ['save-skill'], grantorCaps: ['save-skill'] }).token;
+    const token = (await tokens.mint({ taskId: 't', profileId: 'resolve', principal: 'user:a', ceiling: ['save-skill'], grantorCaps: ['save-skill'] })).token;
     return { k, token, contentDir };
   };
 
   it('writes a "resolve/<slug>" skill into the resolve/ subdir, where the index finds it', async () => {
-    const { k, token, contentDir } = api();
+    const { k, token, contentDir } = (await api());
     try {
       const { path: file } = await k.saveSkill(token, { name: 'resolve/npm eresolve!', content: 'Use --legacy-peer-deps.' });
       // Name is sanitized per-segment but the resolve/ subdir is preserved (not flattened).
@@ -78,7 +78,7 @@ describe('saveSkill → listResolveSkills round-trip', () => {
   });
 
   it('blocks path traversal in a skill name (stays under skills/)', async () => {
-    const { k, token, contentDir } = api();
+    const { k, token, contentDir } = (await api());
     try {
       const { path: file } = await k.saveSkill(token, { name: '../../etc/evil', content: 'x' });
       expect(path.resolve(file).startsWith(path.resolve(contentDir, 'skills'))).toBe(true);

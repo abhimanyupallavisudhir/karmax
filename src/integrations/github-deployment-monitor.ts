@@ -33,7 +33,7 @@ export interface MissingDeploymentFinding {
 }
 
 export interface DeploymentMonitorGithub {
-  actions(repository: Repository): GithubActionsApi;
+  actions(repository: Repository): GithubActionsApi | Promise<GithubActionsApi>;
   repositoryFileStatus(repository: Repository, filePath: string): Promise<GitHubRepositoryFileStatus>;
 }
 
@@ -47,16 +47,16 @@ function expectationKey(repositoryId: string, headSha: string): string {
  * approval is a run, and must not be misreported as "GitHub never made one".
  * `kvClaim` deliberately preserves the first deadline across webhook duplicates.
  */
-export function observeDeploymentWorkflowRun(store: Store, repository: Repository, workflowRun: any,
-  options: { now?: number; graceMs?: number } = {}): void {
+export async function observeDeploymentWorkflowRun(store: Store, repository: Repository, workflowRun: any,
+  options: { now?: number; graceMs?: number } = {}): Promise<void> {
   const branch = String(workflowRun?.head_branch ?? '');
   const headSha = String(workflowRun?.head_sha ?? '');
   const name = String(workflowRun?.name ?? '');
   if (!headSha || branch !== repository.defaultBranch) return;
   const key = expectationKey(repository.id, headSha);
   if (name === DEPLOYMENT_WORKFLOW) {
-    store.kvSet(`${MONITORED_REPOSITORY_PREFIX}${repository.id}`, '1');
-    store.kvDelete(key);
+    (await store.kvSet(`${MONITORED_REPOSITORY_PREFIX}${repository.id}`, '1'));
+    (await store.kvDelete(key));
     return;
   }
   if (name !== DEPLOYMENT_SOURCE_WORKFLOW
@@ -80,7 +80,7 @@ export function observeDeploymentWorkflowRun(store: Store, repository: Repositor
     observedAt: now,
     deadlineAt: now + (options.graceMs ?? DEPLOYMENT_RUN_GRACE_MS),
   };
-  store.kvClaim(key, JSON.stringify(expectation));
+  (await store.kvClaim(key, JSON.stringify(expectation)));
 }
 
 function parseExpectation(value: string): DeploymentRunExpectation | undefined {
@@ -101,29 +101,29 @@ export class GitHubDeploymentMonitor {
 
   async reconcile(now = Date.now()): Promise<MissingDeploymentFinding[]> {
     const findings: MissingDeploymentFinding[] = [];
-    for (const entry of this.store.kvEntries(EXPECTATION_PREFIX)) {
+    for (const entry of (await this.store.kvEntries(EXPECTATION_PREFIX))) {
       const expectation = parseExpectation(entry.value);
-      if (!expectation) { this.store.kvDelete(entry.key); continue; }
+      if (!expectation) { (await this.store.kvDelete(entry.key)); continue; }
       if (expectation.deadlineAt > now) continue;
-      const repository = this.store.getRepository(expectation.repositoryId);
-      if (!repository) { this.store.kvDelete(entry.key); continue; }
+      const repository = (await this.store.getRepository(expectation.repositoryId));
+      if (!repository) { (await this.store.kvDelete(entry.key)); continue; }
 
       const file = await this.github.repositoryFileStatus(repository, expectation.expectedWorkflowFile);
       // Auto-discover the convention without imposing Deploy on every connected
       // repository that happens to name its validation workflow CI. Once seen,
       // the durable marker remains so deleting deploy.yml is itself reported.
       const monitoredKey = `${MONITORED_REPOSITORY_PREFIX}${repository.id}`;
-      const previouslyMonitored = this.store.kvGet(monitoredKey) === '1';
-      if (file.status === 'present') this.store.kvSet(monitoredKey, '1');
+      const previouslyMonitored = (await this.store.kvGet(monitoredKey)) === '1';
+      if (file.status === 'present') (await this.store.kvSet(monitoredKey, '1'));
       if (file.status === 'missing' && !previouslyMonitored) {
-        this.store.kvDelete(entry.key);
+        (await this.store.kvDelete(entry.key));
         continue;
       }
 
       let query: Record<string, unknown>;
       let appeared = false;
       try {
-        const result = await this.github.actions(repository).listRuns(expectation.repository, {
+        const result = await (await this.github.actions(repository)).listRuns(expectation.repository, {
           branch: expectation.branch,
           workflow: 'deploy.yml',
           perPage: 100,
@@ -143,7 +143,7 @@ export class GitHubDeploymentMonitor {
         // endpoint. The repository-wide endpoint can still prove that a delayed
         // run exists, including one waiting for environment approval.
         try {
-          const fallback = await this.github.actions(repository).listRuns(expectation.repository, {
+          const fallback = await (await this.github.actions(repository)).listRuns(expectation.repository, {
             branch: expectation.branch,
             perPage: 100,
           });
@@ -161,7 +161,7 @@ export class GitHubDeploymentMonitor {
           query.fallback = { status: 'error', error: error2 instanceof Error ? error2.message : String(error2) };
         }
       }
-      if (appeared) { this.store.kvDelete(entry.key); continue; }
+      if (appeared) { (await this.store.kvDelete(entry.key)); continue; }
 
       const evidence = {
         kind: 'missing_deployment_run',
@@ -206,7 +206,7 @@ export class GitHubDeploymentMonitor {
       findings.push({
         key: entry.key,
         expectation,
-        events: this.store.projectIdsForRepository(repository.id).map((projectId) => ({
+        events: (await this.store.projectIdsForRepository(repository.id)).map((projectId) => ({
           projectId,
           type: 'github.workflow.failed' as const,
           payload: base,
@@ -218,7 +218,7 @@ export class GitHubDeploymentMonitor {
 
   /** Call only after all project recovery events were dispatched. A crash before
    * this point safely re-polls; downstream incident keys suppress duplicates. */
-  markReported(finding: MissingDeploymentFinding): void {
-    this.store.kvDelete(finding.key);
+  async markReported(finding: MissingDeploymentFinding): Promise<void> {
+    (await this.store.kvDelete(finding.key));
   }
 }

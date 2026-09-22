@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { acquireFileLock } from '../util/file-lock.js';
 
 /**
  * A local, file-backed secret vault (SPEC §8.4). This is the pluggable backend
@@ -52,8 +53,14 @@ export class Vault {
     }
     if (fs.existsSync(this.keyPath)) return fs.readFileSync(this.keyPath);
     const key = crypto.randomBytes(32);
-    fs.writeFileSync(this.keyPath, key, { mode: 0o600 });
-    return key;
+    // Publish only a complete key, without replacing a concurrently created one.
+    const temporary = `${this.keyPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(temporary, key, { mode: 0o600, flag: 'wx' });
+    try {
+      try { fs.linkSync(temporary, this.keyPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+      return fs.readFileSync(this.keyPath);
+    } finally { fs.unlinkSync(temporary); }
   }
 
   private readDb(): Record<string, string> {
@@ -94,10 +101,32 @@ export class Vault {
     return Buffer.concat([decipher.update(Buffer.from(parts[2]!, 'base64')), decipher.final()]).toString('utf8');
   }
 
-  put(handle: string, secret: string) {
-    const db = this.readDb();
-    db[handle] = this.encrypt(secret);
-    this.writeDb(db);
+  private async mutate<T>(operation: (db: Record<string, string>) => T): Promise<T> {
+    const release = process.platform === 'linux'
+      ? await acquireFileLock(`${this.dbPath}.lock`) : undefined;
+    try {
+      const db = this.readDb();
+      const result = operation(db);
+      this.writeDb(db);
+      return result;
+    } finally { release?.(); }
+  }
+
+  async put(handle: string, secret: string): Promise<void> {
+    await this.mutate(db => { db[handle] = this.encrypt(secret); });
+  }
+
+  async putIfAbsent(handle: string, secret: string): Promise<void> {
+    await this.mutate(db => { if (!Object.hasOwn(db, handle)) db[handle] = this.encrypt(secret); });
+  }
+
+  async move(handle: string, nextHandle: string, replacement?: string): Promise<void> {
+    await this.mutate(db => {
+      const secret = replacement ?? (Object.hasOwn(db, handle) ? this.decrypt(db[handle]!) : undefined);
+      if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
+      db[nextHandle] = this.encrypt(secret);
+      if (nextHandle !== handle) delete db[handle];
+    });
   }
   has(handle: string): boolean {
     return handle in this.readDb();
@@ -110,9 +139,15 @@ export class Vault {
   list(): string[] {
     return Object.keys(this.readDb());
   }
-  delete(handle: string) {
-    const db = this.readDb();
-    delete db[handle];
-    this.writeDb(db);
+  async delete(handle: string): Promise<void> {
+    await this.mutate(db => { delete db[handle]; });
+  }
+
+  async deleteIfEqual(handle: string, observed: string): Promise<boolean> {
+    return this.mutate(db => {
+      if (!Object.hasOwn(db, handle) || this.decrypt(db[handle]!) !== observed) return false;
+      delete db[handle];
+      return true;
+    });
   }
 }

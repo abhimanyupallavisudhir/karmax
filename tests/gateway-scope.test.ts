@@ -47,17 +47,17 @@ describe('gateway request scope for bare-id routes', () => {
 
   beforeAll(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-scope-'));
-    store = new Store(':memory:', { hosted: true });
+    store = (await Store.create(':memory:', { hosted: true }));
     tokens = new TokenAuthority();
-    const acme = store.createOrganization({ name: 'Acme', ownerUserId: 'a' });
-    const other = store.createOrganization({ name: 'Other', ownerUserId: 'b' });
+    const acme = (await store.createOrganization({ name: 'Acme', ownerUserId: 'a' }));
+    const other = (await store.createOrganization({ name: 'Other', ownerUserId: 'b' }));
     acmeId = acme.id;
-    mine = store.createProject('Mine', {}, acme.id).id;
-    theirs = store.createProject('Theirs', {}, other.id).id;
+    mine = (await store.createProject('Mine', {}, acme.id)).id;
+    theirs = (await store.createProject('Theirs', {}, other.id)).id;
     // Permission approval now parks by starting a replacement at the exact
     // stage, so this software-dev fixture needs the repository its manifest
     // requires even though the Temporal client below is a stub.
-    store.updateProjectConfig(mine, { repos: [home] });
+    (await store.updateProjectConfig(mine, { repos: [home] }));
     const client = {
       workflow: {
         getHandle: () => ({
@@ -70,12 +70,12 @@ describe('gateway request scope for bare-id routes', () => {
       },
     } as any;
     const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, contentDir: home, worlds: new WorldRegistry() });
-    gateway = new Gateway({
+    gateway = (await Gateway.create({
       api, store, tokens,
       bus: new KarmaxBus(),
       contributions: new ContributionRegistry(),
       overlays: new Overlays(),
-      authorization: new AuthorizationService(store),
+      authorization: (await AuthorizationService.create(store)),
       client,
       taskQueue: 'test',
       staticDir: home,
@@ -88,13 +88,13 @@ describe('gateway request scope for bare-id routes', () => {
           return { accepted: true, events: [], projectEvents: webhookProjectEvents };
         },
       },
-    } as any);
+    } as any));
     const running = await gateway.listen(await findFreePortFrom(48_400));
     base = running.url;
     close = running.close;
     // Exactly the developer profile's task authority, scoped to one project of
     // one organization — the shape a workflow mints for an agent.
-    token = tokens.mintPrincipal('user:a', ['task:*', 'project:read'], mine, 60_000, acme.id).token;
+    token = (await tokens.mintPrincipal('user:a', ['task:*', 'project:read'], mine, 60_000, acme.id)).token;
   }, 30_000);
 
   afterAll(async () => {
@@ -103,8 +103,8 @@ describe('gateway request scope for bare-id routes', () => {
   });
 
   it('refuses PATCH/DELETE /api/tags/:id across a project and tenant boundary', async () => {
-    const foreign = store.createTag({ projectId: theirs, name: 'security' });
-    const own = store.createTag({ projectId: mine, name: 'bug' });
+    const foreign = (await store.createTag({ projectId: theirs, name: 'security' }));
+    const own = (await store.createTag({ projectId: mine, name: 'bug' }));
 
     const renamed = await fetch(`${base}/api/tags/${foreign.id}`, {
       method: 'PATCH', headers: auth(), body: JSON.stringify({ name: 'pwned' }),
@@ -112,14 +112,14 @@ describe('gateway request scope for bare-id routes', () => {
     expect(renamed.status).toBe(403);
     const removed = await fetch(`${base}/api/tags/${foreign.id}`, { method: 'DELETE', headers: auth() });
     expect(removed.status).toBe(403);
-    expect(store.getTag(foreign.id)?.name).toBe('security');
+    expect((await store.getTag(foreign.id))?.name).toBe('security');
 
     // The same call inside the token's own project is untouched.
     const ok = await fetch(`${base}/api/tags/${own.id}`, {
       method: 'PATCH', headers: auth(), body: JSON.stringify({ name: 'defect' }),
     });
     expect(ok.status).toBe(200);
-    expect(store.getTag(own.id)?.name).toBe('defect');
+    expect((await store.getTag(own.id))?.name).toBe('defect');
   });
 
   it('reports Advanced access from the scoped token without exposing unauthorized controls', async () => {
@@ -127,14 +127,14 @@ describe('gateway request scope for bare-id routes', () => {
     expect(readOnly.status).toBe(200);
     expect(await readOnly.json()).toMatchObject({ project: false, organization: false });
 
-    const maintainer = tokens.mintPrincipal('user:a', ['project:read', 'project:delete'], mine, 60_000).token;
+    const maintainer = (await tokens.mintPrincipal('user:a', ['project:read', 'project:delete'], mine, 60_000)).token;
     const allowed = await fetch(`${base}/api/settings/access?projectId=${mine}`, {
       headers: { authorization: `Bearer ${maintainer}` },
     });
     expect(allowed.status).toBe(200);
     expect(await allowed.json()).toMatchObject({ project: false, projectDelete: true });
 
-    const editor = tokens.mintPrincipal('user:a', ['project:read', 'project:edit'], mine, 60_000).token;
+    const editor = (await tokens.mintPrincipal('user:a', ['project:read', 'project:edit'], mine, 60_000)).token;
     const editable = await fetch(`${base}/api/settings/access?projectId=${mine}`, {
       headers: { authorization: `Bearer ${editor}` },
     });
@@ -146,11 +146,11 @@ describe('gateway request scope for bare-id routes', () => {
   });
 
   it('exposes a hosted over-member downgrade as an explicit blocked entitlement state', async () => {
-    store.setOrganizationPlan(acmeId, 'team');
-    store.setOrganizationMembership(acmeId, 'extra-1', 'member');
-    store.setOrganizationMembership(acmeId, 'extra-2', 'member');
-    store.setOrganizationPlan(acmeId, 'free');
-    const organizationReader = tokens.mintPrincipal('user:a', ['organization:read'], undefined, 60_000, acmeId).token;
+    (await store.setOrganizationPlan(acmeId, 'team'));
+    (await store.setOrganizationMembership(acmeId, 'extra-1', 'member'));
+    (await store.setOrganizationMembership(acmeId, 'extra-2', 'member'));
+    (await store.setOrganizationPlan(acmeId, 'free'));
+    const organizationReader = (await tokens.mintPrincipal('user:a', ['organization:read'], undefined, 60_000, acmeId)).token;
 
     const response = await fetch(`${base}/api/organizations/${acmeId}/entitlements`, {
       headers: { authorization: `Bearer ${organizationReader}` },
@@ -161,16 +161,16 @@ describe('gateway request scope for bare-id routes', () => {
       overMemberLimit: true, memberAdmissionAllowed: false, agentRunAdmissionAllowed: false,
     });
 
-    store.removeOrganizationMembership(acmeId, 'extra-1');
-    store.removeOrganizationMembership(acmeId, 'extra-2');
-    store.setOrganizationPlan(acmeId, 'team');
+    (await store.removeOrganizationMembership(acmeId, 'extra-1'));
+    (await store.removeOrganizationMembership(acmeId, 'extra-2'));
+    (await store.setOrganizationPlan(acmeId, 'team'));
   });
 
   it('lets only an organization owner change managed funding while admins may edit ordinary guardrails', async () => {
-    store.setOrganizationPlan(acmeId, 'team');
-    store.setOrganizationMembership(acmeId, 'b', 'admin');
-    const ownerToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId).token;
-    const adminToken = tokens.mintPrincipal('user:b', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId).token;
+    (await store.setOrganizationPlan(acmeId, 'team'));
+    (await store.setOrganizationMembership(acmeId, 'b', 'admin'));
+    const ownerToken = (await tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId)).token;
+    const adminToken = (await tokens.mintPrincipal('user:b', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId)).token;
     (gateway as any).sessions.set('owner-usage-session', { user: 'a', userId: 'a', apiToken: ownerToken });
     (gateway as any).sessions.set('admin-usage-session', { user: 'b', userId: 'b', apiToken: adminToken });
     const endpoint = `${base}/api/organizations/${acmeId}/usage-policy`;
@@ -203,7 +203,7 @@ describe('gateway request scope for bare-id routes', () => {
   });
 
   it('renames only with edit authority in the matching project or organization', async () => {
-    const projectEditor = tokens.mintPrincipal('user:a', ['project:read', 'project:edit'], mine, 60_000, acmeId).token;
+    const projectEditor = (await tokens.mintPrincipal('user:a', ['project:read', 'project:edit'], mine, 60_000, acmeId)).token;
     const renamedProject = await fetch(`${base}/api/projects/${mine}`, {
       method: 'PATCH', headers: { authorization: `Bearer ${projectEditor}`, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'Customer portal' }),
@@ -217,30 +217,30 @@ describe('gateway request scope for bare-id routes', () => {
     });
     expect(denied.status).toBe(403);
 
-    const organizationEditor = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'],
-      undefined, 60_000, acmeId).token;
-    const slug = store.getOrganization(acmeId)!.slug;
+    const organizationEditor = (await tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'],
+      undefined, 60_000, acmeId)).token;
+    const slug = (await store.getOrganization(acmeId))!.slug;
     const renamedOrganization = await fetch(`${base}/api/organizations/${acmeId}`, {
       method: 'PATCH', headers: { authorization: `Bearer ${organizationEditor}`, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'Acme Labs' }),
     });
     expect(renamedOrganization.status).toBe(200);
     expect(await renamedOrganization.json()).toMatchObject({ id: acmeId, name: 'Acme Labs', slug });
-    expect(store.getOrganization(acmeId)?.slug).toBe(slug);
+    expect((await store.getOrganization(acmeId))?.slug).toBe(slug);
   });
 
   it('accepts a scope-only request through HTTP and exposes the added projects for review', async () => {
-    const second = store.createProject('Phase', {}, acmeId);
-    const task = store.createTask({ projectId: mine, title: 'Cross-project work', workflow: 'software-dev',
+    const second = (await store.createProject('Phase', {}, acmeId));
+    const task = (await store.createTask({ projectId: mine, title: 'Cross-project work', workflow: 'software-dev',
       workflowVersion: '1.9.0', createdBy: { kind: 'user', userId: 'a' },
       params: { prompt: 'read phase', _authorization: {
         level: 'developer', scope: 'projects', projectIds: [mine], capabilities: ['task:read'],
-      } } });
-    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do',
-      status: 'active', messages: [], actions: [], state: {}, updatedAt: Date.now() });
-    liveView = store.getTask(task.id)!.lastView;
-    const agent = tokens.mint({ taskId: task.id, profileId: 'do', role: 'do', principal: 'user:a',
-      projectId: mine, organizationId: acmeId, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] }).token;
+      } } }));
+    (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do',
+      status: 'active', messages: [], actions: [], state: {}, updatedAt: Date.now() }));
+    liveView = (await store.getTask(task.id))!.lastView;
+    const agent = (await tokens.mint({ taskId: task.id, profileId: 'do', role: 'do', principal: 'user:a',
+      projectId: mine, organizationId: acmeId, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
     const post = (projectIds: unknown) => fetch(`${base}/api/agent/permission-requests`, { method: 'POST',
       headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
       body: JSON.stringify({ capabilities: [], projectIds, audience: ['@creator'], reason: 'Read phase work.' }) });
@@ -250,26 +250,26 @@ describe('gateway request scope for bare-id routes', () => {
     expect(response.status).toBe(200);
     const requested: any = await response.json();
     expect(requested).toMatchObject({ status: 'needs_approval', capabilities: [], projectIds: [second.id] });
-    const persisted = new PermissionRequests(store, acmeId).requests({ taskId: task.id });
+    const persisted = (await new PermissionRequests(store, acmeId).requests({ taskId: task.id }));
     expect(persisted).toEqual([expect.objectContaining({ projectIds: [second.id],
       baseAuthorization: { level: 'developer', scope: 'projects', projectIds: [mine] } })]);
     const denial = await fetch(`${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${acmeId}`, {
       method: 'POST', headers: auth(), body: JSON.stringify({ action: 'deny' }),
     });
     expect(denial.status).toBe(200);
-    expect((store.getTask(task.id)!.params._authorization as any).projectIds).toEqual([mine]);
+    expect(((await store.getTask(task.id))!.params._authorization as any).projectIds).toEqual([mine]);
   });
 
   it('serves routed permission requests in Approval Requests and enforces the approver capability', async () => {
-    const task = store.createTask({
+    const task = (await store.createTask({
       projectId: mine,
       title: 'Configure email',
       workflow: 'software-dev',
       workflowVersion: '1.9.0',
       params: { prompt: 'inspect email' },
       createdBy: { kind: 'user', userId: 'a' },
-    });
-    store.saveView(task.id, {
+    }));
+    (await store.saveView(task.id, {
       taskId: task.id,
       title: task.title,
       workflow: task.workflow,
@@ -279,18 +279,18 @@ describe('gateway request scope for bare-id routes', () => {
       actions: [],
       state: {},
       updatedAt: Date.now(),
-    });
-    liveView = store.getTask(task.id)!.lastView;
-    const agent = tokens.mint({
+    }));
+    liveView = (await store.getTask(task.id))!.lastView;
+    const agent = (await tokens.mint({
       taskId: task.id,
       profileId: 'do-default',
       role: 'do',
       principal: 'user:a',
       projectId: mine,
-      organizationId: store.getProject(mine)!.organizationId,
+      organizationId: (await store.getProject(mine))!.organizationId,
       ceiling: ['task:escalate'],
       grantorCaps: ['task:escalate'],
-    }).token;
+    })).token;
     const requested: any = await (await fetch(`${base}/api/agent/permission-requests`, {
       method: 'POST',
       headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
@@ -302,15 +302,15 @@ describe('gateway request scope for bare-id routes', () => {
     })).json();
     expect(requested).toMatchObject({ status: 'needs_approval', capabilities: ['settings:read'] });
 
-    const approver = tokens.mintPrincipal(
+    const approver = (await tokens.mintPrincipal(
       'user:a',
       ['task:read', 'settings:read'],
       mine,
       60_000,
-      store.getProject(mine)!.organizationId,
-    ).token;
+      (await store.getProject(mine))!.organizationId,
+    )).token;
     const listed: any = await (await fetch(
-      `${base}/api/permission-requests?taskId=${task.id}&organizationId=${store.getProject(mine)!.organizationId}`,
+      `${base}/api/permission-requests?taskId=${task.id}&organizationId=${(await store.getProject(mine))!.organizationId}`,
       { headers: { authorization: `Bearer ${approver}` } },
     )).json();
     expect(listed).toEqual([
@@ -326,17 +326,17 @@ describe('gateway request scope for bare-id routes', () => {
     const headers = { authorization: `Bearer ${approver}`, 'content-type': 'application/json' };
     expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1 });
     const dismissed = await fetch(
-      `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${store.getProject(mine)!.organizationId}`,
+      `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${(await store.getProject(mine))!.organizationId}`,
       { method: 'POST', headers, body: JSON.stringify({ action: 'dismiss' }) },
     );
     expect(dismissed.status).toBe(200);
     expect(await dismissed.json()).toMatchObject({ status: 'pending', dismissed: { by: 'user:a' } });
     expect(await (await fetch(viewUrl, { headers })).json()).not.toHaveProperty('approvalRequests');
-    expect(new PermissionRequests(store, store.getProject(mine)!.organizationId!).requests({ taskId: task.id }))
+    expect((await new PermissionRequests(store, (await store.getProject(mine))!.organizationId!).requests({ taskId: task.id })))
       .toEqual([expect.objectContaining({ status: 'pending', dismissed: expect.any(Object) })]);
 
     const resolved = await fetch(
-      `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${store.getProject(mine)!.organizationId}`,
+      `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${(await store.getProject(mine))!.organizationId}`,
       {
         method: 'POST',
         headers: { authorization: `Bearer ${approver}`, 'content-type': 'application/json' },
@@ -344,13 +344,13 @@ describe('gateway request scope for bare-id routes', () => {
       },
     );
     expect(resolved.status).toBe(200);
-    expect(new PermissionRequests(store, store.getProject(mine)!.organizationId!).extensionCaps(task.id, 'do'))
+    expect((await new PermissionRequests(store, (await store.getProject(mine))!.organizationId!).extensionCaps(task.id, 'do')))
       .toEqual(['settings:read']);
   });
 
   it('refuses PATCH/DELETE/reorder /api/views/:id across a project and tenant boundary', async () => {
-    const foreign = store.createView({ projectId: theirs, name: 'Theirs', query: {} as any });
-    const own = store.createView({ projectId: mine, name: 'Mine', query: {} as any });
+    const foreign = (await store.createView({ projectId: theirs, name: 'Theirs', query: {} as any }));
+    const own = (await store.createView({ projectId: mine, name: 'Mine', query: {} as any }));
 
     for (const [method, suffix, body] of [
       ['PATCH', '', JSON.stringify({ name: 'pwned' })],
@@ -360,7 +360,7 @@ describe('gateway request scope for bare-id routes', () => {
       const response = await fetch(`${base}/api/views/${foreign.id}${suffix}`, { method, headers: auth(), body });
       expect(response.status, `${method} /api/views/:id${suffix}`).toBe(403);
     }
-    expect(store.getView(foreign.id)?.name).toBe('Theirs');
+    expect((await store.getView(foreign.id))?.name).toBe('Theirs');
 
     const ok = await fetch(`${base}/api/views/${own.id}`, {
       method: 'PATCH', headers: auth(), body: JSON.stringify({ name: 'Renamed' }),
@@ -422,9 +422,9 @@ describe('gateway request scope for bare-id routes', () => {
     const first = await deliver('workflow-recovery-1');
     expect(first.status).toBe(200);
     expect(await first.json()).toMatchObject({ accepted: true, recoveries: 1 });
-    const recovery = store.listTasks(mine).find((task) => task.title === 'Repair failed GitHub workflow: Deploy');
+    const recovery = (await store.listTasks(mine)).find((task) => task.title === 'Repair failed GitHub workflow: Deploy');
     expect(recovery?.params.prompt).toContain('Exact revision: abc123');
-    expect(store.eventsSince(recovery!.id, 0)).toEqual(expect.arrayContaining([
+    expect((await store.eventsSince(recovery!.id, 0))).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'github.workflow.failed' }),
     ]));
 
@@ -432,7 +432,7 @@ describe('gateway request scope for bare-id routes', () => {
     // repository/run key prevents duplicate recovery work across deliveries.
     const duplicate = await deliver('workflow-recovery-2');
     expect(duplicate.status).toBe(200);
-    expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
+    expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
     webhookProjectEvents = [];
   });
 
@@ -459,22 +459,22 @@ describe('gateway request scope for bare-id routes', () => {
     });
 
     expect(await (await deliver('missing-recovery-1')).json()).toMatchObject({ recoveries: 1 });
-    const recovery = store.listTasks(mine)
+    const recovery = (await store.listTasks(mine))
       .find((task) => task.title === 'Repair missing GitHub workflow: Deploy');
     expect(recovery?.params.prompt).toContain('was not created');
     expect(recovery?.params.prompt).toContain('Durable monitor evidence');
     expect(recovery?.params.prompt).toContain('workflow schema/registration');
 
     await deliver('missing-recovery-2');
-    expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
+    expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
     // Simulate a restart after createTask persisted but before the pending claim
     // was acknowledged with the task id. The stale claim adopts that task.
     const recoveryKey = 'github:workflow-recovery:' + mine
       + ':repo-1:missing:def456:.github/workflows/deploy.yml';
-    store.kvSet(recoveryKey, `pending:${Date.now() - 11 * 60_000}`);
+    (await store.kvSet(recoveryKey, `pending:${Date.now() - 11 * 60_000}`));
     await deliver('missing-recovery-after-restart');
-    expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
-    expect(store.kvGet(recoveryKey)).toBe(recovery!.id);
+    expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
+    expect((await store.kvGet(recoveryKey))).toBe(recovery!.id);
     webhookProjectEvents = [];
   });
 });

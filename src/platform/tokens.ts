@@ -121,28 +121,28 @@ export class TokenAuthority {
     return crypto.createHash('sha256').update(token).digest('hex');
   }
 
-  private issue(record: ScopedToken): { token: string; record: ScopedToken } {
+  private async issue(record: ScopedToken): Promise<{ token: string; record: ScopedToken }> {
     const token = `kt_${record.id.slice(4)}.${crypto.randomBytes(32).toString('base64url')}`;
     const digest = this.digest(token);
     this.tokens.set(digest, record);
-    this.store?.putScopedToken(digest, record.id, record as unknown as Record<string, unknown>, record.expiresAt);
+    (await this.store?.putScopedToken(digest, record.id, record as unknown as Record<string, unknown>, record.expiresAt));
     return { token, record };
   }
 
-  private tokenById(id: string): ScopedToken | undefined {
-    if (this.store) return this.store.getScopedTokenById(id) as unknown as ScopedToken | undefined;
+  private async tokenById(id: string): Promise<ScopedToken | undefined> {
+    if (this.store) return (await this.store.getScopedTokenById(id)) as unknown as ScopedToken | undefined;
     for (const record of this.tokens.values()) if (record.id === id && record.expiresAt > Date.now()) return record;
     return undefined;
   }
 
-  private delegation(id: string, visited = new Set<string>()): HumanDelegation | undefined {
+  private async delegation(id: string, visited = new Set<string>()): Promise<HumanDelegation | undefined> {
     if (visited.has(id)) return undefined;
     visited.add(id);
-    const record = (this.store?.getHumanDelegation(id) as unknown as HumanDelegation | undefined)
+    const record = ((await this.store?.getHumanDelegation(id)) as unknown as HumanDelegation | undefined)
       ?? this.delegations.get(id);
     if (!record || record.expiresAt <= Date.now()) return undefined;
     if (record.parentDelegationId) {
-      const parent = this.delegation(record.parentDelegationId, visited);
+      const parent = (await this.delegation(record.parentDelegationId, visited));
       if (!parent || parent.humanUserId !== record.humanUserId) return undefined;
       if (parent.organizationId && record.organizationId !== parent.organizationId) return undefined;
       if (parent.projectId && record.projectId !== parent.projectId) return undefined;
@@ -167,13 +167,13 @@ export class TokenAuthority {
       throw new Error(`delegation is scoped to selected projects ${parent.projectIds.join(', ')}`);
   }
 
-  private delegationDescendsFrom(record: HumanDelegation, ancestorId: string): boolean {
+  private async delegationDescendsFrom(record: HumanDelegation, ancestorId: string): Promise<boolean> {
     let current: HumanDelegation | undefined = record;
     const visited = new Set<string>();
     while (current && !visited.has(current.id)) {
       if (current.id === ancestorId) return true;
       visited.add(current.id);
-      current = current.parentDelegationId ? this.delegation(current.parentDelegationId) : undefined;
+      current = current.parentDelegationId ? (await this.delegation(current.parentDelegationId)) : undefined;
     }
     return false;
   }
@@ -181,16 +181,16 @@ export class TokenAuthority {
   /** Pin a human subject to a task from an already verified bearer. For an
    * interactive human, the external identity was selected by trusted host code;
    * an agent may only inherit its existing pinned identity unchanged. */
-  delegateHuman(token: string, args: HumanDelegationArgs): HumanDelegation | undefined {
-    const parent = this.verify(token);
+  async delegateHuman(token: string, args: HumanDelegationArgs): Promise<HumanDelegation | undefined> {
+    const parent = (await this.verify(token));
     if (!parent?.humanSubject) return undefined;
     this.assertScopeWithin(parent, args);
     if (parent.kind === 'agent' && args.externalIdentities?.githubAccountId !== parent.externalIdentities?.githubAccountId)
       throw new Error('an agent cannot substitute a delegated GitHub account');
-    return this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
+    return (await this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
       externalIdentities: args.externalIdentities ?? parent.externalIdentities,
       parentDelegationId: parent.delegationId,
-      maxExpiresAt: parent.delegationId ? this.delegation(parent.delegationId)?.expiresAt : undefined });
+      maxExpiresAt: parent.delegationId ? (await this.delegation(parent.delegationId))?.expiresAt : undefined }));
   }
 
   /** Pin the subject of a live human session to a scope already authorized by
@@ -200,31 +200,31 @@ export class TokenAuthority {
    * organization, or global task grant. This trusted path deliberately accepts
    * only an interactive human — delegated agents must keep using
    * `delegateHuman`, which enforces strict scope attenuation. */
-  delegateAuthorizedInteractiveHuman(token: string, args: HumanDelegationArgs): HumanDelegation | undefined {
-    const parent = this.verify(token);
+  async delegateAuthorizedInteractiveHuman(token: string, args: HumanDelegationArgs): Promise<HumanDelegation | undefined> {
+    const parent = (await this.verify(token));
     if (!parent?.humanSubject) return undefined;
     if (parent.kind !== 'human' || parent.humanSubject.presence !== 'interactive')
       throw new Error('authorized delegation requires an interactive human');
-    return this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
-      externalIdentities: args.externalIdentities ?? parent.externalIdentities });
+    return (await this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
+      externalIdentities: args.externalIdentities ?? parent.externalIdentities }));
   }
 
   /** Derive a child-task delegation from durable parent provenance. This is used
    * by workflow activities after the short-lived parent bearer is gone. */
-  deriveHumanDelegation(parentDelegationId: string, args: {
+  async deriveHumanDelegation(parentDelegationId: string, args: {
     taskId: string; projectId?: string; projectIds?: string[]; organizationId?: string; ttlMs?: number;
-  }): HumanDelegation {
-    const parent = this.delegation(parentDelegationId);
+  }): Promise<HumanDelegation> {
+    const parent = (await this.delegation(parentDelegationId));
     if (!parent) throw new Error('invalid or expired human delegation');
     this.assertScopeWithin(parent, args);
-    return this.issueDelegation({ ...args, humanUserId: parent.humanUserId,
-      externalIdentities: parent.externalIdentities, parentDelegationId, maxExpiresAt: parent.expiresAt });
+    return (await this.issueDelegation({ ...args, humanUserId: parent.humanUserId,
+      externalIdentities: parent.externalIdentities, parentDelegationId, maxExpiresAt: parent.expiresAt }));
   }
 
-  private issueDelegation(args: {
+  private async issueDelegation(args: {
     taskId: string; humanUserId: string; projectId?: string; projectIds?: string[]; organizationId?: string;
     externalIdentities?: ExternalIdentityClaims; parentDelegationId?: string; ttlMs?: number; maxExpiresAt?: number;
-  }): HumanDelegation {
+  }): Promise<HumanDelegation> {
     const issuedAt = Date.now();
     const expiresAt = Math.min(issuedAt + (args.ttlMs ?? 30 * 24 * 60 * 60 * 1000), args.maxExpiresAt ?? Number.MAX_SAFE_INTEGER);
     const record: HumanDelegation = {
@@ -233,24 +233,24 @@ export class TokenAuthority {
       organizationId: args.organizationId, externalIdentities: args.externalIdentities,
       parentDelegationId: args.parentDelegationId, issuedAt, expiresAt,
     };
-    if (this.store) this.store.putHumanDelegation(record.id, record as unknown as Record<string, unknown>, expiresAt);
+    if (this.store) (await this.store.putHumanDelegation(record.id, record as unknown as Record<string, unknown>, expiresAt));
     else this.delegations.set(record.id, record);
     return record;
   }
 
-  mint(args: MintArgs): { token: string; record: ScopedToken } {
+  async mint(args: MintArgs): Promise<{ token: string; record: ScopedToken }> {
     const id = `tok_${crypto.randomBytes(12).toString('hex')}`;
-    const parent = args.parentTokenId ? this.tokenById(args.parentTokenId) : undefined;
+    const parent = args.parentTokenId ? (await this.tokenById(args.parentTokenId)) : undefined;
     if (args.parentTokenId && !parent) throw new Error('invalid or expired parent token');
     if (parent) this.assertScopeWithin(parent, args);
     const delegationId = args.delegationId ?? parent?.delegationId;
-    const delegation = delegationId ? this.delegation(delegationId) : undefined;
+    const delegation = delegationId ? (await this.delegation(delegationId)) : undefined;
     if (delegationId && (!delegation || delegation.taskId !== args.taskId))
       throw new Error('invalid, expired, or task-mismatched human delegation');
     if (delegation) this.assertScopeWithin(delegation, args);
     if (parent && delegation && (!parent.humanSubject
       || parent.humanSubject.userId !== delegation.humanUserId
-      || parent.delegationId && !this.delegationDescendsFrom(delegation, parent.delegationId)))
+      || parent.delegationId && !(await this.delegationDescendsFrom(delegation, parent.delegationId))))
       throw new Error('child token human delegation does not descend from its parent token');
     const grantorCaps = parent ? attenuate(args.grantorCaps, parent.caps) : args.grantorCaps;
     const expiresAt = Math.min(Date.now() + (args.ttlMs ?? 24 * 60 * 60 * 1000),
@@ -285,11 +285,11 @@ export class TokenAuthority {
         externalIdentities: delegation.externalIdentities,
       } : {}),
     };
-    return this.issue(record);
+    return (await this.issue(record));
   }
 
   /** Mint a token for a (non-task) principal such as a logged-in user. */
-  mintPrincipal(principal: string, caps: Capability[], projectId?: string, ttlMs = 12 * 60 * 60 * 1000, organizationId?: string): { token: string; record: ScopedToken } {
+  async mintPrincipal(principal: string, caps: Capability[], projectId?: string, ttlMs = 12 * 60 * 60 * 1000, organizationId?: string): Promise<{ token: string; record: ScopedToken }> {
     const id = `tok_${crypto.randomBytes(12).toString('hex')}`;
     const userId = principal.startsWith('user:') && principal.length > 5 ? principal.slice(5) : undefined;
     const system = principal.startsWith('system:');
@@ -310,20 +310,20 @@ export class TokenAuthority {
         : { kind: 'autonomous', principal },
       ...(userId ? { humanSubject: { kind: 'user' as const, userId, presence: 'interactive' as const } } : {}),
     };
-    return this.issue(record);
+    return (await this.issue(record));
   }
 
-  verify(token: string): ScopedToken | undefined {
+  async verify(token: string): Promise<ScopedToken | undefined> {
     const digest = this.digest(token);
     // A durable authority deliberately checks shared state on every request so
     // revocation by another gateway replica takes effect immediately.
     const record = this.store
-      ? this.store.getScopedToken(digest) as unknown as ScopedToken | undefined
+      ? (await this.store.getScopedToken(digest)) as unknown as ScopedToken | undefined
       : this.tokens.get(digest);
     if (record && record.expiresAt > Date.now()) {
-      if (record.parentTokenId && !this.tokenById(record.parentTokenId)) return undefined;
+      if (record.parentTokenId && !(await this.tokenById(record.parentTokenId))) return undefined;
       if (record.delegationId) {
-        const delegation = this.delegation(record.delegationId);
+        const delegation = (await this.delegation(record.delegationId));
         if (!delegation || delegation.taskId !== record.taskId
           || delegation.humanUserId !== record.humanSubject?.userId
           || delegation.externalIdentities?.githubAccountId !== record.externalIdentities?.githubAccountId
@@ -334,30 +334,30 @@ export class TokenAuthority {
     }
     if (record) {
       this.tokens.delete(digest);
-      this.store?.revokeScopedToken({ tokenHash: digest });
+      (await this.store?.revokeScopedToken({ tokenHash: digest }));
     }
     return undefined;
   }
 
   /** Verify the token and check it allows the requested capability. */
-  check(token: string, capability: Capability, scope?: { projectId?: string; taskId?: string; organizationId?: string;
-    audience?: ScopedToken['audience']; executionId?: string; worldGeneration?: number }): { ok: boolean; record?: ScopedToken; reason?: string } {
-    const record = this.verify(token);
+  async check(token: string, capability: Capability, scope?: { projectId?: string; taskId?: string; organizationId?: string;
+    audience?: ScopedToken['audience']; executionId?: string; worldGeneration?: number }): Promise<{ ok: boolean; record?: ScopedToken; reason?: string }> {
+    const record = (await this.verify(token));
     if (!record) return { ok: false, reason: 'invalid or expired token' };
     if (!allows(record.caps, capability)) return { ok: false, record, reason: `missing capability ${capability}` };
     // Resolve the tenant from durable ownership, including callers that pass
     // only a project/task ID. A transfer must immediately fence old org tokens.
-    const projectId = scope?.projectId ?? (scope?.taskId ? this.store?.getTask(scope.taskId)?.projectId : undefined);
-    const project = projectId ? this.store?.getProject(projectId) : undefined;
-    if (project && record.organizationId && project.organizationId !== record.organizationId)
+    const projectId = scope?.projectId ?? (scope?.taskId ? (await this.store?.taskProjectIdAsync(scope.taskId)) : undefined);
+    const projectOrganization = projectId ? await this.store?.projectOrganizationAsync(projectId) : undefined;
+    if (projectOrganization && record.organizationId && projectOrganization !== record.organizationId)
       return { ok: false, record, reason: 'project belongs to another organization' };
     if (projectId && !capability.endsWith(':read') && !capability.startsWith('project:transfer-')) {
-      const lock = this.store?.kvGet(`project-transfer-lock:${projectId}`);
+      const lock = await this.store?.kvGet(`project-transfer-lock:${projectId}`);
       if (lock && JSON.parse(lock).expiresAt > Date.now()
         && !(JSON.parse(lock).kind === 'delete' && capability === 'project:delete'))
         return { ok: false, record, reason: 'project move in progress; retry when it finishes' };
     }
-    if (scope?.taskId && this.store?.kvGet(`project-transfer-history:${scope.taskId}`)
+    if (scope?.taskId && await this.store?.kvGet(`project-transfer-history:${scope.taskId}`)
       && ['task:signal', 'task:create', 'task:edit', 'task:conversation:message', 'task:review:execute', 'task:git:publish',
         'resolve-decision', 'confirm-decision', 'review:approve'].includes(capability))
       return { ok: false, record, reason: 'This task is history from before the project moved. Start a new task to continue work.' };
@@ -383,15 +383,15 @@ export class TokenAuthority {
     return { ok: true, record };
   }
 
-  revoke(token: string) {
+  async revoke(token: string) {
     const digest = this.digest(token);
     const record = this.tokens.get(digest);
     this.tokens.delete(digest);
-    this.store?.revokeScopedToken(record ? { tokenId: record.id } : { tokenHash: digest });
+    (await this.store?.revokeScopedToken(record ? { tokenId: record.id } : { tokenHash: digest }));
   }
 
-  revokeTaskDelegation(taskId: string): number {
-    if (this.store) return this.store.revokeHumanDelegationsForTask(taskId);
+  async revokeTaskDelegation(taskId: string): Promise<number> {
+    if (this.store) return (await this.store.revokeHumanDelegationsForTask(taskId));
     let revoked = 0;
     for (const [id, record] of this.delegations) if (record.taskId === taskId) {
       this.delegations.delete(id); revoked++;

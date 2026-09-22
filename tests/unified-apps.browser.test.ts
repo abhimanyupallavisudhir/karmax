@@ -20,16 +20,16 @@ import { VaultItems } from '../src/autonomy/vault-items.js';
 it('unified app search and resource defaults work in the real gateway UI', async () => {
  const priorHome = process.env.KARMAX_HOME;
  const dir=fs.mkdtempSync('/tmp/unified-walkthrough-state-'); process.env.KARMAX_HOME=dir;
- const store=new Store(':memory:'); const tokens=new TokenAuthority(), worlds=new WorldRegistry();
- const project=store.createProject('Connection demo'); seedProfiles(store,'mock');
+ const store=await Store.create(':memory:'); const tokens=new TokenAuthority(), worlds=new WorldRegistry();
+ const project=(await store.createProject('Connection demo')); (await seedProfiles(store,'mock'));
  const client={workflow:{getHandle:()=>({query:async()=>[]}),start:async()=>({})}} as any;
  const broker=new CredentialBroker(new Vault(path.join(dir,'vault')));
  const api=new KarmaxApi({store,tokens,worlds,client,broker,taskQueue:'screenshots',contentDir:dir});
- const item=new VaultItems(store,broker,undefined,'org_personal').save({type:'login',label:'Demo service login',secrets:{password:'demo-not-a-real-password'}});
- store.setSettings('organization:org_personal','vault',{credentialGrants:[`use-credential:item:${item.id}`]});
- store.createCard({id:'card_demo',provider:'mock',scope:'organization',scopeId:'org_personal',label:'Demo card',cap:10000,available:10000,createdAt:Date.now(),last4:'4242'});
- store.setSettings('organization:org_personal','payments',{cardIds:['card_demo'],budget:2500});
- const gateway=new Gateway({store,tokens,worlds,client,api,broker,bus:new KarmaxBus(),contributions:new ContributionRegistry(),overlays:new Overlays(),taskQueue:'screenshots',staticDir:path.resolve('web'),agentInfo:{provider:'mock',reason:'Isolated screenshot demo'}});
+ const item=(await new VaultItems(store,broker,undefined,'org_personal').save({type:'login',label:'Demo service login',secrets:{password:'demo-not-a-real-password'}}));
+ (await store.setSettings('organization:org_personal','vault',{credentialGrants:[`use-credential:item:${item.id}`]}));
+ (await store.createCard({id:'card_demo',provider:'mock',scope:'organization',scopeId:'org_personal',label:'Demo card',cap:10000,available:10000,createdAt:Date.now(),last4:'4242'}));
+ (await store.setSettings('organization:org_personal','payments',{cardIds:['card_demo'],budget:2500}));
+ const gateway=await Gateway.create({store,tokens,worlds,client,api,broker,bus:new KarmaxBus(),contributions:new ContributionRegistry(),overlays:new Overlays(),taskQueue:'screenshots',staticDir:path.resolve('web'),agentInfo:{provider:'mock',reason:'Isolated screenshot demo'}});
  const running=await gateway.listen(await findFreePortFrom(48765)); const base=running.url;
  const browser=await chromium.launch({headless:true});
  try {
@@ -53,23 +53,23 @@ it('unified app search and resource defaults work in the real gateway UI', async
  assert.equal(await projectBox.locator('.payment-budget').inputValue(),'25.00');
  await projectBox.locator('.payment-search').fill('Demo');
  await projectBox.locator('.resource-save').click();
- assert.equal(store.getSettings(project.id,'payments'),undefined);
- assert.equal(store.getSettings(project.id,'vault'),undefined);
+ assert.equal((await store.getSettings(project.id,'payments')),undefined);
+ assert.equal((await store.getSettings(project.id,'vault')),undefined);
  await projectBox.locator('.payment-budget').fill('10');await projectBox.locator('.resource-save').click();
  await page.waitForFunction(async projectId=>((await (await fetch(`/api/settings/project/${projectId}/payments`)).json()) as any).budget===1000,project.id);
- assert.equal(store.getSettings(project.id,'payments')!.cardIds,undefined);
+ assert.equal((await store.getSettings(project.id,'payments'))!.cardIds,undefined);
 
  await projectBox.locator('.resource-vault').click();await page.locator('.vault-grant-all').uncheck();await page.locator('[data-vault-apply]').click();
  await projectBox.locator('[data-remove="card_demo"]').click();await projectBox.locator('.payment-budget').fill('0');
  await projectBox.locator('.resource-save').click();
  await page.waitForFunction(async projectId=>{const r=await fetch(`/api/settings/project/${projectId}/vault`);return ((await r.json()) as any).credentialGrants?.length===0;},project.id);
- assert.deepEqual(store.getSettings(project.id,'vault')!.credentialGrants,[]);
+ assert.deepEqual((await store.getSettings(project.id,'vault'))!.credentialGrants,[]);
  await page.waitForFunction(async projectId=>{const r=await fetch(`/api/settings/project/${projectId}/payments`);return ((await r.json()) as any).budget===0;},project.id);
- assert.deepEqual(store.getSettings(project.id,'payments')!.cardIds,[]);
+ assert.deepEqual((await store.getSettings(project.id,'payments'))!.cardIds,[]);
  await projectBox.scrollIntoViewIfNeeded();await shot('02-project-empty-overrides');
  await projectBox.locator('.resource-reset').click();
  await page.waitForFunction(()=>(globalThis as any).document.querySelector('[data-resource-defaults="project"] .tf-vault-count')?.textContent==='1 selected');
- assert.deepEqual(store.getSettings(project.id,'vault'),{});
+ assert.deepEqual((await store.getSettings(project.id,'vault')),{});
  await page.goto(base+'/personal/connection-demo');await page.locator('#expand-task').click();
  await page.locator('#tf-vault-open:not([disabled])').waitFor();assert.equal(await page.locator('#tf-vault-count').innerText(),'1 selected');
  await page.locator('#tf-payments').scrollIntoViewIfNeeded();await shot('03-task-inherits');
@@ -81,5 +81,5 @@ it('unified app search and resource defaults work in the real gateway UI', async
  await page.locator('.connector-close').click();
  assert.deepEqual(errors,[]);
  console.log('PASS: real gateway/browser defaults inheritance, empty overrides, reset, task display and combined search');
- } finally {await browser.close();await running.close();store.close();fs.rmSync(dir,{recursive:true,force:true}); if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME=priorHome;}
+ } finally {await browser.close();await running.close();(await store.close());fs.rmSync(dir,{recursive:true,force:true}); if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME=priorHome;}
 }, 60_000);

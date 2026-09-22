@@ -61,7 +61,7 @@ describe('agent-enrolled passkeys over CDP (§8)', () => {
       const cred = { credentialId: 'cred1', rpId: 'github.com', privateKey: 'PEMKEY' };
       const { authenticatorId } = await mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'login', credential: cred });
       expect(b.state.credentials[0]).toEqual(cred);
-      mgr.release(authenticatorId);
+      (await mgr.release(authenticatorId));
     } finally {
       await b.close();
     }

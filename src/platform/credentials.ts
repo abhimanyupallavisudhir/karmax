@@ -149,7 +149,7 @@ export function isExplanationEnabled(
 function orderedCredentials(
   all: Credential[],
   layers: { global?: CredPolicy; project?: CredPolicy; task?: CredPolicy },
-  enabled: (credential: Credential) => boolean,
+  enabled: (credential: Credential) => boolean | Promise<boolean>,
 ): Credential[] {
   const order = layers.task?.order ?? layers.project?.order ?? layers.global?.order;
   const rankOf = (c: Credential): [number, number, string] => {

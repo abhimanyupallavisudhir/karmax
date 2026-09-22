@@ -38,7 +38,7 @@ export class PasskeyManager {
   constructor(private ttlMs = 180_000) {}
 
   private hold(id: string, session: CdpSession, origin: string) {
-    const timer = setTimeout(() => this.release(id), this.ttlMs);
+    const timer = setTimeout(async () => (await this.release(id)), this.ttlMs);
     if (typeof timer.unref === 'function') timer.unref();
     this.held.set(id, { session, origin, timer });
   }
@@ -62,7 +62,7 @@ export class PasskeyManager {
       this.hold(authenticatorId, session, origin);
       return { authenticatorId, origin };
     } catch (e) {
-      session.close();
+      (await session.close());
       throw e;
     }
   }
@@ -74,16 +74,16 @@ export class PasskeyManager {
     if (!held) throw new Error('no held passkey session — enrollment expired or was already saved; start over');
     const result = await held.session.call('WebAuthn.getCredentials', { authenticatorId });
     const credentials = (result?.credentials ?? []) as PasskeyCredential[];
-    this.release(authenticatorId);
+    (await this.release(authenticatorId));
     return credentials;
   }
 
-  release(authenticatorId: string): void {
+  async release(authenticatorId: string): Promise<void> {
     const held = this.held.get(authenticatorId);
     if (!held) return;
     clearTimeout(held.timer);
     try {
-      held.session.close();
+      (await held.session.close());
     } catch {
       /* already closed */
     }

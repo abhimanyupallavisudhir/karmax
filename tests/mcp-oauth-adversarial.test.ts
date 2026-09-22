@@ -13,9 +13,9 @@ describe('MCP OAuth hostile inputs and concurrency', () => {
   let dir: string, store: Store, service: McpConnections, connection: McpConnection, state: string;
   let exchanges: URLSearchParams[];
   beforeEach(async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-oauth-hostile-')); store = new Store(':memory:');
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-oauth-hostile-')); store = (await Store.create(':memory:'));
     service = new McpConnections(store, new CredentialBroker(new Vault(dir)), 'org_personal'); exchanges = [];
-    connection = service.save({ label: 'OAuth', transport: { type: 'http', url: 'https://resource.example/mcp' }, auth: 'oauth' });
+    connection = (await service.save({ label: 'OAuth', transport: { type: 'http', url: 'https://resource.example/mcp' }, auth: 'oauth' }));
     vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
       const req = new Request(input, init); const body = await req.text();
       const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { 'content-type': 'application/json' } });
@@ -27,12 +27,12 @@ describe('MCP OAuth hostile inputs and concurrency', () => {
     });
     state = new URL((await beginOAuth(service, connection, 'user:alice', 'https://tavya.example/mcp-callback')).authorizationUrl).searchParams.get('state')!;
   });
-  afterEach(() => { vi.restoreAllMocks(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  afterEach(async () => { vi.restoreAllMocks(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
   it.each(['expired', 'changed', 'deleted', 'wrong-user', 'wrong-state', 'unicode-state', 'missing-code', 'object-code'])('rejects %s before token exchange', async (scenario) => {
     let actor = 'user:alice', suppliedState = state, code: any = 'code';
-    if (scenario === 'expired') { const data = service.secret(connection); data.pending.expires = 0; service.setSecret(connection, data); }
-    if (scenario === 'changed') connection = service.save({ ...connection, label: 'Edited' });
-    if (scenario === 'deleted') service.remove(connection.id);
+    if (scenario === 'expired') { const data = service.secret(connection); data.pending.expires = 0; (await service.setSecret(connection, data)); }
+    if (scenario === 'changed') connection = (await service.save({ ...connection, label: 'Edited' }));
+    if (scenario === 'deleted') (await service.remove(connection.id));
     if (scenario === 'wrong-user') actor = 'user:mallory';
     if (scenario === 'wrong-state') suppliedState = '0'.repeat(64);
     if (scenario === 'unicode-state') suppliedState = 'é'.repeat(64);
@@ -49,11 +49,11 @@ describe('MCP OAuth hostile inputs and concurrency', () => {
   });
   it('coalesces concurrent refreshes and never projects refresh tokens or client credentials', async () => {
     await finishOAuth(service, connection, 'user:alice', state, 'code');
-    service.setSecret(connection, { ...service.secret(connection), expiresAt: 0 });
+    (await service.setSecret(connection, { ...service.secret(connection), expiresAt: 0 }));
     const headers = await Promise.all([1, 2, 3, 4].map(() => connectionHeaders(service, connection, 'task')));
     expect(headers).toEqual(Array(4).fill({ Authorization: 'Bearer scoped-access' }));
     expect(exchanges.filter((e) => e.get('grant_type') === 'refresh_token')).toHaveLength(1);
-    expect(JSON.stringify(service.list())).not.toMatch(/scoped-access|vault-only-refresh|registered-client/);
+    expect(JSON.stringify((await service.list()))).not.toMatch(/scoped-access|vault-only-refresh|registered-client/);
   });
   it('a second authorization invalidates the previous state', async () => {
     await beginOAuth(service, connection, 'user:alice', 'https://tavya.example/mcp-callback');

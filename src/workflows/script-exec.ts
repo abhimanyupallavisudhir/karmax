@@ -1,3 +1,4 @@
+import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -43,7 +44,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
       parentTaskId: input.parentTaskId, updatedAt: workflowInfo().historyLength,
     };
   }
-  const publish = async () => core.publishView(taskId, view());
+  const publish = async () => publishTaskView(core, taskId, view());
 
   setHandler(viewQuery, view);
   setHandler(ackSignal, () => {

@@ -63,33 +63,33 @@ describe('capability model + attenuation (SPEC §8.2)', () => {
 });
 
 describe('TokenAuthority (workflow-minted scoped tokens)', () => {
-  it('mints a token scoped to effective capabilities and checks against it', () => {
+  it('mints a token scoped to effective capabilities and checks against it', async () => {
     const ta = new TokenAuthority();
-    const { token } = ta.mint({
+    const { token } = (await ta.mint({
       taskId: 't1',
       profileId: 'merge-default',
       principal: 'user:abc',
       ceiling: ['merge-into:*', 'signal-completion'],
       grantorCaps: ['merge-into:/r:main', 'signal-completion', 'create-task'],
-    });
-    expect(ta.check(token, 'merge-into:/r:main').ok).toBe(true);
-    expect(ta.check(token, 'signal-completion').ok).toBe(true);
+    }));
+    expect((await ta.check(token, 'merge-into:/r:main')).ok).toBe(true);
+    expect((await ta.check(token, 'signal-completion')).ok).toBe(true);
     // create-task was over the profile ceiling → not in effective set
-    expect(ta.check(token, 'create-task').ok).toBe(false);
-    expect(ta.check('kt_bogus', 'signal-completion').ok).toBe(false);
+    expect((await ta.check(token, 'create-task')).ok).toBe(false);
+    expect((await ta.check('kt_bogus', 'signal-completion')).ok).toBe(false);
   });
 
-  it('scopes one task token to a selected list of projects', () => {
+  it('scopes one task token to a selected list of projects', async () => {
     const ta = new TokenAuthority();
-    const { token } = ta.mint({
+    const { token } = (await ta.mint({
       taskId: 't1', profileId: 'do', principal: 'user:abc',
       projectIds: ['p1', 'p2'], organizationId: 'org1',
       ceiling: ['task:read'], grantorCaps: ['task:read'],
-    });
-    expect(ta.check(token, 'task:read', { projectId: 'p1', organizationId: 'org1' }).ok).toBe(true);
-    expect(ta.check(token, 'task:read', { projectId: 'p2', organizationId: 'org1' }).ok).toBe(true);
-    expect(ta.check(token, 'task:read', { projectId: 'p3', organizationId: 'org1' }).ok).toBe(false);
-    expect(ta.check(token, 'task:read', { projectId: 'p1', organizationId: 'org2' }).ok).toBe(false);
+    }));
+    expect((await ta.check(token, 'task:read', { projectId: 'p1', organizationId: 'org1' })).ok).toBe(true);
+    expect((await ta.check(token, 'task:read', { projectId: 'p2', organizationId: 'org1' })).ok).toBe(true);
+    expect((await ta.check(token, 'task:read', { projectId: 'p3', organizationId: 'org1' })).ok).toBe(false);
+    expect((await ta.check(token, 'task:read', { projectId: 'p1', organizationId: 'org2' })).ok).toBe(false);
   });
 });
 
@@ -99,9 +99,9 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-'));
   });
 
-  it('stores secrets encrypted at rest and resolves only with capability', () => {
+  it('stores secrets encrypted at rest and resolves only with capability', async () => {
     const vault = new Vault(dir);
-    vault.put('openai', 'sk-secret-123');
+    (await vault.put('openai', 'sk-secret-123'));
     // raw file never contains the plaintext secret
     const raw = fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8');
     expect(raw).not.toContain('sk-secret-123');
@@ -118,16 +118,16 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
     expect(log[1]!.granted).toBe(false);
   });
 
-  it('write-back of a newly created account is resolvable later', () => {
+  it('write-back of a newly created account is resolvable later', async () => {
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle('new-acct', 'pw-xyz');
+    (await broker.registerHandle('new-acct', 'pw-xyz'));
     expect(broker.resolve('new-acct', { caps: ['use-credential:*'] })).toBe('pw-xyz');
   });
 
-  it('renames and rotates a handle without leaving the old credential behind', () => {
+  it('renames and rotates a handle without leaving the old credential behind', async () => {
     const broker = new CredentialBroker(new Vault(dir));
-    broker.registerHandle('openrouter:old', 'old-secret');
-    broker.updateHandle('openrouter:old', 'openrouter:new', 'new-secret');
+    (await broker.registerHandle('openrouter:old', 'old-secret'));
+    (await broker.updateHandle('openrouter:old', 'openrouter:new', 'new-secret'));
     expect(broker.hasHandle('openrouter:old')).toBe(false);
     expect(broker.resolve('openrouter:new', { caps: ['use-credential:*'] })).toBe('new-secret');
   });

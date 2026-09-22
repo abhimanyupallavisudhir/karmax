@@ -25,7 +25,7 @@ try {
   await broken.bootstrap({ name: 'Admin', email: 'admin@example.com', password: 'long-enough-password' });
   signupSucceeded = true;
 } catch { signupSucceeded = false; }
-const accountsAfterFailedSend = broken.listUsers().length;
+const accountsAfterFailedSend = (await broken.listUsers()).length;
 
 // …but an explicit resend must report the failure rather than answer 200 and
 // leave someone waiting on an email that was never accepted.

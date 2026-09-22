@@ -49,9 +49,9 @@ export class WebhookDeliveryAdapter implements DeliveryAdapter {
  * retryable projections and can never create or suppress responsibility. */
 export class DeliveryDispatcher {
   private timer?: NodeJS.Timeout;
-  private running = false;
+  private active?: Promise<number>;
   constructor(private store: Store, private adapters: Partial<Record<'browser' | 'email' | 'slack', DeliveryAdapter>>,
-    private user?: (id: string) => { id: string; name?: string; email?: string } | undefined, private intervalMs = 1_000) {}
+    private user?: (id: string) => { id: string; name?: string; email?: string } | undefined | Promise<{ id: string; name?: string; email?: string } | undefined>, private intervalMs = 1_000) {}
 
   start(): void {
     if (this.timer) return;
@@ -69,32 +69,35 @@ export class DeliveryDispatcher {
   private onDrainError(error: unknown): void {
     console.error('[delivery] drain failed:', error instanceof Error ? error.message : String(error));
   }
-  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
+  async stop(): Promise<void> {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    await this.active?.catch(() => {});
+  }
 
-  async drain(limit = 100): Promise<number> {
-    if (this.running) return 0;
-    this.running = true;
+  drain(limit = 100): Promise<number> {
+    if (this.active) return Promise.resolve(0);
+    return this.active = this.drainOnce(limit).finally(() => { this.active = undefined; });
+  }
+
+  private async drainOnce(limit: number): Promise<number> {
     let delivered = 0;
-    try {
-      for (let i = 0; i < limit; i++) {
-        const claim = this.store.claimDelivery();
-        if (!claim) break;
-        try {
-          const adapter = this.adapters[claim.channel];
-          if (!adapter) throw new Error(`${claim.channel} delivery is enabled but no adapter is configured`);
-          const task = this.store.getTask(claim.inbox.taskId);
-          await adapter.deliver({ inbox: claim.inbox,
-            task: task ? { id: task.id, num: task.num, title: task.title } : undefined,
-            user: this.user?.(claim.inbox.userId) });
-          this.store.completeDelivery(claim.id);
-          delivered++;
-        } catch (error) {
-          this.store.failDelivery(claim.id, error instanceof Error ? error.message : String(error), claim.attempts);
-        }
+    for (let i = 0; i < limit; i++) {
+      const claim = (await this.store.claimDelivery());
+      if (!claim) break;
+      try {
+        const adapter = this.adapters[claim.channel];
+        if (!adapter) throw new Error(`${claim.channel} delivery is enabled but no adapter is configured`);
+        const task = (await this.store.getTask(claim.inbox.taskId));
+        await adapter.deliver({ inbox: claim.inbox,
+          task: task ? { id: task.id, num: task.num, title: task.title } : undefined,
+          user: (await this.user?.(claim.inbox.userId)) });
+        (await this.store.completeDelivery(claim.id));
+        delivered++;
+      } catch (error) {
+        (await this.store.failDelivery(claim.id, error instanceof Error ? error.message : String(error), claim.attempts));
       }
-      return delivered;
-    } finally {
-      this.running = false;
     }
+    return delivered;
   }
 }

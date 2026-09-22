@@ -29,7 +29,7 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     projectId = (await post('/api/projects', { name: 'Pay', config: { repos: [repo] } })).id;
     const card = await post('/api/cards', { scope: 'project', projectId, label: 'Ops', cap: 1000000 });
     cardId = card.id;
-    h.store.setSettings(projectId, 'payments', { budget: null });
+    (await h.store.setSettings(projectId, 'payments', { budget: null }));
     await post(`/api/cards/${cardId}/fund`, { amount: 500000 }); // $5,000.00
   }, 60_000);
   afterAll(async () => {
@@ -90,7 +90,7 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     }
     const resumed = await get(`/api/tasks/${created.id}/events?since=0`);
     expect(resumed.filter((event: any) => event.type === 'turn.prompt' && event.payload.role === 'do')).toHaveLength(2);
-    const saved = h.store.getTask(created.id)!;
+    const saved = (await h.store.getTask(created.id))!;
     expect((saved.params as any).paymentPolicy.budget).toBe(1500);
     // Retrying the edit cannot charge the already-resolved request again.
     const again = await fetch(`${base}/api/tasks/${created.id}/payments`, { method: 'PUT', headers: auth(),
@@ -100,7 +100,7 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
 
   it('requires payment authority, rejects invalid policies and duplicate organization names', async () => {
     const created = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', draft: true, params: { prompt: 'Draft payment' } });
-    const actor = h.tokens.mint({ taskId: created.id, projectId, profileId: 'test', principal: `task:${created.id}`, ceiling: ['task:read', 'task:edit', 'task:create'], grantorCaps: ['task:read', 'task:edit', 'task:create'] });
+    const actor = (await h.tokens.mint({ taskId: created.id, projectId, profileId: 'test', principal: `task:${created.id}`, ceiling: ['task:read', 'task:edit', 'task:create'], grantorCaps: ['task:read', 'task:edit', 'task:create'] }));
     const headers = { authorization: `Bearer ${actor.token}`, 'content-type': 'application/json' };
     const readOnly = await fetch(`${base}/api/tasks/${created.id}/payments`, { headers }).then(J);
     expect(readOnly).toMatchObject({ spent: 0, canEdit: false });
@@ -112,23 +112,23 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
       body: JSON.stringify({ cardIds: [cardId], budget: -1 }) })).status).not.toBe(200);
     const duplicate = await post('/api/cards', { scope: 'organization', label: ' ops ', cap: 1000 });
     expect(duplicate.error).toMatch(/name.*unique/i);
-    const otherProject = h.store.createProject('Another project', {});
+    const otherProject = (await h.store.createProject('Another project', {}));
     const otherCard = await post('/api/cards', { scope: 'project', projectId: otherProject.id, label: 'Other', cap: 1000 });
     expect((await fetch(`${base}/api/tasks/${created.id}/payments`, { method: 'PUT', headers: auth(),
       body: JSON.stringify({ cardIds: [otherCard.id], budget: 100 }) })).status).not.toBe(200);
   });
 
   it('captures the zero organization default on new tasks', async () => {
-    const project = h.store.createProject('Zero defaults', {});
+    const project = (await h.store.createProject('Zero defaults', {}));
     const task = await post(`/api/projects/${project.id}/tasks`, { workflow: 'just-do', draft: true, params: { prompt: 'Default budget' } });
     expect(task.params.paymentPolicy.budget).toBe(0);
   });
 
   it('captures inherited defaults and preserves them when a draft is replaced', async () => {
-    h.store.setSettings(projectId, 'payments', { cardIds: [cardId], budget: 4500 });
+    (await h.store.setSettings(projectId, 'payments', { cardIds: [cardId], budget: 4500 }));
     const task = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', draft: true, params: { prompt: 'Inherited payments' } });
     expect(task.params.paymentPolicy).toEqual({ cardIds: [cardId], budget: 4500 });
-    h.store.setSettings(projectId, 'payments', { cardIds: [], budget: 0 });
+    (await h.store.setSettings(projectId, 'payments', { cardIds: [], budget: 0 }));
     const response = await fetch(`${base}/api/tasks/${task.id}/params`, { method: 'PATCH', headers: auth(),
       body: JSON.stringify({ params: { prompt: 'Edited prompt' }, replace: true }) });
     expect(response.status).toBe(200);

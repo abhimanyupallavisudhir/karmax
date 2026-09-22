@@ -190,34 +190,34 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
     config: { defaultBase: 'main', defaultTarget: 'prod', repos: ['/r'], openGithubPr: true },
   };
 
-  it('derives from ProjectConfig when no settings row exists', () => {
-    const s = projectSettingsFor(() => undefined, project, 'software-dev');
+  it('derives from ProjectConfig when no settings row exists', async () => {
+    const s = (await projectSettingsFor(() => undefined, project, 'software-dev'));
     expect(s.base).toBe('main');
     expect(s.target).toBe('prod');
     expect(s.repos).toEqual(['/r']);
     expect(s.remote).toBe('pr');
   });
 
-  it('uses the stored settings row when present', () => {
+  it('uses the stored settings row when present', async () => {
     const stored = { base: 'develop', repos: ['/other'] };
-    const s = projectSettingsFor(() => stored, project, 'software-dev');
+    const s = (await projectSettingsFor(() => stored, project, 'software-dev'));
     expect(s).toBe(stored);
   });
 
-  it('merges shared defaults beneath workflow-specific settings', () => {
+  it('merges shared defaults beneath workflow-specific settings', async () => {
     const get = (_scope: string, workflow: string) => workflow === '__common__'
       ? { base: 'shared', target: 'main' } : workflow === 'software-dev' ? { base: 'workflow' } : undefined;
-    expect(projectSettingsFor(get, project, 'software-dev')).toMatchObject({ base: 'workflow', target: 'main' });
+    expect((await projectSettingsFor(get, project, 'software-dev'))).toMatchObject({ base: 'workflow', target: 'main' });
   });
 
-  it('globalSettingsFor returns {} when absent', () => {
-    expect(globalSettingsFor(() => undefined, 'software-dev')).toEqual({});
+  it('globalSettingsFor returns {} when absent', async () => {
+    expect((await globalSettingsFor(() => undefined, 'software-dev'))).toEqual({});
   });
 
-  it('never leaks legacy installation defaults into a new organization', () => {
+  it('never leaks legacy installation defaults into a new organization', async () => {
     const get = (scope: string) => scope === 'global' ? { base: 'legacy-secret' } : undefined;
-    expect(globalSettingsFor(get, 'software-dev', 'org_team')).toEqual({});
-    expect(globalSettingsFor(get, 'software-dev', 'org_personal')).toEqual({ base: 'legacy-secret' });
+    expect((await globalSettingsFor(get, 'software-dev', 'org_team'))).toEqual({});
+    expect((await globalSettingsFor(get, 'software-dev', 'org_personal'))).toEqual({ base: 'legacy-secret' });
   });
 });
 
@@ -273,21 +273,21 @@ describe('quick-task agent defaults (separate overlay for the quick-add box)', (
     expect(r['agent:do']).toMatchObject({ provider: 'mock' });
   });
 
-  it('quick*SettingsFor read the namespaced rows and default to {}', () => {
+  it('quick*SettingsFor read the namespaced rows and default to {}', async () => {
     const rows: Record<string, Record<string, unknown>> = {
       'quick:global::software-dev': { confirm: { mode: 'auto' }, 'agent:do': { provider: 'codex' } },
       'quick:p1::software-dev': { base: 'qb', 'agent:merge': { provider: 'claude' } },
     };
     const get = (scopeKey: string, wf: string) => rows[`${scopeKey}::${wf}`];
-    expect(quickGlobalSettingsFor(get, 'software-dev')).toEqual({ 'agent:do': { provider: 'codex' } });
-    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ 'agent:merge': { provider: 'claude' } });
-    expect(quickGlobalSettingsFor(() => undefined, 'software-dev')).toEqual({});
-    expect(quickProjectSettingsFor(() => undefined, 'p1', 'software-dev')).toEqual({});
+    expect((await quickGlobalSettingsFor(get, 'software-dev'))).toEqual({ 'agent:do': { provider: 'codex' } });
+    expect((await quickProjectSettingsFor(get, 'p1', 'software-dev'))).toEqual({ 'agent:merge': { provider: 'claude' } });
+    expect((await quickGlobalSettingsFor(() => undefined, 'software-dev'))).toEqual({});
+    expect((await quickProjectSettingsFor(() => undefined, 'p1', 'software-dev'))).toEqual({});
   });
 
-  it('can disable the shared Quick overlay without deleting its values', () => {
+  it('can disable the shared Quick overlay without deleting its values', async () => {
     const get = (_scope: string, workflow: string) => workflow === '__common__' ? { _enabled: false, 'agent:do': { provider: 'codex' } } : undefined;
-    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({});
+    expect((await quickProjectSettingsFor(get, 'p1', 'software-dev'))).toEqual({});
   });
 });
 

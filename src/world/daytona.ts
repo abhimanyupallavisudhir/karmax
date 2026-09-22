@@ -77,7 +77,7 @@ export class DaytonaWorldProvider implements WorldProvider {
     private idleMs = positiveInt(process.env.KARMAX_DAYTONA_IDLE_MS, DEFAULT_IDLE_MS),
     private snapshot = process.env.KARMAX_DAYTONA_SNAPSHOT,
     private image = process.env.KARMAX_DAYTONA_IMAGE,
-    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection,
+    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopSnapshot = process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
     private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE) {
     this.refKey = crypto.createHash('sha256').update(
@@ -87,7 +87,7 @@ export class DaytonaWorldProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     spec.signal?.throwIfAborted();
-    const connection = this.connection(spec.organizationId);
+    const connection = (await this.connection(spec.organizationId));
     const factory = this.factoryFor(connection);
     const environment = spec.environment ?? {};
     const flavor = environment.flavor ?? 'headless';
@@ -176,7 +176,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   async open(handle: WorldHandle): Promise<World> {
     const reference = this.reference(handle);
     const id = reference.sandboxId;
-    const sandbox = this.sandboxes.get(id) ?? await this.factoryFor(this.connection(reference.organizationId)).get(id);
+    const sandbox = this.sandboxes.get(id) ?? await this.factoryFor((await this.connection(reference.organizationId))).get(id);
     await sandbox.refreshData?.();
     await startSandbox(sandbox);
     if (handle.meta?.environmentFlavor === 'desktop') {
@@ -191,7 +191,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   async park(handle: WorldHandle): Promise<WorldHandle> {
     const reference = this.reference(handle);
     const id = reference.sandboxId;
-    const sandbox = this.sandboxes.get(id) ?? await this.factoryFor(this.connection(reference.organizationId)).get(id);
+    const sandbox = this.sandboxes.get(id) ?? await this.factoryFor((await this.connection(reference.organizationId))).get(id);
     await sandbox.refreshData?.();
     if (!['archived', 'archiving'].includes(String(sandbox.state))) {
       if (sandbox.state === 'starting') await sandbox.waitUntilStarted?.(90);
@@ -213,7 +213,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
     const reference = this.reference(handle);
     try {
-      const sandbox = await this.factoryFor(this.connection(reference.organizationId)).get(reference.sandboxId);
+      const sandbox = await this.factoryFor((await this.connection(reference.organizationId))).get(reference.sandboxId);
       await sandbox.refreshData?.();
       const state = String(sandbox.state ?? '').toLowerCase();
       if (!state) return undefined;
@@ -229,7 +229,7 @@ export class DaytonaWorldProvider implements WorldProvider {
    * reaper. Filtered on the `karmaxHome` label so another karmax instance
    * sharing the same Daytona account is never enumerated, let alone deleted. */
   async listSandboxes(organizationId?: string): Promise<ProviderSandboxRef[]> {
-    const factory = this.factoryFor(this.connection(organizationId));
+    const factory = this.factoryFor((await this.connection(organizationId)));
     if (!factory.list) return [];
     const sandboxes = await factory.list({ karmaxHome: serviceHomeLabel() });
     return sandboxes.map((sandbox) => ({
@@ -265,8 +265,8 @@ export class DaytonaWorldProvider implements WorldProvider {
 
   private sandboxId(handle: WorldHandle): string { return this.reference(handle).sandboxId; }
 
-  private connection(organizationId: string | undefined): ResolvedWorldProviderConnection | undefined {
-    if (this.resolveConnection) return this.resolveConnection(organizationId, this.kind);
+  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection | undefined> {
+    if (this.resolveConnection) return (await this.resolveConnection(organizationId, this.kind));
     return process.env.DAYTONA_API_KEY ? { organizationId, provider: this.kind, apiKey: process.env.DAYTONA_API_KEY,
       config: { snapshot: this.snapshot, image: this.image, desktopSnapshot: this.desktopSnapshot,
         desktopImage: this.desktopImage, apiUrl: process.env.DAYTONA_API_URL,
@@ -376,7 +376,7 @@ class DaytonaWorld implements World {
     const emit = (chunk: string) => { if (!attached) pending.push(chunk); for (const listener of output) listener(chunk); };
     const logs = processApi.getSessionCommandLogs(sessionId, commandId, emit, emit)
       .catch((error) => emit(String(error?.message ?? error)));
-    const stopKeepAlive = this.keepAlive();
+    const stopKeepAlive = (await this.keepAlive());
     const finish = (code: number) => {
       if (exitCode !== null) return;
       exitCode = code;
@@ -420,7 +420,7 @@ class DaytonaWorld implements World {
     let stopKeepAlive = () => {};
     try {
       await terminal.waitForConnection?.();
-      stopKeepAlive = this.keepAlive();
+      stopKeepAlive = (await this.keepAlive());
       if (spec.command) await terminal.sendInput(`${spec.command}\n`);
     } catch (error) {
       stopKeepAlive();
@@ -499,17 +499,17 @@ class DaytonaWorld implements World {
   async destroy(): Promise<void> { await deleteSandbox(this.sandbox); }
 
   /** Open processes need control-plane activity even when producing no output. */
-  private keepAlive(): () => void {
+  private async keepAlive(): Promise<() => void> {
     let stopped = false;
     const minutes = Math.max(1, Math.ceil(this.idleMs / 60_000));
-    const refresh = () => {
+    const refresh = async () => {
       if (stopped) return;
       void Promise.resolve(this.sandbox.refreshActivity
         ? this.sandbox.refreshActivity()
         : this.sandbox.setAutostopInterval ? this.sandbox.setAutostopInterval(minutes)
-        : this.sandbox.process.executeCommand('true', undefined, undefined, 15)).catch(() => undefined);
+        : (await this.sandbox.process.executeCommand('true', undefined, undefined, 15))).catch(() => undefined);
     };
-    refresh();
+    (await refresh());
     const timer = setInterval(refresh, Math.max(30_000, Math.min(60_000, Math.floor(this.idleMs / 3))));
     timer.unref();
     return () => { if (!stopped) { stopped = true; clearInterval(timer); } };
