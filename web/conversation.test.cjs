@@ -220,6 +220,7 @@ eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
+global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
 global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
@@ -229,6 +230,7 @@ for (const status of ['done', 'cancelled', 'waiting']) {
   forkView.status = status;
   for (const role of ['do', 'merge', 'confirm', 'resolve']) {
     const html = conversationPane(forkView, { role, messages: [] });
+    ok(html.includes('Pending approvals'), `${role} conversation includes pending task approvals`);
     ok(html.includes('id="fork-task-agent"') && html.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
     let click;
     global.$ = (selector) => selector === '#main'
