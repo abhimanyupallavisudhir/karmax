@@ -22,6 +22,29 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('migrates a shared GitHub installation and preserves connections across restarts', async () => {
+    const db = openSqlDatabase(url!);
+    await db.exec(`CREATE TABLE git_connections (
+      id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
+      installationId TEXT NOT NULL, accountLogin TEXT NOT NULL, accountType TEXT,
+      createdAt INTEGER NOT NULL, suspendedAt INTEGER, UNIQUE (provider, installationId));
+      INSERT INTO git_connections VALUES ('original', 'org_personal', 'github', '42', 'acme', 'User', 123, 456)`);
+    await db.close();
+    let store = await Store.create(url!);
+    try {
+      const original = (await store.getGitConnection('original'))!;
+      expect(original).toMatchObject({ createdAt: 123, suspendedAt: 456 });
+      const other = await store.createOrganization({ name: 'Second', ownerUserId: 'owner' });
+      const second = await store.upsertGitConnection({ ...original, id: undefined, organizationId: other.id });
+      expect(second.id).not.toBe(original.id);
+      expect((await store.upsertGitConnection({ ...second, id: 'losing-concurrent-candidate' })).id).toBe(second.id);
+      await store.close();
+      store = await Store.create(url!);
+      expect(await store.getGitConnection(original.id)).toEqual(original);
+      expect(await store.gitConnectionsForInstallation('github', '42')).toHaveLength(2);
+    } finally { await store.close(); }
+  });
+
   it('migrates multiple pages of legacy conversations without losing history on restart or status writes', async () => {
     let store = await Store.create(url!);
     const expected = new Map<string, any>();

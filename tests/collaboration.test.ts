@@ -123,10 +123,13 @@ describe('organization and collaboration domain', () => {
     expect((await store.userIsProjectMember(project.id, 'developer'))).toBe(true);
     await expect((async () => (await store.setProjectMembership(project.id, { kind: 'user', userId: 'outsider' }, 'member')))()).rejects.toThrow(/not a member/);
 
-    const connection = (await store.upsertGitConnection({ organizationId: acme.id, provider: 'github',
-      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
-    await expect((async () => (await store.upsertGitConnection({ organizationId: other.id, provider: 'github',
-      installationId: '42', accountLogin: 'acme' })))()).rejects.toThrow(/another organization/);
+    const connection = await store.upsertGitConnection({ organizationId: acme.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const otherConnection = await store.upsertGitConnection({ organizationId: other.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme' });
+    expect(otherConnection.id).not.toBe(connection.id);
+    expect(await store.listGitConnections(acme.id)).toEqual([connection]);
+    expect(await store.listGitConnections(other.id)).toEqual([otherConnection]);
     const repository = (await store.upsertRepository({ organizationId: acme.id, provider: 'github', providerId: '100',
       owner: 'acme', name: 'product', sshUrl: 'git@github.com:acme/product.git', defaultBranch: 'main',
       private: true, gitConnectionId: connection.id }));

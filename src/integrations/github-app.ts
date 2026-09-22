@@ -906,9 +906,29 @@ export class GitHubAppService {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
-    const connection = (await this.store.db.prepare('SELECT * FROM git_connections WHERE provider=? AND installationId=?')
-      .get('github', installationId)) as any;
-    if (!connection) return { accepted: true };
+    const connections = await this.store.gitConnectionsForInstallation('github', installationId);
+    // Every connection represents a separate Tavya tenant but uses the same
+    // GitHub installation. Run remote reconciliation concurrently so adding
+    // tenants does not multiply webhook latency. allSettled is deliberate: if
+    // one tenant fails, let the others finish before releasing the delivery for
+    // retry, avoiding overlapping attempts against still-running work.
+    const settled = await Promise.allSettled(connections.map((connection) =>
+      this.dispatchConnectionWebhook(event, payload, connection)));
+    const failed = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+    if (failed) throw failed.reason;
+    const result: GithubWebhookResult = { accepted: true };
+    for (const entry of settled) {
+      const next = (entry as PromiseFulfilledResult<GithubWebhookResult>).value;
+      if (next.reconciled !== undefined) result.reconciled = (result.reconciled ?? 0) + next.reconciled;
+      if (next.events?.length) (result.events ??= []).push(...next.events);
+      if (next.projectEvents?.length) (result.projectEvents ??= []).push(...next.projectEvents);
+      if (next.vaultPushes?.length) (result.vaultPushes ??= []).push(...next.vaultPushes);
+    }
+    return result;
+  }
+
+  private async dispatchConnectionWebhook(event: string, payload: any, connection: GitConnection): Promise<GithubWebhookResult> {
+    const installationId = connection.installationId;
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {
       const saved = (await this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
         accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() }));
