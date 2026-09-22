@@ -770,7 +770,7 @@ export class ProjectResourceService {
   /** Metadata-only safety net for ignored output that has neither an attachment
    * nor a staged candidate. No bytes are read and the bounded result is safe to
    * show at checkpoint/Review. */
-  async ignoredInventory(taskId: string, limit = 100): Promise<IgnoredResourceInventory> {
+  async ignoredInventory(taskId: string, limit = 100, checkContinue?: () => Promise<void>): Promise<IgnoredResourceInventory> {
     const { handle, world } = await this.currentTaskWorld(taskId);
     const excluded = [
       ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
@@ -782,6 +782,7 @@ export class ProjectResourceService {
     let truncated = false;
     const repos = worldRepos(handle);
     for (const repo of repos) {
+      await checkContinue?.();
       const listed = await world.exec('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], { cwd: repo.root });
       if (listed.code !== 0) continue;
       for (const raw of listed.stdout.split('\0').filter(Boolean)) {
@@ -789,6 +790,7 @@ export class ProjectResourceService {
         const relative = repos.length > 1 ? `${repo.name}/${local}` : local;
         if (excluded.some((root) => pathsOverlap(root, relative))) continue;
         if (found.length >= Math.max(1, Math.min(limit, 500))) { truncated = true; break; }
+        await checkContinue?.();
         const sized = await world.exec('du', ['-sb', '--', local], { cwd: repo.root });
         const bytes = sized.code === 0 ? Number(sized.stdout.trim().split(/\s+/)[0]) : 0;
         found.push({ ...(repos.length > 1 ? { checkout: repo.name } : {}), path: relative,
@@ -828,10 +830,11 @@ export class ProjectResourceService {
 
   /** Capture writable task forks for portable hibernation without promoting
    * them to the project's current baseline. */
-  async checkpoint(handle: WorldHandle): Promise<Array<{ attachmentId: string; revisionId: string }>> {
+  async checkpoint(handle: WorldHandle, checkContinue?: () => Promise<void>): Promise<Array<{ attachmentId: string; revisionId: string }>> {
     const world = await this.worlds.open(handle);
     const refs: Array<{ attachmentId: string; revisionId: string }> = [];
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
+      await checkContinue?.();
       if (lease.state !== 'active') continue;
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path') continue;
@@ -840,7 +843,7 @@ export class ProjectResourceService {
         continue;
       }
       const captured = await this.engine.capture(attachment,
-        filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment));
+        filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment, checkContinue));
       const revision = (await this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
         engine: this.engine.id, ...captured, metadata: { checkpoint: true }, createdByTaskId: lease.taskId }));
       refs.push({ attachmentId: attachment.id, revisionId: revision.id });
@@ -999,7 +1002,8 @@ async function readSmallFile(file: string, maximumBytes: number): Promise<Buffer
   }
 }
 
-async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment): AsyncGenerator<SnapshotInputFile> {
+async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment, checkContinue?: () => Promise<void>): AsyncGenerator<SnapshotInputFile> {
+  await checkContinue?.();
   if (attachment && fileShaped(attachment)) {
     const exists = await world.exec('test', ['-f', target]);
     if (exists.code !== 0) return;
@@ -1007,7 +1011,7 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
     yield { path: path.posix.basename(target), bytes,
-      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined), captured.cleanup) };
+      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
     return;
   }
   const prefix = target === '.' ? '' : `${target}/`;
@@ -1016,13 +1020,14 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
   if (listed.code !== 0) throw new Error(listed.stderr || `could not inspect resource path ${target}`);
   const all = listed.stdout.split('\0').filter(Boolean);
   for (const file of all.sort()) {
+    await checkContinue?.();
     const relative = prefix ? (file.startsWith(prefix) ? file.slice(prefix.length) : undefined) : file;
     if (!relative || relative.startsWith('.git/') || relative.startsWith('.karmax-injection/')) continue;
     const captured = await transactionalSnapshotPath(world, file);
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
     yield { path: safePath(relative), bytes,
-      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined), captured.cleanup) };
+      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
   }
 }
 
@@ -1097,12 +1102,14 @@ async function* fixedChunks(value: Buffer | AsyncIterable<Buffer>): AsyncGenerat
   if (pending.length || !emitted) yield pending;
 }
 
-async function* chunksFromWorldFile(world: World, file: string, bytes?: number): AsyncGenerator<Buffer> {
+async function* chunksFromWorldFile(world: World, file: string, bytes?: number, checkContinue?: () => Promise<void>): AsyncGenerator<Buffer> {
   for (let offset = 0; bytes === undefined || offset < bytes; offset += WORLD_READ_BYTES) {
+    await checkContinue?.();
     const result = await world.exec('bash', ['-lc',
       `dd if=${quote(file)} bs=${WORLD_READ_BYTES} skip=${Math.floor(offset / WORLD_READ_BYTES)} count=1 status=none | base64 -w0`],
     { timeoutMs: 30 * 60_000 });
     if (result.code !== 0) throw new Error(result.stderr || `could not read resource file ${file}`);
+    await checkContinue?.();
     const chunk = Buffer.from(result.stdout.trim(), 'base64');
     if (!chunk.length) break;
     yield chunk;

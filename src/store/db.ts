@@ -4898,7 +4898,7 @@ export class Store {
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
-        `view-conversation:${taskId}:`]) (await prefix.run(value, value));
+        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
   
     });

@@ -67,7 +67,8 @@ export class WorldCheckpointService {
     this.runners = runners ?? new RunnerPoolService(store);
   }
 
-  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean } = {}): Promise<WorldCheckpoint> {
+  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void> } = {}): Promise<WorldCheckpoint> {
+    await options.checkContinue?.();
     const handle = ((await this.store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
     (await this.store.assertCurrentWorld(handle));
     const projectId = String(handle.meta?.projectId ?? '');
@@ -78,14 +79,19 @@ export class WorldCheckpointService {
     const organizationRepositories = (await this.store.listRepositories(project.organizationId));
     const files: Array<{ repo: string; path: string; deleted?: boolean; readPath?: string }> = [];
     const repos: WorldCheckpoint['repos'] = [];
-    const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
-    const ignored = await this.resources?.ignoredInventory(handle.id).catch(() => undefined);
+    const resourceRefs = await this.resources?.checkpoint(handle, options.checkContinue) ?? [];
+    await options.checkContinue?.();
+    const ignored = await this.resources?.ignoredInventory(handle.id, 100, options.checkContinue).catch(async () => {
+      await options.checkContinue?.();
+      return undefined;
+    });
     const resourcePaths = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
       .map((projection) => projection.target).filter((value): value is string => Boolean(value));
     const ephemeralPaths = new Set(Array.isArray(handle.meta?.ephemeralPaths)
       ? handle.meta.ephemeralPaths.filter((value): value is string => typeof value === 'string')
       : []);
     for (const repo of worldRepos(world.handle)) {
+      await options.checkContinue?.();
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
@@ -122,10 +128,12 @@ export class WorldCheckpointService {
     }
     async function* contents(): AsyncGenerator<CheckpointFile> {
       for (const { readPath, ...file } of files) {
+        await options.checkContinue?.();
         yield readPath === undefined ? file : { ...file, data: await world.readFileBuffer(readPath) };
       }
     }
     const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), await this.key());
+    await options.checkContinue?.();
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
     const managedStorage = (await this.store.listStorageLocations(project.organizationId))
@@ -155,6 +163,7 @@ export class WorldCheckpointService {
       fundingSource: 'managed',
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
       metadata: { checkpointId, generation: checkpoint.generation } }));
+    await options.checkContinue?.();
     if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
     return checkpoint;
   }

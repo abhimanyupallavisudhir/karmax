@@ -6,7 +6,9 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import type { TaskView } from '../src/domain/types.js';
 
 describe('parking during agent admission', () => {
-  it.each([['status', false], ['checkpoint', false], ['status', true], ['checkpoint', true]] as const)('defers idle parking during %s (separate lifecycle: %s)', async (boundary, separateLifecycle) => {
+  it.each((['do', 'review', 'merge', 'resolve'] as const).flatMap(stage =>
+    (['status', 'checkpoint'] as const).flatMap(boundary => [false, true].map(separateLifecycle =>
+      ({ stage, boundary, separateLifecycle })))))('defers idle parking: $stage/$boundary/separate=$separateLifecycle', async ({ stage, boundary, separateLifecycle }) => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Follow-up');
     const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
@@ -23,7 +25,7 @@ describe('parking during agent admission', () => {
     const checkpoint = vi.fn(async () => { if (boundary === 'checkpoint') await wait(); return { id: 'saved', generation: 1 }; });
     const core = makeCoreActivities({ store, worlds: worlds as any, adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock'), checkpoints: { checkpoint } as any });
-    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage, status: 'waiting',
       waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,
       state: {}, world: handle } as TaskView;
     try {
@@ -32,7 +34,7 @@ describe('parking during agent admission', () => {
         : core.publishView(task.id, view);
       await atBoundary;
       await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(),
-        payload: { role: 'do', message: { id: 'new', role: 'user', text: 'Continue' } } });
+        payload: { role: stage === 'review' ? 'do' : stage, message: { id: 'new', role: 'user', text: 'Continue' } } });
       release();
       await publication;
       expect(worlds.park).not.toHaveBeenCalled();
@@ -43,6 +45,69 @@ describe('parking during agent admission', () => {
       await core.publishView(task.id, view);
       expect(worlds.park).toHaveBeenCalledTimes(1);
     } finally { release(); await store.close(); }
+  });
+
+  it('retains the original follow-up boundary when a legacy publication retries', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retry');
+    const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const handle = { id: task.id, kind: 'container', root: '/workspace', branch: 'task', base: 'main' };
+    const park = vi.fn(async () => handle);
+    const worlds = { get: () => ({ parkable: true }), status: async () => 'ready', park };
+    let interrupted = true;
+    let cancellation = new AbortController();
+    const checkpoint = vi.fn(async () => {
+      if (interrupted) { cancellation.abort(); throw new Error('worker lost'); }
+      return { id: 'saved', generation: 1 };
+    });
+    const core = makeCoreActivities({ store, worlds: worlds as any, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), checkpoints: { checkpoint } as any });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,
+      state: {}, world: handle } as TaskView;
+    const ctx = vi.spyOn(Context, 'current').mockImplementation(() => ({ cancellationSignal: cancellation.signal,
+      info: { workflowExecution: { runId: 'same-run' }, activityId: '37' } } as any));
+    try {
+      await expect(core.publishView(task.id, view)).rejects.toThrow('worker lost');
+      await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(),
+        payload: { role: 'do', message: { id: 'reply', role: 'user', text: 'Continue' } } });
+      interrupted = false;
+      cancellation = new AbortController();
+      checkpoint.mockClear(); park.mockClear();
+      await core.publishView(task.id, view);
+      expect(checkpoint).not.toHaveBeenCalled();
+      expect(park).not.toHaveBeenCalled();
+    } finally { ctx.mockRestore(); await store.close(); }
+  });
+
+  it('stops checkpoint work at its next safe boundary after a follow-up', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Interrupt capture');
+    const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const handle = { id: task.id, kind: 'container', root: '/workspace', branch: 'task', base: 'main' };
+    const park = vi.fn(async () => handle);
+    const expensiveRemainder = vi.fn();
+    const checkpoint = async (_handle: unknown, options?: { checkContinue?: () => Promise<void> }) => {
+      await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(),
+        payload: { role: 'do', message: { id: 'reply', role: 'user', text: 'Continue' } } });
+      await options?.checkContinue?.();
+      expensiveRemainder();
+      return { id: 'saved', generation: 1 };
+    };
+    const core = makeCoreActivities({ store, worlds: { get: () => ({ parkable: true }),
+      status: async () => 'ready', park } as any, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), checkpoints: { checkpoint } as any });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,
+      state: {}, world: handle } as TaskView;
+    try {
+      await core.publishView(task.id, view);
+      expect(expensiveRemainder).not.toHaveBeenCalled();
+      expect(park).not.toHaveBeenCalled();
+      expect(await store.eventsOfType(task.id, 'checkpoint.warning')).toHaveLength(0);
+    } finally { await store.close(); }
   });
 
   it.each([false, true])('publishes startup without checkpointing or parking (recovery handle: %s)', async recovery => {
