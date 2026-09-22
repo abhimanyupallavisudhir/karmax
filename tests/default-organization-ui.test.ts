@@ -80,6 +80,7 @@ describe('searchable organization selection', () => {
       setAttribute(name: string, value: string) { this.attributes[name] = value; }
       removeAttribute(name: string) { delete this.attributes[name]; }
       select() {}
+      blur() { this.listeners.blur?.(); }
       contains() { return false; }
       getBoundingClientRect() { return { left: 20, top: 300, bottom: 330, width: 200, height: 100 }; }
       querySelectorAll() {

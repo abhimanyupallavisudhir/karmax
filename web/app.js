@@ -1488,7 +1488,7 @@ function wireOrganizationCombo(root, selectedId, onSelect, discover = false) {
   input.addEventListener('input', () => { query = input.value; show(); });
   input.addEventListener('blur', hide);
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { event.preventDefault(); hide(); }
+    if (event.key === 'Escape') { event.preventDefault(); hide(); input.blur(); }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       if (menu.hidden) { query = ''; show(); }
