@@ -12982,6 +12982,45 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
     throw error;
   }
 }
+async function connectOrganizationGithub(organizationId, onConnected) {
+  const result = await api(`/api/organizations/${organizationId}/github/install-url`, { method: 'POST', body: '{}' });
+  if (!Array.isArray(result.installations)) { location.assign(result.url); return; }
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal-card';
+  dialog.innerHTML = `<form method="dialog"><h2>Connect GitHub</h2><p>${result.installations.length ? 'Choose an existing GitHub App installation for this organization.' : 'No existing installations are available for this GitHub account. Install the app or sign in to another account.'}</p>
+    ${result.installations.length ? `<label class="form-row">GitHub account<select id="github-existing-installation">${result.installations.map(item => `<option value="${esc(item.id)}">${esc(item.accountLogin)}</option>`).join('')}</select></label>` : ''}
+    <p class="task-sub" role="alert" id="github-connect-error"></p>
+    ${result.installations.length ? '<button class="btn primary" type="button" id="github-connect-existing">Connect</button>' : ''}
+    <a class="btn" href="${esc(result.url)}">Install on another GitHub account</a>
+    ${result.canAuthorize ? '<button class="btn" type="button" id="github-switch-account">Use another GitHub account</button>' : ''}
+    <button class="btn" type="submit">Cancel</button></form>`;
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.querySelector('#github-switch-account')?.addEventListener('click', async () => {
+    try {
+      const authorization = await api(`/api/organizations/${organizationId}/github/authorize`, {
+        method: 'POST', body: JSON.stringify({ returnTo: 'installation', mode: 'add' }),
+      });
+      location.assign(authorization.url);
+    } catch (error) { dialog.querySelector('#github-connect-error').textContent = error.message; }
+  });
+  dialog.querySelector('#github-connect-existing')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${organizationId}/github/connect-existing`, { method: 'POST', body: JSON.stringify({
+        installationId: dialog.querySelector('select').value,
+      }) });
+      dialog.close();
+      await onConnected();
+      toast('GitHub connected');
+    } catch (error) {
+      dialog.querySelector('#github-connect-error').textContent = error.message;
+      button.disabled = false;
+    }
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+}
 function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
@@ -13065,7 +13104,7 @@ async function hydrateProjectAccess(proj) {
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
-    $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+    $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, () => hydrateProjectAccess(proj)); } catch (error) { toast(error.message, true); } });
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
   } catch (error) {
@@ -17128,10 +17167,15 @@ async function hydrateOrganizationView() {
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#connect-github')?.addEventListener('click', async () => {
     try {
-      const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' });
-      location.assign(result.url);
+      await connectOrganizationGithub(organizationId, hydrateOrganizationView);
     } catch (error) { toast(error.message, true); }
   });
+  if (new URL(location.href).searchParams.get('github') === 'choose-installation') {
+    const returned = new URL(location.href);
+    returned.searchParams.delete('github');
+    history.replaceState(history.state, '', returned);
+    connectOrganizationGithub(organizationId, hydrateOrganizationView).catch(error => toast(error.message, true));
+  }
   $('#org-github-custom')?.addEventListener('click', () => openGitIdentityDialog({
     title: 'Custom automation identity', profile: githubIdentity.profile,
     endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: hydrateOrganizationView,

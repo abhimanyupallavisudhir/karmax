@@ -2780,7 +2780,7 @@ export class Store {
    * Only its SHA-256 digest is durable, so a database read cannot mint a valid
    * callback. The state is consumed atomically before any GitHub API call. */
   async createGithubInstallState(organizationId: string, userId: string,
-    options: number | { ttlMs?: number; returnTo?: 'profile'; githubAccountId?: string;
+    options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation'; githubAccountId?: string;
       githubLogin?: string; selectAccount?: boolean } = {}): Promise<string> {
     return this.db.transaction(async () => {
 
@@ -2788,7 +2788,7 @@ export class Store {
     const state = `kg_${crypto.randomBytes(32).toString('base64url')}`;
     const now = Date.now();
     const ttlMs = typeof options === 'number' ? options : options.ttlMs ?? 10 * 60_000;
-    const returnTo = typeof options === 'object' && options.returnTo === 'profile' ? 'profile' : undefined;
+    const returnTo = typeof options === 'object' && ['profile', 'installation'].includes(options.returnTo ?? '') ? options.returnTo : undefined;
     const githubAccountId = typeof options === 'object' ? options.githubAccountId?.trim() : undefined;
     const githubLogin = typeof options === 'object' ? options.githubLogin?.trim() : undefined;
     const selectAccount = typeof options === 'object' && options.selectAccount;
@@ -2803,7 +2803,7 @@ export class Store {
     });
   }
 
-  async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile';
+  async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation';
     githubAccountId?: string; githubLogin?: string; selectAccount?: boolean } | undefined> {
     return this.db.transaction(async () => {
 
@@ -2822,6 +2822,7 @@ export class Store {
       return {
         organizationId: String(row.organizationId),
         ...(row.returnTo === 'profile' ? { returnTo: 'profile' as const } : {}),
+        ...(row.returnTo === 'installation' ? { returnTo: 'installation' as const } : {}),
         ...(row.githubAccountId ? { githubAccountId: String(row.githubAccountId) } : {}),
         ...(row.githubLogin ? { githubLogin: String(row.githubLogin) } : {}),
         ...(row.selectAccount ? { selectAccount: true } : {}),
