@@ -12,5 +12,7 @@ const setup = proxyActivities<Pick<coreActivities, 'createWorld'>>({
 
 export function createTaskWorld(core: Pick<coreActivities, 'createWorld'>,
   args: Parameters<coreActivities['createWorld']>[0]) {
+  // This marker exists in production histories from before the release. Keep
+  // it replayable: removing it strands existing tasks even at later Review gates.
   return (patched('resource-aware-world-setup-v1') ? setup : core).createWorld(args);
 }
