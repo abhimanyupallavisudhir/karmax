@@ -51,7 +51,7 @@ const developer = [
   'resolve-decision', 'confirm-decision', 'merge-into:*',
 ] satisfies Capability[];
 const maintainer = [
-  ...developer, 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
+  ...developer, 'task:*', 'project:delete', 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
   'project:resource:shared-write',
   'workflow:edit', 'team:write', 'repository:write',
   'github:actions:write',
@@ -71,7 +71,7 @@ const PROJECT_GRANT_CEILING: Capability[] = [
   'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
-  'github:actions:*',
+  'github:actions:*', 'diagnostic:read', 'process:read', 'review:approve',
 ];
 
 export const ORGANIZATION_GRANT_CEILING: Capability[] = [
@@ -83,7 +83,7 @@ export const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:*', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
-  'github:actions:*',
+  'github:actions:*', 'diagnostic:read', 'process:read', 'review:approve',
 ];
 
 /** The five canonical levels are deliberately job-shaped, not permission checklists. */
@@ -97,12 +97,12 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
   },
   {
     id: 'developer', name: 'Developer', builtin: true,
-    description: 'Work with tasks, conversations, review actions, queues, and skills inside assigned projects.',
+    description: 'Read diagnostics and work on your own tasks and descendants inside assigned projects.',
     capabilities: developer,
   },
   {
     id: 'maintainer', name: 'Project maintainer', builtin: true,
-    description: 'Developer access plus project settings, agent profiles, queues, and reviewed workflow changes.',
+    description: 'Manage all tasks, reviews, settings, and automation inside assigned projects.',
     capabilities: maintainer,
   },
   {
@@ -122,27 +122,61 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
 // arbitrary profile merely because it still has `builtin: true`. Matching a
 // complete historical capability set lets old untouched installs acquire new
 // platform primitives while preserving every genuinely customized profile.
+const PREVIOUS_BUILTIN_DESCRIPTIONS: Record<string, string> = {
+  developer: 'Work with tasks, conversations, review actions, queues, and skills inside assigned projects.',
+  maintainer: 'Developer access plus project settings, agent profiles, queues, and reviewed workflow changes.',
+};
+
+const PREVIOUS_BUILTIN_CAPABILITIES = {
+  developer: [
+    'project:read', 'project:settings:read', 'task:*', 'queue:read',
+    'workflow:read', 'profile:read', 'organization:read', 'organization:member:read',
+    'team:read', 'repository:read', 'github:actions:read', 'credential:read',
+    'connection:use', 'vault:store', 'skill:write', 'use-card:*',
+    'inbox:*', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+  ],
+  maintainer: [
+    'project:read', 'project:settings:read', 'task:*', 'queue:read',
+    'workflow:read', 'profile:read', 'organization:read', 'organization:member:read',
+    'team:read', 'repository:read', 'github:actions:read', 'credential:read',
+    'connection:use', 'vault:store', 'skill:write', 'use-card:*',
+    'inbox:*', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+    'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
+    'project:resource:shared-write', 'workflow:edit', 'team:write', 'repository:write',
+    'github:actions:write', 'review:approve',
+  ],
+  administrator: [
+    'project:transfer-out', 'project:transfer-in', 'organization:*', 'team:*',
+    'repository:*', 'inbox:*', 'project:read', 'project:create',
+    'project:edit', 'project:delete', 'project:settings:*', 'project:resource:shared-write',
+    'task:*', 'queue:*', 'workflow:read', 'workflow:edit',
+    'profile:*', 'credential:*', 'vault:store', 'connection:use',
+    'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
+    'resolve-decision', 'confirm-decision', 'merge-into:*', 'github:actions:*',
+  ],
+} satisfies Record<string, Capability[]>;
+
 const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capability[][]>> = {
-  developer: [developer.filter((capability) => capability !== 'github:actions:read'), [
+  developer: [PREVIOUS_BUILTIN_CAPABILITIES.developer!, PREVIOUS_BUILTIN_CAPABILITIES.developer!.filter((capability) => capability !== 'github:actions:read'), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [
+  maintainer: [PREVIOUS_BUILTIN_CAPABILITIES.maintainer!, [...maintainer, 'workflow:install'],
     // With workflow:install (before it became global authority), with and without `review:approve`…
-    [...maintainer, 'workflow:install'],
-    [...maintainer.filter((capability) => capability !== 'review:approve'), 'workflow:install'],
-    [...maintainer.filter((capability) => !capability.startsWith('github:actions:') && capability !== 'review:approve'), 'workflow:install'],
+    [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!, 'workflow:install'],
+    [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!.filter((capability) => capability !== 'review:approve'), 'workflow:install'],
+    [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!.filter((capability) => !capability.startsWith('github:actions:') && capability !== 'review:approve'), 'workflow:install'],
     // …and the release just before `review:approve` shipped.
-    maintainer.filter((capability) => capability !== 'review:approve'), [
+    PREVIOUS_BUILTIN_CAPABILITIES.maintainer!.filter((capability) => capability !== 'review:approve'), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit',
   ]],
-  administrator: [
-    ORGANIZATION_GRANT_CEILING.filter(cap => !cap.startsWith('project:transfer-')),
-    [...ORGANIZATION_GRANT_CEILING.filter(cap => !cap.startsWith('project:transfer-')), 'workflow:install'],
-    [...ORGANIZATION_GRANT_CEILING, 'workflow:install'],
+  administrator: [PREVIOUS_BUILTIN_CAPABILITIES.administrator!, [...ORGANIZATION_GRANT_CEILING, 'workflow:install'],
+    PREVIOUS_BUILTIN_CAPABILITIES.administrator!.filter(cap => !cap.startsWith('project:transfer-')),
+    [...PREVIOUS_BUILTIN_CAPABILITIES.administrator!.filter(cap => !cap.startsWith('project:transfer-')), 'workflow:install'],
+    [...PREVIOUS_BUILTIN_CAPABILITIES.administrator!, 'workflow:install'],
   ],
   operator: [[
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
@@ -196,7 +230,7 @@ export class AuthorizationService {
         continue;
       }
       const historical = LEGACY_BUILTIN_CAPABILITIES[profile.id] ?? [];
-      if (stored.builtin && stored.name === profile.name && stored.description === profile.description
+      if (stored.builtin && stored.name === profile.name && (stored.description === profile.description || stored.description === PREVIOUS_BUILTIN_DESCRIPTIONS[profile.id])
         && historical.some((caps) => sameCapabilities(stored.capabilities, caps))) {
         (await this.store.setAuthorizationProfile('global', profile as any));
       }

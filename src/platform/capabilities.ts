@@ -19,7 +19,7 @@ export const CAPABILITIES = [
   'task:read', 'task:create', 'task:edit', 'task:signal', 'task:escalate', 'task:delete',
   'task:conversation:read', 'task:conversation:share', 'task:conversation:fork', 'task:conversation:message',
   'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute', 'review:approve',
-  'task:assign', 'task:subscribe',
+  'task:assign', 'task:subscribe', 'task:manage-own',
   'project:read', 'project:create', 'project:edit', 'project:delete',
   'project:settings:read', 'project:settings:write',
   'project:transfer-out', 'project:transfer-in',
@@ -45,11 +45,32 @@ export type KnownCapability = (typeof CAPABILITIES)[number];
 /** Ordinary developer operations shared by every role that works in a task
  * world. Workflow-internal decisions are added by concrete role declarations. */
 export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
-  'project:read', 'project:settings:read', 'task:*',
+  'project:read', 'project:settings:read',
+  'task:read', 'task:create', 'task:conversation:read', 'task:conversation:fork',
+  'task:event:read', 'task:git:import', 'task:escalate', 'task:manage-own',
+  'diagnostic:read', 'process:read',
   'queue:read', 'workflow:read', 'profile:read',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read',
   'github:actions:read',
   'credential:read', 'connection:use', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
+];
+
+/** Operations covered by own-task management. Reads and creating independent
+ * work remain ordinary capabilities; project-wide metadata never qualifies. */
+export const OWN_TASK_CAPABILITIES = new Set<Capability>([
+  'task:edit', 'task:signal', 'task:delete', 'task:assign', 'task:subscribe',
+  'task:conversation:share', 'task:conversation:message', 'task:git:publish',
+  'task:review:write', 'task:review:execute',
+]);
+
+/** Child tasks inherit working authority, capped by the parent. Keep legacy
+ * spellings for durable workflows whose grants predate namespaced capabilities. */
+export const CHILD_TASK_CAPABILITIES: Capability[] = [
+  'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+  'task:create', 'task:manage-own', 'task:review:write', 'task:signal', 'skill:write',
+  'diagnostic:read', 'process:read',
+  'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
+  'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
 ];
 
 export interface CapabilityDefinition {
@@ -76,6 +97,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     capabilities: [
       ['task:read', 'View tasks', 'Read task metadata, state, and results.'],
       ['task:create', 'Create tasks', 'Create tasks and choose their workflow authorization profile.'],
+      ['task:manage-own', 'Manage own tasks', 'Change your own tasks, tasks you created, and their descendants.'],
       ['task:edit', 'Edit tasks', 'Change task fields, drafts, tags, views, and task-scoped settings.'],
       ['task:signal', 'Act on tasks', 'Send follow-ups, confirmations, cancellations, and other workflow signals.'],
       ['task:escalate', 'Request human input', 'Pause the calling agent’s task and route a decision to selected people or teams.'],
