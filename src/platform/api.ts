@@ -5,7 +5,7 @@ import { timingEnabled, installationTiming, timingReport } from '../timing/index
 import { requireHumanSubject } from './identity.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
-import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client, type WorkflowExecutionDescription } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
@@ -176,6 +176,7 @@ const QUERY_TIMEOUT_MS = 3000;
  * "clicked queue, nothing happened, pile of tasks stuck at setup" failure mode).
  */
 const START_TIMEOUT_MS = 12_000;
+const TERMINAL_CLEANUP_TIMEOUT_MS = 10_000;
 
 /**
  * Which workflows can start a replacement run from a failed execution's
@@ -2370,9 +2371,10 @@ export class KarmaxApi {
   /** Lifecycle mutations must not act on `lastView`: publishing that snapshot is
    * an activity, so the deterministic workflow can already be in the next stage
    * while the store still shows the previous one. A stale read here can hold,
-   * terminate, or restore the wrong stage. Terminal views have no live execution
-   * to query; every active/waiting mutation requires the authoritative query and
-   * fails closed when it cannot be obtained. */
+   * terminate, or restore the wrong stage. Terminal projections can precede
+   * execution closure during cleanup; replacement waits for that separately.
+   * Every active/waiting mutation requires the authoritative query and fails
+   * closed when it cannot be obtained. */
   private async transitionSourceView(task: TaskRecord): Promise<TaskView> {
     const snapshot = task.lastView;
     if (!snapshot) throw new Error('task has no lifecycle state yet');
@@ -2898,6 +2900,40 @@ export class KarmaxApi {
     }
   }
 
+  /** Cancellation publishes its terminal view before saving/parking the world.
+   * ALLOW_DUPLICATE only permits reuse of a CLOSED Temporal execution. Never
+   * terminate that cleanup or use TERMINATE_EXISTING: either could interrupt the
+   * checkpoint, and an overlapping request could target a newer recovery run.
+   * Poll describe rather than result(), which long-polls and follows run chains.
+   */
+  private async waitForTerminalCleanup(task: TaskRecord, view: TaskView): Promise<void> {
+    if (!['done', 'cancelled', 'failed'].includes(view.status)) return;
+    const deadline = Date.now() + TERMINAL_CLEANUP_TIMEOUT_MS;
+    let handle = await this.workflowHandle(task.id, task);
+    let pinned = false;
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0)
+        throw new Error('This task is still finishing cleanup. Try again shortly.');
+      let execution;
+      try {
+        execution = await withTimeout<WorkflowExecutionDescription>(handle.describe(), Math.min(remaining, QUERY_TIMEOUT_MS));
+      } catch (error) {
+        // Deleted/expired history cannot still own this workflow id.
+        if (error instanceof WorkflowNotFoundError) return;
+        throw new Error(`Cannot verify that this task has finished cleanup (${unwrapCause(error)}). Try again shortly.`);
+      }
+      if (execution.status.name !== 'RUNNING') return;
+      if (!pinned) {
+        // Legacy tasks need an id-only lookup once. Subsequent polls must never
+        // switch to a concurrent replacement after the original run closes.
+        handle = this.deps.client.workflow.getHandle(task.id, execution.runId);
+        pinned = true;
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, remaining)));
+    }
+  }
+
   private async startTransitionReplacement(
     task: TaskRecord,
     view: TaskView,
@@ -2906,6 +2942,7 @@ export class KarmaxApi {
     humanWait?: { audience: string[]; detail: string },
     reviewConfirmed = false,
   ): Promise<TaskView> {
+    await this.waitForTerminalCleanup(task, view);
     const { startType, input, version } = await this.buildStart(task, true);
     input.recovery = (await this.transitionCheckpoint(view, resumeStage, pausedForHuman, humanWait, reviewConfirmed));
     const started = await withTimeout(this.deps.client.workflow.start(startType, {
@@ -3030,6 +3067,7 @@ export class KarmaxApi {
     }
 
     if (target === 'draft') {
+      await this.waitForTerminalCleanup(task, view);
       if (!['done', 'cancelled', 'failed'].includes(view.status))
         await this.stopTaskActivity(task, view, 'Task moved back to Draft', 'discard');
       const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
