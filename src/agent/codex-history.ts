@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
 /** Includes the canonical-decoder fix for decimal values in rollout records. */
-export const CODEX_VERSION = '0.154.0-alpha.11';
+export const CODEX_VERSION = '0.156.1';
 export const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 
 export class CodexHistoryError extends Error {

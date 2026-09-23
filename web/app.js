@@ -841,8 +841,8 @@ const NODES = [
 // `mock` is a hermetic test adapter, not a user-selectable agent.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
-  codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
+  codex: ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
   grok: ['grok-build', 'grok-code-fast-1'],
@@ -869,7 +869,9 @@ const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
 function effortLevelsFor(provider, model) {
   const m = (model || '').toLowerCase();
   const advertised = S.modelCatalog?.[provider]?.find((x) => x.id === model)?.effort;
-  if (advertised) return advertised;
+  // The native Codex catalog can advertise modes (e.g. ultra) outside the
+  // task schema. Do not offer a choice that the runtime would silently drop.
+  if (advertised) return provider === 'codex' ? advertised.filter((level) => EFFORT_ORDER.includes(level)) : advertised;
   if (provider === 'claude') {
     if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
@@ -878,6 +880,7 @@ function effortLevelsFor(provider, model) {
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
+    if (/^gpt-6(?:-|$)/.test(m)) return EFFORT_ORDER;
     // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
     if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
     if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
@@ -9387,7 +9390,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/karmax"',
     `cp -n "${source}" "$HOME/.codex/sessions/karmax/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.154.0-alpha.11"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.156.1"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `krmax_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,

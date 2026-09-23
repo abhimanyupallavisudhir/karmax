@@ -50,7 +50,7 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { acpModels, claudeModelCatalog, claudeModels, codexModels, opencodeModels, mergeModels,
+import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
@@ -7493,14 +7493,7 @@ export class Gateway {
       // The SDK picker is account-aware but intentionally partial. Treat it as
       // metadata to add to the stable selections, not an exhaustive allowlist.
       claude: claudeModelCatalog(claude),
-      codex: codex.length ? codex : [
-        { id: 'gpt-5.6-sol', isDefault: true },
-        { id: 'gpt-5.6-terra' },
-        { id: 'gpt-5.6-luna' },
-        { id: 'gpt-5.5' },
-        { id: 'gpt-5.4' },
-        { id: 'gpt-5.4-mini' },
-      ],
+      codex: codexModelCatalog(codex),
       opencode: opencode.length ? opencode : [
         { id: 'kimi/kimi-for-coding' },
         { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
