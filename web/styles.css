@@ -2728,3 +2728,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 .task-payments :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .payment-add-card > summary { cursor: pointer; font-size: 13px; font-weight: 600; padding: 8px 0; }
+
+/* Resource decisions share one compact list; saving a row never replaces its siblings. */
+.resource-review-heading { display:flex; align-items:baseline; gap:10px; margin:12px 0 4px; }
+.resource-review-list { border-top:1px solid var(--line); }
+.resource-review-row { display:flex; align-items:center; gap:12px; min-height:42px; padding:5px 0; border-bottom:1px solid var(--line); }
+.resource-review-name { display:flex; flex:1; min-width:0; flex-direction:column; }
+.resource-review-name > * { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.resource-review-controls { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+@media (max-width:480px) { .resource-review-controls .resource-selection-state { display:none; } }

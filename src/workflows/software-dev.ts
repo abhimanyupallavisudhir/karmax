@@ -54,6 +54,9 @@ import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { conversationPublisher } from '../domain/view-publication.js';
 
+const resourceActivities = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
+});
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
   retry: { maximumAttempts: 3 },
@@ -627,6 +630,9 @@ async function softwareDevImpl(
   let resourceResolutionEpoch = 0;
   let providerChangeEpoch = 0;
   let awaitingResourceDecision = false;
+  let resourceReviewSequence = 0;
+  let applyingResources = false;
+  let resourcesApplied = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
@@ -896,6 +902,7 @@ async function softwareDevImpl(
 
   // ── view-model ──
   function allowed(): DeclaredAction[] {
+    if (applyingResources) return [];
     const pausedRole: AgentRole | undefined =
       stage === 'do' || stage === 'review'
         ? 'do'
@@ -1004,6 +1011,7 @@ async function softwareDevImpl(
       actions: allowed(),
       state: {
         confirmed,
+        ...(applyingResources ? { applyingResources: true } : {}),
         cancelled,
         turnsSeen: seen,
         worldReady: !!world,
@@ -1070,6 +1078,16 @@ async function softwareDevImpl(
     }
   }
 
+  async function applyReviewedResources(): Promise<void> {
+    applyingResources = true;
+    status = 'active';
+    await publish();
+    try {
+      await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
+      resourcesApplied = true;
+    } finally { applyingResources = false; }
+  }
+
   /** Play the one canonical Review route. Restored proposals call this after
    * their PRs have been reopened and reconciled; ordinary proposals call it at
    * the end of Do. Keeping the gate here prevents restoration from silently
@@ -1083,7 +1101,9 @@ async function softwareDevImpl(
     manualPrConfirmer = undefined; // applies only to this proposal and one human layer
     if (clearsConfirmOnGate) confirmed = false;
 
-    if (resourceCandidateReview) {
+    const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
+    if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+    if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
       if (pending) manualConfirmer = undefined;
@@ -1192,6 +1212,7 @@ async function softwareDevImpl(
       }
     }
 
+    if (automaticResources) await applyReviewedResources();
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {
@@ -3144,6 +3165,11 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
   }
   }
+
+  // Recovery may carry an already-approved proposal across a replacement run
+  // and bypass the review gate. Finish any interrupted resource publication too.
+  if (restoredReviewApproved && resourceCandidateReview && !resourcesApplied
+    && patched('automatic-resource-review-restored-v1')) await applyReviewedResources();
 
   if (repositoryless) {
     stage = 'done';

@@ -96,6 +96,29 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.code).not.toBe(0);
   });
 
+  it('just-do: applies resources only after every confirmation layer', async () => {
+    const repo = await h.makeRepo('jd-resources');
+    const project = await h.store.createProject('Just-do resources', { repos: [repo] });
+    const task = await h.store.createTask({ projectId: project.id, title: 'Output', workflow: 'just-do', workflowVersion: '1.7.0', params: { prompt: 'output' } });
+    const handle = await h.client.workflow.start('justDo@1.7.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [baseInput(task.id, repo, { projectId: project.id, prompt: '@write note.txt :: output',
+        confirm: { layers: [{ kind: 'human' }, { kind: 'human' }] } })],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 }).toBe('human');
+    const world = (await h.store.currentWorld(task.id))!;
+    fs.writeFileSync(path.join(world.workdir ?? world.root, 'data.bin'), 'persistent data');
+    const candidate = await h.resources.proposePath(task.id, { path: 'data.bin', name: 'Data', target: { kind: 'path', path: 'data.bin' } });
+    const before = (await view(handle)).updatedAt;
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).updatedAt).toBeGreaterThan(before);
+    expect((await h.store.getResourceCandidate(candidate.candidate.id))?.state).toBe('pending');
+    expect((await view(handle)).stage).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await h.store.getResourceCandidate(candidate.candidate.id))?.state).toBe('adopted');
+  });
+
   it('just-do: reports finalization while approved output is being saved', async () => {
     const repo = await h.makeRepo('jd-finalizing');
     // Hold the actual commit long enough to observe the public workflow view.

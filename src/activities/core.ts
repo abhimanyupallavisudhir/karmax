@@ -3126,6 +3126,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }).length;
     },
 
+    async beginResourceReview(taskId: string, reviewId: string): Promise<void> {
+      await deps.resources?.beginReview(taskId, reviewId);
+    },
+
+    async settleResourceReview(taskId: string): Promise<void> {
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => {
+        try { context?.heartbeat({ taskId, operation: 'applying-resources' }); } catch { /* activity completion/cancellation */ }
+      }, 5_000);
+      try { await deps.resources?.settleReview(taskId); }
+      finally { clearInterval(pulse); }
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return (await store.listResourceCandidates(taskId)).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;

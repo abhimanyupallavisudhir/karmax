@@ -4897,7 +4897,7 @@ export class Store {
       for (const share of shares) (await exact.run(`conversation-share:${share.v}`));
       (await prefix.run(sharePrefix, sharePrefix));
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`]) (await exact.run(key));
+        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
@@ -7091,6 +7091,28 @@ export class Store {
 
     (await this.db.prepare('DELETE FROM github_webhook_deliveries WHERE deliveryId=?').run(deliveryId));
   
+    });
+  }
+
+  /** Serialize independent row choices with the confirmation snapshot. */
+  async resourceReview(taskId: string, change?: { begin: string } | { resourceId: string; excluded: boolean } | { freeze: true }): Promise<{ reviewId?: string; excluded: string[]; frozen: boolean }> {
+    return this.db.transaction(async () => {
+      const key = `resource-review:${taskId}`;
+      const initial = '{"excluded":[],"frozen":false}';
+      if (change) await this.db.prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING').run(key, initial);
+      // PostgreSQL transactions may run in separate gateway/worker processes.
+      // Lock the shared row before merging choices or freezing the selection.
+      const row = await this.db.prepare(`SELECT v FROM kv WHERE k=?${change && this.db.dialect === 'postgres' ? ' FOR UPDATE' : ''}`).get(key) as { v: string } | undefined;
+      let state = JSON.parse(row?.v ?? initial);
+      if (change && 'begin' in change) {
+        if (state.reviewId !== change.begin) state = { reviewId: change.begin, excluded: state.excluded, frozen: false };
+      } else if (change && 'resourceId' in change) {
+        if (state.frozen) throw new Error('resource choices have already been confirmed');
+        state.excluded = state.excluded.filter((id: string) => id !== change.resourceId);
+        if (change.excluded) state.excluded.push(change.resourceId);
+      } else if (change && 'freeze' in change) state.frozen = true;
+      if (change) await this.db.prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(key, JSON.stringify(state));
+      return state;
     });
   }
 

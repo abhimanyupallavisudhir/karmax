@@ -99,7 +99,10 @@ describe('project resources', () => {
     await world.writeFileBuffer!('resources/model/model.bin', tunedBytes);
     const summary = await resources.summarize(task.id, volume.id);
     expect(summary).toMatchObject({ added: 0, modified: 1, deleted: 0 });
-    const promoted = await resources.promote(task.id, volume.id);
+    await resources.beginReview(task.id);
+    await resources.settleReview(task.id);
+    const promoted = { revision: (await store.getResourceRevision((await store.getResourceAttachment(volume.id))!.currentRevisionId!))! };
+    await resources.settleReview(task.id);
     expect(promoted.revision.parentRevisionId).toBe(initial.id);
     expect((await store.getResourceAttachment(volume.id))?.currentRevisionId).toBe(promoted.revision.id);
     expect((await resources.summarize(task.id, volume.id)).promoted).toBe(true);
@@ -120,6 +123,17 @@ describe('project resources', () => {
     // This generation is still pinned to its original lease. A second publish
     // cannot overwrite a baseline that moved since the task forked.
     await expect(resources.promote(task.id, volume.id)).rejects.toThrow(/baseline changed/);
+
+    await world.writeFileBuffer!('resources/model/model.bin', Buffer.from('conflicting task edit'));
+    await resources.beginReview(task.id, 'second-review');
+    await expect(resources.settleReview(task.id)).rejects.toThrow(/baseline changed/);
+    await expect(resources.setReviewExcluded(task.id, volume.id, true)).rejects.toThrow(/confirmed/);
+    // A revised proposal can exclude the conflict without changing the other task's baseline.
+    const headBeforeExclude = (await store.getResourceAttachment(volume.id))!.currentRevisionId;
+    await resources.beginReview(task.id, 'third-review');
+    await resources.setReviewExcluded(task.id, volume.id, true);
+    await resources.settleReview(task.id);
+    expect((await store.getResourceAttachment(volume.id))!.currentRevisionId).toBe(headBeforeExclude);
 
     const storedBytes = allFiles(path.join(dir, 'objects')).map((file) => fs.readFileSync(file)).join('');
     expect(storedBytes).not.toContain('fine-tuned-model');
@@ -231,10 +245,29 @@ describe('project resources', () => {
     expect(proposed.revision).toMatchObject({ bytes: Buffer.byteLength('agent-created-model'), files: 1,
       createdByTaskId: task.id });
 
-    await world.destroy();
+    await world.writeFile('omitted.bin', 'omitted');
+    await world.writeFile('also-omitted.bin', 'also omitted');
+    const omitted = await resources.proposePath(task.id, { path: 'omitted.bin', name: 'Omitted', target: { kind: 'path', path: 'models/omitted' } });
+    const alsoOmitted = await resources.proposePath(task.id, { path: 'also-omitted.bin', name: 'Also omitted', target: { kind: 'path', path: 'models/also-omitted' } });
+    await resources.beginReview(task.id);
+    await resources.setReviewExcluded(task.id, proposed.attachment.id, true);
+    expect(await resources.reviewExclusions(task.id)).toEqual([proposed.attachment.id]);
+    await Promise.all([
+      resources.setReviewExcluded(task.id, proposed.attachment.id, false),
+      resources.setReviewExcluded(task.id, omitted.attachment.id, true),
+      resources.setReviewExcluded(task.id, alsoOmitted.attachment.id, true),
+    ]);
+    expect((await resources.reviewExclusions(task.id)).sort()).toEqual([omitted.attachment.id, alsoOmitted.attachment.id].sort());
+    await world.destroy(); // staged output remains usable without the producer world
+    await resources.settleReview(task.id);
+    expect((await store.getResourceCandidate(omitted.candidate.id))?.state).toBe('discarded');
+    expect((await store.getResourceCandidate(alsoOmitted.candidate.id))?.state).toBe('discarded');
+    await resources.settleReview(task.id); // activity retry does not republish
+    await expect(resources.setReviewExcluded(task.id, proposed.attachment.id, true)).rejects.toThrow(/confirmed|resolved/);
+    expect((await store.getResourceCandidate(proposed.candidate.id))?.state).toBe('adopted');
     const adopted = await resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
     expect(adopted.attachment.enabled).toBe(true);
-    expect(adopted.candidate).toMatchObject({ state: 'adopted', resolvedBy: 'user:reviewer' });
+    expect(adopted.candidate).toMatchObject({ state: 'adopted', resolvedBy: `task:${task.id}:confirmation` });
     const consumer = (await store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'use it' } }));
     const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });

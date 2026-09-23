@@ -8238,6 +8238,7 @@ function wireReviewActions(v) {
 
 const resourceReviewCache = new Map();
 const resourceInventoryCache = new Map();
+const resourceChoiceWrites = new Map();
 function resourceReviewPlaceholder() {
   return '<div id="review-resources"><div class="task-sub" role="status">Loading resource changes…</div></div>';
 }
@@ -8247,9 +8248,10 @@ function resourceReviewPlaceholder() {
 function loadResourceReview(v, force = false, inventory = false) {
   const cache = inventory ? resourceInventoryCache : resourceReviewCache;
   const cached = cache.get(v.taskId);
-  if (!force && cached?.view === v && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  if (!force && cached && (cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))
+    && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
   const entry = { view: v, pending: true, at: Date.now() };
-  entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : ''}`)
+  entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : '?summary=metadata'}`)
     .then((result) => {
       entry.pending = false;
       entry.at = Date.now();
@@ -8283,6 +8285,7 @@ async function wireResourceInventory(v, force = false) {
 function resourceReviewNeedsAction(item) {
   if (item.candidate) return ['pending', 'discarding'].includes(item.candidate.state);
   if (item.discarded) return false;
+  if (item.pendingInspection) return true;
   if (item.error) return true;
   return item.resource.publish === 'review' && !item.summary.promoted
     && item.summary.added + item.summary.modified + item.summary.deleted > 0;
@@ -8303,77 +8306,65 @@ async function wireResourceReview(v, force = false) {
     const thread = wrap.closest?.('.ck-thread');
     const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
     wrap.classList.remove('hidden');
-    wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
+    wrap.innerHTML = `<div class="resource-review-heading"><b>Resources</b>${items.some((item) => item.automaticReview === false) ? '' : '<span class="task-sub">Included on confirmation</span>'}</div><div class="resource-review-list">${items.map((item) => {
       const resource = item.resource;
-      if (item.candidate) {
-        const candidate = item.candidate;
-        const target = resource.target?.kind === 'path' ? resource.target.path : resource.target?.name;
-        const source = candidate.sourceKind === 'path' ? candidate.sourcePath : `vault item ${candidate.vaultItemId}`;
-        const size = item.revision ? `${formatBytes(item.revision.bytes)} · ${item.revision.files ?? 0} file${item.revision.files === 1 ? '' : 's'}`
-          : candidate.sourceKind === 'path' ? 'snapshot incomplete — discard this candidate' : 'credential value remains in the vault';
-        const state = candidate.state === 'pending'
-          ? `<div class="inline-form"><button class="btn sm primary candidate-adopt" data-candidate-id="${esc(candidate.id)}">Adopt as project resource</button><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Discard candidate</button></div>`
-          : candidate.state === 'discarding'
-            ? `<div class="inline-form"><span class="chip">Discard interrupted</span><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Retry discard</button></div>`
-          : `<span class="chip">${candidate.state === 'adopted' ? 'Adopted into project' : candidate.state === 'discarding' ? 'Discarding staged bytes…' : 'Discarded'}</span>`;
-        return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
-          <div class="task-sub">${esc(size)} · ${esc(source || '')} → ${esc(target || '')} · ${esc(resource.access || 'read')} access</div>
-          <div class="task-sub">Bound to world generation ${esc(String(candidate.worldGeneration))}; staged bytes are encrypted and retained until Adopt/Discard. Estimated retained cost: $0.00 under the current deployment storage policy (usage is recorded).</div></div>${state}</div>`;
-      }
-      if (item.discarded) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub">Task fork discarded; project baseline unchanged.</div></div>`;
-      if (item.error) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub" style="color:var(--warn)">${esc(item.error)}</div></div>`;
-      const summary = item.summary;
-      const changed = summary.added + summary.modified + summary.deleted;
-      const detail = changed
-        ? `${summary.added} added · ${summary.modified} modified · ${summary.deleted} deleted · ${formatBytes(summary.bytes)}`
-        : 'No changes from the task’s pinned baseline';
-      const paths = summary.changedPaths?.length
-        ? `<div class="task-sub mono" style="margin-top:5px">${summary.changedPaths.slice(0, 8).map(esc).join(' · ')}${summary.changedPaths.length > 8 ? ' …' : ''}</div>` : '';
-      const action = resource.publish === 'review' && changed
-        ? `<div class="inline-form"><button class="btn sm primary resource-promote" data-resource-id="${esc(resource.id)}">Promote as new baseline</button><button class="btn sm resource-discard" data-resource-id="${esc(resource.id)}">Discard fork</button></div>`
-        : `<span class="chip">${resource.publish === 'discard' ? 'Task fork will be discarded' : 'Unchanged'}</span>`;
-      return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
-        <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
-    }).join('')}`;
+      const target = resource.target?.kind === 'path' ? resource.target.path : resource.target?.name;
+      const detail = item.error || (item.candidate ? 'New resource' : 'Update if changed');
+      const legacy = item.automaticReview === false;
+      const controls = item.candidate?.state === 'discarding'
+        ? `<span class="task-sub">Discard pending</span>${legacy ? `<button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="discard">Retry discard</button>` : ''}`
+        : legacy
+        ? `<button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="${item.candidate ? 'adopt' : 'promote'}">${item.candidate ? 'Adopt' : 'Update'}</button><button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="discard">Discard</button>`
+        : `<span class="task-sub resource-selection-state">${item.excluded ? 'Excluded' : 'Included'}</span><button class="btn sm resource-exclude" data-resource-id="${esc(resource.id)}" aria-label="${item.excluded ? 'Include' : 'Exclude'} ${esc(resource.name)}" aria-pressed="${!!item.excluded}" ${item.selectionFrozen || v.state?.applyingResources ? 'disabled' : ''}>${item.excluded ? 'Include' : 'Exclude'}</button>`;
+      return `<div class="resource-review-row"><div class="resource-review-name"><b>${esc(resource.name)}</b><span class="task-sub" title="${esc(detail)}">${esc(target || detail)}</span></div><div class="resource-review-controls">${controls}</div></div>`;
+    }).join('')}</div>`;
     if (atBottom) thread.scrollTop = thread.scrollHeight;
-    wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
-      button.disabled = true; button.textContent = 'Adopting…';
-      try {
-        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resource-candidates/${encodeURIComponent(button.dataset.candidateId)}/adopt`, { method: 'POST' });
-        toast('Resource adopted into the project'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Adopt as project resource'; }
-    }));
-    wrap.querySelectorAll('.candidate-discard').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm('Discard this staged candidate? Its encrypted snapshot will be deleted; Git changes are unaffected.')) return;
-      button.disabled = true;
-      try {
-        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resource-candidates/${encodeURIComponent(button.dataset.candidateId)}/discard`, { method: 'POST' });
-        toast('Resource candidate discarded'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
-      } catch (error) { toast(error.message, true); button.disabled = false; }
-    }));
-    wrap.querySelectorAll('.resource-promote').forEach((button) => {
+    wrap.querySelectorAll('.resource-exclude').forEach((button) => {
+      const item = items.find((entry) => entry.resource.id === button.dataset.resourceId);
+      const key = `${v.taskId}/${item.resource.id}`;
+      const paint = () => {
+        button.disabled = resourceChoiceWrites.has(key) || item.selectionFrozen || !!v.state?.applyingResources;
+        button.textContent = resourceChoiceWrites.has(key) ? 'Saving…' : item.excluded ? 'Include' : 'Exclude';
+        button.closest('.resource-review-row').querySelector('.resource-selection-state').textContent = item.excluded ? 'Excluded' : 'Included';
+        button.setAttribute('aria-pressed', String(!!item.excluded));
+        button.setAttribute('aria-label', `${item.excluded ? 'Include' : 'Exclude'} ${item.resource.name}`);
+      };
+      const subscribe = async (write) => {
+        paint();
+        try { await write.promise; item.excluded = write.excluded; }
+        catch { /* the initiating click reports the error */ }
+        finally { paint(); }
+      };
+      // Task view updates may replace the DOM while a row is saving. The new
+      // row subscribes to that same write instead of displaying a stale choice.
+      const pending = resourceChoiceWrites.get(key);
+      if (pending) void subscribe(pending);
       button.addEventListener('click', async () => {
-        button.disabled = true;
-        button.textContent = 'Capturing and promoting…';
-        try {
-          const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(button.dataset.resourceId)}/promote`, { method: 'POST' });
-          toast(`Promoted ${result.attachment.name} atomically`);
+        if (resourceChoiceWrites.has(key)) return;
+        const write = { excluded: !item.excluded };
+        write.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(item.resource.id)}/selection`, {
+          method: 'PUT', body: JSON.stringify({ excluded: write.excluded }),
+        }).finally(() => {
+          resourceChoiceWrites.delete(key);
           resourceReviewCache.delete(v.taskId);
-          await wireResourceReview(v, true);
-        } catch (error) {
-          toast(error.message, true);
-          button.disabled = false;
-          button.textContent = 'Promote as new baseline';
-        }
+        });
+        resourceChoiceWrites.set(key, write);
+        const subscribed = subscribe(write);
+        try { await write.promise; }
+        catch (error) { toast(error.message, true); }
+        await subscribed;
       });
     });
-    wrap.querySelectorAll('.resource-discard').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm('Discard this task’s resource fork? Its Git changes are unaffected, but this resource can no longer be promoted from the task.')) return;
+    // Historical workflow histories retain their explicit decision gate.
+    wrap.querySelectorAll('.resource-legacy').forEach((button) => button.addEventListener('click', async () => {
+      if (button.dataset.action === 'discard' && !confirm('Discard this resource output? It will not become a project resource.')) return;
+      const item = items.find((entry) => entry.resource.id === button.dataset.resourceId);
+      const route = item.candidate ? `resource-candidates/${encodeURIComponent(item.candidate.id)}` : `resources/${encodeURIComponent(item.resource.id)}`;
       button.disabled = true;
       try {
-        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(button.dataset.resourceId)}/discard`, { method: 'POST' });
-        toast('Resource fork discarded'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
+        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/${route}/${button.dataset.action}`, { method: 'POST' });
+        button.closest('.resource-review-row').remove();
+        resourceReviewCache.delete(v.taskId);
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
   } catch (error) {
@@ -8388,6 +8379,12 @@ async function wireResourceReview(v, force = false) {
     });
   }
 }
+async function waitResourceChoices(taskId) {
+  while ([...resourceChoiceWrites.keys()].some((key) => key.startsWith(`${taskId}/`))) {
+    await Promise.all([...resourceChoiceWrites].filter(([key]) => key.startsWith(`${taskId}/`)).map(([, write]) => write.promise));
+  }
+}
+
 function setStopBtn(running, procId, taskId) {
   const wrap = document.getElementById('review-actions');
   if (!wrap) return;
@@ -10445,6 +10442,7 @@ function taskActionLabel(v, action) {
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
+  if (v.state?.applyingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Applying resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
@@ -10503,6 +10501,7 @@ function confirmTaskAction(action, v = S.view) {
 // separately on the server. Dismissing this dialog never confirms the proposal.
 async function otherAttemptsConfirmation(action, taskId) {
   if (action !== 'confirm' && action !== 'openPr') return {};
+  await waitResourceChoices(taskId);
   const group = await api(`/api/tasks/${taskId}/attempts`);
   if (!group?.otherAttemptsChoiceAvailable || group.committedAttemptId || !group.attempts.some((a) => a.id !== taskId
     && !['done', 'cancelled', 'failed'].includes(a.lastView?.status))) return {};
@@ -10561,6 +10560,7 @@ function wireActions(v) {
       try {
         const choice = await otherAttemptsConfirmation(act, v.taskId);
         if (choice === null) return;
+        if (act === 'confirm' || act === 'openPr') await waitResourceChoices(v.taskId);
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act, ...choice }) });
         succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
@@ -17609,6 +17609,7 @@ async function runDeclaredAction(a) {
   try {
     const choice = await otherAttemptsConfirmation(a.name, taskId);
     if (choice === null) return;
+    if (a.name === 'confirm' || a.name === 'openPr') await waitResourceChoices(taskId);
     await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name, ...choice }) });
     reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, taskActionLabel(S.view, a)));
