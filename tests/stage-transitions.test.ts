@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { WorkflowExecutionAlreadyStartedError } from '@temporalio/client';
+import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError } from '@temporalio/client';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -31,6 +31,7 @@ async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthor
     workflow: {
       getHandle(id: string, runId?: string) {
         const handle: any = {
+          async describe() { return { runId: runId ?? 'old-run', status: { name: 'COMPLETED' } }; },
           async terminate(reason: string) { terminated.push(`${id}:${reason}`); },
           async signal(signal: string, ...args: unknown[]) { signalled.push({ id, signal, args, runId }); },
           async executeUpdate(_name: string, options: { args: [string] }) {
@@ -59,7 +60,7 @@ async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthor
         return {};
       },
     },
-  } as any;
+  };
   const runners = new RunnerPoolService(store);
   const authorization = withAuthorization ? (await AuthorizationService.create(store)) : undefined;
   const api = new KarmaxApi({ store, client, authorization, taskQueue: 'test', tokens, runners,
@@ -93,6 +94,146 @@ async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthor
 }
 
 describe('task stage transitions', () => {
+  it('waits for cancelled cleanup to close before restoring Review', async () => {
+    const f = await fixture();
+    await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' });
+    await f.store.saveView(f.task.id, {
+      ...f.view, stage: 'cancelled', status: 'cancelled',
+      state: { cancelled: true, cancelledFrom: 'review' },
+    });
+    let closed = false;
+    const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+    const descriptions: Array<string | undefined> = [];
+    vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => ({
+      ...getHandle(id, runId),
+      async describe() {
+        descriptions.push(runId);
+        return { runId: 'old-run', status: { name: closed ? 'COMPLETED' : 'RUNNING' } };
+      },
+    }));
+    const start = vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
+      if (!closed) throw new WorkflowExecutionAlreadyStartedError('Workflow execution already started', f.task.id, 'softwareDev');
+      return { firstExecutionRunId: 'replacement-run' };
+    });
+    const restore = f.api.moveTaskStage(f.token, f.task.id, 'review');
+    // Attach the assertion immediately so the pre-fix rejection is observed.
+    const restored = restore.then(value => ({ value }), error => ({ error }));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(start).not.toHaveBeenCalled();
+    expect((await f.store.getTask(f.task.id))?.lastView?.status).toBe('cancelled');
+    closed = true;
+    expect(await restored).toMatchObject({ value: { stage: 'pr', state: { restoringTo: 'review' } } });
+    expect(descriptions.length).toBeGreaterThan(1);
+    expect(descriptions.every(runId => runId === 'old-run')).toBe(true);
+    expect(f.terminated).toEqual([]);
+    expect((await f.store.getTask(f.task.id))?.params._workflowRunId).toBe('replacement-run');
+  });
+
+  it.each(['COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT', 'missing'])(
+    'restores a terminal task whose execution is %s', async status => {
+      const f = await fixture();
+      await f.store.saveView(f.task.id, {
+        ...f.view, stage: 'cancelled', status: 'cancelled',
+        state: { cancelledFrom: 'review' },
+      });
+      const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+      vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => ({
+        ...getHandle(id, runId),
+        async describe() {
+          if (status === 'missing') throw new WorkflowNotFoundError('expired', id, runId);
+          return { runId: 'old-run', status: { name: status } };
+        },
+      }));
+      await expect(f.api.moveTaskStage(f.token, f.task.id, 'review')).resolves.toMatchObject({ stage: 'pr' });
+      expect(f.starts).toHaveLength(1);
+      expect(f.terminated).toEqual([]);
+    },
+  );
+
+  it.each(['review', 'draft'])('preserves a slow cancelled workspace when moving to %s times out', async target => {
+    const f = await fixture();
+    const cancelled = { ...f.view, stage: 'cancelled' as const, status: 'cancelled' as const,
+      state: { cancelledFrom: 'review' } };
+    await f.store.saveView(f.task.id, cancelled);
+    const params = (await f.store.getTask(f.task.id))!.params;
+    const described: Array<string | undefined> = [];
+    const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+    vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => ({
+      ...getHandle(id, runId),
+      async describe() {
+        described.push(runId);
+        return { runId: 'old-run', status: { name: 'RUNNING' } };
+      },
+    }));
+    vi.useFakeTimers();
+    try {
+      const result = f.api.moveTaskStage(f.token, f.task.id, target).then(value => ({ value }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(10_500);
+      expect(await result).toMatchObject({ error: { message: expect.stringContaining('still finishing cleanup') } });
+      expect(f.starts).toEqual([]);
+      expect(f.terminated).toEqual([]);
+      expect((await f.store.getTask(f.task.id))!.lastView).toEqual(cancelled);
+      expect((await f.store.getTask(f.task.id))!.params).toEqual(params);
+      // An unpinned legacy record looks up the current execution once only.
+      expect(described[0]).toBeUndefined();
+      expect(described.slice(1).every(runId => runId === 'old-run')).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('fails closed when Temporal cannot verify terminal cleanup', async () => {
+    const f = await fixture();
+    await f.store.saveView(f.task.id, {
+      ...f.view, stage: 'cancelled', status: 'cancelled', state: { cancelledFrom: 'review' },
+    });
+    const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+    vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => ({
+      ...getHandle(id, runId),
+      async describe() { throw new Error('Temporal unavailable'); },
+    }));
+    await expect(f.api.moveTaskStage(f.token, f.task.id, 'review')).rejects.toThrow('Cannot verify');
+    expect(f.starts).toEqual([]);
+    expect((await f.store.getTask(f.task.id))!.lastView!.status).toBe('cancelled');
+  });
+
+  it('never terminates or overwrites the winner of overlapping terminal restores', async () => {
+    const f = await fixture();
+    await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' });
+    await f.store.saveView(f.task.id, {
+      ...f.view, stage: 'cancelled', status: 'cancelled', state: { cancelledFrom: 'review' },
+    });
+    let close!: () => void;
+    const cleanup = new Promise<void>(resolve => { close = resolve; });
+    let described = 0;
+    const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+    vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => ({
+      ...getHandle(id, runId),
+      async describe() {
+        expect(runId).toBe('old-run');
+        described++;
+        await cleanup;
+        return { runId, status: { name: 'COMPLETED' } };
+      },
+    }));
+    let started = false;
+    vi.spyOn(f.client.workflow, 'start').mockImplementation(async () => {
+      if (started) throw new WorkflowExecutionAlreadyStartedError('already running', f.task.id, 'softwareDev');
+      started = true;
+      return { firstExecutionRunId: 'winner' };
+    });
+    const restores = Promise.allSettled([
+      f.api.moveTaskStage(f.token, f.task.id, 'review'),
+      f.api.moveTaskStage(f.token, f.task.id, 'review'),
+    ]);
+    await expect.poll(() => described).toBe(2);
+    close();
+    const outcomes = await restores;
+    expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
+    expect(outcomes.filter(outcome => outcome.status === 'rejected')).toHaveLength(1);
+    expect((await f.store.getTask(f.task.id))!.params._workflowRunId).toBe('winner');
+    expect((await f.store.getTask(f.task.id))!.lastView!.stage).toBe('pr');
+    expect(f.terminated).toEqual([]);
+  });
+
   it('keeps the winning run reachable when an overlapping resume finishes preparing too late', async () => {
     const f = (await fixture());
     (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
