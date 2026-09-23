@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { E2BWorldProvider, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
+import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
@@ -39,7 +39,7 @@ describe('E2B cloud world provider', () => {
     }]);
   });
 
-  it('uses E2B\'s built-in codex template when no headless template is configured', async () => {
+  it('uses the public prebuilt template when no headless template is configured', async () => {
     let createdOptions: Parameters<E2BFactory['create']>[0] | undefined;
     const sandbox = fakeSandbox(() => undefined);
     const factory: E2BFactory = {
@@ -51,10 +51,35 @@ describe('E2B cloud world provider', () => {
     try {
       const provider = new E2BWorldProvider(factory);
       await provider.create({ taskId: 'default-template', base: 'main' });
-      expect(createdOptions?.template).toBe('codex');
+      expect(createdOptions?.template).toBe(DEFAULT_E2B_TEMPLATE);
     } finally {
       if (prior === undefined) delete process.env.KARMAX_E2B_TEMPLATE;
       else process.env.KARMAX_E2B_TEMPLATE = prior;
+    }
+  });
+
+  it('inherits the public default across organizations while preserving explicit selections and keys', async () => {
+    const before = process.env.KARMAX_E2B_TEMPLATE;
+    delete process.env.KARMAX_E2B_TEMPLATE;
+    const created: any[] = [];
+    const factory: E2BFactory = {
+      async create(options) { created.push(options); return fakeSandbox(() => undefined); },
+      async connect() { return fakeSandbox(() => undefined); },
+    };
+    try {
+      const provider = new E2BWorldProvider(factory, undefined, undefined, organizationId => ({
+        provider: 'e2b', organizationId, apiKey: `key-${organizationId}`,
+        config: organizationId === 'custom' ? { template: 'org-template' } : {},
+      }));
+      await provider.create({ taskId: 'new-project-a', organizationId: 'new-a', base: 'main' });
+      await provider.create({ taskId: 'new-project-b', organizationId: 'new-b', base: 'main' });
+      await provider.create({ taskId: 'custom-org', organizationId: 'custom', base: 'main' });
+      await provider.create({ taskId: 'custom-project', organizationId: 'custom', base: 'main', environment: { template: 'project-template' } });
+      expect(created.map(x => x.template)).toEqual([DEFAULT_E2B_TEMPLATE, DEFAULT_E2B_TEMPLATE, 'org-template', 'project-template']);
+      expect(created.map(x => x.apiKey)).toEqual(['key-new-a', 'key-new-b', 'key-custom', 'key-custom']);
+    } finally {
+      if (before === undefined) delete process.env.KARMAX_E2B_TEMPLATE;
+      else process.env.KARMAX_E2B_TEMPLATE = before;
     }
   });
 
