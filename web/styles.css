@@ -1071,7 +1071,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .followup-box { display: flex; gap: 8px; margin-top: 10px; align-items: flex-end; }
 .followup-box .prompt-field { flex: 1; }
-.followup-box textarea { min-height: 38px; }
+.followup-box textarea { min-height: 38px; max-height: 40dvh; overflow-y: auto; }
 /* The follow-up box now lives inside each conversation — set it apart from the thread above it. */
 
 /* live event stream */

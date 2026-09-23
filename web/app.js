@@ -89,6 +89,7 @@ const S = {
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
+  followupHeights: {}, // manual minimum height for each draft, preserved across background renders
   // In-flight parameter edits are deliberately manual-save. Keep their working
   // values outside the DOM so a live task refresh cannot silently erase them.
   paramEditDrafts: {}, // taskId -> { saved, values, dirtyNames }
@@ -7365,6 +7366,9 @@ function restoreConversationScroll(thread, state) {
 // reinserting a scroller interrupts native wheel/touch scrolling even if its
 // scrollTop is restored. Everything outside this path is freshly rendered.
 function patchTaskPage(main, html) {
+  // Native resizing changes the inline height without an input event. Capture
+  // it synchronously, even if a refresh arrives before ResizeObserver runs.
+  main.querySelectorAll('.followup-input').forEach((ta) => ta.disposeSizing?.());
   const template = document.createElement('template');
   template.innerHTML = html;
   const oldParams = main.querySelector('#tp-params');
@@ -10581,6 +10585,40 @@ function wireActions(v) {
   $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
 }
 
+function wireFollowupSizing(ta, key) {
+  let appliedHeight = ta.style.height;
+  const remember = () => {
+    if (ta.style.height !== appliedHeight) {
+      S.followupHeights[key] = parseFloat(ta.style.height) || 0;
+      appliedHeight = ta.style.height;
+    }
+  };
+  const grow = () => {
+    remember();
+    const scrollTop = ta.scrollTop;
+    // Measure at the natural two-row height so deleting text shrinks the box.
+    ta.style.height = 'auto';
+    const style = getComputedStyle(ta);
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    const automaticLimit = 12 * parseFloat(style.lineHeight) + padding;
+    ta.style.height = `${Math.max(S.followupHeights[key] || 0, Math.min(ta.scrollHeight, automaticLimit))}px`;
+    appliedHeight = ta.style.height;
+    ta.scrollTop = scrollTop;
+  };
+  grow();
+  ta.addEventListener('input', grow);
+  // Wrapping changes on window resize and when entering/leaving full screen.
+  // Height-only changes are native manual resizes; don't immediately undo them.
+  let width = ta.clientWidth;
+  const observer = new ResizeObserver(() => {
+    if (!ta.isConnected) { ta.disposeSizing(); return; }
+    remember();
+    if (ta.clientWidth !== width) { width = ta.clientWidth; grow(); }
+  });
+  observer.observe(ta);
+  ta.disposeSizing = () => { remember(); observer.disconnect(); };
+}
+
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
 // agent role it addresses, so a follow-up is delivered to the right agent.
 function wireFollowups(v) {
@@ -10605,6 +10643,7 @@ function wireFollowups(v) {
     // Wiki references in follow-ups use the same picker and backend scanner as
     // the task prompt.
     wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
+    wireFollowupSizing(ta, key);
     paint();
     const send = async () => {
       const text = ta.value.trim();
@@ -10628,6 +10667,7 @@ function wireFollowups(v) {
         // content is sourced from S.followupDrafts on every render, so this — not
         // touching the DOM — is what actually empties it.
         delete S.followupDrafts[key];
+        delete S.followupHeights[key];
         images.length = 0;
         files.length = 0;
         // The captured `ta`/`chips` may be detached if a background WS refresh
