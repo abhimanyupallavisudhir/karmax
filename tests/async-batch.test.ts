@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { mapBatches } from '../src/util/async-batch.js';
+import { mapBatches, forEachConcurrent } from '../src/util/async-batch.js';
 
 it('bounds concurrent requests and preserves file bytes and order', async () => {
  let active=0, peak=0;
@@ -24,4 +24,42 @@ it('settles in-flight reads before failure and does not start later batches', as
  let settled=false;const checked=expect(result).rejects.toBe(error).then(()=>{settled=true;});
  await Promise.resolve();await Promise.resolve();expect(settled).toBe(false);
  release();await checked;expect(finished).toBe(true);expect(calls).toEqual(['bad','slow']);
+});
+
+
+it('uses available transfer slots while a large file is still running', async () => {
+  let release!: () => void;
+  const large = new Promise<void>(resolve => { release = resolve; });
+  let active = 0, maximum = 0;
+  const finished: number[] = [];
+  try {
+    await forEachConcurrent([0, 1, 2, 3, 4, 5, 6, 7], async i => {
+      active++; maximum = Math.max(maximum, active);
+      if (i === 0) await large;
+      else await Promise.resolve();
+      if (i === 7) { expect(finished).not.toContain(0); release(); }
+      finished.push(i); active--;
+    }, 4);
+    expect(maximum).toBeLessThanOrEqual(4);
+    expect(finished).toHaveLength(8);
+  } finally { release(); }
+});
+
+it('stops scheduling after failure and waits for active writes before rejecting', async () => {
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started: number[] = [], settled: number[] = [];
+  let returned = false;
+  const result = forEachConcurrent([0, 1, 2, 3, 4, 5], async i => {
+    started.push(i);
+    if (i === 0) throw new Error('bad data');
+    await pending; settled.push(i);
+  }, 4).catch(e => { returned = true; return e; });
+  await Promise.resolve(); await Promise.resolve();
+  expect(returned).toBe(false);
+  expect(started).toEqual([0, 1, 2, 3]);
+  release();
+  expect((await result).message).toBe('bad data');
+  expect(settled).toEqual([1, 2, 3]);
+  expect(started).toHaveLength(4);
 });

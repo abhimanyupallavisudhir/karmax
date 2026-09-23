@@ -5,6 +5,9 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import type { WorldHandle } from '../src/world/types.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const stores: Store[] = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const store of stores.splice(0)) await store.close(); });
@@ -103,4 +106,34 @@ it('honors cancellation while creation waits for transition ownership', async ()
   cancellation.abort(new Error('cancelled'));
   finish.resolve(); await holding; await rejected;
   expect(f.create).not.toHaveBeenCalled();
+});
+
+it('destroys an unpublished world if cancellation arrives during resource restoration', async () => {
+  const store = await Store.create(':memory:'); stores.push(store);
+  const project = await store.createProject('Cancelled restore');
+  const task = await store.createTask({ projectId: project.id, title: 'Restore', workflow: 'just-do',
+    workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+  const cancellation = new AbortController();
+  vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: cancellation.signal,
+    info: { workflowExecution: { runId: 'fixture' } } } as any);
+  const destroy = vi.fn(async () => {});
+  const world = { handle: { id: task.id, kind: 'e2b', root: '/fixture', branch: 'task', base: 'main', generation: 1 }, destroy };
+  const worlds = new WorldRegistry();
+  worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world } as any);
+  const resources = { materialize: vi.fn(async (...args: any[]) => {
+    expect(args[5].signal).toBe(cancellation.signal);
+    cancellation.abort(new Error('cancel restore'));
+    return world.handle;
+  }), release: vi.fn(async () => {}) };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cancel-restore-'));
+  try {
+    const core = makeCoreActivities({ store, worlds, resources: resources as any, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), contentDir: dir });
+    await expect(core.createWorld({ taskId: task.id, projectId: project.id, kind: 'e2b', base: 'main' }))
+      .rejects.toThrow('cancel restore');
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(resources.release).toHaveBeenCalledWith(world.handle, world);
+    expect(await store.currentWorld(task.id)).toBeUndefined();
+    expect((await store.eventsSince(task.id, 0)).some(e => e.type === 'world.ready')).toBe(false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

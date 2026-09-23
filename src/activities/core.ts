@@ -1029,10 +1029,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const parkingTrace = await installationTiming(store, { taskId }, row => record(taskId, 'timing', { ...row }));
     const valid = async () => {
       ctx?.cancellationSignal.throwIfAborted();
-      if (Number.isSafeInteger(publicationSeq)
-        && (await store.eventsSince(taskId, publicationSeq, undefined, true)).some(event =>
-          event.type === 'conversation.message')) {
-        await record(taskId, 'world.park-deferred', { reason: 'accepted-follow-up' });
+      const superseding = Number.isSafeInteger(publicationSeq)
+        ? (await store.eventsSince(taskId, publicationSeq, undefined, true)).find(event =>
+          event.type === 'conversation.message' || event.type === 'task.cancel-requested') : undefined;
+      if (superseding) {
+        await record(taskId, 'world.park-deferred', { reason: superseding.type === 'task.cancel-requested'
+          ? 'accepted-cancellation' : 'accepted-follow-up' });
         return false;
       }
       if (await worlds.hasActiveAccess?.(waitingWorld.id)) return false;
@@ -1426,7 +1428,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
           if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
           if (forkCheckpoint) {
-            await deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!);
+            activitySignal?.throwIfAborted();
+            await timed('world.fork-restore', () => deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!, { signal: activitySignal }));
             if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
               world.handle.warnings = [...(world.handle.warnings ?? []),
                 'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
@@ -1434,9 +1437,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (projectId && deps.resources) {
             const revisions = Object.fromEntries((forkCheckpoint?.resources ?? [])
               .map((resource) => [resource.attachmentId, resource.revisionId]));
-            world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation, revisions);
+            activitySignal?.throwIfAborted();
+            world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, revisions,
+              { signal: activitySignal }));
           }
           if (projectId) {
+            activitySignal?.throwIfAborted();
             const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
               selection: environmentSelection, resources: deps.resources, services: forkCheckpoint?.services, runSetupIfUnbuilt: true });
             world.handle = runtime.handle;
@@ -1448,6 +1454,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
               ...(wikiRepository ? [wikiRepository.id] : [])] };
           if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
+          activitySignal?.throwIfAborted();
           if (projectId) {
             world.handle = (await store.registerWorld(world.handle, projectId, {
               runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
@@ -1456,6 +1463,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`) : 'karmax-local'),
             })) as WorldHandle;
           }
+          activitySignal?.throwIfAborted();
           (await record(args.taskId, 'world.created', { handle: world.handle }));
           if (forkPlan) (await record(args.taskId, 'world.forked', { sourceTaskId: forkPlan.taskId,
             base: args.base, checkpointId: forkCheckpoint?.id, unpublished: Boolean(forkCheckpoint) }));
@@ -1464,7 +1472,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         } catch (error) {
           // `world` is still live on this path — pass it, or teardown addresses the
           // HOST daemon while the containers live inside the world (a silent no-op).
-          await deps.resources?.release(world.handle).catch(() => undefined);
+          await deps.resources?.release(world.handle, world).catch(() => undefined);
           await destroyWorldServices(args.taskId, world).catch(() => undefined);
           await world.destroy().catch(() => undefined);
           if (acquired) (await deps.runners?.release(acquired.leaseId, args.kind));

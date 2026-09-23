@@ -7,6 +7,8 @@ import { temporal } from '@temporalio/proto';
 // Minimal, sanitized Setup prefix from a softwareDev@1.26.0 execution that
 // recorded the temporary resource-aware setup patch. After an image rebuild
 // removed that patch, every Confirm signal was accepted but replay failed.
+// Preserve compatibility with both older histories and the retired-marker shim
+// proposed before the complete resource-aware implementation reached master.
 const fixture = JSON.parse(fs.readFileSync(
   new URL('./fixtures/resource-world-setup-history.json', import.meta.url), 'utf8'));
 let workflowBundle: Awaited<ReturnType<typeof bundleWorkflowCode>>;
