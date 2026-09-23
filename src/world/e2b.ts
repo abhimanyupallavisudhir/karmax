@@ -28,7 +28,9 @@ import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun,
 const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
 const DEFAULT_IDLE_MS = 10 * 60_000;
-const DEFAULT_TEMPLATE = 'codex';
+// Public, package-only browser/runtime build; usable with each organization's
+// own E2B key. Keep this release default aligned with environments/browser.
+export const DEFAULT_E2B_TEMPLATE = 'uj125w982t7wflqad4ig';
 // `createWorld` has a five-minute Temporal boundary that also includes Git
 // provisioning. Give E2B twice its SDK default without consuming the entire
 // activity budget; an indeterminate timeout is reconciled by metadata below.
@@ -99,7 +101,7 @@ export class E2BWorldProvider implements WorldProvider {
   constructor(
     private factory: E2BFactory = defaultE2BFactory(),
     private idleMs = envPositiveInt('KARMAX_E2B_IDLE_MS', DEFAULT_IDLE_MS),
-    private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_TEMPLATE,
+    private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_E2B_TEMPLATE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
   ) {

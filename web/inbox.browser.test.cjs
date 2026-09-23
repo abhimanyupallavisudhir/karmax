@@ -7,7 +7,7 @@ const path = require('node:path');
 const { chromium } = require('playwright');
 const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 function fn(name) {
-  const start = src.indexOf(`function ${name}(`);
+  const start = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm'));
   let parens = 0, open = -1;
   for (let i = src.indexOf('(', start); i < src.length; i++) {
     if (src[i] === '(') parens++;
@@ -63,7 +63,7 @@ function constant(name) {
     });
     await page.addScriptTag({ content: [
       constant('INBOX_TABS'), constant('URGENCY_LEVELS'),
-      ...['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'wireInboxView', 'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'taskRow'].map(fn),
+      ...['updateBell', 'urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'wireInboxView', 'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'taskRow'].map(fn),
       'renderMain();',
     ].join('\n') });
     await page.evaluate(() => document.fonts.ready);
@@ -190,6 +190,40 @@ function constant(name) {
     if (dir) await page.screenshot({ path: path.join(dir, 'notifications-mobile.png'), fullPage: true });
     await page.setViewportSize({ width: 320, height: 700 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no overflow on small phones');
+    // Exercise the real loader, badge and read handlers across organization routes.
+    await page.addScriptTag({ content: ['loadInbox', 'inboxArrivals', 'markVisibleInboxRead'].map(fn).join('\n') });
+    await page.evaluate(() => {
+      document.body.insertAdjacentHTML('afterbegin', '<a id="bell"><span id="bell-badge"></span></a>');
+      S.organizations = [{ id: 'personal' }, { id: 'team' }];
+      S.tab = 'inbox';
+      S.inboxFilter = 'all';
+      window.announceInbox = () => {};
+      window.bgRenderMain = renderMain;
+      window.requests = [];
+      window.api = async (url, options) => {
+        requests.push({ url, ...options });
+        const organizationId = new URL(url, location.origin).searchParams.get('organizationId');
+        if (options) return { unread: false };
+        return [{ id: organizationId, organizationId, kind: 'escalated', actionable: true,
+          urgency: 'high', unread: true, createdAt: Date.now(), task: { title: organizationId } }];
+      };
+    });
+    for (const org of ['personal', 'team', null]) {
+      await page.evaluate(async org => {
+        S.organizationId = org;
+        history.pushState({}, '', org ? `/${org}/inbox` : '/profile');
+        await loadInbox();
+      }, org);
+      assert.equal(await page.locator('#bell-badge').textContent(), '2');
+      assert.equal(await page.locator('.inbox-row').count(), 2);
+    }
+    await page.locator('[data-inbox-toggle="team"]').click();
+    assert.equal(await page.locator('#bell-badge').textContent(), '1');
+    assert.equal(await page.evaluate(() => requests.at(-1).url), '/api/inbox/team?organizationId=team');
+    await page.locator('#inbox-read-all').click();
+    assert.equal(await page.locator('#bell-badge').textContent(), '0');
+    assert.equal(await page.locator('#bell-badge').isHidden(), true);
+    assert.equal(await page.evaluate(() => requests.at(-1).url), '/api/inbox/personal?organizationId=personal');
     console.log('Inbox browser checks passed (desktop, dark, mobile, read/unread, navigation).');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

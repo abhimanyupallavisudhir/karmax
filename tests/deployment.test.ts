@@ -150,3 +150,11 @@ describe('deployment profiles', () => {
     expect(Object.keys(env)).toEqual(['KARMAX_HOME']);
   });
 });
+
+it('passes production worker isolation and the optional template override through both Compose profiles', () => {
+  for (const profile of ['turnkey', 'hosted']) {
+    const yaml = fs.readFileSync(path.join(repoRoot, `deploy/compose.${profile}.yml`), 'utf8');
+    expect(yaml).toContain('KARMAX_WORKER_MODE: ${KARMAX_WORKER_MODE:-process}');
+    expect(yaml).toContain('KARMAX_E2B_TEMPLATE: ${KARMAX_E2B_TEMPLATE:-}');
+  }
+});

@@ -87,6 +87,10 @@ services:
       KARMAX_HOST: 0.0.0.0
       KARMAX_PORT: 4505
       KARMAX_HOME: /var/lib/karmax
+      # PostgreSQL-backed production cells isolate workflow work from HTTP.
+      KARMAX_WORKER_MODE: ${KARMAX_WORKER_MODE:-process}
+      # Empty uses the release's public prebuilt image; org/project choices win.
+      KARMAX_E2B_TEMPLATE: ${KARMAX_E2B_TEMPLATE:-}
       KARMAX_AUTH_SECRET_FILE: /run/secrets/auth_secret
       KARMAX_VAULT_KEY_FILE: /run/secrets/vault_key
       KARMAX_WORLD_REF_KEY_FILE: /run/secrets/world_ref_key
