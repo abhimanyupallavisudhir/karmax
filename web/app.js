@@ -5447,7 +5447,15 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runnow}/run-now`, { method: 'POST', body: '{}' }); toast('Started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-canceltrig]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.canceltrig}/cancel-trigger`, { method: 'POST', body: '{}' }); toast('Triggers cancelled — saved as a draft'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!confirm('Cancel this scheduled task? It will be saved as a draft.')) return;
+      try {
+        await api(`/api/tasks/${b.dataset.canceltrig}/cancel-trigger`, { method: 'POST', body: '{}' });
+        toast('Triggers cancelled — saved as a draft');
+        refreshTasks();
+      } catch (e) { toast(e.message, true); }
+    }),
   );
   // Clicking a waiting task's body opens the same form as a draft — fully editable, triggers included.
   $('#main').querySelectorAll('[data-armed]').forEach((e) =>
@@ -10484,6 +10492,7 @@ const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes, open the PR, a
 const returnToReviewConfirmation = () => `Return this pull request to Review and confirm it if you are authorized? ${siteName()} will first verify that the current proposal is clean and committed.`;
 
 function confirmTaskAction(action, v = S.view) {
+  if (action === 'cancel') return confirm('Cancel this task?');
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
     : hasOpenPullRequest(v) ? returnToReviewConfirmation()
@@ -17633,6 +17642,7 @@ function openActionForm(a) {
       if (arg.required && (val === undefined || val === '')) { el.focus(); return toast(`${arg.label || arg.name} is required`, true); }
       if (val !== undefined && val !== '') body[arg.name] = val;
     }
+    if (!confirmTaskAction(a.name, S.view)) return;
     try {
       await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify(body) });
       close();
