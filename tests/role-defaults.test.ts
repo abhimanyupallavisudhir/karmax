@@ -59,7 +59,7 @@ describe('autonomous role defaults', () => {
       const caps = (await auth.profile('administrator'))!.capabilities;
       expect(CAPABILITIES.filter(cap => !allows(caps, cap))).toEqual([
         'workflow:install', 'process:kill', 'settings:read', 'settings:write',
-        'safe-mode:write', 'authorization:read', 'authorization:write', 'user:read', 'user:write',
+        'safe-mode:write', 'subscription:gift', 'authorization:read', 'authorization:write', 'user:read', 'user:write',
       ]);
     } finally { await store.close(); }
   });

@@ -1,0 +1,69 @@
+{
+  "verifiedAt": "2026-09-23T06:12:45.319557+00:00",
+  "deployment": "tavya.io",
+  "mode": "live validation overrides; not a release image",
+  "files": [
+    {
+      "path": "src/world/resources.ts",
+      "sha256": "b77dca2faf9ee735217178172cea29af78387fc46cc766c30e7532b8d58d6c7d",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/world/resource-transfer.ts",
+      "sha256": "7817e2b385fae64026ef3630c057107290e5d05f83fa9d0bddf53a2550403e61",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/world/git-broker.ts",
+      "sha256": "0a3914fe5a56a42c53166968796762c796641ffe50242a06ea3f5e5b9a9397ee",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/world/checkpoint.ts",
+      "sha256": "9257392d4b2bac1c1438be1c6cc15081a9dd7cc466a4761e0d5353a7c56a0069",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/util/async-batch.ts",
+      "sha256": "f4fd05fd5f87b645cd826a2ee1f95a4bda2098f887dad1b7be96d09498144dcc",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/workflows/world-setup.ts",
+      "sha256": "83b8fa464bc84bbe1373300dbf74c7c9ad7f3fc97369f2633d73c35263c6f9b4",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/activities/core.ts",
+      "sha256": "34077e1b1ce07c07411527c3987897979151f7021eec349cb2b681546cead8e8",
+      "preservesProductionChanges": true
+    },
+    {
+      "path": "src/platform/api.ts",
+      "sha256": "c951b381a1c26b9f9d2318c244bca89a6f4d5ff14e84d138b44b44ba5d7c2dd2",
+      "preservesProductionChanges": true
+    },
+    {
+      "path": "src/workflows/just-do.ts",
+      "sha256": "5c3f0850c841b770045b2a9b0ebf20ca5bb41a334e5af2165d5a5c5fa5390132",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/workflows/software-dev.ts",
+      "sha256": "690cc508e1ee1b06610adb35d20d28311af4aa553e49efbd04a5542c6a1a7a23",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/workflows/script-exec.ts",
+      "sha256": "96bec3cb4237ce5f5fabdee4575ed2216ba2d1fa20d144e15a60b8e15e783a64",
+      "preservesProductionChanges": false
+    },
+    {
+      "path": "src/workflows/merge-only.ts",
+      "sha256": "8e3ca64f55af1ab5ad4406deac5523f9b6acc68891ad937babba1f569b51ed99",
+      "preservesProductionChanges": false
+    }
+  ],
+  "timingEnabled": false,
+  "remainingProbeWorlds": 0
+}

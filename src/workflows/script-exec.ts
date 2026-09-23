@@ -1,3 +1,4 @@
+import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
@@ -56,7 +57,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
 
   await publish();
   const worldKind = input.project.worldProvider ?? 'worktree';
-  world = (await core.createWorld({ taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
+  world = (await createTaskWorld(core, { taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
 
   stage = 'do';
   await publish();

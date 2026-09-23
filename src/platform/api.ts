@@ -4566,6 +4566,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         await handle.signal(signal, { name: text ?? '' });
       } else {
         await handle.signal(signal);
+        // Interrupt expensive waiting-world maintenance after Temporal accepts
+        // cancellation, without waiting for the workflow's next publication.
+        if (signal === SIG.cancel) await this.deps.store.appendEvent({ taskId,
+          type: 'task.cancel-requested', ts: Date.now(), payload: {} });
       }
     } catch (e) {
       // Cancellation is idempotent at the task API boundary. The drawer can be

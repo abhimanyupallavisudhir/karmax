@@ -1,0 +1,8 @@
+{"sandboxId":"i4qbd0ol5movlme7hj1tb"}
+{"round":0,"mode":"four-concurrent","ms":3335.898589}
+{"round":0,"mode":"four-bulk","ms":2842.4283730000006}
+{"round":1,"mode":"four-concurrent","ms":3931.2365199999995}
+{"round":1,"mode":"four-bulk","ms":3477.626053}
+{"round":2,"mode":"four-concurrent","ms":2319.3279509999993}
+{"round":2,"mode":"four-bulk","ms":2042.498276000002}
+{"destroyed":true}

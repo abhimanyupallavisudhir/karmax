@@ -299,6 +299,14 @@ async function pushBranchToOrigin(
   expectedRemoteHead?: string,
   onPublished?: OriginPublicationRecorder,
 ): Promise<void> {
+  // Repeated waiting-world checkpoints usually have no new commits. Only use
+  // this shortcut for a tip already transported and recorded by this broker,
+  // and verify the authoritative remote on every call (never trust cached refs).
+  if (expectedRemoteHead && await timed('git-broker.verify-published', () =>
+    verifyPublishedBranch(world, repo, auth, expectedRemoteHead))) {
+    await onPublished?.(repo, expectedRemoteHead);
+    return;
+  }
   await withTransferredRepo(world, repo, auth, async (clone, env) => {
     const ref = `refs/heads/${repo.branch}`;
     const tip = await git(clone, ['rev-parse', '--verify', ref]);
@@ -333,6 +341,25 @@ async function pushBranchToOrigin(
     if (result.code !== 0) throw new Error(describeGitPushError(repo, result.stderr || result.stdout || 'push failed'));
     await onPublished?.(repo, tip.stdout.trim());
   });
+}
+
+async function verifyPublishedBranch(world: World, repo: WorldRepo, auth: GitBrokerAuth,
+  expected: string): Promise<boolean> {
+  if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(expected) || !validGitBranch(repo.branch)) return false;
+  const source = worldRepoSource(repo);
+  if (!/^(?:ssh:\/\/|git@)/.test(source)) return false;
+  const ref = `refs/heads/${repo.branch}`;
+  const tip = await world.exec('git', ['rev-parse', '--verify', ref], { cwd: repo.root });
+  if (tip.code !== 0 || tip.stdout.trim() !== expected) return false;
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-verify-'));
+  try {
+    const { env } = materializeGitCredential(temp, await resolveCredential(auth, repo));
+    const remote = await git(temp, ['ls-remote', '--refs', source, ref], { env, timeoutMs: 30_000 });
+    // A deleted or advanced branch must take the normal transport/reconciliation
+    // path. Authentication failures are errors, not proof of publication.
+    if (remote.code !== 0) throw new Error('Could not verify published task branch');
+    return remote.stdout.trim() === `${expected}\t${ref}`;
+  } finally { removeTemporaryDirectory(temp); }
 }
 
 /** Mirror a remote-ahead task branch into its sandbox without exposing the
@@ -775,4 +802,3 @@ async function conflictMarkerFiles(dir: string, branch: string, files: string[])
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-

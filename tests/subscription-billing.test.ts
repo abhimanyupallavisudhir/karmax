@@ -23,6 +23,81 @@ const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
 
 describe('hosted subscription billing', () => {
+  it('persists complimentary plans without Stripe and restores paid access after removal', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gifts-'));
+    const database = path.join(directory, 'billing.db');
+    let store = await Store.create(database, { hosted: true });
+    const organization = await store.createOrganization({ name: 'Gift recipient', ownerUserId: 'owner' });
+    const provider = new FakeSubscriptionProvider();
+    let billing = new SubscriptionBillingService(store, provider, true);
+    try {
+      vi.spyOn(provider, 'configured').mockReturnValue(false);
+      await billing.gift(organization.id, 'team', 'user:god', 'gift-team-1');
+      expect(await billing.current(organization.id)).toMatchObject({ plan: 'team', access: 'active',
+        gift: { plan: 'team', grantedBy: 'user:god' }, seatDeficit: 0 });
+      expect((await store.organizationEntitlements(organization.id)).maxActiveAgentRuns).toBe(20);
+      expect(provider.calls).toHaveLength(0);
+      await store.close();
+      store = await Store.create(database, { hosted: true });
+      billing = new SubscriptionBillingService(store, provider, true);
+      await billing.reconcileEntitlements();
+      expect((await billing.current(organization.id)).plan).toBe('team');
+      await billing.gift(organization.id, 'individual', 'user:god', 'gift-individual-1');
+      // A retried older gift must not overwrite a newer selection.
+      await billing.gift(organization.id, 'team', 'user:god', 'gift-team-1');
+      expect((await billing.current(organization.id)).plan).toBe('individual');
+      await expect(billing.gift(organization.id, 'enterprise', 'user:god', 'gift-invalid-1')).rejects.toThrow(/Individual or Team/);
+      await expect(billing.gift(organization.id, 'free', 'user:god', 'gift-invalid-2')).rejects.toThrow(/Individual or Team/);
+      await expect(billing.gift('missing', 'team', 'user:god', 'gift-missing-1')).rejects.toThrow(/organization/);
+      await expect(billing.gift(organization.id, 'team', 'user:god', '')).rejects.toThrow(/Idempotency/);
+      vi.mocked(provider.configured).mockReturnValue(true);
+      await billing.checkout(organization.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'gift-checkout-1');
+      await billing.handleWebhook(event('gift-paid', 'customer.subscription.updated', {
+        id: 'sub_gift', customer: `cus_${organization.id}`, status: 'active',
+        items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] },
+      }));
+      await billing.gift(organization.id, 'team', 'user:god', 'gift-team-2');
+      await billing.reconcileEntitlements();
+      expect(await billing.current(organization.id)).toMatchObject({ plan: 'team', billedPlan: 'individual' });
+      await billing.gift(organization.id, null, 'user:god', 'gift-remove-1');
+      expect(await billing.current(organization.id)).toMatchObject({ plan: 'individual', gift: null });
+      await billing.gift(organization.id, 'team', 'user:god', 'gift-team-3');
+      await billing.handleWebhook(event('gift-canceled', 'customer.subscription.deleted', {
+        id: 'sub_gift', customer: `cus_${organization.id}`,
+      }, 101));
+      expect((await billing.current(organization.id)).plan).toBe('team');
+      await billing.gift(organization.id, null, 'user:god', 'gift-remove-2');
+      expect((await billing.current(organization.id)).plan).toBe('free');
+    } finally {
+      await store.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps better paid access, includes gifts in exports, and cleans them up on deletion', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    const organization = await store.createOrganization({ name: 'Paid team', ownerUserId: 'owner' });
+    const provider = new FakeSubscriptionProvider();
+    const billing = new SubscriptionBillingService(store, provider, true);
+    try {
+      await billing.checkout(organization.id, 'team', { success: 'https://test/s', cancel: 'https://test/c' }, 'paid-team-checkout');
+      await billing.handleWebhook(event('paid-team-active', 'customer.subscription.updated', {
+        id: 'sub_team', customer: `cus_${organization.id}`, status: 'active',
+        items: { data: [{ id: 'si_team', price: { id: 'price_team_base' }, quantity: 1 }] },
+      }));
+      await billing.gift(organization.id, 'individual', 'user:god', 'paid-team-gift');
+      expect(await billing.current(organization.id)).toMatchObject({ plan: 'team', gift: { plan: 'individual' } });
+      expect((await store.exportOrganization(organization.id)).tables).toMatchObject({
+        subscription_gifts: [{ organizationId: organization.id, plan: 'individual', grantedBy: 'user:god', grantedAt: expect.any(Number) }],
+      });
+      await expect(billing.gift(organization.id, null, 'user:god', 'paid-team-gift')).rejects.toThrow(/already used/);
+      const privateBilling = new SubscriptionBillingService(store, provider, false);
+      await expect(privateBilling.gift(organization.id, 'team', 'user:god', 'private-gift')).rejects.toThrow(/hosted/);
+      await store.deleteOrganization(organization.id);
+      expect(await billing.currentGift(organization.id)).toBeNull();
+    } finally { await store.close(); }
+  });
+
   it('reconciles equal-second lifecycle collisions deterministically', async () => {
     const reconcile = async (deliveries: Array<'active' | 'deleted' | 'paid' | 'failed'>) => {
       const store = (await Store.create(':memory:', { hosted: true }));
@@ -383,7 +458,7 @@ describe('subscription administration HTTP authorization', () => {
     vi.unstubAllEnvs();
   });
 
-  const post = (action: 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats',
+  const post = (action: 'gift' | 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats',
     organizationId: string, token: string, body: Record<string, unknown> = {}) => fetch(
     `${base}/api/organizations/${organizationId}/subscription/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
@@ -456,6 +531,45 @@ describe('subscription administration HTTP authorization', () => {
         refundDisclosure: expect.stringMatching(/non-refundable/i),
       },
     });
+  });
+
+  it('lets Gods gift across organizations through the API while denying ordinary payment authority', async () => {
+    const recipient = await store.createOrganization({ name: 'Outside God membership', ownerUserId: 'someone-else' });
+    const before = provider.calls.length;
+    const result = await post('gift', recipient.id, browserToken, { plan: 'team' });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ plan: 'team', gift: { plan: 'team', grantedBy: 'user:me' } });
+    expect(provider.calls.length).toBe(before);
+    const state = await fetch(`${base}/api/organizations/${recipient.id}/subscription/status`, {
+      headers: { authorization: `Bearer ${browserToken}` },
+    });
+    expect(await state.json()).toMatchObject({ canGift: true, canManage: false });
+    const owner = await tokens.mintPrincipal('user:someone-else', ['organization:*', 'payment:*'], undefined, undefined, recipient.id);
+    expect((await post('gift', recipient.id, owner.token)).status).toBe(403);
+    const ordinaryState = await fetch(`${base}/api/organizations/${recipient.id}/subscription/status`, {
+      headers: { authorization: `Bearer ${owner.token}` },
+    });
+    expect(await ordinaryState.json()).toMatchObject({ canGift: false });
+    const human = await tokens.mintPrincipal('user:someone-else', ['organization:read', 'payment:write'], undefined, undefined, recipient.id);
+    const delegation = (await tokens.delegateHuman(human.token, { taskId: 'owner-gift-agent', organizationId: recipient.id }))!;
+    const ownerAgent = await tokens.mint({ taskId: 'owner-gift-agent', profileId: 'administrator', principal: 'task:owner-gift-agent',
+      organizationId: recipient.id, delegationId: delegation.id,
+      ceiling: ['organization:read', 'payment:write'], grantorCaps: ['organization:read', 'payment:write'] });
+    expect((await post('gift', recipient.id, ownerAgent.token)).status).toBe(403);
+    const ownerStatus = await fetch(`${base}/api/organizations/${recipient.id}/subscription/status`, {
+      headers: { authorization: `Bearer ${ownerAgent.token}` },
+    });
+    expect(await ownerStatus.json()).toMatchObject({ canManage: true, canGift: false });
+    expect(await store.db.prepare("SELECT principalId FROM audit_log WHERE action='subscription.gift' AND scopeKey=?")
+      .all(`organization:${recipient.id}`)).toEqual([{ principalId: 'user:me' }]);
+    const agent = await tokens.mint({ taskId: 'gift-agent', profileId: 'god', principal: 'task:gift-agent',
+      ceiling: ['*'], grantorCaps: ['*'] });
+    expect((await post('gift', recipient.id, agent.token, { plan: 'individual' })).status).toBe(200);
+    const scoped = await tokens.mint({ taskId: 'scoped-gift-agent', profileId: 'god', principal: 'task:scoped-gift-agent',
+      organizationId: 'org_personal', ceiling: ['*'], grantorCaps: ['*'] });
+    expect((await post('gift', recipient.id, scoped.token)).status).toBe(403);
+    expect((await post('gift', recipient.id, agent.token, { plan: null })).status).toBe(200);
+    expect((await billing.current(recipient.id)).plan).toBe('free');
   });
 
   it('makes owner-only administration explicit in subscription status', async () => {

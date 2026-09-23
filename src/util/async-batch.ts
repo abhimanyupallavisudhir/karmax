@@ -12,3 +12,22 @@ export async function mapBatches<T, R>(items: T[], run: (item: T) => Promise<R>,
   }
   return out;
 }
+
+/** Keep bounded workers busy when item durations vary. Stop scheduling after a
+ * failure, but settle every active operation before the caller can clean up. */
+export async function forEachConcurrent<T>(items: T[], run: (item: T) => Promise<void>, concurrency = 4): Promise<void> {
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32)
+    throw new Error('Invalid remote request concurrency');
+  let next = 0;
+  let failed = false;
+  let failure: unknown;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const item = items[next++]!;
+      try { await run(item); }
+      catch (error) { if (!failed) { failed = true; failure = error; } }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  if (failed) throw failure;
+}

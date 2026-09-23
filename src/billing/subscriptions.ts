@@ -45,6 +45,12 @@ export interface SubscriptionCheckoutResult {
   url: string;
 }
 
+export interface SubscriptionGift {
+  plan: PaidHostedPlanId;
+  grantedBy: string;
+  grantedAt: number;
+}
+
 export interface BillingAccount {
   organizationId: string;
   provider: string;
@@ -239,21 +245,52 @@ export class SubscriptionBillingService {
       catalog: Object.values(HOSTED_PLANS) };
     const account = (await this.account(organizationId));
     const plan = (await this.store.organizationEntitlements(organizationId)).plan ?? 'free';
+    const gift = await this.currentGift(organizationId);
     const billedPlan = account?.plan ?? 'free';
     const status = account?.status ?? 'none';
     const seats = billedPlan === 'team' ? account?.seats ?? HOSTED_PLANS.team.includedActiveUsers
       : HOSTED_PLANS.individual.includedActiveUsers;
     const graceEndsAt = status === 'past_due' && account?.pastDueAt
       ? account.pastDueAt + this.pastDueGraceMs : undefined;
-    const access = ['active', 'trialing'].includes(status) ? 'active'
+    const access = gift || ['active', 'trialing'].includes(status) ? 'active'
       : status === 'past_due' && graceEndsAt && graceEndsAt > Date.now() ? 'grace'
         : status === 'none' || status === 'canceled' ? 'free' : 'restricted';
-    return { managed: true, providerConfigured: (await this.provider.configured()), plan, billedPlan, status, seats,
-      activeUsers: members, seatDeficit: plan === 'team' ? Math.max(0, members - seats)
+    return { managed: true, providerConfigured: (await this.provider.configured()), plan, billedPlan, status, seats, gift,
+      activeUsers: members, seatDeficit: gift?.plan === 'team' ? 0 : plan === 'team' ? Math.max(0, members - seats)
         : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
       currentPeriodEnd: account?.currentPeriodEnd, verifiedAt: account?.verifiedAt,
       graceEndsAt, lastError: account?.lastError, catalog: Object.values(HOSTED_PLANS) };
+  }
+
+  /** Complimentary access is independent of the provider ledger. A gift never
+   * downgrades paid access or changes an existing financial contract. */
+  async gift(organizationId: string, plan: unknown, grantedBy: string, key: string) {
+    if (!this.hosted) throw new Error('subscription gifts are only available on hosted installations');
+    this.requireKey(key);
+    if (plan !== null && !isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team, or null to remove the gift');
+    return this.store.transaction(async () => {
+      if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+      return this.idempotent(organizationId, `gift:${plan}`, key, async () => {
+        if (plan === null) {
+          await this.store.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId);
+        } else {
+          await this.store.db.prepare(`INSERT INTO subscription_gifts (organizationId, plan, grantedBy, grantedAt)
+            VALUES (?, ?, ?, ?) ON CONFLICT(organizationId) DO UPDATE SET
+            plan=excluded.plan, grantedBy=excluded.grantedBy, grantedAt=excluded.grantedAt`)
+            .run(organizationId, plan, grantedBy, Date.now());
+        }
+        const account = await this.account(organizationId);
+        await this.reconcileOrganization(organizationId, account);
+        return this.current(organizationId);
+      });
+    });
+  }
+
+  async currentGift(organizationId: string): Promise<SubscriptionGift | null> {
+    const row = await this.store.db.prepare('SELECT plan, grantedBy, grantedAt FROM subscription_gifts WHERE organizationId=?')
+      .get(organizationId) as SubscriptionGift | undefined;
+    return row ?? null;
   }
 
   /** Re-applies effective plans from the last verified provider state. The main
@@ -443,9 +480,18 @@ export class SubscriptionBillingService {
   }
 
   private async reconcileAccount(account: BillingAccount, now = Date.now()): Promise<void> {
-    const plan = this.effectivePlan(account, now);
-    if ((await this.store.getOrganization(account.organizationId))?.plan !== plan)
-      (await this.store.setOrganizationPlan(account.organizationId, plan));
+    await this.reconcileOrganization(account.organizationId, account, now);
+  }
+
+  private async reconcileOrganization(organizationId: string, account?: BillingAccount, now = Date.now()): Promise<void> {
+    await this.store.transaction(async () => {
+      const gift = await this.currentGift(organizationId);
+      const paidPlan = account ? this.effectivePlan(account, now) : 'free';
+      const plan = paidPlan === 'team' || gift?.plan === 'team' ? 'team'
+        : paidPlan === 'individual' || gift?.plan === 'individual' ? 'individual' : 'free';
+      if ((await this.store.getOrganization(organizationId))?.plan !== plan)
+        await this.store.setOrganizationPlan(organizationId, plan);
+    });
   }
 
   private async mapSubscription(object: any): Promise<{ plan: HostedPlanId; seats: number; items: Record<string, string> }> {

@@ -1,3 +1,4 @@
+import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
@@ -2509,7 +2510,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (!cancellableSetup) return core.createWorld(args);
       const scope = new CancellationScope({ cancellable: true });
       activeSetup = scope;
-      return scope.run(() => cancellationAwareCore.createWorld(args)).finally(() => {
+      return scope.run(() => createTaskWorld(cancellationAwareCore, args)).finally(() => {
         activeSetup = undefined;
       });
     };

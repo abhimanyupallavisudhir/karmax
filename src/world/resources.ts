@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import { transferResourceChunk, readResourceChunks } from './resource-transfer.js';
+import { forEachConcurrent } from '../util/async-batch.js';
+import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
@@ -23,7 +26,6 @@ import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
-const WORLD_READ_BYTES = 16 * 1024 * 1024;
 const RESOURCE_KEY_PREFIX = 'resource-store:key:';
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
@@ -68,7 +70,8 @@ export interface SnapshotEngine {
   capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>): Promise<{
     sealedRef: string; rootDigest: string; bytes: number; files: number; storageLocationId?: string;
   }>;
-  restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>): Promise<void>;
+  restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
+    options?: { signal?: AbortSignal }): Promise<void>;
   manifest(revision: ResourceRevision): Promise<SnapshotManifest>;
   verify?(revision: ResourceRevision, offset: number, limit: number): Promise<SnapshotVerification>;
   delete?(revision: ResourceRevision): Promise<void>;
@@ -122,6 +125,8 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
           digest.update(plain);
           fileBytes += plain.length;
         }
+        if (input.bytes !== undefined && fileBytes !== input.bytes)
+          throw new Error('resource capture size mismatch');
         total += fileBytes;
         manifestFiles.push({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks });
       }
@@ -140,15 +145,30 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     }
   }
 
-  async restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>): Promise<void> {
+  async restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
+    options: { signal?: AbortSignal } = {}): Promise<void> {
+    options.signal?.throwIfAborted();
     const manifest = await this.manifest(revision);
-    for (const file of manifest.files) {
+    // Bound memory and request fan-out. Chunks of each file remain ordered;
+    // independent files can transfer together. Settle all writes before cleanup.
+    await forEachConcurrent(manifest.files, async file => {
+      options.signal?.throwIfAborted();
       let offset = 0;
+      let buffered: Buffer[] = [];
+      let bytes = 0;
+      const flush = async () => {
+        options.signal?.throwIfAborted();
+        await write(file.path, Buffer.concat(buffered, bytes), offset);
+        options.signal?.throwIfAborted();
+        offset += bytes; buffered = []; bytes = 0;
+      };
       for await (const data of this.readFile(revision, file)) {
-        await write(file.path, data, offset);
-        offset += data.length;
+        options.signal?.throwIfAborted();
+        buffered.push(data); bytes += data.length;
+        if (bytes >= 2 * CHUNK_BYTES) await flush();
       }
-    }
+      if (buffered.length) await flush();
+    }, 4);
   }
 
   /** One shared streaming integrity check for restore and verification. */
@@ -159,7 +179,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const digest = crypto.createHash('sha256');
     let bytes = 0;
     for (const chunkId of file.chunks) {
-      const encrypted = await objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
+      const encrypted = await timed('resource.chunk-read', () => objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`));
       const data = openDeterministic(key, chunkId, encrypted);
       if (data.length !== Math.min(CHUNK_BYTES, file.bytes - bytes))
         throw new Error('resource chunk size mismatch');
@@ -323,11 +343,13 @@ export class ProjectResourceService {
   /** Materialize all enabled project defaults into a newly-created generation.
    * The caller must select the agent workdir before resolving path targets. */
   async materialize(projectId: string, taskId: string, world: World, generation = world.handle.generation ?? 1,
-    revisions: Record<string, string | undefined> = {}): Promise<WorldHandle> {
+    revisions: Record<string, string | undefined> = {}, options: { signal?: AbortSignal } = {}): Promise<WorldHandle> {
     const ephemeralPaths = new Set<string>(Array.isArray(world.handle.meta?.ephemeralPaths)
       ? world.handle.meta!.ephemeralPaths as string[] : []);
     const projections: Record<string, { target: string; revisionId?: string; access: string }> = {};
+    let compression: boolean | undefined;
     for (const attachment of (await this.store.listResourceAttachments(projectId))) {
+      options.signal?.throwIfAborted();
       const revisionId = Object.prototype.hasOwnProperty.call(revisions, attachment.id)
         ? revisions[attachment.id] : attachment.currentRevisionId;
       const lease = (await this.store.createResourceLease({ attachmentId: attachment.id, revisionId,
@@ -352,26 +374,27 @@ export class ProjectResourceService {
           if (revisionId) {
             const revision = (await this.store.getResourceRevision(revisionId));
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
-            await this.engine.restore(revision, async (file, data, offset) => {
+            if (compression === undefined) compression = world.handle.kind === 'e2b' &&
+              (await world.exec('bash', ['-lc', 'command -v gzip >/dev/null'], { cwd: world.handle.root })).code === 0;
+            let uploadedBytes = 0;
+            const startedAt = Date.now();
+            await this.store.appendEvent({ taskId, type: 'world.resource-restoring', ts: startedAt,
+              payload: { attachmentId: attachment.id, revisionId, bytes: revision.bytes, files: revision.files } });
+            await timed('resource.restore', () => this.engine.restore(revision, async (file, data, offset) => {
+              options.signal?.throwIfAborted();
               const relative = fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
-              if (offset === 0) {
-                if (world.writeFileBuffer) await world.writeFileBuffer(relative, data);
-                else await world.writeFile(relative, data.toString('utf8'));
-              } else {
-                const temporary = `.karmax-injection/resource-chunk-${crypto.randomBytes(8).toString('hex')}`;
-                if (world.writeFileBuffer) await world.writeFileBuffer(temporary, data);
-                else await world.writeFile(temporary, data.toString('base64'));
-                const appended = world.writeFileBuffer
-                  ? await world.exec('bash', ['-lc', `cat ${quote(temporary)} >> ${quote(relative)} && rm -f ${quote(temporary)}`], { cwd: world.handle.root })
-                  : await world.exec('bash', ['-lc', `base64 -d ${quote(temporary)} >> ${quote(relative)} && rm -f ${quote(temporary)}`], { cwd: world.handle.root });
-                if (appended.code !== 0) throw new Error(appended.stderr || `could not restore ${relative}`);
-              }
-            });
+              const sent = await timed('resource.transfer', () => transferResourceChunk(world, relative, data, offset,
+                { compress: compression, signal: options.signal }));
+              uploadedBytes += sent;
+            }, options), { itemId: attachment.id });
+            await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: Date.now(),
+              payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt, uploadedBytes } });
           }
           if (attachment.access === 'read')
             await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`], { cwd: world.handle.root });
           projections[attachment.id] = { target, revisionId, access: attachment.access };
         } else throw new Error(`no resource driver registered for ${attachment.driver}`);
+        options.signal?.throwIfAborted();
         (await this.store.updateResourceLease(lease.id, 'active', JSON.stringify({ driver: attachment.driver })));
         (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:lease',
           scopeKey: `project:${projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id,
@@ -475,8 +498,8 @@ export class ProjectResourceService {
     return (await this.withEnvironment(world));
   }
 
-  async scrubSecrets(handle: WorldHandle): Promise<void> {
-    const world = await this.worlds.open(handle).catch(() => undefined);
+  async scrubSecrets(handle: WorldHandle, liveWorld?: World): Promise<void> {
+    const world = liveWorld ?? await this.worlds.open(handle).catch(() => undefined);
     if (!world) return;
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
@@ -485,9 +508,9 @@ export class ProjectResourceService {
     }
   }
 
-  async release(handle: WorldHandle): Promise<void> {
-    await this.scrubSecrets(handle);
-    const world = await this.worlds.open(handle).catch(() => undefined);
+  async release(handle: WorldHandle, liveWorld?: World): Promise<void> {
+    await this.scrubSecrets(handle, liveWorld);
+    const world = liveWorld ?? await this.worlds.open(handle).catch(() => undefined);
     const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object')
       for (const value of Object.values(serviceHandles as Record<string, unknown>))
@@ -1085,7 +1108,7 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
     yield { path: path.posix.basename(target), bytes,
-      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
+      data: cleanupChunks(readResourceChunks(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
     return;
   }
   const prefix = target === '.' ? '' : `${target}/`;
@@ -1101,7 +1124,7 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
     yield { path: safePath(relative), bytes,
-      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
+      data: cleanupChunks(readResourceChunks(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
   }
 }
 
@@ -1174,21 +1197,6 @@ async function* fixedChunks(value: Buffer | AsyncIterable<Buffer>): AsyncGenerat
     }
   }
   if (pending.length || !emitted) yield pending;
-}
-
-async function* chunksFromWorldFile(world: World, file: string, bytes?: number, checkContinue?: () => Promise<void>): AsyncGenerator<Buffer> {
-  for (let offset = 0; bytes === undefined || offset < bytes; offset += WORLD_READ_BYTES) {
-    await checkContinue?.();
-    const result = await world.exec('bash', ['-lc',
-      `dd if=${quote(file)} bs=${WORLD_READ_BYTES} skip=${Math.floor(offset / WORLD_READ_BYTES)} count=1 status=none | base64 -w0`],
-    { timeoutMs: 30 * 60_000 });
-    if (result.code !== 0) throw new Error(result.stderr || `could not read resource file ${file}`);
-    await checkContinue?.();
-    const chunk = Buffer.from(result.stdout.trim(), 'base64');
-    if (!chunk.length) break;
-    yield chunk;
-    if (chunk.length < WORLD_READ_BYTES) break;
-  }
 }
 
 async function transactionalSnapshotPath(world: World, file: string): Promise<{ path: string; cleanup?: () => Promise<void> }> {

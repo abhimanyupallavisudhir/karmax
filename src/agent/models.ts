@@ -30,6 +30,7 @@ export type ModelCatalog = Record<Provider, AvailableModel[]>;
 export const CLAUDE_MODEL_PRESETS: AvailableModel[] = [
   { id: 'default' },
   { id: 'opus[1m]' },
+  { id: 'claude-opus-5-5', displayName: 'Opus 5.5' },
   { id: 'claude-fable-5-1', displayName: 'Fable 5.1' },
   { id: 'sonnet' },
   { id: 'haiku' },
@@ -37,6 +38,21 @@ export const CLAUDE_MODEL_PRESETS: AvailableModel[] = [
 
 export function claudeModelCatalog(discovered: AvailableModel[]): AvailableModel[] {
   return mergeModels([discovered, CLAUDE_MODEL_PRESETS]);
+}
+
+/** Preserve the account's native picker, with current models available offline. */
+export function codexModelCatalog(discovered: AvailableModel[]): AvailableModel[] {
+  return discovered.length ? discovered : [
+    { id: 'gpt-5.6-sol', isDefault: true },
+    { id: 'gpt-6-astra' },
+    { id: 'gpt-6-sol' },
+    { id: 'gpt-6-luna' },
+    { id: 'gpt-5.6-terra' },
+    { id: 'gpt-5.6-luna' },
+    { id: 'gpt-5.5' },
+    { id: 'gpt-5.4' },
+    { id: 'gpt-5.4-mini' },
+  ];
 }
 
 /** A credential-safe reason for provider-discovery logs. Provider exceptions can
