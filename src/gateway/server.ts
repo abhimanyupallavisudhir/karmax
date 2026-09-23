@@ -4036,11 +4036,20 @@ export class Gateway {
         const task = (await store.getTask(taskResources[1]!));
         if (!task || !this.deps.resources) return this.json(res, task ? 503 : 404, { error: task ? 'project resources are unavailable' : 'task not found' });
         const summaries = [];
+        const review = await store.resourceReview(task.id);
+        const metadataOnly = url.searchParams.get('summary') === 'metadata';
+        const world = metadataOnly ? await store.currentWorld(task.id) as import('../world/types.js').WorldHandle | undefined : undefined;
+        const leases = world ? await store.listResourceLeases(world.id, world.generation ?? 1) : [];
         const candidates = (await store.listResourceCandidates(task.id));
         const candidateAttachments = new Set(candidates.map((candidate) => candidate.attachmentId));
         for (const resource of (await store.listResourceAttachments(task.projectId))) {
           if (candidateAttachments.has(resource.id)) continue;
           if (resource.access !== 'write' || resource.target.kind !== 'path') continue;
+          if (metadataOnly) {
+            if (resource.publish === 'review' && leases.some((lease) => lease.attachmentId === resource.id && lease.state === 'active'))
+              summaries.push({ resource: redactResource(resource), pendingInspection: true });
+            continue;
+          }
           try { summaries.push({ resource: redactResource(resource), summary: await this.deps.resources.summarize(task.id, resource.id) }); }
           catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -4056,7 +4065,8 @@ export class Gateway {
               ? redactResourceRevision((await store.getResourceRevision(resource.currentRevisionId))) : undefined }
               : { resource: { id: candidate.attachmentId, name: 'Resource candidate' } }) });
         }
-        return this.json(res, 200, summaries);
+        return this.json(res, 200, summaries.map((item) => ({ ...item,
+          excluded: review.excluded.includes(item.resource.id), automaticReview: !!review.reviewId, selectionFrozen: review.frozen })));
       }
       const taskResourceInventory = p.match(/^\/api\/tasks\/([^/]+)\/resources\/inventory$/);
       if (taskResourceInventory && method === 'GET') {
@@ -4067,6 +4077,18 @@ export class Gateway {
           if (checkpointed) return this.json(res, 200, checkpointed);
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      const taskResourceSelection = p.match(/^\/api\/tasks\/([^/]+)\/resources\/([^/]+)\/selection$/);
+      if (taskResourceSelection && method === 'PUT') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const body = await this.body(req);
+        if (typeof body.excluded !== 'boolean') return this.json(res, 400, { error: 'excluded must be a boolean' });
+        const task = await store.getTask(taskResourceSelection[1]!);
+        if (task?.lastView?.stage !== 'review' || task.lastView.state?.applyingResources)
+          return this.json(res, 409, { error: 'resource choices can only be changed before Review is confirmed' });
+        if (!(await store.resourceReview(task.id)).reviewId) return this.json(res, 409, { error: 'this historical review requires an explicit Adopt or Discard decision' });
+        try { return this.json(res, 200, await this.deps.resources.setReviewExcluded(task.id, taskResourceSelection[2]!, body.excluded)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const taskResourcePromote = p.match(/^\/api\/tasks\/([^/]+)\/resources\/([^/]+)\/promote$/);
       if (taskResourcePromote && method === 'POST') {

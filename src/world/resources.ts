@@ -841,6 +841,59 @@ export class ProjectResourceService {
     return candidate;
   }
 
+  async beginReview(taskId: string, reviewId = 'manual'): Promise<void> {
+    await this.store.resourceReview(taskId, { begin: reviewId });
+  }
+
+  async reviewExclusions(taskId: string): Promise<string[]> {
+    return (await this.store.resourceReview(taskId)).excluded;
+  }
+
+  async setReviewExcluded(taskId: string, resourceId: string, excluded: boolean) {
+    const task = await this.store.getTask(taskId);
+    const resource = await this.store.getResourceAttachment(resourceId);
+    if (!task || !resource || resource.projectId !== task.projectId) throw new Error('resource does not belong to task project');
+    const candidates = await this.store.listResourceCandidates(taskId);
+    const candidate = candidates.find((c) => c.attachmentId === resourceId);
+    if (candidate) {
+      if (candidate.state !== 'pending') throw new Error('resource candidate is already resolved');
+    } else {
+      const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
+      const leases = world ? await this.store.listResourceLeases(world.id, world.generation ?? 1) : [];
+      if (resource.publish !== 'review' || resource.access !== 'write' || resource.isolation !== 'fork'
+        || !leases.some((lease) => lease.attachmentId === resourceId && lease.state === 'active'))
+        throw new Error('task has no reviewable fork for resource');
+    }
+    const state = await this.store.resourceReview(taskId, { resourceId, excluded });
+    return { resourceId, excluded: state.excluded.includes(resourceId) };
+  }
+
+  /** Runs once all confirmation layers approve, inside a retriable workflow activity.
+   * Freeze all choices together; individual publication CAS fences remain authoritative. */
+  async settleReview(taskId: string): Promise<void> {
+    const selection = await this.store.resourceReview(taskId, { freeze: true });
+    const excluded = new Set(selection.excluded);
+    const principal = `task:${taskId}:confirmation`;
+    const candidates = await this.store.listResourceCandidates(taskId);
+    for (const candidate of candidates) {
+      if (candidate.state === 'discarding' || (candidate.state === 'pending' && excluded.has(candidate.attachmentId)))
+        await this.discardCandidate(taskId, candidate.id, principal);
+      else if (candidate.state === 'pending') await this.adoptCandidate(taskId, candidate.id, principal);
+    }
+    const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!world) return;
+    const candidateIds = new Set(candidates.map((c) => c.attachmentId));
+    for (const lease of await this.store.listResourceLeases(world.id, world.generation ?? 1)) {
+      if (lease.state !== 'active' || candidateIds.has(lease.attachmentId)) continue;
+      const resource = await this.store.getResourceAttachment(lease.attachmentId);
+      if (!resource || resource.publish !== 'review' || resource.access !== 'write' || resource.isolation !== 'fork' || resource.target.kind !== 'path') continue;
+      if (excluded.has(resource.id)) { await this.discard(taskId, resource.id); continue; }
+      const summary = await this.summarize(taskId, resource.id);
+      if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0)
+        await this.promoteReviewed(taskId, resource.id, summary);
+    }
+  }
+
   async summarize(taskId: string, attachmentId: string): Promise<ResourceChangeSummary> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
     const base = lease.revisionId ? await this.engine.manifest((await this.store.getResourceRevision(lease.revisionId))!) : emptyManifest(attachment.id);
@@ -892,10 +945,14 @@ export class ProjectResourceService {
   }
 
   async promote(taskId: string, attachmentId: string): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {
+    return this.promoteReviewed(taskId, attachmentId);
+  }
+
+  private async promoteReviewed(taskId: string, attachmentId: string, inspected?: ResourceChangeSummary): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
     if (attachment.publish !== 'review' || attachment.access !== 'write' || attachment.isolation !== 'fork')
       throw new Error('resource is not configured for reviewed promotion');
-    const summary = await this.summarize(taskId, attachmentId);
+    const summary = inspected ?? await this.summarize(taskId, attachmentId);
     // Upload the immutable candidate before entering the singleton. The only
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB model
     // upload cannot block another publication merely while bytes are moving.

@@ -552,7 +552,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   }, async (a) => wrap(async () => (await ops.platformRequest('GET',
     `/api/projects/${encodeURIComponent(a.projectId)}/resources/${encodeURIComponent(a.resourceId)}/revisions/${encodeURIComponent(a.revisionId)}/verify?offset=${a.offset ?? 0}&limit=${a.limit ?? 100}`))));
   server.registerTool('propose_project_resource', {
-    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
+    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. Confirmation adopts it as a project default unless a reviewer excludes it using PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:true} through platform_request. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
     inputSchema: {
       path: z.string().optional(), vaultItemId: z.string().optional(), field: z.string().optional(), name: z.string(),
       driver: z.enum(['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1']).optional(),

@@ -6,6 +6,7 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
+import { httpOps } from '../src/platform/mcp.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { mergeQueueId, accountCoordinatorId } from '../src/coordinators/names.js';
@@ -279,11 +280,16 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await h.store.eventsSince(taskId, 0)).some((event) => event.type === 'merge.completed')).toBe(false);
   }, 120_000);
 
-  it('v1.19 blocks Review on staged resources and wakes on an actual decision', async () => {
-    const repo = await h.makeRepo('resource-candidate-review');
-    const project = (await h.store.createProject('Resource candidate review', { repos: [repo] }));
+  it.each([false, true])('confirmation applies resource choices (excluded: %s)', async (excluded) => {
+    resourceCandidateTurnReleased = false;
+    const repo = await h.makeRepo(`resource-candidate-review-${excluded}`);
+    const project = (await h.store.createProject(`Resource candidate review ${excluded}`, { repos: [repo] }));
     const task = (await h.store.createTask({ projectId: project.id, title: 'Install model', workflow: 'software-dev',
       workflowVersion: '1.19.0', params: { prompt: 'install it' } }));
+    const volume = await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Weights', driver: 'volume@1', target: { kind: 'path', path: 'weights' }, access: 'write',
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+    const baseline = await h.resources.importFiles(volume.id, [{ path: 'weights.bin', data: Buffer.from('base') }]);
     const handle = await h.client.workflow.start('softwareDev@1.19.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
@@ -294,8 +300,10 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     });
 
     await expect.poll(async () => (await h.store.currentWorld(task.id)), { timeout: 30_000 }).toBeTruthy();
+    await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
     const taskWorld = (await h.store.currentWorld(task.id))!;
     fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'model.bin'), Buffer.alloc(1024, 7));
+    fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'weights/weights.bin'), Buffer.from('updated weights'));
     const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
       target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
     await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
@@ -303,19 +311,44 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     releaseResourceCandidateTurn!();
     releaseResourceCandidateTurn = undefined;
 
-    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
-      .toContain('must be Adopted or Discarded');
-    expect((await view(handle)).actions.map((action: any) => action.name)).not.toContain('confirm');
-    await handle.signal('confirm'); // ignored while the resource decision is open
-    await h.resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
-    await handle.signal('resourceResolved');
     await expect.poll(async () => (await view(handle)).actions.map((action: any) => action.name), { timeout: 30_000 })
       .toContain('confirm');
     expect((await view(handle)).stage).toBe('review');
-
+    expect((await h.store.getResourceAttachment(proposed.attachment.id))?.enabled).toBe(false);
+    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.stage).toBe('review');
+    const gateway = await h.startGateway();
+    const session: any = await fetch(`${gateway.url}/api/session`).then((r) => r.json());
+    const headers = { authorization: `Bearer ${session.token}`, 'content-type': 'application/json' };
+    const summarize = h.resources.summarize;
+    h.resources.summarize = async () => { throw new Error('metadata list must not scan files'); };
+    try {
+      const rows: any = await fetch(`${gateway.url}/api/tasks/${task.id}/resources?summary=metadata`, { headers }).then((r) => r.json());
+      expect(rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ automaticReview: true, excluded: false, candidate: expect.any(Object) }),
+        expect.objectContaining({ pendingInspection: true, resource: expect.objectContaining({ id: volume.id }) }),
+      ]));
+      expect(rows.some((r: any) => r.error)).toBe(false);
+    } finally { h.resources.summarize = summarize; }
+    const reviewer = await h.tokens.mint({ taskId: task.id, profileId: 'maintainer', principal: `task:${task.id}`,
+      projectId: project.id, organizationId: project.organizationId, ceiling: ['task:review:execute'], grantorCaps: ['task:review:execute'] });
+    const denied = await h.tokens.mint({ taskId: task.id, profileId: 'do', principal: `task:${task.id}`,
+      projectId: project.id, organizationId: project.organizationId, ceiling: ['task:read'], grantorCaps: ['task:read'] });
+    const route = `${gateway.url}/api/tasks/${task.id}/resources/${proposed.attachment.id}/selection`;
+    expect((await fetch(route, { method: 'PUT', headers: { ...headers, authorization: `Bearer ${denied.token}` }, body: JSON.stringify({ excluded }) })).status).toBe(403);
+    const choices = await Promise.all([
+      fetch(route, { method: 'PUT', headers, body: JSON.stringify({ excluded }) }),
+      httpOps(gateway.url, reviewer.token).platformRequest('PUT', `/api/tasks/${task.id}/resources/${volume.id}/selection`, { excluded }),
+    ]);
+    const humanChoice = choices[0] as Response;
+    expect(humanChoice.status, await humanChoice.text()).toBe(200);
+    expect(choices[1]).toEqual({ resourceId: volume.id, excluded });
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done' });
-    expect((await h.store.getResourceAttachment(proposed.attachment.id))).toMatchObject({ enabled: true });
+    expect((await h.store.getResourceCandidate(proposed.candidate.id))?.state).toBe(excluded ? 'discarded' : 'adopted');
+    const current = (await h.store.getResourceAttachment(volume.id))!.currentRevisionId;
+    if (excluded) expect(current).toBe(baseline.id);
+    else expect((await h.store.getResourceRevision(current!))?.bytes).toBe(Buffer.byteLength('updated weights'));
+    if (!excluded) expect((await h.store.getResourceAttachment(proposed.attachment.id))).toMatchObject({ enabled: true });
   }, 120_000);
 
   it('v1.13 waits for input until Open PR is explicitly requested', async () => {
@@ -1119,6 +1152,35 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await handle.signal('confirm');
     expect((await handle.result()).stage).toBe('done');
     expect((await git(repo, ['show', 'main:reviewed.txt'])).stdout).toContain('preserved reviewed work');
+  });
+
+  it('restored approval finishes interrupted resource publication', async () => {
+    const repo = await h.makeRepo('restored-resource-publication');
+    const project = await h.store.createProject('Restored resources', { repos: [repo] });
+    const task = await h.store.createTask({ projectId: project.id, title: 'Restore output', workflow: 'software-dev',
+      workflowVersion: '1.22.0', params: { prompt: 'restore' } });
+    const existing = await h.worlds.create('worktree', { taskId: task.id, repo, base: 'main', target: 'main' });
+    existing.handle = await h.store.registerWorld(existing.handle, project.id) as typeof existing.handle;
+    await existing.writeFile('data.bin', 'reviewed dataset');
+    const proposed = await h.resources.proposePath(task.id, { path: 'data.bin', name: 'Dataset', target: { kind: 'path', path: 'dataset.bin' } });
+    await existing.writeFile('.gitignore', 'data.bin\n');
+    await existing.writeFile('reviewed.txt', 'preserved reviewed work');
+    await git(existing.handle.workdir ?? existing.handle.root, ['add', '.gitignore', 'reviewed.txt']);
+    await git(existing.handle.workdir ?? existing.handle.root, ['commit', '-m', 'preserved proposal']);
+    await h.resources.beginReview(task.id, 'prior-review');
+    await h.store.resourceReview(task.id, { freeze: true });
+    const handle = await h.client.workflow.start('softwareDev@1.22.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [input({ taskId: task.id, projectId: project.id, repo, prompt: 'Restore reviewed work', recovery: {
+        world: existing.handle, messages: [], seen: 0, target: 'main', resumeStage: 'review', reviewConfirmed: true,
+      } })],
+    });
+    await expect.poll(async () => {
+      const state = await view(handle);
+      return { stage: state.stage, waiting: state.waitingFor, last: state.messages.at(-1)?.text };
+    }, { timeout: 10_000 }).toMatchObject({ stage: 'done' });
+    expect((await handle.result()).stage).toBe('done');
+    expect((await h.store.getResourceCandidate(proposed.candidate.id))?.state).toBe('adopted');
   });
 
   it('v1.22 preserves the exact audience and question of a cross-cutting human hold', async () => {
