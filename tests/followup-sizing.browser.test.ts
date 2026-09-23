@@ -45,7 +45,7 @@ for (const fullscreen of [false, true]) {
       expect(await input.evaluate(el => el.scrollHeight <= el.clientHeight + 1)).toBe(true);
       await evaluate(page, 'renderTaskPage()');
       expect(await input.inputValue()).toBe(draft);
-      expect(await input.evaluate(el => document.activeElement === el)).toBe(true);
+      expect(await input.evaluate(el => el.ownerDocument.activeElement === el)).toBe(true);
       expect(await input.evaluate(el => el.scrollHeight <= el.clientHeight + 1)).toBe(true);
 
       // Soft-wrapped text grows too, and recalculates when the available width changes.
