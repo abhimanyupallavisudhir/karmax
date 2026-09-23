@@ -1,4 +1,4 @@
-import { decayVaultUsage, type VaultUsage } from '../util/vault-usage.js';
+import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -126,6 +126,7 @@ export interface CredentialAccessRequest {
 export interface VaultItemStore {
   /** Serialize compound reads and writes on the same transaction connection. */
   transaction<T>(operation: () => Promise<T>): Promise<T>;
+  vaultSelectionHistory?(organizationId: string, now: number): Promise<Record<string, VaultSelectionUsage>>;
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
@@ -252,6 +253,16 @@ export class VaultItems {
     return items;
 
     });
+  }
+
+  /** Presentation metadata kept separate from access statistics and secrets. */
+  async listForSelection(): Promise<(VaultItem & VaultSelectionUsage)[]> {
+    const items = await this.list();
+    const now = Date.now();
+    const usage = await this.store.vaultSelectionHistory?.(this.organizationId, now) ?? {};
+    return items.map((item) => ({ ...item, ...(usage[item.id] ?? {
+      selectionCount: 0, selectionFrecencyScore: 0, selectionUpdatedAt: now,
+    }) }));
   }
 
   async get(id: string): Promise<VaultItem | undefined> {

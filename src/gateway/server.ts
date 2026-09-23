@@ -6063,7 +6063,7 @@ export class Gateway {
               policy: (await vault.effectivePolicy(callerTaskId, item)),
             }))));
         }
-        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, (await vault.list()));
+        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, (await vault.listForSelection()));
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
           const saved = (await vault.save({
