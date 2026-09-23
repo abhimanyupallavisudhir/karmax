@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { chromium } from 'playwright';
 import { expect, it } from 'vitest';
 
-it('resolves approvals and resource decisions inside the real check-in DOM', async () => {
+it.each([true, false])('resolves approvals and resource decisions inside the real check-in DOM (automatic: %s)', async (automaticReview) => {
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
@@ -15,15 +15,30 @@ it('resolves approvals and resource decisions inside the real check-in DOM', asy
       authorizationRequests: [{ id: 'authorization', status: 'pending', recipients: ['user'], target: { kind: 'task' }, audience: ['@owners'] }],
       connections: [{ id: 'connection', status: 'connecting', ownerId: 'user' }],
     };
-    let resources: any[] = [{ resource: { id: 'resource', name: 'Dataset' }, candidate: { id: 'candidate', state: 'pending', sourceKind: 'path' } }];
+    const resources: any[] = [{ automaticReview, excluded: false, resource: { id: 'resource', name: 'Dataset' }, candidate: { id: 'candidate', state: 'pending', sourceKind: 'path' } }];
     const decisions: string[] = [];
+    const resourceDecisions: string[] = [];
     await page.route('http://checkin.test/**', async route => {
       const url = new URL(route.request().url());
-      if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<div id="app"></div>' });
+      if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<div id="main"><div id="app"></div><div id="tp-foot"></div></div>' });
       if (url.pathname.startsWith('/fonts/')) return route.fulfill({ body: fs.readFileSync(`web${url.pathname}`) });
       if (url.pathname === '/state') return route.fulfill({ json: state });
       if (url.pathname.endsWith('/resources')) return route.fulfill({ json: resources });
+      if (url.pathname.endsWith('/selection')) {
+        expect(route.request().method()).toBe('PUT');
+        resources[0].excluded = route.request().postDataJSON().excluded;
+        resourceDecisions.push(resources[0].excluded ? 'exclude' : 'include');
+        return route.fulfill({ json: { resourceId: 'resource', excluded: resources[0].excluded } });
+      }
+      if (url.pathname.endsWith('/attempts')) return route.fulfill({ json: {} });
+      if (url.pathname.endsWith('/signal')) {
+        expect(route.request().postDataJSON().signal).toBe('confirm');
+        resourceDecisions.push('confirm');
+        resources[0].candidate.state = resources[0].excluded ? 'discarded' : 'adopted';
+        return route.fulfill({ json: {} });
+      }
       if (url.pathname.endsWith('/adopt')) {
+        resourceDecisions.push('adopt');
         resources[0].candidate.state = 'adopted';
         return route.fulfill({ json: {} });
       }
@@ -62,6 +77,10 @@ it('resolves approvals and resource decisions inside the real check-in DOM', asy
           Object.assign(S, await (await fetch('/state')).json());
           patchTaskPage(document.getElementById('app'), checkinTab(S.view));
           wireTaskApprovalRequests(S.view);
+          if (S.showResourceReview) {
+            document.querySelector('.thread').insertAdjacentHTML('beforeend', resourceReviewPlaceholder());
+            await wireResourceReview(S.view);
+          }
         };
       `);
       await w.eval('refreshTask()');
@@ -75,12 +94,35 @@ it('resolves approvals and resource decisions inside the real check-in DOM', asy
     expect(decisions).toEqual(['once', 'deny', 'approve']);
     expect(await page.locator('#ck-thread').count()).toBe(1);
     await page.evaluate(() => (globalThis as any).eval(`
+      S.showResourceReview = true;
       document.querySelector('.thread').insertAdjacentHTML('beforeend', resourceReviewPlaceholder());
       wireResourceReview(S.view);
     `));
     page.on('dialog', dialog => dialog.accept());
-    await page.locator('.candidate-adopt').click();
+    if (automaticReview) {
+      await page.getByRole('button', { name: 'Exclude Dataset', exact: true }).click();
+      await page.getByRole('button', { name: 'Include Dataset', exact: true }).waitFor();
+      expect(resources[0].candidate.state).toBe('pending');
+      expect(resources[0].excluded).toBe(true);
+      // A normal task repaint retains the saved decision and its undo control.
+      await page.evaluate(() => (globalThis as any).eval('refreshTask()'));
+      await page.getByRole('button', { name: 'Include Dataset', exact: true }).click();
+      await page.getByRole('button', { name: 'Exclude Dataset', exact: true }).waitFor();
+      expect(resources[0].excluded).toBe(false);
+      expect(resources[0].candidate.state).toBe('pending');
+      await page.evaluate(() => (globalThis as any).eval(`
+        S.view.actions = [{ name: 'confirm', label: 'Confirm', kind: 'signal', enabled: true }];
+        document.getElementById('tp-foot').innerHTML = taskActions(S.view);
+        wireActions(S.view);
+      `));
+      await page.locator('[data-act="confirm"]').click();
+      await expect.poll(() => resources[0].candidate.state).toBe('adopted');
+      await page.evaluate(() => (globalThis as any).eval('wireResourceReview(S.view, true)'));
+    } else {
+      await page.locator('.resource-legacy[data-action="adopt"]').click();
+    }
     await page.locator('#review-resources.hidden').waitFor({ state: 'attached' });
+    expect(resourceDecisions).toEqual(automaticReview ? ['exclude', 'include', 'confirm'] : ['adopt']);
     expect(await page.locator('#review-resources').innerText()).toBe('');
     // A decision made elsewhere must also clear after a normal refreshed render.
     state.permissionRequests[0]!.status = 'pending';

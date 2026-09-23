@@ -8367,6 +8367,10 @@ async function wireResourceReview(v, force = false) {
       try {
         await api(`/api/tasks/${encodeURIComponent(v.taskId)}/${route}/${button.dataset.action}`, { method: 'POST' });
         button.closest('.resource-review-row').remove();
+        if (!wrap.querySelector('.resource-review-row')) {
+          wrap.classList.add('hidden');
+          wrap.innerHTML = '';
+        }
         resourceReviewCache.delete(v.taskId);
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));

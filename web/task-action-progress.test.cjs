@@ -12,6 +12,7 @@ test('task buttons acknowledge immediately, prevent repeated requests, and recov
       addEventListener: (_event, handler) => { click = handler; } };
     const feedback = [], toasts = [];
     const context = vm.createContext({
+      resourceChoiceWrites: new Map(),
       $: selector => ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
       confirmTaskAction: () => true,
       beginActionFeedback: control => { assert.equal(control, btn); feedback.push('start'); return 'ticket'; },
@@ -28,7 +29,7 @@ test('task buttons acknowledge immediately, prevent repeated requests, and recov
       reflectAcceptedTaskAction() {}, toast: message => toasts.push(message),
       setTimeout() {}, refreshTask() {}, refreshTasks() {},
     });
-    vm.runInContext([fn('actionToast'), fn('otherAttemptsConfirmation'), fn('wireActions')].join('\n'), context);
+    vm.runInContext([fn('actionToast'), fn('waitResourceChoices'), fn('otherAttemptsConfirmation'), fn('wireActions')].join('\n'), context);
     context.wireActions({ taskId: 'task' });
     const pending = click();
     assert.deepEqual(feedback, ['start']);
@@ -52,6 +53,7 @@ test('pending attempt choice prevents repeated clicks and dismissing it never co
       addEventListener: (_event, handler) => { click = handler; } };
     const feedback = [], requests = [], toasts = [];
     const context = vm.createContext({
+      resourceChoiceWrites: new Map(),
       $: selector => ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
       confirmTaskAction: () => true,
       otherAttemptsConfirmation: () => { choices++; return new Promise(resolve => { choose = resolve; }); },
@@ -61,7 +63,7 @@ test('pending attempt choice prevents repeated clicks and dismissing it never co
       reflectAcceptedTaskAction() {}, toast: message => toasts.push(message),
       setTimeout() {}, refreshTask() {}, refreshTasks() {},
     });
-    vm.runInContext([fn('actionToast'), fn('wireActions')].join('\n'), context);
+    vm.runInContext([fn('actionToast'), fn('waitResourceChoices'), fn('wireActions')].join('\n'), context);
     context.wireActions({ taskId: 'task' });
     const pending = click();
     assert.equal(btn.disabled, true);
@@ -87,4 +89,36 @@ test('finalization feedback survives rendering a fresh task view', () => {
   assert.match(html, /Saving task output/);
   assert.match(html, /disabled aria-busy="true"/);
   assert.doesNotMatch(html, /data-act=/);
+});
+
+test('confirmation waits for resource saves and recovers without confirming a failed save', async () => {
+  for (const fail of [false, true]) {
+    let click, settle;
+    const writes = new Map();
+    const requests = [], toasts = [];
+    const btn = { disabled: false, dataset: { act: 'confirm', label: 'Confirm' }, innerHTML: 'Confirm',
+      addEventListener: (_event, handler) => { click = handler; } };
+    const promise = new Promise((resolve, reject) => { settle = () => fail ? reject(new Error('Resource save failed')) : resolve(); })
+      .finally(() => writes.delete('task/resource'));
+    writes.set('task/resource', { promise });
+    const context = vm.createContext({
+      resourceChoiceWrites: writes,
+      $: selector => ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
+      confirmTaskAction: () => true, otherAttemptsConfirmation: async () => ({}),
+      beginActionFeedback() {}, finishActionFeedback() {}, reflectAcceptedTaskAction() {},
+      api: async (_url, options) => requests.push(JSON.parse(options.body)),
+      toast: message => toasts.push(message), setTimeout() {}, refreshTask() {}, refreshTasks() {},
+    });
+    vm.runInContext([fn('actionToast'), fn('waitResourceChoices'), fn('wireActions')].join('\n'), context);
+    context.wireActions({ taskId: 'task' });
+    const pending = click();
+    await new Promise(setImmediate);
+    assert.equal(btn.disabled, true);
+    assert.equal(btn.textContent, 'Sending…');
+    assert.deepEqual(requests, []);
+    settle(); await pending;
+    assert.deepEqual(requests, fail ? [] : [{ signal: 'confirm' }]);
+    assert.deepEqual(toasts, [fail ? 'Resource save failed' : 'Confirmed']);
+    assert.equal(btn.disabled, false);
+  }
 });
