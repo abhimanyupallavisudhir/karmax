@@ -5769,13 +5769,13 @@ function wireDepPicker(values, selfId) {
 // Keep the source array intact: it is shared with other credential controls.
 function sortVaultItems(items, selectedIds = new Set(), now = Date.now()) {
   // Same 30-day half-life as src/util/vault-usage.ts. Normalize every score
-  // to one instant so recently used credentials compete with frequent ones.
-  const score = (item) => (item.frecencyScore ?? item.useCount ?? 0)
-    * 2 ** (-Math.max(0, now - (item.frecencyUpdatedAt ?? now)) / (30 * 24 * 60 * 60 * 1000));
+  // to one instant using saved task selections, independently of agent secret accesses.
+  const score = (item) => (item.selectionFrecencyScore ?? 0)
+    * 2 ** (-Math.max(0, now - (item.selectionUpdatedAt ?? now)) / (30 * 24 * 60 * 60 * 1000));
   return [...items].sort((a, b) =>
     Number(selectedIds.has(b.id)) - Number(selectedIds.has(a.id))
     || score(b) - score(a)
-    || (b.lastUsedAt || 0) - (a.lastUsedAt || 0)
+    || (b.lastSelectedAt || 0) - (a.lastSelectedAt || 0)
     || a.label.localeCompare(b.label)
     || a.id.localeCompare(b.id));
 }
@@ -16794,7 +16794,9 @@ async function hydrateOrganizationSubscription(organizationId) {
   const period = state.currentPeriodEnd ? new Date(state.currentPeriodEnd).toLocaleDateString() : '';
   const billedPlan = state.billedPlan || state.plan;
   const hasSubscription = billedPlan !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
-  const seats = billedPlan === 'team'
+  const seats = state.gift?.plan === 'team' && !hasSubscription
+    ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'}`
+    : billedPlan === 'team'
     ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'} · <b>${state.seats}</b> verified billed seat${state.seats === 1 ? '' : 's'}${state.seatDeficit ? ` · <span style="color:var(--danger)">${state.seatDeficit} awaiting reconciliation</span>` : ''}`
     : `<b>${state.activeUsers}</b> of 1 user`;
   const grace = state.access === 'grace' && state.graceEndsAt
@@ -16816,7 +16818,7 @@ async function hydrateOrganizationSubscription(organizationId) {
     + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
       * Number(team.additionalActiveUserAgentRuns || 0);
   const disclosures = S.launch?.checkoutDisclosures || {};
-  const planCards = !hasSubscription ? `<div class="billing-commercial-terms">
+  const planCards = !hasSubscription && !state.gift ? `<div class="billing-commercial-terms">
       <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
       ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
     <div class="settings-grid" style="margin-top:14px">
@@ -16829,12 +16831,40 @@ async function hydrateOrganizationSubscription(organizationId) {
     ? `<button class="btn sm billing-change" data-plan="team" ${ownerDisabled}>Upgrade to Team</button>`
     : billedPlan === 'team' && ['active', 'trialing', 'past_due'].includes(state.status)
       ? `<button class="btn sm billing-change" data-plan="individual" ${downgradeDisabled}>Downgrade to Individual</button>` : '';
-  const effective = state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
-  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[billedPlan] || billedPlan)} <span class="chip">${esc(statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
+  const giftControls = state.canGift ? `<div class="inline-form" style="margin-top:14px">
+    <label for="billing-gift-plan">Gift subscription</label>
+    <select id="billing-gift-plan" aria-label="Gift subscription">${Object.values(catalog).filter(plan => plan.id !== 'free').map(plan => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
+    <button class="btn sm billing-gift" title="Complimentary access until removed. Existing paid billing continues.">${state.gift ? 'Update gift' : 'Gift'}</button>
+    ${state.gift ? '<button class="btn sm billing-gift-remove">Remove gift</button>' : ''}</div>` : '';
+  const giftNotice = state.gift && hasSubscription ? `<div class="member-row"><span><b>${esc(names[state.gift.plan])}</b> <span class="chip">Gifted · no expiry</span></span></div>` : '';
+  const effective = hasSubscription && state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
+  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[hasSubscription ? billedPlan : state.plan] || state.plan)} <span class="chip">${esc(state.gift && !hasSubscription ? 'Gifted · no expiry' : statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
     ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
-    <p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Plan and seat access changes only after a signed billing event is reconciled. ${policyLinks(['billing'])}</p>`;
+    ${!state.gift || hasSubscription ? `<p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Paid plan and seat changes take effect after billing confirmation. ${policyLinks(['billing'])}</p>` : ''}`;
+  const saveGift = async (plan, button) => {
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/gift`, {
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
+      });
+      toast(plan ? 'Subscription gifted' : 'Gift removed');
+      if (S.organizationId !== organizationId) return;
+      await hydrateOrganizationSubscription(organizationId);
+      const entitlements = await api(`/api/organizations/${encodeURIComponent(organizationId)}/entitlements`);
+      if (S.organizationId === organizationId && $('#org-plan')) $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
+    } catch (error) { button.disabled = false; toast(error.message, true); }
+  };
+  box.querySelector('.billing-gift')?.addEventListener('click', event => {
+    const plan = box.querySelector('#billing-gift-plan').value;
+    if (hasSubscription && !confirm(`Gift ${names[plan]} access? Existing paid billing will continue until canceled separately.`)) return;
+    void saveGift(plan, event.currentTarget);
+  });
+  box.querySelector('.billing-gift-remove')?.addEventListener('click', event => {
+    if (!confirm('Remove this gift? Access will return to the paid subscription or Free plan.')) return;
+    void saveGift(null, event.currentTarget);
+  });
   box.querySelectorAll('.billing-checkout').forEach((button) => button.addEventListener('click', async () => {
     button.disabled = true;
     try {
@@ -16968,7 +16998,7 @@ function organizationPlanMarkup(entitlements) {
   const projects = entitlements.unlimitedProjects ? 'Unlimited projects' : `${entitlements.maxProjects} projects`;
   const runs = `${entitlements.maxActiveAgentRuns} active agent run${entitlements.maxActiveAgentRuns === 1 ? '' : 's'}`;
   const monthly = Number(entitlements.currentMonthlyPriceCents || 0) / 100;
-  const price = monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
+  const price = entitlements.gift ? 'Gifted' : monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
   const usage = `${entitlements.activeAgentRuns || 0} active · ${entitlements.queuedAgentRuns || 0} queued`;
   const memberWarning = entitlements.overMemberLimit
     ? `<div class="card" style="padding:10px;border-color:var(--warn);margin:10px 0"><b>Agent runs are paused</b><div class="task-sub">${esc(entitlements.planName)} allows ${esc(entitlements.maxMembers)} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${esc(memberCount)}. Remove ${esc(memberCount - entitlements.maxMembers)} extra member${memberCount - entitlements.maxMembers === 1 ? '' : 's'} in <a href="#settings-people">People &amp; authorization</a>, or restore Team. Running agents may finish; no new agent run will start until this is resolved.</div></div>`

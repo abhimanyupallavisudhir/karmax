@@ -186,6 +186,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/gift$/.test(p)) return 'subscription:gift';
   if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
@@ -2235,6 +2236,7 @@ export class Gateway {
         }
         return this.json(res, 200, {
           ...entitlements,
+          gift: await this.deps.subscriptions?.currentGift(organizationId) ?? null,
           activeUsers,
           currentMonthlyPriceCents: entitlements.plan
             ? hostedMonthlyPriceCents(entitlements.plan, activeUsers)
@@ -2243,7 +2245,7 @@ export class Gateway {
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|gift)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2256,9 +2258,23 @@ export class Gateway {
           const canManage = Boolean(billingUserId
             && (await this.deps.tokens.check(token, 'payment:write', { organizationId })).ok
             && (await store.organizationMembership(organizationId, billingUserId))?.role === 'owner');
-          return this.json(res, 200, { ...(await billing.current(organizationId)), canManage });
+          const canGift = (await this.deps.tokens.check(token, 'subscription:gift', { organizationId })).ok;
+          return this.json(res, 200, { ...(await billing.current(organizationId)), canManage, canGift });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (action === 'gift') {
+          try {
+            const body = await this.body(req);
+            const key = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+            const actor = actorPrincipal(callerIdentity.actor);
+            const result = await billing.gift(organizationId, body.plan, actor, key);
+            await this.deps.authorization?.audit(actor, 'subscription.gift', `organization:${organizationId}`,
+              { plan: body.plan, requestKey: key, ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, result);
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
         // Billing requires payment authority and a verified owner subject,
         // including securely delegated agents.
         const billingSubject = requireHumanSubject(callerIdentity);
@@ -6047,7 +6063,7 @@ export class Gateway {
               policy: (await vault.effectivePolicy(callerTaskId, item)),
             }))));
         }
-        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, (await vault.list()));
+        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, (await vault.listForSelection()));
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
           const saved = (await vault.save({

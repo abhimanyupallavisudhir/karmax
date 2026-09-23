@@ -33,7 +33,7 @@ export const CAPABILITIES = [
   'profile:read', 'profile:write', 'skill:write',
   'diagnostic:read', 'process:read', 'process:kill',
   'credential:read', 'credential:write', 'connection:use', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
-  'settings:read', 'settings:write', 'safe-mode:write',
+  'settings:read', 'settings:write', 'safe-mode:write', 'subscription:gift',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
   // Workflow decisions are discoverable capabilities too. Authorization selects
   // them; workflow state determines when the corresponding action is valid.
@@ -186,6 +186,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     capabilities: [
       ['settings:read', 'View global settings', 'Read global workflow and platform defaults.'],
       ['settings:write', 'Edit global settings', 'Change global workflow and platform defaults.'],
+      ['subscription:gift', 'Gift subscriptions', 'Grant or remove complimentary organization plans.'],
       ['safe-mode:write', 'Control safe mode', 'Enable or disable safe mode.'],
       ['authorization:read', 'View authorization', 'Read profiles, grants, defaults, and the audit log.'],
       ['authorization:write', 'Manage authorization', 'Change profiles, grants, and authorization defaults.'],
