@@ -845,6 +845,18 @@ export class KarmaxApi {
       ? { taskId: caller.taskId } : undefined);
   }
 
+  private async taskCreator(caller: ScopedToken, projectId: string): Promise<PrincipalRef | undefined> {
+    const creator = creatorRefOf(caller);
+    // Legacy unscoped human tokens can predate organization membership. Apply
+    // the same rule to ordinary tasks, recurring runs, and alternate attempts:
+    // never auto-subscribe an outsider merely by recording them as creator.
+    if (creator?.kind === 'user') {
+      const organizationId = (await this.deps.store.getProject(projectId))?.organizationId ?? 'org_personal';
+      if (!(await this.deps.store.organizationMembership(organizationId, creator.userId))) return undefined;
+    }
+    return creator;
+  }
+
   /**
    * Validate each agent resume source, then authorize every
    * `agent:<role>.resumeFrom.taskId` against the **source** task, not just the
@@ -1133,13 +1145,7 @@ export class KarmaxApi {
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
-    const callerRef = creatorRefOf(caller);
-    // A legacy unscoped human token may predate organization membership. Do not
-    // persist it as an organization principal (which would also auto-subscribe
-    // an outsider); claimed/current installations always retain the creator.
-    const createdBy = callerRef?.kind === 'user'
-      && !(await this.deps.store.organizationMembership(project.organizationId ?? 'org_personal', callerRef.userId))
-      ? undefined : callerRef;
+    const createdBy = await this.taskCreator(caller, project.id);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
@@ -2088,7 +2094,7 @@ export class KarmaxApi {
       workflowVersion: series.workflowVersion,
       params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
       parentTaskId: series.parentTaskId,
-      createdBy: creatorRefOf(caller) ?? series.createdBy,
+      createdBy: (await this.taskCreator(caller, series.projectId)) ?? series.createdBy,
       assignee: series.assignee,
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
@@ -2461,7 +2467,7 @@ export class KarmaxApi {
       params: { ...workflowParams, draft: true, archived: false },
       parentTaskId: source.parentTaskId,
       intentId: group.intentId,
-      createdBy: creatorRefOf(caller),
+      createdBy: await this.taskCreator(caller, source.projectId),
       assignee: source.assignee,
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
@@ -5418,7 +5424,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
         _authorization: { ...authorization, principal: caller.principal },
       },
-      createdBy: creatorRefOf(caller),
+      createdBy: await this.taskCreator(caller, project.id),
     }));
     const workflowDelegation = (await this.deps.tokens.delegateHuman(token, {
       taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,

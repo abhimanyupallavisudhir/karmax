@@ -4,6 +4,7 @@ import { ProjectTransfers } from '../src/platform/project-transfer.js';
 import { AuthorizationService, DEFAULT_AUTHORIZATION_PROFILES } from '../src/platform/authorization.js';
 import { beginEnvironmentBuild, finishEnvironmentBuild, ProjectEnvironment } from '../src/store/project-environment.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import previousProfiles from './fixtures/authorization-pre-diagnostics.json';
 
 const stores: Store[] = [];
 afterEach(async () => { for (const store of stores.splice(0)) await store.close(); });
@@ -211,7 +212,9 @@ describe('transfer policy defaults', () => {
 describe('transfer capabilities on existing installations', () => {
   it('upgrades untouched administrator defaults without granting transfer to maintainers', async () => {
     const { store } = (await fixture());
-    const administrator = DEFAULT_AUTHORIZATION_PROFILES.find(p => p.id === 'administrator')!;
+    // Freeze the released profile: deriving history from today's defaults
+    // turns every new capability into an imaginary historical default.
+    const administrator = previousProfiles.find(p => p.id === 'administrator')!;
     (await store.setAuthorizationProfile('global', { ...administrator, capabilities: administrator.capabilities.filter(cap => !cap.startsWith('project:transfer-')) }));
     await AuthorizationService.create(store);
     expect((await store.getAuthorizationProfile('global', 'administrator')).capabilities).toContain('project:transfer-out');
@@ -219,6 +222,11 @@ describe('transfer capabilities on existing installations', () => {
     (await store.setAuthorizationProfile('global', { ...administrator, name: 'Customized', capabilities: ['project:read'] }));
     await AuthorizationService.create(store);
     expect((await store.getAuthorizationProfile('global', 'administrator')).capabilities).toEqual(['project:read']);
+    const current = DEFAULT_AUTHORIZATION_PROFILES.find(p => p.id === 'administrator')!;
+    const narrowed = { ...current, capabilities: current.capabilities.filter(cap => !cap.startsWith('project:transfer-')) };
+    await store.setAuthorizationProfile('global', narrowed);
+    await AuthorizationService.create(store);
+    expect((await store.getAuthorizationProfile('global', 'administrator')).capabilities).toEqual(narrowed.capabilities);
   });
 });
 
