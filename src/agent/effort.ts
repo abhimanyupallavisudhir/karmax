@@ -140,9 +140,13 @@ export function claudeMessagesEffort(model: string | undefined, effort?: string)
  *  the `codex exec` `-c model_reasoning_effort`. Only reasoning models accept it
  *  (non-reasoning models like gpt-4.1/gpt-4o don't). gpt-5.x accepts xhigh; older
  *  reasoning models clamp xhigh/max → high. */
-export function codexReasoningEffort(model: string | undefined, effort?: string): 'low' | 'medium' | 'high' | 'xhigh' | undefined {
+export function codexReasoningEffort(model: string | undefined, effort?: string): Effort | undefined {
   if (!effort || !model) return undefined;
   const m = model.toLowerCase();
+  // GPT-6 supports max without the downgrade required by older Codex models.
+  if (/^gpt-6(?:-|$)/.test(m)) {
+    return ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort) ? effort as Effort : undefined;
+  }
   const isReasoning = /^(o1|o3|o4|gpt-5|codex)/.test(m) || m.includes('reasoning');
   if (!isReasoning) return undefined;
   const xhighOk = /^gpt-5/.test(m); // gpt-5.x support xhigh; o-series top out at high

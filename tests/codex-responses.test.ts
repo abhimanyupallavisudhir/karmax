@@ -55,6 +55,11 @@ describe('CodexAdapter Responses API path (API key)', () => {
   });
   beforeEach(() => { seen = []; queue = []; });
 
+  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])('sends explicit max effort on the Responses rail for %s', async (model) => {
+    await adapter.runTurn(makeInput({ profile: { ...profile, model, effort: 'max' } }) as any, { emit: () => {} } as any);
+    expect(seen[0]).toMatchObject({ model, reasoning: { effort: 'max' } });
+  });
+
   it('sends the system prompt on EVERY call, not just the first', async () => {
     // Regression: `instructions` was sent only when there was no
     // previous_response_id. The Responses API does not carry instructions across

@@ -26,7 +26,9 @@ global.S = {
     }],
   },
 };
-global.MODELS = { claude: ['default', { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }] };
+eval(src.slice(src.indexOf('const MODELS ='), src.indexOf('const agentProviderChoice')).replace('const MODELS =', 'global.MODELS ='));
+global.EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+eval(extractFn('effortLevelsFor'));
 eval(extractFn('modelOptions'));
 eval(extractFn('normalizeComboOption'));
 
@@ -47,6 +49,15 @@ ok(rendered.description.includes('Opus 5'), 'surfaces the concrete model named b
 
 const fallback = normalizeComboOption('default');
 ok(fallback.value === 'default' && fallback.label === 'default', 'continues to support string fallbacks');
+
+S.modelCatalog = {};
+ok(modelOptions('claude').some(m => m.id === 'claude-opus-5-5'), 'offline picker includes Opus 5.5');
+for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
+  ok(modelOptions('codex').includes(model), `offline picker includes ${model}`);
+  ok(effortLevelsFor('codex', model).join() === EFFORT_ORDER.join(), `offline effort control works for ${model}`);
+}
+S.modelCatalog = { codex: [{ id: 'gpt-6-sol', effort: [...EFFORT_ORDER, 'ultra'] }] };
+ok(effortLevelsFor('codex', 'gpt-6-sol').join() === EFFORT_ORDER.join(), 'does not offer upstream effort levels the task schema cannot execute');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
