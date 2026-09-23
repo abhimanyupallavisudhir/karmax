@@ -1,3 +1,4 @@
+import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import {
   proxyActivities,
@@ -371,7 +372,7 @@ async function mergeOnlyImpl(
   await publish();
   // Open a world on the EXISTING branch under review.
   const worldKind = input.project.worldProvider ?? 'worktree';
-  world = (await core.createWorld({ taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
+  world = (await createTaskWorld(core, { taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
   if (leaser) await leaser.init();
 
   // Workflow-repo edits must pass tests + replay-compat before they can merge.

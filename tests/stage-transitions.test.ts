@@ -93,6 +93,17 @@ async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthor
 }
 
 describe('task stage transitions', () => {
+  it('journals accepted cancellation for checkpoint interruption, but not a rejected signal', async () => {
+    const f = await fixture();
+    try {
+      await f.api.signalTask(f.token, f.task.id, 'cancel');
+      expect(await f.store.eventsOfType(f.task.id, 'task.cancel-requested')).toHaveLength(1);
+      vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({ signal: async () => { throw new Error('Temporal unavailable'); } });
+      await expect(f.api.signalTask(f.token, f.task.id, 'cancel')).rejects.toThrow('Temporal unavailable');
+      expect(await f.store.eventsOfType(f.task.id, 'task.cancel-requested')).toHaveLength(1);
+    } finally { await f.store.close(); }
+  });
+
   it('keeps the winning run reachable when an overlapping resume finishes preparing too late', async () => {
     const f = (await fixture());
     (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));

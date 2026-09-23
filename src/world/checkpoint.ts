@@ -302,7 +302,9 @@ export class WorldCheckpointService {
 
   /** Apply saved work to a freshly provisioned, independent task. Never registers
    * a new generation of the source world or reuses its branches/resource leases. */
-  async applyFork(checkpointId: string, world: World, projectId: string): Promise<void> {
+  async applyFork(checkpointId: string, world: World, projectId: string,
+    options: { signal?: AbortSignal } = {}): Promise<void> {
+    options.signal?.throwIfAborted();
     const checkpoint = (await this.store.getWorldCheckpoint(checkpointId));
     if (!checkpoint?.filesystemDelta || checkpoint.projectId !== projectId)
       throw new Error('fork checkpoint is unavailable in this project');
@@ -313,6 +315,7 @@ export class WorldCheckpointService {
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     const destinations = new Map<string, WorldRepo>();
     for (const repo of checkpoint.repos) {
+      options.signal?.throwIfAborted();
       const destination = worldRepos(world.handle).find((candidate) =>
         repo.source && sameRepository(worldRepoSource(candidate), repo.source)
         && (repo.checkoutPath === '.' || candidate.name === repo.checkoutPath));
@@ -326,6 +329,7 @@ export class WorldCheckpointService {
       if (checkpoint.repos.length === 1) for (const file of delta.files) destinations.set(file.repo, destination);
     }
     for (const file of delta.files) {
+      options.signal?.throwIfAborted();
       const repo = destinations.get(file.repo);
       const plain = checkpoint.repos.length === 0 && file.repo === '' && worldRepos(world.handle).length === 0;
       if ((!repo && !plain) || !safeDeltaPath(file.path)) throw new Error('invalid fork delta path');
@@ -339,6 +343,7 @@ export class WorldCheckpointService {
         else await world.writeFile(relative, content.toString('utf8'));
       }
     }
+    options.signal?.throwIfAborted();
   }
 
   private async key(): Promise<Buffer> {
