@@ -232,7 +232,7 @@ describe('cloud Git broker', () => {
     const mergedHead = (await git(child, ['rev-parse', 'HEAD'])).stdout.trim();
     expect(mergedHead).not.toBe(parentHead);
 
-    expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+    expect(await brokerPublishBranch(world, env, { source: parentHead })).toEqual({ pushed: ['source'], skipped: [] });
     expect((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(mergedHead);
     expect(fs.readFileSync(path.join(world.handle.root, 'child.txt'), 'utf8')).toBe('approved child work\n');
     expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(mergedHead);
@@ -271,6 +271,22 @@ describe('cloud Git broker', () => {
     const record = (repo: { name: string }, head: string) => { observed[repo.name] = head; };
     expect(await brokerPublishBranch(world, env, observed, record)).toEqual({ pushed: ['source'], skipped: [] });
     expect(observed).toEqual({ source: firstHead });
+
+    // An unchanged published tip is verified at origin without exporting the
+    // sandbox branch again. Dirty files remain the checkpoint layer's concern.
+    const exec = vi.spyOn(world, 'exec');
+    await world.writeFile('uncommitted.txt', 'retain me in the filesystem checkpoint');
+    expect(await brokerPublishBranch(world, env, observed, record)).toEqual({ pushed: ['source'], skipped: [] });
+    expect(exec.mock.calls.some(([command, args]) => command === 'git' && args?.includes('bundle'))).toBe(false);
+    expect(await world.readFile('uncommitted.txt')).toContain('retain me');
+
+    // A stale local publication record must not hide deletion at origin.
+    await gitOrThrow(remote, ['update-ref', '-d', `refs/heads/${world.handle.branch}`]);
+    exec.mockClear();
+    expect(await brokerPublishBranch(world, env, observed, record)).toEqual({ pushed: ['source'], skipped: [] });
+    expect(exec.mock.calls.some(([command, args]) => command === 'git' && args?.includes('bundle'))).toBe(true);
+    expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(firstHead);
+    exec.mockRestore();
 
     // Model a repair rebase: replace the proposal commit instead of merging the
     // old task branch, making an ordinary push non-fast-forward by design.

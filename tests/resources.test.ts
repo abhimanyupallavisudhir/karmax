@@ -186,6 +186,11 @@ describe('project resources', () => {
     const attachment = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Weights', driver: 'volume@1', target: { kind: 'path', path: 'weights' }, access: 'read',
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
+    for (const expectedBytes of [1, 3]) {
+      await expect(engine.capture(attachment, (async function* () {
+        yield { path: 'short.bin', bytes: expectedBytes, data: Buffer.from('ab') };
+      })())).rejects.toThrow('resource capture size mismatch');
+    }
     const bytes = Buffer.alloc(9 * 1024 * 1024 + 19, 0x71);
     const captured = await engine.capture(attachment, (async function* () {
       yield { path: 'model.bin', data: (async function* () {
@@ -197,9 +202,46 @@ describe('project resources', () => {
     await engine.restore(revision, async (_path, chunk) => { restored.push(chunk); });
     expect(crypto.createHash('sha256').update(Buffer.concat(restored)).digest('hex'))
       .toBe(crypto.createHash('sha256').update(bytes).digest('hex'));
+    expect(restored.map(chunk => chunk.length)).toEqual([8 * 1024 * 1024, 1024 * 1024 + 19]);
+    const cancellation = new AbortController();
+    let writes = 0;
+    await expect(engine.restore(revision, async () => {
+      writes++; cancellation.abort(new Error('stop restoring'));
+    }, { signal: cancellation.signal })).rejects.toThrow('stop restoring');
+    expect(writes).toBe(1);
     await resources.deleteAttachment(attachment.id);
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('bounds independent restore writes and settles them before returning cancellation', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-cancel-'));
+    const store = await Store.create(':memory:');
+    try {
+      const project = await store.createProject('Restore cancellation');
+      const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+      const engine = new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker);
+      new ProjectResourceService(store, new WorldRegistry(), engine, broker);
+      const attachment = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        name: 'Files', driver: 'volume@1', target: { kind: 'path', path: 'files' }, access: 'read',
+        isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+      const captured = await engine.capture(attachment, (async function* () {
+        for (let i = 0; i < 8; i++) yield { path: `${i}.txt`, data: Buffer.from(String(i)) };
+      })());
+      const revision = await store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...captured, metadata: {} });
+      const cancellation = new AbortController();
+      let finish!: () => void;
+      const gate = new Promise<void>(resolve => { finish = resolve; });
+      let writes = 0, settled = 0;
+      await expect(engine.restore(revision, async () => {
+        writes++;
+        if (writes === 4) { cancellation.abort(new Error('cancel batch')); finish(); }
+        await gate;
+        settled++;
+      }, { signal: cancellation.signal })).rejects.toThrow('cancel batch');
+      expect(writes).toBe(4);
+      expect(settled).toBe(4);
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('stages a task-created ignored dataset and adopts it after the world is gone', async () => {
