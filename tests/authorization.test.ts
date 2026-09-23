@@ -72,7 +72,7 @@ describe('durable authorization policy', () => {
       level: 'developer', scope: 'projects', projectIds: [one.id, two.id],
     }));
     expect(projects).toMatchObject({ level: 'developer', scope: 'projects', projectIds: [one.id, two.id], attenuated: false });
-    expect(projects.capabilities).toContain('task:*');
+    expect(projects.capabilities).toContain('task:manage-own');
 
     const wholeOrg = (await authz.taskGrant('user:maintainer', one.id, {
       level: 'maintainer', scope: 'organization',
@@ -236,7 +236,7 @@ describe('durable authorization policy', () => {
     (await store.removeProjectMembership(project.id, { kind: 'team', teamId: team.id }));
     (await store.setProjectMembership(project.id, { kind: 'organization', organizationId: organization.id }, 'administrator'));
     expect(allows((await authz.capabilities('user:alice', project.id)), 'project:settings:write')).toBe(true);
-    expect(allows((await authz.capabilities('user:alice', project.id)), 'project:delete')).toBe(false);
+    expect(allows((await authz.capabilities('user:alice', project.id)), 'project:delete')).toBe(true);
   });
 
   it('accepts the workflow-role capabilities exposed by the checklist', async () => {

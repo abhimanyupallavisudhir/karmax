@@ -1,6 +1,6 @@
 import { roleCeiling } from '../src/contrib/manifests.js';
 import { CAPABILITIES, allows } from '../src/platform/capabilities.js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,11 +17,12 @@ import { KarmaxBus } from '../src/contrib/bus.js';
 import { ContributionRegistry } from '../src/contrib/registry.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import * as processes from '../src/util/processes.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
 let nextPort = 49_900;
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe('human and agent authorization-level parity', () => {
   it.each(DEFAULT_AUTHORIZATION_PROFILES)('$name has the same HTTP authority for both actors', async (profile) => {
@@ -30,6 +31,18 @@ describe('human and agent authorization-level parity', () => {
     (await store.claimPersonalOrganization('me'));
     const project = (await store.createProject('Parity'));
     (await store.kvSet(`avatars:project:${project.id}`, 'enabled'));
+    const siblingProject = await store.createProject('Sibling');
+    const foreignOrg = await store.createOrganization({ name: 'Foreign' });
+    const foreignProject = await store.createProject('Foreign', {}, foreignOrg.id);
+    const taskIds: string[] = [];
+    for (const p of [project, siblingProject, foreignProject]) taskIds.push((await store.createTask({
+      projectId: p.id, title: p.name, workflow: 'just-do', workflowVersion: '1', params: { prompt: p.name, draft: true },
+    })).id);
+    vi.spyOn(processes, 'sampleProcesses').mockReturnValue({ supported: true, ts: Date.now(),
+      groups: taskIds.map((taskId, i) => ({ key: String(i), kind: 'agent', label: `Task ${i}`, taskId,
+        cpuPct: 1, rssMb: 2, procs: [{ pid: i + 100, ppid: 1, cmd: `task ${i}`, cpuPct: 1, rssMb: 2, ageSec: 3 }] })),
+      totals: { procs: 3, cpuPct: 3, rssMb: 6 },
+    });
     const tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
@@ -85,6 +98,11 @@ describe('human and agent authorization-level parity', () => {
         [await call('POST', `/api/projects/${project.id}/secrets`, { name: `KEY_${kind.toUpperCase()}`, value: 'test-key' }), projectWrite ? 200 : 403],
         [await call('GET', '/api/vault/items'), orgAdmin || profile.id === 'developer' || profile.id === 'maintainer' ? 200 : 403],
         [await call('DELETE', '/api/vault/items/nonexistent'), orgAdmin ? 200 : 403],
+        [await call('GET', `/api/diagnostics?projectId=${project.id}`), profile.id === 'viewer' ? 403 : 200],
+        [await call('GET', `/api/processes?projectId=${project.id}`), profile.id === 'viewer' ? 403 : 200],
+        [await call('PUT', `/api/organizations/${project.organizationId}/settings/__common__`, { values: { test: true } }), orgAdmin ? 200 : 403],
+        [await call('PUT', `/api/settings/project/${project.id}/__common__`, { values: { test: true } }), projectWrite ? 200 : 403],
+        [await call('PUT', '/api/settings/global/__common__', { values: { test: true } }), profile.id === 'god' ? 200 : 403],
         [await call('GET', '/api/users'), profile.id === 'god' ? 200 : 403],
         [await call('POST', '/api/users', { name: 'New account' }), profile.id === 'god' ? 400 : 403],
         [await call('POST', `/api/projects/${project.id}/avatars`, { name: `Helper ${kind}`,
@@ -95,6 +113,20 @@ describe('human and agent authorization-level parity', () => {
         [await call('GET', '/api/user/default-organization'), 200],
         [await call('GET', `/api/inbox?organizationId=${project.organizationId}`), 200],
       ];
+      if (profile.id !== 'viewer') {
+        const diagnostics: any = await (await call('GET', `/api/diagnostics?projectId=${project.id}`)).json();
+        expect(diagnostics.host).toBeDefined();
+        expect(diagnostics.runtimeLifecycle).toEqual([]);
+        expect(diagnostics.controlPlane).toBeUndefined();
+        const processes: any = await (await call('GET', `/api/processes?projectId=${project.id}`)).json();
+        expect(processes.groups.map((group: any) => group.taskId)).toEqual([taskIds[0]]);
+        expect(processes.totals).toEqual({ procs: 1, cpuPct: 1, rssMb: 2 });
+        expect(processes.canKill).toBe(false);
+        const unfiltered: any = await (await call('GET', '/api/processes')).json();
+        expect(unfiltered.groups.map((group: any) => group.taskId)).toEqual(
+          profile.id === 'god' ? taskIds : profile.id === 'administrator' ? taskIds.slice(0, 2) : taskIds.slice(0, 1));
+        expect(unfiltered.canKill).toBe(profile.id === 'god');
+      }
       for (const [response, expected] of checks) {
         expect(response.status, `${profile.id} ${kind}: ${response.url}: ${await response.text()}`).toBe(expected);
       }
@@ -113,4 +145,53 @@ describe('human and agent authorization-level parity', () => {
     }
 
   });
+});
+
+it('enforces Developer ownership through HTTP and records the agent as creator', async () => {
+  const store = await Store.create(':memory:');
+  await store.claimPersonalOrganization('me');
+  const project = await store.createProject('Ownership');
+  const tokens = new TokenAuthority(store);
+  const worlds = new WorldRegistry();
+  const client = { workflow: { getHandle: () => ({}) } } as any;
+  const api = new KarmaxApi({ store, tokens, client, worlds, taskQueue: 'test' });
+  const gateway = await Gateway.create({ api, store, tokens, client, worlds, taskQueue: 'test',
+    staticDir: 'web', bus: new KarmaxBus(), contributions: new ContributionRegistry(),
+    overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'ownership test' } });
+  const server = await gateway.listen(await findFreePortFrom(nextPort += 10));
+  cleanups.push(async () => { await server.close(); await store.close(); });
+  const makeTask = (title: string) => store.createTask({ projectId: project.id, title,
+    workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: title, draft: true },
+    createdBy: { kind: 'user', userId: 'me' } });
+  const own = await makeTask('Own');
+  const sibling = await makeTask('Same human, different agent');
+  const caps = DEFAULT_AUTHORIZATION_PROFILES.find(p => p.id === 'developer')!.capabilities;
+  const agent = await tokens.mint({ taskId: own.id, principal: 'user:me', profileId: 'developer',
+    projectId: project.id, organizationId: project.organizationId, ceiling: caps, grantorCaps: ['*'] });
+  const human = await tokens.mintPrincipal('user:me', caps, project.id, undefined, project.organizationId);
+  const call = (token: string, method: string, route: string, body?: unknown) => fetch(`${server.url}${route}`, {
+    method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const setPriority = (token: string, taskId: string) => call(token, 'PUT', `/api/tasks/${taskId}/priority`, { priority: 2 });
+  expect((await setPriority(agent.token, own.id)).status).toBe(200);
+  expect((await setPriority(agent.token, sibling.id)).status).toBe(403);
+  expect((await setPriority(human.token, sibling.id)).status).toBe(200);
+  const created = await call(agent.token, 'POST', `/api/projects/${project.id}/tasks`, { projectId: project.id,
+    title: 'Created by agent', prompt: 'Help', workflow: 'just-do', draft: true });
+  const task: any = await created.json();
+  expect(created.status, JSON.stringify(task)).toBe(200);
+  expect((await store.getTask(task.id))?.createdBy).toEqual({ kind: 'task-agent', taskId: own.id, role: 'do' });
+  expect((await setPriority(agent.token, task.id)).status).toBe(200);
+  // Task-bound operations must reach their domain checks with own-task authority.
+  await expect(api.publishTaskBranch(agent.token)).rejects.toThrow('no recoverable world');
+  const publish = await call(agent.token, 'POST', '/api/agent/git/publish');
+  expect(await publish.text()).toContain('no recoverable world');
+  const proposal = await call(agent.token, 'POST', '/api/agent/resource-candidates', {});
+  expect(await proposal.text()).toContain('project resources are unavailable');
+  const request = await call(agent.token, 'POST', '/api/agent/collaboration/request',
+    { taskId: sibling.id, action: 'publish_branch' });
+  expect(request.status).toBe(403);
+
+  expect((await call(agent.token, 'PUT', `/api/settings/project/${project.id}/__common__`, { values: {} })).status).toBe(403);
 });

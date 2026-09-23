@@ -1858,7 +1858,13 @@ export class Gateway {
     // below require the same verified account subject for browsers and delegates.
     const required = capabilityForRequest(method, p, url);
     if (required) {
-      const scope = requestedScope;
+      // These endpoints operate on the authenticated calling task. Collaboration
+      // additionally authorizes its target in the service after parsing the body.
+      const callingTaskRoute = p === '/api/agent/git/publish'
+        || p === '/api/agent/resource-candidates' || p === '/api/agent/collaboration/request'
+        || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p);
+      const scope = callingTaskRoute && authRecord.taskId && authRecord.taskId !== '*'
+        ? { ...requestedScope, taskId: authRecord.taskId } : requestedScope;
       const checked = (await this.deps.tokens.check(token, required, scope));
       // The project collection has no single scope. A project-only human may
       // enter it when at least one project grant permits discovery; the response
@@ -1881,7 +1887,11 @@ export class Gateway {
         (await this.deps.authorization?.audit(principal, `http.denied.${required}`, auditScope,
           { path: p, method, reason: checked.reason ?? `missing capability ${required}`,
             ...identityAuditDetail(auditedIdentity) }));
-        return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
+        const error = ['settings:read', 'settings:write'].includes(required)
+          && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
+          ? 'This endpoint configures the shared installation and requires global authority (God). Use /api/organizations/:id/settings/:workflow or /api/settings/project/:id/:workflow for your authorized scope.'
+          : checked.reason ?? `missing capability ${required}`;
+        return this.json(res, 403, { error });
       }
       if (checked.ok && checked.record) {
         authRecord = checked.record;
@@ -3001,6 +3011,8 @@ export class Gateway {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         const { runtimeAuditTrail } = await import('../util/runtime-lifecycle.js');
         const safety = agentSlotStats();
+        const scoped = !!(authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length
+          || requestedScope.organizationId || requestedScope.projectId);
         // The panel needs only counts. `agentQueueView` is bound to `queue:read`
         // (it is a queue surface), so a principal holding `diagnostic:read`
         // alone still gets host stats rather than a blanket 403.
@@ -3011,8 +3023,8 @@ export class Gateway {
         return this.json(res, 200, {
           host: hostStats(),
           agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
-          controlPlane: (await store.operationalSnapshot()),
-          runtimeLifecycle: (await runtimeAuditTrail(store)),
+          ...(scoped ? {} : { controlPlane: await store.operationalSnapshot() }),
+          runtimeLifecycle: scoped ? [] : await runtimeAuditTrail(store),
           providers: this.deps.worlds.catalog(),
           ts: Date.now(),
         });
@@ -3038,7 +3050,22 @@ export class Gateway {
       // src/util/processes.ts for the coverage model.
       if (p === '/api/processes' && method === 'GET') {
         const { sampleProcesses } = await import('../util/processes.js');
-        return this.json(res, 200, sampleProcesses());
+        const sample = sampleProcesses();
+        const scoped = !!(authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length
+          || requestedScope.organizationId || requestedScope.projectId);
+        const groups = scoped ? await __asyncCollections.filter(sample.groups, async (group) => {
+          if (!group.taskId) return false;
+          const projectId = await store.taskProjectIdAsync(group.taskId);
+          if (!projectId || (requestedScope.projectId && requestedScope.projectId !== projectId)) return false;
+          const organizationId = await store.projectOrganizationAsync(projectId);
+          if (requestedScope.organizationId && requestedScope.organizationId !== organizationId) return false;
+          return (await this.deps.tokens.check(token, 'process:read', { projectId, organizationId })).ok;
+        }) : sample.groups;
+        return this.json(res, 200, { ...sample, groups,
+          canKill: !scoped && allows(authRecord.caps, 'process:kill'),
+          totals: groups.reduce((sum, group) => ({ procs: sum.procs + group.procs.length,
+            cpuPct: sum.cpuPct + group.cpuPct, rssMb: sum.rssMb + group.rssMb }), { procs: 0, cpuPct: 0, rssMb: 0 }),
+        });
       }
       if (p === '/api/processes/kill' && method === 'POST') {
         const b = await this.body(req);
@@ -4891,7 +4918,7 @@ export class Gateway {
             message: b.message ? String(b.message) : undefined,
           }));
         } catch (error) {
-          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+          return this.json(res, error instanceof CapabilityError ? 403 : 409, { error: error instanceof Error ? error.message : String(error) });
         }
       }
       const collaborationCancel = p.match(/^\/api\/agent\/collaboration\/([^/]+)\/cancel$/);
@@ -4899,7 +4926,7 @@ export class Gateway {
         try {
           return this.json(res, 200, await api.cancelAgentAction(token, collaborationCancel[1]!));
         } catch (error) {
-          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+          return this.json(res, error instanceof CapabilityError ? 403 : 409, { error: error instanceof Error ? error.message : String(error) });
         }
       }
       const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
@@ -7284,7 +7311,8 @@ export class Gateway {
         const caps = authRecord?.caps ?? (session.userId
           ? (await this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, dashOrg)) ?? []
           : []);
-        return this.json(res, 200, await this.dashboard(dashOrg, allows(caps, 'diagnostic:read')));
+        return this.json(res, 200, await this.dashboard(dashOrg, allows(caps, 'diagnostic:read')
+          && !authRecord.organizationId && !authRecord.projectId && !authRecord.projectIds?.length));
       }
 
       // safe mode toggle

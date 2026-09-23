@@ -1531,8 +1531,8 @@ function normalizeComboOption(option) {
 function authorizationLevels() {
   return [
     { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', description: 'Create and manage tasks, work with agents, publish branches, and save skills in the selected scope.', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', description: 'Developer access plus project settings, queues, teams, repositories, and GitHub Actions in the selected scope.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'developer', description: 'Read diagnostics, create tasks, and manage your own work and its descendants.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Manage all tasks, reviews, settings, and automation in the selected projects.', name: 'Project maintainer', scope: 'selectable' },
     { id: 'administrator', description: 'Manage this organization, including projects, members, credentials, and payments.', name: 'Administrator', scope: 'organization' },
     { id: 'god', description: 'Unrestricted access across every organization and the installation, including global settings and authorization.', name: 'God', scope: 'global' },
     ...(typeof S !== 'undefined' && S.authorizationCatalogOrganization === S.organizationId ? (S.authorizationCatalog?.profiles || []).filter((role) => role.scopeKey === `organization:${S.organizationId}`).map((role) => ({ ...role, scope: 'selectable' })) : []),
@@ -11028,11 +11028,18 @@ function hostDiagHtml(diag) {
 
 // Live-refresh just the host panel every 5s while the Dashboard is open. Self-
 // terminates (no reschedule) once the tab changes or the element is gone.
+function diagnosticsPath(surface) {
+  if (S.installationAccess) return `/api/${surface}`;
+  const scope = S.projectId ? `projectId=${encodeURIComponent(S.projectId)}`
+    : `organizationId=${encodeURIComponent(S.organizationId || 'org_personal')}`;
+  return `/api/${surface}?${scope}`;
+}
+
 async function refreshHostDiag() {
   if (S.tab !== 'dashboard' || !$('#host-diag')) return;
   const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
-  try { diag = await api('/api/diagnostics'); } catch {}
+  try { diag = await api(diagnosticsPath('diagnostics')); } catch {}
   if (S.hostDiagEpoch !== epoch) return;
   const el = $('#host-diag');
   if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
@@ -11065,7 +11072,7 @@ function procPanelHtml(sample) {
   // infrastructure — karmax itself + Temporal — is running).
   const LOCK = `<span class="proc-lock" title="Protected — ${siteNameMarkup()} can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
   const killBtn = (pid, label, killable) =>
-    killable
+    sample.canKill === false ? '' : killable
       ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
       : LOCK;
   const rows = (sample.groups || [])
@@ -11076,7 +11083,7 @@ function procPanelHtml(sample) {
         : '';
       // A group is killable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
-      const rootKillable = !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
+      const rootKillable = sample.canKill !== false && !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
       const head = `<tr class="proc-group">
         <td class="cmd">${esc(g.label)} ${kindChip}${taskChip}</td>
         <td class="mono num">${g.procs.length}</td>
@@ -11106,7 +11113,7 @@ function procPanelHtml(sample) {
       <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (${siteNameMarkup()} core &amp; Temporal); everything else gets a ✕ kill button</div>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()}</div>
   </div>`;
 }
 
@@ -11135,7 +11142,7 @@ async function refreshProcPanel(now = false) {
   clearTimeout(S.procTimer);
   const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
-  try { sample = await api('/api/processes'); } catch {}
+  try { sample = await api(diagnosticsPath('processes')); } catch {}
   if (S.procLoadEpoch !== epoch) return;
   const el = $('#proc-panel');
   if (el && S.tab === 'dashboard') {
@@ -11153,18 +11160,16 @@ async function renderDashboard() {
     const organizationId = S.organizationId || 'org_personal';
     const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
     // The dashboard is org-scoped (counts for THIS organization). Host panels
-    // (diagnostics, processes, agent-account leasing) are operator-only; a
-    // non-operator's /api/diagnostics returns null and those panels are hidden,
-    // so a regular member — e.g. a fresh personal workspace — sees a clean
-    // overview instead of a "missing capability diagnostic:read" error.
+    // expose read-only health to developers; process rows stay in scope and
+    // mutation controls follow the response's authority flags.
     const [d, u, credentialData, diag] = await Promise.all([
       api(`/api/dashboard?organizationId=${encodeURIComponent(organizationId)}`),
       api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
       api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
-      api('/api/diagnostics').catch(() => null),
+      api(diagnosticsPath('diagnostics')).catch(() => null),
     ]);
     if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
-    const isOperator = !!diag; // /api/diagnostics needs diagnostic:read
+    const hasDiagnostics = !!diag;
     const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
     const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
@@ -11177,10 +11182,10 @@ async function renderDashboard() {
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(stageLabel({ stage: s }))}</div></div>`).join('')}
       </div>
       ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use the <b>+</b> next to <b>Projects</b> in the sidebar to create your first one.</div>` : ''}
-      ${!isOperator ? '' : `
+      ${!hasDiagnostics ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
-      <div class="section-h">Processes — everything ${siteNameMarkup()} is running</div>
+      <div class="section-h">Processes</div>
       <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
@@ -11261,9 +11266,9 @@ async function renderDashboard() {
     }));
     // Keep the host panel live without re-rendering (and disrupting focus on) the
     // accounts section; single pending timer (cleared here and inside the loop).
-    // Operator-only panels — skip the polling entirely for members who can't see them.
+    // Skip polling when the caller cannot read diagnostics.
     clearTimeout(S.hostDiagTimer);
-    if (isOperator) {
+    if (hasDiagnostics) {
       S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
       refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
     }

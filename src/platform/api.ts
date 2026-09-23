@@ -147,6 +147,12 @@ function principalRefOf(principal: string, kind?: 'agent' | 'human' | 'system'):
   return kind === 'human' ? { kind: 'user', userId: principal } : undefined;
 }
 
+function creatorRefOf(caller: ScopedToken): PrincipalRef | undefined {
+  return caller.taskId && caller.taskId !== '*'
+    ? { kind: 'task-agent', taskId: caller.taskId, role: caller.role ?? 'do' }
+    : principalRefOf(caller.principal, caller.kind);
+}
+
 /** Deepest cause message — unwraps Temporal's WorkflowUpdateFailedError → the
  *  validator's ApplicationFailure so the user sees the real "why". */
 function unwrapCause(e: unknown): string {
@@ -373,7 +379,7 @@ export class KarmaxApi {
   }
 
   private async collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
-    const caller = (await this.require(token, tool));
+    const caller = await this.requireCallingTask(token, tool);
     if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
     const task = (await this.deps.store.getTask(caller.taskId));
     if (!task) throw new Error('calling task not found');
@@ -462,7 +468,7 @@ export class KarmaxApi {
   }
 
   private async collaborationCaller(token: string) {
-    const caller = (await this.require(token, 'request_agent_action'));
+    const caller = await this.requireCallingTask(token, 'request_agent_action');
     if (!caller.taskId || caller.taskId === '*')
       throw new CapabilityError('request_agent_action requires a task-agent token');
     const task = (await this.deps.store.getTask(caller.taskId));
@@ -482,6 +488,7 @@ export class KarmaxApi {
     message?: string;
   }): Promise<CollaborationRequest> {
     const requester = (await this.collaborationCaller(token));
+    await this.require(token, 'request_agent_action', { taskId: input.taskId });
     const target = (await this.deps.store.getTask(input.taskId));
     if (!target || target.projectId !== requester.projectId)
       throw new Error('target task must belong to the same project');
@@ -627,7 +634,7 @@ export class KarmaxApi {
     access?: ResourceAccess;
     publish?: 'discard' | 'review';
   }) {
-    const caller = (await this.require(token, 'propose_project_resource'));
+    const caller = await this.requireCallingTask(token, 'propose_project_resource');
     if (!caller.taskId || caller.taskId === '*') throw new CapabilityError('propose_project_resource requires a task-agent token');
     if (!this.deps.resources) throw new Error('project resources are unavailable');
     const task = (await this.deps.store.getTask(caller.taskId));
@@ -829,6 +836,13 @@ export class KarmaxApi {
     const r = (await this.deps.tokens.check(token, cap, scope));
     if (!r.ok) throw new CapabilityError(r.reason ?? `denied: ${cap}`);
     return r.record!;
+  }
+
+  /** Only operations that act on the calling task may infer their object scope. */
+  private async requireCallingTask(token: string, tool: string) {
+    const caller = await this.deps.tokens.verify(token);
+    return this.require(token, tool, caller?.taskId && caller.taskId !== '*'
+      ? { taskId: caller.taskId } : undefined);
   }
 
   /**
@@ -1119,7 +1133,7 @@ export class KarmaxApi {
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
-    const callerRef = principalRefOf(caller.principal, caller.kind);
+    const callerRef = creatorRefOf(caller);
     // A legacy unscoped human token may predate organization membership. Do not
     // persist it as an organization principal (which would also auto-subscribe
     // an outsider); claimed/current installations always retain the creator.
@@ -2074,7 +2088,7 @@ export class KarmaxApi {
       workflowVersion: series.workflowVersion,
       params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
       parentTaskId: series.parentTaskId,
-      createdBy: principalRefOf(caller.principal) ?? series.createdBy,
+      createdBy: creatorRefOf(caller) ?? series.createdBy,
       assignee: series.assignee,
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
@@ -2424,6 +2438,7 @@ export class KarmaxApi {
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
   async addAttempt(token: string, sourceTaskId: string): Promise<TaskRecord> {
+    await this.require(token, 'task:edit', { taskId: sourceTaskId });
     const source = (await this.deps.store.getTask(sourceTaskId));
     const caller = (await this.require(token, 'create_task', { projectId: source?.projectId, taskId: sourceTaskId }));
     if (!source) throw new NotFoundError(`no task ${sourceTaskId}`);
@@ -2446,7 +2461,7 @@ export class KarmaxApi {
       params: { ...workflowParams, draft: true, archived: false },
       parentTaskId: source.parentTaskId,
       intentId: group.intentId,
-      createdBy: source.createdBy,
+      createdBy: creatorRefOf(caller),
       assignee: source.assignee,
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
@@ -5403,7 +5418,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
         _authorization: { ...authorization, principal: caller.principal },
       },
-      createdBy: principalRefOf(caller.principal),
+      createdBy: creatorRefOf(caller),
     }));
     const workflowDelegation = (await this.deps.tokens.delegateHuman(token, {
       taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,

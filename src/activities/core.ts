@@ -85,7 +85,7 @@ import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
-import { allows, attenuate } from '../platform/capabilities.js';
+import { allows, attenuate, CHILD_TASK_CAPABILITIES } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
   type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority } from '../domain/types.js';
 import { newId } from '../util/id.js';
@@ -4946,11 +4946,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // branch (which the parent owns and merges into). If no branch is known,
       // the child gets no merge capability — never a broad fallback.
       const delegation = attenuate(
-        [
-          'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
-          'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
-          'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
-        ],
+        CHILD_TASK_CAPABILITIES,
         args.parentGrant ?? DEFAULT_GRANT,
       );
       const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)
