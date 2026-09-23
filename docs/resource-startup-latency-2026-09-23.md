@@ -12,7 +12,8 @@ and resource restoration, and checks cancellation before registering/publishing
 its world. Failed provisioning releases resources using the actual live world,
 not a reopened handle that might resolve to a different generation.
 
-Resource restoration transfers at most four independent files concurrently,
+Resource restoration uses four continuously occupied workers for independent files,
+so a large file cannot hold three idle slots behind a batch barrier. It
 coalesces ordered chunks to at most 8 MiB, and settles active writes before
 returning an error. On E2B, large chunks use level-1 gzip if a world-local probe
 finds gzip and compression saves at least 25%. Other worlds and incompressible
@@ -43,11 +44,15 @@ task 11 was not restarted. No probe changed project files or promoted resources.
 | Task 13, compressed transfer | 147.8 s | One setup attempt; first response 176.1 s; completion 177.4 s |
 | Task 14, cancel during 101 MB resource restore | 2.5 s after cancel | Cancelled, no world.ready, sandbox absent, all 7 leases released |
 | Task 15, cancel during resource checkpoint | 0.69 s after cancel | Maintenance deferred at its next safe boundary; task cancelled |
+| Task 16, compressed transfer with continuous workers | 112.0 s | First response 138.9 s; completion 140.3 s; all 498 hashes match |
 
-Tasks 12 and 13 restored the same 12 resource revisions: **708,437,252 bytes in
+Tasks 12, 13 and 16 restored the same 12 resource revisions: **708,437,252 bytes in
 498 files**. Compression reduced uploaded payloads to **146,771,792 bytes**
 (79.3% fewer bytes). Setup improved by 30.6% between these two single runs. This
-is not a statistical latency distribution. Task 11's older pinned revisions and
+is not a statistical latency distribution. Continuous workers reduced the next
+run to 112.0 seconds: 24.2% below task 13 and 47.4% below task 12. The unchanged
+bytes and revisions were checked, and all 498 hashes were verified again in
+task 16. Network and provider variability still apply. Task 11's older pinned revisions and
 failure/retry path are not a controlled before/after benchmark.
 
 All 498 files in task 13's real sandbox were independently read and SHA-256
@@ -77,7 +82,8 @@ New organizations and projects inherit those defaults unless explicitly overridd
 These source updates are **live validation overrides**, not evidence that a
 release image contains the changes. They can be lost on container replacement.
 The branch/release must carry both the resource fixes and the earlier Git shortcut;
-post-release hash verification remains necessary. A paused orphan belonging to
+post-release hash verification remains necessary. The final live candidate also
+includes the continuous-worker utility and accepted-cancellation journal. A paused orphan belonging to
 cancelled task 11 was verified by task metadata and removed. Its other old sandbox
 was already absent.
 
@@ -92,3 +98,15 @@ assertion resolved it, and all 30 tests in that run passed on repetition.
 The full 26-test workflow suite and 8 fork tests also passed. Typecheck required
 the normal 1536 MiB heap cap; a 1024 MiB attempt exhausted its heap.
 The full repository suite was not run.
+
+An exploratory bulk-upload test in a separate real E2B sandbox compared three
+rounds of 24 synthetic 128 KiB files, four at a time. Bulk multipart upload was
+12–15% faster than four concurrent single-file requests; this was fixed-order,
+not randomized, and no bulk-upload implementation was added. That sandbox was
+killed in a finally block. Content-free reports are in
+`benchmarks/results/resource-*-2026-09-23.*`.
+
+Final cleanup verified that all five task-probe sandboxes and the standalone
+upload-benchmark sandbox were absent. Timing was restored **off**. The final
+production module hashes match the tested candidate (preserving unrelated
+production changes in core.ts and api.ts); see the deployment evidence JSON.

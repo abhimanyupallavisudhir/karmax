@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { transferResourceChunk } from './resource-transfer.js';
-import { mapBatches } from '../util/async-batch.js';
+import { forEachConcurrent } from '../util/async-batch.js';
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -150,7 +150,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const manifest = await this.manifest(revision);
     // Bound memory and request fan-out. Chunks of each file remain ordered;
     // independent files can transfer together. Settle all writes before cleanup.
-    await mapBatches(manifest.files, async file => {
+    await forEachConcurrent(manifest.files, async file => {
       options.signal?.throwIfAborted();
       let offset = 0;
       let buffered: Buffer[] = [];
