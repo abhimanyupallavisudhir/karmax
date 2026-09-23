@@ -706,6 +706,10 @@ export class Store {
         verifiedAt INTEGER, pastDueAt INTEGER, lastError TEXT,
         createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS subscription_gifts (
+        organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL,
+        grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS subscription_billing_events (
         provider TEXT NOT NULL, eventId TEXT NOT NULL, type TEXT NOT NULL,
         createdAt INTEGER NOT NULL, processedAt INTEGER,
@@ -1842,6 +1846,7 @@ export class Store {
       payment_spend_requests: (await selectRows(this.db, 'payment_spend_requests', 'organizationId=?', [organizationId])),
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
+      subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
       policy_acceptances: (await selectRows(this.db, 'policy_acceptances', 'organizationId=?', [organizationId])),
       authorization_profiles: (await rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)])),
@@ -2087,6 +2092,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM payment_oauth_states WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_connections WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_requests WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys));
       (await deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys));
