@@ -126,3 +126,58 @@ unprefixed or custom model id, Karmax leases the highest-priority compatible
 credential and uses that credential's provider namespace when configuring
 OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
+
+
+## September 23, 2026 harness upgrade audit
+
+The shipped versions are Codex **0.156.1** and Claude Agent SDK **0.3.280**
+(paired with Claude Code **2.1.280**). Both dependencies are exact pins: later
+harness changes require another compatibility review. The browser image pins
+match; existing images use the version-checked remote launcher fallback.
+
+- Codex 0.156.1 introduces `gpt-6-sol` and `gpt-6-luna`. The native catalog also
+  contains `gpt-6-astra`; it does not contain `gpt-6-terra`. GPT-5.6 Terra remains
+  selectable. Account discovery stays authoritative, with current models added
+  to the offline fallback. GPT-6 low/medium/high/xhigh/max effort now reaches
+  all three execution paths instead of being silently discarded. Browser fallback
+  models and effort controls agree with the server. Upstream `ultra` is excluded
+  from the picker because it is outside Karmax's existing task effort schema;
+  this upgrade does not introduce a new automatic-delegation mode.
+- Claude Code 2.1.280 introduces `claude-opus-5-5`, now the upstream Opus alias
+  target. The exact id is also a fallback preset so partial SDK discovery cannot
+  hide it. Existing explicit profile model choices are preserved. Upstream
+  `default`/`opus` aliases continue to follow the provider's choices.
+- Reviewed Codex 0.154–0.156.1 release notes: the canonical JSON decoder fix is
+  retained; `mcp-server` was removed (Karmax uses `app-server`); resume/fork
+  permission preservation, worktree defaults, model-catalog refresh, asynchronous
+  input and event changes are covered by adapter and real-binary lineage tests.
+  No rollout migration or source-history rewrite is needed for this upgrade.
+- Reviewed Claude SDK 0.3.260–0.3.280 and CLI 2.1.260–2.1.280: resumed cost and
+  `modelUsage` totals are now cumulative (Karmax reads result `usage`, not those
+  totals); background completions can have empty zero-turn results (the adapter
+  keeps stdin alive while tracked work remains); SDK MCP servers remain awaited
+  despite deferred startup for other servers. Per-model saved effort defaults
+  changed, but Karmax passes effort explicitly. Plan-mode writes now use
+  `canUseTool`; existing permission handling stays in force. In-process MCP
+  entries must be supplied by the SDK host, as Karmax already does. The removed
+  Monitor `persistent` input is not used. Task-list tools are no longer defaults
+  on newer models; Karmax's own platform task tools remain supplied through MCP.
+- OpenCode is an operator-installed optional harness, not a shipped dependency
+  or browser-image package. It discovers models through `opencode models` and
+  negotiates ACP capabilities at startup. Its catalog comes from Models.dev;
+  there is no Karmax model allowlist to update. No OpenCode/ACP dependency bump
+  is required for these native Claude/Codex releases. Kimi and Grok remain
+  disabled as native harnesses under the existing admission policy.
+
+Verification uses real pinned binaries against local model HTTP fixtures,
+including Claude SDK MCP tool execution, explicit Opus effort, resume and fork;
+Codex model discovery, nested forks, decimal-tail history, stale cloud-home
+copies and exports; and adapter permission, cancellation, terminal-result and
+credential-isolation regressions. These checks incur no model charges. They do
+not prove subscription entitlement or a deployed Tavya rollout.
+
+Sources: [Codex releases](https://github.com/openai/codex/releases),
+[Codex 0.156.1 catalog](https://github.com/openai/codex/blob/rust-v0.156.1/codex-rs/models-manager/models.json),
+[Claude SDK changelog](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md),
+[Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md),
+[OpenCode models](https://opencode.ai/docs/models/).

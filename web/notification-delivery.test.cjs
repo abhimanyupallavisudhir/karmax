@@ -26,7 +26,7 @@ function extractFn(name) {
 function browser() {
   const alerts = [];
   const timers = [];
-  const state = { organizationId: 'org', inbox: [], activity: [], tab: 'inbox' };
+  const state = { organizationId: 'org', organizations: [{ id: 'org' }], inbox: [], activity: [], tab: 'inbox' };
   let response = [];
   const ctx = vm.createContext({
     S: state, Map, Set, URGENCY_LEVELS: ['low', 'normal', 'high', 'critical'],
@@ -78,7 +78,7 @@ test('reconnection fetches missed asks; first load and organization switches sta
   await flush();
   assert.equal(b.alerts[0].id, 'missed');
   b.state.organizationId = 'other';
-  b.respond([ask('other-org')]);
+  b.respond([ask('old'), ask('missed')]);
   await b.ctx.loadInbox();
   assert.equal(b.alerts.length, 1);
 });
@@ -146,4 +146,82 @@ test('bulk read wins over an in-flight inbox fetch without hiding later arrivals
   b.ctx.api = async () => [{ ...ask('a'), unread: false }, ask('new')];
   await b.ctx.loadInbox();
   assert.equal(b.state.inbox[1].unread, true);
+});
+
+
+test('inbox and bell include every organization on all pages, even during navigation', async () => {
+  const b = browser();
+  b.state.organizations = [{ id: 'personal' }, { id: 'team' }];
+  const requests = [];
+  b.ctx.api = async (url) => {
+    requests.push(url);
+    const org = new URL(url, 'https://example.test').searchParams.get('organizationId');
+    return [{ ...ask(org), organizationId: org }];
+  };
+  for (const org of ['personal', 'team', null]) {
+    b.state.organizationId = org;
+    await b.ctx.loadInbox();
+    assert.deepEqual(Array.from(b.state.inbox, item => item.id).sort(), ['personal', 'team']);
+  }
+  assert.equal(b.alerts.length, 0);
+  assert.equal(requests.length, 6);
+  const pending = b.ctx.loadInbox();
+  b.state.organizationId = 'personal';
+  await pending;
+  assert.equal(b.state.inbox.length, 2);
+});
+
+test('bulk read uses each notification organization and completes across navigation', async () => {
+  const b = browser();
+  b.state.inbox = [{ ...ask('a'), organizationId: 'personal' }, { ...ask('b'), organizationId: 'team' }];
+  b.ctx.inboxItems = () => b.state.inbox;
+  b.ctx.renderMain = b.ctx.renderRail = () => {};
+  const requests = [];
+  b.ctx.api = async url => { requests.push(url); b.state.organizationId = 'elsewhere'; return { unread: false }; };
+  vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
+  await b.ctx.markVisibleInboxRead();
+  assert.deepEqual(requests, ['/api/inbox/a?organizationId=personal', '/api/inbox/b?organizationId=team']);
+  assert.ok(b.state.inbox.every(item => !item.unread));
+});
+
+test('an arrival in another organization still notifies after a route switch', async () => {
+  const b = browser();
+  b.state.organizations = [{ id: 'org' }, { id: 'other' }];
+  let arrived = false;
+  b.ctx.api = async url => url.endsWith('other') && arrived ? [ask('new')] : [];
+  await b.ctx.loadInbox();
+  b.state.organizationId = null;
+  b.ctx.connectWs();
+  arrived = true;
+  b.state.ws.onmessage({ data: JSON.stringify({ type: 'task.escalated' }) });
+  b.timers.shift()();
+  await flush();
+  assert.deepEqual(b.alerts.map(item => item.id), ['new']);
+});
+
+test('one failed organization request preserves the complete previous count', async () => {
+  const b = browser();
+  b.state.organizations = [{ id: 'org' }, { id: 'other' }];
+  b.ctx.api = async url => [ask(url)];
+  await b.ctx.loadInbox();
+  b.ctx.api = async url => {
+    if (url.endsWith('other')) throw new Error('offline');
+    return [];
+  };
+  await assert.rejects(b.ctx.loadInbox(), /offline/);
+  assert.equal(b.state.inbox.length, 2);
+});
+
+test('opening a notification marks it read in its own organization before navigating', async () => {
+  const b = browser();
+  const item = { ...ask('a'), organizationId: 'personal', task: { id: 'task', num: 7, projectId: 'project' } };
+  const requests = [];
+  b.ctx.api = async url => { requests.push(url); return {}; };
+  b.ctx.projectById = () => ({ id: 'project' });
+  b.ctx.projectBase = () => '/personal/project';
+  b.ctx.go = async url => { requests.push(url); };
+  vm.runInContext(['markInboxItemReadLocally', 'openInboxItem'].map(extractFn).join('\n'), b.ctx);
+  await b.ctx.openInboxItem(item);
+  assert.equal(item.unread, false);
+  assert.deepEqual(requests, ['/api/inbox/a?organizationId=personal', '/personal/project/tasks/7']);
 });

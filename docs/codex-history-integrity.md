@@ -10,7 +10,8 @@ official CLI alone, without Karmax or cloud transfers.
 
 The upstream correction is
 [69cebb5: Route rollout reads through canonical JSON decoder](https://github.com/openai/codex/commit/69cebb5d15939bf9b6c1b4647b53879beab91ba2).
-Karmax pins the official `0.154.0-alpha.11`, which contains that correction.
+Karmax first pinned `0.154.0-alpha.11` for that correction and now pins
+`0.156.1`, which retains it and adds GPT-6 Sol/Luna model discovery.
 The installed dependency, remote launcher, browser image, and downloadable
 handoff commands use that version. Existing cloud images are version-checked
 before using their baked executable.

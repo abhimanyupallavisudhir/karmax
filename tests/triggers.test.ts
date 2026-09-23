@@ -807,12 +807,22 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(disarmCalls).toContain(t.id);
   });
 
-  it('a triggerless repeatable task is a series that spawns run #1 on create', async () => {
+  it.each(['legacy', 'member', 'agent'] as const)('a triggerless repeatable task spawns runs with the correct %s creator', async (kind) => {
     (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const started: string[] = [];
     const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
     const tokens = new TokenAuthority();
-    const token = (await tokens.mintPrincipal('u', ['*'])).token;
+    const organizationId = (await store.getProject(projectId))!.organizationId!;
+    if (kind !== 'legacy') await store.setOrganizationMembership(organizationId, 'u', 'member');
+    const origin = kind === 'agent' ? await store.createTask({ projectId, title: 'Calling agent',
+      workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'work', draft: true },
+      createdBy: { kind: 'user', userId: 'u' } }) : undefined;
+    const token = origin
+      ? (await tokens.mint({ taskId: origin.id, principal: 'user:u', profileId: 'developer',
+          projectId, ceiling: ['*'], grantorCaps: ['*'] })).token
+      : (await tokens.mintPrincipal(kind === 'legacy' ? 'u' : 'user:u', ['*'])).token;
+    const creator = origin ? { kind: 'task-agent', taskId: origin.id, role: 'do' }
+      : kind === 'member' ? { kind: 'user', userId: 'u' } : undefined;
     const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
 
     const series = await api.createTask(token, { projectId, workflow: 'just-do', params: { prompt: 'p', repeatable: true } });
@@ -821,6 +831,8 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(started).not.toContain(series.id);
     const runs = (await store.runsOf(series.id));
     expect(runs).toHaveLength(1);
+    expect(series.createdBy).toEqual(creator);
+    expect(runs[0]!.createdBy).toEqual(creator);
     expect(started).toContain(runs[0]!.id);
     expect(runs[0]!.params.runOf).toBe(series.id);
     expect(runs[0]!.params.repeatable).toBeUndefined(); // a run is a plain one-off
@@ -828,6 +840,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     // "Run again" spawns another run, series stays put.
     await api.runAgain(token, series.id);
     expect((await store.runsOf(series.id))).toHaveLength(2);
+    expect((await store.runsOf(series.id))[1]!.createdBy).toEqual(creator);
   });
 
   it('a cron trigger forces repeatable, and each fire spawns a run (series stays armed)', async () => {

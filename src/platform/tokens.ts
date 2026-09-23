@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { Capability, allows, attenuate } from './capabilities.js';
+import { Capability, allows, attenuate, OWN_TASK_CAPABILITIES } from './capabilities.js';
+import type { TaskRecord } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 
 export type TokenActor =
@@ -344,7 +345,9 @@ export class TokenAuthority {
     audience?: ScopedToken['audience']; executionId?: string; worldGeneration?: number }): Promise<{ ok: boolean; record?: ScopedToken; reason?: string }> {
     const record = (await this.verify(token));
     if (!record) return { ok: false, reason: 'invalid or expired token' };
-    if (!allows(record.caps, capability)) return { ok: false, record, reason: `missing capability ${capability}` };
+    if (!allows(record.caps, capability) && !(OWN_TASK_CAPABILITIES.has(capability)
+      && allows(record.caps, 'task:manage-own') && scope?.taskId
+      && await this.ownsTask(record, scope.taskId))) return { ok: false, record, reason: `missing capability ${capability}` };
     // Resolve the tenant from durable ownership, including callers that pass
     // only a project/task ID. A transfer must immediately fence old org tokens.
     const projectId = scope?.projectId ?? (scope?.taskId ? (await this.store?.taskProjectIdAsync(scope.taskId)) : undefined);
@@ -370,17 +373,39 @@ export class TokenAuthority {
       return { ok: false, record, reason: 'token execution lease mismatch' };
     if (scope?.worldGeneration != null && record.worldGeneration != null && scope.worldGeneration !== record.worldGeneration)
       return { ok: false, record, reason: 'token world generation mismatch' };
-    if (record.projectId && scope?.projectId && record.projectId !== scope.projectId)
+    if (record.projectId && projectId && record.projectId !== projectId)
       return { ok: false, record, reason: `token is scoped to project ${record.projectId}` };
-    if (record.projectIds?.length && scope?.projectId && !record.projectIds.includes(scope.projectId))
+    if (record.projectIds?.length && projectId && !record.projectIds.includes(projectId))
       return { ok: false, record, reason: `token is scoped to selected projects ${record.projectIds.join(', ')}` };
     if (record.organizationId && scope?.organizationId && record.organizationId !== scope.organizationId)
       return { ok: false, record, reason: `token is scoped to organization ${record.organizationId}` };
-    // `taskId` records which workflow minted the token; it is provenance, not an
-    // implicit object ACL. Project scope + named capabilities decide which other
-    // tasks the agent may discover or coordinate with. A future explicit
-    // resource-task scope should be a separate field, never inferred here.
+    // Origin task identity restricts only the explicit task:manage-own fallback.
+    // Ordinary named capabilities continue to authorize peer work in scope.
     return { ok: true, record };
+  }
+
+  private async ownsTask(record: ScopedToken, taskId: string): Promise<boolean> {
+    // The actor owns work, never the human whose authority it was delegated.
+    const actor = record.actor;
+    if (!actor) return false;
+    // Legacy workflow tokens use a system principal but still carry a concrete
+    // originating task. Interactive and autonomous principal tokens carry '*'.
+    const originTaskId = actor.kind === 'task-agent' ? actor.taskId
+      : actor.kind === 'system' && record.taskId !== '*' ? record.taskId : undefined;
+    const seen = new Set<string>();
+    let id: string | undefined = taskId;
+    while (id && !seen.has(id)) {
+      seen.add(id);
+      if (originTaskId && id === originTaskId) return true;
+      const task: TaskRecord | undefined = await this.store?.taskMetadataAsync(id);
+      if (!task) return false;
+      const creator = task.createdBy;
+      if (actor.kind === 'interactive-human' && creator?.kind === 'user' && creator.userId === actor.userId) return true;
+      if (actor.kind === 'autonomous' && creator?.kind === 'avatar' && actor.principal === `avatar:${creator.avatarId}`) return true;
+      if (originTaskId && creator?.kind === 'task-agent' && creator.taskId === originTaskId) return true;
+      id = task.parentTaskId;
+    }
+    return false;
   }
 
   async revoke(token: string) {

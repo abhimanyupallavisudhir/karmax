@@ -841,8 +841,8 @@ const NODES = [
 // `mock` is a hermetic test adapter, not a user-selectable agent.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
-  codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
+  codex: ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
   grok: ['grok-build', 'grok-code-fast-1'],
@@ -869,7 +869,9 @@ const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
 function effortLevelsFor(provider, model) {
   const m = (model || '').toLowerCase();
   const advertised = S.modelCatalog?.[provider]?.find((x) => x.id === model)?.effort;
-  if (advertised) return advertised;
+  // The native Codex catalog can advertise modes (e.g. ultra) outside the
+  // task schema. Do not offer a choice that the runtime would silently drop.
+  if (advertised) return provider === 'codex' ? advertised.filter((level) => EFFORT_ORDER.includes(level)) : advertised;
   if (provider === 'claude') {
     if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
@@ -878,6 +880,7 @@ function effortLevelsFor(provider, model) {
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
+    if (/^gpt-6(?:-|$)/.test(m)) return EFFORT_ORDER;
     // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
     if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
     if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
@@ -1531,8 +1534,8 @@ function normalizeComboOption(option) {
 function authorizationLevels() {
   return [
     { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', description: 'Create and manage tasks, work with agents, publish branches, and save skills in the selected scope.', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', description: 'Developer access plus project settings, queues, teams, repositories, and GitHub Actions in the selected scope.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'developer', description: 'Read diagnostics, create tasks, and manage your own work and its descendants.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Manage all tasks, reviews, settings, and automation in the selected projects.', name: 'Project maintainer', scope: 'selectable' },
     { id: 'administrator', description: 'Manage this organization, including projects, members, credentials, and payments.', name: 'Administrator', scope: 'organization' },
     { id: 'god', description: 'Unrestricted access across every organization and the installation, including global settings and authorization.', name: 'God', scope: 'global' },
     ...(typeof S !== 'undefined' && S.authorizationCatalogOrganization === S.organizationId ? (S.authorizationCatalog?.profiles || []).filter((role) => role.scopeKey === `organization:${S.organizationId}`).map((role) => ({ ...role, scope: 'selectable' })) : []),
@@ -3085,15 +3088,16 @@ async function loadOrganizations() {
 }
 
 async function loadCollaboration() {
+  const inbox = loadInbox().catch(() => {});
   const organizationId = S.organizationId;
-  if (!organizationId) return;
+  if (!organizationId) return inbox;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
   const [members, teams, users, catalog] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/organizations/${organizationId}/roles`).catch(() => null),
-    loadInbox().catch(() => {}),
+    inbox,
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.authorizationCatalog = catalog;
@@ -3104,16 +3108,16 @@ async function loadCollaboration() {
 }
 
 async function loadInbox() {
-  const organizationId = S.organizationId;
-  if (!organizationId) return;
   const epoch = S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
-  // A failed request must not erase the inbox or reset arrival tracking.
-  const inbox = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`);
-  if (S.inboxLoadEpoch !== epoch || S.organizationId !== organizationId) return;
-  const seen = S.announcedOrganizationId === organizationId ? S.announcedInbox : null;
-  S.inbox = inbox || [];
+  // The inbox belongs to the signed-in person, independent of the current route.
+  // Keep organization-scoped requests so each inbox retains its authorization check.
+  // Publish the complete snapshot together; a failed request preserves the old one.
+  const inboxes = await Promise.all(S.organizations.map((organization) =>
+    api(`/api/inbox?organizationId=${encodeURIComponent(organization.id)}`)));
+  if (S.inboxLoadEpoch !== epoch) return;
+  const seen = S.announcedInbox;
+  S.inbox = inboxes.flat();
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
-  S.announcedOrganizationId = organizationId;
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
   if (S.tab === 'inbox') bgRenderMain();
@@ -3552,7 +3556,7 @@ function connectWs() {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
-    if (S.organizationId && inboxEventChanges(ev)) scheduleInboxReload();
+    if (inboxEventChanges(ev)) scheduleInboxReload();
     if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
@@ -5446,7 +5450,15 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runnow}/run-now`, { method: 'POST', body: '{}' }); toast('Started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-canceltrig]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.canceltrig}/cancel-trigger`, { method: 'POST', body: '{}' }); toast('Triggers cancelled — saved as a draft'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!confirm('Cancel this scheduled task? It will be saved as a draft.')) return;
+      try {
+        await api(`/api/tasks/${b.dataset.canceltrig}/cancel-trigger`, { method: 'POST', body: '{}' });
+        toast('Triggers cancelled — saved as a draft');
+        refreshTasks();
+      } catch (e) { toast(e.message, true); }
+    }),
   );
   // Clicking a waiting task's body opens the same form as a draft — fully editable, triggers included.
   $('#main').querySelectorAll('[data-armed]').forEach((e) =>
@@ -9378,7 +9390,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/karmax"',
     `cp -n "${source}" "$HOME/.codex/sessions/karmax/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.154.0-alpha.11"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.156.1"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `krmax_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -10483,6 +10495,7 @@ const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes, open the PR, a
 const returnToReviewConfirmation = () => `Return this pull request to Review and confirm it if you are authorized? ${siteName()} will first verify that the current proposal is clean and committed.`;
 
 function confirmTaskAction(action, v = S.view) {
+  if (action === 'cancel') return confirm('Cancel this task?');
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
     : hasOpenPullRequest(v) ? returnToReviewConfirmation()
@@ -11028,11 +11041,18 @@ function hostDiagHtml(diag) {
 
 // Live-refresh just the host panel every 5s while the Dashboard is open. Self-
 // terminates (no reschedule) once the tab changes or the element is gone.
+function diagnosticsPath(surface) {
+  if (S.installationAccess) return `/api/${surface}`;
+  const scope = S.projectId ? `projectId=${encodeURIComponent(S.projectId)}`
+    : `organizationId=${encodeURIComponent(S.organizationId || 'org_personal')}`;
+  return `/api/${surface}?${scope}`;
+}
+
 async function refreshHostDiag() {
   if (S.tab !== 'dashboard' || !$('#host-diag')) return;
   const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
-  try { diag = await api('/api/diagnostics'); } catch {}
+  try { diag = await api(diagnosticsPath('diagnostics')); } catch {}
   if (S.hostDiagEpoch !== epoch) return;
   const el = $('#host-diag');
   if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
@@ -11065,7 +11085,7 @@ function procPanelHtml(sample) {
   // infrastructure — karmax itself + Temporal — is running).
   const LOCK = `<span class="proc-lock" title="Protected — ${siteNameMarkup()} can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
   const killBtn = (pid, label, killable) =>
-    killable
+    sample.canKill === false ? '' : killable
       ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
       : LOCK;
   const rows = (sample.groups || [])
@@ -11076,7 +11096,7 @@ function procPanelHtml(sample) {
         : '';
       // A group is killable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
-      const rootKillable = !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
+      const rootKillable = sample.canKill !== false && !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
       const head = `<tr class="proc-group">
         <td class="cmd">${esc(g.label)} ${kindChip}${taskChip}</td>
         <td class="mono num">${g.procs.length}</td>
@@ -11106,7 +11126,7 @@ function procPanelHtml(sample) {
       <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (${siteNameMarkup()} core &amp; Temporal); everything else gets a ✕ kill button</div>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()}</div>
   </div>`;
 }
 
@@ -11135,7 +11155,7 @@ async function refreshProcPanel(now = false) {
   clearTimeout(S.procTimer);
   const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
-  try { sample = await api('/api/processes'); } catch {}
+  try { sample = await api(diagnosticsPath('processes')); } catch {}
   if (S.procLoadEpoch !== epoch) return;
   const el = $('#proc-panel');
   if (el && S.tab === 'dashboard') {
@@ -11153,18 +11173,16 @@ async function renderDashboard() {
     const organizationId = S.organizationId || 'org_personal';
     const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
     // The dashboard is org-scoped (counts for THIS organization). Host panels
-    // (diagnostics, processes, agent-account leasing) are operator-only; a
-    // non-operator's /api/diagnostics returns null and those panels are hidden,
-    // so a regular member — e.g. a fresh personal workspace — sees a clean
-    // overview instead of a "missing capability diagnostic:read" error.
+    // expose read-only health to developers; process rows stay in scope and
+    // mutation controls follow the response's authority flags.
     const [d, u, credentialData, diag] = await Promise.all([
       api(`/api/dashboard?organizationId=${encodeURIComponent(organizationId)}`),
       api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
       api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
-      api('/api/diagnostics').catch(() => null),
+      api(diagnosticsPath('diagnostics')).catch(() => null),
     ]);
     if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
-    const isOperator = !!diag; // /api/diagnostics needs diagnostic:read
+    const hasDiagnostics = !!diag;
     const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
     const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
@@ -11177,10 +11195,10 @@ async function renderDashboard() {
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(stageLabel({ stage: s }))}</div></div>`).join('')}
       </div>
       ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use the <b>+</b> next to <b>Projects</b> in the sidebar to create your first one.</div>` : ''}
-      ${!isOperator ? '' : `
+      ${!hasDiagnostics ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
-      <div class="section-h">Processes — everything ${siteNameMarkup()} is running</div>
+      <div class="section-h">Processes</div>
       <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
@@ -11261,9 +11279,9 @@ async function renderDashboard() {
     }));
     // Keep the host panel live without re-rendering (and disrupting focus on) the
     // accounts section; single pending timer (cleared here and inside the loop).
-    // Operator-only panels — skip the polling entirely for members who can't see them.
+    // Skip polling when the caller cannot read diagnostics.
     clearTimeout(S.hostDiagTimer);
-    if (isOperator) {
+    if (hasDiagnostics) {
       S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
       refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
     }
@@ -15867,8 +15885,8 @@ function wireInboxView() {
   $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
     const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
     try {
-      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
-      item.unread = !item.unread; renderMain(); renderRail();
+      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
+      item.unread = !item.unread; updateBell(); renderMain(); renderRail();
     } catch (error) { toast(error.message, true); }
   }));
   $('#inbox-show-read')?.addEventListener('change', (e) => {
@@ -15886,24 +15904,21 @@ function wireInboxView() {
 }
 
 async function markVisibleInboxRead() {
-  const organizationId = S.organizationId;
   const items = inboxItems().filter((item) => item.unread);
   const results = await Promise.allSettled(items.map(async (item) => {
-    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(organizationId)}`, {
+    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, {
       method: 'PATCH', body: JSON.stringify({ unread: false }),
     });
     if (!saved) throw new Error('Notification could not be marked read.');
   }));
-  if (S.organizationId === organizationId) {
-    items.forEach((item, index) => {
-      if (results[index].status !== 'fulfilled') return;
-      const current = S.inbox.find((candidate) => candidate.id === item.id);
-      if (current) current.unread = false;
-    });
-    // Invalidate reads started before the mutation; they may contain stale unread flags.
-    S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
-    updateBell(); renderMain(); renderRail();
-  }
+  items.forEach((item, index) => {
+    if (results[index].status !== 'fulfilled') return;
+    const current = S.inbox.find((candidate) => candidate.id === item.id);
+    if (current) current.unread = false;
+  });
+  // Invalidate reads started before the mutation; they may contain stale unread flags.
+  S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+  updateBell(); renderMain(); renderRail();
   const failed = results.filter((result) => result.status === 'rejected');
   if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
 }
@@ -16042,7 +16057,7 @@ async function openInboxItem(item) {
     // its task. Update the badge locally and let the PATCH finish behind the
     // navigation; restore unread state if it fails.
     markInboxItemReadLocally(item);
-    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
+    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
       .catch(() => { item.unread = true; updateBell(); });
   }
   if (item.subject?.kind === 'avatar-authorization') {
@@ -17635,6 +17650,7 @@ function openActionForm(a) {
       if (arg.required && (val === undefined || val === '')) { el.focus(); return toast(`${arg.label || arg.name} is required`, true); }
       if (val !== undefined && val !== '') body[arg.name] = val;
     }
+    if (!confirmTaskAction(a.name, S.view)) return;
     try {
       await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify(body) });
       close();
