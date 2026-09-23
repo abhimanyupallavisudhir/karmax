@@ -1,7 +1,7 @@
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
-import { decayVaultUsage, type VaultUsage } from '../util/vault-usage.js';
+import { credentialIds, taskSelectionTimes, decayVaultUsage, type VaultSelectionUsage, type VaultUsage } from '../util/vault-usage.js';
 import { canonicalAccountName } from '../domain/account-names.js';
 import { validGitBranch } from '../util/git-ref.js';
 import path from 'node:path';
@@ -900,6 +900,7 @@ export class Store {
     // so no backfill pass is needed; the first drag densifies that organization.
     if (!projectCols.some((c) => c.name === 'ord')) (await this.db.exec('ALTER TABLE projects ADD COLUMN ord INTEGER NOT NULL DEFAULT 0'));
     if (!projectCols.some((c) => c.name === 'folder')) (await this.db.exec('ALTER TABLE projects ADD COLUMN folder TEXT'));
+    if (!cols.some((c) => c.name === 'credentialSelections')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN credentialSelections TEXT'));
     if (!cols.some((c) => c.name === 'conversation')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN conversation TEXT'));
     if (!cols.some((c) => c.name === 'conversationRef')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN conversationRef TEXT'));
     if (!cols.some((c) => c.name === 'intentId')) (await this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT'));
@@ -3140,6 +3141,20 @@ export class Store {
         jsonOrNull(t.delegate),
         jsonOrNull(t.confirmationPolicy),
       ));
+    // Alternate attempts inherit the logical task's selection times; simply
+    // retrying an execution must not make its credentials more frequent/recent.
+    const selections: Record<string, number> = {};
+    if (input.intentId) {
+      const siblings = await this.db.prepare(`SELECT t.params, t.credentialSelections, COALESCE(root.createdAt, t.createdAt) createdAt
+        FROM tasks t LEFT JOIN tasks root ON root.id = t.intentId AND root.projectId = t.projectId
+        WHERE t.intentId = ? AND t.projectId = ? AND t.id != ?`)
+        .all(input.intentId, t.projectId, t.id) as { params: string; createdAt: number; credentialSelections: string | null }[];
+      for (const sibling of siblings) for (const [itemId, at] of Object.entries(taskSelectionTimes(
+        sibling.credentialSelections, JSON.parse(sibling.params)?._authorization?.capabilities, sibling.createdAt,
+      ))) selections[itemId] = Math.max(selections[itemId] ?? 0, at);
+    }
+    for (const itemId of credentialIds((t.params._authorization as any)?.capabilities)) selections[itemId] ??= t.createdAt;
+    await this.db.prepare('UPDATE tasks SET credentialSelections = ? WHERE id = ?').run(JSON.stringify(selections), t.id);
     if (!input.intentId && !input.params.draft) t.num = (await this.allocateTaskNum(t.projectId, t.id));
     if (t.createdBy?.kind === 'user') (await this.subscribeTask(t.id, t.createdBy));
     if (t.assignee) (await this.subscribeTask(t.id, t.assignee));
@@ -3639,6 +3654,7 @@ export class Store {
   async updateTaskParams(taskId: string, params: TaskParams) {
     return this.db.transaction(async () => {
 
+    await this.trackTaskCredentialSelections(taskId, params);
     (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId));
   
     });
@@ -3651,6 +3667,7 @@ export class Store {
 
     const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
     if (!entries.length) return;
+    if (entries.some(([key]) => key === '_authorization')) await this.trackTaskCredentialSelections(taskId, patch);
     if (this.db.dialect === 'postgres') {
       (await this.db.prepare('UPDATE tasks SET params = (params::jsonb || ?::jsonb)::text WHERE id = ?')
         .run(JSON.stringify(Object.fromEntries(entries)), taskId));
@@ -3660,6 +3677,24 @@ export class Store {
     }
   
     });
+  }
+
+  /** Called inside the task write's transaction. Lock on PostgreSQL so two
+   * autosaves cannot both mistake an existing grant for a new selection. */
+  private async trackTaskCredentialSelections(taskId: string, next: Record<string, unknown>): Promise<void> {
+    const row = await this.db.prepare(`SELECT params, credentialSelections,
+      COALESCE((SELECT root.createdAt FROM tasks root
+        WHERE root.id = tasks.intentId AND root.projectId = tasks.projectId), createdAt) createdAt
+      FROM tasks WHERE id = ?${this.db.dialect === 'postgres' ? ' FOR UPDATE' : ''}`)
+      .get(taskId) as { params: string; createdAt: number; credentialSelections: string | null } | undefined;
+    if (!row) return;
+    const before = JSON.parse(row.params)?._authorization?.capabilities;
+    const previousIds = new Set(credentialIds(before));
+    const times = taskSelectionTimes(row.credentialSelections, before, row.createdAt);
+    for (const id of credentialIds((next._authorization as any)?.capabilities)) {
+      if (!previousIds.has(id)) times[id] = Date.now();
+    }
+    await this.db.prepare('UPDATE tasks SET credentialSelections = ? WHERE id = ?').run(JSON.stringify(times), taskId);
   }
 
   /** Archive/unarchive the logical task, regardless of which attempt initiated it.
@@ -4805,6 +4840,41 @@ export class Store {
     return Number(r.lastInsertRowid);
   
     });
+  }
+
+  /** One contribution per logical task and credential, including archived
+   * tasks. Legacy grants use the root task's creation time without rewriting it.
+   * The task column participates in normal backup/export/deletion lifecycle. */
+  async vaultSelectionHistory(organizationId: string, now: number): Promise<Record<string, VaultSelectionUsage>> {
+    const byIntent = new Map<string, Record<string, number>>();
+    let cursor = '';
+    for (;;) {
+      const rows = await this.db.prepare(`SELECT t.id, t.intentId, t.credentialSelections,
+        COALESCE(root.createdAt, t.createdAt) createdAt,
+        json_extract(t.params, '$._authorization.capabilities') capabilities
+        FROM tasks t JOIN projects p ON p.id = t.projectId
+        LEFT JOIN tasks root ON root.id = t.intentId AND root.projectId = t.projectId
+        WHERE p.organizationId = ? AND t.id > ? ORDER BY t.id LIMIT 500`)
+        .all(organizationId, cursor) as { id: string; intentId: string | null; credentialSelections: string | null; createdAt: number; capabilities: string | null }[];
+      for (const row of rows) {
+        const key = row.intentId ?? row.id;
+        const times = byIntent.get(key) ?? {};
+        for (const [id, at] of Object.entries(taskSelectionTimes(row.credentialSelections, row.capabilities ? JSON.parse(row.capabilities) : [], row.createdAt))) {
+          times[id] = Math.max(times[id] ?? 0, at);
+        }
+        byIntent.set(key, times);
+        cursor = row.id;
+      }
+      if (rows.length < 500) break;
+    }
+    const usage: Record<string, VaultSelectionUsage> = {};
+    for (const times of byIntent.values()) for (const [id, at] of Object.entries(times)) {
+      const value = usage[id] ??= { selectionCount: 0, selectionFrecencyScore: 0, selectionUpdatedAt: now };
+      value.selectionCount++;
+      value.selectionFrecencyScore += decayVaultUsage(1, at, now);
+      value.lastSelectedAt = Math.max(value.lastSelectedAt ?? 0, at);
+    }
+    return usage;
   }
 
   /** One-time frecency backfill, restricted to the caller's existing vault IDs.
