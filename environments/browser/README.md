@@ -20,6 +20,19 @@ npx tsx environments/browser/e2b-template.ts
 
 Put the resulting tag in E2B's **Headless template** field.
 
+The release default for headless E2B worlds is the public package-only template
+`uj125w982t7wflqad4ig` (`DEFAULT_E2B_TEMPLATE` in `src/world/e2b.ts`). New
+organizations use it with their own E2B credentials; new projects inherit it.
+Selection order is project template, organization template, installation
+`KARMAX_E2B_TEMPLATE`, then the release default. Desktop selection is separate.
+To opt out, select another template explicitly (for example `codex`). Clearing
+an override restores inheritance, not the stock image.
+
+When changing pinned packages, build and smoke-test a replacement, verify that
+it is public and contains no credentials or task data, and update the release
+constant. Publishing/building alone does not activate a replacement. Both
+production Compose profiles forward the optional installation override.
+
 Alternatively build directly from E2B's `codex` base, without publishing a Docker
 image (`E2B_API_KEY` must be available to the SDK):
 
