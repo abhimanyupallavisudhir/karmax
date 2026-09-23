@@ -186,6 +186,11 @@ describe('project resources', () => {
     const attachment = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Weights', driver: 'volume@1', target: { kind: 'path', path: 'weights' }, access: 'read',
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
+    for (const expectedBytes of [1, 3]) {
+      await expect(engine.capture(attachment, (async function* () {
+        yield { path: 'short.bin', bytes: expectedBytes, data: Buffer.from('ab') };
+      })())).rejects.toThrow('resource capture size mismatch');
+    }
     const bytes = Buffer.alloc(9 * 1024 * 1024 + 19, 0x71);
     const captured = await engine.capture(attachment, (async function* () {
       yield { path: 'model.bin', data: (async function* () {

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { transferResourceChunk } from './resource-transfer.js';
+import { transferResourceChunk, readResourceChunks } from './resource-transfer.js';
 import { forEachConcurrent } from '../util/async-batch.js';
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
@@ -26,7 +26,6 @@ import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
-const WORLD_READ_BYTES = 16 * 1024 * 1024;
 const RESOURCE_KEY_PREFIX = 'resource-store:key:';
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
@@ -126,6 +125,8 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
           digest.update(plain);
           fileBytes += plain.length;
         }
+        if (input.bytes !== undefined && fileBytes !== input.bytes)
+          throw new Error('resource capture size mismatch');
         total += fileBytes;
         manifestFiles.push({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks });
       }
@@ -1050,7 +1051,7 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
     yield { path: path.posix.basename(target), bytes,
-      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
+      data: cleanupChunks(readResourceChunks(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
     return;
   }
   const prefix = target === '.' ? '' : `${target}/`;
@@ -1066,7 +1067,7 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
     yield { path: safePath(relative), bytes,
-      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
+      data: cleanupChunks(readResourceChunks(world, captured.path, Number.isFinite(bytes) ? bytes : undefined, checkContinue), captured.cleanup) };
   }
 }
 
@@ -1139,21 +1140,6 @@ async function* fixedChunks(value: Buffer | AsyncIterable<Buffer>): AsyncGenerat
     }
   }
   if (pending.length || !emitted) yield pending;
-}
-
-async function* chunksFromWorldFile(world: World, file: string, bytes?: number, checkContinue?: () => Promise<void>): AsyncGenerator<Buffer> {
-  for (let offset = 0; bytes === undefined || offset < bytes; offset += WORLD_READ_BYTES) {
-    await checkContinue?.();
-    const result = await world.exec('bash', ['-lc',
-      `dd if=${quote(file)} bs=${WORLD_READ_BYTES} skip=${Math.floor(offset / WORLD_READ_BYTES)} count=1 status=none | base64 -w0`],
-    { timeoutMs: 30 * 60_000 });
-    if (result.code !== 0) throw new Error(result.stderr || `could not read resource file ${file}`);
-    await checkContinue?.();
-    const chunk = Buffer.from(result.stdout.trim(), 'base64');
-    if (!chunk.length) break;
-    yield chunk;
-    if (chunk.length < WORLD_READ_BYTES) break;
-  }
 }
 
 async function transactionalSnapshotPath(world: World, file: string): Promise<{ path: string; cleanup?: () => Promise<void> }> {

@@ -110,3 +110,48 @@ Final cleanup verified that all five task-probe sandboxes and the standalone
 upload-benchmark sandbox were absent. Timing was restored **off**. The final
 production module hashes match the tested candidate (preserving unrelated
 production changes in core.ts and api.ts); see the deployment evidence JSON.
+
+## Subsequent release audit and capture hardening
+
+At the next audit, production was running revision
+`242a8d6d0430b4db65e64020990354da055ab013`, with its container started at
+2026-09-23 06:47:30 UTC. Deploy run 35828236321 explicitly reported that revision
+as completed and healthy. Task 305's reviewed commit
+`451b28583b2442e51c4534cf9b1d71661b3292de` is an ancestor of that running checkout.
+The process-worker and prebuilt-template installation settings survived.
+However, the resource restore, continuous-worker and Git shortcut file hashes
+had reverted: PR #336 remained open, so those temporary validation overrides
+were **not durably deployed**. The deployment workflow requires a master revision
+with successful CI. No candidate-branch deployment or additional application
+source override was used during this audit. The branch was merged with master
+`7c45692f9eacac84fe0da593474d265ebfe7f728`, preserving both cancellation tests
+in the only merge conflict.
+
+Further integrity checks found that checkpoint reads could silently accept a
+failed `dd` pipeline or a short read, and the text-only restore fallback decoded
+arbitrary bytes as UTF-8. Reads now propagate pipeline failures and reject
+unexpected lengths; snapshot capture independently checks supplied byte counts.
+The fallback restores base64 through the remote decoder, including the first
+chunk, preserving binary data.
+
+A disposable real E2B sandbox was exercised from the production host at
+17:45 UTC using the candidate transfer module in an isolated script, without
+restarting or replacing the running application. Both binary-write and text-only
+paths preserved compressed binary data and appends. Missing files and truncated
+reads failed as expected. The sandbox was destroyed. Exact evidence is in
+`benchmarks/results/resource-integrity-2026-09-23.json`; the repeatable probe is
+`benchmarks/e2b-resource-integrity.ts`. This additional check covers the real
+resource data plane, not a new gateway/Temporal task-start benchmark; the full
+workflow timings above remain the relevant end-to-end measurements. Installation
+timing remains disabled.
+
+Checkpoint capture still reads files serially and uses base64 command output.
+This audit does not claim that cost is eliminated or that all latency is optimal.
+Task 332 separately proposes avoiding file scans when listing review resources;
+its proposal was still waiting for review at this audit, so it was not counted as
+an already deployed improvement.
+
+Post-merge validation passed 211 targeted tests: 91 stage-transition/agent-parking,
+24 resource/integrity/transfer, and 96 Git publication, queueing, E2B defaults,
+deployment, workflow, fork and teardown tests. Typecheck also passed. These are
+targeted checks, not a new full-repository CI result.
