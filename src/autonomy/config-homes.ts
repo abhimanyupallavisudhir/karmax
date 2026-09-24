@@ -490,6 +490,9 @@ export function scrubbedEnv(opts: { provider: Provider; configHome?: string; ext
   // Never let one profile's keys leak into another's process.
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;
+  delete env.CODEX_API_KEY;
+  delete env.CODEX_ACCESS_TOKEN;
+  delete env.ANTHROPIC_AUTH_TOKEN;
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
   delete env.KIMI_MODEL_API_KEY;
   delete env.KIMI_MODEL_NAME;

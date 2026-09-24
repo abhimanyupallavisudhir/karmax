@@ -1,3 +1,4 @@
+import { ProjectResourceService } from '../src/world/resources.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -20,6 +21,7 @@ import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
 import { ProviderFailure } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
+import { localProviderCli } from '../src/agent/provider-cli.js';
 
 const input: any = {
   profile: { id: 'p', name: 'claude', provider: 'claude', role: 'do', capabilities: [] },
@@ -59,15 +61,17 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
   });
 
-  it('injects project secrets into the local agent subprocess without letting them shadow control env', async () => {
+  it('keeps project secrets out of the harness while preserving Tavya control env', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
     await new ClaudeAdapter().runTurn({
       ...input,
       secretEnv: { DATABASE_URL: 'postgres://task-db', KARMAX_TOKEN: 'resource-value' },
       extraEnv: { KARMAX_TOKEN: 'scoped-turn-token' },
     }, ctx);
+    expect(sdkState.options.env.DATABASE_URL).toBeUndefined();
+    expect(sdkState.options.settings.hooks.SessionStart).toHaveLength(1);
+    expect(JSON.stringify(sdkState.options.settings)).not.toContain('postgres://task-db');
     expect(sdkState.options.env).toMatchObject({
-      DATABASE_URL: 'postgres://task-db',
       KARMAX_TOKEN: 'scoped-turn-token',
     });
   });
@@ -101,6 +105,51 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     }
   });
 
+  it.each([undefined, 'leased-setup-token'])('keeps project credentials from overriding the selected Claude login (%s)', async (oauthToken) => {
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1' }];
+    await new ClaudeAdapter().runTurn({
+      ...input,
+      resolvedAuth: { ...input.resolvedAuth, oauthToken },
+      secretEnv: {
+        ANTHROPIC_API_KEY: 'project-api-key', ANTHROPIC_AUTH_TOKEN: 'project-bearer',
+        CLAUDE_CODE_OAUTH_TOKEN: 'different-account', DATABASE_URL: 'project-db',
+      },
+    }, ctx);
+    expect(sdkState.options.env).toMatchObject({
+      ANTHROPIC_API_KEY: '', ANTHROPIC_AUTH_TOKEN: '',
+      CLAUDE_CODE_OAUTH_TOKEN: oauthToken ?? '',
+    });
+  });
+
+  it('the shipped Claude binary sees the subscription at the final local spawn boundary', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-claude-auth-'));
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'fixture-access', scopes: ['user:inference', 'user:profile'],
+      subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x', expiresAt: Date.now() + 3600_000,
+    } }));
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'fixture@example.com', organizationUuid: 'fixture-org' },
+    }));
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1' }];
+    try {
+      await new ClaudeAdapter().runTurn({ ...input, resolvedAuth: { configHome: home },
+        secretEnv: { ANTHROPIC_API_KEY: 'project-api-key' } }, ctx);
+      // auth status is local metadata only: no model request or real credentials.
+      const child = sdkState.options.spawnClaudeCodeProcess({
+        command: localProviderCli('claude'), args: ['auth', 'status', '--json'], cwd: home,
+        env: { ...sdkState.options.env, ANTHROPIC_API_KEY: 'reintroduced-key' },
+        signal: new AbortController().signal,
+      });
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => { output += chunk; });
+      const code = await new Promise((resolve, reject) => { child.once('close', resolve); child.once('error', reject); });
+      expect(code).toBe(0);
+      const status = JSON.parse(output);
+      expect(status).toMatchObject({ loggedIn: true, authMethod: 'claude.ai', subscriptionType: 'max' });
+      expect(status.apiKeySource).toBeUndefined();
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it('returns only after an explicit SDK success result', async () => {
     sdkState.messages = [
       { type: 'assistant', session_id: 's1', message: { content: [{ type: 'text', text: 'done' }] } },
@@ -117,10 +166,13 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       claudeAiOauth: { accessToken: 'subscription', refreshToken: 'host-only-refresh', expiresAt: Date.now() + 60 * 60_000 },
     }));
     const files = new Map<string, Buffer>();
+    let spawnedEnv: Record<string, string> | undefined;
     const world: any = {
       handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'remote',
         root: '/workspace', branch: 'task', base: 'main' },
-      async exec(_command: string, args: string[]) {
+      async exec(_command: string, args: string[], options: any = {}) {
+        expect(options.env?.NODE_OPTIONS).toBeUndefined();
+        expect(options.env?.DATABASE_URL).toBeUndefined();
         if (args[1]?.includes('-type f -print')) return { stdout: '', stderr: '', code: 0 };
         return { stdout: '', stderr: '', code: 0 };
       },
@@ -129,10 +181,27 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       async readFileBuffer(name: string) { const value = files.get(name); if (!value) throw new Error('missing'); return value; },
       async writeFile(name: string, value: string) { files.set(name, Buffer.from(value)); },
       async listFiles() { return [...files.keys()]; }, async destroy() {},
+      async openPty(spec: any) {
+        spawnedEnv = spec.env;
+        let exit: (code: number) => void = () => {};
+        return { onData: () => () => {}, onExit: (fn: typeof exit) => { exit = fn; return () => {}; },
+          write: async () => {}, resize: async () => {}, close: async () => { exit(0); } };
+      },
     };
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 'remote-session', stop_reason: 'end_turn' }];
     try {
-      await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx);
+      const secretEnv = { ANTHROPIC_API_KEY: 'project-api-key', NODE_OPTIONS: '--invalid-project-option', DATABASE_URL: 'project-db' };
+      const decoratedWorld = await ProjectResourceService.prototype.withEnvironment.call({ environmentFor: async () => secretEnv } as any, world);
+      await new ClaudeAdapter().runTurn({ ...input, world: decoratedWorld, resolvedAuth: { configHome: home }, secretEnv }, ctx);
+      expect(sdkState.options.env.ANTHROPIC_API_KEY).toBe('');
+      const child = sdkState.options.spawnClaudeCodeProcess({ command: localProviderCli('claude'), args: [],
+        env: { ...sdkState.options.env, ANTHROPIC_API_KEY: 'sdk-key' }, signal: new AbortController().signal });
+      const closed = new Promise(resolve => child.once('close', resolve));
+      child.kill();
+      await closed;
+      expect(spawnedEnv?.DATABASE_URL).toBeUndefined();
+      expect(spawnedEnv?.NODE_OPTIONS).not.toBe('--invalid-project-option');
+      expect(spawnedEnv).toMatchObject({ ANTHROPIC_API_KEY: '', ANTHROPIC_AUTH_TOKEN: '', CLAUDE_CODE_OAUTH_TOKEN: '' });
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
       expect(sdkState.options).not.toHaveProperty('getOAuthToken');
       expect(sdkState.options.mcpServers.karmax).toBeUndefined();

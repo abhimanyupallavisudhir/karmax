@@ -1042,6 +1042,7 @@ export class ProjectResourceService {
 
 class EnvironmentWorld implements World {
   constructor(private inner: World, private env: Record<string, string>) {}
+  withoutProjectEnvironment(): World { return this.inner.withoutProjectEnvironment?.() ?? this.inner; }
   get handle() { return this.inner.handle; }
   set handle(value: WorldHandle) { this.inner.handle = value; }
   exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
