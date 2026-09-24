@@ -17325,8 +17325,78 @@ async function wireInstallationUsers() {
   if (!box) return;
   try {
     const users = await api('/api/users');
-    box.innerHTML = users.map((user) => `<div class="form-row"><a data-spa href="${profileRoute(user.id)}">${esc(user.name)} · ${esc(user.email)}</a></div>`).join('');
+    const reviews = await api('/api/users/erasure-cases').catch(() => null);
+    box.innerHTML = users.map((user) => `<div class="form-row"><a data-spa href="${profileRoute(user.id)}">${esc(user.name)} · ${esc(user.email)}</a>
+      ${reviews ? `<button class="btn sm" data-erasure-user="${esc(user.id)}">Preview account closure</button>` : ''}</div>`).join('')
+      + (reviews ? `<p class="task-sub">Account closure removes login/access, not shared work. Erasure reviews require documented decisions; replacing a name is not anonymisation.</p>
+        ${reviews.requests.map(request => `<p class="task-sub">Deletion requested: ${esc(request.userId)} · ${esc(new Date(request.requestedAt).toLocaleString())}</p>`).join('')}
+        ${reviews.cases.map(record => `<div class="form-row"><button class="btn sm" data-erasure-user="${esc(record.userId)}">Review ${esc(record.userId)}</button>
+          <span>${esc(record.state)}${record.items.some(item => item.decision?.reviewAt <= Date.now()) ? ' · retention review overdue' : ''}${record.retryRequired ? ' · cleanup retry required' : ''}</span></div>`).join('')}
+        <div id="account-erasure-panel" aria-live="polite"></div>` : '');
+    box.querySelectorAll('[data-erasure-user]').forEach(button => button.addEventListener('click', () =>
+      loadAccountErasure(button.dataset.erasureUser).catch(error => toast(error.message, true))));
   } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
+}
+
+function accountErasureMarkup(preview) {
+  const record = preview.case;
+  const closed = record && record.state !== 'closing';
+  const due = record?.items.some(item => item.decision?.reviewAt <= Date.now());
+  return `<div class="card"><div class="section-h">Account closure / erasure review</div>
+    <p><b>${esc(preview.userId)}</b>${preview.identity ? ` · ${esc(preview.identity.email)}` : ''}</p>
+    <p class="task-sub">${esc(preview.warning)} Export must be offered before closure. No subscriptions are cancelled and no external accounts or GitHub activity are deleted automatically.</p>
+    <details><summary>Exact inventory and automatic cleanup</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify({
+      organizations: preview.organizations, relatedTaskIds: preview.relatedTaskIds, linkedGit: preview.linkedGit,
+      gitProfiles: preview.gitProfiles, automatic: preview.automatic, preserved: preview.preserved,
+    }, null, 2))}</pre></details>
+    ${!record ? `<p class="task-sub">${preview.blockers.length ? esc(preview.blockers.join('\n')) : 'No closure blockers detected. Review scope and identity before proceeding.'}</p>` : ''}
+    ${!closed ? `<label class="form-row"><span><input id="erasure-export-handled" type="checkbox"> I verified the requester and offered/handled their export.</span></label>
+      <label class="form-row">Type CLOSE ${esc(preview.userId)}<input id="erasure-confirmation" autocomplete="off"></label>
+      <button class="btn danger" id="erasure-close" ${!record && preview.blockers.length ? 'disabled' : ''}>${record ? 'Retry interrupted cleanup' : 'Close this account'}</button>` : ''}
+    ${record ? `<p class="task-sub">${esc(record.state)} · completed cleanup: ${esc(record.steps.join(', '))}${record.retryRequired ? ' · cleanup incomplete; retry required' : ''}${due ? ' · retention review overdue' : ''}</p>
+      <a class="btn sm" href="/api/users/${encodeURIComponent(preview.userId)}/erasure/export" download>Download suppression manifest</a>
+      <p class="task-sub">Keep the manifest securely outside the backup restore set. Reapply its closure and content actions before restoring service. This is a manual recovery control, not an automatic restore filter.</p>
+      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}"><p>${esc(item.label)}</p>
+        <label class="form-row">Outcome<select data-erasure-outcome><option value="">Unreviewed</option>${['erased', 'redacted', 'retained', 'not-applicable'].map(outcome => `<option value="${outcome}" ${item.decision?.outcome === outcome ? 'selected' : ''}>${outcome}</option>`).join('')}</select></label>
+        <label class="form-row">Evidence / controller instructions / lawful retention reason<textarea data-erasure-evidence maxlength="4000" placeholder="References and reasoning only; do not copy personal content.">${esc(item.decision?.evidence || '')}</textarea></label>
+        <label class="form-row">Review / expiry date (required for retention and backups)<input type="date" data-erasure-review-at value="${item.decision?.reviewAt ? new Date(item.decision.reviewAt).toISOString().slice(0, 10) : ''}"></label>
+        <button class="btn sm" data-erasure-save="${index}">Save decision</button></div>`).join('') : ''}
+      ${closed ? `<p class="task-sub">Review completion records your decisions; it is not proof of universal erasure. Retention exceptions remain subject to their review dates.</p>
+        <label class="form-row">Type REVIEWED ${esc(preview.userId)}<input id="erasure-reviewed" autocomplete="off"></label>
+        <button class="btn" id="erasure-complete" ${record.items.some(item => !item.decision) || due ? 'disabled' : ''}>Mark review complete</button>` : ''}` : ''}
+    <p class="task-sub" id="erasure-feedback" role="status"></p></div>`;
+}
+
+async function loadAccountErasure(userId) {
+  const panel = $('#account-erasure-panel');
+  if (!panel) return;
+  const endpoint = `/api/users/${encodeURIComponent(userId)}/erasure`;
+  const preview = await api(endpoint);
+  if (!panel.isConnected) return;
+  panel.innerHTML = accountErasureMarkup(preview);
+  const mutate = async (body) => {
+    panel.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    try {
+      await api(endpoint, { method: 'POST', body: JSON.stringify(body) });
+      await loadAccountErasure(userId);
+    } catch (error) {
+      await loadAccountErasure(userId);
+      const feedback = $('#erasure-feedback');
+      if (feedback) feedback.textContent = error.message;
+    }
+  };
+  $('#erasure-close')?.addEventListener('click', () => mutate({ action: 'close', fingerprint: preview.fingerprint,
+    confirmation: $('#erasure-confirmation').value, exportHandled: $('#erasure-export-handled').checked }));
+  panel.querySelectorAll('[data-erasure-save]').forEach(button => button.addEventListener('click', () => {
+    const item = preview.case.items[Number(button.dataset.erasureSave)];
+    const card = button.closest('[data-erasure-item]');
+    const date = card.querySelector('[data-erasure-review-at]').value;
+    return mutate({ action: 'decision', revision: preview.case.revision, itemId: item.id,
+      outcome: card.querySelector('[data-erasure-outcome]').value, evidence: card.querySelector('[data-erasure-evidence]').value,
+      ...(date ? { reviewAt: Date.parse(`${date}T23:59:59Z`) } : {}) });
+  }));
+  $('#erasure-complete')?.addEventListener('click', () => mutate({ action: 'complete', revision: preview.case.revision,
+    confirmation: $('#erasure-reviewed').value }));
 }
 
 function installationView() {

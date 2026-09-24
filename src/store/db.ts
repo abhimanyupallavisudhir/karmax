@@ -2249,6 +2249,7 @@ export class Store {
   async setOrganizationMembership(organizationId: string, userId: string, role: OrganizationMembership['role']): Promise<OrganizationMembership> {
     return this.db.transaction(async () => {
 
+    if (await this.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const existing = (await this.organizationMembership(organizationId, userId));
     (await this.assertOrganizationMemberCapacity(organizationId, userId));
@@ -3095,6 +3096,8 @@ export class Store {
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
 
+    for (const principal of [input.createdBy, input.assignee, input.delegate])
+      if (principal?.kind === 'user' && await this.kvGet(`account-closed:${principal.userId}`)) throw new Error('account is closed');
     await this.assertProjectNotTransferring(input.projectId);
     const listId =
       input.listId ?? (await this.listLists(input.projectId))[0]?.id ?? (await this.createList(input.projectId, 'Tasks')).id;
@@ -4833,6 +4836,7 @@ export class Store {
 
   async setPrincipalGrant(principalId: string, scopeKey: string, grant: Record<string, unknown>): Promise<void> {
     return this.db.transaction(async () => {
+    if (principalId.startsWith('user:') && await this.kvGet(`account-closed:${principalId.slice(5)}`)) throw new Error('account is closed');
 
     const { principalId: _p, scopeKey: _s, ...json } = grant as any;
     (await this.db.prepare(
