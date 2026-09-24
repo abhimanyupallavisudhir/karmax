@@ -103,8 +103,12 @@ export class AccountErasureService {
       }
     }
     if (linkedGit.length) blockers.push('Replace organization Git profiles linked to this user before removing their credentials.');
-    if (user?.role === 'admin' && !(await this.identity.listUsers()).some(other => other.id !== userId && other.role === 'admin'))
-      blockers.push('Create another installation administrator before closing the last administrator.');
+    if (user?.role === 'admin') {
+      let continuingAdmin = false;
+      for (const other of await this.identity.listUsers())
+        if (other.id !== userId && other.role === 'admin' && !(await this.store.kvGet(closedAccountKey(other.id)))) continuingAdmin = true;
+      if (!continuingAdmin) blockers.push('Create another installation administrator before closing the last administrator.');
+    }
     const profiles = await new GitProfiles(this.store, this.broker, this.gitHome, userGitScope(userId)).list();
     const inventory = { userId, identity: user ? { name: user.name, email: user.email } : null,
       organizations, relatedTaskIds: related.map(row => row.id), activeTasks, ownedAvatarIds: avatars.map(row => row.id), linkedGit,
@@ -137,6 +141,13 @@ export class AccountErasureService {
           ...REVIEW_ITEMS.map(item => ({ ...item })),
         ] };
       await this.store.kvSet(closedAccountKey(userId), JSON.stringify({ userId, closedAt: next.startedAt }));
+      // Remove memberships in the fence transaction, not after external cleanup:
+      // another owner must not be allowed to leave while the sole remaining
+      // owner is already fenced. A failed SQL cleanup rolls the fence back too.
+      if (!next.steps.includes('access-and-preferences')) {
+        await this.clearAccess(userId);
+        next.steps.push('access-and-preferences');
+      }
       await this.store.kvSet(caseKey(userId), JSON.stringify(next));
       await this.store.appendAudit({ principalId: actor, action: 'privacy.account.close-started', detail: { userId } });
       return next;

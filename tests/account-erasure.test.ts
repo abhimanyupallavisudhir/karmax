@@ -140,7 +140,19 @@ it('keeps access fenced during failure and resumes idempotently with persisted p
   const restarted = new AccountErasureService(store, identity, broker, dir);
   expect((await restarted.close('u_1', { confirmation: 'CLOSE u_1', exportHandled: true }, 'user:admin')).state).toBe('closed');
   expect(broker.hasHandle('github-app:user:u_1:authorization')).toBe(false);
-  expect((await restarted.get('u_1'))?.steps).toEqual(['personal-credentials', 'access-and-preferences', 'identity']);
+  expect((await restarted.get('u_1'))?.steps).toEqual(['access-and-preferences', 'personal-credentials', 'identity']);
+});
+
+it('removes the departing owner atomically with the fence, even when credential cleanup fails', async () => {
+  const { store, broker, close } = await fixture();
+  const org = await store.createOrganization({ name: 'Two owners', ownerUserId: 'u_1' });
+  await store.setOrganizationMembership(org.id, 'admin', 'owner');
+  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture');
+  vi.spyOn(broker, 'deleteHandle').mockImplementationOnce(() => { throw new Error('outage'); });
+  await expect(close()).rejects.toThrow('cleanup is incomplete');
+  expect(await store.kvGet(closedAccountKey('u_1'))).toBeDefined();
+  expect(await store.organizationMembership(org.id, 'u_1')).toBeUndefined();
+  await expect(store.removeOrganizationMembership(org.id, 'admin')).rejects.toThrow('at least one owner');
 });
 
 it('rejects delayed GitHub grants and refreshes after closure without affecting the installation key', async () => {

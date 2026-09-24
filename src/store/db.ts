@@ -4713,6 +4713,7 @@ export class Store {
   async upsertAvatar(avatar: Avatar): Promise<Avatar> {
     return this.db.transaction(async () => {
 
+    if (await this.kvGet(`account-closed:${avatar.ownerUserId}`)) throw new Error('account is closed');
     (await this.db.prepare(`INSERT INTO avatars
       (id, organizationId, projectId, ownerUserId, json, createdAt, updatedAt, deletedAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
