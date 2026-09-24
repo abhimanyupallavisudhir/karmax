@@ -9418,13 +9418,13 @@ async function openConversationShare(v, role) {
         ? `${globalRoute('organization', organizationById(settings.id))}#organization-conversation-sharing`
         : `${projectRoute(settings?.id, 'settings')}#project-conversation-sharing`;
       const blocked = settings
-        ? `Public sharing is disabled for this ${settings.scope}. ${settings.canManage
-          ? `<a data-sharing-settings href="${esc(settingsUrl)}">${settingsLabel}</a>`
+        ? `Your ${settings.scope} has disabled public conversation sharing. ${settings.canManage
+          ? `Enable it in <a data-sharing-settings href="${esc(settingsUrl)}">${settingsLabel}</a>.`
           : `Ask ${settings.scope === 'organization' ? 'an organization' : 'a project'} administrator to enable it.`}`
         : 'Public sharing is disabled in organization or project settings.';
       dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="conversation-share-title">Share conversation</h2><button class="btn sm" data-close>Close</button></header>
-        <div class="artifact-reader-content"><p>Anyone with this link can read the user and agent message text, including any sensitive information in it. Attachments, system messages, and tool activity are excluded. Later messages will not be added.</p>
-        ${!state.enabled ? `<p role="status">${blocked}${state.url ? ' This link is unavailable until sharing is enabled again.' : ''}</p>` : ''}
+        <div class="artifact-reader-content">${!state.enabled ? `<p role="status">${blocked}${state.url ? ' This link is unavailable until sharing is enabled again.' : ''}</p>` : ''}
+        <p>Anyone with this link can read the user and agent message text, including any sensitive information in it. Attachments, system messages, and tool activity are excluded. Later messages will not be added.</p>
         ${state.url ? `<label class="form-row"><span>Public snapshot link</span><input data-link readonly value="${esc(new URL(state.url, location.origin).href)}"></label><p class="task-sub">Created ${esc(new Date(state.createdAt).toLocaleString())}. Revoke this link before creating a new snapshot.</p><div class="inline-form"><button class="btn sm" data-copy>Copy link</button><a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open snapshot</a><button class="btn sm" data-revoke>Revoke link</button></div>` : `<details><summary>Preview message text</summary>${(preview?.messages || []).filter(m => m.role === 'user' || m.role === 'agent').map(m => `<article><b>${m.role === 'user' ? 'User' : 'Agent'}</b><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</pre></article>`).join('')}</details><button class="btn primary" data-create ${state.enabled ? '' : 'disabled'}>Create public link</button>`}</div>`;
       dialog.querySelector('[data-close]').onclick = () => dialog.close();
       dialog.querySelector('[data-sharing-settings]')?.addEventListener('click', event => {

@@ -138,6 +138,7 @@ describe('public conversation sharing over HTTP', async () => {
       const open = () => page.evaluate(() => (globalThis as any).openShare());
       await open();
       expect(await page.getByRole('button', { name: 'Create public link' }).isDisabled()).toBe(true);
+      expect(await page.locator('dialog [role=status]').innerText()).toBe('Your organization has disabled public conversation sharing. Enable it in Organization settings.');
       const settingsLink = page.getByRole('link', { name: 'Organization settings', exact: true });
       expect(await settingsLink.getAttribute('href')).toBe('/personal/settings#organization-conversation-sharing');
       await settingsLink.click();
@@ -149,6 +150,7 @@ describe('public conversation sharing over HTTP', async () => {
       // A project override is identified separately; developers cannot manage it.
       await request(`/api/projects/${project.id}/conversation-sharing`, 'PUT', owner, { value: 'disabled' });
       await open();
+      expect(await page.locator('dialog [role=status]').innerText()).toBe('Your project has disabled public conversation sharing. Enable it in Project settings.');
       expect(await page.getByRole('link', { name: 'Project settings', exact: true }).getAttribute('href')).toBe('/personal/sharing/settings#project-conversation-sharing');
       await page.getByRole('button', { name: 'Close', exact: true }).click();
       await page.evaluate(token => (globalThis as any).eval(`S.token = ${JSON.stringify(token)}`), developer);
