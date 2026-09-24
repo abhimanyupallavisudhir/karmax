@@ -1,14 +1,48 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store/db.js';
 import { createBackup, restoreBackup } from '../src/ops/backup.js';
+import { Vault } from '../src/autonomy/vault.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe('control-plane backup', () => {
+  it('recovers records and decrypts a real vault in a separate offline home', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-recovery-drill-'));
+    roots.push(root);
+    const original = path.join(root, 'original');
+    const recovered = path.join(root, 'recovered');
+    vi.stubEnv('KARMAX_VAULT_KEY', undefined);
+    try {
+      fs.mkdirSync(path.join(original, 'state'), { recursive: true });
+      const store = await Store.create(path.join(original, 'state', 'karmax.db'));
+      const vault = new Vault(path.join(original, 'vault'));
+      const handle = 'recovery-fixture';
+      const secret = 'synthetic-recovery-fixture-not-a-provider-credential';
+      try {
+        await store.kvSet('recovery-handle', handle);
+        await vault.put(handle, secret);
+      } finally { await store.close(); }
+
+      const { directory } = await createBackup({ home: original, destination: path.join(root, 'snapshot'),
+        externalTemporal: true });
+      // Prove recovery uses the snapshot, not the source's current state.
+      await vault.put(handle, 'changed-after-backup');
+      await restoreBackup(directory, { home: recovered });
+      const restored = await Store.create(path.join(recovered, 'state', 'karmax.db'));
+      try {
+        const restoredHandle = await restored.kvGet('recovery-handle');
+        expect(restoredHandle).toBe(handle);
+        expect(new Vault(path.join(recovered, 'vault')).reveal(restoredHandle!)).toBe(secret);
+        expect(vault.reveal(handle)).toBe('changed-after-backup');
+        expect(fs.readFileSync(path.join(recovered, 'vault', 'secrets.json'), 'utf8')).not.toContain(secret);
+      } finally { await restored.close(); }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('uses consistent SQLite snapshots, excludes worlds, verifies, and restores', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-'));
     const home = path.join(root, 'home');
