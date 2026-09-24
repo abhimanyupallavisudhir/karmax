@@ -509,6 +509,13 @@ export class CodexAdapter implements AgentAdapter {
     let terminalReason: string | undefined;
     let shuttingDown = false;
     let modelCredentialHealthy = false;
+    // One `thread/tokenUsage/updated` arrives per model request: `last` is that
+    // request, `total` the whole thread. Resuming replays the previous turn's
+    // reading under its old turn id, so only turns this run started count, and a
+    // re-emitted thread total is never counted twice.
+    const reportedUsage = new ReportedUsage();
+    const ownTurns = new Set<string>();
+    let countedThreadTotal: number | undefined;
     const mcpStartup: any[] = [];
     // Codex Apps is a provider-managed, optional MCP. Its OAuth token has a
     // separate lifecycle from the ChatGPT/Codex login in CODEX_HOME. In
@@ -582,8 +589,17 @@ export class CodexAdapter implements AgentAdapter {
       switch (method) {
         case 'turn/started':
           currentTurnId = params?.turn?.id ?? currentTurnId;
+          if (currentTurnId) ownTurns.add(currentTurnId);
           turnActive = true;
           break;
+        case 'thread/tokenUsage/updated': {
+          const threadTotal = params?.tokenUsage?.total?.totalTokens;
+          if (!ownTurns.has(params?.turnId) || threadTotal === countedThreadTotal) break;
+          countedThreadTotal = threadTotal;
+          const round = reportedUsage.addCodexCli(params.tokenUsage.last);
+          void notificationTrace?.mark('provider.usage', round);
+          break;
+        }
         case 'item/started':
           // Surface a command as it begins, mirroring the exec/SDK live terminal feed.
           if (params?.item?.type === 'commandExecution' && typeof params.item.command === 'string') ctx.emit(`$ ${params.item.command}`);
@@ -838,6 +854,7 @@ export class CodexAdapter implements AgentAdapter {
           ...(effort ? { effort } : {}),
         });
         currentTurnId = started?.turn?.id ?? currentTurnId;
+        if (currentTurnId) ownTurns.add(currentTurnId);
         await settled;
         (await providerRoundEnd?.(ctx.signal?.aborted ? 'cancelled' : turnError || terminalStatus !== 'completed' ? 'failed' : 'ok'));
         if (ctx.signal?.aborted) break;
@@ -906,6 +923,7 @@ export class CodexAdapter implements AgentAdapter {
       session: threadId,
       output: finalText,
       delivered: deliveredIndex,
+      usage: reportedUsage.total(),
     };
   }
 
@@ -1012,6 +1030,7 @@ export class CodexAdapter implements AgentAdapter {
     let buf = '';
     let sawCompleted = false;
     let turnFailure: string | undefined;
+    const reportedUsage = new ReportedUsage();
 
     const handleLine = (line: string) => {
       const s = line.trim();
@@ -1023,7 +1042,12 @@ export class CodexAdapter implements AgentAdapter {
         return; // non-JSON progress line
       }
       const t: string = ev.type ?? ev.msg?.type ?? '';
-      if (t === 'turn.completed') sawCompleted = true;
+      if (t === 'turn.completed') {
+        sawCompleted = true;
+        // On a resumed thread `codex exec` reports cumulative thread totals, not
+        // this turn's; an unknown turn share is recorded as unknown, never inflated.
+        if (!input.session && ev.usage) reportedUsage.addCodexCli(ev.usage);
+      }
       if (t === 'turn.failed') turnFailure = ev.error?.message ?? JSON.stringify(ev.error ?? ev);
       if (/thread\.(started|created)|session\.created/.test(t)) {
         const prev = threadId;
@@ -1138,6 +1162,7 @@ export class CodexAdapter implements AgentAdapter {
       session: threadId,
       output: finalText,
       delivered: input.messages.length,
+      usage: reportedUsage.total(),
     };
   }
 }

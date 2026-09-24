@@ -11438,8 +11438,11 @@ function insDelta(current, previous, days, better) {
 // Stable identity colors for models: the top three by tokens in the period take
 // the categorical slots, everything else is "Other". One mapping feeds the chart
 // and the model list so a model keeps its color everywhere on the page.
+function insightTopTokenModels(models) {
+  return models.filter((model) => model.tokens > 0).sort((a, b) => b.tokens - a.tokens).slice(0, 3).map((model) => model.model);
+}
 function insightModelColors(models) {
-  const ranked = [...models].filter((model) => model.tokens > 0).slice(0, 3).map((model) => model.model);
+  const ranked = insightTopTokenModels(models);
   return (model) => { const i = ranked.indexOf(model); return i < 0 ? 'var(--viz-other)' : `var(--viz-${i + 1})`; };
 }
 
@@ -11508,8 +11511,9 @@ function insightKpisHtml(data) {
     ${tile('Time to ship', 'Median time from creating a task to done', insDuration(t.medianShipMs), insDelta(t.medianShipMs, p.medianShipMs, days, 'down'))}
     ${tile('Agent time', 'Time agents spent on turns', insDuration(t.agentSeconds * 1000), insDelta(t.agentSeconds, p.agentSeconds, days),
       t.turns ? `${insNum(t.turns)} turns${failPct ? ` · ${failPct}% failed` : ''}` : '')}
-    ${tile('Tokens', 'Model tokens reported by providers', insNum(t.tokens), insDelta(t.tokens, p.tokens, days),
-      t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
+    ${tile('Tokens', 'Model tokens reported by providers', t.meteredTurns || !t.turns ? insNum(t.tokens) : '—', insDelta(t.tokens, p.tokens, days),
+      t.meteredTurns < t.turns ? `reported for ${insNum(t.meteredTurns)} of ${insNum(t.turns)} turns`
+        : t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
     ${spend ? tile('Spend', 'Metered model and sandbox cost plus card purchases by agents (USD)', insMoney(t.spendMicros), insDelta(t.spendMicros, p.spendMicros, days),
       spend.cardMicros ? `${insMoney(spend.cardMicros)} on cards` : '') : ''}
   </div>`;
@@ -11522,7 +11526,7 @@ function insightSeries(data, lens) {
   if (lens === 'time') return { unit: 'h', bars: [{ label: 'Agent hours', color: 'var(--accent)', values: daily.map((d) => d.agentSeconds / 3600) }] };
   if (lens === 'tokens') {
     const color = insightModelColors(data.models);
-    const top = data.models.filter((model) => model.tokens > 0).slice(0, 3).map((model) => model.model);
+    const top = insightTopTokenModels(data.models);
     const bars = top.map((model) => ({ label: model, color: color(model), values: daily.map((d) => d.tokensByModel[model] || 0) }));
     const other = daily.map((d) => Object.entries(d.tokensByModel).reduce((sum, [model, n]) => sum + (top.includes(model) ? 0 : n), 0));
     if (other.some(Boolean)) bars.push({ label: 'Other', color: 'var(--viz-other)', values: other });
@@ -11653,13 +11657,17 @@ function insightModelsHtml(data) {
   const models = data.models.filter((model) => model.turns || model.tokens);
   if (!models.length) return `<div class="ins-empty">No agent turns yet</div>`;
   const color = insightModelColors(data.models);
-  const total = models.reduce((sum, model) => sum + model.tokens, 0) || 1;
+  // Share of agent time: known for every turn, unlike tokens.
+  const total = models.reduce((sum, model) => sum + model.agentSeconds, 0) || 1;
+  const tokens = (model) => !model.meteredTurns ? `<span class="ins-unreported" title="Not reported for these turns">—</span>`
+    : model.meteredTurns < model.turns ? `<span title="Reported for ${model.meteredTurns} of ${model.turns} turns">≥${insNum(model.tokens)}</span>`
+    : insNum(model.tokens);
   return `<table class="ins-table"><thead><tr><th>Model</th><th class="num">Tokens</th><th class="num">Turns</th><th class="num" title="Turns that ended in an error">Failed</th></tr></thead><tbody>${models.slice(0, 8).map((model) => {
-    const share = Math.round((model.tokens / total) * 100);
+    const share = Math.round((model.agentSeconds / total) * 100);
     return `<tr>
       <td class="ins-name"><span class="ins-model" title="${esc(model.provider)}">${esc(model.model)}</span>
-        <span class="ins-share" title="${share}% of tokens"><i style="width:${share}%;background:${color(model.model)}"></i></span></td>
-      <td class="num">${insNum(model.tokens)}</td><td class="num">${model.turns}</td>
+        <span class="ins-share" title="${share}% of agent time"><i style="width:${share}%;background:${color(model.model)}"></i></span></td>
+      <td class="num">${tokens(model)}</td><td class="num">${model.turns}</td>
       <td class="num">${model.turns ? `${Math.round((model.failedTurns / model.turns) * 100)}%` : '—'}</td>
     </tr>`;
   }).join('')}</tbody></table>`;

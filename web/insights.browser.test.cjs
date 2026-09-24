@@ -36,14 +36,17 @@ function fixture(overrides = {}) {
   }));
   return {
     days, from: NOW - 6 * DAY, to: NOW, utcOffsetMinutes: 0,
-    totals: { shipped: 11, created: 16, turns: 21, failedTurns: 2, agentSeconds: 100_800, tokens: 28_000, inputTokens: 24_000, outputTokens: 4_000, medianShipMs: 3 * 3_600_000 },
+    totals: { shipped: 11, created: 16, turns: 21, meteredTurns: 21, failedTurns: 2, agentSeconds: 100_800, tokens: 28_000, inputTokens: 24_000, outputTokens: 4_000, medianShipMs: 3 * 3_600_000 },
     previous: { shipped: 8, created: 16, turns: 10, failedTurns: 0, agentSeconds: 50_000, tokens: 20_000, inputTokens: 1, outputTokens: 1, medianShipMs: 4 * 3_600_000 },
     daily,
+    // Server order: most turns first. gpt-6 ran before Codex subscription turns
+    // reported usage; codex is only partly reported.
     models: [
-      { model: 'opus', provider: 'anthropic', turns: 10, failedTurns: 1, agentSeconds: 50_000, tokens: 14_000 },
-      { model: 'codex', provider: 'openai', turns: 6, failedTurns: 1, agentSeconds: 30_000, tokens: 8_400 },
-      { model: 'haiku', provider: 'anthropic', turns: 3, failedTurns: 0, agentSeconds: 10_000, tokens: 2_800 },
-      { model: 'tiny', provider: 'local', turns: 2, failedTurns: 0, agentSeconds: 10_800, tokens: 2_800 },
+      { model: 'gpt-6', provider: 'openai', turns: 40, meteredTurns: 0, failedTurns: 4, agentSeconds: 90_000, tokens: 0 },
+      { model: 'opus', provider: 'anthropic', turns: 10, meteredTurns: 10, failedTurns: 1, agentSeconds: 50_000, tokens: 14_000 },
+      { model: 'codex', provider: 'openai', turns: 6, meteredTurns: 3, failedTurns: 1, agentSeconds: 30_000, tokens: 8_400 },
+      { model: 'haiku', provider: 'anthropic', turns: 3, meteredTurns: 3, failedTurns: 0, agentSeconds: 10_000, tokens: 2_800 },
+      { model: 'tiny', provider: 'local', turns: 2, meteredTurns: 2, failedTurns: 0, agentSeconds: 10_800, tokens: 2_800 },
     ],
     projects: [
       { id: 'web', name: 'Storefront', shipped: 7, open: 5, turns: 12, agentSeconds: 60_000, tokens: 18_000, daily: [1, 0, 1, 2, 0, 1, 2] },
@@ -151,9 +154,21 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
     await page.locator('[data-ins-lens="tokens"]').click();
     assert.deepEqual(await page.$$eval('.ins-legend span', els => els.map(e => e.textContent)), ['opus', 'codex', 'haiku', 'Other']);
     const legendColors = await page.$$eval('.ins-legend i', els => els.map(e => e.style.background));
-    const shareColors = await page.$$eval('.ins-share i', els => els.map(e => e.style.background));
-    assert.deepEqual(shareColors.slice(0, 3), legendColors.slice(0, 3), 'a model has one color on the whole page');
-    assert.equal(shareColors[3], 'var(--viz-other)');
+    const shareColor = await page.$$eval('.ins-table tr', rows => Object.fromEntries(rows.filter(row => row.querySelector('.ins-share'))
+      .map(row => [row.querySelector('.ins-model').textContent, row.querySelector('.ins-share i').style.background])));
+    assert.deepEqual([shareColor.opus, shareColor.codex, shareColor.haiku], legendColors.slice(0, 3), 'a model has one color on the whole page');
+    assert.equal(shareColor.tiny, 'var(--viz-other)');
+
+    // Unreported usage reads as unknown, never as zero; partial as a lower bound.
+    const tokenCell = async name => page.locator('.ins-table tr', { has: page.locator('.ins-model', { hasText: name }) }).locator('td.num').first();
+    assert.equal(await (await tokenCell('gpt-6')).textContent(), '—');
+    assert.equal(await (await tokenCell('gpt-6')).locator('span').getAttribute('title'), 'Not reported for these turns');
+    assert.equal(await (await tokenCell('codex')).textContent(), '≥8.4k');
+    assert.equal(await (await tokenCell('codex')).locator('span').getAttribute('title'), 'Reported for 3 of 6 turns');
+    assert.equal(await (await tokenCell('opus')).textContent(), '14k');
+    assert.deepEqual(await page.$$eval('.ins-model', els => els.map(e => e.textContent)), ['gpt-6', 'opus', 'codex', 'haiku', 'tiny'],
+      'models keep the server\'s work-done order');
+    assert.equal(await page.locator('.ins-share', { has: page.locator('i') }).first().getAttribute('title'), '47% of agent time');
     await page.locator('[data-ins-lens="time"]').click();
     assert.equal(await page.locator('.ins-legend span').count(), 0, 'a single series needs no legend');
     assert.equal(await page.locator('.ins-svg text.tick').first().textContent(), '0m');
@@ -183,6 +198,12 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
     await page.evaluate(() => { window.insightsResponse = () => ({ ...FIXTURE, totals: { ...FIXTURE.totals, spendMicros: 12_500_000 }, previous: { ...FIXTURE.previous, spendMicros: 10_000_000 }, spend: { modelMicros: 10_000_000, cardMicros: 2_500_000 } }); return renderPage(); });
     assert.equal(await page.locator('.ins-kpi').count(), 5);
     assert.match(await page.locator('.ins-kpi', { hasText: 'Spend' }).textContent(), /\$12\.50.*\$2\.50 on cards/s);
+
+    // Tokens say how much of the work they cover when some turns went unreported.
+    await page.evaluate(() => { window.insightsResponse = () => ({ ...FIXTURE, totals: { ...FIXTURE.totals, turns: 61, meteredTurns: 21 } }); return renderPage(); });
+    assert.equal(await page.locator('.ins-kpi', { hasText: 'Tokens' }).locator('.ins-kpi-s').textContent(), 'reported for 21 of 61 turns');
+    await page.evaluate(() => { window.insightsResponse = () => ({ ...FIXTURE, totals: { ...FIXTURE.totals, tokens: 0, meteredTurns: 0 } }); return renderPage(); });
+    assert.match(await page.locator('.ins-kpi', { hasText: 'Tokens' }).locator('.ins-kpi-n').textContent(), /^—/);
 
     // A narrow phone: no horizontal overflow; what needs a person comes first.
     await page.setViewportSize({ width: 390, height: 900 });
