@@ -62,8 +62,8 @@ function constant(name) {
       window.renderMain = () => { $('#main').innerHTML = inboxView(); wireInboxView(); };
     });
     await page.addScriptTag({ content: [
-      constant('INBOX_TABS'), constant('URGENCY_LEVELS'),
-      ...['updateBell', 'urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'wireInboxView', 'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'taskRow'].map(fn),
+      constant('INBOX_TABS'), constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
+      ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'wireInboxView', 'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'taskRow'].map(fn),
       'renderMain();',
     ].join('\n') });
     await page.evaluate(() => document.fonts.ready);

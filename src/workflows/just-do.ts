@@ -20,6 +20,9 @@ import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldH
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
 
+const resourceActivities = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
+});
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 // Agent turns heartbeat every ~1s; a 2-minute gap = dead/slept worker → Temporal
 // retries the turn and the next attempt resumes the interrupted session (see
@@ -127,6 +130,8 @@ async function justDoImpl(
   let cancelled = false;
   let resourceResolutionEpoch = 0;
   let awaitingResourceDecision = false;
+  let resourceReviewSequence = 0;
+  let applyingResources = false;
   let world: WorldHandleLike | undefined;
   let session: string | undefined;
   let reviewInfo: ReviewInfo | undefined;
@@ -144,7 +149,7 @@ async function justDoImpl(
   const confirmLayers = confirmLayersOf(input.confirm);
 
   function actions(): DeclaredAction[] {
-    if (finalizing) return [];
+    if (finalizing || applyingResources) return [];
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Done', enabled: true };
@@ -155,7 +160,7 @@ async function justDoImpl(
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { worldReady: !!world, ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
+      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
@@ -327,7 +332,9 @@ async function justDoImpl(
     // Play the confirm layers in order (SPEC §5.2): every layer must approve; a
     // revise/follow-up returns to Do and the next Review replays from the first.
     let backToDo = false;
-    if (resourceCandidateReview) {
+    const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
+    if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+    if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
       while (pending && !cancelled && msgs.length === seen) {
@@ -379,7 +386,16 @@ async function justDoImpl(
       confirmed = false; // consumed by this layer
     }
     if (cancelled) break;
-    if (!backToDo) break; // every layer approved (or none configured) → done
+    if (!backToDo) {
+      if (automaticResources) {
+        applyingResources = true;
+        status = 'active';
+        await publish();
+        try { await resourceActivities.settleResourceReview(taskId); }
+        finally { applyingResources = false; }
+      }
+      break; // every layer approved (or none configured) → done
+    }
     stage = 'do';
     status = 'active';
   }

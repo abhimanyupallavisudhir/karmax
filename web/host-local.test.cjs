@@ -92,7 +92,7 @@ ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess
 // this machine's Tailscale/pkexec. Like the other installation cards below, it
 // lives behind the operator-only Installation route and is revealed only after
 // its settings endpoint succeeds.
-ok(src.includes("if (!S.installationAccess) return go(globalRoute('dashboard')"),
+ok(src.includes("if (!S.installationAccess) return go(globalRoute('insights')"),
   'the Installation route refuses a non-operator before rendering host controls');
 ok(/id="phone-access-card"[^>]*\shidden/.test(src), 'the Phone Access card ships hidden');
 ok(/error\?\.status === 403\) return/.test(src), 'a refused Phone Access read leaves the control absent');

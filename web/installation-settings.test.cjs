@@ -22,7 +22,7 @@ const organization = slice('function organizationView()', 'async function hydrat
 const project = slice('function settingsView(proj)', 'function cloudEnvironmentCard(proj)');
 
 for (const marker of [
-  'installation-appearance', 'installation-capacity', 'installation-github',
+  'installation-appearance', 'installation-health', 'installation-capacity', 'installation-github',
   'installation-paid-launch', 'installation-stripe', 'installation-email', 'installation-access', 'installation-recovery',
 ]) ok(installation.includes(`id="${marker}"`), `Installation includes #${marker}`);
 
@@ -40,7 +40,7 @@ ok(!organization.includes('pay-stripe-platform'), 'Organization omits shared Str
 ok(!project.includes('project-setup-github'), 'Project settings never bootstrap the shared GitHub App');
 ok(src.includes("${S.installationAccess ? `<div class=\"label\">Installation</div><a class=\"nav-item"), 'rail renders Installation only after an authorized probe');
 ok(src.includes("api('/api/settings/installation')"), 'boot probes an installation-scoped endpoint');
-ok(src.includes("if (!S.installationAccess) return go(globalRoute('dashboard')"), 'a direct non-operator route is redirected');
+ok(src.includes("if (!S.installationAccess) return go(globalRoute('insights')"), 'a direct non-operator route is redirected');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

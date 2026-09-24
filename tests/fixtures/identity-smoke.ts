@@ -117,11 +117,11 @@ const collidingOrganization = await json('/api/organizations', {
   method: 'POST', headers: rootHeaders,
   body: JSON.stringify({ name: ' waiting USER ' }),
 });
-// The org dashboard must be viewable by its own (non-operator) owner: it needs
-// only organization:read, and host/diagnostic data is gated separately. This is
-// the "missing capability diagnostic:read" landing bug.
+// The org Insights page must be viewable by its own (non-operator) owner: it
+// needs only organization:read, and host/diagnostic data is gated separately.
+// This is the "missing capability diagnostic:read" landing bug.
 const signupDashboard = signupOrgs[0]
-  ? await json(`/api/dashboard?organizationId=${encodeURIComponent(signupOrgs[0].id)}`, { headers: { cookie: signupCookie } })
+  ? await json(`/api/organizations/${encodeURIComponent(signupOrgs[0].id)}/insights`, { headers: { cookie: signupCookie } })
   : { status: 0 };
 const signupDashboardOk = signupDashboard.status === 200;
 const upload = await fetch(`${base}/api/attachments?projectId=${encodeURIComponent(project.id)}`, {

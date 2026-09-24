@@ -356,7 +356,7 @@ describe('Store', () => {
     // A project is addressed at /<org>/<project> by the slug of its name, and an
     // organization owns the top URL segment — a name that slugifies to a built-in
     // route word (wiki, settings, dashboard, api, …) would be unreachable.
-    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'inbox', 'profile', 'api', 'tasks', 'queue', ' Wiki ']) {
+    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'Insights', 'inbox', 'profile', 'api', 'tasks', 'queue', ' Wiki ']) {
       await expect((async () => (await store.createProject(name)))()).rejects.toThrow(/reserved/i);
       await expect((async () => (await store.createOrganization({ name })))()).rejects.toThrow(/reserved/i);
     }
@@ -897,9 +897,11 @@ describe('Store', () => {
     (await store.db.prepare(`INSERT INTO delivery_outbox (id, inboxId, channel, state, attempts, nextAt, createdAt)
       VALUES ('do1', 'ib1', 'email', 'pending', 0, 0, 1)`).run());
 
+    await store.resourceReview(t.id, { begin: 'review' });
     await store.kvSet(`view-publication-fence:${t.id}:run:37`, '1:fence');
     await store.kvSet(`view-publication-fence:${other.id}:run:37`, '2:other');
     (await store.deleteTask(t.id));
+    expect(await store.kvGet(`resource-review:${t.id}`)).toBeUndefined();
     expect(await store.kvGet(`view-publication-fence:${t.id}:run:37`)).toBeUndefined();
     expect(await store.kvGet(`view-publication-fence:${other.id}:run:37`)).toBe('2:other');
 

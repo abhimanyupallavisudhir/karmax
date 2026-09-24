@@ -89,6 +89,7 @@ const S = {
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
+  followupHeights: {}, // manual minimum height for each draft, preserved across background renders
   // In-flight parameter edits are deliberately manual-save. Keep their working
   // values outside the DOM so a live task refresh cannot silently erase them.
   paramEditDrafts: {}, // taskId -> { saved, values, dirtyNames }
@@ -110,8 +111,9 @@ const S = {
   explanationPending: {}, // sourceKey -> true while the annotation model is running
   explanationErrors: {}, // sourceKey -> structured inline failure with settings links
   ws: null,
-  hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
-  procTimer: null, // live-refresh handle for the dashboard processes (task manager) panel
+  hostDiagTimer: null, // live-refresh handle for the Installation host-diagnostics panel
+  procTimer: null, // live-refresh handle for the Installation processes (task manager) panel
+  insightsTimer: null, // live-refresh handle for the Insights page
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where closing the task page returns to (the list/queue we opened from)
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
@@ -266,8 +268,8 @@ function taskRecord(id) {
 //   /                                    → home (redirects into the current org)
 //   /profile                             → the current user's profile
 //   /installation                        → global operator-only installation controls
-//   /<org>                               → org home (redirects to a project or dashboard)
-//   /<org>/dashboard                     → organization dashboard
+//   /<org>                               → org home (redirects to a project or insights)
+//   /<org>/insights                      → organization insights (/<org>/dashboard redirects here)
 //   /<org>/settings                      → organization settings
 //   /<org>/inbox                         → inbox
 //   /<org>/wiki                          → organization wiki
@@ -336,7 +338,7 @@ function syncOrganizationSwitcher() {
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
+const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
 // Parse an in-app URL — a path, optionally with its `?…` query string — into the
 // page it names. The tasks list's whole search state (free text, filters, group,
@@ -352,7 +354,7 @@ function parseRoute(url) {
   if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
   if (seg[0] === 'installation') return { name: 'installation' };
   // Pre-organization URLs — resolved, then canonicalised to the org form.
-  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
+  if (seg[0] === 'dashboard') return { name: 'global', tab: 'insights', legacy: true };
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
@@ -368,6 +370,8 @@ function parseRoute(url) {
   // Profile used to be organization-prefixed. It never belonged to that tenant,
   // so recognize old bookmarks without carrying their org into application state.
   if (seg[1] === 'profile') return { name: 'profile', legacy: true };
+  // Insights replaced the old Dashboard; keep its bookmarks working.
+  if (seg[1] === 'dashboard') return { name: 'global', org, tab: 'insights', legacy: true };
   // The inbox is the one org view with a sub-view (which kind of notification).
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
@@ -399,7 +403,7 @@ function projectBase(pid) {
 // which belongs to the project currently on screen and to no other.
 function projectRoute(pid, tab = 'tasks', q = pid === S.projectId ? S.search : '') {
   const base = projectBase(pid);
-  if (!base) return globalRoute('dashboard');
+  if (!base) return globalRoute('insights');
   if (tab !== 'tasks') return `${base}/${tab}`;
   return q ? `${base}?q=${encodeQuery(q)}` : base;
 }
@@ -411,7 +415,7 @@ function encodeQuery(q) {
   return encodeURIComponent(q).replace(/%3A/g, ':').replace(/%2C/g, ',').replace(/%20/g, '+');
 }
 
-// An organization-level route (dashboard / settings / inbox) under the current
+// An organization-level route (insights / settings / inbox) under the current
 // (or a given) org's slug. Internal tab key 'organization' → URL segment 'settings'.
 function globalRoute(tab, org = currentOrg()) {
   const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab;
@@ -494,7 +498,7 @@ async function applyRoute() {
   const r = parseRoute(currentPath());
   if (r.name === 'home') {
     const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
-    return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
+    return go(pid ? projectRoute(pid) : globalRoute('insights'), { replace: true });
   }
   if (r.name === 'profile') {
     if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
@@ -508,7 +512,7 @@ async function applyRoute() {
     return;
   }
   if (r.name === 'installation') {
-    if (!S.installationAccess) return go(globalRoute('dashboard'), { replace: true });
+    if (!S.installationAccess) return go(globalRoute('insights'), { replace: true });
     closeTaskDom();
     S.tab = 'installation';
     renderRail();
@@ -536,15 +540,15 @@ async function applyRoute() {
     }
     await loadOrganizationRuntimeCatalog();
     if (!routeIsCurrent()) return;
-    // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
+    // Bare /<org> → that org's default project (or its insights); pre-org URLs
     // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
     // redirect when the canonical path actually differs, so an unresolvable slug
     // (or a workspace with no organizations yet) renders instead of looping.
     if (!r.tab) {
       const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
-      const dest = pid ? projectRoute(pid) : globalRoute('dashboard');
+      const dest = pid ? projectRoute(pid) : globalRoute('insights');
       if (dest !== currentPath()) return go(dest, { replace: true });
-      r.tab = 'dashboard'; // fall through to a real page
+      r.tab = 'insights'; // fall through to a real page
     }
     if (r.tab === 'inbox') {
       S.inboxFilter = INBOX_TABS.some((tab) => tab.key === r.sub) ? r.sub : 'all';
@@ -556,7 +560,7 @@ async function applyRoute() {
     closeTaskDom();
     S.tab = r.tab;
     renderRail();
-    // renderMain() already dispatches per-tab hydration (renderDashboard,
+    // renderMain() already dispatches per-tab hydration (renderInsights,
     // hydrateOrganizationView, …). Calling them again here double-ran hydration
     // on the same DOM, stacking a second click listener on static buttons like
     // "Invite" — which sent every invitation (and its email) twice and rendered
@@ -683,7 +687,6 @@ async function applyRoute() {
   renderMain();
   if (tab === 'activity') seedActivity();
   if (tab === 'queue') seedQueue();
-  if (tab === 'dashboard') renderDashboard();
 }
 
 // The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
@@ -1110,7 +1113,7 @@ function resumeChosenInner(rf, task) {
     ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
-    : ''}`;
+    : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
 }
 
 // The grants a task ended with, in the task form's own vocabulary: its stored
@@ -1916,13 +1919,65 @@ function wireAgentBox(box) {
     if (!grants) return;
     box.dispatchEvent(new CustomEvent('af-reauthorize', { bubbles: true, detail: { taskId: task.id, enabled: on, ...grants } }));
   };
-  // Dropping the source also withdraws the grants it brought along.
+  // Reuse fills the ordinary fields, so task creation and parameter editing
+  // persist the same AgentSpec as a manual selection. Keep the previous values
+  // only until the source is withdrawn or the user customizes these controls.
+  let modelStash = null;
+  let modelRequest = 0;
+  const modelSelection = () => ({
+    avatarId: avatarSelect?.value || '',
+    provider: providerOf(),
+    model: box.querySelector('.af-model').value,
+    effort: box.querySelector('.af-effort').value,
+  });
+  const applyModelSelection = (spec) => {
+    if (avatarSelect) avatarSelect.value = spec.avatarId || '';
+    box.querySelector('.af-provider').value = spec.provider;
+    box.querySelector('.af-model').value = spec.model || '';
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+    box.querySelector('.af-effort').value = spec.effort || '';
+    syncAvatar();
+  };
+  const withdrawModel = () => {
+    modelRequest++;
+    if (modelStash) applyModelSelection(modelStash);
+    modelStash = null;
+  };
+  const reuseModel = async (option) => {
+    if (!option.checked) { withdrawModel(); return; }
+    const request = ++modelRequest;
+    try {
+      const rf = JSON.parse(chosen.dataset.resume);
+      const session = chosen._sourceSession || (await api(`/api/tasks/${encodeURIComponent(rf.taskId)}/sessions?metadata=1`))[rf.role || 'do'];
+      if (request !== modelRequest || !option.checked) return;
+      if (!session?.provider || !AGENT_PROVIDERS.includes(session.provider)) throw new Error('The source agent’s model settings are unavailable.');
+      modelStash = modelStash || modelSelection();
+      applyModelSelection(session);
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      if (request !== modelRequest) return;
+      option.checked = false;
+      toast(error.message, true);
+    }
+  };
+  const releaseModel = (event) => {
+    if (!event.target.matches('.af-provider, .af-model, .af-effort, .af-avatar')) return;
+    modelRequest++;
+    modelStash = null;
+    const option = chosen?.querySelector('.af-resume-reuse-model');
+    if (option) option.checked = false;
+  };
+  box.addEventListener('input', releaseModel);
+  box.addEventListener('change', releaseModel);
+  // Dropping the source also withdraws the grants and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
   };
   const clearTask = () => {
     if (!chosen) return;
     withdrawReauthorize();
+    withdrawModel();
+    chosen._sourceSession = undefined;
     chosen.dataset.resume = 'null';
     chosen.innerHTML = '';
   };
@@ -1931,13 +1986,15 @@ function wireAgentBox(box) {
     uploaded.dataset.upload = 'null';
     uploaded.innerHTML = '';
   };
-  const setResume = (rf, task) => {
+  const setResume = (rf, task, session) => {
     if (!chosen) return;
     if (rf) {
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
     withdrawReauthorize();
+    withdrawModel();
+    chosen._sourceSession = rf ? session : undefined;
     chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
@@ -1949,6 +2006,8 @@ function wireAgentBox(box) {
   chosen?.addEventListener('change', (e) => {
     const option = e.target.closest?.('.af-resume-reauthorize');
     if (option) announceReauthorize(option.checked);
+    const modelOption = e.target.closest?.('.af-resume-reuse-model');
+    if (modelOption) reuseModel(modelOption);
   });
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
@@ -1967,7 +2026,7 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
   sessionInput?.addEventListener('input', () => {
@@ -3513,6 +3572,7 @@ function connectWs() {
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
+    if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
     const patchedList = patchTaskListFromEvent(ev);
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
@@ -4158,12 +4218,12 @@ function renderRail() {
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0" title="${esc(commandHint('Dashboard', 'nav.dashboard'))}">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'insights' ? 'active' : ''}" data-spa href="${globalRoute('insights')}" data-tab="insights" tabindex="0" title="${esc(commandHint('Insights', 'nav.insights'))}">▦ Insights</a>
     <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
     <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
     ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
-  // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
+  // Insights/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   if (!searching) {
     $('#new-project')?.addEventListener('click', () => newProject());
@@ -4279,11 +4339,11 @@ function dropFolder(row) {
 }
 
 function switchTab(tab) {
-  if (tab === 'dashboard') return go(globalRoute('dashboard'));
+  if (tab === 'insights') return go(globalRoute('insights'));
   if (tab === 'global' || tab === 'organization') return go(globalRoute('organization'));
   if (tab === 'inbox') return go(globalRoute('inbox'));
   const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
-  return go(pid ? projectRoute(pid, tab) : globalRoute('dashboard'));
+  return go(pid ? projectRoute(pid, tab) : globalRoute('insights'));
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -4421,7 +4481,7 @@ function renderMain() {
   if (S.tab === 'tasks') content = tasksView();
   else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
-  else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
+  else if (S.tab === 'insights') content = insightsView();
   else if (S.tab === 'inbox') content = inboxView();
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'installation') content = installationView();
@@ -4447,7 +4507,7 @@ function renderMain() {
   if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
-  if (S.tab === 'dashboard') renderDashboard();
+  if (S.tab === 'insights') { wireInsights(); renderInsights(); }
   if (S.tab === 'inbox') wireInboxView();
   if (S.tab === 'profile') wireProfileView();
   if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
@@ -7091,7 +7151,7 @@ async function refreshTask() {
 // (the ← button, Esc and the palette all route through here).
 function closeTask() {
   const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
-  const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('dashboard'));
+  const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('insights'));
   S.returnRoute = null;
   // A push, not a replace: Back after closing reopens the task that was just
   // closed, and Back from the task page returns to the list — the history a
@@ -7365,6 +7425,9 @@ function restoreConversationScroll(thread, state) {
 // reinserting a scroller interrupts native wheel/touch scrolling even if its
 // scrollTop is restored. Everything outside this path is freshly rendered.
 function patchTaskPage(main, html) {
+  // Native resizing changes the inline height without an input event. Capture
+  // it synchronously, even if a refresh arrives before ResizeObserver runs.
+  main.querySelectorAll('.followup-input').forEach((ta) => ta.disposeSizing?.());
   const template = document.createElement('template');
   template.innerHTML = html;
   const oldParams = main.querySelector('#tp-params');
@@ -8241,6 +8304,7 @@ function wireReviewActions(v) {
 
 const resourceReviewCache = new Map();
 const resourceInventoryCache = new Map();
+const resourceChoiceWrites = new Map();
 function resourceReviewPlaceholder() {
   return '<div id="review-resources"><div class="task-sub" role="status">Loading resource changes…</div></div>';
 }
@@ -8250,9 +8314,10 @@ function resourceReviewPlaceholder() {
 function loadResourceReview(v, force = false, inventory = false) {
   const cache = inventory ? resourceInventoryCache : resourceReviewCache;
   const cached = cache.get(v.taskId);
-  if (!force && cached?.view === v && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  if (!force && cached && (cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))
+    && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
   const entry = { view: v, pending: true, at: Date.now() };
-  entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : ''}`)
+  entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : '?summary=metadata'}`)
     .then((result) => {
       entry.pending = false;
       entry.at = Date.now();
@@ -8286,6 +8351,7 @@ async function wireResourceInventory(v, force = false) {
 function resourceReviewNeedsAction(item) {
   if (item.candidate) return ['pending', 'discarding'].includes(item.candidate.state);
   if (item.discarded) return false;
+  if (item.pendingInspection) return true;
   if (item.error) return true;
   return item.resource.publish === 'review' && !item.summary.promoted
     && item.summary.added + item.summary.modified + item.summary.deleted > 0;
@@ -8306,77 +8372,69 @@ async function wireResourceReview(v, force = false) {
     const thread = wrap.closest?.('.ck-thread');
     const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
     wrap.classList.remove('hidden');
-    wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
+    wrap.innerHTML = `<div class="resource-review-heading"><b>Resources</b>${items.some((item) => item.automaticReview === false) ? '' : '<span class="task-sub">Included on confirmation</span>'}</div><div class="resource-review-list">${items.map((item) => {
       const resource = item.resource;
-      if (item.candidate) {
-        const candidate = item.candidate;
-        const target = resource.target?.kind === 'path' ? resource.target.path : resource.target?.name;
-        const source = candidate.sourceKind === 'path' ? candidate.sourcePath : `vault item ${candidate.vaultItemId}`;
-        const size = item.revision ? `${formatBytes(item.revision.bytes)} · ${item.revision.files ?? 0} file${item.revision.files === 1 ? '' : 's'}`
-          : candidate.sourceKind === 'path' ? 'snapshot incomplete — discard this candidate' : 'credential value remains in the vault';
-        const state = candidate.state === 'pending'
-          ? `<div class="inline-form"><button class="btn sm primary candidate-adopt" data-candidate-id="${esc(candidate.id)}">Adopt as project resource</button><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Discard candidate</button></div>`
-          : candidate.state === 'discarding'
-            ? `<div class="inline-form"><span class="chip">Discard interrupted</span><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Retry discard</button></div>`
-          : `<span class="chip">${candidate.state === 'adopted' ? 'Adopted into project' : candidate.state === 'discarding' ? 'Discarding staged bytes…' : 'Discarded'}</span>`;
-        return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
-          <div class="task-sub">${esc(size)} · ${esc(source || '')} → ${esc(target || '')} · ${esc(resource.access || 'read')} access</div>
-          <div class="task-sub">Bound to world generation ${esc(String(candidate.worldGeneration))}; staged bytes are encrypted and retained until Adopt/Discard. Estimated retained cost: $0.00 under the current deployment storage policy (usage is recorded).</div></div>${state}</div>`;
-      }
-      if (item.discarded) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub">Task fork discarded; project baseline unchanged.</div></div>`;
-      if (item.error) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub" style="color:var(--warn)">${esc(item.error)}</div></div>`;
-      const summary = item.summary;
-      const changed = summary.added + summary.modified + summary.deleted;
-      const detail = changed
-        ? `${summary.added} added · ${summary.modified} modified · ${summary.deleted} deleted · ${formatBytes(summary.bytes)}`
-        : 'No changes from the task’s pinned baseline';
-      const paths = summary.changedPaths?.length
-        ? `<div class="task-sub mono" style="margin-top:5px">${summary.changedPaths.slice(0, 8).map(esc).join(' · ')}${summary.changedPaths.length > 8 ? ' …' : ''}</div>` : '';
-      const action = resource.publish === 'review' && changed
-        ? `<div class="inline-form"><button class="btn sm primary resource-promote" data-resource-id="${esc(resource.id)}">Promote as new baseline</button><button class="btn sm resource-discard" data-resource-id="${esc(resource.id)}">Discard fork</button></div>`
-        : `<span class="chip">${resource.publish === 'discard' ? 'Task fork will be discarded' : 'Unchanged'}</span>`;
-      return `<div class="card resource-review-card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
-        <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
-    }).join('')}`;
+      const target = resource.target?.kind === 'path' ? resource.target.path : resource.target?.name;
+      const detail = item.error || (item.candidate ? 'New resource' : 'Update if changed');
+      const legacy = item.automaticReview === false;
+      const controls = item.candidate?.state === 'discarding'
+        ? `<span class="task-sub">Discard pending</span>${legacy ? `<button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="discard">Retry discard</button>` : ''}`
+        : legacy
+        ? `<button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="${item.candidate ? 'adopt' : 'promote'}">${item.candidate ? 'Adopt' : 'Update'}</button><button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="discard">Discard</button>`
+        : `<span class="task-sub resource-selection-state">${item.excluded ? 'Excluded' : 'Included'}</span><button class="btn sm resource-exclude" data-resource-id="${esc(resource.id)}" aria-label="${item.excluded ? 'Include' : 'Exclude'} ${esc(resource.name)}" aria-pressed="${!!item.excluded}" ${item.selectionFrozen || v.state?.applyingResources ? 'disabled' : ''}>${item.excluded ? 'Include' : 'Exclude'}</button>`;
+      return `<div class="resource-review-row"><div class="resource-review-name"><b>${esc(resource.name)}</b><span class="task-sub" title="${esc(detail)}">${esc(target || detail)}</span></div><div class="resource-review-controls">${controls}</div></div>`;
+    }).join('')}</div>`;
     if (atBottom) thread.scrollTop = thread.scrollHeight;
-    wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
-      button.disabled = true; button.textContent = 'Adopting…';
-      try {
-        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resource-candidates/${encodeURIComponent(button.dataset.candidateId)}/adopt`, { method: 'POST' });
-        toast('Resource adopted into the project'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Adopt as project resource'; }
-    }));
-    wrap.querySelectorAll('.candidate-discard').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm('Discard this staged candidate? Its encrypted snapshot will be deleted; Git changes are unaffected.')) return;
-      button.disabled = true;
-      try {
-        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resource-candidates/${encodeURIComponent(button.dataset.candidateId)}/discard`, { method: 'POST' });
-        toast('Resource candidate discarded'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
-      } catch (error) { toast(error.message, true); button.disabled = false; }
-    }));
-    wrap.querySelectorAll('.resource-promote').forEach((button) => {
+    wrap.querySelectorAll('.resource-exclude').forEach((button) => {
+      const item = items.find((entry) => entry.resource.id === button.dataset.resourceId);
+      const key = `${v.taskId}/${item.resource.id}`;
+      const paint = () => {
+        button.disabled = resourceChoiceWrites.has(key) || item.selectionFrozen || !!v.state?.applyingResources;
+        button.textContent = resourceChoiceWrites.has(key) ? 'Saving…' : item.excluded ? 'Include' : 'Exclude';
+        button.closest('.resource-review-row').querySelector('.resource-selection-state').textContent = item.excluded ? 'Excluded' : 'Included';
+        button.setAttribute('aria-pressed', String(!!item.excluded));
+        button.setAttribute('aria-label', `${item.excluded ? 'Include' : 'Exclude'} ${item.resource.name}`);
+      };
+      const subscribe = async (write) => {
+        paint();
+        try { await write.promise; item.excluded = write.excluded; }
+        catch { /* the initiating click reports the error */ }
+        finally { paint(); }
+      };
+      // Task view updates may replace the DOM while a row is saving. The new
+      // row subscribes to that same write instead of displaying a stale choice.
+      const pending = resourceChoiceWrites.get(key);
+      if (pending) void subscribe(pending);
       button.addEventListener('click', async () => {
-        button.disabled = true;
-        button.textContent = 'Capturing and promoting…';
-        try {
-          const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(button.dataset.resourceId)}/promote`, { method: 'POST' });
-          toast(`Promoted ${result.attachment.name} atomically`);
+        if (resourceChoiceWrites.has(key)) return;
+        const write = { excluded: !item.excluded };
+        write.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(item.resource.id)}/selection`, {
+          method: 'PUT', body: JSON.stringify({ excluded: write.excluded }),
+        }).finally(() => {
+          resourceChoiceWrites.delete(key);
           resourceReviewCache.delete(v.taskId);
-          await wireResourceReview(v, true);
-        } catch (error) {
-          toast(error.message, true);
-          button.disabled = false;
-          button.textContent = 'Promote as new baseline';
-        }
+        });
+        resourceChoiceWrites.set(key, write);
+        const subscribed = subscribe(write);
+        try { await write.promise; }
+        catch (error) { toast(error.message, true); }
+        await subscribed;
       });
     });
-    wrap.querySelectorAll('.resource-discard').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm('Discard this task’s resource fork? Its Git changes are unaffected, but this resource can no longer be promoted from the task.')) return;
+    // Historical workflow histories retain their explicit decision gate.
+    wrap.querySelectorAll('.resource-legacy').forEach((button) => button.addEventListener('click', async () => {
+      if (button.dataset.action === 'discard' && !confirm('Discard this resource output? It will not become a project resource.')) return;
+      const item = items.find((entry) => entry.resource.id === button.dataset.resourceId);
+      const route = item.candidate ? `resource-candidates/${encodeURIComponent(item.candidate.id)}` : `resources/${encodeURIComponent(item.resource.id)}`;
       button.disabled = true;
       try {
-        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(button.dataset.resourceId)}/discard`, { method: 'POST' });
-        toast('Resource fork discarded'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
+        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/${route}/${button.dataset.action}`, { method: 'POST' });
+        button.closest('.resource-review-row').remove();
+        if (!wrap.querySelector('.resource-review-row')) {
+          wrap.classList.add('hidden');
+          wrap.innerHTML = '';
+        }
+        resourceReviewCache.delete(v.taskId);
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
   } catch (error) {
@@ -8391,6 +8449,12 @@ async function wireResourceReview(v, force = false) {
     });
   }
 }
+async function waitResourceChoices(taskId) {
+  while ([...resourceChoiceWrites.keys()].some((key) => key.startsWith(`${taskId}/`))) {
+    await Promise.all([...resourceChoiceWrites].filter(([key]) => key.startsWith(`${taskId}/`)).map(([, write]) => write.promise));
+  }
+}
+
 function setStopBtn(running, procId, taskId) {
   const wrap = document.getElementById('review-actions');
   if (!wrap) return;
@@ -10448,6 +10512,7 @@ function taskActionLabel(v, action) {
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
+  if (v.state?.applyingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Applying resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
@@ -10506,6 +10571,7 @@ function confirmTaskAction(action, v = S.view) {
 // separately on the server. Dismissing this dialog never confirms the proposal.
 async function otherAttemptsConfirmation(action, taskId) {
   if (action !== 'confirm' && action !== 'openPr') return {};
+  await waitResourceChoices(taskId);
   const group = await api(`/api/tasks/${taskId}/attempts`);
   if (!group?.otherAttemptsChoiceAvailable || group.committedAttemptId || !group.attempts.some((a) => a.id !== taskId
     && !['done', 'cancelled', 'failed'].includes(a.lastView?.status))) return {};
@@ -10564,6 +10630,7 @@ function wireActions(v) {
       try {
         const choice = await otherAttemptsConfirmation(act, v.taskId);
         if (choice === null) return;
+        if (act === 'confirm' || act === 'openPr') await waitResourceChoices(v.taskId);
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act, ...choice }) });
         succeeded = true;
         reflectAcceptedTaskAction(v.taskId, act);
@@ -10579,6 +10646,40 @@ function wireActions(v) {
     }),
   );
   $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
+}
+
+function wireFollowupSizing(ta, key) {
+  let appliedHeight = ta.style.height;
+  const remember = () => {
+    if (ta.style.height !== appliedHeight) {
+      S.followupHeights[key] = parseFloat(ta.style.height) || 0;
+      appliedHeight = ta.style.height;
+    }
+  };
+  const grow = () => {
+    remember();
+    const scrollTop = ta.scrollTop;
+    // Measure at the natural two-row height so deleting text shrinks the box.
+    ta.style.height = 'auto';
+    const style = getComputedStyle(ta);
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    const automaticLimit = 12 * parseFloat(style.lineHeight) + padding;
+    ta.style.height = `${Math.max(S.followupHeights[key] || 0, Math.min(ta.scrollHeight, automaticLimit))}px`;
+    appliedHeight = ta.style.height;
+    ta.scrollTop = scrollTop;
+  };
+  grow();
+  ta.addEventListener('input', grow);
+  // Wrapping changes on window resize and when entering/leaving full screen.
+  // Height-only changes are native manual resizes; don't immediately undo them.
+  let width = ta.clientWidth;
+  const observer = new ResizeObserver(() => {
+    if (!ta.isConnected) { ta.disposeSizing(); return; }
+    remember();
+    if (ta.clientWidth !== width) { width = ta.clientWidth; grow(); }
+  });
+  observer.observe(ta);
+  ta.disposeSizing = () => { remember(); observer.disconnect(); };
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -10605,6 +10706,7 @@ function wireFollowups(v) {
     // Wiki references in follow-ups use the same picker and backend scanner as
     // the task prompt.
     wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
+    wireFollowupSizing(ta, key);
     paint();
     const send = async () => {
       const text = ta.value.trim();
@@ -10628,6 +10730,7 @@ function wireFollowups(v) {
         // content is sourced from S.followupDrafts on every render, so this — not
         // touching the DOM — is what actually empties it.
         delete S.followupDrafts[key];
+        delete S.followupHeights[key];
         images.length = 0;
         files.length = 0;
         // The captured `ta`/`chips` may be detached if a background WS refresh
@@ -11003,7 +11106,7 @@ function activityView() {
     .join('')}</div></div>`;
 }
 
-// ── dashboard ────────────────────────────────────────────────────────────────
+// ── host health (Installation) ───────────────────────────────────────────────
 // Host diagnostics + agent-turn admission (GET /api/diagnostics). Reporting only:
 // loadavg, free/total RAM, live agent-slot occupancy, and whether either pressure
 // gate is currently holding new agent leases back (adaptive admission control).
@@ -11039,24 +11142,18 @@ function hostDiagHtml(diag) {
     <div class="task-sub" style="margin-top:6px;color:var(--ink-3)"><b>Runtime lifecycle:</b> ${runtimeLine}</div>`;
 }
 
-// Live-refresh just the host panel every 5s while the Dashboard is open. Self-
+// Live-refresh just the host panel every 5s while Installation is open. Self-
 // terminates (no reschedule) once the tab changes or the element is gone.
-function diagnosticsPath(surface) {
-  if (S.installationAccess) return `/api/${surface}`;
-  const scope = S.projectId ? `projectId=${encodeURIComponent(S.projectId)}`
-    : `organizationId=${encodeURIComponent(S.organizationId || 'org_personal')}`;
-  return `/api/${surface}?${scope}`;
-}
-
 async function refreshHostDiag() {
-  if (S.tab !== 'dashboard' || !$('#host-diag')) return;
+  if (S.tab !== 'installation' || !$('#host-diag')) return;
+  clearTimeout(S.hostDiagTimer);
   const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
-  try { diag = await api(diagnosticsPath('diagnostics')); } catch {}
+  try { diag = await api('/api/diagnostics'); } catch {}
   if (S.hostDiagEpoch !== epoch) return;
   const el = $('#host-diag');
-  if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
-  if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
+  if (el && S.tab === 'installation') el.innerHTML = hostDiagHtml(diag);
+  if (S.tab === 'installation') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
 }
 
 // ── processes (task manager) ─────────────────────────────────────────────────
@@ -11147,147 +11244,577 @@ function wireProcPanel(el) {
   );
 }
 
-// Live-refresh the processes panel every 5s while the Dashboard is open; same
+// Live-refresh the processes panel every 5s while Installation is open; same
 // self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
 // so the very first paint shows 0% and settles from the second sample on.
 async function refreshProcPanel(now = false) {
-  if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
+  if (S.tab !== 'installation' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
   const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
-  try { sample = await api(diagnosticsPath('processes')); } catch {}
+  try { sample = await api('/api/processes'); } catch {}
   if (S.procLoadEpoch !== epoch) return;
   const el = $('#proc-panel');
-  if (el && S.tab === 'dashboard') {
+  if (el && S.tab === 'installation') {
     el.innerHTML = procPanelHtml(sample);
     wireProcPanel(el);
   }
-  if (S.tab === 'dashboard') { clearTimeout(S.procTimer); S.procTimer = setTimeout(refreshProcPanel, now ? 1200 : 5000); }
+  if (S.tab === 'installation') { clearTimeout(S.procTimer); S.procTimer = setTimeout(refreshProcPanel, now ? 1200 : 5000); }
 }
 
-async function renderDashboard() {
-  const box = $('#dash');
+// ── agent account status (Settings → Codex/Claude) ──────────────────────────
+// Live leasing state of the organization's own logins and keys: availability,
+// quota windows, in-use/concurrency and the last credential incident, with the
+// manual overrides beside them.
+async function renderAccountStatus(organizationId = S.organizationId || 'org_personal') {
+  const box = $('#account-status');
   if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
-  try {
-    const organizationId = S.organizationId || 'org_personal';
-    const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
-    // The dashboard is org-scoped (counts for THIS organization). Host panels
-    // expose read-only health to developers; process rows stay in scope and
-    // mutation controls follow the response's authority flags.
-    const [d, u, credentialData, diag] = await Promise.all([
-      api(`/api/dashboard?organizationId=${encodeURIComponent(organizationId)}`),
-      api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
-      api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
-      api(diagnosticsPath('diagnostics')).catch(() => null),
-    ]);
-    if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
-    const hasDiagnostics = !!diag;
-    const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
-    const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
-    const usage = u.usage || {};
-    const pollable = new Set(u.pollable || []);
-    box.innerHTML = `
-      <div class="page-title">Overview</div>
-      <div class="stat-grid">
-        <div class="stat"><div class="n">${d.projects}</div><div class="l">Projects</div></div>
-        <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
-        ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(stageLabel({ stage: s }))}</div></div>`).join('')}
-      </div>
-      ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use the <b>+</b> next to <b>Projects</b> in the sidebar to create your first one.</div>` : ''}
-      ${!hasDiagnostics ? '' : `
-      <div class="section-h">Host &amp; admission control</div>
-      <div id="host-diag">${hostDiagHtml(diag)}</div>
-      <div class="section-h">Processes</div>
-      <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
-      <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
-        <span>Agent accounts (login availability &amp; quota)</span>
-        ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
-      </div>
-      ${accounts.length
-        ? accounts.map((a) => {
-            const status = a.status || 'available';
-            const badge = status === 'available'
-              ? '🟢 available'
-              : status === 'manual-off'
-                ? '⏸ off (manual)'
-                : status === 'needs-attention'
-                  ? '🔴 needs attention (funding or re-authentication)'
-                  : `🟠 ${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
-            const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
-            return `<div class="card">
-              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                <b class="mono">${esc(a.id)}</b>
-                <span class="chip">${esc(a.provider || '')}</span>
-                <span>${badge}</span>${weekly}
-                <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent}</span>
-              </div>
-              ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
-              ${accountIncidentHtml(a)}
-              <div class="task-sub" style="gap:6px;margin-top:6px;align-items:center">
-                ${status === 'available'
-                  ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
-                  : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
-                <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
-                ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
-                <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
-              </div>
-            </div>`;
-          }).join('')
-        : `<div class="card" style="color:var(--ink-3)">No Codex/Claude accounts yet. Add one in Settings → Codex/Claude.</div>`}`}`;
-    const recheck = async (btn, body) => {
-      const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
-      try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
-      catch (e) { toast(e.message, true); }
-      btn.textContent = label; renderDashboard();
-    };
-    // Auto-refresh stale usage: a snapshot whose window has already reset (server
-    // marks it `stale`) or a pollable login never probed. Without this the % froze
-    // at whenever ↻ was last clicked and a week-old 15% read as current. Guarded to
-    // one attempt a minute so a failing probe can't loop the dashboard.
-    if ([...pollable].some((id) => !usage[id] || usage[id].stale) && Date.now() - (S.usageAutoAt || 0) > 60_000) {
-      S.usageAutoAt = Date.now();
-      api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify({}) }).then(() => {
-        // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
-        const el = document.activeElement;
-        if (S.tab === 'dashboard' && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderDashboard();
-      }).catch(() => {});
-    }
-    box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
-    box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
-    box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
-      await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
-      renderDashboard();
-    }));
-    box.querySelectorAll('.acct-conc').forEach((inp) => {
-      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
-      inp.addEventListener('change', async () => {
-        const v = inp.value.trim(); // empty = unlimited
-        await api(`${accountBase}/accounts/concurrency`, { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
-          .then(() => toast('Concurrency updated')).catch((e) => toast(e.message, true));
-        renderDashboard();
-      });
+  const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
+  const [status, u] = await Promise.all([
+    api(`${accountBase}/accounts/status`).catch(() => null),
+    api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
+  ]);
+  if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
+  const accounts = status?.accounts || [];
+  const usage = u.usage || {};
+  const pollable = new Set(u.pollable || []);
+  if (!accounts.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Availability &amp; quota</span>
+      ${pollable.size ? `<button class="btn sm usage-recheck-all" title="Check usage with each provider now">↻ Re-check</button>` : ''}
+    </div>
+    ${accounts.map((a) => {
+      const status = a.status || 'available';
+      const badge = status === 'available'
+        ? '🟢 available'
+        : status === 'manual-off'
+          ? '⏸ off (manual)'
+          : status === 'needs-attention'
+            ? '🔴 needs attention (funding or re-authentication)'
+            : `🟠 ${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
+      const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
+      return `<div class="account-status">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <b class="mono">${esc(a.id)}</b>
+          <span>${badge}</span>${weekly}
+          <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent}</span>
+        </div>
+        ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
+        ${accountIncidentHtml(a)}
+        <div class="task-sub" style="gap:6px;margin-top:6px;align-items:center">
+          ${status === 'available'
+            ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
+            : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
+          <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
+          ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
+          <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
+        </div>
+      </div>`;
+    }).join('')}`;
+  const recheck = async (btn, body) => {
+    const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
+    try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
+    catch (e) { toast(e.message, true); }
+    btn.textContent = label; renderAccountStatus(organizationId);
+  };
+  // Auto-refresh stale usage: a snapshot whose window has already reset (server
+  // marks it `stale`) or a pollable login never probed. Without this the % froze
+  // at whenever ↻ was last clicked and a week-old 15% read as current. Guarded to
+  // one attempt a minute so a failing probe can't loop the panel.
+  if (autoRecheckUsage(accountBase, usage, pollable)) autoRecheckUsage.pending.then(() => {
+    // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
+    const el = document.activeElement;
+    if ($('#account-status') === box && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderAccountStatus(organizationId);
+  });
+  box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
+  box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
+  box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
+    await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
+    renderAccountStatus(organizationId);
+  }));
+  box.querySelectorAll('.acct-conc').forEach((inp) => {
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
+    inp.addEventListener('change', async () => {
+      const v = inp.value.trim(); // empty = unlimited
+      await api(`${accountBase}/accounts/concurrency`, { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
+        .then(() => toast('Concurrency updated')).catch((e) => toast(e.message, true));
+      renderAccountStatus(organizationId);
     });
-    box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
-      const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
-      if (!ans) return;
-      const mins = Number(ans);
-      const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
-      if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
-      await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
-      renderDashboard();
-    }));
-    // Keep the host panel live without re-rendering (and disrupting focus on) the
-    // accounts section; single pending timer (cleared here and inside the loop).
-    // Skip polling when the caller cannot read diagnostics.
-    clearTimeout(S.hostDiagTimer);
-    if (hasDiagnostics) {
-      S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
-      refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
-    }
+  });
+  box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
+    const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
+    if (!ans) return;
+    const mins = Number(ans);
+    const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
+    if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
+    await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
+    renderAccountStatus(organizationId);
+  }));
+}
+
+// Re-probe provider usage when any pollable login has no snapshot or a stale one,
+// at most once a minute per organization. Returns true when a probe started;
+// `autoRecheckUsage.pending` then settles once it finishes (never rejects).
+function autoRecheckUsage(accountBase, usage, pollable) {
+  const last = (S.usageAutoAt ||= {});
+  if (![...pollable].some((id) => !usage[id] || usage[id].stale) || Date.now() - (last[accountBase] || 0) <= 60_000) return false;
+  last[accountBase] = Date.now();
+  autoRecheckUsage.pending = api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify({}) }).catch(() => {});
+  return true;
+}
+
+// ── insights ─────────────────────────────────────────────────────────────────
+// The organization's own page: the live flow of work (the stage pipeline, org-
+// wide), what shipped and what it took, where the time and tokens went, what
+// waits on a person right now, and how much subscription quota is left. Data:
+// GET /api/organizations/:id/insights (+ the account usage/status endpoints for
+// the quota panel, which members without credential:read simply don't see).
+const INSIGHT_DAYS = [7, 30, 90];
+const INSIGHT_LENSES = [
+  { key: 'shipped', label: 'Shipped' },
+  { key: 'time', label: 'Agent time' },
+  { key: 'tokens', label: 'Tokens' },
+];
+// The org-wide track reuses the task pipeline's stages; `resolve` (conflict
+// resolution) is part of landing.
+const INSIGHT_STAGES = [
+  { keys: ['setup'], label: 'Setup' }, { keys: ['do'], label: 'Working' }, { keys: ['review'], label: 'Review' },
+  { keys: ['pr'], label: 'PR' }, { keys: ['merge', 'resolve'], label: 'Landing' },
+];
+
+function insightsView() {
+  const days = insightDays();
+  return `<div class="insights" id="insights">
+    <div class="ins-head">
+      <h1 class="page-title">Insights</h1>
+      <div class="ins-seg" role="radiogroup" aria-label="Period">${INSIGHT_DAYS.map((d) =>
+        `<button type="button" role="radio" aria-checked="${d === days}" class="${d === days ? 'on' : ''}" data-ins-days="${d}">${d}d</button>`).join('')}</div>
+    </div>
+    <div id="insights-body"><div class="ins-flow card ins-skeleton" aria-busy="true"></div></div>
+  </div>`;
+}
+
+function insightDays() {
+  const saved = Number(localStorage.getItem('karmax.insightsDays'));
+  return INSIGHT_DAYS.includes(saved) ? saved : 30;
+}
+
+const insNum = (n) => {
+  n = Number(n) || 0;
+  const short = (value, suffix) => `${value.toFixed(1).replace(/\.0$/, '')}${suffix}`;
+  if (n >= 1e9) return short(n / 1e9, 'B');
+  if (n >= 1e6) return short(n / 1e6, 'M');
+  if (n >= 1e4) return `${Math.round(n / 1e3)}k`;
+  if (n >= 1e3) return short(n / 1e3, 'k');
+  return String(Math.round(n));
+};
+function insDuration(ms) {
+  if (ms == null) return '—';
+  const minutes = ms / 60_000;
+  if (minutes < 1) return ms > 0 ? '<1m' : '0m';
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${Math.floor(hours)}h${Math.round(minutes % 60) ? ` ${Math.round(minutes % 60)}m` : ''}`;
+  if (hours < 100) return `${Math.round(hours)}h`;
+  return `${(hours / 24).toFixed(hours < 240 ? 1 : 0)}d`;
+}
+const insMoney = (micros) => `$${(Number(micros || 0) / 1e6).toLocaleString(undefined,
+  { minimumFractionDigits: micros < 1e8 ? 2 : 0, maximumFractionDigits: micros < 1e8 ? 2 : 0 })}`;
+
+// Change vs the preceding window of equal length. `better` names the direction
+// that is good news; metrics that are neither (tokens, spend) stay neutral.
+function insDelta(current, previous, days, better) {
+  current = Number(current) || 0; previous = Number(previous) || 0;
+  if (!current && !previous) return '';
+  const tip = `Previous ${days} days: `;
+  if (!previous) return `<span class="ins-delta" title="${tip}none">new</span>`;
+  const pct = Math.round(((current - previous) / previous) * 100);
+  const tone = !pct || !better ? '' : (pct > 0) === (better === 'up') ? ' good' : ' bad';
+  return `<span class="ins-delta${tone}" data-prev="${previous}">${pct > 0 ? '▲' : pct < 0 ? '▼' : ''} ${Math.abs(pct)}%</span>`;
+}
+
+// Stable identity colors for models: the top three by tokens in the period take
+// the categorical slots, everything else is "Other". One mapping feeds the chart
+// and the model list so a model keeps its color everywhere on the page.
+function insightModelColors(models) {
+  const ranked = [...models].filter((model) => model.tokens > 0).slice(0, 3).map((model) => model.model);
+  return (model) => { const i = ranked.indexOf(model); return i < 0 ? 'var(--viz-other)' : `var(--viz-${i + 1})`; };
+}
+
+function insightTaskHref(ref) {
+  const base = projectBase(ref.projectId);
+  return base ? `${base}/tasks/${ref.num ?? ref.taskId}` : null;
+}
+
+function insightTaskRow(ref, kind) {
+  const href = insightTaskHref(ref);
+  const project = projectById(ref.projectId)?.name || '';
+  const meta = kind === 'shipped'
+    ? `${esc(project)}${ref.at ? ` · ${esc(fmtAgo(ref.at))}` : ''}`
+    : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'needs input' : stageLabel({ stage: ref.stage }))}` : ''}`;
+  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(ref.pr)}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
+  const title = `${ref.num != null ? `<span class="ins-num">#${esc(ref.num)}</span> ` : ''}${esc(ref.title)}`;
+  return `<div class="ins-task"><span class="ins-dot ${kind}" aria-hidden="true"></span>
+    ${href ? `<a class="ins-task-title" data-spa href="${esc(href)}">${title}</a>` : `<span class="ins-task-title">${title}</span>`}
+    <span class="ins-task-meta">${meta}</span>${pr}</div>`;
+}
+
+function insightFlowHtml(data) {
+  const { pipeline, totals, previous, days } = data;
+  const nodes = INSIGHT_STAGES.map((stage) => {
+    const sum = { open: 0, working: 0, waiting: 0 };
+    for (const key of stage.keys) for (const k of Object.keys(sum)) sum[k] += pipeline.stages[key]?.[k] || 0;
+    const idle = Math.max(0, sum.open - sum.working - sum.waiting);
+    const tip = sum.open
+      ? `${sum.open} open · ${sum.working} with an agent · ${sum.waiting} waiting on a person${idle ? ` · ${idle} queued` : ''}`
+      : 'Nothing here right now';
+    return `<div class="ins-node${sum.open ? '' : ' zero'}" title="${esc(tip)}">
+      <div class="ins-node-n">${sum.open}</div>
+      <div class="ins-node-bar">${sum.open ? `${sum.working ? `<i class="w" style="flex:${sum.working}"></i>` : ''}${sum.waiting ? `<i class="h" style="flex:${sum.waiting}"></i>` : ''}${idle ? `<i class="q" style="flex:${idle}"></i>` : ''}` : ''}</div>
+      <div class="ins-node-name">${esc(stage.label)}</div>
+    </div>`;
+  }).join('');
+  const stuck = (pipeline.stages.escalated?.open || 0);
+  const failed = (pipeline.stages.failed?.open || 0);
+  const foot = [
+    `<span><i class="ins-key w"></i>${pipeline.working} with agents</span>`,
+    `<span><i class="ins-key h"></i>${pipeline.waiting} waiting on people</span>`,
+    stuck ? `<span class="warn" title="Escalated to a person">⚠ ${stuck} escalated</span>` : '',
+    failed ? `<span class="warn">✕ ${failed} failed</span>` : '',
+    pipeline.drafts ? `<span class="muted">${pipeline.drafts} draft${pipeline.drafts === 1 ? '' : 's'}</span>` : '',
+  ].filter(Boolean).join('');
+  return `<section class="ins-flow card" aria-label="Work in flight">
+    <div class="ins-track">${nodes}
+      <div class="ins-node shipped${totals.shipped ? '' : ' zero'}" title="Tasks that reached done in the last ${days} days">
+        <div class="ins-node-n">${totals.shipped}${insDelta(totals.shipped, previous.shipped, days, 'up')}</div>
+        <div class="ins-node-bar"><i></i></div>
+        <div class="ins-node-name">Shipped<span class="ins-period"> · ${days}d</span></div>
+      </div>
+    </div>
+    <div class="ins-flow-foot"><span class="ins-live" title="Updates live"><i></i>Now</span>${foot}</div>
+  </section>`;
+}
+
+function insightKpisHtml(data) {
+  const { totals: t, previous: p, days, spend } = data;
+  const failPct = t.turns ? Math.round((t.failedTurns / t.turns) * 100) : 0;
+  const tile = (label, tip, value, delta, sub = '') => `<div class="ins-kpi" title="${esc(tip)}">
+    <div class="ins-kpi-l">${label}</div><div class="ins-kpi-n">${value}${delta}</div>
+    <div class="ins-kpi-s">${sub || '&nbsp;'}</div></div>`;
+  return `<div class="ins-kpis">
+    ${tile('Started', 'Tasks created (drafts excluded)', t.created, insDelta(t.created, p.created, days))}
+    ${tile('Time to ship', 'Median time from creating a task to done', insDuration(t.medianShipMs), insDelta(t.medianShipMs, p.medianShipMs, days, 'down'))}
+    ${tile('Agent time', 'Time agents spent on turns', insDuration(t.agentSeconds * 1000), insDelta(t.agentSeconds, p.agentSeconds, days),
+      t.turns ? `${insNum(t.turns)} turns${failPct ? ` · ${failPct}% failed` : ''}` : '')}
+    ${tile('Tokens', 'Model tokens reported by providers', insNum(t.tokens), insDelta(t.tokens, p.tokens, days),
+      t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
+    ${spend ? tile('Spend', 'Metered model and sandbox cost plus card purchases by agents (USD)', insMoney(t.spendMicros), insDelta(t.spendMicros, p.spendMicros, days),
+      spend.cardMicros ? `${insMoney(spend.cardMicros)} on cards` : '') : ''}
+  </div>`;
+}
+
+// Series for the chosen lens: `bars` stack bottom-up; an optional `line` shares
+// the same axis (one unit per lens, never a second scale).
+function insightSeries(data, lens) {
+  const daily = data.daily;
+  if (lens === 'time') return { unit: 'h', bars: [{ label: 'Agent hours', color: 'var(--accent)', values: daily.map((d) => d.agentSeconds / 3600) }] };
+  if (lens === 'tokens') {
+    const color = insightModelColors(data.models);
+    const top = data.models.filter((model) => model.tokens > 0).slice(0, 3).map((model) => model.model);
+    const bars = top.map((model) => ({ label: model, color: color(model), values: daily.map((d) => d.tokensByModel[model] || 0) }));
+    const other = daily.map((d) => Object.entries(d.tokensByModel).reduce((sum, [model, n]) => sum + (top.includes(model) ? 0 : n), 0));
+    if (other.some(Boolean)) bars.push({ label: 'Other', color: 'var(--viz-other)', values: other });
+    return { unit: 'tokens', bars };
+  }
+  return {
+    unit: 'tasks',
+    bars: [{ label: 'Shipped', color: 'var(--merged)', values: daily.map((d) => d.shipped) }],
+    line: { label: 'Started', color: 'var(--accent)', values: daily.map((d) => d.created) },
+  };
+}
+
+function insNiceTicks(max) {
+  if (max <= 0) return [0, 1];
+  const rough = max / 3;
+  const pow = 10 ** Math.floor(Math.log10(rough));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * pow).find((s) => s >= rough) || pow * 10;
+  const ticks = [];
+  for (let v = 0; v < max + step * 0.999; v += step) ticks.push(+v.toFixed(6));
+  return ticks;
+}
+
+const insDayLabel = (day, days) => {
+  const date = new Date(`${day}T00:00:00Z`);
+  return date.toLocaleDateString(undefined, days <= 7 ? { weekday: 'short', timeZone: 'UTC' } : { month: 'short', day: 'numeric', timeZone: 'UTC' });
+};
+const insFmtValue = (value, unit) => unit === 'h' ? insDuration(value * 3_600_000) : unit === 'tokens' ? insNum(value) : String(Math.round(value));
+
+function insightChartSvg(data, lens, width) {
+  const series = insightSeries(data, lens);
+  const n = data.daily.length;
+  const H = 188, padL = 34, padR = 6, padT = 10, padB = 22;
+  const plotW = Math.max(40, width - padL - padR), plotH = H - padT - padB;
+  const stackTotals = data.daily.map((_, i) => series.bars.reduce((sum, bar) => sum + bar.values[i], 0));
+  const max = Math.max(0, ...stackTotals, ...(series.line?.values || []));
+  const ticks = insNiceTicks(max);
+  const top = ticks.at(-1) || 1;
+  const y = (v) => padT + plotH - (v / top) * plotH;
+  const band = plotW / n;
+  const barW = Math.max(2, Math.min(24, band * 0.64));
+  const x = (i) => padL + band * i + band / 2;
+  const grid = ticks.map((tick) => `<line class="grid${tick ? '' : ' base'}" x1="${padL}" x2="${padL + plotW}" y1="${y(tick)}" y2="${y(tick)}"/>
+    <text class="tick" x="${padL - 6}" y="${y(tick) + 3}" text-anchor="end">${esc(insFmtValue(tick, series.unit))}</text>`).join('');
+  const labelEvery = n <= 7 ? 1 : Math.ceil(n / 6);
+  const xLabels = data.daily.map((d, i) => (n - 1 - i) % labelEvery ? '' :
+    `<text class="tick" x="${x(i)}" y="${H - 6}" text-anchor="middle">${esc(insDayLabel(d.day, n))}</text>`).join('');
+  const radius = Math.min(4, barW / 2);
+  let bars = '';
+  data.daily.forEach((_, i) => {
+    let base = 0;
+    const segs = series.bars.map((bar) => ({ bar, v: bar.values[i] })).filter((s) => s.v > 0);
+    segs.forEach((seg, k) => {
+      const y0 = y(base), y1 = y(base + seg.v);
+      base += seg.v;
+      const bottom = k ? y0 - 2 : y0; // 2px surface gap between stacked segments
+      const h = bottom - y1;
+      if (h <= 0.5) return;
+      const left = x(i) - barW / 2, r = k === segs.length - 1 ? Math.min(radius, h) : 0;
+      bars += `<path fill="${seg.bar.color}" d="M${left},${bottom}V${y1 + r}Q${left},${y1} ${left + r},${y1}H${left + barW - r}Q${left + barW},${y1} ${left + barW},${y1 + r}V${bottom}Z"/>`;
+    });
+  });
+  const line = series.line && max > 0
+    ? `<path class="ins-line" stroke="${series.line.color}" d="${series.line.values.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('')}"/>` : '';
+  const empty = max === 0 ? `<text class="ins-empty-t" x="${padL + plotW / 2}" y="${padT + plotH / 2}" text-anchor="middle">No activity in the last ${n} days</text>` : '';
+  return { series, band, padL, x, y, H, svg: `<svg class="ins-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="img"
+    aria-label="${esc(`${INSIGHT_LENSES.find((l) => l.key === lens)?.label} per day, last ${n} days`)}">
+    ${grid}${bars}${line}${xLabels}${empty}<rect class="ins-hover" x="0" y="${padT}" width="${barW + 8}" height="${plotH}" rx="4" visibility="hidden"/>
+    ${series.line ? `<circle class="ins-hover-dot" r="4" fill="${series.line.color}" visibility="hidden"/>` : ''}</svg>` };
+}
+
+function insightLegendHtml(series) {
+  const items = [...series.bars.map((bar) => ({ ...bar, kind: 'bar' })), ...(series.line ? [{ ...series.line, kind: 'line' }] : [])];
+  if (items.length < 2) return '';
+  return `<div class="ins-legend">${items.map((item) =>
+    `<span><i class="${item.kind}" style="background:${item.color}"></i>${esc(item.label)}</span>`).join('')}</div>`;
+}
+
+function drawInsightChart(box, data) {
+  const lens = INSIGHT_LENSES.some((l) => l.key === S.insightsLens) ? S.insightsLens : 'shipped';
+  const plot = box.querySelector('.ins-plot');
+  const width = Math.floor(plot.clientWidth);
+  if (!width) return;
+  plot.dataset.width = String(width);
+  const chart = insightChartSvg(data, lens, width);
+  box.querySelector('.ins-legend-slot').innerHTML = insightLegendHtml(chart.series);
+  plot.innerHTML = `${chart.svg}<div class="ins-tip" hidden></div>`;
+  const svg = plot.querySelector('svg'), tip = plot.querySelector('.ins-tip');
+  const hover = svg.querySelector('.ins-hover'), dot = svg.querySelector('.ins-hover-dot');
+  const hide = () => { tip.hidden = true; hover.setAttribute('visibility', 'hidden'); dot?.setAttribute('visibility', 'hidden'); };
+  const show = (event) => {
+    const rect = svg.getBoundingClientRect();
+    const i = Math.floor((event.clientX - rect.left - chart.padL) / chart.band);
+    if (i < 0 || i >= data.daily.length) return hide();
+    const day = data.daily[i];
+    const cx = chart.x(i);
+    hover.setAttribute('x', String(cx - Number(hover.getAttribute('width')) / 2));
+    hover.setAttribute('visibility', 'visible');
+    if (dot) { dot.setAttribute('cx', String(cx)); dot.setAttribute('cy', String(chart.y(chart.series.line.values[i]))); dot.setAttribute('visibility', 'visible'); }
+    const rows = [...chart.series.bars, ...(chart.series.line ? [chart.series.line] : [])]
+      .map((s) => `<div><i style="background:${s.color}"></i><span>${esc(s.label)}</span><b>${esc(insFmtValue(s.values[i], chart.series.unit))}</b></div>`);
+    tip.innerHTML = `<div class="ins-tip-h">${esc(new Date(`${day.day}T00:00:00Z`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }))}</div>${rows.join('')}`;
+    tip.hidden = false;
+    const left = Math.min(Math.max(0, cx + 14), width - tip.offsetWidth);
+    tip.style.left = `${cx + 14 + tip.offsetWidth > width ? Math.max(0, cx - 14 - tip.offsetWidth) : left}px`;
+  };
+  svg.addEventListener('pointermove', show);
+  svg.addEventListener('pointerdown', show);
+  svg.addEventListener('pointerleave', hide);
+}
+
+function insightProjectsHtml(data) {
+  if (!data.projects.length) return `<div class="ins-empty">No project activity yet</div>`;
+  const rows = data.projects.slice(0, 8).map((project) => {
+    const max = Math.max(1, ...project.daily);
+    const w = 72, h = 18, step = w / project.daily.length;
+    const spark = project.daily.map((v, i) => v ? `<rect x="${(i * step).toFixed(1)}" y="${(h - (v / max) * h).toFixed(1)}" width="${Math.max(1, step - 1).toFixed(1)}" height="${((v / max) * h).toFixed(1)}" rx="1"/>` : '').join('');
+    const href = projectById(project.id) ? projectRoute(project.id) : null;
+    return `<tr>
+      <td class="ins-name">${href ? `<a data-spa href="${esc(href)}">${esc(project.name)}</a>` : esc(project.name)}</td>
+      <td class="ins-spark-col"><svg class="ins-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"><line x1="0" x2="${w}" y1="${h - 0.5}" y2="${h - 0.5}"/>${spark}</svg></td>
+      <td class="num">${project.shipped}</td><td class="num">${project.open}</td><td class="num">${esc(insDuration(project.agentSeconds * 1000))}</td>
+    </tr>`;
+  }).join('');
+  return `<table class="ins-table"><thead><tr><th>Project</th><th class="ins-spark-col"><span class="sr-only">Shipped per day</span></th><th class="num">Shipped</th><th class="num">Open</th><th class="num">Agent</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function insightModelsHtml(data) {
+  const models = data.models.filter((model) => model.turns || model.tokens);
+  if (!models.length) return `<div class="ins-empty">No agent turns yet</div>`;
+  const color = insightModelColors(data.models);
+  const total = models.reduce((sum, model) => sum + model.tokens, 0) || 1;
+  return `<table class="ins-table"><thead><tr><th>Model</th><th class="num">Tokens</th><th class="num">Turns</th><th class="num" title="Turns that ended in an error">Failed</th></tr></thead><tbody>${models.slice(0, 8).map((model) => {
+    const share = Math.round((model.tokens / total) * 100);
+    return `<tr>
+      <td class="ins-name"><span class="ins-model" title="${esc(model.provider)}">${esc(model.model)}</span>
+        <span class="ins-share" title="${share}% of tokens"><i style="width:${share}%;background:${color(model.model)}"></i></span></td>
+      <td class="num">${insNum(model.tokens)}</td><td class="num">${model.turns}</td>
+      <td class="num">${model.turns ? `${Math.round((model.failedTurns / model.turns) * 100)}%` : '—'}</td>
+    </tr>`;
+  }).join('')}</tbody></table>`;
+}
+
+function insightQuotaHtml(quota) {
+  if (!quota?.logins?.length) return '';
+  const bar = (label, win) => {
+    const pct = Math.max(0, Math.min(100, Math.round(win.pct || 0)));
+    const expired = win.resetAt && win.resetAt < Date.now();
+    const tone = expired ? '' : pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '';
+    return `<div class="ins-quota-row${expired ? ' stale' : ''}" title="${esc(expired ? 'Window has reset; re-checking' : `Resets ${usageResetLabel(win)}`)}">
+      <span>${esc(label)}</span><span class="ins-quota-bar${tone}"><i style="width:${pct}%"></i></span>
+      <b>${pct}%</b><span class="ins-quota-reset">${win.resetAt && !expired ? esc(fmtCountdown(win.resetAt).replace(/^in /, '')) : ''}</span></div>`;
+  };
+  const rows = quota.logins.map((login) => {
+    const snap = login.usage;
+    const state = login.status && login.status !== 'available'
+      ? `<span class="ins-quota-state">${login.status === 'manual-off' ? 'off' : login.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
+        login.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(login.resetAt))}` : ''}</span>` : '';
+    const windows = snap?.ok ? [snap.session && bar('Session', snap.session), snap.week && bar('Week', snap.week)].filter(Boolean).join('') : '';
+    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(login.id.replace(/^login:/, ''))}</span>${state}</div>${windows}</div>`;
+  }).join('');
+  return `<section class="card ins-card"><div class="ins-card-h"><span>Quota</span>
+    <a class="ins-more" data-spa href="${esc(globalRoute('organization'))}#settings-agents">Manage</a></div>${rows}</section>`;
+}
+
+async function loadInsightQuota(organizationId) {
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
+  const [u, status] = await Promise.all([
+    api(`${base}/accounts/usage`).catch(() => null),
+    api(`${base}/accounts/status`).catch(() => null),
+  ]);
+  if (!u) return null;
+  const usage = u.usage || {};
+  const pollable = new Set(u.pollable || []);
+  const accountById = Object.fromEntries((status?.accounts || []).map((account) => [account.id, account]));
+  const statusById = Object.fromEntries(Object.values(accountById).map((account) => [account.id, account.status]));
+  autoRecheckUsage(base, usage, pollable);
+  // Subscriptions with a quota reading, plus any account that cannot take work
+  // right now (an exhausted API key has no quota % but still matters here).
+  const ids = new Set([...pollable, ...Object.keys(statusById).filter((id) => statusById[id] !== 'available')]);
+  return { logins: [...ids].map((id) => ({ id, usage: usage[id], status: statusById[id], resetAt: accountById[id]?.resetAt }))
+    .filter((login) => login.usage?.ok || (login.status && login.status !== 'available')) };
+}
+
+async function renderInsights({ refresh = false } = {}) {
+  const box = $('#insights-body');
+  if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
+  const organizationId = S.organizationId || 'org_personal';
+  const days = insightDays();
+  clearTimeout(S.insightsTimer);
+  let data, quota;
+  try {
+    [data, quota] = await Promise.all([
+      api(`/api/organizations/${encodeURIComponent(organizationId)}/insights?days=${days}&utcOffset=${-new Date().getTimezoneOffset()}`),
+      loadInsightQuota(organizationId),
+    ]);
   } catch (e) {
     if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    return;
   }
+  if (!renderIsCurrent() || S.tab !== 'insights' || (S.organizationId || 'org_personal') !== organizationId) return;
+  // A live refresh repaints only when something changed, so hovering the chart
+  // or reading a list is never disturbed by an identical redraw.
+  const signature = JSON.stringify([data.totals, data.pipeline, data.daily, data.working, data.waiting, data.recent, quota]);
+  if (!refresh || signature !== box.dataset.signature) {
+    box.dataset.signature = signature;
+    S.insightsData = data;
+    const lens = INSIGHT_LENSES.some((l) => l.key === S.insightsLens) ? S.insightsLens : 'shipped';
+    if (insightsIsEmpty(data)) {
+      const project = firstProjectForOrganization(organizationId);
+      box.innerHTML = `${insightFlowHtml(data)}
+        <div class="card ins-start"><div><b>Your work will show up here</b>
+          <p>Start a task and follow it from setup to shipped.</p></div>
+          ${project ? `<a class="btn primary" data-spa href="${esc(projectRoute(project.id))}">Open ${esc(project.name)}</a>`
+            : '<button class="btn primary" type="button" id="insights-new-project">Create a project</button>'}</div>`;
+      $('#insights-new-project')?.addEventListener('click', () => newProject());
+    } else box.innerHTML = `
+      ${insightFlowHtml(data)}
+      ${insightKpisHtml(data)}
+      <div class="ins-grid">
+        <div class="ins-col">
+          <section class="card ins-card ins-chart">
+            <div class="ins-card-h"><div class="ins-seg sm" role="tablist" aria-label="Chart">${INSIGHT_LENSES.map((l) =>
+              `<button type="button" role="tab" aria-selected="${l.key === lens}" class="${l.key === lens ? 'on' : ''}" data-ins-lens="${l.key}">${l.label}</button>`).join('')}</div>
+              <div class="ins-legend-slot"></div></div>
+            <div class="ins-plot"></div>
+          </section>
+          <section class="card ins-card"><div class="ins-card-h"><span>Projects</span></div>${insightProjectsHtml(data)}</section>
+          <section class="card ins-card"><div class="ins-card-h"><span>Models</span></div>${insightModelsHtml(data)}</section>
+          <section class="card ins-card"><div class="ins-card-h"><span>Recently shipped</span></div>
+            ${data.recent.length ? data.recent.map((ref) => insightTaskRow(ref, 'shipped')).join('') : `<div class="ins-empty">Nothing shipped in ${days} days</div>`}</section>
+        </div>
+        <div class="ins-col">
+          <section class="card ins-card"><div class="ins-card-h"><span>Waiting on people</span><b class="ins-count">${data.pipeline.waiting}</b></div>
+            ${data.waiting.length ? data.waiting.map((ref) => insightTaskRow(ref, 'waiting')).join('') : '<div class="ins-empty">Nothing is waiting ✓</div>'}</section>
+          <section class="card ins-card"><div class="ins-card-h"><span>With agents</span><b class="ins-count">${data.pipeline.working}</b></div>
+            ${data.working.length ? data.working.map((ref) => insightTaskRow(ref, 'working')).join('') : '<div class="ins-empty">No agent is working</div>'}</section>
+          ${insightQuotaHtml(quota)}
+        </div>
+      </div>`;
+    if (!refresh) box.classList.add('ins-enter');
+    const chart = box.querySelector('.ins-chart');
+    if (chart) {
+      drawInsightChart(chart, data);
+      box.querySelectorAll('[data-ins-lens]').forEach((button) => button.addEventListener('click', () => {
+        S.insightsLens = button.dataset.insLens;
+        box.querySelectorAll('[data-ins-lens]').forEach((b) => { const on = b === button; b.classList.toggle('on', on); b.setAttribute('aria-selected', String(on)); });
+        drawInsightChart(chart, S.insightsData);
+      }));
+      // Redraw at the new width (the SVG is laid out in real pixels so its text
+      // never stretches); the observer retires itself once the page is gone.
+      const observer = new ResizeObserver(() => {
+        const plot = chart.querySelector('.ins-plot');
+        if (!chart.isConnected) return observer.disconnect();
+        if (plot && String(Math.floor(plot.clientWidth)) !== plot.dataset.width) drawInsightChart(chart, S.insightsData);
+      });
+      observer.observe(chart);
+    }
+  }
+  // Socket events drive most updates; this slow poll catches the rest (quota,
+  // agent time accruing). Hidden tabs skip it; it stops with the page.
+  const tick = () => {
+    if (S.tab !== 'insights' || !$('#insights-body')) return;
+    if (document.hidden) S.insightsTimer = setTimeout(tick, 60_000);
+    else renderInsights({ refresh: true });
+  };
+  S.insightsTimer = setTimeout(tick, 60_000);
+}
+
+// Nothing has ever happened here (in this or the previous window): a page of
+// zeros says less than one clear next step.
+function insightsIsEmpty(data) {
+  const { totals: t, previous: p, pipeline } = data;
+  return !t.created && !t.shipped && !t.turns && !p.created && !p.shipped && !p.turns && !pipeline.drafts
+    && !Object.values(pipeline.stages).some((stage) => stage.open);
+}
+
+// Task transitions arrive over the socket; coalesce a burst into one refresh.
+function scheduleInsightsRefresh() {
+  if (S.insightsLiveTimer) return;
+  S.insightsLiveTimer = setTimeout(() => {
+    S.insightsLiveTimer = null;
+    if (S.tab === 'insights' && !document.hidden) renderInsights({ refresh: true });
+  }, 2000);
+}
+
+function wireInsights() {
+  $('#insights')?.querySelectorAll('[data-ins-days]').forEach((button) => button.addEventListener('click', () => {
+    localStorage.setItem('karmax.insightsDays', button.dataset.insDays);
+    $('#insights').querySelectorAll('[data-ins-days]').forEach((b) => { const on = b === button; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
+    renderInsights();
+  }));
 }
 
 function accountIncidentHtml(account) {
@@ -13235,7 +13762,7 @@ function wireSettingsView(proj) {
         if (next) return go(projectRoute(next.id));
         S.projectId = null;
         S.organizationId = deletedOrganizationId;
-        return go(globalRoute('dashboard', organizationById(deletedOrganizationId)));
+        return go(globalRoute('insights', organizationById(deletedOrganizationId)));
       }
       renderRail();
       renderMain();
@@ -13311,7 +13838,7 @@ function moveProject(project) {
       S.projectId = null;
       await loadProjects();
       S.projectId = null; S.organizationId = project.organizationId;
-      await go(projectById(moved.id) ? projectRoute(moved.id, 'settings') : globalRoute('dashboard', organizationById(moved.organizationId)));
+      await go(projectById(moved.id) ? projectRoute(moved.id, 'settings') : globalRoute('insights', organizationById(moved.organizationId)));
       toast(`Moved “${moved.name}”`);
     } catch (cause) {
       moving = false;
@@ -13512,6 +14039,7 @@ function globalSettingsView(embedded = false) {
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
+      <div id="account-status" style="margin-bottom:14px"></div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
       <div class="form-row"><label>Connect a login</label>
@@ -15674,7 +16202,7 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
 // drag to reorder, On/Off to enable/disable, ✎/✕ to rename/delete a login). This just
 // refreshes it after a connect/register/delete.
 async function hydrateAccounts(organizationId = S.organizationId) {
-  await renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId });
+  await Promise.all([renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }), renderAccountStatus(organizationId)]);
 }
 
 function profilesCard(scope) {
@@ -15694,6 +16222,7 @@ function wireGlobalSettings(organizationId) {
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
   renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
+  renderAccountStatus(organizationId || S.organizationId);
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
@@ -15820,6 +16349,7 @@ function wireGlobalSettings(organizationId) {
 
 // ── inbox + collaboration ───────────────────────────────────────────────────
 function updateBell() {
+  syncNotificationAlerts();
   const badge = $('#bell-badge');
   if (!badge) return;
   const n = inboxUnreadCount('all');
@@ -16021,6 +16551,18 @@ function announceInbox(items) {
     if (behaviour.sound && !sounded) { playNotificationSound(item.urgency); sounded = true; }
   }
 }
+// Alerts mirror the inbox: each leaves when its ask is read or resolved, however
+// that happens. Every inbox change ends in updateBell, which calls this.
+const systemNotifications = new Map();
+function syncNotificationAlerts() {
+  const live = new Set(S.inbox.filter((item) => item.unread).map((item) => item.id));
+  document.querySelectorAll('#notification-alerts > .notification-alert').forEach((alert) => {
+    if (!live.has(alert.dataset.id)) alert.remove();
+  });
+  for (const [id, notification] of systemNotifications) if (!live.has(id)) { systemNotifications.delete(id); notification.close(); }
+}
+// The row may have been replaced by a refresh since the alert was shown.
+const liveInboxItem = (item) => S.inbox.find((candidate) => candidate.id === item.id) || item;
 function showVisualNotification(item) {
   let region = document.getElementById('notification-alerts');
   if (!region) {
@@ -16035,7 +16577,7 @@ function showVisualNotification(item) {
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
   alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
-  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(item); };
+  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
   while (region.children.length > 5) region.lastElementChild.remove();
@@ -16057,7 +16599,9 @@ function showSystemNotification(item) {
       tag: item.id,                                    // a restated ask replaces its own popup
       requireInteraction: item.urgency === 'critical', // critical waits to be dismissed
     });
-    notification.onclick = () => { window.focus(); notification.close(); openInboxItem(item); };
+    notification.onclick = () => { window.focus(); notification.close(); openInboxItem(liveInboxItem(item)); };
+    notification.onclose = () => { if (systemNotifications.get(item.id) === notification) systemNotifications.delete(item.id); };
+    systemNotifications.set(item.id, notification);
     return true;
   } catch { return false; }
 }
@@ -16758,11 +17302,14 @@ function installationView() {
   </div><span class="chip">operator only</span></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
-      <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
+      <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>
+      <div id="host-diag"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
+      <div id="proc-panel" style="margin-top:12px"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>GitHub App for repository access</small></div></div>${installationGithubCard()}
@@ -16938,6 +17485,8 @@ function wireInstallationSettings() {
   wireInstallationUsers();
   wireSettingsNavigation();
   wireAppearanceCard();
+  refreshHostDiag();
+  refreshProcPanel();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -17611,7 +18160,7 @@ const HOST_COMMANDS = [
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
-  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g D', run: () => switchTab('dashboard') },
+  { id: 'nav.insights', title: 'Go to insights', key: 'g i', run: () => switchTab('insights') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
@@ -17711,6 +18260,7 @@ async function runDeclaredAction(a) {
   try {
     const choice = await otherAttemptsConfirmation(a.name, taskId);
     if (choice === null) return;
+    if (a.name === 'confirm' || a.name === 'openPr') await waitResourceChoices(taskId);
     await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name, ...choice }) });
     reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, taskActionLabel(S.view, a)));

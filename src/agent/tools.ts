@@ -341,7 +341,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'propose_project_resource',
     description:
-      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
+      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. The resource becomes a project default on confirmation; reviewers can exclude it with PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:true} through platform_request. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
     parameters: {
       type: 'object',
       properties: {
@@ -1065,7 +1065,7 @@ export function platformToolHandlers(
           : args.target_service ? { kind: 'service', name: String(args.target_service) }
             : { kind: 'environment', name: String(args.target_environment) },
       });
-      await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Included on confirmation unless excluded.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       return JSON.stringify(result);
     },
     async check_agent_mail(args) {

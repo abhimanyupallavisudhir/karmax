@@ -89,7 +89,7 @@ merged into your target branch.
 | **PR-test-approve gate** via merge-only (dogfooded) | ✅ |
 | Gateway (HTTP → signal/query/update) + WebSocket live stream + karmax's own auth | ✅ |
 | Contribution system: slots, declared event schemas, command/keymap registry; generic auto-render floor + sandboxed iframe | ✅ |
-| Core UI: task list, task drawer w/ stage pipeline, merge-queue, settings, dashboard, notifications, keyboard nav, command palette | ✅ |
+| Core UI: task list, task drawer w/ stage pipeline, merge-queue, settings, insights, notifications, keyboard nav, command palette | ✅ |
 | Config homes per (account × profile) + scrubbed env | ✅ |
 | Virtual-card **budget lease** (hard cap + review-gate threshold) | ✅ |
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |

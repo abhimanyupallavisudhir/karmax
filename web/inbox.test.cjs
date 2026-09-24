@@ -38,6 +38,7 @@ global.S = { inbox: [], inboxFilter: 'all', meta: { deliveryChannels: ['browser'
 
 global.globalRoute = (tab) => `/personal/${tab}`;
 global.profileRoute = () => '/profile';
+global.syncNotificationAlerts = () => {}; // alert overlays: web/notification-alerts.browser.test.cjs
 
 // A `const` inside a direct eval stays in the eval's own scope; hoist it out.
 eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
