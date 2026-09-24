@@ -23,6 +23,7 @@ global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="a
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
 global.S = { tasks: [], meta: { hostLocal: true }, projects: [{ id: 'p1', name: 'Website' }, { id: 'p2', name: 'Billing' }] };
+global.document = { querySelectorAll: () => [] };
 global.hostLocal = () => S.meta?.hostLocal !== false;
 global.projectById = (id) => S.projects.find((p) => p.id === id);
 global.taskUrl = (id, rec) => `/acme/${rec?.projectId || 'p1'}/tasks/${rec?.num ?? id}`;
@@ -42,6 +43,8 @@ eval(extractFn('mcpPickerHtml'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('prefillForkBranch'));
+eval(extractFn('retargetForkBase'));
+eval(extractFn('selectedDepIds'));
 eval(extractFn('showForkWorldHelp'));
 eval(extractFn('collectForm'));
 eval(extractFn('readResume'));
@@ -66,6 +69,26 @@ const forkBranchInput = { value: 'main', dispatchEvent: () => branchChanges++ };
 const forkForm = { querySelector: (selector) => selector === '[data-field="base"]' ? forkBranchInput : {} };
 prefillForkBranch({ dataset: { agent: 'do' }, closest: () => forkForm }, { lastView: { status: 'waiting', branch: 'karmax/source' } });
 ok(forkBranchInput.value === 'karmax/source' && branchChanges === 1, 'picking a source fills the branch field and announces the change');
+global.document.querySelectorAll = (selector) => selector === '#dep-chips [data-depid]' ? [{ dataset: { depid: 'task_source' } }] : [];
+forkBranchInput.value = 'main';
+prefillForkBranch({ dataset: { agent: 'do' }, closest: () => forkForm }, { id: 'task_source', params: { target: 'release' }, lastView: { status: 'waiting', branch: 'karmax/source' } });
+ok(forkBranchInput.value === 'release', 'a source that is already a dependency fills the branch it lands on');
+global.document.querySelectorAll = () => [];
+
+ok(forkBranchDefaults({ lastView: { status: 'waiting', branch: 'karmax/source', targetBranch: 'release' } }, true).base === 'release', 'a fork awaiting its source starts where the source lands');
+ok(!forkBranchDefaults({ lastView: { status: 'waiting', branch: 'karmax/source' } }, true).base, 'a fork awaiting a source with no known target keeps ordinary defaults');
+const retargetInput = { value: 'karmax/source', dataset: { inherit: '"main"' }, dispatchEvent: () => retargets++ };
+const retargetForm = { querySelector: () => retargetInput };
+const unlanded = { lastView: { status: 'waiting', branch: 'karmax/source' } };
+let retargets = 0;
+retargetForkBase(retargetForm, unlanded, true);
+ok(retargetInput.value === 'main' && retargets === 1, 'adding the source as a dependency resets the fork branch to the default');
+retargetForkBase(retargetForm, unlanded, false);
+ok(retargetInput.value === 'karmax/source' && retargets === 2, 'dropping that dependency restores the fork branch');
+retargetInput.value = 'feature/mine';
+retargetForkBase(retargetForm, unlanded, true);
+retargetForkBase(retargetForm, unlanded, false);
+ok(retargetInput.value === 'feature/mine' && retargets === 2, 'a manually chosen base branch is never replaced');
 
 const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
@@ -249,7 +272,6 @@ for (const status of ['running', 'waiting', 'failed', 'cancelled']) {
 }
 ok(!resumeChosenInner({ taskId: source.id }, { ...source, lastView: { status: 'done' } }).includes('Also add as dependency?'), 'done source needs no dependency');
 ok(!resumeChosenInner({ taskId: 'unknown' }).includes('Also add as dependency?'), 'unknown source does not guess its completion state');
-eval(extractFn('selectedDepIds'));
 eval(extractFn('dependencyChipHtml'));
 eval(extractFn('wireDepPicker'));
 eval(extractFn('collectTriggers'));
@@ -261,7 +283,7 @@ const depInput = {
   closest: (selector) => selector === '.af-resume-dependency' ? depLabel : selector === '.af-resume-add-dependency' ? depInput : { _sourceTask: source },
 };
 const depRoot = {
-  dataset: {}, querySelectorAll: () => [depInput],
+  dataset: {}, querySelectorAll: () => [depInput], querySelector: () => null,
   addEventListener: (_type, callback) => { depChange = callback; },
 };
 const depBox = {

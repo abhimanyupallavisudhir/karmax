@@ -33,7 +33,7 @@ import {
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
-import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
+import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
@@ -60,7 +60,7 @@ import type { WorldHandle } from '../world/types.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
-import { forkWorldSource, type ForkWorldSource } from '../world/fork.js';
+import { forkLandingBranch, forkWorldSource, type ForkWorldSource } from '../world/fork.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
@@ -1005,11 +1005,17 @@ export class KarmaxApi {
     // Cross-project conversation reuse does not grant access to private worlds.
     if (!source || source.projectId !== projectId) return;
     const retained = previous?._forkWorld as ForkWorldSource | undefined;
-    const start = retained?.taskId === sourceId ? retained
-      : forkWorldSource(source, (await this.deps.store.currentWorld(sourceId)) as WorldHandle | undefined);
+    const handle = retained?.taskId === sourceId ? undefined : (await this.deps.store.currentWorld(sourceId)) as WorldHandle | undefined;
+    const start = retained?.taskId === sourceId ? retained : forkWorldSource(source, handle);
     if (!start) return;
     params._forkWorld = start;
-    if (!previous && params.base === undefined) params.base = start.base;
+    if (previous || params.base !== undefined) return;
+    // A fork that waits for its source to succeed starts after the source has
+    // landed, so it starts where the source lands rather than from its branch.
+    if (awaitsSuccessOf(normalizeTriggers(params), sourceId)) {
+      const landing = forkLandingBranch(source, handle);
+      if (landing) params.base = landing;
+    } else params.base = start.base;
   }
 
   async createTask(

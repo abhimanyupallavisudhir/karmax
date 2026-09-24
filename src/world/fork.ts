@@ -11,10 +11,15 @@ export interface ForkWorldSource {
   repos: Array<{ source: string; name: string; base: string; target: string }>;
 }
 
+/** The branch the task lands on (empty when unknown ⇒ the project default). */
+export function forkLandingBranch(task: TaskRecord, handle?: WorldHandle): string {
+  return task.lastView?.targetBranch ?? handle?.target ?? String(task.params.target ?? '');
+}
+
 export function forkWorldSource(task: TaskRecord, handle?: WorldHandle): ForkWorldSource | undefined {
   const view = task.lastView;
   const landed = view?.status === 'done';
-  const target = view?.targetBranch ?? handle?.target ?? String(task.params.target ?? '');
+  const target = forkLandingBranch(task, handle);
   const base = landed ? target : handle?.branch ?? view?.branch;
   if (!base) return undefined;
   return { taskId: task.id, base, unpublished: !landed,

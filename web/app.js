@@ -1066,9 +1066,12 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
-function forkBranchDefaults(task) {
+// Where a fork starts: the source's unpublished branch, or where the source
+// lands once it has landed — or will have, because the fork waits for it
+// (`awaited`, mirroring prepareForkWorld in src/platform/api.ts).
+function forkBranchDefaults(task, awaited = false) {
   const view = task?.lastView || task;
-  const base = view?.status === 'done' ? view.targetBranch || task?.params?.target : view?.branch;
+  const base = view?.status === 'done' || awaited ? view?.targetBranch || task?.params?.target : view?.branch;
   return base ? { base } : {};
 }
 
@@ -1076,11 +1079,24 @@ function prefillForkBranch(box, task) {
   if (!['do', 'unified'].includes(box.dataset.agent)) return;
   const root = box.closest('#tf-body');
   const input = root?.querySelector('[data-field="base"]');
-  const base = forkBranchDefaults(task).base;
+  const base = forkBranchDefaults(task, selectedDepIds().includes(task.id)).base;
   if (!input || !base || (task.projectId && task.projectId !== S.projectId)) return;
   input.value = base;
   input.dispatchEvent(new Event('change', { bubbles: true }));
   showForkWorldHelp(root);
+}
+
+// Adding (or dropping) the fork source as a dependency moves the base branch
+// to where the fork will now start — unless the user already chose one.
+function retargetForkBase(root, task, awaited) {
+  const input = root?.querySelector('[data-field="base"]');
+  if (!input || !task) return;
+  const fallback = JSON.parse(input.dataset.inherit || 'null') ?? '';
+  const from = forkBranchDefaults(task, !awaited).base ?? fallback;
+  const to = forkBranchDefaults(task, awaited).base ?? fallback;
+  if (from === to || input.value !== from) return;
+  input.value = to;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function showForkWorldHelp(root) {
@@ -5727,7 +5743,20 @@ function wireDepPicker(values, selfId) {
   if (!box || !btn) return;
   const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
   const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
+  const root = box.closest('#tf-body');
+  // The task the do agent forks from, if any (an archived one only rides on the chip).
+  const forkSource = () => {
+    const chosen = root?.querySelector('.agent-field[data-agent="do"] .af-resume-chosen, .agent-field[data-agent="unified"] .af-resume-chosen');
+    const id = (() => { try { return JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { return undefined; } })();
+    if (!id || id === selfId) return null;
+    return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || (S.tasks || []).find((t) => t.id === id) || null;
+  };
   const paint = (ids, changed) => {
+    if (changed) {
+      const before = selectedDepIds();
+      const source = forkSource();
+      if (source && before.includes(source.id) !== ids.includes(source.id)) retargetForkBase(root, source, ids.includes(source.id));
+    }
     box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id))).join('');
     box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
     if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
@@ -5742,7 +5771,6 @@ function wireDepPicker(values, selfId) {
   );
   // Both fork entry points use this form. The checkbox is another view of the
   // ordinary dependency selection, so drafts and manual picker edits stay in sync.
-  const root = box.closest('#tf-body');
   if (root) {
     root.dataset.dependencyHost = '';
     root._syncForkDependencies = () => {
