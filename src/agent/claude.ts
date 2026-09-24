@@ -401,7 +401,18 @@ export class ClaudeAdapter implements AgentAdapter {
     // follow-up advances it, and it is reported back so the workflow positions the
     // agent's reply and advances its boundary past exactly what was delivered.
     let deliveredIndex = input.messages.length;
-    const injector = createFollowUpInjector([toSdkUserMessage(initialContent)]);
+    // Every message we send stays outstanding until the harness echoes its uuid on an
+    // assistant frame (`user_message_uuids`) — proof the agent actually read it. A
+    // producer that never echoes is answered by any result that ran a model turn
+    // (the orphan-settling result below has `num_turns: 0`).
+    const unanswered = new Set<string>();
+    let harnessEchoes = false;
+    const send = (content: string | any[]) => {
+      const message = toSdkUserMessage(content);
+      unanswered.add(message.uuid);
+      return message;
+    };
+    const injector = createFollowUpInjector([send(initialContent)]);
     const promptArg: any = injector.stream;
 
     // Fetch + inject any follow-ups queued at/after `deliveredIndex`. Serialized by
@@ -423,7 +434,7 @@ export class ClaudeAdapter implements AgentAdapter {
           // never send conversation system messages) — but count both so the index
           // stays aligned with the workflow's `msgs` array.
           if (m.role !== 'system' && m.role !== 'agent') {
-            injector.push(toSdkUserMessage(followUpContent(m)));
+            injector.push(send(followUpContent(m)));
             injected++;
           }
           deliveredIndex++;
@@ -455,6 +466,8 @@ export class ClaudeAdapter implements AgentAdapter {
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     }, Object.keys(input.secretEnv ?? {}));
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+    // Ask the harness for its authoritative turn-over signal (see `settleInput` below).
+    env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = '1';
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
     // cancels. The Agent SDK spawns a child harness process (the Claude Code
@@ -501,14 +514,38 @@ export class ClaudeAdapter implements AgentAdapter {
     // shell is still running it keeps the session alive, folds the settlement back in,
     // and drives the agent through more exchanges. Closing there left agents working for
     // the rest of the turn against a dead control channel — the "Stream closed" reports.
-    // So hold the stream open until a result arrives with nothing outstanding, bounded
-    // because a backgrounded shell may be a dev server the task deliberately left running.
+    // Neither a `result` nor even `idle` reliably means the harness has read OUR input:
+    // resuming a session whose previous harness died with a background shell running,
+    // Claude Code settles that orphan first and may emit an empty `result` and an `idle`
+    // BEFORE it processes the resumed prompt (task #348 — the whole turn then ran with
+    // every control tool failing, "interrupted before a result was received").
+    // So the turn ends on the harness's own `session_state_changed: idle` (emitted only
+    // after held-back results flush and its background-agent loop exits; `result` is the
+    // fallback for a harness that doesn't report state) AND only once every message we
+    // sent has been answered. Unanswered input and tracked in-harness work both hold the
+    // stream open, bounded because a backgrounded shell may be a dev server the task
+    // deliberately left running.
     const settleGraceMs = Number(process.env.KARMAX_AGENT_BG_SETTLE_MS ?? 300_000);
     let settleDeadline: number | undefined;
     const harnessStillWorking = (): boolean => {
-      if (!subagents.size) return false;
+      if (!subagents.size && !unanswered.size) return false;
       settleDeadline ??= Date.now() + settleGraceMs;
       return Date.now() < settleDeadline;
+    };
+    let harnessReportsState = false;
+    let harnessIdle = false;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    // The harness went idle: end the turn — UNLESS a follow-up landed in the meantime and
+    // the agent hasn't declared completion (inject it and let the session continue
+    // in-place), or tracked work will drive the agent again (re-check at the deadline,
+    // since a never-settling shell produces no further message to wake us).
+    const settleInput = async (): Promise<void> => {
+      harnessIdle = true;
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = undefined; }
+      if (!completionSeen && await drainFollowUps()) { harnessIdle = false; return; }
+      if (!harnessStillWorking()) { await injector.close(); return; }
+      settleTimer = setTimeout(() => { if (harnessIdle) void settleInput(); },
+        Math.max(0, (settleDeadline ?? Date.now()) - Date.now()));
     };
     const startupEnd = (await (await currentTiming())?.start('process.sdk-startup.opaque'));
     const iterator = query({
@@ -646,7 +683,12 @@ export class ClaudeAdapter implements AgentAdapter {
         // the stream to its end lets any in-turn settlements clear before we report —
         // only genuinely still-running sub-agents remain (see subagents.ts).
         trackTaskMessage(subagents, message);
-        if (!subagents.size) settleDeadline = undefined; // drained ⇒ a fresh grace for the next batch
+        if (message.type === 'assistant') {
+          harnessIdle = false; // working again: a pending settle re-check must not close under it
+          const answered: unknown = (message as any).user_message_uuids ?? [(message as any).user_message_uuid];
+          if (Array.isArray(answered)) for (const id of answered) if (typeof id === 'string') { harnessEchoes = true; unanswered.delete(id); }
+        }
+        if (!subagents.size && !unanswered.size) settleDeadline = undefined; // drained ⇒ a fresh grace for the next batch
         if (message.type === 'assistant') {
           const content = (message.message?.content ?? []) as any[];
           const text = content
@@ -830,6 +872,10 @@ export class ClaudeAdapter implements AgentAdapter {
             title: `${String((message as any).tool_name ?? 'Tool')} denied`,
             ...(activityDetail((message as any).message) ? { detail: activityDetail((message as any).message) } : {}),
           });
+        } else if (message.type === 'system' && (message as any).subtype === 'session_state_changed') {
+          harnessReportsState = true;
+          if ((message as any).state === 'idle') await settleInput();
+          else harnessIdle = false;
         } else if (message.type === 'result') {
           session = message.session_id ?? session;
           const result = message as any;
@@ -841,15 +887,8 @@ export class ClaudeAdapter implements AgentAdapter {
             throw providerErrorFromMessage('claude', message);
           }
           successfulResult = result;
-          // The agent went idle (finished responding to its current input). End the
-          // turn — UNLESS a follow-up landed in the meantime and the agent hasn't
-          // declared completion, in which case inject it and let the session continue
-          // in-place rather than tearing down and resuming on a fresh turn — or the
-          // harness still has work in flight that will drive the agent again, in which
-          // case the input stream (and with it the control channel) stays open.
-          if ((completionSeen || !(await drainFollowUps())) && !harnessStillWorking()) {
-            (await injector.close());
-          }
+          if (!harnessEchoes && result.num_turns !== 0) unanswered.clear();
+          if (!harnessReportsState) await settleInput();
         }
       }
     } catch (e) {
@@ -866,6 +905,7 @@ export class ClaudeAdapter implements AgentAdapter {
     } finally {
       if (hb) clearInterval(hb);
       if (followPoll) clearInterval(followPoll);
+      if (settleTimer) clearTimeout(settleTimer);
       (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {
