@@ -1,8 +1,8 @@
-// Coverage for the conversation Markdown/MathJax renderer (app.js).
+// Coverage for the conversation Markdown/MathJax renderer (markdown.js).
 // Run: node web/markdown.test.cjs
 const fs = require('fs');
 const path = require('path');
-const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, 'markdown.js'), 'utf8');
 
 // Brace-count from the body's opening `{` (skips any `{}` in the parameter list,
 // e.g. `opts = {}`), so functions with default-object params extract cleanly.

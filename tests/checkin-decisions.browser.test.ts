@@ -61,6 +61,7 @@ it.each([true, false])('resolves approvals and resource decisions inside the rea
     // Load the actual console, suppressing only its application bootstrap.
     const app = fs.readFileSync('web/app.js', 'utf8').replace(/^boot\(\)\.catch\(.*$/m, '');
     await page.addScriptTag({ content: fs.readFileSync('web/totp-qr.js', 'utf8') });
+    await page.addScriptTag({ content: fs.readFileSync('web/markdown.js', 'utf8') });
     await page.addScriptTag({ content: app });
     await page.evaluate(async () => {
       const w = globalThis as any;

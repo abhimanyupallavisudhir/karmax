@@ -1323,10 +1323,11 @@ export class Gateway {
     }
     if (p.startsWith('/share/conversations/')) {
       const share = req.method === 'GET' ? (await publicShare(this.deps.store, p.slice('/share/conversations/'.length))) : undefined;
+      const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
       res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
-        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
-      return void res.end(publicConversationHtml(share));
+        'content-security-policy': "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn }));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);

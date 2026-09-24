@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
+import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 import type { Message } from '../domain/types.js';
 
 export async function sharingPolicy(store: Store, projectId: string) {
@@ -54,6 +55,40 @@ export async function publicShare(store: Store, id: string): Promise<Conversatio
   return share;
 }
 const escape = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
-export function publicConversationHtml(share?: ConversationShare) {
-  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${share ? escape(share.title) : 'Conversation unavailable'}</title><style>body{font:16px/1.6 system-ui,sans-serif;color:#222;background:#faf9f6;margin:0}main{max-width:850px;margin:48px auto;padding:0 24px}h1{line-height:1.2}article{background:white;border:1px solid #ddd;border-radius:12px;padding:24px;margin:20px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}small{color:#666}</style><main>${share ? `<small>Public conversation · ${escape(share.role)} · Snapshot from ${new Date(share.createdAt).toISOString().slice(0, 10)}</small><h1>${escape(share.title)}</h1><p>This snapshot contains user and agent message text. Attachments and tool activity are not included.</p>${share.messages.map(m => `<article><b>${m.role === 'user' ? 'User' : 'Agent'}</b><pre>${escape(m.text)}</pre></article>`).join('')}` : '<h1>Conversation unavailable</h1><p>This link may have been revoked or sharing disabled.</p>'}</main></html>`;
+export function publicConversationHtml(share?: ConversationShare, options: { siteName?: string; signedIn?: boolean } = {}) {
+  const name = escape(options.siteName ?? DEFAULT_SITE_NAME);
+  const title = share ? escape(share.title) : 'Conversation unavailable';
+  return `<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow"><title>${title} · ${name}</title>
+  <link rel="icon" href="/brand/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/shared-conversation.css">
+  <script defer src="/markdown.js"></script><script defer src="/shared-conversation.js"></script>
+</head><body class="shared-page">
+  <header class="topbar shared-topbar">
+    <a class="brand" href="/" aria-label="${name} home"><img class="mark" src="/brand/icon-192.png" alt=""><span>${name}</span></a>
+    <span class="spacer"></span>
+    <nav aria-label="Main navigation">${options.signedIn
+      ? '<a class="btn sm" href="/">Open workspace</a>'
+      : `<a class="shared-home" href="/">Home</a><a class="btn sm" href="/login">Sign in</a><a class="btn sm primary" href="/signup">Join ${name}</a>`}</nav>
+  </header>
+  <main class="shared-main">${share ? `
+    <header class="shared-heading">
+      <div class="shared-eyebrow">Shared conversation</div>
+      <h1>${title}</h1>
+      <div class="shared-toolbar"><p title="A fixed snapshot of message text. Attachments and tool activity aren’t included.">Snapshot · <time datetime="${new Date(share.createdAt).toISOString()}">${new Date(share.createdAt).toISOString().slice(0, 10)}</time></p>
+        <button type="button" class="conversation-math" aria-label="Typeset math in this conversation" aria-pressed="true" title="Toggle math typesetting for this conversation" hidden><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
+      </div>
+    </header>
+    <div class="thread shared-thread">${share.messages.map(m => `<article class="msg ${m.role === 'user' ? 'user' : 'agent'}" data-share-message>
+      <div class="msg-meta"><span class="role">${m.role === 'user' ? 'User' : 'Agent'}</span></div>
+      <div class="msg-text">${escape(m.text)}</div>
+    </article>`).join('')}</div>` : `
+    <section class="shared-unavailable"><div class="shared-eyebrow">Shared conversation</div>
+      <h1>Conversation unavailable</h1><p>This link may have been revoked or sharing disabled.</p>
+      <a class="btn" href="/">Go to homepage</a>
+    </section>`}
+  </main>
+</body></html>`;
 }
