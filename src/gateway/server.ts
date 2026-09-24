@@ -1960,7 +1960,15 @@ export class Gateway {
           if (!messages?.length) return this.json(res, 404, { error: 'conversation not found' });
           share = (await createShare(store, taskId, role, messages));
         } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
-        return this.json(res, 200, { enabled: policy.effective, url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
+        // Give the dialog an actionable destination for the policy that blocks
+        // sharing. Match the settings endpoint's scope when checking management.
+        const settings = policy.effective ? null : !policy.organization
+          ? { scope: 'organization', id: actualScope.organizationId!, canManage: (await this.deps.tokens.check(token,
+            'organization:edit', { organizationId: actualScope.organizationId })).ok }
+          : { scope: 'project', id: task.projectId, canManage: (await this.deps.tokens.check(token,
+            'project:settings:write', { projectId: task.projectId, organizationId: actualScope.organizationId })).ok };
+        return this.json(res, 200, { enabled: policy.effective, settings,
+          url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
       }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;

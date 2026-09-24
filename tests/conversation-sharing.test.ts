@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { chromium } from 'playwright';
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { Gateway, routeCapability } from '../src/gateway/server.js';
 import { Store } from '../src/store/db.js';
@@ -35,7 +37,7 @@ describe('public conversation sharing over HTTP', async () => {
   beforeAll(async () => {
     const gateway = (await Gateway.create({ store, tokens, bus: new KarmaxBus(), contributions: new ContributionRegistry(),
       overlays: new Overlays(), client: {} as any, taskQueue: 'test', staticDir: 'web',
-      api: { getTaskView: async () => ({ messages: [{ role: 'agent', text: 'wrong agent' }], transcripts: [{ role: 'merge', messages }] }) } as any,
+      api: { taskConversation: async () => ({ messages }), getTaskView: async () => ({ messages: [{ role: 'agent', text: 'wrong agent' }], transcripts: [{ role: 'merge', messages }] }) } as any,
       worlds: new WorldRegistry(), agentInfo: { provider: 'mock', reason: 'test' }, password: 'test-password',
     } as any));
     const running = await gateway.listen(await findFreePortFrom(48_700));
@@ -44,6 +46,12 @@ describe('public conversation sharing over HTTP', async () => {
   afterAll(async () => { await close?.(); (await store.close()); });
 
   it('defaults to disabled and reserves policy management for administrators', async () => {
+    expect(await (await request(endpoint)).json()).toMatchObject({
+      enabled: false, settings: { scope: 'organization', id: project.organizationId, canManage: true },
+    });
+    expect(await (await request(endpoint, 'GET', developer)).json()).toMatchObject({
+      enabled: false, settings: { scope: 'organization', id: project.organizationId, canManage: false },
+    });
     expect((await request(endpoint, 'POST', developer)).status).toBe(403);
     expect((await request(`/api/organizations/${project.organizationId}/conversation-sharing`, 'PUT', developer, { enabled: true })).status).toBe(403);
     expect((await request(`/api/projects/${project.id}/conversation-sharing`, 'PUT', developer, { value: 'inherit' })).status).toBe(403);
@@ -62,7 +70,9 @@ describe('public conversation sharing over HTTP', async () => {
   it('publishes only the selected agent as an escaped immutable anonymous snapshot', async () => {
     const response = await request(endpoint, 'POST', developer);
     expect(response.status).toBe(200);
-    sharedUrl = (await response.json() as any).url;
+    const result = await response.json() as any;
+    expect(result.settings).toBeNull();
+    sharedUrl = result.url;
     const publicResponse = await fetch(`${base}${sharedUrl}`);
     expect(publicResponse.status).toBe(200);
     expect(publicResponse.headers.get('cache-control')).toBe('no-store');
@@ -78,6 +88,12 @@ describe('public conversation sharing over HTTP', async () => {
   it('enforces both policies on existing links and allows revocation while disabled', async () => {
     const projectUrl = `/api/projects/${project.id}/conversation-sharing`;
     await request(projectUrl, 'PUT', owner, { value: 'disabled' });
+    expect(await (await request(endpoint)).json()).toMatchObject({
+      enabled: false, settings: { scope: 'project', id: project.id, canManage: true },
+    });
+    expect(await (await request(endpoint, 'GET', developer)).json()).toMatchObject({
+      enabled: false, settings: { scope: 'project', id: project.id, canManage: false },
+    });
     expect((await fetch(`${base}${sharedUrl}`)).status).toBe(404);
     expect((await request(endpoint, 'POST', developer)).status).toBe(403);
     await request(projectUrl, 'PUT', owner, { value: 'inherit' });
@@ -90,6 +106,75 @@ describe('public conversation sharing over HTTP', async () => {
     const next = (await (await request(endpoint, 'POST', developer)).json() as any).url;
     expect(next).not.toBe(sharedUrl);
     expect(await (await fetch(`${base}${next}`)).text()).toContain('later message');
+  });
+  it('guides the browser from a blocked policy through creating and revoking a snapshot', async () => {
+    await request(endpoint, 'DELETE');
+    await orgPolicy(false);
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage();
+      page.setDefaultTimeout(5000);
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.route(`${base}/sharing-test`, route => route.fulfill({ contentType: 'text/html', body: '<div id="main"></div>' }));
+      await page.goto(`${base}/sharing-test`);
+      await page.addScriptTag({ content: fs.readFileSync('web/totp-qr.js', 'utf8') });
+      await page.addScriptTag({ content: fs.readFileSync('web/app.js', 'utf8').replace(/^boot\(\)\.catch\(.*$/m, '') });
+      await page.evaluate(({ owner, project, task }) => {
+        (globalThis as any).eval(`
+          Object.assign(S, ${JSON.stringify({ token: owner, projects: [project], organizations: [{ id: project.organizationId, name: 'Personal', slug: 'personal' }] })});
+          globalThis.shareTask = ${JSON.stringify(task)};
+          globalThis.openShare = () => openConversationShare({ taskId: shareTask.id }, 'merge');
+          toast = () => {};
+          // Keep navigation in this fixture; settings and sharing use the real gateway.
+          go = async href => {
+            history.pushState({}, '', href);
+            const scope = href.includes('/sharing/settings') ? 'project' : 'organization';
+            document.querySelector('#main').innerHTML = '<div id="' + scope + '-conversation-sharing"></div>';
+            await hydrateConversationSharing(scope, scope === 'project' ? shareTask.projectId : S.organizations[0].id);
+          };
+        `);
+      }, { owner, project, task });
+      const open = () => page.evaluate(() => (globalThis as any).openShare());
+      await open();
+      expect(await page.getByRole('button', { name: 'Create public link' }).isDisabled()).toBe(true);
+      const settingsLink = page.getByRole('link', { name: 'Organization settings', exact: true });
+      expect(await settingsLink.getAttribute('href')).toBe('/personal/settings#organization-conversation-sharing');
+      await settingsLink.click();
+      expect(await page.locator('dialog').count()).toBe(0);
+      await page.locator('select').selectOption('enabled');
+      await page.getByRole('button', { name: 'Save', exact: true }).click();
+      await expect.poll(async () => (await (await request(endpoint)).json() as any).enabled).toBe(true);
+
+      // A project override is identified separately; developers cannot manage it.
+      await request(`/api/projects/${project.id}/conversation-sharing`, 'PUT', owner, { value: 'disabled' });
+      await open();
+      expect(await page.getByRole('link', { name: 'Project settings', exact: true }).getAttribute('href')).toBe('/personal/sharing/settings#project-conversation-sharing');
+      await page.getByRole('button', { name: 'Close', exact: true }).click();
+      await page.evaluate(token => (globalThis as any).eval(`S.token = ${JSON.stringify(token)}`), developer);
+      await open();
+      expect(await page.locator('dialog').innerText()).toContain('Ask a project administrator to enable it.');
+      expect(await page.locator('dialog [data-sharing-settings]').count()).toBe(0);
+      await page.getByRole('button', { name: 'Close', exact: true }).click();
+      await page.evaluate(token => (globalThis as any).eval(`S.token = ${JSON.stringify(token)}`), owner);
+      await request(`/api/projects/${project.id}/conversation-sharing`, 'PUT', owner, { value: 'inherit' });
+      await open();
+      await page.getByText('Preview message text', { exact: true }).click();
+      expect(await page.locator('dialog details').innerText()).toContain('Answer');
+      expect(await page.locator('dialog details').innerText()).not.toContain('hidden system');
+      await page.getByRole('button', { name: 'Create public link' }).click();
+      await page.locator('[data-link]').waitFor();
+      const url = await page.locator('[data-link]').inputValue();
+      const anonymous = await browser.newPage();
+      await anonymous.goto(url);
+      expect(await anonymous.locator('main').innerText()).toContain('Answer');
+      await page.getByRole('button', { name: 'Revoke link' }).click();
+      await page.getByRole('button', { name: 'Create public link' }).waitFor();
+      expect((await fetch(url)).status).toBe(404);
+      expect(errors).toEqual([]);
+      // Leave a snapshot for the deletion regression below.
+      await request(endpoint, 'POST');
+    } finally { await browser.close(); }
   });
   it('removes snapshot data when its project is deleted', async () => {
     const share = (await currentShare(store, task.id, 'merge'))!;
