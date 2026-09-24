@@ -111,15 +111,48 @@ describe('organization insights', () => {
         .run(organization.id, web.id, work.id, NOW - DAY, NOW - DAY, NOW + DAY);
 
       const insights = await organizationInsights(store, organization.id, { days: 7, now: NOW, includeSpend: true });
-      expect(insights.totals).toMatchObject({ turns: 3, failedTurns: 1, agentSeconds: 960, tokens: 3000,
+      expect(insights.totals).toMatchObject({ turns: 3, meteredTurns: 3, failedTurns: 1, agentSeconds: 960, tokens: 3000,
         inputTokens: 2400, outputTokens: 600, spendMicros: 250_000 + 12_500_000 });
       expect(insights.spend).toEqual({ modelMicros: 250_000, cardMicros: 12_500_000 });
       expect(insights.models).toEqual([
-        { model: 'claude-opus', provider: 'anthropic', turns: 2, failedTurns: 1, agentSeconds: 900, tokens: 2000 },
-        { model: 'claude-haiku', provider: 'anthropic', turns: 1, failedTurns: 0, agentSeconds: 60, tokens: 1000 },
+        { model: 'claude-opus', provider: 'anthropic', turns: 2, meteredTurns: 2, failedTurns: 1, agentSeconds: 900, tokens: 2000 },
+        { model: 'claude-haiku', provider: 'anthropic', turns: 1, meteredTurns: 1, failedTurns: 0, agentSeconds: 60, tokens: 1000 },
       ]);
       expect(insights.daily.at(-2)!.tokensByModel).toEqual({ 'claude-opus': 2000 });
       expect(insights.projects[0]).toMatchObject({ name: 'Web', turns: 3, agentSeconds: 960, tokens: 3000 });
+    } finally { await store.close(); }
+  });
+
+  /** Production showed 834 GPT turns with 0 tokens: Codex subscription turns did
+   * not report usage, and the page ranked and colored models as if they had used
+   * nothing. Turns without a provider reading are counted as unreported, models
+   * rank by work done, and input is measured the same way for every provider
+   * (Anthropic's inputTokens excludes cache reads; OpenAI's includes them). */
+  it('treats missing usage as unreported and measures input consistently across providers', async () => {
+    const { store, organization, web, task } = await seed();
+    try {
+      const work = await task(web.id, 'Mixed agents', NOW - 2 * DAY);
+      const turn = async (id: string, provider: string, model: string, at: number, tokens?: { quantity: number; input: number; output: number }) => {
+        await store.admitAgentUsage({ id, organizationId: organization.id, projectId: web.id, taskId: work.id,
+          provider, model, fundingSource: 'byok', now: at });
+        await store.finishUsageAdmission(id, true, at + 60_000, tokens ? [{
+          id: `usage:tokens:${id}`, organizationId: organization.id, projectId: web.id, taskId: work.id,
+          provider, kind: 'agent.tokens', quantity: tokens.quantity, unit: 'token', costMicros: 0,
+          startedAt: at + 60_000, endedAt: at + 60_000, fundingSource: 'byok',
+          metadata: { model, inputTokens: tokens.input, outputTokens: tokens.output },
+        }] : []);
+      };
+      // Anthropic: 100 fresh input + 9,700 cache reads/writes + 200 output = 10,000.
+      await turn('claude-1', 'anthropic', 'claude-opus', NOW - DAY, { quantity: 10_000, input: 100, output: 200 });
+      // OpenAI (after the fix): input already includes cached input.
+      await turn('gpt-1', 'openai', 'gpt-6', NOW - DAY, { quantity: 3_050, input: 3_000, output: 50 });
+      // OpenAI (before the fix): three turns that never reported usage.
+      for (const id of ['gpt-2', 'gpt-3', 'gpt-4']) await turn(id, 'openai', 'gpt-6', NOW - DAY + 1000);
+
+      const insights = await organizationInsights(store, organization.id, { days: 7, now: NOW });
+      expect(insights.totals).toMatchObject({ turns: 5, meteredTurns: 2, tokens: 13_050, inputTokens: 12_800, outputTokens: 250 });
+      expect(insights.models.map((model) => [model.model, model.turns, model.meteredTurns, model.tokens]))
+        .toEqual([['gpt-6', 4, 1, 3_050], ['claude-opus', 1, 1, 10_000]]);
     } finally { await store.close(); }
   });
 

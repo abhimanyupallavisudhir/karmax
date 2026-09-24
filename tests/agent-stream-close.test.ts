@@ -48,7 +48,7 @@ interface Harness {
 }
 
 /** Install a scripted fake harness as the SDK's `query`, and return a handle on it. */
-function fakeHarness(script: (h: Harness) => AsyncGenerator<any>): { current?: Harness } {
+function fakeHarness(script: (h: Harness) => AsyncGenerator<any>, { echo = true } = {}): { current?: Harness } {
   const handle: { current?: Harness } = {};
   sdk.query = (args: any) => {
     const tools = new Map<string, any>((args.options.mcpServers.karmax_control.tools ?? []).map((t: any) => [t.name, t]));
@@ -60,13 +60,22 @@ function fakeHarness(script: (h: Harness) => AsyncGenerator<any>): { current?: H
         return (await tools.get(name)!.run(input)).content[0].text;
       },
     };
-    // The harness reads stdin until the SDK ends it (`transport.endInput()`).
+    // The harness reads stdin until the SDK ends it (`transport.endInput()`), and, like
+    // Claude Code, stamps the uuids of the prompts it consumed on its next assistant frame.
+    let consumed: string[] = [];
     void (async () => {
-      for await (const _ of args.prompt) { /* the turn's user messages */ }
+      for await (const m of args.prompt) consumed.push(m.uuid);
       inputClosed = true;
     })();
     handle.current = h;
-    return script(h);
+    return (async function* () {
+      for await (const m of script(h)) {
+        if (echo && m.type === 'assistant' && consumed.length && !m.user_message_uuids) {
+          yield { ...m, user_message_uuid: consumed.at(-1), user_message_uuids: consumed };
+          consumed = [];
+        } else yield m;
+      }
+    })();
   };
   return handle;
 }
@@ -167,6 +176,118 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
 
     await runTurn([]);
     expect(h.current!.inputClosed).toBe(true);
+  });
+
+  it('keeps it alive past the spurious result a resumed session emits before its real work', async () => {
+    // Task #348: resuming a session whose previous harness died with a background shell
+    // running, Claude Code first settles that orphaned task and emits an empty
+    // `result success` (~0.5 s in) BEFORE it processes the resumed prompt. Closing stdin
+    // there left the whole turn without a control channel; every karmax_control call
+    // (create_review_info, open_pr, platform_request) came back "Stream closed", which
+    // the CLI reports as "The tool call was interrupted before a result was received"
+    // (its StreamClosed error extends AbortError). Captured shape from the real CLI.
+    const seen: string[] = [];
+    fakeHarness(async function* (h) {
+      yield { type: 'system', subtype: 'task_notification', task_id: 'orphan', status: 'stopped' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+      yield { type: 'system', subtype: 'init', session_id: 'sess-5' };
+      yield { type: 'result', subtype: 'success', num_turns: 0, session_id: 'sess-5' };
+      await sleep(30);
+      yield { type: 'system', subtype: 'init', session_id: 'sess-5' };
+      for (const name of ['create_review_info', 'open_pr']) {
+        try {
+          seen.push(await h.control(name, { caption: 'check it' }));
+        } catch (e) {
+          seen.push(`error: ${(e as Error).message}`);
+        }
+      }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'opened' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-5' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      await sleep(30);
+    });
+
+    const turn = await runTurn([]);
+    expect(seen).toEqual(['review info recorded', expect.not.stringMatching(/^error:/)]);
+    expect(turn.output).toBe('opened');
+  });
+
+  it('keeps it alive past a spurious idle until the harness has answered the prompt', async () => {
+    // The orphan-settling pass can also report `idle` before the resumed prompt is read
+    // (observed with the real CLI 2.1.281): only the prompt's echoed uuid proves it was.
+    const seen: string[] = [];
+    fakeHarness(async function* (h) {
+      yield { type: 'system', subtype: 'task_notification', task_id: 'orphan', status: 'stopped' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+      yield { type: 'system', subtype: 'init', session_id: 'sess-8' };
+      yield { type: 'result', subtype: 'success', num_turns: 0, session_id: 'sess-8' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      await sleep(30);
+      yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+      yield { type: 'system', subtype: 'init', session_id: 'sess-8' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'opening' }] } };
+      try {
+        seen.push(await h.control('open_pr', {}));
+      } catch (e) {
+        seen.push(`error: ${(e as Error).message}`);
+      }
+      yield { type: 'result', subtype: 'success', session_id: 'sess-8' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      await sleep(30);
+    });
+
+    await runTurn([]);
+    expect(seen).toEqual([expect.not.stringMatching(/^error:/)]);
+  });
+
+  it('treats a model-turn result as the answer from a harness that never echoes uuids', async () => {
+    const seen: string[] = [];
+    fakeHarness(async function* (h) {
+      yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+      yield { type: 'result', subtype: 'success', num_turns: 0, session_id: 'sess-9' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      await sleep(30);
+      yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } };
+      seen.push(await h.control('open_pr', {}).catch((e) => `error: ${(e as Error).message}`));
+      yield { type: 'result', subtype: 'success', num_turns: 1, session_id: 'sess-9' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      await sleep(30);
+    }, { echo: false });
+
+    const started = Date.now();
+    await runTurn([]);
+    expect(seen).toEqual([expect.not.stringMatching(/^error:/)]);
+    expect(Date.now() - started).toBeLessThan(5_000); // closed at idle, not at the settle bound
+  });
+
+  it('closes on the harness idle signal even when no result is pending', async () => {
+    const h = fakeHarness(async function* () {
+      yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+      yield { type: 'system', subtype: 'init', session_id: 'sess-6' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-6' };
+      yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+      await sleep(30);
+    });
+
+    await runTurn([]);
+    expect(h.current!.inputClosed).toBe(true);
+  });
+
+  it('asks the harness to emit its session-state events, locally and in remote worlds', async () => {
+    let env: Record<string, string | undefined> = {};
+    sdk.query = (args: any) => {
+      env = args.options.env;
+      return (async function* () {
+        yield { type: 'result', subtype: 'success', session_id: 'sess-7' };
+      })();
+    };
+    await runTurn([]);
+    expect(env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe('1');
+    const { remoteAgentEnv } = await import('../src/agent/remote-process.js');
+    expect(remoteAgentEnv('claude', '/home', { CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }))
+      .toMatchObject({ CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' });
   });
 
   it('bounds the wait — a deliberately long-lived background shell cannot wedge the turn', async () => {

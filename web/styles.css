@@ -1308,6 +1308,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .ins-spark rect { fill: var(--merged); }
 .ins-spark line { stroke: var(--line); }
 .ins-model { font-family: var(--font-mono); display: block; overflow: hidden; text-overflow: ellipsis; }
+.ins-unreported { color: var(--ink-3); cursor: help; }
 .ins-share { display: block; height: 3px; margin-top: 4px; background: var(--line); border-radius: 2px; overflow: hidden; max-width: 140px; }
 .ins-share i { display: block; height: 100%; border-radius: 2px; }
 
@@ -2056,13 +2057,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-label { min-width: 0; }
 .af-resume-source { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
 .af-resume-source:hover { text-decoration-style: solid; }
-/* the fork's "Re-authorize previous grants?" — its own line under the chip */
-.af-resume-reauth, .af-resume-dependency {
+/* Fork options each occupy their own line under the source chip. */
+.af-resume-reauth, .af-resume-dependency, .af-resume-model {
   flex-basis: 100%; display: flex; align-items: center; gap: 6px; width: max-content; max-width: 100%;
   margin-top: 2px; color: var(--ink-3); font-size: 12px; cursor: pointer;
 }
 .af-resume-reauth[hidden], .af-resume-dependency[hidden] { display: none !important; }
-.af-resume-reauth input, .af-resume-dependency input { width: auto; margin: 0; }
+.af-resume-reauth input, .af-resume-dependency input, .af-resume-model input { width: auto; margin: 0; }
 .af-resume-reauth-summary { opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .af-resume-clear:hover { color: var(--danger); }

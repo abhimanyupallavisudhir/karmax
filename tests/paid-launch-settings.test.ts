@@ -36,6 +36,37 @@ const complete = (enabled = true) => ({
 });
 
 describe('installation paid-launch settings', () => {
+  it('never carries bootstrap secrets or prices into a different Paddle environment', async () => {
+    const { store, broker } = await harness();
+    const service = new PaidLaunchSettingsService(store, broker, {
+      KARMAX_SUBSCRIPTION_PADDLE_ENVIRONMENT: 'sandbox', KARMAX_SUBSCRIPTION_PADDLE_API_KEY: 'pdl_sdbx_apikey_bootstrap',
+      KARMAX_SUBSCRIPTION_PADDLE_CLIENT_TOKEN: 'test_bootstrap', KARMAX_SUBSCRIPTION_PADDLE_INDIVIDUAL_PRICE_ID: `pri_${'a'.repeat(26)}`,
+    });
+    await service.configure({ billingProvider: 'paddle', paddle: { environment: 'live' } }, 'https://tavya.test');
+    expect(await service.paddleConfig()).toMatchObject({ environment: 'live', apiKey: undefined, clientToken: undefined, individualPriceId: undefined });
+    await store.close();
+  });
+  it('stores Paddle secrets only in the vault and refuses sandbox as live checkout', async () => {
+    const { store, service } = await harness();
+    const id = (letter: string) => `pri_${letter.repeat(26)}`;
+    const input = { ...complete(false), billingProvider: 'paddle', paddle: {
+      environment: 'sandbox', apiKey: 'pdl_sdbx_apikey_secret', webhookSecret: 'pdl_ntfset_secret',
+      clientToken: 'test_public', individualPriceId: id('a'), teamBasePriceId: id('b'), teamSeatPriceId: id('c'),
+    } };
+    const result = await service.configure(input, 'https://tavya.test');
+    expect(result).toMatchObject({ billingProvider: 'paddle', canEnable: false,
+      paddle: { configured: true, webhookUrl: 'https://tavya.test/api/subscriptions/paddle/webhook' } });
+    expect(JSON.stringify(result)).not.toContain('pdl_sdbx_apikey_secret');
+    expect(JSON.stringify(result)).not.toContain('pdl_ntfset_secret');
+    expect(await store.kvGet(PAID_LAUNCH_SETTINGS_KEY)).not.toContain('pdl_ntfset_secret');
+    await expect(service.configure({ ...input, paidLaunch: true }, 'https://tavya.test')).rejects.toThrow(/live environment/);
+    await expect(service.configure({ ...input, paddle: { ...input.paddle, environment: 'live' } }, 'https://tavya.test'))
+      .rejects.toThrow(/environment/);
+    const live = await service.configure({ ...input, paddle: { environment: 'live' } }, 'https://tavya.test');
+    expect(live.paddle).toMatchObject({ configured: false, secretKeyConfigured: false, webhookSecretConfigured: false });
+    expect(live.paddle.individualPriceId).toBeUndefined();
+    await store.close();
+  });
   it('persists public configuration and checklist while keeping Stripe secrets in the vault', async () => {
     const { store, broker, service } = (await harness());
     const result = (await service.configure(complete(), 'https://krmax.test'));

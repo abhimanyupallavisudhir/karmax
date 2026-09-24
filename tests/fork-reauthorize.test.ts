@@ -80,6 +80,23 @@ describe('fork_agent reauthorize', () => {
     (await f.store.close());
   });
 
+  it('starts a fork that waits for its source to succeed from where the source lands', async () => {
+    const f = (await fixture());
+    const token = (await f.tokenFor('owner'));
+    (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
+      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any));
+    const fork = (triggers: unknown[], base?: string) => f.api.createTask(token, { projectId: f.project.id, draft: true,
+      params: { prompt: 'after it lands', ...(base ? { base } : {}), triggers, 'agent:do': { resumeFrom: { taskId: f.source.id } } } });
+    expect((await fork([{ kind: 'dependency', tasks: [f.source.id] }])).params.base).toBe('release');
+    expect((await fork([{ kind: 'dependency', tasks: ['task_other', f.source.id], on: 'done' }])).params.base).toBe('release');
+    // Only a guaranteed landing moves the start; an explicit branch always wins.
+    expect((await fork([{ kind: 'dependency', tasks: [f.source.id], on: 'failed' }])).params.base).toBe('karmax/source');
+    expect((await fork([{ kind: 'dependency', tasks: ['task_other', f.source.id], mode: 'any' }])).params.base).toBe('karmax/source');
+    expect((await fork([{ kind: 'dependency', tasks: ['task_other'] }])).params.base).toBe('karmax/source');
+    expect((await fork([{ kind: 'dependency', tasks: [f.source.id] }], 'karmax/source')).params.base).toBe('karmax/source');
+    (await f.store.close());
+  });
+
   it('reads the grants a task ended with in task-creation shape', async () => {
     const f = (await fixture());
     expect(previousTaskGrants((await f.store.getTask(f.source.id))!)).toEqual({

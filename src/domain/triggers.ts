@@ -214,6 +214,13 @@ export function statusSatisfiesDependency(on: DependencyOn | undefined, status: 
   }
 }
 
+/** Does this task start only once `taskId` has succeeded (and so landed)? */
+export function awaitsSuccessOf(triggers: TaskTrigger[], taskId: string): boolean {
+  return triggers.some((t) => t.kind === 'dependency' && t.tasks?.includes(taskId)
+    && (t.on === undefined || t.on === 'success' || t.on === 'done')
+    && ((t.mode ?? 'all') === 'all' || t.tasks.length === 1));
+}
+
 /**
  * Given which dependency tasks are currently satisfied, is the dependency
  * trigger as a whole met? (`all` ⇒ every dep; `any` ⇒ at least one.)

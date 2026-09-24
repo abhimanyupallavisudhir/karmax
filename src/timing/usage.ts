@@ -15,6 +15,16 @@ export class ReportedUsage {
     this.rounds.push(value);
     return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
   }
+  /** A Codex CLI per-request breakdown — app-server camelCase
+   * (`thread/tokenUsage/updated` `last`) or `codex exec` snake_case — whose input,
+   * like the Responses API's, already includes cached input. */
+  addCodexCli(raw: any) {
+    return this.add({
+      input_tokens: raw?.inputTokens ?? raw?.input_tokens,
+      output_tokens: raw?.outputTokens ?? raw?.output_tokens,
+      input_tokens_details: { cached_tokens: raw?.cachedInputTokens ?? raw?.cached_input_tokens },
+    }, 'codex');
+  }
   total(): AdapterTurn['usage'] {
     if (!this.rounds.length || this.rounds.some(r => r.inputTokens === undefined || r.outputTokens === undefined)) return undefined;
     const total: NonNullable<AdapterTurn['usage']> = { inputTokens: 0, outputTokens: 0,

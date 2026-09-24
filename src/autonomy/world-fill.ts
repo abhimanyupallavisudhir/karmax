@@ -27,7 +27,10 @@ export async function fillInWorld(world: World, args: {
   timeoutMs?: number;
 }): Promise<{ origin: string }> {
   await world.writeFile(HELPER_REL, HELPER_SOURCE);
+  // writeFile is root-relative but exec defaults to the workdir, which a
+  // single-repo world nests below the root — run from where the helper lives.
   const res = await world.exec('node', [HELPER_REL, args.selector, (args.expectDomains ?? []).join(','), args.cdpUrl], {
+    cwd: world.handle.root,
     input: (await args.resolveText()),
     timeoutMs: args.timeoutMs ?? 30_000,
   });

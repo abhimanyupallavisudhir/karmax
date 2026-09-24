@@ -4,6 +4,7 @@ import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
 import type { SubscriptionRuntimeConfig } from '../launch/settings.js';
 import { STRIPE_BILLING_API_VERSION } from './stripe-contract.js';
+import { BillingRequestRejected } from './paddle.js';
 
 export type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
 const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
@@ -71,12 +72,17 @@ export interface BillingAccount {
 
 export interface SubscriptionProvider {
   readonly name: string;
+  readonly customerMode?: 'checkout';
+  readonly supportsIdempotency?: boolean;
   configured(): boolean | Promise<boolean>;
   catalog(): SubscriptionCatalogConfig | undefined | Promise<SubscriptionCatalogConfig | undefined>;
   createCustomer(input: { organizationId: string; name: string; idempotencyKey: string }): Promise<{ id: string }>;
   createCheckout(input: { organizationId: string; customerId: string; plan: PaidHostedPlanId;
     seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
-  createPortal(input: { customerId: string; returnUrl: string; idempotencyKey: string }): Promise<{ url: string }>;
+  resumeCheckout?(input: Parameters<SubscriptionProvider['createCheckout']>[0] & { checkoutId: string }): Promise<{ id: string; url: string } | null>;
+  cancelCheckout?(checkoutId: string): Promise<{ id: string }>;
+  reconcileRequest?(intent: BillingRequestIntent, reference: string, createdAt: number): Promise<{ id: string; url?: string } | null>;
+  createPortal(input: { customerId: string; subscriptionId?: string; returnUrl: string; idempotencyKey: string }): Promise<{ url: string }>;
   changePlan(input: { subscriptionId: string; plan: PaidHostedPlanId; seats: number;
     items: Record<string, string>; idempotencyKey: string }): Promise<{ id: string }>;
   cancelAtPeriodEnd(input: { subscriptionId: string; idempotencyKey: string }): Promise<{ id: string }>;
@@ -89,7 +95,18 @@ export interface BillingEvent {
   id: string;
   type: string;
   created: number;
+  checkoutId?: string;
   data: { object: any };
+}
+
+export interface BillingRequestIntent {
+  kind: 'checkout' | 'change' | 'cancel' | 'seats' | 'abandon';
+  subscriptionId?: string;
+  checkoutId?: string;
+  plan?: PaidHostedPlanId;
+  seats?: number;
+  successUrl?: string;
+  checkoutResult?: Omit<SubscriptionCheckoutResult, 'checkoutSessionReference' | 'url'>;
 }
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -235,8 +252,14 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
 }
 
 export class SubscriptionBillingService {
-  constructor(private store: Store, private provider: SubscriptionProvider, private hosted: boolean,
+  constructor(private store: Store, private providerSource: SubscriptionProvider | ((name?: string) => Promise<SubscriptionProvider>), private hosted: boolean,
     private pastDueGraceMs = PAST_DUE_GRACE_MS) {}
+
+  private async provider(name?: string): Promise<SubscriptionProvider> {
+    const provider = typeof this.providerSource === 'function' ? await this.providerSource(name) : this.providerSource;
+    if (name && name !== provider.name) throw new Error(`billing provider ${name} is unavailable`);
+    return provider;
+  }
 
   async current(organizationId: string) {
     const members = (await this.store.listOrganizationMemberships(organizationId)).length;
@@ -244,6 +267,7 @@ export class SubscriptionBillingService {
       seats: null, activeUsers: members, seatDeficit: 0, access: 'unmetered', cancelAtPeriodEnd: false,
       catalog: Object.values(HOSTED_PLANS) };
     const account = (await this.account(organizationId));
+    const provider = await this.provider(account?.provider);
     const plan = (await this.store.organizationEntitlements(organizationId)).plan ?? 'free';
     const gift = await this.currentGift(organizationId);
     const billedPlan = account?.plan ?? 'free';
@@ -255,7 +279,9 @@ export class SubscriptionBillingService {
     const access = gift || ['active', 'trialing'].includes(status) ? 'active'
       : status === 'past_due' && graceEndsAt && graceEndsAt > Date.now() ? 'grace'
         : status === 'none' || status === 'canceled' ? 'free' : 'restricted';
-    return { managed: true, providerConfigured: (await this.provider.configured()), plan, billedPlan, status, seats, gift,
+    const pendingRequest = Boolean(await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId));
+    const pendingCheckout = Boolean(await this.store.db.prepare("SELECT checkoutId FROM subscription_billing_checkouts WHERE organizationId=? AND state='pending'").get(organizationId));
+    return { managed: true, providerConfigured: (await provider.configured()), plan, billedPlan, status, seats, gift, pendingRequest, pendingCheckout,
       activeUsers: members, seatDeficit: gift?.plan === 'team' ? 0 : plan === 'team' ? Math.max(0, members - seats)
         : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
@@ -302,50 +328,68 @@ export class SubscriptionBillingService {
   }
 
   async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
-    await this.requireHosted(); this.requireKey(key);
+    const provider = await this.requireHosted(); this.requireKey(key);
     if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const current = (await this.account(organizationId));
+    if (current && current.provider !== provider.name)
+      throw new Error('this organization has a billing account with another provider; reconcile it before switching');
     if (current?.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(current.status))
       throw new Error('use Change plan for an existing subscription');
-    return this.idempotent(organizationId, `checkout:${plan}`, key, async () => {
-      const activeUsers = (await this.store.listOrganizationMemberships(organizationId)).length;
-      const definition = HOSTED_PLANS[plan];
-      if (definition.maxMembers != null && activeUsers > definition.maxMembers)
-        throw new Error(`remove additional active users before choosing ${definition.name}`);
-      const customerId = await this.ensureCustomer(organizationId, `${key}:customer`);
-      const seats = Math.max(definition.includedActiveUsers, activeUsers);
-      const session = await this.provider.createCheckout({ organizationId, customerId, plan, seats,
-        successUrl: urls.success, cancelUrl: urls.cancel, idempotencyKey: `${key}:checkout` });
-      return {
-        organizationId, plan,
-        commercialTerms: {
-          planId: plan, planName: definition.name, currency: 'usd', billingInterval: 'month',
-          monthlyBasePriceCents: definition.monthlyBasePriceCents,
-          includedActiveUsers: definition.includedActiveUsers,
-          monthlyAdditionalActiveUserPriceCents: definition.monthlyAdditionalActiveUserPriceCents,
-          activeUsers,
-          monthlyTotalPriceCents: hostedMonthlyPriceCents(plan, activeUsers),
-        },
-        checkoutRequestReference: key,
-        checkoutSessionReference: session.id,
-        checkoutProvider: this.provider.name,
-        url: session.url,
-      };
-    });
+    if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+    const activeUsers = (await this.store.listOrganizationMemberships(organizationId)).length;
+    const definition = HOSTED_PLANS[plan];
+    if (definition.maxMembers != null && activeUsers > definition.maxMembers)
+      throw new Error(`remove additional active users before choosing ${definition.name}`);
+    const seats = Math.max(definition.includedActiveUsers, activeUsers);
+    const checkoutResult = { organizationId, plan, commercialTerms: {
+      planId: plan, planName: definition.name, currency: 'usd' as const, billingInterval: 'month' as const,
+      monthlyBasePriceCents: definition.monthlyBasePriceCents, includedActiveUsers: definition.includedActiveUsers,
+      monthlyAdditionalActiveUserPriceCents: definition.monthlyAdditionalActiveUserPriceCents, activeUsers,
+      monthlyTotalPriceCents: hostedMonthlyPriceCents(plan, activeUsers),
+    }, checkoutRequestReference: key, checkoutProvider: provider.name };
+    const intent: BillingRequestIntent = { kind: 'checkout', plan, seats, successUrl: urls.success, checkoutResult };
+    return this.idempotent(organizationId, `checkout:${plan}`, key, async (reference) => {
+      const latest = await this.account(organizationId);
+      if (latest && (latest.provider !== provider.name || latest.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(latest.status)))
+        throw new BillingRequestRejected('billing state changed; refresh before starting checkout');
+      const customerId = await this.ensureCustomer(organizationId, `${key}:customer`, provider);
+      const input = { organizationId, customerId, plan, seats,
+        successUrl: urls.success, cancelUrl: urls.cancel, idempotencyKey: `${provider.supportsIdempotency === false ? reference : key}:checkout` };
+      const pending = provider.resumeCheckout ? await this.store.db.prepare(`SELECT checkoutId FROM subscription_billing_checkouts
+        WHERE provider=? AND organizationId=? AND state='pending' ORDER BY createdAt DESC LIMIT 1`)
+        .get(provider.name, organizationId) as { checkoutId: string } | undefined : undefined;
+      if (pending) {
+        intent.checkoutId = pending.checkoutId;
+        await this.store.db.prepare('UPDATE subscription_billing_locks SET intentJson=? WHERE organizationId=? AND requestKey=?')
+          .run(JSON.stringify(intent), organizationId, key);
+      }
+      let session = pending ? await provider.resumeCheckout!({ ...input, checkoutId: pending.checkoutId }) : null;
+      if (pending && !session) await this.store.db.prepare("UPDATE subscription_billing_checkouts SET state='canceled' WHERE provider=? AND checkoutId=?")
+        .run(provider.name, pending.checkoutId);
+      session ??= await provider.createCheckout(input);
+      if (provider.customerMode === 'checkout') await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
+        (provider, checkoutId, organizationId, createdAt) VALUES (?, ?, ?, ?)`)
+        .run(provider.name, session.id, organizationId, Date.now());
+      return { ...checkoutResult, checkoutSessionReference: session.id, url: session.url };
+    }, provider, intent);
   }
 
   async portal(organizationId: string, returnUrl: string, key: string) {
-    await this.requireHosted(); this.requireKey(key);
-    const customerId = (await this.account(organizationId))?.customerId;
-    if (!customerId) throw new Error('no billing account exists for this organization');
+    const account = await this.account(organizationId);
+    const provider = await this.requireHosted(account?.provider); this.requireKey(key);
+    const customerId = account?.customerId;
+    if (!customerId && !account?.subscriptionId) throw new Error('no billing account exists for this organization');
+    if (provider.customerMode === 'checkout') return provider.createPortal({ customerId: customerId ?? '',
+      subscriptionId: account?.subscriptionId, returnUrl, idempotencyKey: `${key}:portal` });
     return this.idempotent(organizationId, 'portal', key,
-      () => this.provider.createPortal({ customerId, returnUrl, idempotencyKey: `${key}:portal` }));
+      () => provider.createPortal({ customerId: customerId!, returnUrl, idempotencyKey: `${key}:portal` }), provider);
   }
 
   async changePlan(organizationId: string, plan: unknown, key: string) {
-    await this.requireHosted(); this.requireKey(key);
+    this.requireKey(key);
     if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const account = (await this.account(organizationId));
+    const provider = await this.requireHosted(account?.provider);
     if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
       throw new Error('there is no changeable subscription');
     const seats = Math.max(HOSTED_PLANS[plan].includedActiveUsers,
@@ -353,19 +397,30 @@ export class SubscriptionBillingService {
     if (plan === 'individual' && HOSTED_PLANS.individual.maxMembers != null
       && seats > HOSTED_PLANS.individual.maxMembers)
       throw new Error('remove additional active users before downgrading to Individual');
-    return this.idempotent(organizationId, `change:${plan}`, key, () => this.provider.changePlan({
+    return this.idempotent(organizationId, `change:${plan}`, key, () => provider.changePlan({
       subscriptionId: account.subscriptionId!, plan, seats, items: account.items, idempotencyKey: `${key}:change`,
-    }));
+    }), provider, { kind: 'change', subscriptionId: account.subscriptionId, plan, seats });
   }
 
   async cancel(organizationId: string, key: string) {
-    await this.requireHosted(); this.requireKey(key);
+    this.requireKey(key);
     const account = (await this.account(organizationId));
+    const provider = await this.requireHosted(account?.provider);
+    if (provider.cancelCheckout && (!account?.subscriptionId || ['none', 'canceled', 'incomplete_expired'].includes(account.status))) {
+      const pending = await this.store.db.prepare("SELECT checkoutId FROM subscription_billing_checkouts WHERE organizationId=? AND provider=? AND state='pending' ORDER BY createdAt DESC LIMIT 1")
+        .get(organizationId, provider.name) as { checkoutId: string } | undefined;
+      if (pending) return this.idempotent(organizationId, 'cancel', key, async () => {
+        const result = await provider.cancelCheckout!(pending.checkoutId);
+        await this.store.db.prepare("UPDATE subscription_billing_checkouts SET state='canceled' WHERE organizationId=? AND checkoutId=? AND provider=?")
+          .run(organizationId, pending.checkoutId, provider.name);
+        return result;
+      }, provider, { kind: 'abandon', checkoutId: pending.checkoutId });
+    }
     if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
       throw new Error('there is no cancellable subscription');
-    return this.idempotent(organizationId, 'cancel', key, () => this.provider.cancelAtPeriodEnd({
+    return this.idempotent(organizationId, 'cancel', key, () => provider.cancelAtPeriodEnd({
       subscriptionId: account.subscriptionId!, idempotencyKey: `${key}:cancel`,
-    }));
+    }), provider, { kind: 'cancel', subscriptionId: account.subscriptionId });
   }
 
   async syncSeats(organizationId: string): Promise<void> {
@@ -375,44 +430,108 @@ export class SubscriptionBillingService {
     const seats = Math.max(HOSTED_PLANS.team.includedActiveUsers,
       (await this.store.listOrganizationMemberships(organizationId)).length);
     if (seats === account.seats) return;
-    await this.provider.updateSeats({ subscriptionId: account.subscriptionId,
+    const provider = await this.requireHosted(account.provider);
+    const key = `seat-sync:${organizationId}:${seats}:${account.lastEventAt}`;
+    await this.idempotent(organizationId, `seats:${seats}`, key, () => provider.updateSeats({ subscriptionId: account.subscriptionId!,
       seatItemId: account.items.teamSeat, seats,
-      idempotencyKey: `seat-sync:${organizationId}:${seats}:${account.lastEventAt}` });
+      idempotencyKey: key }), provider, { kind: 'seats', subscriptionId: account.subscriptionId, plan: 'team', seats });
+  }
+
+  /** Read-only provider recovery: never repeat an uncertain financial write.
+   * If its result cannot be proven, retain the reservation for operator review. */
+  async reconcilePending(organizationId: string) {
+    const account = await this.account(organizationId);
+    const provider = await this.requireHosted(account?.provider);
+    const lock = await this.store.db.prepare('SELECT * FROM subscription_billing_locks WHERE organizationId=?')
+      .get(organizationId) as any;
+    if (!lock) return { reconciled: true, pending: false };
+    if (!provider.reconcileRequest || !lock.intentJson || Date.now() - Number(lock.createdAt) < 60_000)
+      throw new Error('billing request is still in progress or requires operator reconciliation');
+    const intent = JSON.parse(lock.intentJson) as BillingRequestIntent;
+    const result = await provider.reconcileRequest(intent, lock.providerReference, Number(lock.createdAt));
+    if (!result) return { reconciled: false, pending: true };
+    return this.store.transaction(async () => {
+      const current = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId) as any;
+      if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false };
+      if (intent.kind === 'checkout') {
+        await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
+          (provider, checkoutId, organizationId, createdAt) VALUES (?, ?, ?, ?)`)
+          .run(provider.name, result.id, organizationId, Number(lock.createdAt));
+      }
+      if (intent.kind === 'abandon') await this.store.db.prepare("UPDATE subscription_billing_checkouts SET state='canceled' WHERE organizationId=? AND checkoutId=? AND provider=?")
+        .run(organizationId, result.id, provider.name);
+      const response = intent.kind === 'checkout' ? { ...intent.checkoutResult, checkoutSessionReference: result.id, url: result.url } : { id: result.id };
+      await this.store.db.prepare('UPDATE subscription_billing_requests SET responseJson=? WHERE requestKey=? AND organizationId=? AND responseJson IS NULL')
+        .run(JSON.stringify(response), lock.requestKey, organizationId);
+      await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, lock.requestKey);
+      return { reconciled: true, pending: false };
+    });
   }
 
   /** Organization metadata must retain the tenant mapping until a signed
    * provider event says the associated subscription is terminal. */
   async assertOrganizationDeletionAllowed(organizationId: string): Promise<void> {
     if (!this.hosted) return;
+    if (await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId))
+      throw new Error('a billing request requires provider reconciliation before deleting this organization');
+    if (await this.store.db.prepare("SELECT checkoutId FROM subscription_billing_checkouts WHERE organizationId=? AND state='pending'").get(organizationId))
+      throw new Error('an uncompleted Paddle checkout must be reconciled before deleting this organization');
     const account = (await this.account(organizationId));
     if (!account?.subscriptionId) return;
     if ((TERMINAL_PROVIDER_SUBSCRIPTION_STATUSES as readonly SubscriptionStatus[]).includes(account.status)) return;
     throw new Error(`the provider subscription is ${account.status}; cancel it and wait for signed terminal confirmation before deleting this organization`);
   }
 
-  async handleWebhook(raw: Buffer, signature?: string): Promise<{ duplicate: boolean }> {
-    await this.requireHosted();
-    const event = (await this.provider.verifyWebhook(raw, signature));
+  async handleWebhook(raw: Buffer, signature?: string, providerName?: string): Promise<{ duplicate: boolean }> {
+    // The original endpoint is permanently Stripe's, even after new checkouts
+    // move to Paddle. Fixed-provider installations/test harnesses retain their
+    // explicit adapter; dynamic routing must never infer this from settings.
+    const provider = await this.requireHosted(providerName
+      ?? (typeof this.providerSource === 'function' ? 'stripe-billing' : undefined));
+    const event = (await provider.verifyWebhook(raw, signature));
     return this.store.transaction(async () => {
       const claim = await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_events
         (provider, eventId, type, createdAt, processedAt) VALUES (?, ?, ?, ?, NULL)`)
-        .run(this.provider.name, event.id, event.type, event.created * 1000);
+        .run(provider.name, event.id, event.type, event.created * 1000);
       if (Number(claim.changes) === 0) return { duplicate: true };
-      await this.applyEvent(event);
+      await this.applyEvent(event, provider);
       await this.store.db.prepare('UPDATE subscription_billing_events SET processedAt=? WHERE provider=? AND eventId=?')
-        .run(Date.now(), this.provider.name, event.id);
+        .run(Date.now(), provider.name, event.id);
       return { duplicate: false };
     });
   }
 
-  private async applyEvent(event: BillingEvent): Promise<void> {
+  private async applyEvent(event: BillingEvent, provider: SubscriptionProvider): Promise<void> {
+    if (event.type === 'ignored') return;
     const object = event.data.object;
     const customerId = stringId(object.customer);
     const subscriptionId = event.type.startsWith('customer.subscription.') ? String(object.id)
       : event.type.startsWith('invoice.') ? invoiceSubscriptionId(object)
         : stringId(object.subscription);
-    const account = customerId ? (await this.accountByCustomer(customerId)) : subscriptionId ? (await this.accountBySubscription(subscriptionId)) : undefined;
+    let account = subscriptionId ? await this.accountBySubscription(subscriptionId) : undefined;
+    if (provider.customerMode === 'checkout') {
+      if (!account && event.checkoutId) {
+        const checkout = await this.store.db.prepare('SELECT organizationId FROM subscription_billing_checkouts WHERE provider=? AND checkoutId=?')
+          .get(provider.name, event.checkoutId) as { organizationId: string } | undefined;
+        if (checkout) account = await this.account(checkout.organizationId);
+      }
+      // A subscription.updated can arrive before subscription.created. Retry it
+      // rather than permanently acknowledging an unassociated state change.
+      if (!account && !event.checkoutId) {
+        // Old subscriptions keep their binding after a tenant resubscribes.
+        // Their delayed events must not affect the replacement subscription.
+        if (await this.store.db.prepare('SELECT checkoutId FROM subscription_billing_checkouts WHERE provider=? AND subscriptionId=?')
+          .get(provider.name, subscriptionId ?? '')) return;
+        throw new Error('Paddle subscription association is pending; retry delivery');
+      }
+      if (account?.subscriptionId && account.subscriptionId !== subscriptionId
+        && (!event.checkoutId || !['canceled', 'incomplete_expired'].includes(account.status))) return;
+    } else if (!account && customerId) account = await this.accountByCustomer(customerId);
+    if (account && account.provider !== provider.name) return;
     if (!account) return; // Never adopt a tenant association from provider metadata.
+    if (provider.customerMode === 'checkout' && event.checkoutId && subscriptionId)
+      await this.store.db.prepare("UPDATE subscription_billing_checkouts SET subscriptionId=?, state='associated' WHERE provider=? AND checkoutId=? AND organizationId=?")
+        .run(subscriptionId, provider.name, event.checkoutId, account.organizationId);
     const eventAt = event.created * 1000;
     if (eventAt < account.lastEventAt) return;
     if (event.type === 'checkout.session.completed') {
@@ -435,7 +554,7 @@ export class SubscriptionBillingService {
         (await this.reconcileAccount(updated));
         return;
       }
-      const mapped = (await this.mapSubscription(object));
+      const mapped = (await this.mapSubscription(object, provider));
       const status = normalizeStatus(object.status);
       const rank = billingEventRank(event.type, status);
       const cancelAtPeriodEnd = Boolean(object.cancel_at_period_end);
@@ -494,8 +613,8 @@ export class SubscriptionBillingService {
     });
   }
 
-  private async mapSubscription(object: any): Promise<{ plan: HostedPlanId; seats: number; items: Record<string, string> }> {
-    const catalog = (await this.provider.catalog());
+  private async mapSubscription(object: any, provider: SubscriptionProvider): Promise<{ plan: HostedPlanId; seats: number; items: Record<string, string> }> {
+    const catalog = (await provider.catalog());
     if (!catalog) throw new Error('subscription catalog is not configured');
     const items: Record<string, string> = {};
     let plan: HostedPlanId | undefined;
@@ -504,24 +623,29 @@ export class SubscriptionBillingService {
       const price = stringId(item.price);
       const product = stringId(item.price?.product);
       if (price === catalog.individualPriceId) {
+        if (provider.customerMode === 'checkout' && item.quantity !== 1) throw new Error('base plan quantity must be one');
         if (plan) throw new Error('subscription contains multiple configured base plan prices');
         if (catalog.individualProductId && product !== catalog.individualProductId)
           throw new Error('Individual price belongs to an unexpected Stripe product');
         plan = 'individual'; items.individual = String(item.id);
       } else if (price === catalog.teamBasePriceId) {
+        if (provider.customerMode === 'checkout' && item.quantity !== 1) throw new Error('base plan quantity must be one');
         if (plan) throw new Error('subscription contains multiple configured base plan prices');
         if (catalog.teamProductId && product !== catalog.teamProductId)
           throw new Error('Team base price belongs to an unexpected Stripe product');
         plan = 'team'; items.teamBase = String(item.id);
       } else if (price === catalog.teamSeatPriceId) {
+        if (items.teamSeat) throw new Error('subscription contains duplicate seat prices');
         if (catalog.teamProductId && product !== catalog.teamProductId)
           throw new Error('Team seat price belongs to an unexpected Stripe product');
         const quantity = Number(item.quantity);
         if (!Number.isSafeInteger(quantity) || quantity < 0) throw new Error('Team seat quantity is invalid');
         seats += quantity; items.teamSeat = String(item.id);
-      }
+      } else if (provider.customerMode === 'checkout') throw new Error('Paddle subscription contains an unexpected price');
     }
     if (!plan) throw new Error('subscription contains no configured Karmax plan price');
+    if (provider.customerMode === 'checkout' && plan === 'individual' && items.teamSeat)
+      throw new Error('Individual subscription contains Team seats');
     return { plan, seats: plan === 'team' ? seats : HOSTED_PLANS.individual.includedActiveUsers, items };
   }
 
@@ -534,18 +658,19 @@ export class SubscriptionBillingService {
   private async accountBySubscription(subscriptionId: string): Promise<BillingAccount | undefined> {
     return rowAccount((await this.store.db.prepare('SELECT * FROM subscription_billing_accounts WHERE subscriptionId=?').get(subscriptionId)) as any);
   }
-  private async ensureCustomer(organizationId: string, key: string): Promise<string> {
+  private async ensureCustomer(organizationId: string, key: string, provider: SubscriptionProvider): Promise<string> {
     const existing = (await this.account(organizationId))?.customerId;
     if (existing) return existing;
     const organization = (await this.store.getOrganization(organizationId));
     if (!organization) throw new Error('organization not found');
-    const customer = await this.provider.createCustomer({ organizationId, name: organization.name, idempotencyKey: key });
+    const customer = provider.customerMode === 'checkout' ? { id: '' }
+      : await provider.createCustomer({ organizationId, name: organization.name, idempotencyKey: key });
     const now = Date.now();
     (await this.store.db.prepare(`INSERT INTO subscription_billing_accounts
       (organizationId, provider, customerId, plan, status, seats, itemsJson, cancelAtPeriodEnd, lastEventAt, createdAt, updatedAt)
       VALUES (?, ?, ?, ?, 'none', ?, '{}', 0, 0, ?, ?)
       ON CONFLICT(organizationId) DO UPDATE SET customerId=excluded.customerId, updatedAt=excluded.updatedAt`)
-      .run(organizationId, this.provider.name, customer.id, HOSTED_PLANS.free.id,
+      .run(organizationId, provider.name, customer.id || null, HOSTED_PLANS.free.id,
         HOSTED_PLANS.free.includedActiveUsers, now, now));
     return customer.id;
   }
@@ -565,12 +690,16 @@ export class SubscriptionBillingService {
       Date.now(), organizationId));
     return (await this.account(organizationId))!;
   }
-  private async idempotent<T>(organizationId: string, operation: string, key: string, work: () => Promise<T>): Promise<T> {
+  private async idempotent<T>(organizationId: string, operation: string, key: string, work: (reference: string) => Promise<T>, provider?: SubscriptionProvider, intent?: BillingRequestIntent): Promise<T> {
     const hash = crypto.createHash('sha256').update(`${organizationId}:${operation}`).digest('hex');
+    const reference = crypto.randomUUID();
+    const cached = await this.store.transaction(async () => {
     const prior = (await this.store.db.prepare('SELECT * FROM subscription_billing_requests WHERE requestKey=?').get(key)) as any;
     if (prior) {
       if (prior.organizationId !== organizationId || prior.requestHash !== hash) throw new Error('idempotency key was already used for another billing request');
-      if (prior.responseJson) return JSON.parse(prior.responseJson) as T;
+      if (prior.responseJson) return { response: JSON.parse(prior.responseJson) as T };
+      if (provider?.supportsIdempotency === false)
+        throw new Error('billing request requires provider reconciliation before retrying');
       // A process can die after reserving the local key but before saving the
       // response. Stripe retains the same provider idempotency key, so releasing
       // only a stale local reservation resumes safely without duplicating money.
@@ -578,22 +707,42 @@ export class SubscriptionBillingService {
         throw new Error('an identical billing request is already in progress');
       (await this.store.db.prepare('DELETE FROM subscription_billing_requests WHERE requestKey=? AND responseJson IS NULL').run(key));
     }
+    if (provider?.supportsIdempotency === false) {
+      const pending = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_requests WHERE organizationId=? AND responseJson IS NULL')
+        .get(organizationId);
+      if (pending) throw new Error('another billing request is in progress or requires provider reconciliation');
+      const lock = await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_locks
+        (organizationId, requestKey, intentJson, providerReference, createdAt) VALUES (?, ?, ?, ?, ?)`)
+        .run(organizationId, key, intent ? JSON.stringify(intent) : null, reference, Date.now());
+      if (!Number(lock.changes)) throw new Error('another billing request is in progress or requires provider reconciliation');
+    }
     (await this.store.db.prepare(`INSERT INTO subscription_billing_requests
       (requestKey, organizationId, operation, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, NULL, ?)`)
       .run(key, organizationId, operation, hash, Date.now()));
+    return undefined;
+    });
+    if (cached) return cached.response;
     try {
-      const response = await work();
+      const response = await work(reference);
+      await this.store.transaction(async () => {
       (await this.store.db.prepare('UPDATE subscription_billing_requests SET responseJson=? WHERE requestKey=?')
         .run(JSON.stringify(response), key));
+      await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, key);
+      });
       return response;
     } catch (error) {
-      (await this.store.db.prepare('DELETE FROM subscription_billing_requests WHERE requestKey=? AND responseJson IS NULL').run(key));
+      if (provider?.supportsIdempotency !== false || error instanceof BillingRequestRejected) await this.store.transaction(async () => {
+        (await this.store.db.prepare('DELETE FROM subscription_billing_requests WHERE requestKey=? AND responseJson IS NULL').run(key));
+        await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, key);
+      });
       throw error;
     }
   }
-  private async requireHosted(): Promise<void> {
+  private async requireHosted(name?: string): Promise<SubscriptionProvider> {
     if (!this.hosted) throw new Error('hosted subscription billing is not used by self-hosted installations');
-    if (!(await this.provider.configured())) throw new Error('hosted subscription billing is not configured');
+    const provider = await this.provider(name);
+    if (!(await provider.configured())) throw new Error('hosted subscription billing is not configured');
+    return provider;
   }
   private requireKey(key: string): void {
     if (!/^[A-Za-z0-9._:-]{8,200}$/.test(key)) throw new Error('a valid Idempotency-Key header is required');

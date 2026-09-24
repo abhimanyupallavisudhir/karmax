@@ -19,7 +19,8 @@ const OPEN_STAGES = ['setup', 'do', 'review', 'pr', 'merge', 'resolve', 'escalat
 const LIST_LIMIT = 6;
 
 export interface InsightTotals {
-  shipped: number; created: number; turns: number; failedTurns: number; agentSeconds: number;
+  /** meteredTurns: turns whose provider reported token usage (older Codex subscription turns did not). */
+  shipped: number; created: number; turns: number; meteredTurns: number; failedTurns: number; agentSeconds: number;
   tokens: number; inputTokens: number; outputTokens: number; medianShipMs: number | null;
   spendMicros?: number;
 }
@@ -30,7 +31,7 @@ export interface OrganizationInsights {
   totals: InsightTotals; previous: InsightTotals;
   daily: Array<{ day: string; shipped: number; created: number; turns: number; agentSeconds: number; tokens: number;
     tokensByModel: Record<string, number> }>;
-  models: Array<{ model: string; provider: string; turns: number; failedTurns: number; agentSeconds: number; tokens: number }>;
+  models: Array<{ model: string; provider: string; turns: number; meteredTurns: number; failedTurns: number; agentSeconds: number; tokens: number }>;
   projects: Array<{ id: string; name: string; shipped: number; open: number; turns: number; agentSeconds: number;
     tokens: number; daily: number[] }>;
   /** Open work right now, per stage: how much an agent holds vs. how much waits on a person. */
@@ -40,7 +41,7 @@ export interface OrganizationInsights {
 }
 
 function emptyTotals(): InsightTotals {
-  return { shipped: 0, created: 0, turns: 0, failedTurns: 0, agentSeconds: 0, tokens: 0, inputTokens: 0, outputTokens: 0, medianShipMs: null };
+  return { shipped: 0, created: 0, turns: 0, meteredTurns: 0, failedTurns: 0, agentSeconds: 0, tokens: 0, inputTokens: 0, outputTokens: 0, medianShipMs: null };
 }
 
 function median(values: number[]): number | null {
@@ -88,11 +89,11 @@ export async function organizationInsights(store: Store, organizationId: string,
     id: project.id, name: project.name, shipped: 0, open: 0, turns: 0, agentSeconds: 0, tokens: 0,
     daily: Array.from({ length: days }, () => 0),
   }]));
-  const perModel = new Map<string, { model: string; provider: string; turns: number; failedTurns: number; agentSeconds: number; tokens: number }>();
+  const perModel = new Map<string, OrganizationInsights['models'][number]>();
   const modelEntry = (model: string, provider: string) => {
     const key = model || provider || 'unknown';
     let entry = perModel.get(key);
-    if (!entry) perModel.set(key, entry = { model: key, provider: provider || '', turns: 0, failedTurns: 0, agentSeconds: 0, tokens: 0 });
+    if (!entry) perModel.set(key, entry = { model: key, provider: provider || '', turns: 0, meteredTurns: 0, failedTurns: 0, agentSeconds: 0, tokens: 0 });
     return entry;
   };
   const ref = (task: typeof summaries[number], extra: Partial<InsightTaskRef> = {}): InsightTaskRef => ({
@@ -130,28 +131,34 @@ export async function organizationInsights(store: Store, organizationId: string,
   totals.medianShipMs = median(shipDurations);
   previous.medianShipMs = median(previousShipDurations);
 
-  // Agent turns: one admission per turn; duration includes any host-slot wait.
+  // Agent turns: one admission per turn; duration includes any host-slot wait. A
+  // turn's token reading is keyed by its admission id; a turn without one is
+  // unreported (never "used 0 tokens").
+  const metered = new Set(rows.tokens.map((row) => row.id.replace(/^usage:tokens:/, '')));
   for (const admission of rows.admissions) {
     const seconds = Math.max(0, ((admission.releasedAt ?? now) - admission.createdAt) / 1000);
     const failed = admission.state === 'released';
+    const reported = metered.has(admission.id);
     if (inWindow(admission.createdAt)) {
-      totals.turns++; totals.agentSeconds += seconds; if (failed) totals.failedTurns++;
+      totals.turns++; totals.agentSeconds += seconds; if (failed) totals.failedTurns++; if (reported) totals.meteredTurns++;
       const day = daily[bucket(admission.createdAt)]!;
       day.turns++; day.agentSeconds += seconds;
       const model = modelEntry(admission.model ?? '', admission.provider);
-      model.turns++; model.agentSeconds += seconds; if (failed) model.failedTurns++;
+      model.turns++; model.agentSeconds += seconds; if (failed) model.failedTurns++; if (reported) model.meteredTurns++;
       const project = perProject.get(admission.projectId);
       if (project) { project.turns++; project.agentSeconds += seconds; }
     } else if (inPrevious(admission.createdAt)) {
-      previous.turns++; previous.agentSeconds += seconds; if (failed) previous.failedTurns++;
+      previous.turns++; previous.agentSeconds += seconds; if (failed) previous.failedTurns++; if (reported) previous.meteredTurns++;
     }
   }
 
-  // Tokens: provider-reported per turn.
+  // Tokens: provider-reported per turn. Input is everything but output, so it is
+  // measured alike for every provider: Anthropic's inputTokens excludes cache
+  // reads/writes (usually most of the total), OpenAI's already includes them.
   for (const row of rows.tokens) {
     const metadata = parseJson(row.metadata);
-    const input = Number(metadata.inputTokens ?? 0);
-    const output = Number(metadata.outputTokens ?? 0);
+    const output = Math.min(row.quantity, Number(metadata.outputTokens ?? 0));
+    const input = row.quantity - output;
     if (inWindow(row.startedAt)) {
       totals.tokens += row.quantity; totals.inputTokens += input; totals.outputTokens += output;
       const day = daily[bucket(row.startedAt)]!;
@@ -194,7 +201,8 @@ export async function organizationInsights(store: Store, organizationId: string,
   const result: OrganizationInsights = {
     days, from, to: now, utcOffsetMinutes: offset / 60_000,
     totals, previous, daily,
-    models: [...perModel.values()].sort((a, b) => b.tokens - a.tokens || b.turns - a.turns),
+    // Ranked by work done: tokens are missing for unreported turns, turns never are.
+    models: [...perModel.values()].sort((a, b) => b.turns - a.turns || b.tokens - a.tokens),
     projects: [...perProject.values()]
       .filter((project) => project.shipped || project.open || project.turns || project.tokens)
       .sort((a, b) => b.shipped - a.shipped || b.agentSeconds - a.agentSeconds || b.open - a.open),

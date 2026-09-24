@@ -1066,9 +1066,12 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
-function forkBranchDefaults(task) {
+// Where a fork starts: the source's unpublished branch, or where the source
+// lands once it has landed — or will have, because the fork waits for it
+// (`awaited`, mirroring prepareForkWorld in src/platform/api.ts).
+function forkBranchDefaults(task, awaited = false) {
   const view = task?.lastView || task;
-  const base = view?.status === 'done' ? view.targetBranch || task?.params?.target : view?.branch;
+  const base = view?.status === 'done' || awaited ? view?.targetBranch || task?.params?.target : view?.branch;
   return base ? { base } : {};
 }
 
@@ -1076,11 +1079,24 @@ function prefillForkBranch(box, task) {
   if (!['do', 'unified'].includes(box.dataset.agent)) return;
   const root = box.closest('#tf-body');
   const input = root?.querySelector('[data-field="base"]');
-  const base = forkBranchDefaults(task).base;
+  const base = forkBranchDefaults(task, selectedDepIds().includes(task.id)).base;
   if (!input || !base || (task.projectId && task.projectId !== S.projectId)) return;
   input.value = base;
   input.dispatchEvent(new Event('change', { bubbles: true }));
   showForkWorldHelp(root);
+}
+
+// Adding (or dropping) the fork source as a dependency moves the base branch
+// to where the fork will now start — unless the user already chose one.
+function retargetForkBase(root, task, awaited) {
+  const input = root?.querySelector('[data-field="base"]');
+  if (!input || !task) return;
+  const fallback = JSON.parse(input.dataset.inherit || 'null') ?? '';
+  const from = forkBranchDefaults(task, !awaited).base ?? fallback;
+  const to = forkBranchDefaults(task, awaited).base ?? fallback;
+  if (from === to || input.value !== from) return;
+  input.value = to;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function showForkWorldHelp(root) {
@@ -1113,7 +1129,7 @@ function resumeChosenInner(rf, task) {
     ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
-    : ''}`;
+    : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
 }
 
 // The grants a task ended with, in the task form's own vocabulary: its stored
@@ -1919,13 +1935,65 @@ function wireAgentBox(box) {
     if (!grants) return;
     box.dispatchEvent(new CustomEvent('af-reauthorize', { bubbles: true, detail: { taskId: task.id, enabled: on, ...grants } }));
   };
-  // Dropping the source also withdraws the grants it brought along.
+  // Reuse fills the ordinary fields, so task creation and parameter editing
+  // persist the same AgentSpec as a manual selection. Keep the previous values
+  // only until the source is withdrawn or the user customizes these controls.
+  let modelStash = null;
+  let modelRequest = 0;
+  const modelSelection = () => ({
+    avatarId: avatarSelect?.value || '',
+    provider: providerOf(),
+    model: box.querySelector('.af-model').value,
+    effort: box.querySelector('.af-effort').value,
+  });
+  const applyModelSelection = (spec) => {
+    if (avatarSelect) avatarSelect.value = spec.avatarId || '';
+    box.querySelector('.af-provider').value = spec.provider;
+    box.querySelector('.af-model').value = spec.model || '';
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+    box.querySelector('.af-effort').value = spec.effort || '';
+    syncAvatar();
+  };
+  const withdrawModel = () => {
+    modelRequest++;
+    if (modelStash) applyModelSelection(modelStash);
+    modelStash = null;
+  };
+  const reuseModel = async (option) => {
+    if (!option.checked) { withdrawModel(); return; }
+    const request = ++modelRequest;
+    try {
+      const rf = JSON.parse(chosen.dataset.resume);
+      const session = chosen._sourceSession || (await api(`/api/tasks/${encodeURIComponent(rf.taskId)}/sessions?metadata=1`))[rf.role || 'do'];
+      if (request !== modelRequest || !option.checked) return;
+      if (!session?.provider || !AGENT_PROVIDERS.includes(session.provider)) throw new Error('The source agent’s model settings are unavailable.');
+      modelStash = modelStash || modelSelection();
+      applyModelSelection(session);
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      if (request !== modelRequest) return;
+      option.checked = false;
+      toast(error.message, true);
+    }
+  };
+  const releaseModel = (event) => {
+    if (!event.target.matches('.af-provider, .af-model, .af-effort, .af-avatar')) return;
+    modelRequest++;
+    modelStash = null;
+    const option = chosen?.querySelector('.af-resume-reuse-model');
+    if (option) option.checked = false;
+  };
+  box.addEventListener('input', releaseModel);
+  box.addEventListener('change', releaseModel);
+  // Dropping the source also withdraws the grants and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
   };
   const clearTask = () => {
     if (!chosen) return;
     withdrawReauthorize();
+    withdrawModel();
+    chosen._sourceSession = undefined;
     chosen.dataset.resume = 'null';
     chosen.innerHTML = '';
   };
@@ -1934,13 +2002,15 @@ function wireAgentBox(box) {
     uploaded.dataset.upload = 'null';
     uploaded.innerHTML = '';
   };
-  const setResume = (rf, task) => {
+  const setResume = (rf, task, session) => {
     if (!chosen) return;
     if (rf) {
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
     withdrawReauthorize();
+    withdrawModel();
+    chosen._sourceSession = rf ? session : undefined;
     chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
@@ -1952,6 +2022,8 @@ function wireAgentBox(box) {
   chosen?.addEventListener('change', (e) => {
     const option = e.target.closest?.('.af-resume-reauthorize');
     if (option) announceReauthorize(option.checked);
+    const modelOption = e.target.closest?.('.af-resume-reuse-model');
+    if (modelOption) reuseModel(modelOption);
   });
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
@@ -1970,7 +2042,7 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
   sessionInput?.addEventListener('input', () => {
@@ -5727,7 +5799,20 @@ function wireDepPicker(values, selfId) {
   if (!box || !btn) return;
   const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
   const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
+  const root = box.closest('#tf-body');
+  // The task the do agent forks from, if any (an archived one only rides on the chip).
+  const forkSource = () => {
+    const chosen = root?.querySelector('.agent-field[data-agent="do"] .af-resume-chosen, .agent-field[data-agent="unified"] .af-resume-chosen');
+    const id = (() => { try { return JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { return undefined; } })();
+    if (!id || id === selfId) return null;
+    return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || (S.tasks || []).find((t) => t.id === id) || null;
+  };
   const paint = (ids, changed) => {
+    if (changed) {
+      const before = selectedDepIds();
+      const source = forkSource();
+      if (source && before.includes(source.id) !== ids.includes(source.id)) retargetForkBase(root, source, ids.includes(source.id));
+    }
     box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id))).join('');
     box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
     if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
@@ -5742,7 +5827,6 @@ function wireDepPicker(values, selfId) {
   );
   // Both fork entry points use this form. The checkbox is another view of the
   // ordinary dependency selection, so drafts and manual picker edits stay in sync.
-  const root = box.closest('#tf-body');
   if (root) {
     root.dataset.dependencyHost = '';
     root._syncForkDependencies = () => {
@@ -11382,8 +11466,11 @@ function insDelta(current, previous, days, better) {
 // Stable identity colors for models: the top three by tokens in the period take
 // the categorical slots, everything else is "Other". One mapping feeds the chart
 // and the model list so a model keeps its color everywhere on the page.
+function insightTopTokenModels(models) {
+  return models.filter((model) => model.tokens > 0).sort((a, b) => b.tokens - a.tokens).slice(0, 3).map((model) => model.model);
+}
 function insightModelColors(models) {
-  const ranked = [...models].filter((model) => model.tokens > 0).slice(0, 3).map((model) => model.model);
+  const ranked = insightTopTokenModels(models);
   return (model) => { const i = ranked.indexOf(model); return i < 0 ? 'var(--viz-other)' : `var(--viz-${i + 1})`; };
 }
 
@@ -11452,8 +11539,9 @@ function insightKpisHtml(data) {
     ${tile('Time to ship', 'Median time from creating a task to done', insDuration(t.medianShipMs), insDelta(t.medianShipMs, p.medianShipMs, days, 'down'))}
     ${tile('Agent time', 'Time agents spent on turns', insDuration(t.agentSeconds * 1000), insDelta(t.agentSeconds, p.agentSeconds, days),
       t.turns ? `${insNum(t.turns)} turns${failPct ? ` · ${failPct}% failed` : ''}` : '')}
-    ${tile('Tokens', 'Model tokens reported by providers', insNum(t.tokens), insDelta(t.tokens, p.tokens, days),
-      t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
+    ${tile('Tokens', 'Model tokens reported by providers', t.meteredTurns || !t.turns ? insNum(t.tokens) : '—', insDelta(t.tokens, p.tokens, days),
+      t.meteredTurns < t.turns ? `reported for ${insNum(t.meteredTurns)} of ${insNum(t.turns)} turns`
+        : t.tokens ? `${insNum(t.inputTokens)} in · ${insNum(t.outputTokens)} out` : '')}
     ${spend ? tile('Spend', 'Metered model and sandbox cost plus card purchases by agents (USD)', insMoney(t.spendMicros), insDelta(t.spendMicros, p.spendMicros, days),
       spend.cardMicros ? `${insMoney(spend.cardMicros)} on cards` : '') : ''}
   </div>`;
@@ -11466,7 +11554,7 @@ function insightSeries(data, lens) {
   if (lens === 'time') return { unit: 'h', bars: [{ label: 'Agent hours', color: 'var(--accent)', values: daily.map((d) => d.agentSeconds / 3600) }] };
   if (lens === 'tokens') {
     const color = insightModelColors(data.models);
-    const top = data.models.filter((model) => model.tokens > 0).slice(0, 3).map((model) => model.model);
+    const top = insightTopTokenModels(data.models);
     const bars = top.map((model) => ({ label: model, color: color(model), values: daily.map((d) => d.tokensByModel[model] || 0) }));
     const other = daily.map((d) => Object.entries(d.tokensByModel).reduce((sum, [model, n]) => sum + (top.includes(model) ? 0 : n), 0));
     if (other.some(Boolean)) bars.push({ label: 'Other', color: 'var(--viz-other)', values: other });
@@ -11597,13 +11685,17 @@ function insightModelsHtml(data) {
   const models = data.models.filter((model) => model.turns || model.tokens);
   if (!models.length) return `<div class="ins-empty">No agent turns yet</div>`;
   const color = insightModelColors(data.models);
-  const total = models.reduce((sum, model) => sum + model.tokens, 0) || 1;
+  // Share of agent time: known for every turn, unlike tokens.
+  const total = models.reduce((sum, model) => sum + model.agentSeconds, 0) || 1;
+  const tokens = (model) => !model.meteredTurns ? `<span class="ins-unreported" title="Not reported for these turns">—</span>`
+    : model.meteredTurns < model.turns ? `<span title="Reported for ${model.meteredTurns} of ${model.turns} turns">≥${insNum(model.tokens)}</span>`
+    : insNum(model.tokens);
   return `<table class="ins-table"><thead><tr><th>Model</th><th class="num">Tokens</th><th class="num">Turns</th><th class="num" title="Turns that ended in an error">Failed</th></tr></thead><tbody>${models.slice(0, 8).map((model) => {
-    const share = Math.round((model.tokens / total) * 100);
+    const share = Math.round((model.agentSeconds / total) * 100);
     return `<tr>
       <td class="ins-name"><span class="ins-model" title="${esc(model.provider)}">${esc(model.model)}</span>
-        <span class="ins-share" title="${share}% of tokens"><i style="width:${share}%;background:${color(model.model)}"></i></span></td>
-      <td class="num">${insNum(model.tokens)}</td><td class="num">${model.turns}</td>
+        <span class="ins-share" title="${share}% of agent time"><i style="width:${share}%;background:${color(model.model)}"></i></span></td>
+      <td class="num">${tokens(model)}</td><td class="num">${model.turns}</td>
       <td class="num">${model.turns ? `${Math.round((model.failedTurns / model.turns) * 100)}%` : '—'}</td>
     </tr>`;
   }).join('')}</tbody></table>`;
@@ -14403,21 +14495,41 @@ async function wirePaidLaunchCard() {
   catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
   const contacts = state.contacts || {};
   const stripe = state.stripe || {};
+  const paddle = state.paddle || {};
   const completed = new Set(state.completedTasks || []);
   const groups = [...new Set((state.tasks || []).map((task) => task.group))];
   const readiness = state.paidLaunch
     ? '<span class="chip" style="color:var(--ok,#4ec9a3)">paid checkout live</span>'
     : state.canEnable ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready to enable</span>'
       : '<span class="chip">setup incomplete</span>';
-  const missing = [...(state.missing || []), ...(stripe.missing || [])];
+  const missing = [...(state.missing || []), ...(state.billingMissing || stripe.missing || [])];
   const taskMarkup = groups.map((group) => `<div class="section-h" style="margin-top:18px">${esc(group)}</div>${(state.tasks || [])
     .filter((task) => task.group === group).map((task) => `<label class="card" style="display:flex;gap:10px;padding:12px;margin:8px 0;cursor:pointer">
       <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
       <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
   box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
-    <p class="task-sub">This is the control center for selling subscriptions on ${esc(location.host)}. Values are saved with the installation; Stripe secrets are encrypted in the ${siteNameMarkup()} vault and are never returned to the browser. No paid-launch environment variables are required.</p>
+    <p class="task-sub">Subscription settings for ${esc(location.host)}. No paid-launch environment variables are required. Secret keys stay encrypted in the vault.</p>
     ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
-
+    <label class="form-row">Billing provider<select class="paid-billing-provider"><option value="paddle" ${state.billingProvider === 'paddle' ? 'selected' : ''}>Paddle · merchant of record</option><option value="stripe" ${state.billingProvider !== 'paddle' ? 'selected' : ''}>Stripe Billing</option></select></label>
+    <div class="paid-paddle-section" ${state.billingProvider === 'paddle' ? '' : 'hidden'}>
+      <div class="section-h" style="margin-top:18px">Paddle Billing</div>
+      <div class="settings-grid">
+        <label class="form-row">Environment<select class="paid-paddle-environment"><option value="sandbox" ${paddle.environment === 'sandbox' ? 'selected' : ''}>Sandbox</option><option value="live" ${paddle.environment !== 'sandbox' ? 'selected' : ''}>Live</option></select></label>
+        <label class="form-row">API key<input class="paid-paddle-api-key" type="password" autocomplete="new-password" placeholder="${paddle.secretKeyConfigured ? 'Configured — leave blank to keep' : 'pdl_…_apikey_…'}" /></label>
+      </div>
+      <button type="button" class="btn paid-paddle-provision" ${state.canManage && paddle.secretKeyConfigured ? '' : 'disabled'} title="Save the API key first. Creates or reuses products, monthly prices, a client token and a signed webhook. Does not enable checkout.">Set up Paddle automatically</button>
+      <details style="margin-top:12px"><summary>Integration details</summary><div class="settings-grid">
+        <label class="form-row">Client-side token<input class="paid-paddle-client-token" value="${esc(paddle.clientToken || '')}" /></label>
+        <label class="form-row">Webhook secret<input class="paid-paddle-webhook" type="password" autocomplete="new-password" placeholder="${paddle.webhookSecretConfigured ? 'Configured — leave blank to keep' : 'pdl_ntfset_…'}" /></label>
+        <label class="form-row">Individual $9 price<input class="paid-paddle-individual-price" value="${esc(paddle.individualPriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Team $19 base price<input class="paid-paddle-team-base-price" value="${esc(paddle.teamBasePriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Additional user $5 price<input class="paid-paddle-team-seat-price" value="${esc(paddle.teamSeatPriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Default payment link<input value="${esc(paddle.checkoutUrl || '')}" readonly /></label>
+        <label class="form-row">Webhook destination<input value="${esc(paddle.webhookUrl || '')}" readonly /></label>
+      </div></details>
+      <p class="task-sub">Paddle must approve your identity and checkout domain before going live.</p>
+    </div>
+    <div class="paid-stripe-section" ${state.billingProvider === 'paddle' ? 'hidden' : ''}>
     <div class="section-h" style="margin-top:18px">Stripe Billing</div>
     <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. ${siteNameMarkup()} uses hosted Stripe Checkout, so it does not need a publishable key.</p>
     <ol class="task-sub"><li>Create the live recurring products/prices described in the founder checklist below.</li><li>In Stripe Workbench, create a snapshot webhook destination at <span class="mono">${esc(stripe.webhookUrl || '')}</span>, select API version <span class="mono">${esc(stripe.apiVersion || '')}</span>, and subscribe to: <span class="mono">${esc((stripe.webhookEvents || []).join(', '))}</span>.</li><li>Paste the live secret key, webhook signing secret, and IDs here. Blank secret fields keep the encrypted values already saved.</li><li>Configure and test the Stripe customer portal, then exercise the full lifecycle in test mode before enabling checkout.</li></ol>
@@ -14431,11 +14543,12 @@ async function wirePaidLaunchCard() {
       <label class="form-row">Team product ID (optional)<input class="paid-stripe-team-product" value="${esc(stripe.teamProductId || '')}" placeholder="prod_…" /></label>
       <label class="form-row">Webhook destination<input value="${esc(stripe.webhookUrl || '')}" readonly /></label>
     </div>
+    </div>
 
     <div class="section-h" style="margin-top:18px">Legal operator and public contacts</div>
     <p class="task-sub">Use the contracting entity’s exact details. These values populate public policies and support/deletion flows. Ask qualified counsel to review the supplied policy drafts for the business, jurisdiction, data flows, and customers.</p>
     <div class="settings-grid">
-      <label class="form-row">Legal entity name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" /></label>
+      <label class="form-row">Legal operator name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" title="Your legal name as a sole trader, or the registered company name." /></label>
       <label class="form-row">Country of establishment<input class="paid-operator-country" value="${esc(state.operatorCountry || '')}" /></label>
       <label class="form-row">Governing law and courts<input class="paid-governing-law" value="${esc(state.governingLaw || '')}" placeholder="e.g. laws of …; courts of …" /></label>
       <label class="form-row">Legal notice address<textarea class="paid-legal-address" rows="3">${esc(state.legalNoticeAddress || '')}</textarea></label>
@@ -14453,13 +14566,23 @@ async function wirePaidLaunchCard() {
     ${taskMarkup}
 
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
-      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Only turn this on after the legal and Stripe configuration is complete. Disabling it immediately closes new paid checkout without deleting subscriptions or settings.</span></span></label>
+      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
     <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
   box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
     try {
       await api('/api/settings/paid-launch', { method: 'PUT', body: JSON.stringify({
+        billingProvider: box.querySelector('.paid-billing-provider').value,
+        paddle: {
+          environment: box.querySelector('.paid-paddle-environment').value,
+          apiKey: box.querySelector('.paid-paddle-api-key').value || undefined,
+          webhookSecret: box.querySelector('.paid-paddle-webhook').value || undefined,
+          clientToken: box.querySelector('.paid-paddle-client-token').value,
+          individualPriceId: box.querySelector('.paid-paddle-individual-price').value,
+          teamBasePriceId: box.querySelector('.paid-paddle-team-base-price').value,
+          teamSeatPriceId: box.querySelector('.paid-paddle-team-seat-price').value,
+        },
         paidLaunch: box.querySelector('.paid-launch-enabled').checked,
         founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
         operatorName: box.querySelector('.paid-operator-name').value,
@@ -14489,6 +14612,25 @@ async function wirePaidLaunchCard() {
       S.launch = await api('/api/launch');
       await wirePaidLaunchCard();
     } catch (error) { toast(error.message, true); await wirePaidLaunchCard(); }
+  });
+  box.querySelector('.paid-billing-provider').addEventListener('change', (event) => {
+    box.querySelector('.paid-paddle-section').hidden = event.target.value !== 'paddle';
+    box.querySelector('.paid-stripe-section').hidden = event.target.value === 'paddle';
+    box.querySelector('.paid-launch-enabled').checked = false;
+  });
+  box.querySelector('.paid-paddle-environment').addEventListener('change', () => {
+    for (const field of ['client-token', 'webhook', 'api-key', 'individual-price', 'team-base-price', 'team-seat-price'])
+      box.querySelector(`.paid-paddle-${field}`).value = '';
+    box.querySelector('.paid-launch-enabled').checked = false;
+    box.querySelector('.paid-paddle-provision').disabled = true;
+  });
+  box.querySelector('.paid-paddle-provision')?.addEventListener('click', async (event) => {
+    event.target.disabled = true;
+    try {
+      await api('/api/settings/paid-launch/paddle/provision', { method: 'POST', body: '{}' });
+      toast('Paddle integration configured. Complete domain and identity review in Paddle.');
+    } catch (error) { toast(error.message, true); }
+    await wirePaidLaunchCard();
   });
 }
 // ── card fields ──────────────────────────────────────────────────────────────
@@ -17254,10 +17396,10 @@ async function hydrateOrganizationSubscription(organizationId) {
     ? ` Access continues through ${new Date(state.graceEndsAt).toLocaleDateString()}.` : '';
   const checkoutReturn = new URLSearchParams(location.search).get('billing');
   const checkoutNotice = checkoutReturn === 'success'
-    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for Stripe’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
+    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for the billing provider’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
     : checkoutReturn === 'canceled'
       ? '<div class="card" style="margin:12px 0;padding:12px"><b>Checkout canceled</b><p class="task-sub">No plan change was applied.</p></div>' : '';
-  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until Stripe confirms payment.')}${esc(grace)}</p></div>` : '';
+  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until payment is confirmed.')}${esc(grace)}</p></div>` : '';
   const individual = catalog.individual || {};
   const team = catalog.team || {};
   const ownerDisabled = state.canManage ? '' : 'disabled title="Only an organization owner can administer this subscription"';
@@ -17293,6 +17435,8 @@ async function hydrateOrganizationSubscription(organizationId) {
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
     ${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
     ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
+    ${state.pendingRequest ? `<p class="task-sub">A billing request is pending confirmation. Wait a minute, then check its result before retrying. <button class="btn sm billing-reconcile" ${ownerDisabled}>Check pending billing request</button></p>` : ''}
+    ${state.pendingCheckout && !hasSubscription ? `<p class="task-sub">An unpaid checkout is open. <button class="btn sm billing-cancel-checkout" ${ownerDisabled}>Cancel pending checkout</button></p>` : ''}
     ${!state.gift || hasSubscription ? `<p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Paid plan and seat changes take effect after billing confirmation. ${policyLinks(['billing'])}</p>` : ''}`;
   const saveGift = async (plan, button) => {
     button.disabled = true;
@@ -17336,23 +17480,40 @@ async function hydrateOrganizationSubscription(organizationId) {
   });
   box.querySelector('.billing-change')?.addEventListener('click', async (event) => {
     const plan = event.currentTarget.dataset.plan;
-    if (!confirm(`Change this organization to ${names[plan]}? Stripe will prorate the current billing period.`)) return;
+    if (!confirm(`Change this organization to ${names[plan]}? The billing provider will prorate the current billing period.`)) return;
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/change`, {
       method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
-    }); toast('Plan change submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    }); toast('Plan change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
     catch (error) { toast(error.message, true); }
   });
   box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
     if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
       method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
-    }); toast('Cancellation submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    }); toast('Cancellation submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
     catch (error) { toast(error.message, true); }
   });
   box.querySelector('.billing-sync')?.addEventListener('click', async () => {
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/sync-seats`, {
       method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
     }); toast('Seat reconciliation submitted.'); } catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-reconcile')?.addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/reconcile`, { method: 'POST' });
+      toast(result.reconciled ? 'Billing result confirmed. You can continue.' : 'Result still uncertain. Contact billing support; no payment has been retried.', !result.reconciled);
+      await hydrateOrganizationSubscription(organizationId);
+    } catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-cancel-checkout')?.addEventListener('click', async () => {
+    if (!confirm('Cancel the unpaid checkout? Its existing payment link will stop working.')) return;
+    try {
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+      });
+      toast('Pending checkout canceled.');
+      await hydrateOrganizationSubscription(organizationId);
+    } catch (error) { toast(error.message, true); }
   });
 }
 
@@ -18742,7 +18903,7 @@ function renderPricing() {
     <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
       <div class="pricing-grid">${cards}</div>
-      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Payments are non-refundable except where law requires or checkout expressly states otherwise.</p>
+      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Refunds are subject to applicable law and the payment provider’s buyer terms. Request refunds through billing support or the payment provider.</p>
       ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
       <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>${legalFooter()}</div>`;
   window.onpopstate = () => boot();
