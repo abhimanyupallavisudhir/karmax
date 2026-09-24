@@ -144,10 +144,18 @@ describe('finalizeMerge (work must actually land)', () => {
     await world.destroy();
   });
 
-  it('still lands work and reports files when the configured base branch does not exist', async () => {
+  it.each(['corrected', 'legacy'])('lands work and reports files after a missing base (%s metadata)', async (metadata) => {
     const provider = new WorktreeProvider(home);
-    // base "develop" is not a ref — world creation forks off HEAD instead.
+    // Setup now resolves the missing base and reports the correction immediately.
     const world = await provider.create({ taskId: 'nobase1', repo, base: 'develop', target: 'main' });
+    expect(world.handle).toMatchObject({ base: 'main', target: 'main' });
+    expect(world.handle.warnings?.join('\n')).toContain('Base branch changed to "main" because "develop" did not exist');
+    expect(world.handle.repos![0]).toMatchObject({ base: 'main', target: 'main' });
+    if (metadata === 'legacy') {
+      // Persisted worlds from before setup corrections still need the merge fallback.
+      world.handle.base = world.handle.repos![0]!.base = 'develop';
+      delete world.handle.repos![0]!.branchAdjustment;
+    }
     await world.writeFile('factorial.js', 'export const f = (n) => (n <= 1 ? 1 : n * f(n - 1));\n');
     await git(world.handle.root, ['add', '-A']);
     await git(world.handle.root, ['commit', '-q', '-m', 'work']);
@@ -156,23 +164,30 @@ describe('finalizeMerge (work must actually land)', () => {
     expect(res.merged).toBe(true);
     // The landed-files report must not be silently blanked by a failed base diff.
     expect(res.landedFiles).toContain('factorial.js');
-    // The misconfiguration is surfaced rather than swallowed.
-    expect(res.note).toMatch(/base "develop" not found/);
+    if (metadata === 'legacy') expect(res.note).toMatch(/base "develop" not found/);
+    else {
+      expect(res.note).toBeUndefined();
+      expect(res.landedFiles).toEqual(['factorial.js']);
+    }
     const onMain = await git(repo, ['show', 'main:factorial.js']);
     expect(onMain.stdout).toContain('export const f');
     await world.destroy();
   });
 
-  it('still catches committed conflict markers when the configured base branch does not exist', async () => {
+  it.each(['corrected', 'legacy'])('rejects committed conflict markers after a missing base (%s metadata)', async (metadata) => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'nobase2', repo, base: 'develop', target: 'main' });
+    if (metadata === 'legacy') {
+      world.handle.base = world.handle.repos![0]!.base = 'develop';
+      delete world.handle.repos![0]!.branchAdjustment;
+    }
     // an agent "resolved" a conflict by committing the markers as content
     await world.writeFile('index.js', '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n');
     await git(world.handle.root, ['add', '-A']);
     await git(world.handle.root, ['commit', '-q', '-m', 'bad resolution']);
 
     const res = await finalizeMerge(world, 'main');
-    // The marker guard must still run even though the base ref is unresolvable.
+    // Both corrected checkouts and historical unresolved bases retain the marker guard.
     expect(res.merged).toBe(false);
     expect(res.conflict).toContain('index.js');
     const onMain = await git(repo, ['show', 'main:index.js']);
