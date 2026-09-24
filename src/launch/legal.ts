@@ -1,7 +1,7 @@
 /**
  * Launch-policy source of truth.
  *
- * This copy is an initial founder-reviewed launch draft, not legal advice. Keep
+ * This copy is a launch draft pending operator approval, not legal advice. Keep
  * the version beside the text: acceptance evidence is useful only when it can be
  * tied to the exact disclosure a person saw.
  */
@@ -9,7 +9,7 @@ import { HOSTED_PLANS } from '../domain/entitlements.js';
 
 export const POLICY_VERSION = '2026-09-24';
 export const POLICY_EFFECTIVE_DATE = 'September 24, 2026';
-export const POLICY_DRAFT_NOTICE = 'Initial founder-reviewed launch draft — not legal advice. Counsel review remains required before final publication.';
+export const POLICY_DRAFT_NOTICE = 'Launch draft pending final operator approval — not legal advice or a statement of completed legal review.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
 export type AcceptanceContext = 'signup' | 'checkout';
@@ -45,6 +45,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       ] },
       { heading: 'Disclaimers and unresolved legal terms', paragraphs: [
         'To the extent permitted by the law selected in the completed launch configuration, the service is provided as available and without promises not expressly made here. No compliance certification is claimed by this draft.',
+        'Nothing in these Terms excludes mandatory consumer rights, liability for fraud or fraudulent misrepresentation, or liability for death or personal injury caused by negligence where that liability cannot lawfully be excluded. Any choice of governing law or courts is subject to the protections and courts available to consumers under mandatory applicable law.',
         'The launch checklist fails closed on the contracting entity, governing law, legal-notice address, contacts, and founder review of this exact version. Billing provider configuration is validated separately by the canonical organization subscription service. This draft does not invent a liability cap or dispute forum; qualified counsel should decide whether the final terms require those or other additions, which must ship as a new version.',
       ] },
     ],
@@ -77,6 +78,14 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Customer workspace data: repository files and metadata, prompts, tasks, messages, outputs, environment state, attachments, connected-service data, and audit events.',
       ] },
       { heading: 'How data is used', paragraphs: ['Data is used to provide and secure the service, execute customer instructions, authenticate users, administer subscriptions, respond to support and legal requests, prevent abuse, and maintain reliable operations. This draft does not authorize selling personal data or using private customer repository/workspace content to train general-purpose models.'] },
+      { heading: 'Lawful bases and required information', paragraphs: [
+        'Where the operator acts as controller under UK data protection law, account administration and providing a service you request rely on performance of a contract or steps you ask us to take before a contract. Tax, accounting and responses to binding legal requirements rely on compliance with legal obligations.',
+        'Security, fraud prevention, service reliability and administration of business-customer contacts rely on legitimate interests in protecting the service and communicating with customers, balanced against individuals’ rights. Where an activity instead requires consent, we must ask separately before starting it; accepting these Terms or this Privacy Policy is not blanket consent to optional tracking or marketing.',
+        'Authentication and necessary account or billing information are required to provide the corresponding service. If you do not provide them, we may be unable to create your account, supply a paid subscription or resolve a support request. Optional integrations and their credentials are not required unless you choose to use those integrations.',
+      ] },
+      { heading: 'Sources of information', paragraphs: [
+        'We receive information from you, your organization’s administrators and invited members, and the identity, repository, model and other services that you authorize us to connect. Those services may supply profile identifiers, access permissions and the records requested by your tasks. Payment providers supply subscription and transaction status. Service operation also generates security and diagnostic records.',
+      ] },
       { heading: 'Model keys and usage modes', paragraphs: [
         'With bring-your-own-key (BYOK), krmax stores the customer-supplied secret in its encrypted credential system and sends selected prompts, context, and files to the model provider the customer chose. Charges and provider data terms belong to that customer account.',
         'With a customer-connected OpenAI, Anthropic, or other subscription login, krmax operates the provider client under that customer connection. With managed usage, the operator supplies the provider account and the provider acts as an applicable subprocessor. The UI must identify the active rail; no mode prevents the chosen provider from receiving the content needed for the request.',
@@ -84,6 +93,11 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       { heading: 'Sharing, transfers, and retention', paragraphs: [
         'Data is shared with subprocessors only for the service functions described on the Subprocessor list, with customer-selected integrations, when a customer directs, or when legally required. Providers may process data in the regions described by their own service terms and the applicable DPA.',
         'Retention, export, deletion, and backup behavior are described on Data controls. Contact the configured privacy address for access, correction, portability, objection, restriction, or other applicable privacy requests.',
+      ] },
+      { heading: 'Your rights and complaints', paragraphs: [
+        'Contact the privacy address shown on this page to request access, correction, erasure, restriction or portability where applicable. You may object to processing based on legitimate interests. Where we rely on consent, you may withdraw it at any time without affecting the lawfulness of processing before withdrawal. We may need proportionate information to verify your identity and authority; some rights depend on the purpose and legal basis of processing.',
+        'For personal data controlled by your organization, direct requests to that organization; we assist it under the applicable processing agreement. You can also contact us so we can identify the appropriate route.',
+        'You may complain to the UK Information Commissioner’s Office at https://ico.org.uk/make-a-complaint/ or telephone 0303 123 1113. You do not have to complain to us first. You may also have the right to complain to the supervisory authority where you live or work.',
       ] },
     ],
   },
@@ -134,7 +148,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     sections: [
       { heading: 'Retention', paragraphs: [
         'Active account, project, task, audit, workspace, and billing records are retained while needed to provide and secure the service. Execution worlds may be short-lived or hibernated by their provider; adopted project resources and repository history follow their configured storage and Git retention.',
-        'After account or contract termination, production data is deleted or de-identified on the schedule in the completed DPA/launch configuration, subject to backups, fraud and security records, billing/tax records, legal holds, and data another customer must retain. This draft intentionally states no invented number of days.',
+        'Retention decisions depend on whether an account or project is active, whether records are needed to complete an authorized task or resolve a dispute, statutory accounting requirements, security investigations and legal holds. Information must not be retained merely because storage is available. The operator must document the applicable periods and review retained exceptions.',
+        'Account deletion is an operator-reviewed process, not an automatic purge triggered by subscription cancellation. Backup copies and data held by connected services require separate handling. There is no universal deletion deadline verified for this deployment in this draft; the operator must publish the production and backup deletion schedule before approving it for launch. An offboarding response must identify retained categories, their reason and applicable period rather than promise immediate deletion everywhere.',
       ] },
       { heading: 'Export', paragraphs: ['A signed-in user can download a personal JSON archive from Profile → Your data. Organization administrators can export organization records from Settings. Repository data remains exportable through its repository host; adopted resources should be downloaded before deletion. Contact support for a business offboarding export if the online exports are insufficient.'] },
       { heading: 'Account deletion', paragraphs: [
@@ -271,7 +286,9 @@ export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: 
     pricingCatalog: Object.values(HOSTED_PLANS).map((plan) => ({ ...plan, currency: 'usd' as const,
       billingInterval: 'month' as const })),
     checkoutDisclosures: CHECKOUT_DISCLOSURES,
-    operator: config.paidLaunch && config.ready && config.operatorName ? { name: config.operatorName, country: config.operatorCountry, governingLaw: config.governingLaw,
+    // These are deliberately public operator fields, not private KYC details.
+    // Publishing them must not depend on opening checkout or approving drafts.
+    operator: config.operatorName && config.operatorCountry && config.legalNoticeAddress ? { name: config.operatorName, country: config.operatorCountry, governingLaw: config.governingLaw,
       legalNoticeAddress: config.legalNoticeAddress } : null,
     contacts: config.contacts,
     paidLaunch: config.paidLaunch, ready: config.ready,

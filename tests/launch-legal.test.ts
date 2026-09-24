@@ -84,4 +84,31 @@ describe('paid-launch policies', () => {
         currency: 'usd', billingInterval: 'month' }),
     ]);
   });
+
+  it('publishes configured public operator details without enabling checkout or claiming draft approval', () => {
+    const stored = { paidLaunch: false, operatorName: 'Public Sole Trader', operatorCountry: 'United Kingdom',
+      legalNoticeAddress: 'Approved public correspondence address' };
+    const info = publicLaunchInfo({}, stored, 'Tavya');
+    expect(info).toMatchObject({ paidLaunch: false, ready: false, operator: {
+      name: stored.operatorName, country: stored.operatorCountry, legalNoticeAddress: stored.legalNoticeAddress,
+    } });
+    expect(info.draftNotice).toMatch(/pending final operator approval/);
+    expect(info.draftNotice).not.toMatch(/founder-reviewed/);
+    expect(policyDocument('terms', {}, stored, 'Tavya')?.operator).toEqual(info.operator);
+    expect(publicLaunchInfo({}, { operatorName: 'Incomplete' }).operator).toBeNull();
+    expect(() => assertPaidLaunchReady({}, stored)).toThrow(/not enabled/);
+  });
+
+  it('discloses privacy grounds and complaints without claiming an unverified deletion schedule', () => {
+    const privacy = JSON.stringify(policyDocument('privacy', {}, undefined, 'Tavya'));
+    expect(privacy).toContain('performance of a contract');
+    expect(privacy).toContain('legitimate interests');
+    expect(privacy).toContain('withdraw it at any time');
+    expect(privacy).toContain('https://ico.org.uk/make-a-complaint/');
+    expect(privacy).not.toContain('krmax');
+    const data = JSON.stringify(policyDocument('data'));
+    expect(data).toContain('not an automatic purge');
+    expect(data).toContain('publish the production and backup deletion schedule');
+    expect(JSON.stringify(policyDocument('terms'))).toContain('mandatory consumer rights');
+  });
 });
