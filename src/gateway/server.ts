@@ -1323,10 +1323,11 @@ export class Gateway {
     }
     if (p.startsWith('/share/conversations/')) {
       const share = req.method === 'GET' ? (await publicShare(this.deps.store, p.slice('/share/conversations/'.length))) : undefined;
+      const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
       res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
-        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
-      return void res.end(publicConversationHtml(share));
+        'content-security-policy': "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn }));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);
@@ -1960,7 +1961,15 @@ export class Gateway {
           if (!messages?.length) return this.json(res, 404, { error: 'conversation not found' });
           share = (await createShare(store, taskId, role, messages));
         } else if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
-        return this.json(res, 200, { enabled: policy.effective, url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
+        // Give the dialog an actionable destination for the policy that blocks
+        // sharing. Match the settings endpoint's scope when checking management.
+        const settings = policy.effective ? null : !policy.organization
+          ? { scope: 'organization', id: actualScope.organizationId!, canManage: (await this.deps.tokens.check(token,
+            'organization:edit', { organizationId: actualScope.organizationId })).ok }
+          : { scope: 'project', id: task.projectId, canManage: (await this.deps.tokens.check(token,
+            'project:settings:write', { projectId: task.projectId, organizationId: actualScope.organizationId })).ok };
+        return this.json(res, 200, { enabled: policy.effective, settings,
+          url: share ? `/share/conversations/${share.id}` : null, createdAt: share?.createdAt });
       }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;

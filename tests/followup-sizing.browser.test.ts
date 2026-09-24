@@ -20,6 +20,7 @@ for (const fullscreen of [false, true]) {
       await page.goto('http://followup.test/');
       await page.addStyleTag({ content: fs.readFileSync('web/styles.css', 'utf8') });
       await page.addScriptTag({ content: fs.readFileSync('web/totp-qr.js', 'utf8') });
+      await page.addScriptTag({ content: fs.readFileSync('web/markdown.js', 'utf8') });
       await page.addScriptTag({ content: fs.readFileSync('web/app.js', 'utf8').replace(/^boot\(\)\.catch\(.*$/m, '') });
       await evaluate(page, `
         Object.assign(S, { projects: [{ id: 'project', organizationId: 'org' }], projectId: 'project',
