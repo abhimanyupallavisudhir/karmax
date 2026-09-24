@@ -1,3 +1,4 @@
+import { ProjectResourceService } from '../src/world/resources.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -409,12 +410,14 @@ describe('remote subscription agents', () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const world = fakeWorld(true);
+    const secretEnv = { OPENAI_API_KEY: 'project-key', DATABASE_URL: 'project-db', NODE_OPTIONS: '--invalid-project-option' };
+    const decoratedWorld = await ProjectResourceService.prototype.withEnvironment.call({ environmentFor: async () => secretEnv } as any, world);
     const sessions: string[] = [];
     const platformCalls: string[] = [];
 
     const result = await new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
-      world,
+      world: decoratedWorld, secretEnv,
       messages: [{ id: 'm', role: 'user', text: 'edit the repository', ts: 0 }],
       systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
     } as any, { emit() {}, emitActivity() {}, onSession: (id: string) => sessions.push(id),
@@ -429,6 +432,9 @@ describe('remote subscription agents', () => {
     expect(world.openedPty?.command).toContain('karmax-agent.pid');
     expect(world.openedPty?.command).not.toContain('\u001eKARMAX_AGENT_READY\u001e');
     expect(spawnSync('bash', ['-n', '-c', world.openedPty?.command ?? '']).status).toBe(0);
+    expect(world.openedPty?.env?.DATABASE_URL).toBeUndefined();
+    expect(world.openedPty?.env?.NODE_OPTIONS).not.toBe('--invalid-project-option');
+    expect(world.openedPty?.env?.OPENAI_API_KEY).toBe('');
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
     expect(world.openedPty?.env).toMatchObject({ CODEX_HOME: `/workspace/${remoteHome}` });
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('chatgpt');

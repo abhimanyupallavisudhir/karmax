@@ -18,6 +18,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
 const record = (value) => out && fs.appendFileSync(out, JSON.stringify(value) + '\\n');
 record({ env: {
   KIMI_API_KEY: process.env.KIMI_API_KEY,
+  DATABASE_URL: process.env.DATABASE_URL,
   KIMI_MODEL_API_KEY: process.env.KIMI_MODEL_API_KEY,
   KIMI_MODEL_NAME: process.env.KIMI_MODEL_NAME,
   KIMI_MODEL_BASE_URL: process.env.KIMI_MODEL_BASE_URL,
@@ -40,9 +41,18 @@ const finish = () => {
   } });
   send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: process.env.STUB_STOP_REASON || 'end_turn' } });
 };
-readline.createInterface({ input: process.stdin }).on('line', (line) => {
+readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   const msg = JSON.parse(line);
   record(msg);
+  if (msg.method === 'initialize' && process.env.OPENCODE_CONFIG_CONTENT) {
+    const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+    for (const url of config.plugin || []) {
+      const plugin = await (await import(url)).default();
+      const output = { env: {} };
+      await plugin['shell.env']({}, output);
+      record({ nativeShellEnv: output.env });
+    }
+  }
   if (msg.method === 'initialize') send({ jsonrpc: '2.0', id: msg.id, result: {
     protocolVersion: 1,
     agentCapabilities: {
@@ -90,7 +100,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ jsonrpc: '2.0', id: 901, method: 'terminal/create', params: {
       sessionId: 'session-new',
       command: process.execPath,
-      args: ['-e', 'process.stdout.write("terminal-ok:" + (process.env.KARMAX_CUSTODY_CHAIN || ""))'],
+      args: ['-e', 'process.stdout.write("terminal-ok:" + (process.env.KARMAX_CUSTODY_CHAIN || "") + ":work:" + (process.env.DATABASE_URL || "") + ":" + (process.env.XAI_API_KEY || ""))'],
       outputByteLimit: 1024,
     } });
   } else if (msg.id === 901) {
@@ -122,6 +132,8 @@ describe('generic ACP agent adapter', () => {
   });
 
   async function run(opts: {
+    subscription?: boolean;
+    secretEnv?: Record<string, string>;
     session?: string;
     fork?: boolean;
     image?: boolean;
@@ -155,7 +167,8 @@ describe('generic ACP agent adapter', () => {
       messages: [{ id: 'm', role: 'user', text: 'make it beautiful', ts: 0, ...(image ? { images: [image] } : {}) }],
       systemPrompt: 'Work carefully.',
       role: 'do',
-      resolvedAuth: { apiKey: 'secret-kimi-key', configHome: path.join(dir, 'home') },
+      resolvedAuth: { ...(opts.subscription ? {} : { apiKey: 'secret-kimi-key' }), configHome: path.join(dir, 'home') },
+      secretEnv: opts.secretEnv,
       extraEnv: { KARMAX_TOKEN: 'scoped-token' },
       agentMcp: [{ name: 'extra', command: process.execPath, args: ['server.js'] }],
       ...(opts.session ? { session: opts.session } : {}),
@@ -169,6 +182,25 @@ describe('generic ACP agent adapter', () => {
     const records = fs.readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     return { turn, output, activities, records };
   }
+
+  it('honors a leased subscription over ambient keys while giving terminals their project secrets', async () => {
+    const prior = process.env.XAI_API_KEY;
+    process.env.XAI_API_KEY = 'ambient-wrong-key';
+    try {
+      const { records } = await run({ subscription: true, model: 'xai/grok-4', modelProvider: 'xai',
+        secretEnv: { XAI_API_KEY: 'project-xai', DATABASE_URL: 'project-db' } });
+      const harness = records.find(r => r.env).env;
+      expect(harness.XAI_API_KEY).toBeUndefined();
+      expect(harness.DATABASE_URL).toBeUndefined();
+      expect(records.find(r => r.nativeShellEnv).nativeShellEnv).toEqual({ XAI_API_KEY: 'project-xai', DATABASE_URL: 'project-db' });
+      expect(fs.readdirSync(path.join(dir!, '.karmax-injection/work-env'))).toEqual([]);
+      expect(harness.OPENCODE_CONFIG_CONTENT).not.toContain('project-xai');
+      expect(JSON.parse(harness.OPENCODE_CONFIG_CONTENT).provider).toBeUndefined();
+      expect(records.find(r => r.id === 903).result.output).toContain(':work:project-db:project-xai');
+    } finally {
+      if (prior === undefined) delete process.env.XAI_API_KEY; else process.env.XAI_API_KEY = prior;
+    }
+  });
 
   it('negotiates ACP, configures the advertised model/effort, passes MCP, and verifies end_turn', async () => {
     const { turn, output, activities, records } = await run({ image: true });
@@ -215,7 +247,7 @@ describe('generic ACP agent adapter', () => {
       exitStatus: { exitCode: 0 },
     });
     const env = records[0].env;
-    expect(terminalResult.output).toMatch(new RegExp(`^terminal-ok:${env.KARMAX_CUSTODY_CHAIN},[0-9a-f-]{36}$`, 'i'));
+    expect(terminalResult.output).toMatch(new RegExp(`^terminal-ok:${env.KARMAX_CUSTODY_CHAIN},[0-9a-f-]{36}:work::$`, 'i'));
     expect(env.KIMI_API_KEY).toBe('secret-kimi-key');
     expect(env.XDG_DATA_HOME).toContain('/home/data');
     expect(env.KARMAX_CUSTODY_CHAIN).toMatch(/[0-9a-f-]{36}$/i);

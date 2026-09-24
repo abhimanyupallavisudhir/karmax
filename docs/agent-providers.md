@@ -103,6 +103,33 @@ prompt.
 API-key namespaces include Kimi, xAI, Google, OpenAI,
 Anthropic, Moonshot AI, OpenRouter, Groq, Mistral, and DeepSeek.
 
+Project resources and granted vault environment secrets belong to **work
+commands**, not to the coding harness's runtime. Adding `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `CODEX_API_KEY`, `NODE_OPTIONS`, or any other project variable
+cannot change Tavya's model authentication or process startup. They remain
+available under their original names to the agent's shell commands, including
+application builds and tests.
+
+The separation covers Claude SDK SessionStart shell hooks, Codex app-server
+thread shell policy (start/resume/fork), the legacy Codex exec profile, OpenCode's
+native `shell.env` plugin and ACP terminals, and the direct API adapters' Bash
+tool. Remote harness bootstrap/spawn bypasses the project's environment wrapper;
+work tools keep it. Private temporary export/plugin/profile files are removed
+at turn end; project secret values are not put in process arguments.
+
+Credentials/Logins order determines the first enabled, compatible, available
+account. A login before an API credential prefers the subscription; reversing
+the enabled order prefers metered API access. A task/project override can change
+the effective order, and unavailable accounts may fall through to the next
+eligible entry. Project secrets do not participate in this selection.
+
+Standalone Claude Code does prefer `ANTHROPIC_API_KEY` from its environment over
+a saved subscription. Tavya prevents that ambient override after selecting a
+login. An explicitly selected API credential still uses the metered adapter.
+
+References: [Claude SessionStart environment hooks](https://code.claude.com/docs/en/hooks#sessionstart),
+[OpenCode shell environment hooks](https://opencode.ai/docs/plugins/).
+
 For the requested Kimi design workflow, use:
 
 - **OpenCode harness + Kimi Code API key:**

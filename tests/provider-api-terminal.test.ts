@@ -15,6 +15,33 @@ const ctx: any = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('metered provider API terminal outcomes', () => {
+  it.each(['claude', 'codex'] as const)('%s keeps the selected API credential while delivering application secrets to Bash', async (provider) => {
+    const secretEnv = { ANTHROPIC_API_KEY: 'project-anthropic', OPENAI_API_KEY: 'project-openai', DATABASE_URL: 'project-db' };
+    const exec = vi.fn().mockResolvedValue({ code: 0, stdout: 'work complete', stderr: '' });
+    const responses = provider === 'claude' ? [
+      { content: [{ type: 'tool_use', id: 't', name: 'bash', input: { command: 'app-test' } }], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+    ] : [
+      { id: 'r1', status: 'completed', output: [{ type: 'function_call', call_id: 't', name: 'bash', arguments: JSON.stringify({ command: 'app-test' }) }] },
+      { id: 'r2', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'done' }] }] },
+    ];
+    const request = vi.fn().mockImplementation(async () => ({ ok: true, json: async () => responses.shift() }));
+    vi.stubGlobal('fetch', request);
+    const adapter = provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
+    const result = await adapter.runTurn({
+      profile: { id: 'p', name: 'api', provider, role: 'do', capabilities: [] },
+      world: { ...world, exec }, messages, systemPrompt: 'Do it.', role: 'do',
+      resolvedAuth: { apiKey: 'selected-model-key' }, secretEnv,
+    } as any, ctx);
+    expect(result.output).toBe('done');
+    expect(exec).toHaveBeenCalledWith('bash', ['-lc', 'app-test'], expect.objectContaining({ env: secretEnv }));
+    expect(request).toHaveBeenCalledTimes(2);
+    for (const [, options] of request.mock.calls) {
+      expect(options.headers[provider === 'claude' ? 'x-api-key' : 'authorization'])
+        .toBe(provider === 'claude' ? 'selected-model-key' : 'Bearer selected-model-key');
+    }
+  });
+
   it.each([false, true])('accepts an Anthropic end_turn without requiring signal_completion (timing: %s)', async (tracing) => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,

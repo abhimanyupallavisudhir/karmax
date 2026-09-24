@@ -2399,7 +2399,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal'
               ? {}
               : (await gitEnvFor(args.worldHandle, args.taskId));
-            // Granted `auto` vault items materialize into the subprocess env
+            // Granted `auto` vault items materialize into the work-command env
             // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
             // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
             // Item resolution is per-organization (the tenant boundary), so bind
@@ -2408,11 +2408,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...vaultEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
             // Values are resolved from resource leases and broker handles only
-            // now, at the activity/subprocess boundary. Keep them separate so a
-            // remote adapter can explicitly allowlist only these names.
-            const secretEnv = (await deps.resources?.environmentFor(world.handle)) ?? {};
+            // now, at the activity boundary. Keep application secrets separate
+            // from runtime env so they cannot change model auth or startup.
+            const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
             return {
               ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
               ...(Object.keys(secretEnv).length ? { secretEnv } : {}),

@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { VaultItems } from '../src/autonomy/vault-items.js';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -62,6 +63,14 @@ describe('agent project-secret delivery', () => {
         DATABASE_URL: 'postgres://task-service',
         PROJECT_TOKEN: 'secret-project-token',
       });
+      expect(received?.extraEnv ?? {}).not.toHaveProperty('PROJECT_TOKEN');
+      const vaultEnvironment = vi.spyOn(VaultItems.prototype, 'envFor').mockResolvedValue({ ANTHROPIC_API_KEY: 'granted-app-key' });
+      try {
+        await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle, messages: [],
+          task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any });
+        expect(received?.secretEnv?.ANTHROPIC_API_KEY).toBe('granted-app-key');
+        expect(received?.extraEnv ?? {}).not.toHaveProperty('ANTHROPIC_API_KEY');
+      } finally { vaultEnvironment.mockRestore(); }
       // A resumed turn opens the same world, without materializing its files again.
       const lateHandle = 'resource:test:late-token';
       (await broker.registerHandle(lateHandle, 'late-project-token'));
