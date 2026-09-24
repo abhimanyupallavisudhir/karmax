@@ -1,3 +1,4 @@
+import { missingBaseAdjustment } from './branch-fallback.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -110,6 +111,10 @@ export class WorktreeProvider implements WorldProvider {
       }
     }
 
+    for (const repo of repos.slice(1)) {
+      if (repo.branchAdjustment || (repos[0]?.branchAdjustment && repo.target && repo.target !== repos[0].target)) repo.targetPinned = true;
+    }
+
     const handle: WorldHandle = {
       kind: 'worktree',
       id: spec.taskId,
@@ -121,9 +126,9 @@ export class WorktreeProvider implements WorldProvider {
       ...(scratchWorkdir ? { workdir: scratchWorkdir }
         : spec.layout === 'nested' && repos.length === 1 ? { workdir: repos[0]!.root } : {}),
       branch,
-      base: spec.base,
+      base: repos[0]?.base ?? spec.base,
       ...(repos[0] ? { repo: repos[0].repo } : {}),
-      target: spec.target,
+      target: repos[0]?.target ?? spec.target,
       repos,
       ...(ephemeralPaths.length ? { meta: { ephemeralPaths } } : {}),
       ...(warnings.length ? { warnings } : {}),
@@ -139,11 +144,20 @@ export class WorktreeProvider implements WorldProvider {
     warnings?: string[], source?: string, ephemeralPaths?: string[], worldPrefix = '', pinnedTarget = false,
     credentialSource = source ?? repo): Promise<WorldRepo> {
     // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
-    let baseRef = spec.base;
+    let base = spec.base;
+    let target = spec.target;
+    let branchAdjustment;
+    let baseRef = base;
     let baseSha: string | undefined;
     if (spec.sourceAuthority === 'origin') {
       const refreshed = await this.refreshOriginRefs(repo, spec.base, spec.branch, credentialSource, spec);
       baseRef = refreshed.ref;
+      if (refreshed.base !== base) {
+        branchAdjustment = missingBaseAdjustment(name, base, target, refreshed.base);
+        base = branchAdjustment.base;
+        target = branchAdjustment.target;
+        warnings?.push(branchAdjustment.warning);
+      }
       baseSha = refreshed.sha;
       const local = await git(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${spec.base}`]);
       if (local.code === 0 && local.stdout.trim() !== baseSha) {
@@ -152,11 +166,13 @@ export class WorktreeProvider implements WorldProvider {
     }
     let verify = await git(repo, ['rev-parse', '--verify', baseRef]);
     if (verify.code !== 0) {
-      baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
-      // Don't fork off the wrong ref silently — surface that the configured base
-      // was ignored so the misconfiguration is visible (and merges downstream can
-      // no longer resolve `base` either; see finalizeMergeRepo).
-      warnings?.push(`repo "${name}": base branch "${spec.base}" not found — forked off HEAD instead`);
+      const fallback = await git(repo, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+      if (fallback.code !== 0) throw new Error(`Repository "${name}" has no named fallback branch for missing base "${base}"`);
+      branchAdjustment = missingBaseAdjustment(name, base, target, fallback.stdout.trim());
+      base = branchAdjustment.base;
+      target = branchAdjustment.target;
+      baseRef = `refs/heads/${base}`;
+      warnings?.push(branchAdjustment.warning);
       verify = await git(repo, ['rev-parse', '--verify', baseRef]);
     }
     // The ancestry check needs the exact provisioned commit, not a branch name
@@ -206,8 +222,9 @@ export class WorktreeProvider implements WorldProvider {
       ephemeralPaths?.push(...copied.map((file) => worldPrefix ? `${worldPrefix}/${file}` : file));
     }
 
-    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base,
-      ...(spec.target ? { target: spec.target } : {}), targetPinned: pinnedTarget,
+    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base,
+      ...(target ? { target } : {}), targetPinned: pinnedTarget,
+      ...(branchAdjustment ? { branchAdjustment } : {}),
       ...(baseSha ? { baseSha } : {}), ...(spec.sourceAuthority === 'origin' ? { sourceAuthority: 'origin' as const } : {}) };
   }
 
@@ -227,7 +244,7 @@ export class WorktreeProvider implements WorldProvider {
    * while a `pr` task must start from GitHub's protected target. Credentials are
    * materialized for this one trusted fetch and removed immediately. */
   private async refreshOriginRefs(repo: string, base: string, branch: string | undefined, credentialSource: string,
-    spec: WorldSpec): Promise<{ ref: string; sha: string }> {
+    spec: WorldSpec): Promise<{ ref: string; sha: string; base: string }> {
     const origin = await git(repo, ['remote']);
     const names = origin.stdout.split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
     const remote = names.includes('origin') ? 'origin' : names.length === 1 ? names[0]! : undefined;
@@ -242,8 +259,23 @@ export class WorktreeProvider implements WorldProvider {
       ...(httpsToken ? { httpsToken } : {}),
       env: baseEnv,
     });
-    const ref = `refs/remotes/origin/${base}`;
     try {
+      // Probe before fetching so an authentication/transport failure is never
+      // mistaken for a missing branch. Resolve fallback from the remote's HEAD.
+      const advertised = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], { env });
+      if (advertised.code !== 0) throw new Error(`Could not verify PR base "${base}": ${advertised.stderr || advertised.stdout}`);
+      if (!advertised.stdout.trim() && !branch) {
+        const head = await git(repo, ['ls-remote', '--symref', remote, 'HEAD'], { env });
+        const fallback = head.code === 0 ? head.stdout.match(/^ref: refs\/heads\/(.+)\tHEAD$/m)?.[1] : undefined;
+        if (!fallback) throw new Error(`PR base "${base}" is missing and ${remote} has no resolvable default branch`);
+        base = missingBaseAdjustment(credentialSource, base, spec.target, fallback).base;
+      }
+      if (spec.target && spec.target !== spec.base && !branch) {
+        const advertisedTarget = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${spec.target}`], { env });
+        if (advertisedTarget.code !== 0) throw new Error(`Could not verify PR target "${spec.target}": ${advertisedTarget.stderr || advertisedTarget.stdout}`);
+        if (!advertisedTarget.stdout.trim()) throw new Error(`repository "${credentialSource}": target branch "${spec.target}" does not exist; choose an existing target before starting the task`);
+      }
+      const ref = `refs/remotes/origin/${base}`;
       const wanted = [...new Set([base, branch].filter((value): value is string => Boolean(value)))];
       const fetched = await git(repo, ['fetch', '--no-tags', remote, ...wanted.map((name) =>
         `+refs/heads/${name}:refs/remotes/origin/${name}`)], { env, timeoutMs: 10 * 60_000 });
@@ -254,7 +286,7 @@ export class WorktreeProvider implements WorldProvider {
       const sha = resolved.stdout.trim();
       if (resolved.code !== 0 || !/^[0-9a-f]{40,64}$/i.test(sha))
         throw new Error(`PR base "${base}" fetched from ${remote} has no resolvable commit`);
-      return { ref, sha };
+      return { ref, sha, base };
     } finally {
       fs.rmSync(credentialDir, { recursive: true, force: true });
     }

@@ -1427,6 +1427,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // retain the encompassing root as their working directory.
           const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
           if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
+          // Provisioning may have replaced a missing base with an actual named
+          // branch. Persist that fact, so views, retries and new attempts do not
+          // reintroduce the missing name. Never let a companion wiki set task policy.
+          const adjustment = developmentRepos[0]?.branchAdjustment;
+          if (adjustment) {
+            const patch: Record<string, string> = {};
+            if (adjustment.requestedBase === args.base) {
+              world.handle.base = adjustment.base;
+              patch.base = adjustment.base;
+            }
+            if ((adjustment.requestedTarget ?? adjustment.requestedBase) === (args.target ?? args.base)) {
+              world.handle.target = adjustment.target;
+              patch.target = adjustment.target;
+              // Other checkouts may legitimately retain the old common target.
+              for (const repo of developmentRepos) {
+                if (repo.target && repo.target !== adjustment.target) repo.targetPinned = true;
+              }
+            }
+            if (taskRecord && Object.keys(patch).length) {
+              const current = await store.getTask(args.taskId);
+              // A target edit may have arrived while the clone was running.
+              if (current?.params.target && current.params.target !== args.target) delete patch.target;
+              await store.patchTaskParams(args.taskId, patch);
+            }
+          }
+
           if (forkCheckpoint) {
             activitySignal?.throwIfAborted();
             await timed('world.fork-restore', () => deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!, { signal: activitySignal }));

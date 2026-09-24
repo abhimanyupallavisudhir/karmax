@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { provisionGitCredentials, provisionGitRepos, type ProvisionTarget } from '../src/world/provision-git.js';
+import { worldRepoTarget } from '../src/world/types.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 
 const pexec = promisify(execFile);
@@ -184,6 +185,61 @@ describe('seeding a cloud world from its local checkout', () => {
     };
     return { root, source, env };
   }
+
+  it.each(['master', 'release'])('records the fallback base and preserves an independent %s target', async (targetBranch) => {
+    const { root, env } = await makeRepoPair('karmax-missing-base-');
+    const remote = path.join(root, 'remote.git');
+    await gitOrThrow(remote, ['branch', 'release', 'main']);
+    const world = path.join(root, 'world');
+    const result = await provisionGitRepos(hostTarget(env), {
+      taskId: 'fallback', base: 'master', target: targetBranch, repo: 'git@example:remote.git',
+    }, { ...OPTIONS, root: world, home: root });
+    expect(result.repos[0]).toMatchObject({ base: 'main', target: targetBranch === 'master' ? 'main' : 'release' });
+    expect(worldRepoTarget(result.repos[0]!, 'release')).toBe('release');
+    expect(result.warnings.join('\n')).toContain(targetBranch === 'master'
+      ? 'Base and target branch changed to "main" because "master" did not exist'
+      : 'Base branch changed to "main" because "master" did not exist');
+    expect(await gitOrThrow(world, ['rev-parse', 'HEAD'])).toBe(await gitOrThrow(remote, ['rev-parse', 'main']));
+    expect((await git(world, ['show-ref', '--verify', '--quiet', 'refs/heads/master'])).code).not.toBe(0);
+  });
+
+  it.each(['master', 'trunk'])('uses the actual remote default %s rather than assuming main', async (defaultBranch) => {
+    const { root, env } = await makeRepoPair('karmax-default-branch-');
+    const remote = path.join(root, 'remote.git');
+    await gitOrThrow(remote, ['branch', '-m', 'main', defaultBranch]);
+    const result = await provisionGitRepos(hostTarget(env), {
+      taskId: 'fallback', base: 'main', target: 'main', repo: 'git@example:remote.git',
+    }, { ...OPTIONS, root: path.join(root, 'world'), home: root });
+    expect(result.repos[0]).toMatchObject({ base: defaultBranch, target: defaultBranch });
+    expect(result.warnings[0]).toContain(`Base and target branch changed to "${defaultBranch}" because "main" did not exist`);
+  });
+
+  it('keeps a second repository on its existing target when the first repository falls back', async () => {
+    const { root, env } = await makeRepoPair('karmax-multi-fallback-');
+    const second = path.join(root, 'second.git');
+    await gitOrThrow(root, ['clone', '-q', '--bare', path.join(root, 'remote.git'), second]);
+    await gitOrThrow(second, ['branch', '-m', 'main', 'master']);
+    const result = await provisionGitRepos(hostTarget(env), {
+      taskId: 'multi', base: 'master', target: 'master', repos: ['git@example:remote.git', 'git@example:second.git'],
+    }, { ...OPTIONS, root: path.join(root, 'world'), home: root });
+    expect(result.repos.map(repo => repo.base)).toEqual(['main', 'master']);
+    expect(result.repos.map(repo => worldRepoTarget(repo, 'main'))).toEqual(['main', 'master']);
+    expect(result.warnings).toHaveLength(1);
+  });
+
+  it('rejects a distinct missing target during setup instead of redirecting it', async () => {
+    const { root, env } = await makeRepoPair('karmax-missing-target-');
+    await expect(provisionGitRepos(hostTarget(env), {
+      taskId: 'missing-target', base: 'master', target: 'release', repo: 'git@example:remote.git',
+    }, { ...OPTIONS, root: path.join(root, 'world'), home: root })).rejects.toThrow('target branch "release" does not exist');
+  });
+
+  it('does not fall back when an explicitly reviewed branch is missing', async () => {
+    const { root, env } = await makeRepoPair('karmax-missing-review-');
+    await expect(provisionGitRepos(hostTarget(env), {
+      taskId: 'missing-review', base: 'main', branch: 'karmax/missing', repo: 'git@example:remote.git',
+    }, { ...OPTIONS, root: path.join(root, 'world'), home: root })).rejects.toThrow('no remote branch "karmax/missing"');
+  });
 
   it('forks off the local branch state when the checkout is ahead of origin', async () => {
     const { root, source, env } = await makeRepoPair('karmax-provision-seed-');

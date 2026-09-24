@@ -1,3 +1,4 @@
+import { missingBaseAdjustment } from './branch-fallback.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -121,8 +122,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   for (let index = 0; index < sources.length; index++) {
     const source = sources[index]!;
     const branchPolicy = spec.repositoryBranches?.[source];
-    const base = branchPolicy?.base ?? spec.base;
-    const targetBranch = branchPolicy?.target ?? spec.target;
+    let base = branchPolicy?.base ?? spec.base;
+    let targetBranch = branchPolicy?.target ?? spec.target;
     const repoRoot = multi ? path.posix.join(root, names[index]!) : root;
     const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
     const token = spec.gitCredentials?.httpsTokens?.[source];
@@ -137,18 +138,37 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     if (localPath && sourceAuthority !== 'origin')
       await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
     const requested = spec.branch ?? base;
-    const remoteRef = `refs/remotes/origin/${requested}`;
+    let remoteRef = `refs/remotes/origin/${requested}`;
     const refCheck = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(remoteRef)}`, 120_000);
     const remoteRefExists = refCheck.code === 0;
     if (spec.branch && !remoteRefExists) throw new Error(`repository "${source}" has no remote branch "${spec.branch}" to review`);
-    if (!spec.branch && !remoteRefExists) warnings.push(`repo "${names[index]}": base branch "${base}" not found — forked off the remote default branch instead`);
-    const resolved = await target.run(`git -C ${quote(repoRoot)} rev-parse ${quote(remoteRefExists ? remoteRef : 'refs/remotes/origin/HEAD')}`, 120_000);
+    let branchAdjustment;
+    if (!spec.branch && !remoteRefExists) {
+      const fallback = await runOrThrow(target, `git -C ${quote(repoRoot)} symbolic-ref refs/remotes/origin/HEAD`);
+      const prefix = 'refs/remotes/origin/';
+      const ref = fallback.stdout.trim();
+      if (!ref.startsWith(prefix)) throw new Error(`repository "${source}" has no named remote default branch`);
+      branchAdjustment = missingBaseAdjustment(names[index]!, base, targetBranch, ref.slice(prefix.length));
+      base = branchAdjustment.base;
+      targetBranch = branchAdjustment.target;
+      remoteRef = ref;
+      warnings.push(branchAdjustment.warning);
+    }
+    if (!spec.branch && targetBranch && targetBranch !== base) {
+      const check = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(`refs/remotes/origin/${targetBranch}`)}`, 120_000);
+      if (check.code !== 0) throw new Error(`repository "${source}": target branch "${targetBranch}" does not exist; choose an existing target before starting the task`);
+    }
+    const resolved = await target.run(`git -C ${quote(repoRoot)} rev-parse ${quote(remoteRef)}`, 120_000);
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
-    await configureRepo(target, repoRoot, spec, branch, true, remoteRefExists, base);
+    await configureRepo(target, repoRoot, spec, branch, true, true, base);
     repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base,
-      ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target), baseSha,
+      ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target || (branchAdjustment && index > 0)), baseSha,
+      ...(branchAdjustment ? { branchAdjustment } : {}),
       ...(localPath ? { localPath } : {}), ...(sourceAuthority === 'origin' ? { sourceAuthority } : {}) });
+  }
+  if (repos[0]?.branchAdjustment) {
+    for (const repo of repos.slice(1)) if (repo.target && repo.target !== repos[0].target) repo.targetPinned = true;
   }
   if (spec.copyGlobs?.length) {
     let copied = 0;
