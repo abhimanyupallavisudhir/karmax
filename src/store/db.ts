@@ -6437,6 +6437,39 @@ export class Store {
       events: rows.length, byKind, byFundingSource, byCostClassification, byProvider, quantities, requests, active };
   }
 
+  /** Raw rows behind an organization's Insights page (aggregated in
+   * `src/platform/insights.ts`). A task's completion is its FIRST published
+   * `done` view — later re-saves of a finished task must not count it again, so
+   * the minimum is taken over all time and only then windowed. */
+  async insightRows(organizationId: string, from: number, now = Date.now()): Promise<{
+    completions: Array<{ taskId: string; doneAt: number }>;
+    admissions: Array<{ taskId: string; projectId: string; provider: string; model: string | null; state: string;
+      createdAt: number; releasedAt: number | null }>;
+    tokens: Array<{ taskId: string | null; projectId: string | null; provider: string; quantity: number;
+      metadata: string | null; startedAt: number }>;
+    cardSpend: Array<{ amount: number; currency: string; createdAt: number }>;
+  }> {
+    const completions = (await this.db.prepare(`SELECT e.taskId AS taskId, MIN(e.ts) AS doneAt FROM events e
+      JOIN tasks t ON t.id=e.taskId JOIN projects p ON p.id=t.projectId
+      WHERE COALESCE(p.organizationId, 'org_personal')=? AND e.type='view.updated' AND e.payload LIKE ?
+      GROUP BY e.taskId HAVING MIN(e.ts)>=?`).all(organizationId, '%"status":"done"%', from)) as any[];
+    const admissions = (await this.db.prepare(`SELECT taskId, projectId, provider, model, state, createdAt, releasedAt
+      FROM usage_admissions WHERE organizationId=? AND kind='agent' AND createdAt>=?`).all(organizationId, from)) as any[];
+    const tokens = (await this.db.prepare(`SELECT taskId, projectId, provider, quantity, metadata, startedAt
+      FROM usage_events WHERE organizationId=? AND kind='agent.tokens' AND startedAt>=?`).all(organizationId, from)) as any[];
+    const cardSpend = (await this.db.prepare(`SELECT amount, currency, createdAt FROM payment_spend_requests
+      WHERE organizationId=? AND createdAt>=? AND (status IN ('authorizing','consumed','settled')
+        OR (status='authorized' AND expiresAt>?))`).all(organizationId, from, now)) as any[];
+    const num = (value: unknown) => Number(value ?? 0);
+    return {
+      completions: completions.map((row) => ({ taskId: String(row.taskId), doneAt: num(row.doneAt) })),
+      admissions: admissions.map((row) => ({ ...row, createdAt: num(row.createdAt),
+        releasedAt: row.releasedAt == null ? null : num(row.releasedAt) })),
+      tokens: tokens.map((row) => ({ ...row, quantity: num(row.quantity), startedAt: num(row.startedAt) })),
+      cardSpend: cardSpend.map((row) => ({ amount: num(row.amount), currency: String(row.currency || 'usd'), createdAt: num(row.createdAt) })),
+    };
+  }
+
   async savePromotedArtifact(artifact: PromotedArtifact): Promise<PromotedArtifact> {
     return this.db.transaction(async () => {
 
@@ -7475,7 +7508,7 @@ const RESERVED_ROUTE_SLUGS = new Set([
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations',
   // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
-  'dashboard', 'settings', 'inbox', 'wiki', 'profile',
+  'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'profile',
   // project-level tabs
   'tasks', 'queue', 'activity',
 ]);

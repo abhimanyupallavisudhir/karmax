@@ -160,10 +160,6 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/resource-drivers') return 'workflow:read';
   if (p.startsWith('/api/resource-uploads/')) return 'project:settings:write';
   if (p === '/api/logout') return 'none';
-  // The dashboard is the current organization's overview (scoped in the handler);
-  // any member with organization:read may see it. Host/diagnostic panels are
-  // fetched separately and gated by diagnostic:read on their own routes.
-  if (p === '/api/dashboard') return 'organization:read';
   if (p === '/api/remote-access') return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
   if (p === '/api/metrics') return 'diagnostic:read';
@@ -184,6 +180,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage-policy/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  // Insights are every member's view of the organization's work; money inside
+  // them is included only for callers who also hold payment:read (handler).
+  if (/^\/api\/organizations\/[^/]+\/insights$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/gift$/.test(p)) return 'subscription:gift';
@@ -2866,6 +2865,16 @@ export class Gateway {
         if (!this.deps.providerConnections) return this.json(res, 503, { error: 'provider connections are unavailable' });
         try { return this.json(res, 200, await this.deps.providerConnections.test(testWorldProvider[1]!, testWorldProvider[2]!)); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const insights = p.match(/^\/api\/organizations\/([^/]+)\/insights$/);
+      if (insights && method === 'GET') {
+        const organizationId = insights[1]!;
+        const { organizationInsights } = await import('../platform/insights.js');
+        return this.json(res, 200, await organizationInsights(store, organizationId, {
+          days: Number(url.searchParams.get('days') ?? 30),
+          utcOffsetMinutes: Number(url.searchParams.get('utcOffset') ?? 0),
+          includeSpend: (await this.deps.tokens.check(token, 'payment:read', { organizationId })).ok,
+        }));
       }
       const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
       if (usage && method === 'GET') {
@@ -7011,6 +7020,14 @@ export class Gateway {
         }
         return this.json(res, 200, { usage, pollable });
       }
+      // Live leasing state of THIS organization's agent accounts — availability,
+      // in-use/concurrency, quota resets and the last credential incident — the
+      // account coordinator's view filtered to the organization's own credentials.
+      // Any member who may read credentials may see it; this used to ride on the
+      // operator-only dashboard payload, which org-scoped browser sessions never got.
+      if (resourcePath === '/api/accounts/status' && method === 'GET') {
+        return this.json(res, 200, { accounts: await this.organizationAccountStatus(resourceOrganizationId) });
+      }
       if (resourcePath === '/api/accounts/usage/recheck' && method === 'POST') {
         const b = await this.body(req);
         const only = b.accountId ? String(b.accountId) : undefined;
@@ -7340,19 +7357,6 @@ export class Gateway {
         return this.json(res, 200, events);
       }
 
-      // dashboard
-      if (p === '/api/dashboard' && method === 'GET') {
-        const dashOrg = requestedScope.organizationId ?? authRecord?.organizationId;
-        // Host-wide agent-account leasing is operator data; include it only for a
-        // caller who holds diagnostic:read (global operator), never for an ordinary
-        // organization member viewing their own overview.
-        const caps = authRecord?.caps ?? (session.userId
-          ? (await this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, dashOrg)) ?? []
-          : []);
-        return this.json(res, 200, await this.dashboard(dashOrg, allows(caps, 'diagnostic:read')
-          && !authRecord.organizationId && !authRecord.projectId && !authRecord.projectIds?.length));
-      }
-
       // safe mode toggle
       // Installation-wide: safe mode reboots the whole cell. The console renders
       // every card for everyone, so the server has to say who may manage this —
@@ -7598,6 +7602,29 @@ export class Gateway {
     }, { organizationId, only });
   }
 
+  private async organizationAccountStatus(organizationId: string): Promise<Array<Record<string, any>>> {
+    const keys = new Set(this.organizationCredentialKeys(organizationId));
+    let view: { accounts?: Array<Record<string, any>> } = {};
+    try {
+      view = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000) as typeof view;
+    } catch {
+      /* coordinator not running or wedged — show empty rather than hang */
+    }
+    return __asyncCollections.map((view.accounts ?? []).filter((account) => keys.has(account.id)), async (account) => {
+      const sourceTaskId = account.lastTransition?.sourceTaskId;
+      const task = sourceTaskId ? (await this.deps.store.getTask(sourceTaskId)) : undefined;
+      // A source task in another tenant stays an opaque id, never a title.
+      const visible = task && ((await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal') === organizationId;
+      return {
+        ...account,
+        ...(visible ? { lastTransition: {
+          ...account.lastTransition,
+          sourceTask: { id: task.id, num: task.num, title: task.title, projectId: task.projectId },
+        } } : {}),
+      };
+    });
+  }
+
   private organizationCredentialKeys(organizationId: string): string[] {
     return enumerateCredentials(gatherCredentialSources({
       configHomes: this.deps.configHomes,
@@ -7653,47 +7680,6 @@ export class Gateway {
         : agent;
     }
     return out;
-  }
-
-  private async dashboard(organizationId?: string, includeHost = true) {
-    let accounts: unknown = { accounts: [], waiting: 0 };
-    if (includeHost) {
-      try {
-        accounts = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000);
-        const view = accounts as { accounts?: Array<Record<string, any>>; waiting?: number };
-        accounts = {
-          ...view,
-          accounts: (await __asyncCollections.map((view.accounts ?? []), async (account) => {
-            const sourceTaskId = account.lastTransition?.sourceTaskId;
-            const task = sourceTaskId ? (await this.deps.store.getTask(sourceTaskId)) : undefined;
-            return {
-              ...account,
-              ...(task ? { lastTransition: {
-                ...account.lastTransition,
-                sourceTask: { id: task.id, num: task.num, title: task.title, projectId: task.projectId },
-              } } : {}),
-            };
-          })),
-        };
-      } catch {
-        /* coordinator not running or wedged — show empty rather than hang */
-      }
-    }
-    // Scope to the caller's organization so a member sees their own overview, not
-    // a host-wide count across every tenant.
-    const projects = (await this.deps.store.listProjects())
-      .filter((pr) => !organizationId || (pr.organizationId ?? 'org_personal') === organizationId);
-    // Summaries only: the dashboard reads nothing but `lastView.stage`, while
-    // `listTasks` hydrates every row's full `lastView` — transcripts included —
-    // for every project in the organization at once (the store documents that
-    // pattern as having cost >1 GiB RSS).
-    const allTasks = (await __asyncCollections.flatMap(projects, async (pr) => (await this.deps.store.listTaskSummaries(pr.id))));
-    const byStage: Record<string, number> = {};
-    for (const t of allTasks) {
-      const stage = t.lastView?.stage ?? 'unknown';
-      byStage[stage] = (byStage[stage] ?? 0) + 1;
-    }
-    return { accounts, projects: projects.length, tasks: allTasks.length, byStage };
   }
 
   /** Brand assets, resolved per request against the instance-wide icon setting.

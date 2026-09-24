@@ -93,8 +93,8 @@ install, where the operator's ambient login is the whole point.
 
 ### Diagnosing credential incidents
 
-The operator Dashboard distinguishes a timed quota exhaustion from a credential
-that needs attention. For the latest automatic quarantine it retains only a
+Settings → Codex/Claude (Availability & quota) distinguishes a timed quota
+exhaustion from a credential that needs attention. For the latest automatic quarantine it retains only a
 secret-safe provider diagnostic (kind, native code, HTTP status, request id,
 model, operation, retry disposition/count, and bounded message), plus the
 originating task/activity and timestamp. Raw provider envelopes are never
@@ -109,8 +109,8 @@ Codex treats refresh-token presence as its login-state flag: deleting the field
 makes it discard an otherwise-valid access token and call Responses without a
 bearer header. The marker cannot refresh OAuth and remote auth is never imported
 back into the canonical home.
-Usage/dashboard probes read quota with the current token first and rotate OAuth
-only when that authenticated read fails; a dashboard refresh must never rotate
+Usage probes (Insights, Settings) read quota with the current token first and rotate OAuth
+only when that authenticated read fails; a usage refresh must never rotate
 credentials out from under live remote turns. Current Codex also treats that
 projection as logged out when its short-lived ID token expires, even while the
 access token is still valid. Before each remote process Karmax checks the ID-token

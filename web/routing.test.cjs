@@ -91,7 +91,7 @@ eq(projectRoute('P2'), '/globex/mobile-app', 'project route uses the project’s
 eq(firstProjectForOrganization('org_globex')?.id, 'P2', 'project fallback skips an earlier project from another organization');
 eq(firstProjectForOrganization('org_missing'), undefined, 'project fallback does not borrow a project from another organization');
 eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under /<org>/<project>/tasks/:num');
-eq(globalRoute('dashboard'), '/acme/dashboard', 'dashboard route is org-prefixed');
+eq(globalRoute('insights'), '/acme/insights', 'insights route is org-prefixed');
 eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
 eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
 eq(installationRoute(), '/installation', 'installation route is global, not org-prefixed');
@@ -107,7 +107,8 @@ eq(organizationSwitcher.value, 'org_globex', 'the persistent top-left picker fol
 S.organizationId = 'org_acme';
 
 // ── parseRoute round-trips the new scheme ─────────────────────────────────────
-eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'dashboard' }, 'parse /<org>/dashboard');
+eq(parseRoute('/acme/insights'), { name: 'global', org: 'acme', tab: 'insights' }, 'parse /<org>/insights');
+eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'insights', legacy: true }, 'old /<org>/dashboard bookmarks land on insights');
 eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organization' }, 'parse /<org>/settings');
 eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox', sub: null }, 'parse /<org>/inbox');
 eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', org: 'acme', tab: 'inbox', sub: 'review-requested' },
@@ -156,7 +157,7 @@ eq(projectBySlug('mobile-app', 'org_globex')?.id, 'P2', 'same slug resolves per-
 eq(projectBySlug('P2', 'org_acme'), undefined, 'a raw project id cannot escape the organization named in the URL');
 
 // ── Legacy URLs still parse and are flagged for canonicalisation ──────────────
-eq(parseRoute('/dashboard'), { name: 'global', tab: 'dashboard', legacy: true }, 'legacy /dashboard');
+eq(parseRoute('/dashboard'), { name: 'global', tab: 'insights', legacy: true }, 'legacy /dashboard');
 eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /organization');
 eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
 eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', sub: null, legacy: true }, 'legacy /inbox');

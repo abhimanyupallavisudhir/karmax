@@ -172,7 +172,7 @@ for (const kind of ['task', 'queue', 'draft', 'nested']) {
   ok(event.defaultPrevented, `focused ${kind} Enter prevents a second default action`);
 }
 
-// ── shifted chords survive the Shift keydown (g P / g W / g D / g S) ──
+// ── shifted chords survive the Shift keydown (g P / g W / g S) ──
 // The dispatcher skips bare-modifier keydowns so pressing Shift for the second
 // step of a shifted chord doesn't reset the pending prefix. Model `g` → `Shift`
 // → `P`: the Shift event is ignored, so the buffer still holds `g` when `P`/`S`

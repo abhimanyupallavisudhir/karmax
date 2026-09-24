@@ -83,7 +83,7 @@ describe('Project settings browser source', () => {
     const projectWiring = extractFunction('wireSettingsView');
 
     expect(projectWiring).toContain('firstProjectForOrganization(deletedOrganizationId)');
-    expect(projectWiring).toContain("globalRoute('dashboard', organizationById(deletedOrganizationId))");
+    expect(projectWiring).toContain("globalRoute('insights', organizationById(deletedOrganizationId))");
     expect(projectWiring).not.toContain('const next = S.projects[0]');
   });
 

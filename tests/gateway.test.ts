@@ -913,10 +913,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       state: { cancelled: true },
     });
 
-    // dashboard reflects the project + task
-    const dash: any = await (await fetch(`${base}/api/dashboard`, { headers: auth() })).json();
-    expect(dash.projects).toBeGreaterThanOrEqual(1);
-    expect(dash.tasks).toBeGreaterThanOrEqual(1);
+    // insights reflect the project + task (started today, cancelled so not open)
+    const insights: any = await (await fetch(`${base}/api/organizations/org_personal/insights?days=7`, { headers: auth() })).json();
+    expect(insights.totals.created).toBeGreaterThanOrEqual(1);
+    expect(insights.daily).toHaveLength(7);
+    expect(insights.totals.spendMicros).toBeGreaterThanOrEqual(0);
   });
 
   it('runs a review "run" action in the world and serves an "open" artifact', async () => {
@@ -1306,10 +1307,10 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(connected.status).toBe('awaiting_oauth');
 
     await expect.poll(async () => {
-      const dashboard: any = await fetch(`${delayedGateway.url}/api/dashboard?organizationId=org_personal`, {
+      const status: any = await fetch(`${delayedGateway.url}/api/organizations/org_personal/accounts/status`, {
         headers: delayedAuth,
       }).then((response) => response.json());
-      return dashboard.accounts.accounts.some((account: any) => account.id === 'login:codex:delayed');
+      return status.accounts.some((account: any) => account.id === 'login:codex:delayed');
     }, { timeout: 4_000 }).toBe(true);
   });
 
@@ -1348,18 +1349,18 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
       await expect(connect()).resolves.toMatchObject({ status: 'awaiting_oauth' });
       await expect.poll(async () => {
-        const dashboard: any = await fetch(`${reauthGateway.url}/api/dashboard?organizationId=org_personal`, { headers })
+        const status: any = await fetch(`${reauthGateway.url}/api/organizations/org_personal/accounts/status`, { headers })
           .then((response) => response.json());
-        return dashboard.accounts.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
+        return status.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
       }, { timeout: 5_000 }).toBe('available');
 
       const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
       await coordinator.setAccountAvailability({ accountId: 'login:claude:reauth', status: 'needs-attention' });
       await expect(connect()).resolves.toMatchObject({ status: 'awaiting_oauth' });
       await expect.poll(async () => {
-        const dashboard: any = await fetch(`${reauthGateway.url}/api/dashboard?organizationId=org_personal`, { headers })
+        const status: any = await fetch(`${reauthGateway.url}/api/organizations/org_personal/accounts/status`, { headers })
           .then((response) => response.json());
-        return dashboard.accounts.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
+        return status.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
       }, { timeout: 5_000 }).toBe('available');
     } finally {
       if (previousUsageCommand === undefined) delete process.env.KARMAX_CLAUDE_USAGE_CMD;

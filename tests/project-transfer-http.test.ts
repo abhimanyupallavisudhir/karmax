@@ -205,7 +205,7 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
       w.projectById = (id: string) => w.S.projects.find((p: any) => p.id === id);
       w.organizationById = () => organization;
       w.projectRoute = (id: string) => `/moved/${id}/settings`;
-      w.globalRoute = () => '/destination/dashboard';
+      w.globalRoute = () => '/destination/insights';
       w.go = async (route: string) => { w.visited = route; };
       w.toast = (message: string) => { w.notice = message; };
       w.eval(move);
