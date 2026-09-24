@@ -15,6 +15,7 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
+import * as network from '../src/mcp/connections/http.js';
 
 describe('connection gateway flow', () => {
   let store: Store, tokens: TokenAuthority, home: string, base: string, close: () => Promise<void>;
@@ -22,6 +23,9 @@ describe('connection gateway flow', () => {
   let agent: string, forbiddenAgent: string; let live = false;
   const signal = vi.fn(async () => {});
   const execute = vi.fn(async () => ({ successful: true, data: { messages: [{ subject: 'Fixture mail' }] } }));
+  const callTool = vi.fn(async () => ({ content: [{ type: 'text', text: 'MCP fixture mail' }] }));
+  const openMcp = vi.fn(async () => ({ listTools: async () => ({ tools: [{ name: 'search_emails', description: 'Search mail', inputSchema: { type: 'object' } }] }),
+    callTool, close: async () => {} }) as any);
   const request = (p: string, options: { method?: string; body?: unknown; token?: string; user?: string } = {}) =>
     fetch(base + p, { method: options.method ?? 'GET', headers: { 'content-type': 'application/json',
       ...(options.token ? { authorization: `Bearer ${options.token}` } : { cookie: `test-user=${options.user ?? 'alice'}` }) },
@@ -43,7 +47,7 @@ describe('connection gateway flow', () => {
       authorize: async () => ({ id: 'exact-account', url: 'https://connect.composio.dev/link/private' }),
       active: async () => live, session: async () => 'private-session',
       tools: async () => [{ slug: 'GMAIL_FETCH_EMAILS', name: 'Fetch mail', inputParameters: { type: 'object' } }], execute, disconnect: async () => {} };
-    service = new ServiceConnections(store, broker, () => backend); await service.configure('secret-api-key');
+    service = new ServiceConnections(store, broker, () => backend, openMcp); await service.configure('secret-api-key');
     const client = { workflow: { getHandle: () => ({ signal, query: async () => ({ status: 'waiting', stage: 'do' }) }) } } as any;
     const worlds = new WorldRegistry();
     const api = new KarmaxApi({ store, tokens, client, worlds, taskQueue: 'test', contentDir: home });
@@ -155,6 +159,41 @@ describe('connection gateway flow', () => {
     const result = await request(`/api/connections/${pending.connection.id}/execute`, { token, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } });
     expect(result.status).toBe(200);
     expect((await request(`/api/connections/${account}/execute`, { token, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } })).status).toBe(403);
+  });
+  it('requests a native MCP server, finishes the owner sign-in callback, resumes the task, and calls its tools', async () => {
+    const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+    vi.spyOn(network, 'publicStreamFetch').mockResolvedValue(new Response('', { status: 401 }));
+    vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
+      const req = new Request(input, init); const body = await req.text();
+      if (req.url.includes('oauth-protected-resource')) return json({ resource: 'https://mail.example/mcp', authorization_servers: ['https://auth.example'] });
+      if (req.url.includes('.well-known')) return json({ issuer: 'https://auth.example', authorization_endpoint: 'https://auth.example/authorize', token_endpoint: 'https://auth.example/token',
+        registration_endpoint: 'https://auth.example/register', response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] });
+      if (req.url.endsWith('/register')) return json({ ...JSON.parse(body), client_id: 'client' });
+      if (req.url.endsWith('/token')) return json({ access_token: 'mcp-access-secret', token_type: 'Bearer', refresh_token: 'mcp-refresh-secret', expires_in: 3600 });
+      throw new Error(`Unexpected request ${req.url}`);
+    });
+    expect((await request('/api/connections/request', { token: agent, method: 'POST', body: { why: 'Read mail' } })).status).toBe(400);
+    const pending: any = await (await request('/api/connections/request', { token: agent, method: 'POST', body: { mcp: 'https://mail.example/mcp', why: 'Read mail' } })).json();
+    expect(pending).toMatchObject({ status: 'needs_connection', connection: { label: 'mail.example', mcp: { auth: 'oauth' } } });
+    const id = pending.connection.id;
+    const begin: any = await (await request(`/api/connections/connect?organizationId=${org}`, { method: 'POST', body: { id } })).json();
+    expect(begin).toMatchObject({ callback: 'mcp', connection: { status: 'connecting' } });
+    const authorization = new URL(begin.url);
+    expect(authorization.searchParams.get('redirect_uri')).toMatch(/\/mcp-callback$/);
+    const state = authorization.searchParams.get('state');
+    expect((await request(`/api/connections/${id}/callback?organizationId=${org}`, { user: 'bob', method: 'POST', body: { state, code: 'code' } })).status).toBe(403);
+    signal.mockClear();
+    const finished = await request(`/api/connections/${id}/callback?organizationId=${org}`, { method: 'POST', body: { state, code: 'code' } });
+    expect(await finished.json()).toMatchObject({ status: 'active' });
+    await vi.waitFor(() => expect(signal.mock.calls.some(call => JSON.stringify(call).includes(id))).toBe(true));
+    const tools: any = await (await request(`/api/connections/${id}/tools?search=mail`, { token: agent })).json();
+    expect(tools).toEqual([expect.objectContaining({ slug: 'search_emails' })]);
+    const result = await request(`/api/connections/${id}/execute`, { token: agent, method: 'POST', body: { tool: 'search_emails', arguments: { query: 'invoice' } } });
+    expect(await result.json()).toEqual({ content: [{ type: 'text', text: 'MCP fixture mail' }] });
+    expect(openMcp).toHaveBeenLastCalledWith({ type: 'http', url: 'https://mail.example/mcp' }, { Authorization: 'Bearer mcp-access-secret' });
+    const exposed = JSON.stringify([await (await request('/api/connections', { token: agent })).json(), await (await request(`/api/connections?organizationId=${org}`)).json()]);
+    for (const secret of ['mcp-access-secret', 'mcp-refresh-secret', String(state)]) expect(exposed).not.toContain(secret);
+    vi.restoreAllMocks();
   });
   it('declines an unclaimed request without requiring an account', async () => {
     const pending = (await service.request(org, 'slack', taskId, 'do', 'Read Slack'));

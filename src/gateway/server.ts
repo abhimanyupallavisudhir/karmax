@@ -5965,15 +5965,25 @@ export class Gateway {
             // A person answering a task request may reuse their own connected account.
             if (!callerTaskId && ownerId && taskId) for (const c of listed as Array<typeof listed[number] & { reusable?: unknown }>)
               if (c.status === 'requested' && (!c.ownerId || c.ownerId === ownerId))
-                c.reusable = (await service.reusable(org, ownerId, c.toolkit)).map(({ id, label }) => ({ id, label }));
+                c.reusable = (await service.reusable(org, ownerId, c)).map(({ id, label }) => ({ id, label }));
             return this.json(res, 200, listed);
           }
           if (p === '/api/connections/request' && method === 'POST') {
             if (!callerTaskId || !task) return this.json(res, 400, { error: 'A task-agent token is required' });
-            const toolkit = String(b.toolkit ?? '');
-            const available = (await service.list(org, { taskId, projectId })).find(c => c.toolkit === toolkit && c.status === 'active');
-            if (available) return this.json(res, 200, { status: 'connected', connection: available });
-            const c = (await service.request(org, toolkit, task.id, authRecord.role ?? 'do', String(b.why ?? '')));
+            const why = String(b.why ?? '');
+            let c;
+            if (typeof b.mcp === 'string' && b.mcp.trim()) {
+              const server = await service.resolveMcp(b.mcp);
+              const available = (await service.list(org, { taskId, projectId })).find(c => c.mcp?.url === server.transport.url && c.status === 'active');
+              if (available) return this.json(res, 200, { status: 'connected', connection: available });
+              c = (await service.requestMcp(org, server, task.id, authRecord.role ?? 'do', why));
+            } else {
+              const toolkit = String(b.toolkit ?? '');
+              if (!toolkit) return this.json(res, 400, { error: 'Pass mcp (an MCP Registry name or HTTPS URL) or a Composio toolkit' });
+              const available = (await service.list(org, { taskId, projectId })).find(c => !c.mcp && c.toolkit === toolkit && c.status === 'active');
+              if (available) return this.json(res, 200, { status: 'connected', connection: available });
+              c = (await service.request(org, toolkit, task.id, authRecord.role ?? 'do', why));
+            }
             if (c.status === 'requested') (await this.emitTaskEvent({ taskId: task.id, type: 'connection.requested', ts: Date.now(),
               payload: { requestId: c.id, connectionId: c.id, toolkit: c.toolkit, why: c.why } }));
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
@@ -5990,12 +6000,14 @@ export class Gateway {
                   return this.json(res, 403, { error: 'Task access denied' });
               }
             }
+            const origin = process.env.KARMAX_PUBLIC_URL ?? (hostLocal() ? url.origin : undefined);
             const result = await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label, restart: b.restart === true,
-              useConnectionId: typeof b.useConnectionId === 'string' ? b.useConnectionId : undefined });
+              useConnectionId: typeof b.useConnectionId === 'string' ? b.useConnectionId : undefined,
+              redirect: origin ? new URL('/mcp-callback', origin).href : undefined });
             if (result.connection.status === 'active') this.sweepConnections();
             return this.json(res, 200, result);
           }
-          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|tools|execute)$/);
+          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|callback|tools|execute)$/);
           if (match) {
             const id = match[1]!; const action = match[2]!;
             const c = (await service.get(org, id));
@@ -6015,6 +6027,10 @@ export class Gateway {
             } else {
               const userId = requireOwner();
               if (callerTaskId || (c.ownerId !== userId && !(action === 'disconnect' && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
+              if (action === 'callback' && method === 'POST') {
+                const result = await service.finishMcp(org, id, userId, b.state, b.code); this.sweepConnections();
+                return this.json(res, 200, result);
+              }
               if (action === 'refresh' && method === 'POST') {
                 const result = await service.refresh(org, id); this.sweepConnections();
                 return this.json(res, 200, service.view(result));

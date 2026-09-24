@@ -15111,7 +15111,19 @@ function wireConnectionActions(root, organizationId, refresh) {
         await refresh();
       } else if (action === 'connect' || action === 'restart') {
         const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });
-        if (result.url) {
+        if (result.url && result.callback === 'mcp') {
+          // The MCP server returns to Tavya's callback page, which finishes sign-in for this connection.
+          const state = new URL(result.url).searchParams.get('state');
+          if (popup) {
+            popup.sessionStorage.setItem(`mcp-oauth:${state}`, JSON.stringify({ path: `/api/connections/${encodeURIComponent(id)}/callback${oq}`, popup: true, back: location.pathname }));
+            const channel = new BroadcastChannel(`mcp-oauth:${state}`);
+            const timeout = setTimeout(() => channel.close(), 600000);
+            channel.onmessage = async (event) => { if (event.data === 'connected') { clearTimeout(timeout); channel.close(); await refresh(); } };
+            popup.location.replace(result.url);
+            row.querySelector('[data-connection-result]').innerHTML = '<p class="task-sub">Finish signing in in the new tab. This task continues automatically.</p>';
+          } else row.querySelector('[data-connection-result]').innerHTML = '<p class="task-sub">Allow pop-ups, then click Connect again.</p>';
+          button.hidden = !!popup;
+        } else if (result.url) {
           if (popup) popup.location.href = result.url;
           row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
           button.hidden = true;
@@ -19485,7 +19497,8 @@ async function finishMcpCallback() {
   try {
     if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
     if (params.get('error')) throw new Error('Authorization was declined. You can try again in connection settings.');
-    await api(`/api/mcp/${pending.id}/callback${pending.query}`, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
+    const path = typeof pending.path === 'string' && pending.path.startsWith('/api/connections/') ? pending.path : `/api/mcp/${pending.id}/callback${pending.query}`;
+    await api(path, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
     sessionStorage.removeItem(key);
     if (pending.popup) {
       const channel = new BroadcastChannel(`mcp-oauth:${state}`); channel.postMessage('connected'); channel.close();

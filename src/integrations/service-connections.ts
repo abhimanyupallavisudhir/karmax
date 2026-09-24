@@ -5,8 +5,13 @@ import Composio from '@composio/client';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { newId } from '../util/id.js';
+import { beginOAuth, finishOAuth, connectionHeaders, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
+import { openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
+import { registryServer } from '../mcp/connections/registry.js';
+import { validateTransport } from '../mcp/connections/store.js';
 
 const PREFIX = 'service-connection:';
+const MCP_CREDENTIALS = 'service-connection-mcp:';
 const KEY = 'service-connections:composio:api-key';
 const TTL = 30 * 60_000;
 export interface ServiceConnection {
@@ -27,8 +32,15 @@ export interface ServiceConnection {
   /** Set on a task grant: the owner's existing connection it uses. A grant
    * holds no provider account; revoking it never touches the account. */
   grantedConnectionId?: string;
+  /** A native MCP server account (instead of a Composio toolkit). Its OAuth
+   * credentials stay in the vault; the gateway calls the server for the task. */
+  mcp?: McpServer;
+  /** Changes on every sign-in, so a stale OAuth exchange cannot overwrite it. */
+  revision?: string;
   notifiedAt?: number;
 }
+export interface McpServer extends RemoteMcpTransport { auth: 'oauth' | 'none'; registry?: { name: string; version: string } }
+type OpenMcp = typeof openRemoteMcp;
 export interface ServiceTool { slug: string; name: string; description?: string; inputParameters?: unknown }
 export interface ConnectionBackend {
   catalog(search: string): Promise<Array<{ slug: string; name: string }>>;
@@ -88,7 +100,22 @@ export class ServiceConnections {
   private client?: ConnectionBackend;
   private locks = new Map<string, Promise<unknown>>();
   constructor(private store: Store, private broker: CredentialBroker,
-    private factory: (key: string) => ConnectionBackend = key => new ComposioBackend(key)) {}
+    private factory: (key: string) => ConnectionBackend = key => new ComposioBackend(key),
+    private openMcp: OpenMcp = openRemoteMcp) {}
+  private vault: OAuthVault = {
+    secret: (c) => {
+      const handle = MCP_CREDENTIALS + c.id;
+      return this.broker.hasHandle(handle) ? JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) : {};
+    },
+    setSecret: async (c, value) => {
+      if ((await this.get(c.organizationId, c.id)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
+      (await this.broker.registerHandle(MCP_CREDENTIALS + c.id, JSON.stringify(value)));
+    },
+  };
+  private target(c: ServiceConnection): OAuthTarget {
+    return { id: c.id, organizationId: c.organizationId, label: c.label, auth: c.mcp!.auth,
+      transport: { type: c.mcp!.type, url: c.mcp!.url }, revision: c.revision ?? '' };
+  }
 
   configured() { return this.broker.hasHandle(KEY); }
   async configure(key: string) {
@@ -160,13 +187,44 @@ export class ServiceConnections {
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() }));
       });
   }
-  private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
-  /** The person's own connected accounts that a task request can use without another sign-in. */
-  async reusable(org: string, ownerId: string, toolkit: string) {
-    return (await this.all()).filter(c => c.organizationId === org && c.ownerId === ownerId && c.toolkit === toolkit
-      && c.status === 'active' && c.accountId && !c.grantedConnectionId).map(c => this.view(c));
+  /** Resolves an agent's MCP request: an MCP Registry name or a public HTTPS URL. */
+  async resolveMcp(target: string): Promise<{ transport: RemoteMcpTransport; label: string; registry?: McpServer['registry'] }> {
+    target = target.trim();
+    if (target.startsWith('https://')) {
+      try { const transport = validateTransport({ type: 'http', url: target }) as RemoteMcpTransport; return { transport, label: new URL(transport.url).hostname }; }
+      catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'Invalid MCP server URL'); }
+    }
+    let entry;
+    try { entry = await registryServer(target); } catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'MCP Registry is unavailable', 502); }
+    if (!entry) throw new ConnectionError(`No MCP Registry server is named ${target}`, 404);
+    const remote = entry.options.find((o: any) => o.transport.type !== 'stdio');
+    if (!remote) throw new ConnectionError('This MCP server runs as a local process. Ask the user to add it in Tools settings.');
+    if (remote.fields.some((f: any) => f.isRequired || f.isSecret))
+      throw new ConnectionError('This MCP server needs an API key. Ask the user to add it in Tools settings.');
+    return { transport: remote.transport as RemoteMcpTransport, label: entry.title && entry.title !== entry.name ? entry.title : entry.name,
+      registry: { name: entry.name, version: entry.version } };
   }
-  async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string }) {
+  async requestMcp(org: string, server: Awaited<ReturnType<ServiceConnections['resolveMcp']>>, taskId: string, role: string, why: string) {
+    const open = async () => (await this.all()).find(c => c.organizationId === org && c.mcp?.url === server.transport.url && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status));
+    const prior = (await open());
+    if (prior) return prior;
+    let auth: McpServer['auth'];
+    try { auth = await remoteMcpAuth(server.transport); } catch { throw new ConnectionError('Could not reach that MCP server. Check its URL.', 502); }
+    return this.store.transaction(async () => (await open()) ?? (await this.save({ id: newId('conn'), organizationId: org,
+      toolkit: `mcp:${server.registry?.name ?? new URL(server.transport.url).hostname}`.slice(0, 120), label: server.label.slice(0, 120),
+      mcp: { ...server.transport, auth, ...(server.registry ? { registry: server.registry } : {}) },
+      taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() })));
+  }
+  private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
+  private sameApp(a: ServiceConnection, b: ServiceConnection) { return a.mcp ? a.mcp.url === b.mcp?.url : !b.mcp && a.toolkit === b.toolkit; }
+  /** An account the person connected themselves, rather than a grant of one. */
+  private isAccount(c: ServiceConnection) { return !c.grantedConnectionId && c.status === 'active' && (c.mcp ? true : !!c.accountId); }
+  /** The person's own connected accounts that a task request can use without another sign-in. */
+  async reusable(org: string, ownerId: string, app: string | ServiceConnection) {
+    const wanted = typeof app === 'string' ? { toolkit: app } as ServiceConnection : app;
+    return (await this.all()).filter(c => c.organizationId === org && c.ownerId === ownerId && this.sameApp(wanted, c) && this.isAccount(c)).map(c => this.view(c));
+  }
+  async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string; redirect?: string }) {
     return this.locked(input.id ?? `${org}:${ownerId}:${input.toolkit}`, async () => {
       let c = input.id ? (await this.get(org, input.id)) : undefined;
       if (c?.ownerId && c.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
@@ -175,16 +233,17 @@ export class ServiceConnections {
         if (!c?.taskId) throw new ConnectionError('Only a task request can use an existing account');
         const account = (await this.get(org, input.useConnectionId));
         if (account.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
-        if (account.toolkit !== c.toolkit || account.grantedConnectionId || account.status !== 'active' || !account.accountId)
-          throw new ConnectionError('That account is not connected for this app');
+        if (!this.sameApp(c, account) || !this.isAccount(account)) throw new ConnectionError('That account is not connected for this app');
         // An unfinished sign-in for this request is no longer needed.
         if (c.accountId) await this.remote(() => this.backend().disconnect(c!.accountId!));
+        if (c.mcp) (await this.broker.deleteHandle(MCP_CREDENTIALS + c.id));
         Object.assign(c, { ownerId, label: account.label, grantedConnectionId: account.id, status: 'active',
           accountId: undefined, sessionId: undefined, notifiedAt: undefined });
         (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
         (await this.audit(c, ownerId, 'granted'));
         return { connection: this.view(c) };
       }
+      if (c?.mcp) return this.connectMcp(c, ownerId, input.redirect);
       const toolkit = c?.toolkit ?? input.toolkit ?? '';
       this.slug(toolkit);
       if (input.restart && c?.status === 'connecting' && c.accountId && await this.remote(() => this.backend().active(c!.accountId!, toolkit))) {
@@ -217,9 +276,39 @@ export class ServiceConnections {
       return { connection: this.view(c), url: auth.url };
     });
   }
+  /** Signs the owner in to a native MCP server. Each sign-in stores fresh credentials. */
+  private async connectMcp(c: ServiceConnection, ownerId: string, redirect?: string) {
+    Object.assign(c, { ownerId, grantedConnectionId: undefined, revision: crypto.randomUUID(), notifiedAt: undefined });
+    (await this.broker.deleteHandle(MCP_CREDENTIALS + c.id));
+    if (c.mcp!.auth === 'none') { c.status = 'active'; (await this.save(c)); (await this.audit(c, ownerId, 'connected')); return { connection: this.view(c) }; }
+    if (!redirect) throw new ConnectionError('Configure the public Tavya URL before signing in to MCP servers', 503);
+    c.status = 'connecting'; (await this.save(c));
+    try {
+      const { authorizationUrl } = await beginOAuth(this.vault, this.target(c), `user:${ownerId}`, redirect);
+      return { connection: this.view(c), url: authorizationUrl, callback: 'mcp' as const };
+    } catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'MCP authorization failed', 502); }
+  }
+  /** Completes the owner's MCP sign-in from the browser callback's state and code. */
+  async finishMcp(org: string, id: string, ownerId: string, state: unknown, code: unknown) {
+    return this.locked(id, async () => {
+      const c = (await this.get(org, id));
+      if (!c.mcp || c.ownerId !== ownerId) throw new ConnectionError('Only the connection owner can finish this sign-in', 403);
+      if (c.status !== 'connecting') throw new ConnectionError('This sign-in is no longer pending. Connect again.', 409);
+      try { await finishOAuth(this.vault, this.target(c), `user:${ownerId}`, state as string, code as string); }
+      catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'MCP authorization failed'); }
+      c.status = 'active'; c.notifiedAt = undefined;
+      (await this.save(c)); (await this.audit(c, ownerId, 'connected'));
+      return this.view(c);
+    });
+  }
   async refresh(org: string, id: string) {
     return this.locked(id, async () => {
       const c = (await this.get(org, id));
+      if (c.mcp) {
+        // MCP sign-in completes only through its callback; abandoned sign-ins expire.
+        if (c.status === 'connecting' && Date.now() - c.updatedAt > TTL) { c.status = 'expired'; c.notifiedAt = undefined; (await this.save(c)); }
+        return c;
+      }
       if (!['connecting', 'active'].includes(c.status) || !c.accountId) return c;
       const active = await this.remote(() => this.backend().active(c.accountId!, c.toolkit));
       if (active && c.status === 'connecting') {
@@ -252,7 +341,7 @@ export class ServiceConnections {
       // Revoke local access first, even if upstream deletion is unavailable.
       if (!['disconnected', 'denied'].includes(c.status)) c.notifiedAt = undefined;
       c.status = c.ownerId ? 'disconnected' : 'denied'; c.projectIds = []; c.sessionId = undefined;
-      (await this.save(c)); (await this.broker.deleteHandle(PREFIX + id));
+      (await this.save(c)); (await this.broker.deleteHandle(PREFIX + id)); (await this.broker.deleteHandle(MCP_CREDENTIALS + id));
       for (const grant of (await this.all()).filter(g => g.grantedConnectionId === c.id && g.status !== 'disconnected'))
         (await this.save({ ...grant, status: 'disconnected', notifiedAt: undefined }));
       if (c.accountId) { await this.remote(() => this.backend().disconnect(c.accountId!)); c.accountId = undefined; (await this.save(c)); }
@@ -265,17 +354,32 @@ export class ServiceConnections {
     if (!c.ownerId || !(await this.store.organizationMembership(org, c.ownerId))) throw new ConnectionError('The account owner is no longer a member of this organization', 403);
     if (!this.canUse(c, taskId, projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
     const account = c.grantedConnectionId && c.status === 'active' ? (await this.get(org, c.grantedConnectionId)) : c;
-    if (c.status !== 'active' || account.ownerId !== c.ownerId || account.status !== 'active' || !account.sessionId)
+    if (c.status !== 'active' || account.ownerId !== c.ownerId || account.status !== 'active' || !(account.mcp || account.sessionId))
       throw new ConnectionError('Reconnect this account in Connections before using it', 409);
     return account;
   }
   async tools(org: string, id: string, taskId: string, projectId: string, search: string) {
     const c = (await this.authorized(org, id, taskId, projectId));
+    if (c.mcp) return timed('service.catalog.remote', () => this.mcpCall(c, taskId, async client => {
+      const tools = [];
+      for (let cursor: string | undefined, page = 0; page < 10 && (page === 0 || cursor); page++) {
+        const result = await client.listTools(cursor ? { cursor } : undefined, { timeout: 30_000 });
+        tools.push(...result.tools); cursor = result.nextCursor;
+      }
+      const words = search.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2);
+      const matches = tools.filter(t => words.some(w => `${t.name} ${t.title ?? ''} ${t.description ?? ''}`.toLowerCase().includes(w)));
+      return (matches.length ? matches : tools).slice(0, 30).map(t => ({ slug: t.name, name: t.title ?? t.name, description: t.description, inputParameters: t.inputSchema }));
+    }));
     return timed('service.catalog.remote', () => this.remote(() => this.backend().tools(c.toolkit, search.slice(0, 200))));
   }
   async execute(org: string, id: string, taskId: string, projectId: string, slug: string, args: Record<string, unknown>) {
     return this.locked(id, async () => {
       const c = (await this.authorized(org, id, taskId, projectId));
+      if (c.mcp) {
+        if (!/^[A-Za-z0-9_.\-/]{1,128}$/.test(slug)) throw new ConnectionError('Invalid tool name');
+        (await this.audit(c, `task:${taskId}`, 'execute', slug));
+        return timed('service.action.remote', () => this.mcpCall(c, taskId, client => client.callTool({ name: slug, arguments: args }, undefined, { timeout: 60_000 })), undefined, toolFailed);
+      }
       // The session is pinned to exactly one toolkit and connected account.
       // Reject meta-tools, including proxy, remote bash and connection managers.
       if (!/^[A-Z][A-Z0-9_]{1,199}$/.test(slug) || !slug.startsWith(c.toolkit.toUpperCase() + '_') || slug.startsWith('COMPOSIO_'))
@@ -289,6 +393,20 @@ export class ServiceConnections {
       (await this.audit(c, `task:${taskId}`, 'execute', slug));
       return timed('service.action.remote', () => this.remote(async () => (await this.backend().execute(c.sessionId!, slug, args))), undefined, toolFailed);
     });
+  }
+  /** One bounded MCP session with the account's current credentials. Never retried. */
+  private async mcpCall<T>(c: ServiceConnection, taskId: string, run: (client: Awaited<ReturnType<OpenMcp>>) => Promise<T>): Promise<T> {
+    let headers: Record<string, string>;
+    try { headers = await connectionHeaders(this.vault, this.target(c), taskId); }
+    catch { throw new ConnectionError('Account access expired; reconnect it in Connections', 409); }
+    let client: Awaited<ReturnType<OpenMcp>> | undefined;
+    try {
+      client = await this.openMcp({ type: c.mcp!.type, url: c.mcp!.url }, headers);
+      return await run(client);
+    } catch (e) {
+      if (e instanceof ConnectionError) throw e;
+      throw new ConnectionError('The MCP server could not complete this request. Retry or reconnect the account.', 502);
+    } finally { await client?.close().catch(() => {}); }
   }
   private async audit(c: ServiceConnection, principalId: string, action: string, tool?: string) {
     (await this.store.appendAudit({ principalId, action: `connection.${action}`, scopeKey: c.organizationId,
