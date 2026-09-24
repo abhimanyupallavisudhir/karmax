@@ -528,7 +528,7 @@ describe('subscription administration HTTP authorization', () => {
         monthlyAdditionalActiveUserPriceCents: 0, currency: 'usd', billingInterval: 'month',
         autoRenews: true, renewalDisclosure: expect.stringMatching(/renews monthly/i),
         cancellationDisclosure: expect.stringMatching(/cancel online/i),
-        refundDisclosure: expect.stringMatching(/non-refundable/i),
+        refundDisclosure: expect.stringMatching(/payment provider.*buyer terms/i),
       },
     });
   });

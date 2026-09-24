@@ -198,7 +198,8 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/skills', 'POST /api/safe-mode',
   ],
   installation: [
-    'GET|PUT /api/settings/paid-launch (installation operator: persisted legal entity, Stripe Billing catalog/secrets, paid-checkout gate, and founder task checklist)',
+    'GET|PUT /api/settings/paid-launch (installation operator: legal operator, billingProvider stripe|paddle, provider catalog and encrypted secrets, checkout gate, founder checklist)',
+    'POST /api/settings/paid-launch/paddle/provision (settings:write; discover/create monthly prices, client token, and signed webhook; does not enable live checkout)',
     'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
     'GET /api/email', 'POST /api/email/connect|test',
     'GET|POST /api/remote-access',
@@ -266,6 +267,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/organizations/:organizationId/subscription/gift (subscription:gift, God authority; Idempotency-Key required; body {plan:individual|team|null}; null removes the gift; existing paid billing continues)',
     'GET /api/organizations/:organizationId/subscription/status (hosted SaaS plan and verified seat/payment state; self-hosted reports unmetered)',
     'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (owner-only hosted SaaS billing; mutation calls require Idempotency-Key; checkout body also requires {plan,acceptedPolicies:true,policyVersions})',
+    'POST /api/organizations/:organizationId/subscription/reconcile (owner-only; checks an uncertain Paddle request using provider reads only; never retries a payment)',
     'GET /api/organizations/:organizationId/payments/providers',
     'POST /api/organizations/:organizationId/payments/connect',
     'DELETE /api/organizations/:organizationId/payments/connections/:provider',

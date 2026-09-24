@@ -7,8 +7,8 @@
  */
 import { HOSTED_PLANS } from '../domain/entitlements.js';
 
-export const POLICY_VERSION = '2026-08-15';
-export const POLICY_EFFECTIVE_DATE = 'August 15, 2026';
+export const POLICY_VERSION = '2026-09-24';
+export const POLICY_EFFECTIVE_DATE = 'September 24, 2026';
 export const POLICY_DRAFT_NOTICE = 'Initial founder-reviewed launch draft — not legal advice. Counsel review remains required before final publication.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
@@ -73,7 +73,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'For repository, prompt, task, workspace, credential, and output data a business customer submits, the customer generally determines the purpose and the operator processes that data to provide the service. The contract and requested DPA control where applicable law assigns different roles.',
       ], bullets: [
         'Account data: name, email, login providers, memberships, preferences, sessions, and security events.',
-        'Billing data: plan, price, renewal state, Stripe customer/subscription references, acceptance evidence, refunds, and support history. Full card numbers are handled by Stripe and are not stored by krmax.',
+        'Billing data: plan, price, renewal state, payment-provider customer/subscription references, acceptance evidence, refunds, and support history. The checkout payment provider handles subscription card details; krmax does not store full subscription payment-card numbers.',
         'Customer workspace data: repository files and metadata, prompts, tasks, messages, outputs, environment state, attachments, connected-service data, and audit events.',
       ] },
       { heading: 'How data is used', paragraphs: ['Data is used to provide and secure the service, execute customer instructions, authenticate users, administer subscriptions, respond to support and legal requests, prevent abuse, and maintain reliable operations. This draft does not authorize selling personal data or using private customer repository/workspace content to train general-purpose models.'] },
@@ -91,7 +91,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     slug: 'billing', title: 'Subscription, Refund & Cancellation Terms', summary: 'Price display, automatic renewal, refunds, downgrades, and online cancellation.',
     sections: [
       { heading: 'Before a charge', paragraphs: [
-        'Organization settings show the central plan catalog, current active-user total, currency, monthly billing frequency, renewal rule, and cancellation path before redirecting to Stripe. Stripe then shows its provider checkout summary before charge; the operator must keep its configured price identifiers aligned with the public catalog.',
+        'Organization settings show the central plan catalog, current active-user total, currency, monthly billing frequency, renewal rule, and cancellation path before checkout. The payment provider shows the final summary before charge. Where checkout is provided by Paddle, Paddle is the merchant of record and reseller for that purchase, handles applicable customer sales taxes, and issues payment receipts. Paddle buyer terms and privacy information are presented at checkout.',
         'A subscription renews automatically at the displayed interval until canceled. Applicable taxes may be added by the payment provider where required. Any future price change must be disclosed before it applies as required by law.',
       ] },
       { heading: 'Cancellation and renewal', paragraphs: [
@@ -99,8 +99,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Deleting an account does not silently replace subscription cancellation. The account-deletion flow directs customers to cancel first and support must resolve any active billing relationship as part of deletion.',
       ] },
       { heading: 'Refunds and downgrades', paragraphs: [
-        'Except where law requires otherwise or the checkout display expressly offers a refund window, payments are non-refundable and unused time is not credited. Duplicate or erroneous charges should be reported to the configured billing contact promptly.',
-        'If multiple paid plans are offered, a downgrade takes effect on the date shown before confirmation, normally the next renewal. Feature or usage limits may change then. This draft does not promise a plan or proration behavior that is not configured in the product.',
+        'Request refunds or report duplicate or erroneous charges through the configured billing contact or the payment provider. Paddle purchases are subject to Paddle’s buyer terms and refund decisions. Statutory consumer rights are not excluded. Approved Paddle refunds are processed through Paddle, not by a separate direct payment from krmax.',
+        'Plan and active-user changes take effect after confirmation by the payment provider. Prorated adjustments are added to the next bill. A downgrade can reduce feature or usage limits when confirmed; cancellation at period end is a separate action.',
       ] },
     ],
   },
@@ -108,7 +108,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     slug: 'subprocessors', title: 'Subprocessor List', summary: 'Providers that may handle account, billing, repository, or workspace data.',
     sections: [
       { heading: 'Core and conditional providers', paragraphs: ['The exact provider set depends on deployment and customer configuration. A provider receives only the categories needed for its role.'], bullets: [
-        'Stripe — checkout, card handling, invoices, subscription administration, refunds, and billing identifiers; not customer repository/workspace content.',
+        'Paddle — merchant-of-record checkout, customer sales taxes, receipts, subscriptions, refunds, and related billing identifiers when Paddle is selected. Paddle also acts as an independent controller for its own payment and legal obligations; it does not receive repository/workspace content for subscription billing.',
+        'Stripe — legacy subscription billing where configured, and the separate agent-card integration when selected; receives the account and payment information required for those functions, not repository/workspace content for subscription billing.',
         'OpenAI and Anthropic — prompts, selected repository/workspace context, attachments, and outputs when their model or connected subscription is selected. BYOK uses the customer’s provider account; managed usage uses the operator’s account.',
         'E2B or Daytona — isolated compute, repository checkout, workspace files, environment variables made available to the world, command traffic, and resulting artifacts when that cloud world provider is selected.',
         'Configured database, object-storage, hosting, email, monitoring, and support providers — account records, service metadata, stored objects, transactional messages, diagnostics, or support content as needed for their function.',
@@ -122,7 +123,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     sections: [
       { heading: 'Operational safeguards', paragraphs: [
         'krmax uses scoped authorization, isolated execution worlds, encrypted credential storage, reviewed change flows, audit events, and provider-specific access boundaries. Customers remain responsible for repository permissions, connected accounts, agent grants, budgets, and reviewing proposed changes.',
-        'No SOC 2, ISO 27001, HIPAA, PCI, GDPR, or other certification or compliance status is claimed unless a separately signed document explicitly says so. Stripe handles payment-card entry; that fact alone is not a krmax certification.',
+        'No SOC 2, ISO 27001, HIPAA, PCI, GDPR, or other certification or compliance status is claimed unless a separately signed document explicitly says so. The subscription payment provider handles payment-card entry; that fact alone is not a krmax certification.',
       ] },
       { heading: 'Responsible disclosure', paragraphs: ['Send suspected vulnerabilities to the configured security contact with reproduction details, impact, and a safe way to reply. Do not access other customers’ data, degrade service, or publicly disclose an unresolved issue. The operator will acknowledge and coordinate in good faith; this draft does not invent a bounty or guaranteed response time.'] },
       { heading: 'Incidents', paragraphs: ['Customers should use the configured incident contact for suspected account compromise or exposure. The operator will investigate, contain, preserve relevant evidence, and notify affected customers as required by contract and applicable law.'] },
@@ -175,7 +176,7 @@ export const CHECKOUT_DISCLOSURES = Object.freeze({
   autoRenews: true,
   renewalDisclosure: 'The subscription renews monthly until canceled.',
   cancellationDisclosure: 'Cancel online from Organization settings before renewal; cancellation normally takes effect at the end of the current paid period.',
-  refundDisclosure: 'Payments are non-refundable except where law requires or the checkout display expressly states otherwise.',
+  refundDisclosure: 'Refunds are subject to applicable law and the payment provider’s buyer terms. Request a refund through billing support or the payment provider.',
 });
 
 export function policyVersions(context: AcceptanceContext): Record<string, string> {

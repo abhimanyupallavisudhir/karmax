@@ -4,6 +4,56 @@ Karmax keeps its trusted control plane on the VPS and runs repository code,
 agents, terminals, tests, and previews in isolated E2B or Daytona worlds. The
 normal self-hosted installation needs only Docker, a domain, and two DNS records.
 
+## Hosted subscription billing with Paddle
+
+Hosted operators can select **Paddle** in **Installation → Paid-launch setup**.
+This is separate from the cards agents use to buy services. Private/self-hosted
+installations remain unmetered. Existing Stripe subscriptions retain their
+provider and webhook route; changing the default does not migrate customers.
+
+1. Create a Paddle Billing account and complete its website, identity and payout
+   checks. A UK individual can onboard as a sole trader; incorporation is not an
+   application requirement. Publish the actual operator and reviewed policies.
+2. Save a same-environment Paddle API key, then choose **Set up Paddle
+   automatically** (or POST `/api/settings/paid-launch/paddle/provision` with
+   installation authority). Setup discovers/reuses the two products, three USD
+   monthly prices, browser token and signed notification destination. It does
+   not enable paid checkout or approve legal terms. The setup key needs read/write
+   product, price, client-token and notification-setting permissions. Runtime
+   needs transaction and subscription read/write; keep keys in the vault and
+   arrange rotation before their expiry.
+3. In Paddle's Checkout settings, save the default payment link as
+   `https://YOUR_DOMAIN/billing/checkout`. Live domains require Paddle approval.
+   Sandbox accepts test domains. This setting is required even when transactions
+   supply their own checkout URL.
+4. Verify checkout, signed events, seats, plan changes, portal, failed-payment
+   recovery and cancellation in a separate sandbox installation. Never switch
+   an installation with Paddle billing records between sandbox and live.
+5. Review the exact policy version and enable paid launch only after live
+   verification. Setup never checks off the founder's review on their behalf.
+
+New Paddle checkout uses server-created transactions; only signed subscription
+events grant access. `/api/subscriptions/paddle/checkout-config` exposes the
+public browser token, never the API key or signing secret. The Paddle webhook is
+`/api/subscriptions/paddle/webhook`; the original `/api/subscriptions/webhook`
+continues handling Stripe. Sandbox notification simulators must never be sent
+to an installation handling live entitlements.
+
+An unchanged pending checkout is reused. Changing its commercial terms cancels
+the previous unpaid link before creating a replacement. Owners can also cancel
+an abandoned checkout from Plan & billing before deleting the organization.
+Paddle writes are serialized locally: network/5xx uncertainty retains a durable
+reservation, not an automatic retry. **Check pending billing request** (POST
+`/api/organizations/:id/subscription/reconcile`, owner authority) performs only
+provider reads after a one-minute settling period. It releases the reservation
+only when the result can be proven. If still uncertain, the operator must inspect
+Paddle and the retained request before resolving it; do not blindly delete locks
+or replay financial requests. Entitlements still wait for signed events.
+
+The legacy `KARMAX_SUBSCRIPTION_PROVIDER=paddle` and
+`KARMAX_SUBSCRIPTION_PADDLE_*` environment settings remain a bootstrap option;
+the normal setup uses encrypted installation settings and needs no `.env` edits.
+
 ## Turnkey VPS installation
 
 On an Ubuntu/Debian VPS (including one.com), install Docker Engine with its

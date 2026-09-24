@@ -259,8 +259,13 @@ async function main() {
   // the agent card registry above. Self-hosted installs construct the service so
   // status calls can report "unmetered", but it never contacts Stripe there.
   const { StripeSubscriptionProvider, SubscriptionBillingService } = await import('./billing/subscriptions.js');
-  const subscriptionBilling = new SubscriptionBillingService(store,
-    new StripeSubscriptionProvider(async () => (await paidLaunchSettings.subscriptionConfig()), fetch), deployment.hosted);
+  const { PaddleSubscriptionProvider } = await import('./billing/paddle.js');
+  const subscriptionBilling = new SubscriptionBillingService(store, async (name) => {
+    const selected = name ?? `${await paidLaunchSettings.billingProvider()}-billing`;
+    if (selected === 'paddle-billing') return new PaddleSubscriptionProvider(() => paidLaunchSettings.paddleConfig());
+    if (selected === 'stripe-billing') return new StripeSubscriptionProvider(() => paidLaunchSettings.subscriptionConfig());
+    throw new Error(`unsupported subscription provider ${selected}`);
+  }, deployment.hosted);
   const { LoginManager } = await import('./autonomy/login.js');
   const login = new LoginManager(configHomes);
   // A managed worker so newly-installed workflow packages can be picked up by

@@ -13931,21 +13931,41 @@ async function wirePaidLaunchCard() {
   catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
   const contacts = state.contacts || {};
   const stripe = state.stripe || {};
+  const paddle = state.paddle || {};
   const completed = new Set(state.completedTasks || []);
   const groups = [...new Set((state.tasks || []).map((task) => task.group))];
   const readiness = state.paidLaunch
     ? '<span class="chip" style="color:var(--ok,#4ec9a3)">paid checkout live</span>'
     : state.canEnable ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready to enable</span>'
       : '<span class="chip">setup incomplete</span>';
-  const missing = [...(state.missing || []), ...(stripe.missing || [])];
+  const missing = [...(state.missing || []), ...(state.billingMissing || stripe.missing || [])];
   const taskMarkup = groups.map((group) => `<div class="section-h" style="margin-top:18px">${esc(group)}</div>${(state.tasks || [])
     .filter((task) => task.group === group).map((task) => `<label class="card" style="display:flex;gap:10px;padding:12px;margin:8px 0;cursor:pointer">
       <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
       <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
   box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
-    <p class="task-sub">This is the control center for selling subscriptions on ${esc(location.host)}. Values are saved with the installation; Stripe secrets are encrypted in the ${siteNameMarkup()} vault and are never returned to the browser. No paid-launch environment variables are required.</p>
+    <p class="task-sub">Subscription settings for ${esc(location.host)}. Secret keys stay encrypted in the vault.</p>
     ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
-
+    <label class="form-row">Billing provider<select class="paid-billing-provider"><option value="paddle" ${state.billingProvider === 'paddle' ? 'selected' : ''}>Paddle · merchant of record</option><option value="stripe" ${state.billingProvider !== 'paddle' ? 'selected' : ''}>Stripe Billing</option></select></label>
+    <div class="paid-paddle-section" ${state.billingProvider === 'paddle' ? '' : 'hidden'}>
+      <div class="section-h" style="margin-top:18px">Paddle Billing</div>
+      <div class="settings-grid">
+        <label class="form-row">Environment<select class="paid-paddle-environment"><option value="sandbox" ${paddle.environment === 'sandbox' ? 'selected' : ''}>Sandbox</option><option value="live" ${paddle.environment !== 'sandbox' ? 'selected' : ''}>Live</option></select></label>
+        <label class="form-row">API key<input class="paid-paddle-api-key" type="password" autocomplete="new-password" placeholder="${paddle.secretKeyConfigured ? 'Configured — leave blank to keep' : 'pdl_…_apikey_…'}" /></label>
+      </div>
+      <button type="button" class="btn paid-paddle-provision" ${state.canManage && paddle.secretKeyConfigured ? '' : 'disabled'} title="Save the API key first. Creates or reuses products, monthly prices, a client token and a signed webhook. Does not enable checkout.">Set up Paddle automatically</button>
+      <details style="margin-top:12px"><summary>Integration details</summary><div class="settings-grid">
+        <label class="form-row">Client-side token<input class="paid-paddle-client-token" value="${esc(paddle.clientToken || '')}" /></label>
+        <label class="form-row">Webhook secret<input class="paid-paddle-webhook" type="password" autocomplete="new-password" placeholder="${paddle.webhookSecretConfigured ? 'Configured — leave blank to keep' : 'pdl_ntfset_…'}" /></label>
+        <label class="form-row">Individual $9 price<input class="paid-paddle-individual-price" value="${esc(paddle.individualPriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Team $19 base price<input class="paid-paddle-team-base-price" value="${esc(paddle.teamBasePriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Additional user $5 price<input class="paid-paddle-team-seat-price" value="${esc(paddle.teamSeatPriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Default payment link<input value="${esc(paddle.checkoutUrl || '')}" readonly /></label>
+        <label class="form-row">Webhook destination<input value="${esc(paddle.webhookUrl || '')}" readonly /></label>
+      </div></details>
+      <p class="task-sub">Paddle must approve your identity and checkout domain before going live.</p>
+    </div>
+    <div class="paid-stripe-section" ${state.billingProvider === 'paddle' ? 'hidden' : ''}>
     <div class="section-h" style="margin-top:18px">Stripe Billing</div>
     <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. ${siteNameMarkup()} uses hosted Stripe Checkout, so it does not need a publishable key.</p>
     <ol class="task-sub"><li>Create the live recurring products/prices described in the founder checklist below.</li><li>In Stripe Workbench, create a snapshot webhook destination at <span class="mono">${esc(stripe.webhookUrl || '')}</span>, select API version <span class="mono">${esc(stripe.apiVersion || '')}</span>, and subscribe to: <span class="mono">${esc((stripe.webhookEvents || []).join(', '))}</span>.</li><li>Paste the live secret key, webhook signing secret, and IDs here. Blank secret fields keep the encrypted values already saved.</li><li>Configure and test the Stripe customer portal, then exercise the full lifecycle in test mode before enabling checkout.</li></ol>
@@ -13959,11 +13979,12 @@ async function wirePaidLaunchCard() {
       <label class="form-row">Team product ID (optional)<input class="paid-stripe-team-product" value="${esc(stripe.teamProductId || '')}" placeholder="prod_…" /></label>
       <label class="form-row">Webhook destination<input value="${esc(stripe.webhookUrl || '')}" readonly /></label>
     </div>
+    </div>
 
     <div class="section-h" style="margin-top:18px">Legal operator and public contacts</div>
     <p class="task-sub">Use the contracting entity’s exact details. These values populate public policies and support/deletion flows. Ask qualified counsel to review the supplied policy drafts for the business, jurisdiction, data flows, and customers.</p>
     <div class="settings-grid">
-      <label class="form-row">Legal entity name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" /></label>
+      <label class="form-row">Legal operator name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" title="Your legal name as a sole trader, or the registered company name." /></label>
       <label class="form-row">Country of establishment<input class="paid-operator-country" value="${esc(state.operatorCountry || '')}" /></label>
       <label class="form-row">Governing law and courts<input class="paid-governing-law" value="${esc(state.governingLaw || '')}" placeholder="e.g. laws of …; courts of …" /></label>
       <label class="form-row">Legal notice address<textarea class="paid-legal-address" rows="3">${esc(state.legalNoticeAddress || '')}</textarea></label>
@@ -13981,13 +14002,23 @@ async function wirePaidLaunchCard() {
     ${taskMarkup}
 
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
-      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Only turn this on after the legal and Stripe configuration is complete. Disabling it immediately closes new paid checkout without deleting subscriptions or settings.</span></span></label>
+      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
     <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
   box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
     try {
       await api('/api/settings/paid-launch', { method: 'PUT', body: JSON.stringify({
+        billingProvider: box.querySelector('.paid-billing-provider').value,
+        paddle: {
+          environment: box.querySelector('.paid-paddle-environment').value,
+          apiKey: box.querySelector('.paid-paddle-api-key').value || undefined,
+          webhookSecret: box.querySelector('.paid-paddle-webhook').value || undefined,
+          clientToken: box.querySelector('.paid-paddle-client-token').value,
+          individualPriceId: box.querySelector('.paid-paddle-individual-price').value,
+          teamBasePriceId: box.querySelector('.paid-paddle-team-base-price').value,
+          teamSeatPriceId: box.querySelector('.paid-paddle-team-seat-price').value,
+        },
         paidLaunch: box.querySelector('.paid-launch-enabled').checked,
         founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
         operatorName: box.querySelector('.paid-operator-name').value,
@@ -14017,6 +14048,25 @@ async function wirePaidLaunchCard() {
       S.launch = await api('/api/launch');
       await wirePaidLaunchCard();
     } catch (error) { toast(error.message, true); await wirePaidLaunchCard(); }
+  });
+  box.querySelector('.paid-billing-provider').addEventListener('change', (event) => {
+    box.querySelector('.paid-paddle-section').hidden = event.target.value !== 'paddle';
+    box.querySelector('.paid-stripe-section').hidden = event.target.value === 'paddle';
+    box.querySelector('.paid-launch-enabled').checked = false;
+  });
+  box.querySelector('.paid-paddle-environment').addEventListener('change', () => {
+    for (const field of ['client-token', 'webhook', 'api-key', 'individual-price', 'team-base-price', 'team-seat-price'])
+      box.querySelector(`.paid-paddle-${field}`).value = '';
+    box.querySelector('.paid-launch-enabled').checked = false;
+    box.querySelector('.paid-paddle-provision').disabled = true;
+  });
+  box.querySelector('.paid-paddle-provision')?.addEventListener('click', async (event) => {
+    event.target.disabled = true;
+    try {
+      await api('/api/settings/paid-launch/paddle/provision', { method: 'POST', body: '{}' });
+      toast('Paddle integration configured. Complete domain and identity review in Paddle.');
+    } catch (error) { toast(error.message, true); }
+    await wirePaidLaunchCard();
   });
 }
 // ── card fields ──────────────────────────────────────────────────────────────
@@ -16763,10 +16813,10 @@ async function hydrateOrganizationSubscription(organizationId) {
     ? ` Access continues through ${new Date(state.graceEndsAt).toLocaleDateString()}.` : '';
   const checkoutReturn = new URLSearchParams(location.search).get('billing');
   const checkoutNotice = checkoutReturn === 'success'
-    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for Stripe’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
+    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for the billing provider’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
     : checkoutReturn === 'canceled'
       ? '<div class="card" style="margin:12px 0;padding:12px"><b>Checkout canceled</b><p class="task-sub">No plan change was applied.</p></div>' : '';
-  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until Stripe confirms payment.')}${esc(grace)}</p></div>` : '';
+  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until payment is confirmed.')}${esc(grace)}</p></div>` : '';
   const individual = catalog.individual || {};
   const team = catalog.team || {};
   const ownerDisabled = state.canManage ? '' : 'disabled title="Only an organization owner can administer this subscription"';
@@ -16802,6 +16852,8 @@ async function hydrateOrganizationSubscription(organizationId) {
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
     ${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
     ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
+    ${state.pendingRequest ? `<p class="task-sub">A billing request is pending confirmation. Wait a minute, then check its result before retrying. <button class="btn sm billing-reconcile" ${ownerDisabled}>Check pending billing request</button></p>` : ''}
+    ${state.pendingCheckout && !hasSubscription ? `<p class="task-sub">An unpaid checkout is open. <button class="btn sm billing-cancel-checkout" ${ownerDisabled}>Cancel pending checkout</button></p>` : ''}
     ${!state.gift || hasSubscription ? `<p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Paid plan and seat changes take effect after billing confirmation. ${policyLinks(['billing'])}</p>` : ''}`;
   const saveGift = async (plan, button) => {
     button.disabled = true;
@@ -16845,23 +16897,40 @@ async function hydrateOrganizationSubscription(organizationId) {
   });
   box.querySelector('.billing-change')?.addEventListener('click', async (event) => {
     const plan = event.currentTarget.dataset.plan;
-    if (!confirm(`Change this organization to ${names[plan]}? Stripe will prorate the current billing period.`)) return;
+    if (!confirm(`Change this organization to ${names[plan]}? The billing provider will prorate the current billing period.`)) return;
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/change`, {
       method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
-    }); toast('Plan change submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    }); toast('Plan change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
     catch (error) { toast(error.message, true); }
   });
   box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
     if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
       method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
-    }); toast('Cancellation submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    }); toast('Cancellation submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
     catch (error) { toast(error.message, true); }
   });
   box.querySelector('.billing-sync')?.addEventListener('click', async () => {
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/sync-seats`, {
       method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
     }); toast('Seat reconciliation submitted.'); } catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-reconcile')?.addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/reconcile`, { method: 'POST' });
+      toast(result.reconciled ? 'Billing result confirmed. You can continue.' : 'Result still uncertain. Contact billing support; no payment has been retried.', !result.reconciled);
+      await hydrateOrganizationSubscription(organizationId);
+    } catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-cancel-checkout')?.addEventListener('click', async () => {
+    if (!confirm('Cancel the unpaid checkout? Its existing payment link will stop working.')) return;
+    try {
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+      });
+      toast('Pending checkout canceled.');
+      await hydrateOrganizationSubscription(organizationId);
+    } catch (error) { toast(error.message, true); }
   });
 }
 
@@ -18248,7 +18317,7 @@ function renderPricing() {
     <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
       <div class="pricing-grid">${cards}</div>
-      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Payments are non-refundable except where law requires or checkout expressly states otherwise.</p>
+      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Refunds are subject to applicable law and the payment provider’s buyer terms. Request refunds through billing support or the payment provider.</p>
       ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
       <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>${legalFooter()}</div>`;
   window.onpopstate = () => boot();
