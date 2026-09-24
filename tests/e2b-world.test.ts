@@ -337,6 +337,36 @@ describe('E2B cloud world provider', () => {
     await expect(world.exec('pwd', [])).rejects.toMatchObject({ code: 'ETIMEDOUT' });
   });
 
+  it('reports a stdin command that exited before its input arrived by its own exit, not the stale pid', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'stdin-exited', base: 'main' });
+    const notFound = () => Promise.reject(Object.assign(new Error('[not_found] process with pid 2185 not found'), { code: 5 }));
+    sandbox.commands.run = (async () => ({
+      pid: 2185, sendStdin: notFound, closeStdin: notFound, kill: async () => false,
+      wait: async () => { throw Object.assign(new Error('exit status 1'), { exitCode: 1, stdout: '',
+        stderr: "Error: Cannot find module '/home/user/karmax/repo/.karmax/cdp-fill.mjs'" }); },
+    })) as any;
+
+    expect(await world.exec('node', ['.karmax/cdp-fill.mjs'], { input: 'secret' })).toEqual({
+      stdout: '', stderr: "Error: Cannot find module '/home/user/karmax/repo/.karmax/cdp-fill.mjs'", code: 1 });
+  });
+
+  it('keeps the stdin transport error when the command is still running', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'stdin-transport', base: 'main' });
+    let killed = 0;
+    sandbox.commands.run = (async () => ({
+      pid: 7, closeStdin: async () => undefined, kill: async () => { killed++; return true; },
+      sendStdin: async () => { throw Object.assign(new Error('E2B stdin request failed'), { code: 'ECONNRESET' }); },
+      wait: async () => { throw new Error('wait must not be awaited for a live command'); },
+    })) as any;
+
+    await expect(world.exec('node', ['helper.mjs'], { input: 'secret' })).rejects.toMatchObject({ code: 'ECONNRESET' });
+    expect(killed).toBe(1);
+  });
+
   it('fails rather than silently reviewing the wrong branch', async () => {
     const sandbox = fakeSandbox(() => undefined);
     sandbox.commands.run = async (command) => ({
