@@ -321,6 +321,9 @@ export interface WorldDesktopSession {
 
 export interface World {
   handle: WorldHandle;
+  /** Same task boundary without application environment injection. Provider
+   * bootstrap/model subprocesses use this; agent work retains the decorated world. */
+  withoutProjectEnvironment?(): World;
   exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
   readFile(relPath: string): Promise<string>;
   readFileBuffer(relPath: string): Promise<Buffer>;

@@ -10,6 +10,7 @@ const STUB = `#!/usr/bin/env node
 const fs = require('fs');
 const readline = require('readline');
 const out = process.env.STUB_REQUESTS_OUT;
+if (out) fs.appendFileSync(out, JSON.stringify({ kind: 'harness-env', openai: process.env.OPENAI_API_KEY, codex: process.env.CODEX_API_KEY, database: process.env.DATABASE_URL }) + '\\n');
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const msg = JSON.parse(line);
@@ -114,7 +115,7 @@ describe('CodexAdapter app-server security policy', () => {
   });
 
   let lastResult: any;
-  async function run(session?: string, mode?: string, fork = false, ctx: any = {}): Promise<any[]> {
+  async function run(session?: string, mode?: string, fork = false, ctx: any = {}, secretEnv?: Record<string, string>): Promise<any[]> {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-app-server-'));
     const stub = path.join(dir, 'codex-stub.cjs');
     const requests = path.join(dir, 'requests.jsonl');
@@ -140,7 +141,7 @@ describe('CodexAdapter app-server security policy', () => {
         messages: [{ id: 'm', role: 'user', text: 'prepare the branch', ts: 0 }],
         systemPrompt: 'Prepare the branch for merge.',
         role: 'merge',
-        resolvedAuth: { configHome: dir },
+        resolvedAuth: { configHome: dir }, secretEnv,
         ...(session ? { session } : {}), ...(fork ? { fork: true } : {}),
       } as any,
       { emit() {}, emitActivity() {}, ...ctx } as any,
@@ -150,6 +151,17 @@ describe('CodexAdapter app-server security policy', () => {
 
   /** Subscription (app-server) turns used to report no usage at all, so every
    * GPT turn showed 0 tokens in Insights while its turns and time counted. */
+  it.each(['fresh', 'resume', 'fork'])('keeps work secrets out of the harness and restores them only to shell tools (%s)', async (mode) => {
+    const secretEnv = { OPENAI_API_KEY: 'project-openai', CODEX_API_KEY: 'project-codex', DATABASE_URL: 'project-db', NODE_OPTIONS: '--invalid-project-option' };
+    const session = mode === 'fresh' ? undefined : '11111111-1111-4111-8111-111111111111';
+    const records = await run(session, undefined, mode === 'fork', {}, secretEnv);
+    expect(records.find(r => r.kind === 'harness-env').database).toBeUndefined();
+    expect(records.find(r => r.kind === 'harness-env').openai).toBeFalsy();
+    expect(records.find(r => r.kind === 'harness-env').codex).toBeFalsy();
+    const method = mode === 'fresh' ? 'thread/start' : mode === 'fork' ? 'thread/fork' : 'thread/resume';
+    expect(records.find(r => r.method === method).params.config['shell_environment_policy.set']).toEqual(secretEnv);
+  });
+
   it('reports provider token usage for the requests this turn made', async () => {
     await run('11111111-1111-4111-8111-111111111111', 'usage');
     expect(lastResult.usage).toEqual({ inputTokens: 3000, outputTokens: 50, cacheReadTokens: 2400,

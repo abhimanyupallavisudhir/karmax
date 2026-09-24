@@ -26,6 +26,27 @@ describe('model-agnostic harness credential routing', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it.each(['claude', 'codex'] as const)('%s login and API credentials follow the configured order in either direction', async (provider) => {
+    const organization = await store.createOrganization({ name: 'Ordering' });
+    const project = await store.createProject('Work', {}, organization.id);
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const handle = `${provider}:${organization.id}:key`;
+    await broker.registerHandle(handle, 'fixture-api-key');
+    const configHomes = new ConfigHomeManager(path.join(dir, 'homes'));
+    const home = configHomes.ensure(provider, 'subscription', organization.id);
+    fs.writeFileSync(path.join(home, provider === 'claude' ? '.credentials.json' : 'auth.json'),
+      JSON.stringify(provider === 'claude' ? { claudeAiOauth: { accessToken: 'fixture-token' } }
+        : { tokens: { access_token: 'fixture-token', refresh_token: 'fixture-refresh' } }));
+    const login = `login:${organization.id}:${provider}:subscription`;
+    const key = `key:handle:${handle}`;
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, provider), broker, configHomes });
+    for (const order of [[login, key], [key, login]]) {
+      await store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({ order, on: [login, key] }));
+      expect(await core.resolveCredentialOrder({ taskId: 'ordering', projectId: project.id, provider })).toEqual(order);
+    }
+  });
+
   it('uses model prefixes when clear and Credentials precedence when ambiguous', async () => {
     const organization = (await store.createOrganization({ name: 'Design' }));
     const project = (await store.createProject('Site', {}, organization.id));

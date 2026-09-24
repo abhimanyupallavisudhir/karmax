@@ -1,3 +1,4 @@
+import { workEnvironment, codexWorkProfile } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
@@ -228,7 +229,7 @@ export class CodexAdapter implements AgentAdapter {
     (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
+    const handlers = { ...platformToolHandlers(input.world, ctx, workEnvironment(input)), ...mcp.handlers };
     // Responses API function tools are flat ({type:'function', name, ...}).
     const tools = [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
 
@@ -401,45 +402,49 @@ export class CodexAdapter implements AgentAdapter {
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
   private async runCodexAppServer(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
+    const workEnv = workEnvironment(input);
+    const workConfig = { 'shell_environment_policy.set': workEnv };
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? undefined;
     (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
     const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
-    const cwd = worldWorkingDirectory(input.world.handle);
+    const cwd = worldWorkingDirectory(runtimeWorld.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
-    const remote = isRemoteAgentWorld(input.world);
+    const remote = isRemoteAgentWorld(runtimeWorld);
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'codex', input.resolvedAuth?.configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
       : undefined;
     const dynamicTools = codexDynamicTools(remote);
     // Resume/fork cannot override dynamicTools. Migrate into a new rollout
     // identity instead of changing bytes referenced by existing descendants.
     let preparedSession = input.session;
     if (remoteHome && input.session)
-      preparedSession = await timed('bootstrap.session-tools', () => ensureRemoteCodexSessionTools(input.world, remoteHome, input.session!, dynamicTools)) ?? input.session;
+      preparedSession = await timed('bootstrap.session-tools', () => ensureRemoteCodexSessionTools(runtimeWorld, remoteHome, input.session!, dynamicTools)) ?? input.session;
     else if (!remote && input.session && input.resolvedAuth?.configHome)
       preparedSession = await ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools) ?? input.session;
     let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
-      extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
+      extra: input.extraEnv });
     if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
-    }, Object.keys(input.secretEnv ?? {}));
+    });
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+    Object.assign(env, { OPENAI_API_KEY: '', CODEX_API_KEY: '', CODEX_ACCESS_TOKEN: '' });
     const custody = remote ? undefined : createCustodyEnv(env);
     if (custody) env = custody.env;
 
-    const mcpFlags = await timed('bootstrap.mcp-config', () => selectedCodexMcpFlags(input.world, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(input.world) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal));
+    const mcpFlags = await timed('bootstrap.mcp-config', () => selectedCodexMcpFlags(runtimeWorld, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(runtimeWorld) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal));
 
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const startupEnd = (await (await currentTiming())?.start('process.startup'));
     const child: any = remote
-      ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
+      ? spawnRemoteAgentProcess({ world: runtimeWorld, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
       : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
-    const platformHandlers = platformToolHandlers(input.world, ctx);
+    const platformHandlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
     let stderr = '';
     child.stderr?.on('data', (d: Buffer | string) => { stderr += d.toString(); });
 
@@ -455,9 +460,9 @@ export class CodexAdapter implements AgentAdapter {
         for (const file of files) {
           const relative = `.karmax-injection/agent/codex/images/${path.basename(file)}`;
           const content = fs.readFileSync(file);
-          if (!input.world.writeFileBuffer) throw new Error('remote world cannot receive image attachments');
-          await input.world.writeFileBuffer(relative, content);
-          uploaded.push(path.posix.join(input.world.handle.root, relative));
+          if (!runtimeWorld.writeFileBuffer) throw new Error('remote world cannot receive image attachments');
+          await runtimeWorld.writeFileBuffer(relative, content);
+          uploaded.push(path.posix.join(runtimeWorld.handle.root, relative));
         }
         return uploaded.map((p) => ({ type: 'localImage', path: p }));
       }
@@ -790,6 +795,7 @@ export class CodexAdapter implements AgentAdapter {
       const resuming = !!input.session;
       if (resuming && input.fork) {
         const forked = await client.request<any>('thread/fork', {
+          config: workConfig,
           threadId: preparedSession,
           // The native history stays in Codex. We only need the thread id;
           // returning all prior tool/image payloads can stream tens of MB.
@@ -805,6 +811,7 @@ export class CodexAdapter implements AgentAdapter {
         // Resume otherwise reloads the CLI/config defaults (`:workspace` +
         // on-request in current Codex), discarding karmax's headless posture.
         await client.request('thread/resume', {
+          config: workConfig,
           threadId: preparedSession,
           excludeTurns: true,
           cwd,
@@ -814,6 +821,7 @@ export class CodexAdapter implements AgentAdapter {
         });
       } else {
         const started = await client.request<any>('thread/start', {
+          config: workConfig,
           cwd,
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
@@ -895,7 +903,7 @@ export class CodexAdapter implements AgentAdapter {
       else await child.stop();
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
       if (remoteHome && input.resolvedAuth?.configHome) {
-        const failure = await syncRemoteAgentHomeBestEffort(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
+        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome);
         if (failure) ctx.emitActivity({
           id: 'codex-remote-state-sync', kind: 'error', phase: 'failed',
           title: 'Could not preserve remote Codex state', detail: failure.message.slice(0, 1000),
@@ -929,6 +937,12 @@ export class CodexAdapter implements AgentAdapter {
 
   // ─── Codex CLI on a ChatGPT subscription (`codex exec --json`) ───────────────
   private async runCodexExec(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    const work = codexWorkProfile(input);
+    try { return await this.runCodexExecProcess(input, ctx, work.args); }
+    finally { work.cleanup(); }
+  }
+
+  private async runCodexExecProcess(input: TurnInput, ctx: PlatformToolContext, workArgs: string[]): Promise<AdapterTurn> {
     if (input.session && input.resolvedAuth?.configHome) {
       const home = input.resolvedAuth.configHome;
       input = { ...input, session: await ensureLocalCodexSessionTools(home, input.session) };
@@ -941,8 +955,9 @@ export class CodexAdapter implements AgentAdapter {
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
-      extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
+      extra: input.extraEnv });
 
+    Object.assign(env, { OPENAI_API_KEY: '', CODEX_API_KEY: '', CODEX_ACCESS_TOKEN: '' });
     const resuming = !!input.session;
     // The messages to actually send: the whole conversation on a fresh thread, only
     // the delta new since the thread last advanced when resuming (history is held
@@ -973,7 +988,7 @@ export class CodexAdapter implements AgentAdapter {
     // with `-c` overrides rather than by writing the leased config home: the socket path
     // is per-turn, and two concurrent turns sharing a home would clobber each other.
     // Values are JSON, which is valid TOML for strings and arrays.
-    const control = await startControlBridge(platformToolHandlers(input.world, ctx));
+    const control = await startControlBridge(platformToolHandlers(input.world, ctx, workEnvironment(input)));
     if (control) {
       const spec = controlMcpServerSpec(control);
       flags.push('-c', `mcp_servers.${CONTROL_SERVER_NAME}.command=${JSON.stringify(spec.command)}`);
@@ -989,7 +1004,7 @@ export class CodexAdapter implements AgentAdapter {
     const { files: imageFiles, cleanup: cleanupImages } = materializeImageFiles(toSend);
     for (const f of imageFiles) flags.push('-i', f);
     // Args go straight to execve (no shell), so a multi-line prompt needs no escaping.
-    const args = resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText];
+    const args = [...workArgs, ...(resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText])];
 
     // Keep a detached root group as fallback, while the inherited custody marker
     // covers descendants that create their own groups/sessions.

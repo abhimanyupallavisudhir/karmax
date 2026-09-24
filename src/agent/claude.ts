@@ -1,3 +1,4 @@
+import { claudeWorkEnvironment, workEnvironment } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
@@ -88,7 +89,7 @@ export class ClaudeAdapter implements AgentAdapter {
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
+    const handlers = { ...platformToolHandlers(input.world, ctx, workEnvironment(input)), ...mcp.handlers };
     const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
 
     const messages: any[] = [];
@@ -283,6 +284,14 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    const work = await claudeWorkEnvironment(input);
+    try { return await this.runAgentSdkProcess(input, ctx, work.settings); }
+    finally { await work.cleanup(); }
+  }
+
+  private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
+    workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings']): Promise<AdapterTurn> {
+    const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
     let sdk: any;
     try {
       sdk = await import('@anthropic-ai/claude-agent-sdk');
@@ -306,8 +315,8 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     const { query, createSdkMcpServer, tool } = sdk;
     const zod = (await import('zod')).z;
-    const handlers = platformToolHandlers(input.world, ctx);
-    const remote = isRemoteAgentWorld(input.world);
+    const handlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
+    const remote = isRemoteAgentWorld(runtimeWorld);
     const configHome = input.resolvedAuth?.configHome;
     const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));
     // Rotate the canonical host credential before projecting it. Mid-turn
@@ -340,7 +349,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     }
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
       : undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and
@@ -453,10 +462,9 @@ export class ClaudeAdapter implements AgentAdapter {
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
       // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
-      // plus project secrets and JIT-resolved subprocess env (git credentials,
-      // platform token). Karmax-owned values win on a name collision.
+      // plus Tavya-owned runtime values (git credentials and platform token).
+      // Application secrets reach only work commands through the native hook.
       extra: {
-        ...(input.secretEnv ?? {}),
         ...(input.extraEnv ?? {}),
         ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
       },
@@ -464,7 +472,17 @@ export class ClaudeAdapter implements AgentAdapter {
     if (remoteHome) env = remoteAgentEnv('claude', remoteHome.absolute, {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
-    }, Object.keys(input.secretEnv ?? {}));
+    });
+    // This rail was selected for a login, not a metered API credential. Project
+    // secrets are application credentials, never an override of that selection.
+    // Keep explicit empty values: the SDK can merge ambient env back at the
+    // final subprocess boundary. Runtime worlds bypass resource injection.
+    const subscriptionAuthEnv = {
+      ANTHROPIC_API_KEY: '',
+      ANTHROPIC_AUTH_TOKEN: '',
+      CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth?.oauthToken ?? '',
+    };
+    Object.assign(env, subscriptionAuthEnv);
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
     // Ask the harness for its authoritative turn-over signal (see `settleInput` below).
     env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = '1';
@@ -552,8 +570,9 @@ export class ClaudeAdapter implements AgentAdapter {
       prompt: promptArg,
       options: {
         abortController,
-        cwd: worldWorkingDirectory(input.world.handle),
-        additionalDirectories: [input.world.handle.root],
+        ...(workSettings ? { settings: workSettings } : {}),
+        cwd: worldWorkingDirectory(runtimeWorld.handle),
+        additionalDirectories: [runtimeWorld.handle.root],
         // The world is already an isolated git worktree (the sandbox boundary) and
         // the agent runs headless — there is no human to approve tool calls, so it
         // must never stall on a permission prompt.
@@ -621,20 +640,20 @@ export class ClaudeAdapter implements AgentAdapter {
         //    task attribution and an escalating kill.
         spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
           if (remote && remoteHome) {
-            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env,
-              Object.keys(input.secretEnv ?? {}));
+            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env);
+            Object.assign(remoteEnv, subscriptionAuthEnv);
             if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
             return spawnRemoteAgentProcess({
-              world: input.world,
+              world: runtimeWorld,
               provider: 'claude',
               command: o.command,
               args: o.args,
-              cwd: worldWorkingDirectory(input.world.handle),
+              cwd: worldWorkingDirectory(runtimeWorld.handle),
               env: remoteEnv,
               signal: o.signal,
             }) as any;
           }
-          const custody = createCustodyEnv(o.env);
+          const custody = createCustodyEnv({ ...o.env, ...subscriptionAuthEnv });
           const child = spawn(o.command, o.args, {
             cwd: o.cwd,
             env: custody.env,
@@ -649,12 +668,12 @@ export class ClaudeAdapter implements AgentAdapter {
           child.on('error', () => {});
           if (child.pid) {
             const pid = child.pid;
-            registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
+            registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: runtimeWorld.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
             const untrack = trackProcess({
               pid,
               kind: 'agent',
               label: `claude agent (${input.role})`,
-              taskId: input.world.handle.id,
+              taskId: runtimeWorld.handle.id,
               startedAt: Date.now(),
               kill: () => killAgent(pid, 2500, custody.custodyId),
             });
@@ -909,7 +928,7 @@ export class ClaudeAdapter implements AgentAdapter {
       (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {
-        const failure = await syncRemoteAgentHomeBestEffort(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);
+        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'claude', remoteHome, input.resolvedAuth.configHome);
         if (failure) ctx.emitActivity({
           id: 'claude-remote-state-sync', kind: 'error', phase: 'failed',
           title: 'Could not preserve remote Claude state', detail: failure.message.slice(0, 1000),
