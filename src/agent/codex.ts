@@ -557,7 +557,8 @@ export class CodexAdapter implements AgentAdapter {
     child.once('error', (e: Error) => { turnError = turnError ?? `codex app-server spawn error: ${String(e)}`; turnActive = false; client.close(); settleTurn?.(); });
     child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
       if (!shuttingDown && !turnError) {
-        turnError = `codex app-server connection closed unexpectedly (code ${code ?? -1}${signal ? `, signal ${signal}` : ''})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
+        turnError = child.lost?.message
+          ?? `codex app-server connection closed unexpectedly (${signal ? `signal ${signal}` : `code ${code ?? -1}`})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
       }
       turnActive = false;
       client.close();

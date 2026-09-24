@@ -1041,7 +1041,11 @@ export class ProjectResourceService {
 }
 
 class EnvironmentWorld implements World {
-  constructor(private inner: World, private env: Record<string, string>) {}
+  /** Present only when the inner world has it: its absence marks a local world. */
+  readonly diagnose?: World['diagnose'];
+  constructor(private inner: World, private env: Record<string, string>) {
+    if (inner.diagnose) this.diagnose = (window) => inner.diagnose!(window);
+  }
   withoutProjectEnvironment(): World { return this.inner.withoutProjectEnvironment?.() ?? this.inner; }
   get handle() { return this.inner.handle; }
   set handle(value: WorldHandle) { this.inner.handle = value; }

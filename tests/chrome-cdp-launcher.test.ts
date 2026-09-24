@@ -31,7 +31,7 @@ http.createServer((req, res) => {
 `, { mode: 0o700 });
   fs.writeFileSync(mcp, `#!${process.execPath}
 fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/visit')
-  .then(r => r.text()).then(s => console.log(s));
+  .then(r => r.json()).then(s => console.log(JSON.stringify({ ...s, telemetry: process.env.CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS ? 'off' : 'on' })));
 `, { mode: 0o700 });
   const env = { ...process.env, KARMAX_CDP_PORT: String(port), KARMAX_CDP_CHROME: chrome,
     KARMAX_CDP_MCP_BIN: mcp, KARMAX_CDP_KEEP_ALIVE: keepAlive ? '1' : '0',
@@ -41,9 +41,11 @@ fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/visit')
     const first = JSON.parse((await exec(process.execPath, [launcher], { env })).stdout);
     pid = first.pid;
     expect(first.visits).toBe(1);
+    // Its telemetry watchdog costs ~80 MB of a 2 GB sandbox and reports tenants' tool use.
+    expect(first.telemetry).toBe('off');
     if (keepAlive) {
       const second = JSON.parse((await exec(process.execPath, [launcher], { env })).stdout);
-      expect(second).toEqual({ pid, visits: 2 });
+      expect(second).toEqual({ pid, visits: 2, telemetry: 'off' });
     } else {
       await expect.poll(async () => {
         try { await fetch(`http://127.0.0.1:${port}/json/version`); return true; }

@@ -7,9 +7,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
-  reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
+  reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL, installMemoryGuard,
+  spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
-import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
+import { isTransportError } from '../src/agent/limits.js';
+import type { World, WorldPty, WorldPtySpec, WorldPtyTermination } from '../src/world/types.js';
 
 const codexIdToken = (expiresAt: number) =>
   `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1000) })).toString('base64url')}.signature`;
@@ -154,6 +156,62 @@ describe('remote subscription agents', () => {
       exit(254);
       await closed;
     }
+  });
+
+  // Tasks 348/349: a 2 GB sandbox spent ~150 MB on an `npm exec` process that
+  // only waited for Claude, and nothing stopped a runaway command from freezing it.
+  it('runs the paired CLI without a resident npm and starts the memory guard', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-spawn-'));
+    const stubs = path.join(root, 'stubs');
+    const injection = path.join(root, '.karmax-injection', 'agent');
+    const home = path.join(injection, 'claude', 'home');
+    fs.mkdirSync(stubs); fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(stubs, 'npx'), `#!/bin/sh\ncase "$*" in *'-c command -v claude') echo ${stubs}/claude ;; *) echo "npx ran the agent" >&2; exit 9 ;; esac\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(stubs, 'claude'), '#!/bin/sh\necho "parent=$(cat /proc/$PPID/comm) args=$*"\n', { mode: 0o755 });
+    let spec: WorldPtySpec | undefined;
+    const world = { handle: { root, id: 'spawn' }, async openPty(options: WorldPtySpec) {
+      spec = options;
+      return { onData: () => () => {}, onExit: () => () => {}, write: async () => {}, resize: async () => {}, close: async () => {} };
+    } } as unknown as World;
+    try {
+      await installMemoryGuard({ ...world, async writeFile(file: string, content: string) {
+        fs.writeFileSync(path.join(root, file), content);
+      } } as unknown as World);
+      spawnRemoteAgentProcess({ world, provider: 'claude', command: '/sdk/claude', args: ['--output-format', 'stream-json'],
+        cwd: root, env: { CLAUDE_CONFIG_DIR: home } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const run = spawnSync('bash', ['-c', spec!.command!], { cwd: root, encoding: 'utf8',
+        env: { ...process.env, ...spec!.env, PATH: `${stubs}:${process.env.PATH}` } });
+      expect(run.stdout).toContain('\u001eKARMAX_AGENT_READY\u001e');
+      expect(run.stdout).toContain('parent=node args=--print --output-format stream-json');
+      const guardPid = Number(fs.readFileSync(path.join(injection, 'memory-guard.pid'), 'utf8'));
+      expect(spawnSync('kill', ['-0', String(guardPid)]).status).toBe(0);
+      process.kill(guardPid, 'SIGTERM');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('reports a signal as a signal and a lost sandbox stream as a transport failure, never as exit -1', async () => {
+    const ending = async (termination: WorldPtyTermination) => {
+      let exit!: (code: number | null, termination?: WorldPtyTermination) => void;
+      const world = fakeWorld();
+      world.openPty = async () => ({
+        onData: () => () => {}, onExit: (listener) => { exit = listener; return () => {}; },
+        write: async () => {}, resize: async () => {}, close: async () => {},
+      });
+      world.exec = async () => ({ code: 0, stdout: '', stderr: '' });
+      const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {}, undefined, '/home/agent-stderr.log');
+      const exited = new Promise<unknown[]>((resolve) => child.once('exit', (...args) => resolve(args)));
+      await Promise.resolve();
+      exit(null, termination);
+      return { args: await exited, lost: child.lost };
+    };
+    expect(await ending({ signal: 'SIGKILL' })).toEqual({ args: [null, 'SIGKILL'], lost: undefined });
+    const cause = new Error('[unavailable] upstream connect error or disconnect/reset before headers');
+    const { args, lost } = await ending({ lost: cause });
+    expect(args).toEqual([null, null]);
+    expect(lost?.message).toBe(`lost the connection to the agent in the sandbox; it may still be running there (${cause.message})`);
+    expect(lost?.cause).toBe(cause);
+    expect(isTransportError(lost)).toBe(true);
   });
 
   it('keeps Claude refresh authority on the control plane across parallel worlds', async () => {
