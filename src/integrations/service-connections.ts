@@ -24,6 +24,9 @@ export interface ServiceConnection {
   updatedAt: number;
   accountId?: string;
   sessionId?: string;
+  /** Set on a task grant: the owner's existing connection it uses. A grant
+   * holds no provider account; revoking it never touches the account. */
+  grantedConnectionId?: string;
   notifiedAt?: number;
 }
 export interface ServiceTool { slug: string; name: string; description?: string; inputParameters?: unknown }
@@ -158,11 +161,30 @@ export class ServiceConnections {
       });
   }
   private slug(value: string) { if (!/^[a-z][a-z0-9_]{0,79}$/.test(value)) throw new ConnectionError('Invalid app identifier'); }
-  async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean }) {
+  /** The person's own connected accounts that a task request can use without another sign-in. */
+  async reusable(org: string, ownerId: string, toolkit: string) {
+    return (await this.all()).filter(c => c.organizationId === org && c.ownerId === ownerId && c.toolkit === toolkit
+      && c.status === 'active' && c.accountId && !c.grantedConnectionId).map(c => this.view(c));
+  }
+  async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string }) {
     return this.locked(input.id ?? `${org}:${ownerId}:${input.toolkit}`, async () => {
       let c = input.id ? (await this.get(org, input.id)) : undefined;
       if (c?.ownerId && c.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
       if (c?.status === 'active') return { connection: this.view(c) };
+      if (input.useConnectionId) {
+        if (!c?.taskId) throw new ConnectionError('Only a task request can use an existing account');
+        const account = (await this.get(org, input.useConnectionId));
+        if (account.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
+        if (account.toolkit !== c.toolkit || account.grantedConnectionId || account.status !== 'active' || !account.accountId)
+          throw new ConnectionError('That account is not connected for this app');
+        // An unfinished sign-in for this request is no longer needed.
+        if (c.accountId) await this.remote(() => this.backend().disconnect(c!.accountId!));
+        Object.assign(c, { ownerId, label: account.label, grantedConnectionId: account.id, status: 'active',
+          accountId: undefined, sessionId: undefined, notifiedAt: undefined });
+        (await this.broker.deleteHandle(PREFIX + c.id)); (await this.save(c));
+        (await this.audit(c, ownerId, 'granted'));
+        return { connection: this.view(c) };
+      }
       const toolkit = c?.toolkit ?? input.toolkit ?? '';
       this.slug(toolkit);
       if (input.restart && c?.status === 'connecting' && c.accountId && await this.remote(() => this.backend().active(c!.accountId!, toolkit))) {
@@ -175,7 +197,7 @@ export class ServiceConnections {
         return { connection: this.view(c), url: this.broker.resolve(PREFIX + c.id, { caps: [`use-credential:${PREFIX + c.id}`] }) };
       c ??= { id: newId('conn'), organizationId: org, toolkit, label: (input.label || toolkit).slice(0, 120),
         projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() };
-      c.ownerId = ownerId;
+      c.ownerId = ownerId; c.grantedConnectionId = undefined;
       // Retire the previous provider account before replacing its only local
       // reference, so failed/abandoned sign-ins cannot leave orphaned accounts.
       if (c.accountId) {
@@ -231,6 +253,8 @@ export class ServiceConnections {
       if (!['disconnected', 'denied'].includes(c.status)) c.notifiedAt = undefined;
       c.status = c.ownerId ? 'disconnected' : 'denied'; c.projectIds = []; c.sessionId = undefined;
       (await this.save(c)); (await this.broker.deleteHandle(PREFIX + id));
+      for (const grant of (await this.all()).filter(g => g.grantedConnectionId === c.id && g.status !== 'disconnected'))
+        (await this.save({ ...grant, status: 'disconnected', notifiedAt: undefined }));
       if (c.accountId) { await this.remote(() => this.backend().disconnect(c.accountId!)); c.accountId = undefined; (await this.save(c)); }
       (await this.audit(c, ownerId, 'disconnected'));
       return this.view(c);
@@ -240,8 +264,10 @@ export class ServiceConnections {
     const c = (await this.get(org, id));
     if (!c.ownerId || !(await this.store.organizationMembership(org, c.ownerId))) throw new ConnectionError('The account owner is no longer a member of this organization', 403);
     if (!this.canUse(c, taskId, projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
-    if (c.status !== 'active' || !c.sessionId) throw new ConnectionError('Reconnect this account in Connections before using it', 409);
-    return c;
+    const account = c.grantedConnectionId && c.status === 'active' ? (await this.get(org, c.grantedConnectionId)) : c;
+    if (c.status !== 'active' || account.ownerId !== c.ownerId || account.status !== 'active' || !account.sessionId)
+      throw new ConnectionError('Reconnect this account in Connections before using it', 409);
+    return account;
   }
   async tools(org: string, id: string, taskId: string, projectId: string, search: string) {
     const c = (await this.authorized(org, id, taskId, projectId));

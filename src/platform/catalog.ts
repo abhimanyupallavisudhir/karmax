@@ -32,10 +32,10 @@ export const PLATFORM_API_CATALOG = {
     ],
   },
   connections: [
-    'GET /api/connections (own accounts for humans; explicitly shared task/project accounts for agents)',
+    'GET /api/connections (own accounts for humans; explicitly shared task/project accounts for agents; ?taskId= requests list the viewer\'s reusable accounts)',
     'GET /api/connections/catalog?search=',
-    'POST /api/connections/request (task agents; body {toolkit,why}; task resumes after sign-in)',
-    'POST /api/connections/connect (verified owner; body {toolkit|id,label?})',
+    'POST /api/connections/request (task agents with connection:use; body {toolkit,why}; task resumes once the owner allows an existing account or signs in)',
+    'POST /api/connections/connect (verified owner; body {toolkit|id,label?,useConnectionId?}; useConnectionId grants an existing account to the request\'s task without another sign-in)',
     'POST /api/connections/:id/refresh', 'POST /api/connections/:id/disconnect',
     'PUT /api/connections/:id/access (verified owner; body {projectIds}; project settings authority required)',
     'GET /api/connections/:id/tools?search=',

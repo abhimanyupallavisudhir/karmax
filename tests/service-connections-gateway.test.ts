@@ -135,6 +135,27 @@ describe('connection gateway flow', () => {
     expect((await request(`/api/connections/${id}/access?organizationId=${org}`, { method: 'PUT', body: { projectIds: [project] } })).status).toBe(200);
     expect((await request(`/api/connections/${id}/execute`, { token: forbiddenAgent, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } })).status).toBe(200);
   });
+  it('lets the owner allow an existing account for another task without signing in again', async () => {
+    const account = (await service.all()).find(c => c.toolkit === 'gmail' && c.status === 'active')!.id;
+    const elsewhere = (await store.createProject('Elsewhere', {}, org)).id;
+    const task = (await store.createTask({ projectId: elsewhere, title: 'Mail', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'Mail' }, createdBy: { kind: 'user', userId: 'alice' } })).id;
+    const mint = async (caps: string[]) => (await tokens.mint({ taskId: task, profileId: 'developer', role: 'do', principal: 'user:alice',
+      projectId: elsewhere, organizationId: org, ceiling: caps, grantorCaps: caps })).token;
+    // A task that could not use the account must not send its owner through sign-in first.
+    expect((await request('/api/connections/request', { token: await mint(['task:read', 'credential:read']), method: 'POST', body: { toolkit: 'gmail', why: 'Mail' } })).status).toBe(403);
+    const token = await mint(['task:read', 'credential:read', 'connection:use']);
+    const pending: any = await (await request('/api/connections/request', { token, method: 'POST', body: { toolkit: 'gmail', why: 'Mail' } })).json();
+    expect(pending.status).toBe('needs_connection');
+    const rows = await (await request(`/api/connections?taskId=${task}&organizationId=${org}`)).json() as any[];
+    expect(rows).toEqual([expect.objectContaining({ id: pending.connection.id, reusable: [{ id: account, label: 'gmail' }] })]);
+    expect((await (await request(`/api/connections?taskId=${task}&organizationId=${org}`, { user: 'bob' })).json() as any[])[0]?.reusable ?? []).toEqual([]);
+    const allowed = await request(`/api/connections/connect?organizationId=${org}`, { method: 'POST', body: { id: pending.connection.id, useConnectionId: account } });
+    expect(await allowed.json()).toEqual({ connection: expect.objectContaining({ status: 'active' }) });
+    await vi.waitFor(() => expect(signal.mock.calls.some(call => JSON.stringify(call).includes(pending.connection.id))).toBe(true));
+    const result = await request(`/api/connections/${pending.connection.id}/execute`, { token, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } });
+    expect(result.status).toBe(200);
+    expect((await request(`/api/connections/${account}/execute`, { token, method: 'POST', body: { tool: 'GMAIL_FETCH_EMAILS', arguments: {} } })).status).toBe(403);
+  });
   it('declines an unclaimed request without requiring an account', async () => {
     const pending = (await service.request(org, 'slack', taskId, 'do', 'Read Slack'));
     const response = await request(`/api/connections/${pending.id}/disconnect?organizationId=${org}`, { method: 'POST', body: {} });

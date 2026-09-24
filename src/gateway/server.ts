@@ -149,7 +149,7 @@ export interface GatewayDeps {
 export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
   if (p === '/api/connections/config') return read ? 'credential:read' : 'settings:write';
-  if (p.startsWith('/api/connections')) return p.endsWith('/execute') ? 'connection:use' : 'credential:read';
+  if (p.startsWith('/api/connections')) return p.endsWith('/execute') || p === '/api/connections/request' ? 'connection:use' : 'credential:read';
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
@@ -5961,7 +5961,12 @@ export class Gateway {
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
           if (p === '/api/connections' && method === 'GET') {
             if (!taskId && !ownerId) requireOwner();
-            return this.json(res, 200, (await service.list(org, { ownerId, taskId, projectId })));
+            const listed = (await service.list(org, { ownerId, taskId, projectId }));
+            // A person answering a task request may reuse their own connected account.
+            if (!callerTaskId && ownerId && taskId) for (const c of listed as Array<typeof listed[number] & { reusable?: unknown }>)
+              if (c.status === 'requested' && (!c.ownerId || c.ownerId === ownerId))
+                c.reusable = (await service.reusable(org, ownerId, c.toolkit)).map(({ id, label }) => ({ id, label }));
+            return this.json(res, 200, listed);
           }
           if (p === '/api/connections/request' && method === 'POST') {
             if (!callerTaskId || !task) return this.json(res, 400, { error: 'A task-agent token is required' });
@@ -5985,7 +5990,10 @@ export class Gateway {
                   return this.json(res, 403, { error: 'Task access denied' });
               }
             }
-            return this.json(res, 200, await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label, restart: b.restart === true }));
+            const result = await service.connect(org, userId, { id: b.id, toolkit: b.toolkit, label: b.label, restart: b.restart === true,
+              useConnectionId: typeof b.useConnectionId === 'string' ? b.useConnectionId : undefined });
+            if (result.connection.status === 'active') this.sweepConnections();
+            return this.json(res, 200, result);
           }
           const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|tools|execute)$/);
           if (match) {

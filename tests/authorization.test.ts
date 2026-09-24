@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
-import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
+import { AuthorizationService, DEFAULT_AUTHORIZATION_PROFILES, projectScope } from '../src/platform/authorization.js';
+import { SHIPPED_BUILTIN_PROFILES } from '../src/platform/builtin-profile-history.js';
 import { allows, CAPABILITIES, CAPABILITY_GROUPS } from '../src/platform/capabilities.js';
 
 describe('durable authorization policy', () => {
@@ -147,6 +148,30 @@ describe('durable authorization policy', () => {
     }));
     (await AuthorizationService.create(store));
     expect((await store.getAuthorizationProfile('global', 'maintainer')).capabilities).toEqual(['project:read', 'task:read']);
+  });
+
+  it('upgrades every untouched shipped built-in, including the July payments release', async () => {
+    // Production still stored this exact release's profiles, so its task agents
+    // lacked `connection:use` and could not run connected-app tools.
+    const store = (await Store.create(':memory:'));
+    try {
+      for (const shipped of SHIPPED_BUILTIN_PROFILES) {
+        (await store.setAuthorizationProfile('global', { ...shipped, capabilities: [...shipped.capabilities], builtin: true }));
+        (await AuthorizationService.create(store));
+        const current = DEFAULT_AUTHORIZATION_PROFILES.find((p) => p.id === shipped.id)!;
+        expect((await store.getAuthorizationProfile('global', shipped.id)), `${shipped.id}: ${shipped.capabilities.length}`)
+          .toMatchObject({ description: current.description, capabilities: current.capabilities });
+      }
+      expect(allows((await store.getAuthorizationProfile('global', 'developer')).capabilities, 'connection:use')).toBe(true);
+    } finally { (await store.close()); }
+  });
+
+  it('records every current built-in as a shipped version so later releases can upgrade it', () => {
+    const key = (p: { id: string; name: string; description: string; capabilities: readonly string[] }) =>
+      JSON.stringify([p.id, p.name, p.description, [...p.capabilities].sort()]);
+    const shipped = new Set(SHIPPED_BUILTIN_PROFILES.map(key));
+    for (const profile of DEFAULT_AUTHORIZATION_PROFILES.filter((p) => p.id !== 'god'))
+      expect(shipped.has(key(profile)), `${profile.id} missing from SHIPPED_BUILTIN_PROFILES`).toBe(true);
   });
 
   it('migrates legacy grants into the five canonical levels', async () => {

@@ -149,6 +149,40 @@ describe('service connections', () => {
     await expect(service.configure('wrong-project-key')).rejects.toThrow('provider could not complete');
     expect(broker.resolve('service-connections:composio:api-key', { caps: ['use-credential:*'] })).toBe('project-key-private');
   });
+  it('allows a later task to use an existing account without signing in again', async () => {
+    const account = await connected('task_a');
+    const request = (await service.request(org, 'gmail', 'task_b', 'do', 'Read more mail'));
+    expect((await service.reusable(org, 'alice', 'gmail')).map(c => c.id)).toEqual([account]);
+    expect((await service.reusable(org, 'bob', 'gmail'))).toEqual([]);
+    await expect(service.connect(org, 'bob', { id: request.id, useConnectionId: account })).rejects.toThrow('another person');
+    const result = await service.connect(org, 'alice', { id: request.id, useConnectionId: account });
+    expect(result).toEqual({ connection: expect.objectContaining({ id: request.id, status: 'active', ownerId: 'alice' }) });
+    expect(backend.authorize).toHaveBeenCalledTimes(1);
+    // A grant is not an account: it is never offered for reuse or granted onward.
+    expect((await service.reusable(org, 'alice', 'gmail')).map(c => c.id)).toEqual([account]);
+    expect(await service.execute(org, request.id, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+    expect(backend.execute).toHaveBeenLastCalledWith('session-private', 'GMAIL_FETCH_EMAILS', {});
+    await expect(service.execute(org, account, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('not been shared');
+    await expect(service.execute(org, request.id, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('not been shared');
+    const resumed: string[] = [];
+    await service.reconcile(async c => { resumed.push(`${c.taskId}:${c.id}:${c.status}`); return true; });
+    expect(resumed).toContain(`task_b:${request.id}:active`);
+
+    // Revoking the grant leaves the account and its other users intact.
+    await service.disconnect(org, request.id, 'alice');
+    expect(backend.disconnect).not.toHaveBeenCalled();
+    await expect(service.execute(org, request.id, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('Reconnect');
+    expect(await service.execute(org, account, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+
+    // Disconnecting the account ends every grant made from it.
+    const later = (await service.request(org, 'gmail', 'task_c', 'do', 'Read mail'));
+    await service.connect(org, 'alice', { id: later.id, useConnectionId: account });
+    await service.disconnect(org, account, 'alice');
+    expect((await service.get(org, later.id)).status).toBe('disconnected');
+    await expect(service.execute(org, later.id, 'task_c', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('Reconnect');
+    await expect(service.connect(org, 'alice', { id: (await service.request(org, 'gmail', 'task_d', 'do', 'x')).id, useConnectionId: account }))
+      .rejects.toThrow('not connected');
+  });
   it('detects revoked access before execution; reconnects without widening grants', async () => {
     const id = await connected(); vi.mocked(backend.active).mockResolvedValue(false);
     await expect(service.execute(org, id, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('expired');

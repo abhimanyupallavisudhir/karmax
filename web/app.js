@@ -15076,7 +15076,7 @@ function connectionRows(connections, inTask = false) {
   return connections.map(c => {
     const own = c.ownerId === userId;
     const canConnect = !c.ownerId || own;
-    const status = { requested: 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
+    const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
     return `<div class="approval-request" data-connection="${esc(c.id)}">
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
@@ -15087,10 +15087,11 @@ function connectionRows(connections, inTask = false) {
           <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
-        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm primary" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : 'Connect'}${inTask ? ' for this task' : ''}</button>` : ''}
+        ${canConnect && c.status === 'requested' ? (c.reusable || []).map(account => `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(account.id)}" title="Use your connected ${esc(account.label)} account — no new sign-in">${c.reusable.length > 1 ? `Use ${esc(account.label)}` : 'Allow'}</button>`).join('') : ''}
+        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
-        ${own && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
-        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
       </div></div>`;
   }).join('');
 }
@@ -15105,7 +15106,10 @@ function wireConnectionActions(root, organizationId, refresh) {
     if (popup) popup.opener = null;
     button.disabled = true;
     try {
-      if (action === 'connect' || action === 'restart') {
+      if (action === 'allow') {
+        await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, useConnectionId: button.dataset.useConnection }) });
+        await refresh();
+      } else if (action === 'connect' || action === 'restart') {
         const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });
         if (result.url) {
           if (popup) popup.location.href = result.url;

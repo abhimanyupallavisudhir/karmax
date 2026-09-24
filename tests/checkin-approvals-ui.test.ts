@@ -47,6 +47,18 @@ describe('check-in pending decisions', () => {
       expect(c.conversationApprovalRequests()).toBe('');
     }
   });
+  it('offers an existing account before a new sign-in', () => {
+    const c = setup();
+    const request = { id: 'connection', label: 'gmail', status: 'requested', projectIds: [], taskId: 'task' };
+    expect(c.connectionRows([request], true)).toContain('Connect for this task');
+    const one = c.connectionRows([{ ...request, reusable: [{ id: 'mine', label: 'gmail' }] }], true);
+    expect(one).toContain('data-connection-action="allow" data-use-connection="mine"');
+    expect(one).toContain('>Allow<');
+    expect(one).toContain('>Other account<');
+    const two = c.connectionRows([{ ...request, reusable: [{ id: 'a', label: 'Work' }, { id: 'b', label: 'Home' }] }], true);
+    expect(two).toContain('>Use Work<'); expect(two).toContain('>Use Home<');
+    expect(c.connectionRows([{ ...request, status: 'active', ownerId: 'user', grantedConnectionId: 'mine' }], true)).toContain('>Revoke<');
+  });
   it('removes settled resource cards but keeps pending decisions and failures', () => {
     const c = setup();
     for (const state of ['pending', 'discarding']) expect(c.resourceReviewNeedsAction({ candidate: { state } })).toBe(true);
