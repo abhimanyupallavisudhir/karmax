@@ -103,6 +103,15 @@ prompt.
 API-key namespaces include Kimi, xAI, Google, OpenAI,
 Anthropic, Moonshot AI, OpenRouter, Groq, Mistral, and DeepSeek.
 
+When Claude runs under a selected login, project environment secrets cannot
+replace that login: the harness clears `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN`, and takes `CLAUDE_CODE_OAUTH_TOKEN` only from the selected
+account. These overrides also apply to the harness's child processes, including
+Bash tools. Application code that needs a separate Anthropic credential must load
+it explicitly (for example, from a separately named project secret). The stored
+project resources remain intact; intentionally selecting an API credential in
+Credentials still uses the metered Messages API adapter.
+
 For the requested Kimi design workflow, use:
 
 - **OpenCode harness + Kimi Code API key:**

@@ -454,6 +454,16 @@ export class ClaudeAdapter implements AgentAdapter {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     }, Object.keys(input.secretEnv ?? {}));
+    // This rail was selected for a login, not a metered API credential. Project
+    // secrets are application credentials, never an override of that selection.
+    // Keep explicit empty values: SDK env merges and EnvironmentWorld's resource
+    // injection would restore deleted keys at the final subprocess boundary.
+    const subscriptionAuthEnv = {
+      ANTHROPIC_API_KEY: '',
+      ANTHROPIC_AUTH_TOKEN: '',
+      CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth?.oauthToken ?? '',
+    };
+    Object.assign(env, subscriptionAuthEnv);
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
@@ -586,6 +596,7 @@ export class ClaudeAdapter implements AgentAdapter {
           if (remote && remoteHome) {
             const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env,
               Object.keys(input.secretEnv ?? {}));
+            Object.assign(remoteEnv, subscriptionAuthEnv);
             if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
             return spawnRemoteAgentProcess({
               world: input.world,
@@ -597,7 +608,7 @@ export class ClaudeAdapter implements AgentAdapter {
               signal: o.signal,
             }) as any;
           }
-          const custody = createCustodyEnv(o.env);
+          const custody = createCustodyEnv({ ...o.env, ...subscriptionAuthEnv });
           const child = spawn(o.command, o.args, {
             cwd: o.cwd,
             env: custody.env,
