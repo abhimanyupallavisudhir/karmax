@@ -1,3 +1,4 @@
+import { ProjectResourceService } from '../src/world/resources.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -60,15 +61,17 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
   });
 
-  it('injects project secrets into the local agent subprocess without letting them shadow control env', async () => {
+  it('keeps project secrets out of the harness while preserving Tavya control env', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
     await new ClaudeAdapter().runTurn({
       ...input,
       secretEnv: { DATABASE_URL: 'postgres://task-db', KARMAX_TOKEN: 'resource-value' },
       extraEnv: { KARMAX_TOKEN: 'scoped-turn-token' },
     }, ctx);
+    expect(sdkState.options.env.DATABASE_URL).toBeUndefined();
+    expect(sdkState.options.settings.hooks.SessionStart).toHaveLength(1);
+    expect(JSON.stringify(sdkState.options.settings)).not.toContain('postgres://task-db');
     expect(sdkState.options.env).toMatchObject({
-      DATABASE_URL: 'postgres://task-db',
       KARMAX_TOKEN: 'scoped-turn-token',
     });
   });
@@ -114,7 +117,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     }, ctx);
     expect(sdkState.options.env).toMatchObject({
       ANTHROPIC_API_KEY: '', ANTHROPIC_AUTH_TOKEN: '',
-      CLAUDE_CODE_OAUTH_TOKEN: oauthToken ?? '', DATABASE_URL: 'project-db',
+      CLAUDE_CODE_OAUTH_TOKEN: oauthToken ?? '',
     });
   });
 
@@ -167,7 +170,9 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     const world: any = {
       handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'remote',
         root: '/workspace', branch: 'task', base: 'main' },
-      async exec(_command: string, args: string[]) {
+      async exec(_command: string, args: string[], options: any = {}) {
+        expect(options.env?.NODE_OPTIONS).toBeUndefined();
+        expect(options.env?.DATABASE_URL).toBeUndefined();
         if (args[1]?.includes('-type f -print')) return { stdout: '', stderr: '', code: 0 };
         return { stdout: '', stderr: '', code: 0 };
       },
@@ -177,8 +182,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       async writeFile(name: string, value: string) { files.set(name, Buffer.from(value)); },
       async listFiles() { return [...files.keys()]; }, async destroy() {},
       async openPty(spec: any) {
-        // EnvironmentWorld merges project resources underneath explicit values.
-        spawnedEnv = { ANTHROPIC_API_KEY: 'world-resource-key', ...spec.env };
+        spawnedEnv = spec.env;
         let exit: (code: number) => void = () => {};
         return { onData: () => () => {}, onExit: (fn: typeof exit) => { exit = fn; return () => {}; },
           write: async () => {}, resize: async () => {}, close: async () => { exit(0); } };
@@ -186,14 +190,17 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     };
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 'remote-session', stop_reason: 'end_turn' }];
     try {
-      await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home },
-        secretEnv: { ANTHROPIC_API_KEY: 'project-api-key' } }, ctx);
+      const secretEnv = { ANTHROPIC_API_KEY: 'project-api-key', NODE_OPTIONS: '--invalid-project-option', DATABASE_URL: 'project-db' };
+      const decoratedWorld = await ProjectResourceService.prototype.withEnvironment.call({ environmentFor: async () => secretEnv } as any, world);
+      await new ClaudeAdapter().runTurn({ ...input, world: decoratedWorld, resolvedAuth: { configHome: home }, secretEnv }, ctx);
       expect(sdkState.options.env.ANTHROPIC_API_KEY).toBe('');
       const child = sdkState.options.spawnClaudeCodeProcess({ command: localProviderCli('claude'), args: [],
         env: { ...sdkState.options.env, ANTHROPIC_API_KEY: 'sdk-key' }, signal: new AbortController().signal });
       const closed = new Promise(resolve => child.once('close', resolve));
       child.kill();
       await closed;
+      expect(spawnedEnv?.DATABASE_URL).toBeUndefined();
+      expect(spawnedEnv?.NODE_OPTIONS).not.toBe('--invalid-project-option');
       expect(spawnedEnv).toMatchObject({ ANTHROPIC_API_KEY: '', ANTHROPIC_AUTH_TOKEN: '', CLAUDE_CODE_OAUTH_TOKEN: '' });
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
       expect(sdkState.options).not.toHaveProperty('getOAuthToken');

@@ -115,7 +115,7 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     expect(r.usage).toBeUndefined();
   });
 
-  it('injects project secrets into the local Codex subprocess with control env taking precedence', async () => {
+  it('keeps project secrets outside the legacy harness process', async () => {
     const output = path.join(dir, 'env.json');
     process.env.STUB_ENV_OUT = output;
     try {
@@ -124,7 +124,6 @@ describe('CodexAdapter subscription path (codex exec)', () => {
       input.extraEnv = { KARMAX_TOKEN: 'scoped-turn-token' };
       await adapter.runTurn(input, ctx);
       expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({
-        DATABASE_URL: 'postgres://task-db',
         KARMAX_TOKEN: 'scoped-turn-token',
       });
     } finally {
