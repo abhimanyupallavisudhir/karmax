@@ -28,6 +28,17 @@ function expandAlternatives(path: string): string[] {
 const cap = (method: string, p: string) => routeCapability(method, p, new URL(`http://gateway.invalid${p}`));
 
 describe('gateway route capability binding', () => {
+  /** Insights are every member's view of their organization's work (money inside
+   * is added only for payment:read holders by the handler); the raw usage ledger
+   * stays payment-gated, and live account status needs credential:read. The old
+   * operator-only dashboard route is gone. */
+  it('lets any organization member read insights without widening usage or account access', () => {
+    expect(cap('GET', '/api/organizations/x/insights')).toBe('organization:read');
+    expect(cap('GET', '/api/organizations/x/usage')).toBe('payment:read');
+    expect(cap('GET', '/api/accounts/status')).toBe('credential:read');
+    expect(PLATFORM_API_CATALOG.operations.some((entry: string) => entry.includes('/api/dashboard'))).toBe(false);
+  });
+
   /**
    * `routeCapability` tested `p.startsWith('/api/queue')`, which does NOT match
    * `/api/agent-queue`. Both routes fell through to the conservative fallback

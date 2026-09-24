@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-describe('credential incident dashboard', () => {
+describe('credential incident panel', () => {
   const app = fs.readFileSync(path.join(process.cwd(), 'web/app.js'), 'utf8');
 
   it('distinguishes needs-attention from quota exhaustion and renders native provenance', () => {
