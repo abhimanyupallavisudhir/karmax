@@ -6443,9 +6443,9 @@ export class Store {
    * the minimum is taken over all time and only then windowed. */
   async insightRows(organizationId: string, from: number, now = Date.now()): Promise<{
     completions: Array<{ taskId: string; doneAt: number }>;
-    admissions: Array<{ taskId: string; projectId: string; provider: string; model: string | null; state: string;
+    admissions: Array<{ id: string; taskId: string; projectId: string; provider: string; model: string | null; state: string;
       createdAt: number; releasedAt: number | null }>;
-    tokens: Array<{ taskId: string | null; projectId: string | null; provider: string; quantity: number;
+    tokens: Array<{ id: string; taskId: string | null; projectId: string | null; provider: string; quantity: number;
       metadata: string | null; startedAt: number }>;
     cardSpend: Array<{ amount: number; currency: string; createdAt: number }>;
   }> {
@@ -6453,9 +6453,9 @@ export class Store {
       JOIN tasks t ON t.id=e.taskId JOIN projects p ON p.id=t.projectId
       WHERE COALESCE(p.organizationId, 'org_personal')=? AND e.type='view.updated' AND e.payload LIKE ?
       GROUP BY e.taskId HAVING MIN(e.ts)>=?`).all(organizationId, '%"status":"done"%', from)) as any[];
-    const admissions = (await this.db.prepare(`SELECT taskId, projectId, provider, model, state, createdAt, releasedAt
+    const admissions = (await this.db.prepare(`SELECT id, taskId, projectId, provider, model, state, createdAt, releasedAt
       FROM usage_admissions WHERE organizationId=? AND kind='agent' AND createdAt>=?`).all(organizationId, from)) as any[];
-    const tokens = (await this.db.prepare(`SELECT taskId, projectId, provider, quantity, metadata, startedAt
+    const tokens = (await this.db.prepare(`SELECT id, taskId, projectId, provider, quantity, metadata, startedAt
       FROM usage_events WHERE organizationId=? AND kind='agent.tokens' AND startedAt>=?`).all(organizationId, from)) as any[];
     const cardSpend = (await this.db.prepare(`SELECT amount, currency, createdAt FROM payment_spend_requests
       WHERE organizationId=? AND createdAt>=? AND (status IN ('authorizing','consumed','settled')
