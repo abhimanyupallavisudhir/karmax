@@ -383,8 +383,17 @@ describe('WorktreeProvider (real git)', () => {
     expect(await world.readFile('index.js')).toContain('console.log');
     // …but the ignored base is surfaced, not swallowed.
     expect(world.handle.warnings).toBeTruthy();
-    expect(world.handle.warnings!.join('\n')).toMatch(/base branch "develop" not found/);
+    expect(world.handle.warnings!.join('\n')).toMatch(/Base branch changed to "main" because "develop" did not exist/);
     await world.destroy();
+  });
+
+  it('records both branch names when a missing base and target fall back to HEAD', async () => {
+    const world = await new WorktreeProvider(home).create({ taskId: 'fallback', repo, base: 'master', target: 'master' });
+    try {
+      expect(world.handle).toMatchObject({ base: 'main', target: 'main' });
+      expect(world.handle.repos![0]).toMatchObject({ base: 'main', target: 'main' });
+      expect(world.handle.warnings!.join('\n')).toContain('Base and target branch changed to "main" because "master" did not exist');
+    } finally { await world.destroy(); }
   });
 
   it('does not warn when the configured base branch exists', async () => {

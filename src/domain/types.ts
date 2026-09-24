@@ -415,6 +415,15 @@ export interface PreviewLease {
   hostname?: string;
 }
 
+/** Named branch correction discovered while provisioning a repository. */
+export interface BranchAdjustment {
+  requestedBase: string;
+  requestedTarget?: string;
+  base: string;
+  target: string;
+  warning: string;
+}
+
 /** Plain, serializable reference to a task world. Workflows and trusted server
  * code carry this opaque handle; only the selected provider is allowed to
  * interpret `root` and `meta`. The gateway replaces it with the public
@@ -444,9 +453,9 @@ export interface WorldHandleRef {
   repo?: string;
   target?: string;
   repos?: { name: string; role?: 'project-wiki'; repo: string; root: string; branch: string; base: string; target?: string;
-    /** True only when a repository attachment pins its own target. False means
+    /** True when an attachment or a setup fallback gives this repo its own target. False means
      * `target` is the task's initial value and live task updates take precedence. */
-    targetPinned?: boolean; baseSha?: string; localPath?: string }[];
+    targetPinned?: boolean; baseSha?: string; localPath?: string; branchAdjustment?: BranchAdjustment }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
 }

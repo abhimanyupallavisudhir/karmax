@@ -75,6 +75,13 @@ To do real work, open **Settings**, point the project at a git repo directory,
 then add a task. The agent runs in an isolated git worktree and its work is
 merged into your target branch.
 
+Branch existence is checked during workspace setup, before agent work starts.
+If the requested base is missing, setup uses the remote's default branch (or
+local HEAD's named branch for local worktrees), records the actual base, and
+shows a warning in the task conversation. A target matching the missing base
+moves with it; a separately selected target is preserved. A missing separate
+remote target fails setup with an actionable error.
+
 ## What's implemented (SPEC v1)
 
 | Area | Status |
