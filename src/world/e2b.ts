@@ -14,10 +14,14 @@ import type {
   WorldProcess,
   WorldProcessSpec,
   WorldProvider,
+  WorldDiagnosis,
   WorldPty,
   WorldPtySpec,
+  WorldPtyTermination,
   WorldSpec,
 } from './types.js';
+import { diagnoseMetrics } from './health.js';
+import { withTimeout } from '../util/timeout.js';
 import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
@@ -35,6 +39,14 @@ export const DEFAULT_E2B_TEMPLATE = 'uj125w982t7wflqad4ig';
 // provisioning. Give E2B twice its SDK default without consuming the entire
 // activity budget; an indeterminate timeout is reconciled by metadata below.
 const DEFAULT_REQUEST_TIMEOUT_MS = 2 * 60_000;
+// Long enough to see the memory spike that froze a sandbox before a retry.
+const DIAGNOSIS_WINDOW_MS = 30 * 60_000;
+// Resuming a paused sandbox takes seconds; a frozen one never answers.
+const REATTACH_REQUEST_MS = 60_000;
+// A stream reattached right after E2B resumes may drop once more (live-tested);
+// one that keeps dropping is not a pause.
+const REATTACH_LIMIT = 3;
+const REATTACH_WINDOW_MS = 10 * 60_000;
 
 /** Minimal SDK surface kept structural so the provider can be unit-tested with
  * no E2B account and upgraded independently from Temporal workflow contracts. */
@@ -55,12 +67,18 @@ export interface E2BSandboxLike {
     sendInput(pid: number, data: Uint8Array): Promise<unknown>;
     resize(pid: number, size: { cols: number; rows: number }): Promise<unknown>;
     kill(pid: number): Promise<unknown>;
+    /** Follow a running PTY again after its stream dropped. */
+    connect?(pid: number, options: { onData: (data: unknown) => void; timeoutMs: number; requestTimeoutMs: number }): Promise<any>;
   };
+  /** Resume this sandbox if paused (a no-op while it runs). */
+  connect?(options: { timeoutMs: number; requestTimeoutMs: number }): Promise<unknown>;
   pause(): Promise<unknown>;
   kill(): Promise<unknown>;
   updateNetwork(network: { allowInternetAccess?: boolean; allowOut?: string[]; denyOut?: string[] }): Promise<unknown>;
   setTimeout?(timeoutMs: number): Promise<unknown>;
   getInfo?(): Promise<{ state?: string }>;
+  /** Control-plane resource samples; served even while the sandbox is frozen. */
+  getMetrics?(options: { start?: Date; end?: Date }): Promise<Array<{ timestamp: Date | string; memUsed: number; memTotal: number }>>;
   stream?: {
     start(options?: { requireAuth?: boolean }): Promise<void>;
     getAuthKey(): string;
@@ -525,38 +543,51 @@ class E2BWorld implements World {
   async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
     const sandbox = this.sandbox;
     const outputs = new Set<(chunk: string) => void>();
-    const exits = new Set<(code: number | null) => void>();
+    const exits = new Set<(code: number | null, termination?: WorldPtyTermination) => void>();
     const pending: string[] = [];
     let attached = false;
     let exited = false;
     let exitCode: number | null = null;
-    const terminal = await this.sandbox.pty.create({
+    let termination: WorldPtyTermination | undefined;
+    let closed = false;
+    const onData = (data: unknown) => {
+      const chunk = sdkText(data);
+      if (!attached) pending.push(chunk);
+      for (const listener of outputs) listener(chunk);
+    };
+    let terminal = await this.sandbox.pty.create({
       cols: spec.cols ?? 80,
       rows: spec.rows ?? 24,
       cwd: this.cwd(spec.cwd),
       envs: this.remoteEnv(spec.env),
       timeoutMs: 0,
-      onData: (data: unknown) => {
-        const chunk = sdkText(data);
-        if (!attached) pending.push(chunk);
-        for (const listener of outputs) listener(chunk);
-      },
+      onData,
     });
     const remotePid = Number(terminal.pid);
     const stopKeepAlive = this.keepAlive();
     if (spec.command) await sandbox.pty.sendInput(remotePid, new TextEncoder().encode(`${spec.command}\n`));
-    void Promise.resolve(terminal.wait?.()).then((result) => {
+    let reattached: number[] = [];
+    const follow = () => void Promise.resolve(terminal.wait?.()).then((result) => {
       stopKeepAlive();
       const code = Number(result?.exitCode ?? result?.code ?? 0);
       exited = true;
       exitCode = code;
       for (const listener of exits) listener(code);
-    }).catch((error) => {
+    }).catch(async (error) => {
+      const ending = ptyEnding(error);
+      reattached = reattached.filter((at) => Date.now() - at < REATTACH_WINDOW_MS);
+      if (ending.termination && 'lost' in ending.termination && !closed && reattached.length < REATTACH_LIMIT) {
+        reattached.push(Date.now());
+        const again = await this.reattachPty(remotePid, onData).catch(() => undefined);
+        if (again && !closed) { terminal = again; return follow(); }
+        if (again) void again.disconnect?.();
+      }
       stopKeepAlive();
       exited = true;
-      exitCode = typeof error?.exitCode === 'number' ? error.exitCode : -1;
-      for (const listener of exits) listener(exitCode);
+      ({ code: exitCode, termination } = ending);
+      for (const listener of exits) listener(exitCode, termination);
     });
+    follow();
     return {
       onData(listener) {
         outputs.add(listener);
@@ -564,13 +595,14 @@ class E2BWorld implements World {
         return () => outputs.delete(listener);
       },
       onExit(listener) {
-        if (exited) queueMicrotask(() => listener(exitCode));
+        if (exited) queueMicrotask(() => listener(exitCode, termination));
         else exits.add(listener);
         return () => exits.delete(listener);
       },
       async write(data) { await sandbox.pty.sendInput(remotePid, new TextEncoder().encode(data)); },
       async resize(cols, rows) { await sandbox.pty.resize(remotePid, { cols, rows }); },
       async close() {
+        closed = true;
         stopKeepAlive();
         if (typeof terminal.kill === 'function') await terminal.kill();
         else await sandbox.pty.kill(remotePid);
@@ -586,6 +618,29 @@ class E2BWorld implements World {
 
   async destroy(): Promise<void> {
     await this.sandbox.kill();
+  }
+
+  /** E2B pauses a sandbox when its plan's continuous-runtime cap expires (one
+   * hour on Hobby, whatever timeout karmax requests; task 350). The pause drops
+   * every stream into the sandbox but its processes survive it, so resume the
+   * sandbox, which starts a new runtime window, and follow the same PTY. A
+   * sandbox frozen by memory exhaustion fails these bounded requests instead. */
+  private async reattachPty(pid: number, onData: (data: unknown) => void): Promise<any> {
+    if (!this.sandbox.pty.connect) return undefined;
+    await this.sandbox.connect?.({ timeoutMs: this.idleMs, requestTimeoutMs: REATTACH_REQUEST_MS });
+    return this.sandbox.pty.connect(pid, { onData, timeoutMs: 0, requestTimeoutMs: REATTACH_REQUEST_MS });
+  }
+
+  /** Reads the sandbox's own metrics from E2B's control plane, which keeps
+   * answering while memory exhaustion has frozen envd (tasks 348 and 349). */
+  async diagnose({ since, now = Date.now() }: { since: number; now?: number }): Promise<WorldDiagnosis | undefined> {
+    if (!this.sandbox.getMetrics) return undefined;
+    try {
+      const samples = await withTimeout(this.sandbox.getMetrics({ start: new Date(now - DIAGNOSIS_WINDOW_MS), end: new Date(now) }), 10_000);
+      return diagnoseMetrics(samples.map((s) => ({ at: new Date(s.timestamp).getTime(), memUsed: s.memUsed, memTotal: s.memTotal })), { since, now });
+    } catch {
+      return undefined; // diagnosis must never replace the failure it explains
+    }
   }
 
   async fetchPort(port: number, requestPath: string, request: WorldHttpRequest = { method: 'GET' }): Promise<WorldHttpResponse> {
@@ -660,6 +715,23 @@ class E2BWorld implements World {
     timer.unref();
     return () => { if (!stopped) { stopped = true; clearInterval(timer); } };
   }
+}
+
+/** Go's signal names, as envd reports a signalled process ("signal: killed"). */
+const ENVD_SIGNALS: Record<string, NodeJS.Signals> = {
+  killed: 'SIGKILL', terminated: 'SIGTERM', interrupt: 'SIGINT', hangup: 'SIGHUP', quit: 'SIGQUIT',
+  aborted: 'SIGABRT', 'segmentation fault': 'SIGSEGV', 'bus error': 'SIGBUS', 'broken pipe': 'SIGPIPE',
+  'illegal instruction': 'SIGILL', 'floating point exception': 'SIGFPE', 'alarm clock': 'SIGALRM',
+};
+
+/** envd ends a signalled PTY with exit -1 and names the signal in `error`; a
+ * rejection without an exit status means the stream, not the process, ended. */
+function ptyEnding(error: any): { code: number | null; termination?: WorldPtyTermination } {
+  if (typeof error?.exitCode !== 'number') return { code: null, termination: { lost: error instanceof Error ? error : new Error(String(error)) } };
+  const signal = error.exitCode === -1
+    ? ENVD_SIGNALS[/^signal: (.+?)(?: \(core dumped\))?$/.exec(String(error.error ?? error.message ?? ''))?.[1] ?? '']
+    : undefined;
+  return signal ? { code: null, termination: { signal } } : { code: error.exitCode };
 }
 
 /** E2B uses CommandExitError with a numeric exitCode for ordinary process

@@ -275,10 +275,21 @@ export interface WorldProcessSpec {
 
 /** A provider-owned interactive terminal. This deliberately mirrors the tiny
  * subset the browser terminal needs instead of leaking node-pty into callers. */
+/** How a PTY process ended when it produced no exit code: killed by a signal,
+ * or unknown because the provider stream was lost (the process may still be
+ * running in the world). */
+export type WorldPtyTermination = { signal: NodeJS.Signals } | { lost: Error };
+
+/** Evidence, from outside the agent, that the world itself broke a turn. */
+export interface WorldDiagnosis {
+  summary: string;
+  memoryExhausted: boolean;
+}
+
 export interface WorldPty {
   readonly pid?: number;
   onData(listener: (chunk: string) => void): () => void;
-  onExit(listener: (code: number | null) => void): () => void;
+  onExit(listener: (code: number | null, termination?: WorldPtyTermination) => void): () => void;
   write(data: string): void | Promise<void>;
   resize(cols: number, rows: number): void | Promise<void>;
   close(): (void | Promise<void>) | Promise<void | Promise<void>>;
@@ -342,6 +353,9 @@ export interface World {
    * return the updated handle. The world mutates its own handle too, so a
    * caller holding the live world sees the new checkout immediately. */
   addCheckout?(spec: WorldCheckoutSpec): Promise<WorldHandle>;
+  /** Remote providers: whether the sandbox (not the agent) explains a failure,
+   * judged from control-plane evidence that survives a frozen sandbox. */
+  diagnose?(window: { since: number; now?: number }): Promise<WorldDiagnosis | undefined>;
   destroy(): Promise<void>;
 }
 

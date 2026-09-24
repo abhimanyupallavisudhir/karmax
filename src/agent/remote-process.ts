@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
-import type { World, WorldPty } from '../world/types.js';
+import type { World, WorldPty, WorldPtyTermination } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
 import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, prepareCodexHistory, selectCodexHistoryCopy } from './codex-history.js';
 import { atomicPrivateWrite, publishLocalCodexHistory } from './codex-history-files.js';
@@ -24,6 +24,13 @@ const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? PINNED_CODEX_PA
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? PINNED_REMOTE_NODE_VERSION;
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? PINNED_REMOTE_NPM_VERSION;
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
+const MEMORY_GUARD = `${REMOTE_ROOT}/memory-guard.sh`;
+
+/** Ship the sandbox memory guard (src/agent/memory-guard.sh); every remote
+ * agent start launches it if it is not already running. */
+export async function installMemoryGuard(world: World): Promise<void> {
+  await world.writeFile(MEMORY_GUARD, fs.readFileSync(fileURLToPath(new URL('./memory-guard.sh', import.meta.url)), 'utf8'));
+}
 /** Current Codex treats refresh-token *presence* as the ChatGPT login marker,
  * even with fresh ID/access tokens. Remote worlds receive this inert value so
  * the real rotating credential remains exclusively host-owned. */
@@ -88,7 +95,11 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // Ordinary files have distinct paths and no live reader until startup. Rollout
   // publication reconciles shared session identity, so keep it serialized.
   const rolloutSet = new Set(rollouts);
-  await timed('bootstrap.seed-files', () => mapBatches(files.filter(file => !rolloutSet.has(file)), seed));
+  await Promise.all([
+    timed('bootstrap.seed-files', () => mapBatches(files.filter(file => !rolloutSet.has(file)), seed)),
+    // A safety net, not a requirement: never fail a turn over it.
+    installMemoryGuard(world).catch(() => undefined),
+  ]);
   for (const file of rollouts) await seed(file);
   // Retries may restore exclusively from the host after the source world has
   // been deleted. Repair prior duplicate copies here too, before Codex opens its
@@ -334,14 +345,16 @@ export function spawnRemoteAgentProcess(opts: {
   const pidFile = path.posix.join(home, 'karmax-agent.pid');
   const stderr = path.posix.join(home, 'agent-stderr.log');
   const bakedExecutable = `/opt/karmax/bin/${opts.provider}`;
+  const packageSpec = executable.args[1] ?? '';
   const forwardedArgs = executable.args.slice(2);
-  const expectedVersion = executable.args[1]?.slice(executable.args[1]!.lastIndexOf('@') + 1) ?? '';
+  const expectedVersion = packageSpec.slice(packageSpec.lastIndexOf('@') + 1);
   // A user may keep an older E2B/Daytona template after upgrading Karmax. Only
   // use its baked CLI when it is the version paired with this control-plane
   // adapter; otherwise npx installs the matching package into the sandbox cache.
   const bakedMatches = `[ -x ${quote(bakedExecutable)} ] && ${quote(bakedExecutable)} --version 2>/dev/null | grep -Fq -- ${quote(expectedVersion)}`;
+  // `command` is a shell expression (the resolved "$bin"); args are quoted.
   const invocation = (command: string, args: string[]) => {
-    if (opts.provider !== 'claude') return [command, ...args].map(quote).join(' ');
+    if (opts.provider !== 'claude') return [command, ...args.map(quote)].join(' ');
     // World transports are PTYs, but Claude's stream-json/print mode requires
     // non-interactive stdin. This foreground relay gives the CLI a real pipe,
     // forwards termination, and leaves its stdout/stderr on the provider PTY.
@@ -354,9 +367,13 @@ export function spawnRemoteAgentProcess(opts: {
       "child.on('error', (error) => { console.error(error); process.exitCode = 1 })",
       "child.on('exit', (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
     ].join('; ');
-    return ['node', '-e', relay, command, ...args].map(quote).join(' ');
+    return [...['node', '-e', relay].map(quote), command, ...args.map(quote)].join(' ');
   };
-  const selectedCommand = `if ${bakedMatches}; then exec ${invocation(bakedExecutable, forwardedArgs)}; else exec ${invocation(executable.command, executable.args)}; fi`;
+  // Resolve the paired CLI through npx's cache, then exec it directly: running
+  // it *under* npx kept a ~150 MB npm process alive for the whole session.
+  const resolved = `npx --yes --package=${quote(packageSpec)} -c ${quote(`command -v ${opts.provider}`)}`;
+  const selectedCommand = `if ${bakedMatches}; then bin=${quote(bakedExecutable)}; else bin=$(${resolved}) || exit 127; fi; `
+    + `exec ${invocation('"$bin"', forwardedArgs)}`;
   const commandLine = `sh -c ${quote(selectedCommand)}`;
   // Raw mode is required for the line-oriented JSON protocols: canonical PTYs
   // truncate single lines around MAX_CANON (~4 KiB). The sandbox-local pidfile
@@ -369,6 +386,7 @@ export function spawnRemoteAgentProcess(opts: {
     `pidfile=${quote(pidFile)}`,
     `if [ -s "$pidfile" ]; then old=$(cat "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
     'printf \'%s\\n\' "$$" > "$pidfile"',
+    `guard=${quote(path.posix.join(opts.world.handle.root, MEMORY_GUARD))}; [ -f "$guard" ] && sh "$guard" start >/dev/null 2>&1`,
     // Assemble the sentinel at runtime. The PTY echoes this whole shell command
     // before `stty -echo` executes; embedding READY literally would make that
     // command echo open the protocol gate before `exec agent`, allowing Bash to
@@ -387,6 +405,9 @@ export class RemoteSpawnedProcess extends EventEmitter {
   readonly pid = undefined;
   killed = false;
   exitCode: number | null = null;
+  /** Set when the provider stream ended without the process exiting. The
+   * ChildProcess contract has no such state, so adapters must check it. */
+  lost?: Error;
   private pty?: WorldPty;
   private ready: Promise<WorldPty>;
   private protocolGate: Promise<void>;
@@ -403,7 +424,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.ready = world.openPty({ command, cwd, env, cols: 200, rows: 40 }).then((pty) => {
       this.pty = pty;
       pty.onData((chunk) => this.onData(chunk));
-      pty.onExit((code) => this.finish(code));
+      pty.onExit((code, termination) => this.finish(code, termination));
       return pty;
     }).catch((error) => {
       const failure = error instanceof Error ? error : new Error(String(error));
@@ -456,10 +477,17 @@ export class RemoteSpawnedProcess extends EventEmitter {
     return true;
   }
 
-  private async finish(code: number | null): Promise<void> {
+  private async finish(code: number | null, termination?: WorldPtyTermination | NodeJS.Signals | null): Promise<void> {
     if (this.finishing) return;
     this.finishing = true;
     this.exitCode = code;
+    // Tolerate providers that forward Node's exit(code, signal) verbatim.
+    const ending: WorldPtyTermination | undefined = typeof termination === 'string' ? { signal: termination }
+      : termination && typeof termination === 'object' ? termination : undefined;
+    const signal = ending && 'signal' in ending ? ending.signal : null;
+    if (ending && 'lost' in ending) this.lost = new Error(
+      `lost the connection to the agent in the sandbox; it may still be running there (${ending.lost.message})`,
+      { cause: ending.lost });
     this.openProtocolGate();
     // The protocol owns PTY stdout; native stderr is redirected to a file.
     // Recover a bounded tail before close so startup failures retain their cause.
@@ -472,8 +500,8 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.finished = true;
     this.stdout.end();
     this.stderr.end();
-    this.emit('exit', code, null);
-    this.emit('close', code, null);
+    this.emit('exit', code, signal);
+    this.emit('close', code, signal);
   }
 
   private onData(chunk: string): void {

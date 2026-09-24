@@ -3,13 +3,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const sdkState = vi.hoisted(() => ({ messages: [] as any[], options: undefined as any }));
+const sdkState = vi.hoisted(() => ({ messages: [] as any[], options: undefined as any,
+  run: undefined as undefined | ((options: any) => AsyncGenerator<any>) }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   createSdkMcpServer: (config: any) => ({ type: 'sdk', name: config.name, instance: {}, tools: config.tools }),
   tool: (name: string, description: string, schema: unknown, handler: unknown) => ({ name, description, schema, handler }),
   query: (args: any) => {
     sdkState.options = args.options;
+    if (sdkState.run) return sdkState.run(args.options);
     return (async function* () {
       for (const message of sdkState.messages) yield message;
     })();
@@ -45,7 +47,7 @@ const ctx: any = {
 };
 
 describe('Claude Agent SDK terminal outcome contract', () => {
-  beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; });
+  beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; sdkState.run = undefined; });
 
   it('uses one stdio platform server plus a disjoint local-control server', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
@@ -140,6 +142,33 @@ describe('Claude Agent SDK terminal outcome contract', () => {
         .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource']));
       expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).toContain('subscription');
       expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).not.toContain('host-only-refresh');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  // Task 348: the sandbox froze, E2B dropped the PTY stream, and the SDK saw a
+  // process "exit" with no code. The agent was in fact still running remotely.
+  it('reports a lost sandbox connection rather than a process exit', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-lost-'));
+    const cause = new Error('[unavailable] upstream connect error or disconnect/reset before headers');
+    const world: any = {
+      handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'remote',
+        root: '/workspace', branch: 'task', base: 'main' },
+      async exec() { return { stdout: '', stderr: '', code: 0 }; },
+      async writeFileBuffer() {}, async writeFile() {}, async listFiles() { return []; }, async destroy() {},
+      async readFile() { throw new Error('missing'); }, async readFileBuffer() { throw new Error('missing'); },
+      async openPty() {
+        return { onData: () => () => {}, write: async () => {}, resize: async () => {}, close: async () => {},
+          onExit(listener: any) { setTimeout(() => listener(null, { lost: cause }), 0); return () => {}; } };
+      },
+    };
+    sdkState.run = async function* (options: any) {
+      const child = options.spawnClaudeCodeProcess({ command: 'claude', args: [], env: {}, signal: new AbortController().signal });
+      await new Promise((resolve) => child.once('exit', resolve));
+    };
+    try {
+      const failure = await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx).catch((e) => e);
+      expect(failure.message).toMatch(/^lost the connection to the agent in the sandbox; it may still be running there \(\[unavailable\]/);
+      expect(failure.cause).toBe(cause);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 

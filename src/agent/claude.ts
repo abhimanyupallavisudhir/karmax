@@ -25,7 +25,7 @@ import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './cust
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity, toolActivityDetail } from './activity.js';
 import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-homes.js';
-import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess,
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, type RemoteSpawnedProcess,
   syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 import { recoverClaudeToolInputs } from './claude-history.js';
@@ -342,6 +342,9 @@ export class ClaudeAdapter implements AgentAdapter {
     const remoteHome = remote
       ? await timed('bootstrap.home', () => seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
       : undefined;
+    // The SDK only sees a codeless exit when the sandbox stream drops; the
+    // process knows the agent may still be running there (task 348).
+    let remoteProcess: RemoteSpawnedProcess | undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and
     // the config-home stdio bridge were both registered as `karmax`; the SDK
@@ -587,7 +590,7 @@ export class ClaudeAdapter implements AgentAdapter {
             const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env,
               Object.keys(input.secretEnv ?? {}));
             if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
-            return spawnRemoteAgentProcess({
+            remoteProcess = spawnRemoteAgentProcess({
               world: input.world,
               provider: 'claude',
               command: o.command,
@@ -595,7 +598,8 @@ export class ClaudeAdapter implements AgentAdapter {
               cwd: worldWorkingDirectory(input.world.handle),
               env: remoteEnv,
               signal: o.signal,
-            }) as any;
+            });
+            return remoteProcess as any;
           }
           const custody = createCustodyEnv(o.env);
           const child = spawn(o.command, o.args, {
@@ -858,6 +862,7 @@ export class ClaudeAdapter implements AgentAdapter {
       // it (return the partial output); rethrow anything else as a real failure.
       if (!ctx.signal?.aborted) {
         if (e instanceof ProviderFailure) throw e;
+        if (remoteProcess?.lost) throw remoteProcess.lost;
         const message = e instanceof Error ? e.message : String(e);
         const classified = providerErrorFromMessage('claude', message);
         if (classified instanceof ProviderFailure || !(e instanceof Error)) throw classified;
@@ -878,6 +883,7 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
     if (!successfulResult) {
+      if (remoteProcess?.lost) throw remoteProcess.lost;
       throw new Error('Claude Agent SDK stream ended unexpectedly without a successful result event');
     }
     // Only a subtype=success result is a turn boundary. `delivered` = every message

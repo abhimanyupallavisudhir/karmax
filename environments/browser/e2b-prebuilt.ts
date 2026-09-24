@@ -33,7 +33,10 @@ const command = [
   'PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers node /opt/karmax/smoke.mjs',
 ].join(' && ');
 const template = Template().fromTemplate(process.env.KARMAX_E2B_BASE_TEMPLATE ?? 'codex').runCmd(command, { user: 'root' });
+// E2B fixes memory per template. 2 GiB leaves ~1.1 GiB beside the agent and
+// browser, too little to type-check a mid-sized TypeScript repo (tasks 348/349);
+// build a larger variant for such projects with KARMAX_E2B_MEMORY_MB=4096.
 const result = await Template.build(template, process.env.KARMAX_E2B_TEMPLATE_TAG ?? 'karmax-browser-v2', {
-  cpuCount: 2, memoryMB: 2048, onBuildLogs: defaultBuildLogger(),
+  cpuCount: 2, memoryMB: Number(process.env.KARMAX_E2B_MEMORY_MB ?? 2048), onBuildLogs: defaultBuildLogger(),
 });
 console.log(JSON.stringify(result));
