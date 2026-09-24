@@ -16453,7 +16453,7 @@ function syncNotificationAlerts() {
   document.querySelectorAll('#notification-alerts > .notification-alert').forEach((alert) => {
     if (!live.has(alert.dataset.id)) alert.remove();
   });
-  for (const [id, notification] of systemNotifications) if (!live.has(id)) notification.close();
+  for (const [id, notification] of systemNotifications) if (!live.has(id)) { systemNotifications.delete(id); notification.close(); }
 }
 // The row may have been replaced by a refresh since the alert was shown.
 const liveInboxItem = (item) => S.inbox.find((candidate) => candidate.id === item.id) || item;
