@@ -142,6 +142,7 @@ export class TokenAuthority {
     const record = ((await this.store?.getHumanDelegation(id)) as unknown as HumanDelegation | undefined)
       ?? this.delegations.get(id);
     if (!record || record.expiresAt <= Date.now()) return undefined;
+    if (await this.store?.kvGet(`account-closed:${record.humanUserId}`)) return undefined;
     if (record.parentDelegationId) {
       const parent = (await this.delegation(record.parentDelegationId, visited));
       if (!parent || parent.humanUserId !== record.humanUserId) return undefined;
@@ -322,6 +323,11 @@ export class TokenAuthority {
       ? (await this.store.getScopedToken(digest)) as unknown as ScopedToken | undefined
       : this.tokens.get(digest);
     if (record && record.expiresAt > Date.now()) {
+      const subject = record.humanSubject?.userId
+        ?? (record.actor?.kind === 'interactive-human' ? record.actor.userId : undefined);
+      const users = new Set([subject, record.principal.startsWith('user:') ? record.principal.slice(5) : undefined]);
+      for (const userId of users)
+        if (userId && await this.store?.kvGet(`account-closed:${userId}`)) return undefined;
       if (record.parentTokenId && !(await this.tokenById(record.parentTokenId))) return undefined;
       if (record.delegationId) {
         const delegation = (await this.delegation(record.delegationId));

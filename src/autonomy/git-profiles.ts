@@ -132,6 +132,7 @@ export class GitProfiles {
     if ((await this.list()).length || (await this.defaultProfile())) throw new Error('organization Git is already configured');
     const userId = userIdOfScope(userProfiles.organizationId);
     if (!userId) throw new Error('source must be a user Git profile');
+    if (await this.store.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
     const source = (await userProfiles.resolve(undefined));
     if (!source) throw new Error('Add a default Git identity on your profile, then try again.');
     const linked: GitProfile = {
@@ -160,6 +161,8 @@ export class GitProfiles {
     githubToken?: string; github?: { id: string; login: string; name?: string };
     customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean }): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    const userId = userIdOfScope(this.organizationId);
+    if (userId && await this.store.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
     const name = args.name.trim();
     assertProfileName(name);
     if (!args.userName?.trim() || !args.userEmail?.trim()) throw new Error('userName and userEmail are required');
@@ -324,6 +327,7 @@ export class GitProfiles {
    * whenever the profile is saved).
    */
   async identity(profile: GitProfile, ctx: { taskId?: string }): Promise<GitIdentity> {
+    await this.assertAccountOpen(profile);
     const id: GitIdentity = { name: profile.userName, email: profile.userEmail };
     if (profile.signingKey) id.signingKeyPath = (await this.materializeKey(profile.name, 'signing', ctx));
     return id;
@@ -333,6 +337,7 @@ export class GitProfiles {
    * The caller passes it directly to the provider; it is never journaled or
    * stored in the serializable world handle. */
   async worldCredentials(profile: GitProfile, ctx: { taskId?: string }): Promise<{ sshKey?: string }> {
+    await this.assertAccountOpen(profile);
     return {
       ...(profile.sshKey ? { sshKey: (await this.resolveSecret(profile.name, 'ssh', ctx)) } : {}),
     };
@@ -346,6 +351,7 @@ export class GitProfiles {
    * `gh auth switch`, which mutates global state under sibling tasks).
    */
   async env(profile: GitProfile, ctx: { taskId?: string }): Promise<Record<string, string>> {
+    await this.assertAccountOpen(profile);
     const env: Record<string, string> = {};
     if (profile.sshKey) {
       const key = (await this.materializeKey(profile.name, 'ssh', ctx));
@@ -475,6 +481,7 @@ export class GitProfiles {
 
   private async resolveSecret(profile: string, kind: 'ssh' | 'signing' | 'token', ctx: { taskId?: string }): Promise<string> {
     const record = (await this.get(profile));
+    await this.assertAccountOpen(record);
     const scope = record?.source ? userGitScope(record.source.userId) : this.organizationId;
     const sourceProfile = record?.source?.profile ?? profile;
     const handle = gitHandle(sourceProfile, kind, scope);
@@ -511,6 +518,11 @@ export class GitProfiles {
   private scopeLabel(): string {
     const userId = userIdOfScope(this.organizationId);
     return userId ? `user ${userId}` : `organization ${this.organizationId}`;
+  }
+
+  private async assertAccountOpen(profile?: GitProfile): Promise<void> {
+    const userId = profile?.source?.userId ?? userIdOfScope(this.organizationId);
+    if (userId && await this.store.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
   }
 
   private requireBroker(): CredentialBroker {
