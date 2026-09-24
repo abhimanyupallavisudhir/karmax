@@ -414,8 +414,14 @@ class E2BWorld implements World {
     if (opts.input !== undefined) {
       try {
         const handle: any = await (this.sandbox.commands.run as any)(line, { ...runOpts, background: true, stdin: true });
-        await handle.sendStdin(opts.input);
-        await handle.closeStdin();
+        try {
+          await handle.sendStdin(opts.input);
+          await handle.closeStdin();
+        } catch (stdinError) {
+          // A command that exits before reading its input (missing file or
+          // binary) leaves only a stale pid behind; its own exit explains why.
+          if (await handle.kill().catch(() => false)) throw stdinError;
+        }
         const result: any = await handle.wait();
         return { stdout: String(result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
           code: Number(result?.exitCode ?? 0) };
