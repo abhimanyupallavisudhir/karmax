@@ -57,3 +57,13 @@ export function registryEntry(server: any) {
   return { name: String(server.name ?? '').slice(0, 256), version: String(server.version ?? '').slice(0, 128),
     title: String(server.title ?? server.name ?? '').slice(0, 256), description: String(server.description ?? '').slice(0, 1000), options };
 }
+/** The exact registry server named by an agent request, or undefined. */
+export async function registryServer(name: string): Promise<ReturnType<typeof registryEntry> | undefined> {
+  if (!/^[A-Za-z0-9.-]+\/[A-Za-z0-9._-]+$/.test(name) || name.length > 160) throw new Error('Use an MCP Registry name such as com.example/server');
+  for (let page = 0, cursor = ''; page < 5; page++) {
+    const result = await registrySearch(name, cursor);
+    const exact = result.servers.find((server: any) => server.name === name);
+    if (exact || !result.nextCursor) return exact;
+    cursor = result.nextCursor;
+  }
+}

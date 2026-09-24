@@ -14906,7 +14906,7 @@ function connectionRows(connections, inTask = false) {
   return connections.map(c => {
     const own = c.ownerId === userId;
     const canConnect = !c.ownerId || own;
-    const status = { requested: 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
+    const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
     return `<div class="approval-request" data-connection="${esc(c.id)}">
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
@@ -14917,10 +14917,11 @@ function connectionRows(connections, inTask = false) {
           <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
-        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm primary" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : 'Connect'}${inTask ? ' for this task' : ''}</button>` : ''}
+        ${canConnect && c.status === 'requested' ? (c.reusable || []).map(account => `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(account.id)}" title="Use your connected ${esc(account.label)} account — no new sign-in">${c.reusable.length > 1 ? `Use ${esc(account.label)}` : 'Allow'}</button>`).join('') : ''}
+        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
-        ${own && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
-        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
       </div></div>`;
   }).join('');
 }
@@ -14935,9 +14936,24 @@ function wireConnectionActions(root, organizationId, refresh) {
     if (popup) popup.opener = null;
     button.disabled = true;
     try {
-      if (action === 'connect' || action === 'restart') {
+      if (action === 'allow') {
+        await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, useConnectionId: button.dataset.useConnection }) });
+        await refresh();
+      } else if (action === 'connect' || action === 'restart') {
         const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });
-        if (result.url) {
+        if (result.url && result.callback === 'mcp') {
+          // The MCP server returns to Tavya's callback page, which finishes sign-in for this connection.
+          const state = new URL(result.url).searchParams.get('state');
+          if (popup) {
+            popup.sessionStorage.setItem(`mcp-oauth:${state}`, JSON.stringify({ path: `/api/connections/${encodeURIComponent(id)}/callback${oq}`, popup: true, back: location.pathname }));
+            const channel = new BroadcastChannel(`mcp-oauth:${state}`);
+            const timeout = setTimeout(() => channel.close(), 600000);
+            channel.onmessage = async (event) => { if (event.data === 'connected') { clearTimeout(timeout); channel.close(); await refresh(); } };
+            popup.location.replace(result.url);
+            row.querySelector('[data-connection-result]').innerHTML = '<p class="task-sub">Finish signing in in the new tab. This task continues automatically.</p>';
+          } else row.querySelector('[data-connection-result]').innerHTML = '<p class="task-sub">Allow pop-ups, then click Connect again.</p>';
+          button.hidden = !!popup;
+        } else if (result.url) {
           if (popup) popup.location.href = result.url;
           row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
           button.hidden = true;
@@ -19400,7 +19416,8 @@ async function finishMcpCallback() {
   try {
     if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
     if (params.get('error')) throw new Error('Authorization was declined. You can try again in connection settings.');
-    await api(`/api/mcp/${pending.id}/callback${pending.query}`, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
+    const path = typeof pending.path === 'string' && pending.path.startsWith('/api/connections/') ? pending.path : `/api/mcp/${pending.id}/callback${pending.query}`;
+    await api(path, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
     sessionStorage.removeItem(key);
     if (pending.popup) {
       const channel = new BroadcastChannel(`mcp-oauth:${state}`); channel.postMessage('connected'); channel.close();

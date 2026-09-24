@@ -1,7 +1,12 @@
 import crypto from 'node:crypto';
 import { auth, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import { publicFetch, publicUrl } from './http.js';
-import { McpConnections, type McpConnection } from './store.js';
+import type { McpConnection } from './store.js';
+
+/** Credential storage for an OAuth-authorized remote MCP server: project/organization
+ * Tools connections and personal app connections share the same OAuth flow. */
+export interface OAuthVault { secret(c: OAuthTarget, taskId?: string): any; setSecret(c: OAuthTarget, value: unknown): Promise<void> }
+export type OAuthTarget = Pick<McpConnection, 'id' | 'organizationId' | 'label' | 'auth' | 'transport' | 'revision'>;
 
 export const MCP_CLIENT_METADATA_PATH = '/api/mcp-client-metadata';
 export function mcpClientMetadata(publicOrigin = process.env.KARMAX_PUBLIC_URL) {
@@ -28,7 +33,7 @@ async function exclusive<T>(key: string, run: () => Promise<T>): Promise<T> {
   const next = old.catch(() => {}).then(run); locks.set(key, next);
   try { return await next; } finally { const count = (waiters.get(key) ?? 1) - 1; if (count) waiters.set(key, count); else waiters.delete(key); if (locks.get(key) === next) locks.delete(key); }
 }
-function provider(service: McpConnections, connection: McpConnection, data: any, redirect: string,
+function provider(service: OAuthVault, connection: OAuthTarget, data: any, redirect: string,
   onRedirect: (url: string) => void): OAuthClientProvider {
   return {
     redirectUrl: redirect,
@@ -46,7 +51,7 @@ function provider(service: McpConnections, connection: McpConnection, data: any,
     saveDiscoveryState: async (state) => { data.discovery = state; (await service.setSecret(connection, data)); },
   };
 }
-export async function beginOAuth(service: McpConnections, c: McpConnection, actor: string, redirect: string) {
+export async function beginOAuth(service: OAuthVault, c: OAuthTarget, actor: string, redirect: string) {
   if (c.auth !== 'oauth' || c.transport.type === 'stdio') throw new Error('This connection does not use OAuth');
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
     const data = service.secret(c);
@@ -65,7 +70,7 @@ export async function beginOAuth(service: McpConnections, c: McpConnection, acto
     return { authorizationUrl };
   });
 }
-export async function finishOAuth(service: McpConnections, c: McpConnection, actor: string, state: string, code: string) {
+export async function finishOAuth(service: OAuthVault, c: OAuthTarget, actor: string, state: string, code: string) {
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
     const data = service.secret(c);
     const pending = data.pending;
@@ -80,7 +85,7 @@ export async function finishOAuth(service: McpConnections, c: McpConnection, act
     } finally { delete data.pending; (await service.setSecret(c, data)); }
   });
 }
-export async function connectionHeaders(service: McpConnections, c: McpConnection, taskId?: string): Promise<Record<string, string>> {
+export async function connectionHeaders(service: OAuthVault, c: OAuthTarget, taskId?: string): Promise<Record<string, string>> {
   if (c.auth === 'none') return {};
   if (c.auth === 'secrets') return service.secret(c, taskId);
   return exclusive(`${c.organizationId}:${c.id}`, async () => {

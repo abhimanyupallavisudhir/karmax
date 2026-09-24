@@ -1,6 +1,7 @@
 import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { Capability, CAPABILITIES, DEVELOPER_WORKSPACE_CAPABILITIES, allows, attenuate } from './capabilities.js';
+import { SHIPPED_BUILTIN_PROFILES } from './builtin-profile-history.js';
 import type { AuthorizationSelection, ProjectMembership } from '../domain/types.js';
 
 export type AuthorizationProfileId = 'viewer' | 'developer' | 'maintainer' | 'administrator' | 'god' | string;
@@ -230,8 +231,11 @@ export class AuthorizationService {
         continue;
       }
       const historical = LEGACY_BUILTIN_CAPABILITIES[profile.id] ?? [];
-      if (stored.builtin && stored.name === profile.name && (stored.description === profile.description || stored.description === PREVIOUS_BUILTIN_DESCRIPTIONS[profile.id])
-        && historical.some((caps) => sameCapabilities(stored.capabilities, caps))) {
+      const legacy = (stored.description === profile.description || stored.description === PREVIOUS_BUILTIN_DESCRIPTIONS[profile.id])
+        && historical.some((caps) => sameCapabilities(stored.capabilities, caps));
+      const shipped = SHIPPED_BUILTIN_PROFILES.some((version) => version.id === profile.id && version.description === stored.description
+        && sameCapabilities(stored.capabilities, [...version.capabilities]));
+      if (stored.builtin && stored.name === profile.name && (legacy || shipped)) {
         (await this.store.setAuthorizationProfile('global', profile as any));
       }
     }
