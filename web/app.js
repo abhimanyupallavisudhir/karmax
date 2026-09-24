@@ -14472,7 +14472,7 @@ async function wirePaidLaunchCard() {
       <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
       <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
   box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
-    <p class="task-sub">Subscription settings for ${esc(location.host)}. Secret keys stay encrypted in the vault.</p>
+    <p class="task-sub">Subscription settings for ${esc(location.host)}. No paid-launch environment variables are required. Secret keys stay encrypted in the vault.</p>
     ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
     <label class="form-row">Billing provider<select class="paid-billing-provider"><option value="paddle" ${state.billingProvider === 'paddle' ? 'selected' : ''}>Paddle · merchant of record</option><option value="stripe" ${state.billingProvider !== 'paddle' ? 'selected' : ''}>Stripe Billing</option></select></label>
     <div class="paid-paddle-section" ${state.billingProvider === 'paddle' ? '' : 'hidden'}>
