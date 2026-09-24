@@ -186,7 +186,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/gift$/.test(p)) return 'subscription:gift';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats)$/.test(p))
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -251,7 +251,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
-  if (p === '/api/subscriptions/webhook') return 'none';
+  if (p === '/api/subscriptions/webhook' || p === '/api/subscriptions/paddle/webhook'
+    || p === '/api/subscriptions/paddle/checkout-config') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
@@ -1470,12 +1471,20 @@ export class Gateway {
     // SaaS subscription billing has its own secret, provider, and ledger. Keep
     // this pre-auth raw-body route separate from the Stripe Issuing webhook
     // above so customer subscription events can never authorize agent spend.
-    if (p === '/api/subscriptions/webhook' && method === 'POST') {
+    if (p === '/api/subscriptions/paddle/checkout-config' && method === 'GET') {
+      const c = await this.deps.paidLaunchSettings?.paddleConfig();
+      if (!c?.clientToken) return this.json(res, 503, { error: 'Paddle checkout is unavailable' });
+      res.setHeader('Cache-Control', 'no-store');
+      return this.json(res, 200, { environment: c.environment, clientToken: c.clientToken });
+    }
+    if ((p === '/api/subscriptions/webhook' || p === '/api/subscriptions/paddle/webhook') && method === 'POST') {
       try {
         if (!this.deps.subscriptions) return this.json(res, 503, { error: 'subscription billing is unavailable' });
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const paddle = p === '/api/subscriptions/paddle/webhook';
+        const signature = req.headers[paddle ? 'paddle-signature' : 'stripe-signature'];
         const result = (await this.deps.subscriptions.handleWebhook(raw,
-          typeof req.headers['stripe-signature'] === 'string' ? req.headers['stripe-signature'] : undefined));
+          typeof signature === 'string' ? signature : undefined, paddle ? 'paddle-billing' : undefined));
         return this.json(res, 200, { received: true, ...result });
       } catch (error) {
         return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -2104,6 +2113,14 @@ export class Gateway {
         (await store.setSettings('global', 'appearance', { ...appearance, siteName }));
         return this.json(res, 200, { ok: true, siteName });
       }
+      if (p === '/api/settings/paid-launch/paddle/provision' && method === 'POST') {
+        if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
+          return this.json(res, 403, { error: 'installation administrator access is required' });
+        if (!this.deps.paidLaunchSettings) return this.json(res, 503, { error: 'paid-launch settings are unavailable' });
+        try {
+          return this.json(res, 200, await this.deps.paidLaunchSettings.provisionPaddle(this.publicUrl(req), await this.siteName));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       if (p === '/api/settings/paid-launch') {
         if (!this.deps.paidLaunchSettings)
           return this.json(res, 503, { error: 'paid-launch settings are unavailable' });
@@ -2244,7 +2261,7 @@ export class Gateway {
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|gift)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|reconcile|gift)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2312,6 +2329,7 @@ export class Gateway {
               String(body.plan ?? ''), idempotencyKey));
           }
           if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
+          if (action === 'reconcile') return this.json(res, 200, await billing.reconcilePending(organizationId));
           await billing.syncSeats(organizationId);
           return this.json(res, 202, { syncing: true });
         } catch (error) {
@@ -7730,7 +7748,7 @@ export class Gateway {
 
   // ── static SPA ──
   private async static(p: string, res: http.ServerResponse, req?: http.IncomingMessage) {
-    let rel = p === '/' ? '/index.html' : p;
+    let rel = p === '/' ? '/index.html' : p === '/billing/checkout' ? '/paddle-checkout.html' : p;
     let file = path.join(this.deps.staticDir, rel);
     if (!file.startsWith(this.deps.staticDir) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
       file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback

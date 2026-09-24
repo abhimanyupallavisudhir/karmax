@@ -710,6 +710,14 @@ export class Store {
         organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL,
         grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS subscription_billing_checkouts (
+        provider TEXT NOT NULL, checkoutId TEXT NOT NULL, organizationId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, subscriptionId TEXT, state TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY (provider, checkoutId)
+      );
+      CREATE TABLE IF NOT EXISTS subscription_billing_locks (
+        organizationId TEXT PRIMARY KEY, requestKey TEXT NOT NULL,
+        intentJson TEXT, providerReference TEXT NOT NULL, createdAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS subscription_billing_events (
         provider TEXT NOT NULL, eventId TEXT NOT NULL, type TEXT NOT NULL,
         createdAt INTEGER NOT NULL, processedAt INTEGER,
@@ -1849,6 +1857,8 @@ export class Store {
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
+      subscription_billing_checkouts: (await selectRows(this.db, 'subscription_billing_checkouts', 'organizationId=?', [organizationId])),
+      subscription_billing_locks: (await selectRows(this.db, 'subscription_billing_locks', 'organizationId=?', [organizationId])),
       policy_acceptances: (await selectRows(this.db, 'policy_acceptances', 'organizationId=?', [organizationId])),
       authorization_profiles: (await rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)])),
       principal_grants: (await rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)])),
@@ -2095,6 +2105,8 @@ export class Store {
       (await this.db.prepare('DELETE FROM subscription_billing_requests WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM subscription_billing_checkouts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys));
       (await deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys));
       (await deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys));

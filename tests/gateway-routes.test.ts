@@ -103,6 +103,9 @@ describe('gateway route capability binding', () => {
     expect(cap('POST', '/api/organizations/o1/subscription/checkout')).toBe('payment:write');
     expect(cap('POST', '/api/organizations/o1/subscription/cancel')).toBe('payment:write');
     expect(cap('POST', '/api/subscriptions/webhook')).toBe('none');
+    expect(cap('POST', '/api/subscriptions/paddle/webhook')).toBe('none');
+    expect(cap('GET', '/api/subscriptions/paddle/checkout-config')).toBe('none');
+    expect(PLATFORM_API_CATALOG.payments.some((entry) => entry.startsWith('GET /api/subscriptions/paddle/checkout-config '))).toBe(true);
     expect(cap('POST', '/api/payments/stripe/webhook')).toBe('none');
   });
 
