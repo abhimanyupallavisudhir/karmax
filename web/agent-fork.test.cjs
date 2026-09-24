@@ -99,6 +99,9 @@ const source = {
 const chip = resumeChosenInner({ taskId: 'task_source', role: 'do' }, source);
 ok(chip.includes('<a class="af-resume-source" data-spa href="/acme/p1/tasks/42"'), 'the "fork of" text links to the source task');
 ok(chip.includes('>#42 Ship &lt;billing&gt;</a>'), 'the link carries the task number and escaped title');
+ok(chip.includes('class="af-resume-reuse-model"') && chip.includes('Re-use same AI model'), 'known task offers model reuse');
+ok(!chip.includes('class="af-resume-reuse-model" checked'), 'model reuse starts unchecked');
+ok(resumeChosenInner({ taskId: 'missing' }).includes('af-resume-reuse-model'), 'saved forks can reuse a source outside the current task list');
 ok(chip.includes('class="af-resume-clear"'), 'the chip keeps its clear button');
 ok(chip.includes('class="af-resume-reauthorize"') && chip.includes('Re-authorize previous grants?'), 'a source with known grants offers to re-authorize them');
 ok(chip.includes('class="af-resume-reauth" hidden'), 'the option starts hidden until a form with grant controls claims it');
@@ -148,6 +151,7 @@ const hostRoot = { dataset: {}, querySelectorAll: () => [], addEventListener(typ
 let hostAttached = false;
 const dispatched = [];
 const box = {
+  addEventListener() {},
   dataset: { agent: 'do' },
   querySelector(selector) {
     return {

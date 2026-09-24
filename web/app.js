@@ -1113,7 +1113,7 @@ function resumeChosenInner(rf, task) {
     ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
-    : ''}`;
+    : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
 }
 
 // The grants a task ended with, in the task form's own vocabulary: its stored
@@ -1919,13 +1919,65 @@ function wireAgentBox(box) {
     if (!grants) return;
     box.dispatchEvent(new CustomEvent('af-reauthorize', { bubbles: true, detail: { taskId: task.id, enabled: on, ...grants } }));
   };
-  // Dropping the source also withdraws the grants it brought along.
+  // Reuse fills the ordinary fields, so task creation and parameter editing
+  // persist the same AgentSpec as a manual selection. Keep the previous values
+  // only until the source is withdrawn or the user customizes these controls.
+  let modelStash = null;
+  let modelRequest = 0;
+  const modelSelection = () => ({
+    avatarId: avatarSelect?.value || '',
+    provider: providerOf(),
+    model: box.querySelector('.af-model').value,
+    effort: box.querySelector('.af-effort').value,
+  });
+  const applyModelSelection = (spec) => {
+    if (avatarSelect) avatarSelect.value = spec.avatarId || '';
+    box.querySelector('.af-provider').value = spec.provider;
+    box.querySelector('.af-model').value = spec.model || '';
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+    box.querySelector('.af-effort').value = spec.effort || '';
+    syncAvatar();
+  };
+  const withdrawModel = () => {
+    modelRequest++;
+    if (modelStash) applyModelSelection(modelStash);
+    modelStash = null;
+  };
+  const reuseModel = async (option) => {
+    if (!option.checked) { withdrawModel(); return; }
+    const request = ++modelRequest;
+    try {
+      const rf = JSON.parse(chosen.dataset.resume);
+      const session = chosen._sourceSession || (await api(`/api/tasks/${encodeURIComponent(rf.taskId)}/sessions?metadata=1`))[rf.role || 'do'];
+      if (request !== modelRequest || !option.checked) return;
+      if (!session?.provider || !AGENT_PROVIDERS.includes(session.provider)) throw new Error('The source agent’s model settings are unavailable.');
+      modelStash = modelStash || modelSelection();
+      applyModelSelection(session);
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      if (request !== modelRequest) return;
+      option.checked = false;
+      toast(error.message, true);
+    }
+  };
+  const releaseModel = (event) => {
+    if (!event.target.matches('.af-provider, .af-model, .af-effort, .af-avatar')) return;
+    modelRequest++;
+    modelStash = null;
+    const option = chosen?.querySelector('.af-resume-reuse-model');
+    if (option) option.checked = false;
+  };
+  box.addEventListener('input', releaseModel);
+  box.addEventListener('change', releaseModel);
+  // Dropping the source also withdraws the grants and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
   };
   const clearTask = () => {
     if (!chosen) return;
     withdrawReauthorize();
+    withdrawModel();
+    chosen._sourceSession = undefined;
     chosen.dataset.resume = 'null';
     chosen.innerHTML = '';
   };
@@ -1934,13 +1986,15 @@ function wireAgentBox(box) {
     uploaded.dataset.upload = 'null';
     uploaded.innerHTML = '';
   };
-  const setResume = (rf, task) => {
+  const setResume = (rf, task, session) => {
     if (!chosen) return;
     if (rf) {
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
     withdrawReauthorize();
+    withdrawModel();
+    chosen._sourceSession = rf ? session : undefined;
     chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
@@ -1952,6 +2006,8 @@ function wireAgentBox(box) {
   chosen?.addEventListener('change', (e) => {
     const option = e.target.closest?.('.af-resume-reauthorize');
     if (option) announceReauthorize(option.checked);
+    const modelOption = e.target.closest?.('.af-resume-reuse-model');
+    if (modelOption) reuseModel(modelOption);
   });
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
@@ -1970,7 +2026,7 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
   sessionInput?.addEventListener('input', () => {
