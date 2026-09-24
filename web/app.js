@@ -16243,6 +16243,7 @@ function wireGlobalSettings(organizationId) {
 
 // ── inbox + collaboration ───────────────────────────────────────────────────
 function updateBell() {
+  syncNotificationAlerts();
   const badge = $('#bell-badge');
   if (!badge) return;
   const n = inboxUnreadCount('all');
@@ -16444,6 +16445,18 @@ function announceInbox(items) {
     if (behaviour.sound && !sounded) { playNotificationSound(item.urgency); sounded = true; }
   }
 }
+// Alerts mirror the inbox: each leaves when its ask is read or resolved, however
+// that happens. Every inbox change ends in updateBell, which calls this.
+const systemNotifications = new Map();
+function syncNotificationAlerts() {
+  const live = new Set(S.inbox.filter((item) => item.unread).map((item) => item.id));
+  document.querySelectorAll('#notification-alerts > .notification-alert').forEach((alert) => {
+    if (!live.has(alert.dataset.id)) alert.remove();
+  });
+  for (const [id, notification] of systemNotifications) if (!live.has(id)) { systemNotifications.delete(id); notification.close(); }
+}
+// The row may have been replaced by a refresh since the alert was shown.
+const liveInboxItem = (item) => S.inbox.find((candidate) => candidate.id === item.id) || item;
 function showVisualNotification(item) {
   let region = document.getElementById('notification-alerts');
   if (!region) {
@@ -16458,7 +16471,7 @@ function showVisualNotification(item) {
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
   alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
-  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(item); };
+  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
   while (region.children.length > 5) region.lastElementChild.remove();
@@ -16480,7 +16493,9 @@ function showSystemNotification(item) {
       tag: item.id,                                    // a restated ask replaces its own popup
       requireInteraction: item.urgency === 'critical', // critical waits to be dismissed
     });
-    notification.onclick = () => { window.focus(); notification.close(); openInboxItem(item); };
+    notification.onclick = () => { window.focus(); notification.close(); openInboxItem(liveInboxItem(item)); };
+    notification.onclose = () => { if (systemNotifications.get(item.id) === notification) systemNotifications.delete(item.id); };
+    systemNotifications.set(item.id, notification);
     return true;
   } catch { return false; }
 }
