@@ -514,10 +514,13 @@ export class GitHubAppService {
     const identity = await this.identityForToken(String(value.access_token));
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
-    await this.saveUserToken(userId, identity.id, value);
-    (await this.clearUserAuthorizationFailure(userId, identity.id));
-    (await this.clearUserAuthorizationFailure(userId));
-    (await this.saveUserIdentity(userId, identity, options.makeActive));
+    await this.store.transaction(async () => {
+      await this.assertUserOpen(userId);
+      await this.saveUserToken(userId, identity.id, value);
+      (await this.clearUserAuthorizationFailure(userId, identity.id));
+      (await this.clearUserAuthorizationFailure(userId));
+      (await this.saveUserIdentity(userId, identity, options.makeActive));
+    });
     return identity;
   }
 
@@ -532,15 +535,18 @@ export class GitHubAppService {
     const identity = await this.identityForToken(authorization.accessToken);
     if (identity.id !== expectedAccountId)
       throw new Error(`GitHub signed in as @${identity.login}, but returned a mismatched account id`);
-    (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
-      accessToken: authorization.accessToken,
-      ...(authorization.accessTokenExpiresAt ? { expiresAt: authorization.accessTokenExpiresAt.getTime() } : {}),
-      ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
-      ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
-    })));
-    (await this.clearUserAuthorizationFailure(userId, identity.id));
-    (await this.clearUserAuthorizationFailure(userId));
-    (await this.saveUserIdentity(userId, identity, false));
+    await this.store.transaction(async () => {
+      await this.assertUserOpen(userId);
+      (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
+        accessToken: authorization.accessToken,
+        ...(authorization.accessTokenExpiresAt ? { expiresAt: authorization.accessTokenExpiresAt.getTime() } : {}),
+        ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
+        ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
+      })));
+      (await this.clearUserAuthorizationFailure(userId, identity.id));
+      (await this.clearUserAuthorizationFailure(userId));
+      (await this.saveUserIdentity(userId, identity, false));
+    });
     return identity;
   }
 
@@ -1557,7 +1563,10 @@ export class GitHubAppService {
       }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
-    await this.saveTokenHandle(handle, value);
+    await this.store.transaction(async () => {
+      await this.assertUserOpen(userId);
+      await this.saveTokenHandle(handle, value);
+    });
     (await this.clearUserAuthorizationFailure(userId, accountId));
     (await this.store.appendAudit({
       principalId: `user:${userId}`,
@@ -1574,6 +1583,7 @@ export class GitHubAppService {
    * made with this token as the person, not as the organization App. Concurrent
    * callers share one refresh because GitHub refresh tokens are single-use. */
   async userAccessToken(userId: string, opts: { forceRefresh?: boolean; accountId?: string } = {}): Promise<string> {
+    await this.assertUserOpen(userId);
     const accountId = opts.accountId ?? (await this.activeUserAccountId(userId));
     const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
     const resolved = this.resolvedUserToken(handle);
@@ -1586,6 +1596,10 @@ export class GitHubAppService {
       .finally(() => this.userTokenRefreshes.delete(handle));
     this.userTokenRefreshes.set(handle, refresh);
     return refresh;
+  }
+
+  private async assertUserOpen(userId: string): Promise<void> {
+    if (await this.store.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
   }
 
   /** A user-token GitHub request that self-heals a server-side invalidation: on a

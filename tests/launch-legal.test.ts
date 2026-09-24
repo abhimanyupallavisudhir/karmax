@@ -108,7 +108,40 @@ describe('paid-launch policies', () => {
     expect(privacy).not.toContain('krmax');
     const data = JSON.stringify(policyDocument('data'));
     expect(data).toContain('not an automatic purge');
-    expect(data).toContain('publish the production and backup deletion schedule');
+    expect(data).toContain('applicable period or expiry criteria');
+    expect(data).toContain('completed deletion requests reapplied');
     expect(JSON.stringify(policyDocument('terms'))).toContain('mandatory consumer rights');
+  });
+
+  it('distinguishes operator subprocessors, customer destinations and retained copies', () => {
+    const privacy = JSON.stringify(policyDocument('privacy', {}, undefined, 'Tavya'));
+    expect(privacy).toContain('MCP');
+    expect(privacy).toContain('not automatically an operator subprocessor');
+    expect(privacy).toContain('Disconnecting an integration does not erase');
+    expect(privacy).toContain('no service-wide promise');
+    expect(privacy).toContain('does not replace those requirements');
+    const providers = JSON.stringify(policyDocument('subprocessors'));
+    for (const name of ['E2B', 'Daytona', 'one.com', 'Resend', 'Composio']) expect(providers).toContain(name);
+    expect(providers).toContain('does not establish which region is in use');
+    expect(providers).toContain('Publishing an updated list alone does not replace');
+  });
+
+  it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {
+    const dpa = policyDocument('dpa')!;
+    expect(dpa.title).toBe('Data Processing Addendum');
+    const text = JSON.stringify(dpa);
+    for (const obligation of ['documented', 'confidentiality', 'Subprocessors', 'International',
+      'without undue delay', 'return or delete', 'audits and inspections', 'its subprocessor']) {
+      expect(text).toContain(obligation);
+    }
+    expect(text).toContain('not limited to sensitive or regulated-sector data');
+    expect(text).toContain('not itself an executed international-transfer instrument');
+    expect(text).toContain('operator-approval gate');
+    expect(JSON.stringify(policyDocument('terms'))).toContain('Data Processing Addendum linked with these Terms');
+    expect(JSON.stringify(policyDocument('terms'))).not.toContain('support, and improve');
+    expect(launchConfig({ ...completeEnv(), KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: '2026-09-24' }))
+      .toMatchObject({ ready: false, missing: ['KARMAX_FOUNDER_REVIEWED_POLICY_VERSION'] });
+    expect(() => assertPolicyAcceptance('signup', true, { ...policyVersions('signup'), terms: '2026-09-24' }))
+      .toThrow(/current terms/);
   });
 });

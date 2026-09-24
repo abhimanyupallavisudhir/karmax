@@ -7,7 +7,7 @@
  */
 import { HOSTED_PLANS } from '../domain/entitlements.js';
 
-export const POLICY_VERSION = '2026-09-24';
+export const POLICY_VERSION = '2026-09-24.1';
 export const POLICY_EFFECTIVE_DATE = 'September 24, 2026';
 export const POLICY_DRAFT_NOTICE = 'Launch draft pending final operator approval — not legal advice or a statement of completed legal review.';
 
@@ -30,13 +30,14 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       { heading: 'Agreement and operator', paragraphs: [
         'These Terms are an initial launch draft between you and the service operator identified in the launch configuration. Do not publish paid checkout until that identity and the governing-law fields are completed.',
         'By creating an account or buying a subscription, you affirmatively accept the versions shown at that action. If you use krmax for an organization, you represent that you may accept for it.',
+        'Where the operator processes personal data on your behalf as a processor, the Data Processing Addendum linked with these Terms forms part of the agreement. It takes precedence over conflicting provisions of these Terms for that processing. It is not a certification that your particular use complies with data protection law.',
       ] },
       { heading: 'The service', paragraphs: [
         'krmax coordinates AI agents, repositories, isolated workspaces, credentials, approvals, and related project records. Outputs can be incomplete or wrong. You remain responsible for reviewing work and choosing permissions, budgets, and deployment targets.',
         'Third-party services remain governed by their own terms. Availability can change when a repository host, model provider, cloud-workspace provider, payment provider, or customer-supplied integration changes or is unavailable.',
       ] },
       { heading: 'Your content and instructions', paragraphs: [
-        'You retain rights in content you submit. You authorize the operator and applicable subprocessors to host, copy, transmit, and process it only as needed to provide, secure, support, and improve the service as described in the Privacy Policy.',
+        'You retain rights in content you submit. You authorize the operator and applicable subprocessors to host, copy, transmit, and process it to provide, secure and support the service on your documented instructions. This does not authorize training general-purpose models on your private workspace content.',
         'You are responsible for having rights to repositories, prompts, data, credentials, and instructions you connect, and for configuring agent access appropriately.',
       ] },
       { heading: 'Accounts, suspension, and termination', paragraphs: [
@@ -71,7 +72,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     sections: [
       { heading: 'Roles and data categories', paragraphs: [
         'For account, authentication, support, product telemetry, and billing records, the configured service operator generally determines why and how data is processed.',
-        'For repository, prompt, task, workspace, credential, and output data a business customer submits, the customer generally determines the purpose and the operator processes that data to provide the service. The contract and requested DPA control where applicable law assigns different roles.',
+        'For repository, prompt, task, workspace, credential, and output data a customer submits under a controller/processor relationship, the customer determines the purpose and the operator processes that data on its behalf. The Data Processing Addendum applies to that processing, including where the customer is itself a processor for another controller. Roles depend on the actual processing, not just whose API key is used.',
       ], bullets: [
         'Account data: name, email, login providers, memberships, preferences, sessions, and security events.',
         'Billing data: plan, price, renewal state, payment-provider customer/subscription references, acceptance evidence, refunds, and support history. The checkout payment provider handles subscription card details; krmax does not store full subscription payment-card numbers.',
@@ -92,7 +93,13 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       ] },
       { heading: 'Sharing, transfers, and retention', paragraphs: [
         'Data is shared with subprocessors only for the service functions described on the Subprocessor list, with customer-selected integrations, when a customer directs, or when legally required. Providers may process data in the regions described by their own service terms and the applicable DPA.',
+        'There is no service-wide promise that all data stays in the UK or EEA. Model calls, sandbox execution and connected services may involve other countries. Where the operator is responsible for a restricted transfer, it must use an applicable adequacy decision or appropriate transfer safeguards; a customer instruction or a warning about overseas processing does not replace those requirements. Contact the privacy address for the safeguards applicable to an operator-arranged transfer and how to obtain a copy.',
         'Retention, export, deletion, and backup behavior are described on Data controls. Contact the configured privacy address for access, correction, portability, objection, restriction, or other applicable privacy requests.',
+      ] },
+      { heading: 'Customer-connected services and MCP', paragraphs: [
+        'When you connect a repository, model account, MCP server or other integration, your authorized tasks may send it tool arguments, files, prompts or other selected information and receive information in return. Review the destination, its permissions and its own terms before allowing access. A connection is not permission for unrelated actions.',
+        'A service you independently engage is not automatically an operator subprocessor merely because krmax can connect to it. Conversely, a provider engaged by the operator to deliver the service remains its responsibility even when you choose it from a menu. Any intermediary used by the operator to broker a connection must also be accounted for.',
+        'Information returned by an integration may be retained in krmax tasks, conversations, logs or artifacts under Data controls. Disconnecting an integration does not erase those copies or records already held by the destination. The operator remains responsible for its own copies and for processing within its role; it cannot promise deletion from every independent service.',
       ] },
       { heading: 'Your rights and complaints', paragraphs: [
         'Contact the privacy address shown on this page to request access, correction, erasure, restriction or portability where applicable. You may object to processing based on legitimate interests. Where we rely on consent, you may withdraw it at any time without affecting the lawfulness of processing before withdrawal. We may need proportionate information to verify your identity and authority; some rights depend on the purpose and legal basis of processing.',
@@ -126,10 +133,17 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Stripe — legacy subscription billing where configured, and the separate agent-card integration when selected; receives the account and payment information required for those functions, not repository/workspace content for subscription billing.',
         'OpenAI and Anthropic — prompts, selected repository/workspace context, attachments, and outputs when their model or connected subscription is selected. BYOK uses the customer’s provider account; managed usage uses the operator’s account.',
         'E2B or Daytona — isolated compute, repository checkout, workspace files, environment variables made available to the world, command traffic, and resulting artifacts when that cloud world provider is selected.',
+        'one.com — VPS hosting and server backups where used by the operator. This can include application databases, encrypted vault material and local objects. A core-hosting location is not a location guarantee for model calls, sandboxes or integrations.',
+        'Resend — transactional account, verification, security and support-notification email where configured; receives recipient addresses and message contents, not unrestricted repository access.',
+        'Composio — managed connection brokerage where configured; may handle connection credentials and tool requests/results. A broker engaged by the operator is distinct from the customer-selected destination service.',
         'Configured database, object-storage, hosting, email, monitoring, and support providers — account records, service metadata, stored objects, transactional messages, diagnostics, or support content as needed for their function.',
         'Customer-selected repository hosts and integrations (for example GitHub) — data the customer directs krmax to read or write under the customer’s connection. These may be independent services as well as processors acting on the customer’s instructions.',
       ] },
-      { heading: 'Changes and questions', paragraphs: ['Material additions should be versioned here and communicated to business customers as required by their DPA. Request the current provider/region details or object to a new subprocessor through the DPA contact.'] },
+      { heading: 'Roles, locations and changes', paragraphs: [
+        'This list includes conditional providers and independent services, not a claim that every named company is a subprocessor for every customer. Providers engaged by the operator to process customer personal data are subject to the DPA; independently selected destinations and payment providers may have different roles. Neither BYOK nor customer selection alone determines the legal role.',
+        'The operator must supply the current applicable subprocessor identities, functions and processing-country information before processing under the DPA. A provider offering a choice of regions does not establish which region is in use. Ask the DPA contact for the deployment-specific record; unknown locations must not be represented as verified.',
+        'The operator will notify affected customers before adding or replacing a subprocessor and allow a reasonable opportunity to object on data-protection grounds before the change, as described in the DPA. Publishing an updated list alone does not replace a required notification.',
+      ] },
     ],
   },
   security: {
@@ -149,7 +163,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       { heading: 'Retention', paragraphs: [
         'Active account, project, task, audit, workspace, and billing records are retained while needed to provide and secure the service. Execution worlds may be short-lived or hibernated by their provider; adopted project resources and repository history follow their configured storage and Git retention.',
         'Retention decisions depend on whether an account or project is active, whether records are needed to complete an authorized task or resolve a dispute, statutory accounting requirements, security investigations and legal holds. Information must not be retained merely because storage is available. The operator must document the applicable periods and review retained exceptions.',
-        'Account deletion is an operator-reviewed process, not an automatic purge triggered by subscription cancellation. Backup copies and data held by connected services require separate handling. There is no universal deletion deadline verified for this deployment in this draft; the operator must publish the production and backup deletion schedule before approving it for launch. An offboarding response must identify retained categories, their reason and applicable period rather than promise immediate deletion everywhere.',
+        'Account deletion is an operator-reviewed process, not an automatic purge triggered by subscription cancellation. Backup copies and data held by connected services require separate handling. An offboarding response must identify retained categories, their reason and applicable period or expiry criteria rather than promise immediate deletion everywhere. Retention exceptions must be reviewed and ended when their purpose no longer applies.',
+        'Provider backup retention and local application-backup retention are separate. Deleting active data does not instantly erase historical backups. Retained copies must be restricted from ordinary use, expire under the applicable backup cycle, and have completed deletion requests reapplied before restored data is returned to service. Backups do not preserve all external services or live sandbox state.',
       ] },
       { heading: 'Export', paragraphs: ['A signed-in user can download a personal JSON archive from Profile → Your data. Organization administrators can export organization records from Settings. Repository data remains exportable through its repository host; adopted resources should be downloaded before deletion. Contact support for a business offboarding export if the online exports are insufficient.'] },
       { heading: 'Account deletion', paragraphs: [
@@ -160,10 +175,41 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     ],
   },
   dpa: {
-    slug: 'dpa', title: 'Business DPA Requests', summary: 'A direct path for business customers to request and negotiate a Data Processing Addendum.',
+    slug: 'dpa', title: 'Data Processing Addendum', summary: 'Processing terms for personal data the operator handles on a customer’s behalf.',
     sections: [
-      { heading: 'Request a DPA', paragraphs: ['Business customers can request the current Data Processing Addendum at the configured DPA contact before putting regulated or material personal data into the service. Include the legal customer name, country, expected data categories, relevant jurisdictions, desired signer, and any required security or subprocessor questionnaire.'] },
-      { heading: 'What the DPA should settle', paragraphs: ['The final DPA should identify the contracting entities and roles, documented instructions, confidentiality, security measures, subprocessors and objection process, international-transfer mechanism, assistance with rights and incidents, audit information, return/deletion timing, and liability/order-of-precedence terms. None are silently represented as complete by this launch draft.'] },
+      { heading: 'Parties, scope and precedence', paragraphs: [
+        'This Addendum is part of the Terms between the customer accepting them and the operator identified on this page. It applies whenever the operator processes personal data as the customer’s processor, or as its subprocessor where the customer acts for another controller. It is not limited to sensitive or regulated-sector data. Controller and processor have the meanings given by applicable data protection law.',
+        'The customer determines the lawful purposes, has the necessary authority to give instructions and must provide required notices and a lawful basis for its processing. This Addendum does not cover the operator’s separate controller activities described in the Privacy Policy. For processing within scope it prevails over conflicting Terms, without limiting mandatory law or applicable transfer clauses.',
+      ] },
+      { heading: 'Processing description and instructions', paragraphs: [
+        'The subject matter is customer-directed agent orchestration. Processing comprises receiving, storing, retrieving, transmitting, executing against, exporting and deleting task, repository, workspace and integration data to provide and support the service. It lasts for the service relationship and subsequent return/deletion handling, not an unlimited right to reuse customer data.',
+        'Data subjects may include customer users, employees, contractors, customers, contacts and people mentioned in supplied content. Data may include names, contact details, account identifiers, communications, repository metadata, task content and other personal data the customer is authorized to supply. Customers must assess suitability before supplying special-category or similarly sensitive data; this service makes no regulated-sector certification promise.',
+        'Instructions are documented through the agreement, customer settings, authorized tasks and written support requests, including instructions about destinations. The operator will process only on those instructions unless applicable law requires otherwise, in which case it will inform the customer before processing unless legally prohibited. It will promptly flag an instruction it considers contrary to applicable data protection law.',
+      ] },
+      { heading: 'Confidentiality and security', paragraphs: [
+        'The operator will restrict access to authorized people who need it and are subject to appropriate confidentiality obligations. It will maintain technical and organizational measures appropriate to the processing risks, including access controls, protected credentials, separation of customer work, security logging and recovery procedures. The Security page describes the service safeguards without asserting certifications or a guaranteed recovery time.',
+        'The operator will assess these measures and test recovery proportionately. The customer must configure its own accounts, agent permissions and credentials securely. Customer responsibilities do not remove the operator’s obligations for systems it controls.',
+      ] },
+      { heading: 'Subprocessors and customer-selected destinations', paragraphs: [
+        'The customer gives general authorization for the operator to engage the applicable subprocessors disclosed for its deployment. Before adding or replacing one, the operator will notify affected customers of its identity, function and relevant locations and give a reasonable opportunity to object on data-protection grounds. The parties will seek a practical resolution; if none is possible, the customer may discontinue the affected processing before the change.',
+        'The operator will impose equivalent applicable processing obligations by binding contract and remains responsible to the customer for its subprocessors’ performance. Customer-connected independent services are distinguished as described in the Privacy Policy; selecting a service or supplying an API key does not, by itself, determine the parties’ legal roles.',
+      ] },
+      { heading: 'International processing', paragraphs: [
+        'Customer instructions may involve international processing. For restricted transfers for which the operator is responsible, it will establish a valid adequacy basis or appropriate safeguards required by applicable law before transferring, including the applicable UK or EU transfer instrument and assessment where needed. This Addendum is not itself an executed international-transfer instrument and does not waive those requirements.',
+        'The operator will provide information about the applicable safeguards through the DPA contact. It will not represent an unverified region or an unsigned provider agreement as an established safeguard.',
+      ] },
+      { heading: 'Rights, incidents and assistance', paragraphs: [
+        'Taking account of the nature of processing and information available, the operator will assist the customer with data-subject requests, security obligations, breach assessment and notifications, impact assessments and consultation with supervisory authorities. Requests received directly about customer-controlled data will be referred to the customer unless law requires another response.',
+        'The operator will notify the customer without undue delay after becoming aware of a personal-data breach affecting data within this Addendum and supply available information, updates and reasonable cooperation for investigation and mitigation. The customer decides its own notifications where it is controller; no provision postpones either party’s statutory deadlines.',
+      ] },
+      { heading: 'Return, deletion and restricted backups', paragraphs: [
+        'At the end of the relevant processing, the operator will, at the customer’s choice, return or delete the personal data and delete remaining copies unless applicable law requires retention. Data controls explains the authenticated request and export routes. The operator will confirm the scope and any justified retention, including the applicable backup expiry cycle, rather than treating subscription cancellation as an erasure request.',
+        'Where immediate removal from a historical backup is not feasible, the retained data must be put beyond ordinary use and erased as soon as practicable under an appropriate expiry cycle. Any restoration must reapply completed deletion requests before returning affected data to use. Independent destination services and data another customer lawfully retains require separate handling.',
+      ] },
+      { heading: 'Evidence, audits and contact', paragraphs: [
+        'The operator will make available information necessary to demonstrate compliance with these processing obligations and allow and contribute to audits and inspections by the customer or its appointed auditor. The parties will coordinate proportionate arrangements that protect other customers’ confidentiality and service security, without excluding mandatory audit rights.',
+        'Use the DPA contact on this page for deployment details, processing instructions, objections and audit arrangements. A separately negotiated processing agreement may supplement or replace this Addendum when expressly agreed. This launch draft remains subject to the operator-approval gate; its publication does not claim that every operational prerequisite has been verified.',
+      ] },
     ],
   },
 };

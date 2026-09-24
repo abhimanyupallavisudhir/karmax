@@ -90,6 +90,7 @@ import { actorPrincipal, identityAuditDetail, requireHumanSubject,
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
+import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
 import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
   type HostedOnboardingDisplay } from './hosted-onboarding.js';
 import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
@@ -164,6 +165,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
+  if (p === '/api/users/erasure-cases' || /^\/api\/users\/[^/]+\/erasure(?:\/export)?$/.test(p)) return 'user:write';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
   if (p === '/api/user/export' || p === '/api/user/default-organization'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
@@ -627,6 +629,7 @@ export class Gateway {
 
     if (deps.identity) {
       deps.identity.connectOrganizationNames(async () => (await deps.store.organizationNameReservations()));
+      deps.identity.connectAccountClosure?.(async id => Boolean(await deps.store.kvGet(`account-closed:${id}`)));
       deps.store.connectUserNames(async () => (await deps.identity!.listUsers()));
     }
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
@@ -2985,6 +2988,40 @@ export class Gateway {
 
       // Multiple human accounts + karmax authorization. Better Auth owns the
       // account/session records; these routes only attach karmax grants.
+      const erasureRoute = p.match(/^\/api\/users\/([^/]+)\/erasure(?:\/(export))?$/);
+      if (p === '/api/users/erasure-cases' || erasureRoute) {
+        // The inventory spans tenants and potentially sensitive privacy cases.
+        // Possessing user:write in a narrowed task is not installation authority.
+        if (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
+          return this.json(res, 403, { error: 'Account erasure requires unscoped installation user:write authority.' });
+        if (!this.deps.identity) return this.json(res, 503, { error: 'identity service unavailable' });
+        const service = new AccountErasureService(store, this.deps.identity, this.deps.broker);
+        try {
+          if (p === '/api/users/erasure-cases' && method === 'GET') return this.json(res, 200, await service.list());
+          if (!erasureRoute) return this.json(res, 405, { error: 'method not allowed' });
+          const userId = erasureRoute[1]!;
+          if (erasureRoute[2] === 'export' && method === 'GET') {
+            const record = await service.get(userId);
+            if (!record) return this.json(res, 404, { error: 'case not found' });
+            return this.downloadJson(res, `account-erasure-${userId}.json`, { format: 'karmax-erasure-suppression', version: 1, case: record,
+              restoreInstructions: 'Store securely outside the backup restore set. Before restoring service, reapply the account closure fence and documented erasure/redaction actions to all restored copies. Review retained records and outstanding decisions. This manifest does not execute a restore or claim external erasure.' });
+          }
+          if (method === 'GET') return this.json(res, 200, await service.preview(userId));
+          if (method !== 'POST' || erasureRoute[2]) return this.json(res, 405, { error: 'method not allowed' });
+          const body = await this.body(req), actor = actorPrincipal(callerIdentity.actor);
+          if (body.action === 'close') {
+            if (userId === callerIdentity.humanSubject?.userId || actor === `user:${userId}`)
+              return this.json(res, 400, { error: 'Another operator must close the current account.' });
+            return this.json(res, 200, await service.close(userId, body, actor));
+          }
+          if (body.action === 'decision') return this.json(res, 200, await service.decide(userId, body, actor));
+          if (body.action === 'complete') return this.json(res, 200, await service.complete(userId, body.revision, body.confirmation, actor));
+          return this.json(res, 400, { error: 'action must be close, decision or complete' });
+        } catch (error) {
+          if (error instanceof ErasureError) return this.json(res, error.status, { error: error.message });
+          throw error;
+        }
+      }
       if (p === '/api/users' && method === 'GET') {
         return this.json(res, 200, (await __asyncCollections.map(((await this.deps.identity?.listUsers()) ?? []), async (u) => ({ ...u, grants: (await this.deps.authorization?.grants(`user:${u.id}`)) ?? [] }))));
       }
@@ -3022,10 +3059,7 @@ export class Gateway {
       }
       const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
       if (userMatch && method === 'DELETE') {
-        if (userMatch[1] === callerIdentity.humanSubject?.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
-        await this.deps.identity?.removeUser(userMatch[1]!);
-        for (const g of (await this.deps.authorization?.grants(`user:${userMatch[1]}`)) ?? []) (await this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), g.principalId, g.scopeKey));
-        return this.json(res, 200, { ok: true });
+        return this.json(res, 409, { error: 'Preview /api/users/:id/erasure, then explicitly confirm account closure. Direct identity deletion bypasses ownership and privacy safeguards.' });
       }
       if (p === '/api/authorization/profiles' && method === 'GET') {
         const projectId = url.searchParams.get('projectId') ?? undefined;
@@ -8310,6 +8344,7 @@ export class Gateway {
     if (!this.deps.identity) return undefined;
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
+    if (await this.deps.store.kvGet(`account-closed:${identity.user.id}`)) return undefined;
     if (((await this.deps.paidLaunchSettings?.publicLaunchInfo()) ?? publicLaunchInfo()).paidLaunch && !await this.deps.store.hasSignupAcceptanceAsync(identity.user.id)) return undefined;
     const principal = `user:${identity.user.id}`;
     const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);

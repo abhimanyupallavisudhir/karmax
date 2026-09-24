@@ -105,6 +105,7 @@ export class IdentityService {
   private pool?: Pool;
   migration?: SqliteImportResult;
   private organizationNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
+  private accountClosed?: (userId: string) => Promise<boolean>;
 
   /** Installation-wide outbound email, injected after construction (main.ts wires
    *  it once the vault/broker exist). The Better Auth hooks below read it lazily,
@@ -194,13 +195,20 @@ export class IdentityService {
       // not apply) and its user grant is also adopted by the development profile.
       ...(trustedSocialProviders.length ? { socialProviders } : {}),
       databaseHooks: {
+        session: { create: { before: async (session: Record<string, unknown>) => {
+          if (await this.accountClosed?.(String(session.userId))) return false;
+        } } },
         user: { create: { before: async (user: Record<string, unknown>) => {
           (await this.assertUserNameAvailable(String(user.name ?? '')));
         } } },
-        ...(opts.github?.onAuthorization ? { account: {
-          create: { after: adoptGithubAuthorization },
-          update: { after: adoptGithubAuthorization },
-        } } : {}),
+        account: {
+          create: { before: async (account: Record<string, unknown>) => {
+            if (await this.accountClosed?.(String(account.userId))) return false;
+          }, ...(opts.github?.onAuthorization ? { after: adoptGithubAuthorization } : {}) },
+          update: { before: async (account: Record<string, unknown>) => {
+            if (account.userId && await this.accountClosed?.(String(account.userId))) return false;
+          }, ...(opts.github?.onAuthorization ? { after: adoptGithubAuthorization } : {}) },
+        },
       },
       // Account linking. A user who signed up with email+password and later uses
       // Google or GitHub on the same address should land in the SAME
@@ -329,6 +337,10 @@ export class IdentityService {
     this.organizationNames = lookup;
   }
 
+  connectAccountClosure(lookup: (userId: string) => Promise<boolean>): void {
+    this.accountClosed = lookup;
+  }
+
   async assertUserNameAvailable(name: string): Promise<string> {
     const value = name.trim();
     if (!value) throw new Error('user name is required');
@@ -361,6 +373,7 @@ export class IdentityService {
 
   async session(headers: Headers): Promise<IdentitySession | undefined> {
     const result = await this.auth.api.getSession({ headers }).catch(() => null);
+    if (result?.user && await this.accountClosed?.(String(result.user.id))) return undefined;
     return result?.session && result?.user ? result as IdentitySession : undefined;
   }
 
@@ -455,6 +468,8 @@ export class IdentityService {
     try {
       (await this.db.prepare('DELETE FROM session WHERE userId = ?').run(userId));
       (await this.db.prepare('DELETE FROM account WHERE userId = ?').run(userId));
+      // Password reset verifications store the user id as their value.
+      (await this.db.prepare("DELETE FROM verification WHERE value=? AND identifier LIKE 'reset-password:%'").run(userId));
       (await this.db.prepare('DELETE FROM user WHERE id = ?').run(userId));
       (await this.db.exec('COMMIT'));
     } catch (e) {

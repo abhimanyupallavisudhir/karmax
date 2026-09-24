@@ -11,6 +11,10 @@ import { IdentityService } from '../src/auth/identity.js';
 import { openStore, Store } from '../src/store/db.js';
 import { openSqlDatabase } from '../src/store/sql.js';
 import { BudgetService, MockPaymentProvider } from '../src/autonomy/payments.js';
+import { AccountErasureService } from '../src/privacy/account-erasure.js';
+import { CredentialBroker } from '../src/autonomy/broker.js';
+import { Vault } from '../src/autonomy/vault.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
 
 const url = process.env.KARMAX_TEST_POSTGRES_URL;
 const integration = url ? describe : describe.skip;
@@ -21,6 +25,36 @@ integration('PostgreSQL cutover', () => {
     await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
   });
   afterAll(async () => { await admin?.end(); });
+
+  it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
+    const store = await Store.create(url!);
+    const identity = await IdentityService.open(':memory:', { databaseUrl: url!, secret: 'fixture-only-erasure-secret-32-characters', baseURL: 'http://localhost:4598' });
+    try {
+      const owner = await identity.createUser({ name: 'Continuing owner', email: 'owner@example.test', password: 'fixture-owner-password' });
+      const subject = await identity.createUser({ name: 'Closing subject', email: 'subject@example.test', password: 'fixture-subject-password' });
+      const org = await store.createOrganization({ name: 'Shared erasure fixture', ownerUserId: owner.id });
+      await store.setOrganizationMembership(org.id, subject.id, 'member');
+      const project = await store.createProject('Shared tasks', {}, org.id);
+      const task = await store.createTask({ projectId: project.id, title: 'Retained pending scoped review', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' }, createdBy: { kind: 'user', userId: subject.id } });
+      await store.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify({ status: 'done' }), task.id);
+      const tokens = new TokenAuthority(store);
+      const human = await tokens.mintPrincipal(`user:${subject.id}`, ['*']);
+      const service = new AccountErasureService(store, identity, new CredentialBroker(new Vault(path.join(home, 'vault'))), home);
+      const preview = await service.preview(subject.id);
+      expect(preview.relatedTaskIds).toContain(task.id);
+      expect(preview.blockers).toEqual([]);
+      expect((await service.close(subject.id, { fingerprint: preview.fingerprint, confirmation: `CLOSE ${subject.id}`, exportHandled: true }, 'operator')).state).toBe('closed');
+      expect(await tokens.verify(human.token)).toBeUndefined();
+      expect((await identity.listUsers()).map(user => user.id)).toEqual([owner.id]);
+      expect((await store.getTask(task.id))?.title).toBe('Retained pending scoped review');
+      expect(await store.organizationMembership(org.id, owner.id)).toBeDefined();
+      expect(await store.organizationMembership(org.id, subject.id)).toBeUndefined();
+    } finally {
+      await identity.close(); await store.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('migrates a shared GitHub installation and preserves connections across restarts', async () => {
     const db = openSqlDatabase(url!);
