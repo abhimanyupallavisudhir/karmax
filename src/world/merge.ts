@@ -141,7 +141,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
 
   // Files this attempt changed vs its base (for the landed-files report, and the
   // input to the conflict-marker guard below). When the configured base is absent
-  // — world creation silently forks off HEAD instead (see worktree.ts) — the
+  // (e.g. a persisted world from before setup corrected missing bases), the
   // `${base}...HEAD` diff would error and leave an EMPTY list, which both blanks
   // the landed-files report AND skips the marker scan (it early-returns on []).
   // Fall back to every file tracked at HEAD: over-inclusive for the report, but it

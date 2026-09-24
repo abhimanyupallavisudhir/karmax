@@ -1,3 +1,4 @@
+import { workEnvironment, openCodeWorkEnvironment } from './work-environment.js';
 import { currentTiming } from '../timing/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -158,7 +159,7 @@ function harnessSpec(input: TurnInput): HarnessSpec {
   // shell it opens through `terminal.create`) must not inherit them.
   const env = scrubbedEnv({ provider, configHome: input.resolvedAuth?.configHome, extra: input.extraEnv });
   const credentialEnv = apiKeyEnv(credentialProvider(input.profile));
-  const ambientApiKey = input.extraEnv?.[credentialEnv] ?? process.env[credentialEnv];
+  const ambientApiKey = input.resolvedAuth ? undefined : process.env[credentialEnv];
   for (const key of [
     'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'KIMI_API_KEY', 'MOONSHOT_API_KEY',
     'XAI_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY',
@@ -335,12 +336,23 @@ export class AcpAdapter implements AgentAdapter {
       throw new Error(
         `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where krmax itself runs. `
         + 'Choose a Claude or Codex agent for this task, or give the project a local/container world.');
+    const work = await openCodeWorkEnvironment(input);
+    try { return await this.runAcpTurn(input, ctx, work.plugin); }
+    finally { work.cleanup(); }
+  }
+
+  private async runAcpTurn(input: TurnInput, ctx: PlatformToolContext, workPlugin?: string): Promise<AdapterTurn> {
     const spec = harnessSpec(input);
+    if (workPlugin) {
+      const config = JSON.parse(spec.env.OPENCODE_CONFIG_CONTENT!);
+      config.plugin = [...(config.plugin ?? []), workPlugin];
+      spec.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
+    }
     // Turn-local controls, served over a socket for exactly this turn and torn
     // down in `finally` below — it must never outlive the activity whose result
     // it mutates (control-bridge.ts). Started after `harnessSpec`, which throws
     // for an unsupported provider before there is anything to clean up.
-    const control = await startControlBridge(platformToolHandlers(input.world, ctx));
+    const control = await startControlBridge(platformToolHandlers(input.world, ctx, workEnvironment(input)));
     const custody = createCustodyEnv(spec.env);
     spec.env = custody.env;
     const startupEnd = (await (await currentTiming())?.start('process.acp-startup'));
@@ -397,6 +409,7 @@ export class AcpAdapter implements AgentAdapter {
         const terminalId = `karmax-terminal-${++terminalSeq}`;
         const env = {
           ...spec.env,
+          ...workEnvironment(input),
           ...Object.fromEntries((params.env ?? []).map((entry) => [entry.name, entry.value])),
         };
         const terminalCustody = createCustodyEnv(env);

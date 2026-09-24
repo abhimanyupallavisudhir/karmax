@@ -1,4 +1,4 @@
-import type { WorldHandleRef } from '../domain/types.js';
+import type { BranchAdjustment, WorldHandleRef } from '../domain/types.js';
 
 /**
  * The world provider interface (SPEC §11.1). A world is the environment a
@@ -72,11 +72,13 @@ export interface WorldRepo {
   base: string;
   /** Protected branch this repo lands on. Defaults to the world's target. */
   target?: string;
-  /** Whether `target` is an explicit per-repository policy. A non-pinned target
+  /** Whether `target` is an explicit or resolved per-repository policy. A non-pinned target
    * is retained for inspection but merge receives the task's live target. */
   targetPinned?: boolean;
   /** Immutable commit from which this attempt started. */
   baseSha?: string;
+  /** Setup corrected a missing base; retained for durable task metadata and notices. */
+  branchAdjustment?: BranchAdjustment;
 }
 
 export interface WorldHandle extends WorldHandleRef {
@@ -332,6 +334,9 @@ export interface WorldDesktopSession {
 
 export interface World {
   handle: WorldHandle;
+  /** Same task boundary without application environment injection. Provider
+   * bootstrap/model subprocesses use this; agent work retains the decorated world. */
+  withoutProjectEnvironment?(): World;
   exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
   readFile(relPath: string): Promise<string>;
   readFileBuffer(relPath: string): Promise<Buffer>;

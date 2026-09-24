@@ -615,7 +615,7 @@ async function softwareDevImpl(
       ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
-  const base = input.base ?? input.project.defaultBase ?? 'main';
+  let base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
   let confirmed = false;
   let manualPrConfirmer: string | undefined;
@@ -2515,6 +2515,19 @@ Inspect the complete current diff and specifically compare its delta from the re
       });
     };
     world = (await withResolve('setup', create)) as WorldHandleLike;
+    if (patched('software-dev-resolved-base-branches-v1')) {
+      const development = world.repos?.filter(repo => repo.role !== 'project-wiki') ?? [];
+      const adjustment = development[0]?.branchAdjustment;
+      if (adjustment) {
+        if (base === adjustment.requestedBase) base = adjustment.base;
+        if (target === (adjustment.requestedTarget ?? adjustment.requestedBase)) target = adjustment.target;
+      }
+      for (const repo of development) {
+        if (repo.branchAdjustment) msgs.push({ id: `branch-warning-${msgs.length}`, role: 'agent',
+          text: `Setup warning: ${repo.branchAdjustment.warning}`, ts: msgs.length });
+      }
+    }
+
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coordinator.accountPoolSize().catch(() => 0);

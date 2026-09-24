@@ -92,6 +92,12 @@ describe('project resources', () => {
       .toBe('postgres://private-per-world-endpoint');
     expect(JSON.stringify(world.handle)).not.toContain('secret-token');
     expect(JSON.stringify(world.handle)).not.toContain('private-per-world-endpoint');
+    // A sandbox's own failure evidence must survive the wrapper (task 350); a
+    // local world has none, which keeps its host-memory classification.
+    expect(wrapped.diagnose).toBeUndefined();
+    const evidence = { summary: 'sandbox stopped responding', memoryExhausted: false };
+    const sandboxWorld = Object.assign(Object.create(world), { diagnose: async () => evidence });
+    expect(await (await resources.withEnvironment(sandboxWorld)).diagnose?.({ since: 0 })).toBe(evidence);
     const serviceHandle = Object.values(world.handle.meta?.serviceEnvironmentHandles as Record<string, string>)[0]!;
     expect(broker.hasHandle(serviceHandle)).toBe(true);
 

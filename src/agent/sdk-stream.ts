@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Message } from '../domain/types.js';
 import { anthropicUserContent } from './images.js';
 
@@ -17,12 +18,15 @@ export interface SdkUserMessage {
   type: 'user';
   parent_tool_use_id: null;
   message: { role: 'user'; content: string | any[] };
+  /** Client id the harness echoes on the assistant frame answering this message
+   *  (`user_message_uuid(s)`), so the adapter can tell its own input was consumed. */
+  uuid: string;
 }
 
 /** Wrap a karmax {@link Message} as an SDK streaming-input user message, resolving
  *  any image attachments to content blocks (text-only ⇒ a plain string, unchanged). */
 export function toSdkUserMessage(content: string | any[]): SdkUserMessage {
-  return { type: 'user', parent_tool_use_id: null, message: { role: 'user', content } };
+  return { type: 'user', parent_tool_use_id: null, message: { role: 'user', content }, uuid: crypto.randomUUID() };
 }
 
 /** Content (string or blocks) for a follow-up injected mid-turn. */

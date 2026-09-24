@@ -369,6 +369,39 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     return repo;
   }
 
+  it.each(['1.8.0', '1.26.0'])('%s corrects a missing base and target before agent work and opens the PR against the actual branch', async (version) => {
+    const repo = await repoWithOrigin(`missing-base-${version}`);
+    const project = await h.store.createProject(`Missing branch recovery ${version}`, { repos: [repo], remote: 'pr' });
+    const connection = await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = await h.store.createTask({ projectId: project.id, title: 'Fallback proposal', workflow: 'software-dev',
+      workflowVersion: version, params: { prompt: 'Fallback proposal', base: 'master', target: 'master', _repositoryBranchesResolved: true,
+        _githubAccountId: 'a-github' }, createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start(`softwareDev@${version}`, {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: 'Fallback proposal',
+        prompt: '@write repaired.txt :: preserved work\n@run git add -A && git commit -qm proposal\n@review Ready',
+        base: 'master', target: 'master', project: { repos: [repo], remote: 'pr' },
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const reviewed = await view(handle);
+    expect(reviewed).toMatchObject({ base: 'main', targetBranch: 'main' });
+    expect(reviewed.messages.map((m: any) => m.text).join('\n'))
+      .toContain('Base and target branch changed to "main" because "master" did not exist');
+    expect((await h.store.getTask(task.id))?.params).toMatchObject({ base: 'main', target: 'main' });
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect(prs).toHaveLength(1);
+    expect(prs[0].base.ref).toBe('main');
+    const origin = path.join(originDir, `missing-base-${version}.git`);
+    expect(await gitOrThrow(origin, ['show', 'main:repaired.txt'])).toBe('preserved work');
+    expect((await git(origin, ['show-ref', '--verify', '--quiet', 'refs/heads/master'])).code).not.toBe(0);
+  }, 120_000);
+
   it('opens the PR at the PR stage and closes it once the merge lands', async () => {
     const repo = await repoWithOrigin('app');
     const taskId = newId('task');

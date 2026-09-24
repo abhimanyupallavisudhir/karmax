@@ -1,3 +1,4 @@
+import { claudeWorkEnvironment, workEnvironment } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
@@ -88,7 +89,7 @@ export class ClaudeAdapter implements AgentAdapter {
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx), ...mcp.handlers };
+    const handlers = { ...platformToolHandlers(input.world, ctx, workEnvironment(input)), ...mcp.handlers };
     const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
 
     const messages: any[] = [];
@@ -283,6 +284,14 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    const work = await claudeWorkEnvironment(input);
+    try { return await this.runAgentSdkProcess(input, ctx, work.settings); }
+    finally { await work.cleanup(); }
+  }
+
+  private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
+    workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings']): Promise<AdapterTurn> {
+    const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
     let sdk: any;
     try {
       sdk = await import('@anthropic-ai/claude-agent-sdk');
@@ -306,8 +315,8 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     const { query, createSdkMcpServer, tool } = sdk;
     const zod = (await import('zod')).z;
-    const handlers = platformToolHandlers(input.world, ctx);
-    const remote = isRemoteAgentWorld(input.world);
+    const handlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
+    const remote = isRemoteAgentWorld(runtimeWorld);
     const configHome = input.resolvedAuth?.configHome;
     const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));
     // Rotate the canonical host credential before projecting it. Mid-turn
@@ -340,7 +349,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     }
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
       : undefined;
     // The SDK only sees a codeless exit when the sandbox stream drops; the
     // process knows the agent may still be running there (task 348).
@@ -404,7 +413,18 @@ export class ClaudeAdapter implements AgentAdapter {
     // follow-up advances it, and it is reported back so the workflow positions the
     // agent's reply and advances its boundary past exactly what was delivered.
     let deliveredIndex = input.messages.length;
-    const injector = createFollowUpInjector([toSdkUserMessage(initialContent)]);
+    // Every message we send stays outstanding until the harness echoes its uuid on an
+    // assistant frame (`user_message_uuids`) — proof the agent actually read it. A
+    // producer that never echoes is answered by any result that ran a model turn
+    // (the orphan-settling result below has `num_turns: 0`).
+    const unanswered = new Set<string>();
+    let harnessEchoes = false;
+    const send = (content: string | any[]) => {
+      const message = toSdkUserMessage(content);
+      unanswered.add(message.uuid);
+      return message;
+    };
+    const injector = createFollowUpInjector([send(initialContent)]);
     const promptArg: any = injector.stream;
 
     // Fetch + inject any follow-ups queued at/after `deliveredIndex`. Serialized by
@@ -426,7 +446,7 @@ export class ClaudeAdapter implements AgentAdapter {
           // never send conversation system messages) — but count both so the index
           // stays aligned with the workflow's `msgs` array.
           if (m.role !== 'system' && m.role !== 'agent') {
-            injector.push(toSdkUserMessage(followUpContent(m)));
+            injector.push(send(followUpContent(m)));
             injected++;
           }
           deliveredIndex++;
@@ -445,10 +465,9 @@ export class ClaudeAdapter implements AgentAdapter {
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
       // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
-      // plus project secrets and JIT-resolved subprocess env (git credentials,
-      // platform token). Karmax-owned values win on a name collision.
+      // plus Tavya-owned runtime values (git credentials and platform token).
+      // Application secrets reach only work commands through the native hook.
       extra: {
-        ...(input.secretEnv ?? {}),
         ...(input.extraEnv ?? {}),
         ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
       },
@@ -456,8 +475,20 @@ export class ClaudeAdapter implements AgentAdapter {
     if (remoteHome) env = remoteAgentEnv('claude', remoteHome.absolute, {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
-    }, Object.keys(input.secretEnv ?? {}));
+    });
+    // This rail was selected for a login, not a metered API credential. Project
+    // secrets are application credentials, never an override of that selection.
+    // Keep explicit empty values: the SDK can merge ambient env back at the
+    // final subprocess boundary. Runtime worlds bypass resource injection.
+    const subscriptionAuthEnv = {
+      ANTHROPIC_API_KEY: '',
+      ANTHROPIC_AUTH_TOKEN: '',
+      CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth?.oauthToken ?? '',
+    };
+    Object.assign(env, subscriptionAuthEnv);
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+    // Ask the harness for its authoritative turn-over signal (see `settleInput` below).
+    env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = '1';
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
     // cancels. The Agent SDK spawns a child harness process (the Claude Code
@@ -504,22 +535,47 @@ export class ClaudeAdapter implements AgentAdapter {
     // shell is still running it keeps the session alive, folds the settlement back in,
     // and drives the agent through more exchanges. Closing there left agents working for
     // the rest of the turn against a dead control channel — the "Stream closed" reports.
-    // So hold the stream open until a result arrives with nothing outstanding, bounded
-    // because a backgrounded shell may be a dev server the task deliberately left running.
+    // Neither a `result` nor even `idle` reliably means the harness has read OUR input:
+    // resuming a session whose previous harness died with a background shell running,
+    // Claude Code settles that orphan first and may emit an empty `result` and an `idle`
+    // BEFORE it processes the resumed prompt (task #348 — the whole turn then ran with
+    // every control tool failing, "interrupted before a result was received").
+    // So the turn ends on the harness's own `session_state_changed: idle` (emitted only
+    // after held-back results flush and its background-agent loop exits; `result` is the
+    // fallback for a harness that doesn't report state) AND only once every message we
+    // sent has been answered. Unanswered input and tracked in-harness work both hold the
+    // stream open, bounded because a backgrounded shell may be a dev server the task
+    // deliberately left running.
     const settleGraceMs = Number(process.env.KARMAX_AGENT_BG_SETTLE_MS ?? 300_000);
     let settleDeadline: number | undefined;
     const harnessStillWorking = (): boolean => {
-      if (!subagents.size) return false;
+      if (!subagents.size && !unanswered.size) return false;
       settleDeadline ??= Date.now() + settleGraceMs;
       return Date.now() < settleDeadline;
+    };
+    let harnessReportsState = false;
+    let harnessIdle = false;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    // The harness went idle: end the turn — UNLESS a follow-up landed in the meantime and
+    // the agent hasn't declared completion (inject it and let the session continue
+    // in-place), or tracked work will drive the agent again (re-check at the deadline,
+    // since a never-settling shell produces no further message to wake us).
+    const settleInput = async (): Promise<void> => {
+      harnessIdle = true;
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = undefined; }
+      if (!completionSeen && await drainFollowUps()) { harnessIdle = false; return; }
+      if (!harnessStillWorking()) { await injector.close(); return; }
+      settleTimer = setTimeout(() => { if (harnessIdle) void settleInput(); },
+        Math.max(0, (settleDeadline ?? Date.now()) - Date.now()));
     };
     const startupEnd = (await (await currentTiming())?.start('process.sdk-startup.opaque'));
     const iterator = query({
       prompt: promptArg,
       options: {
         abortController,
-        cwd: worldWorkingDirectory(input.world.handle),
-        additionalDirectories: [input.world.handle.root],
+        ...(workSettings ? { settings: workSettings } : {}),
+        cwd: worldWorkingDirectory(runtimeWorld.handle),
+        additionalDirectories: [runtimeWorld.handle.root],
         // The world is already an isolated git worktree (the sandbox boundary) and
         // the agent runs headless — there is no human to approve tool calls, so it
         // must never stall on a permission prompt.
@@ -587,21 +643,21 @@ export class ClaudeAdapter implements AgentAdapter {
         //    task attribution and an escalating kill.
         spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
           if (remote && remoteHome) {
-            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env,
-              Object.keys(input.secretEnv ?? {}));
+            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env);
+            Object.assign(remoteEnv, subscriptionAuthEnv);
             if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
             remoteProcess = spawnRemoteAgentProcess({
-              world: input.world,
+              world: runtimeWorld,
               provider: 'claude',
               command: o.command,
               args: o.args,
-              cwd: worldWorkingDirectory(input.world.handle),
+              cwd: worldWorkingDirectory(runtimeWorld.handle),
               env: remoteEnv,
               signal: o.signal,
             });
             return remoteProcess as any;
           }
-          const custody = createCustodyEnv(o.env);
+          const custody = createCustodyEnv({ ...o.env, ...subscriptionAuthEnv });
           const child = spawn(o.command, o.args, {
             cwd: o.cwd,
             env: custody.env,
@@ -616,12 +672,12 @@ export class ClaudeAdapter implements AgentAdapter {
           child.on('error', () => {});
           if (child.pid) {
             const pid = child.pid;
-            registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
+            registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: runtimeWorld.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
             const untrack = trackProcess({
               pid,
               kind: 'agent',
               label: `claude agent (${input.role})`,
-              taskId: input.world.handle.id,
+              taskId: runtimeWorld.handle.id,
               startedAt: Date.now(),
               kill: () => killAgent(pid, 2500, custody.custodyId),
             });
@@ -650,7 +706,12 @@ export class ClaudeAdapter implements AgentAdapter {
         // the stream to its end lets any in-turn settlements clear before we report —
         // only genuinely still-running sub-agents remain (see subagents.ts).
         trackTaskMessage(subagents, message);
-        if (!subagents.size) settleDeadline = undefined; // drained ⇒ a fresh grace for the next batch
+        if (message.type === 'assistant') {
+          harnessIdle = false; // working again: a pending settle re-check must not close under it
+          const answered: unknown = (message as any).user_message_uuids ?? [(message as any).user_message_uuid];
+          if (Array.isArray(answered)) for (const id of answered) if (typeof id === 'string') { harnessEchoes = true; unanswered.delete(id); }
+        }
+        if (!subagents.size && !unanswered.size) settleDeadline = undefined; // drained ⇒ a fresh grace for the next batch
         if (message.type === 'assistant') {
           const content = (message.message?.content ?? []) as any[];
           const text = content
@@ -834,6 +895,10 @@ export class ClaudeAdapter implements AgentAdapter {
             title: `${String((message as any).tool_name ?? 'Tool')} denied`,
             ...(activityDetail((message as any).message) ? { detail: activityDetail((message as any).message) } : {}),
           });
+        } else if (message.type === 'system' && (message as any).subtype === 'session_state_changed') {
+          harnessReportsState = true;
+          if ((message as any).state === 'idle') await settleInput();
+          else harnessIdle = false;
         } else if (message.type === 'result') {
           session = message.session_id ?? session;
           const result = message as any;
@@ -845,15 +910,8 @@ export class ClaudeAdapter implements AgentAdapter {
             throw providerErrorFromMessage('claude', message);
           }
           successfulResult = result;
-          // The agent went idle (finished responding to its current input). End the
-          // turn — UNLESS a follow-up landed in the meantime and the agent hasn't
-          // declared completion, in which case inject it and let the session continue
-          // in-place rather than tearing down and resuming on a fresh turn — or the
-          // harness still has work in flight that will drive the agent again, in which
-          // case the input stream (and with it the control channel) stays open.
-          if ((completionSeen || !(await drainFollowUps())) && !harnessStillWorking()) {
-            (await injector.close());
-          }
+          if (!harnessEchoes && result.num_turns !== 0) unanswered.clear();
+          if (!harnessReportsState) await settleInput();
         }
       }
     } catch (e) {
@@ -871,10 +929,11 @@ export class ClaudeAdapter implements AgentAdapter {
     } finally {
       if (hb) clearInterval(hb);
       if (followPoll) clearInterval(followPoll);
+      if (settleTimer) clearTimeout(settleTimer);
       (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {
-        const failure = await syncRemoteAgentHomeBestEffort(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);
+        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'claude', remoteHome, input.resolvedAuth.configHome);
         if (failure) ctx.emitActivity({
           id: 'claude-remote-state-sync', kind: 'error', phase: 'failed',
           title: 'Could not preserve remote Claude state', detail: failure.message.slice(0, 1000),
