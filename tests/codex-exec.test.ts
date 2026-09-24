@@ -49,7 +49,10 @@ if (mode === 'partial-fail') {
 if (outFile) fs.writeFileSync(outFile, 'FINAL ANSWER from codex stub');
 process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
 process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'working on it' } }) + '\\n');
-process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
+// The real CLI's shape (verified against the pinned @openai/codex). On a resumed
+// thread these are cumulative thread totals, not this turn's.
+process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: mode === 'no-usage' ? undefined
+  : { input_tokens: 1200, cached_input_tokens: 800, cache_write_input_tokens: 0, output_tokens: 90, reasoning_output_tokens: 40 } }) + '\\n');
 process.exit(0);
 `;
 
@@ -91,6 +94,25 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     const r = await adapter.runTurn(makeInput() as any, ctx);
     expect(r.output).toContain('FINAL ANSWER');
     expect(r.session).toBe('th_stub');
+  });
+
+  it('reports the turn\'s provider token usage on a fresh thread', async () => {
+    delete process.env.STUB_MODE;
+    const r = await adapter.runTurn(makeInput() as any, ctx);
+    expect(r.usage).toEqual({ inputTokens: 1200, outputTokens: 90, cacheReadTokens: 800,
+      inputTokensIncludeCacheRead: true, totalTokens: 1290 });
+  });
+
+  it('records no usage rather than a cumulative thread total on a resumed thread', async () => {
+    delete process.env.STUB_MODE;
+    const session = '22222222-2222-4222-8222-222222222222';
+    const sessions = path.join(dir, 'sessions', 'forked');
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(path.join(sessions, `rollout-2026-09-09T00-00-00-${session}.jsonl`), JSON.stringify({
+      ordinal: 0, type: 'session_meta', payload: { id: session, timestamp: '2026-09-09T00:00:00Z', history_mode: 'paginated' },
+    }) + '\n');
+    const r = await adapter.runTurn({ ...makeInput(), session } as any, ctx);
+    expect(r.usage).toBeUndefined();
   });
 
   it('injects project secrets into the local Codex subprocess with control env taking precedence', async () => {

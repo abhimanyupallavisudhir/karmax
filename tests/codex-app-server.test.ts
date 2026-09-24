@@ -77,6 +77,23 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'recovered' } } });
       send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
     }
+    else if (mode === 'usage') {
+      // Real app-server order (verified against the pinned CLI): resuming replays
+      // the previous turn's reading under its old id, then one update per model
+      // request — last is that request, total the whole thread.
+      const b = (input, cached, output) => ({ totalTokens: input + output, inputTokens: input, cachedInputTokens: cached,
+        cacheWriteInputTokens: 0, outputTokens: output, reasoningOutputTokens: 1 });
+      send({ method: 'thread/tokenUsage/updated', params: { threadId: 't', turnId: 'turn-0',
+        tokenUsage: { total: b(5000, 4000, 50), last: b(5000, 4000, 50), modelContextWindow: 258400 } } });
+      send({ method: 'turn/started', params: { turn: { id: 'turn-1' } } });
+      send({ method: 'thread/tokenUsage/updated', params: { threadId: 't', turnId: 'turn-1',
+        tokenUsage: { total: b(6000, 4800, 70), last: b(1000, 800, 20), modelContextWindow: 258400 } } });
+      send({ method: 'thread/tokenUsage/updated', params: { threadId: 't', turnId: 'turn-1',
+        tokenUsage: { total: b(6000, 4800, 70), last: b(1000, 800, 20), modelContextWindow: 258400 } } }); // re-emitted, not a new request
+      send({ method: 'thread/tokenUsage/updated', params: { threadId: 't', turnId: 'turn-1',
+        tokenUsage: { total: b(8000, 6400, 100), last: b(2000, 1600, 30), modelContextWindow: 258400 } } });
+      send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    }
     else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
     else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
     else send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
@@ -96,6 +113,7 @@ describe('CodexAdapter app-server security policy', () => {
     dir = undefined;
   });
 
+  let lastResult: any;
   async function run(session?: string, mode?: string, fork = false, ctx: any = {}): Promise<any[]> {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-app-server-'));
     const stub = path.join(dir, 'codex-stub.cjs');
@@ -115,7 +133,7 @@ describe('CodexAdapter app-server security policy', () => {
       }) + '\n');
     }
 
-    await new CodexAdapter().runTurn(
+    lastResult = await new CodexAdapter().runTurn(
       {
         profile: { id: 'p', name: 'codex', provider: 'codex', model: 'gpt-5.5', role: 'merge', capabilities: [] },
         world: { handle: { id: 'w', root: dir, branch: 'task', base: 'main' } },
@@ -129,6 +147,19 @@ describe('CodexAdapter app-server security policy', () => {
     );
     return fs.readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   }
+
+  /** Subscription (app-server) turns used to report no usage at all, so every
+   * GPT turn showed 0 tokens in Insights while its turns and time counted. */
+  it('reports provider token usage for the requests this turn made', async () => {
+    await run('11111111-1111-4111-8111-111111111111', 'usage');
+    expect(lastResult.usage).toEqual({ inputTokens: 3000, outputTokens: 50, cacheReadTokens: 2400,
+      inputTokensIncludeCacheRead: true, totalTokens: 3050 });
+  });
+
+  it('reports no usage when the app-server sent none', async () => {
+    await run();
+    expect(lastResult.usage).toBeUndefined();
+  });
 
   it('starts fresh threads and turns with unrestricted, non-interactive execution', async () => {
     const requests = await run();

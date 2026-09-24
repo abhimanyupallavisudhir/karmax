@@ -1308,6 +1308,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .ins-spark rect { fill: var(--merged); }
 .ins-spark line { stroke: var(--line); }
 .ins-model { font-family: var(--font-mono); display: block; overflow: hidden; text-overflow: ellipsis; }
+.ins-unreported { color: var(--ink-3); cursor: help; }
 .ins-share { display: block; height: 3px; margin-top: 4px; background: var(--line); border-radius: 2px; overflow: hidden; max-width: 140px; }
 .ins-share i { display: block; height: 100%; border-radius: 2px; }
 
