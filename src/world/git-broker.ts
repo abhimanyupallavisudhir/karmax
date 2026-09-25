@@ -12,6 +12,14 @@ import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merg
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
 import { canonicalRepositoryIdentity } from './repository-identity.js';
 
+/** Clone options for the broker's throwaway repositories. `git fetch` and
+ * `git commit` start `git maintenance run --auto`, which current Git detaches;
+ * it can still be writing `.git/objects` while the clone is being deleted, and
+ * the deletion then fails with ENOTEMPTY after the operation itself succeeded.
+ * Given to `clone`, the options persist in the clone's config, so every later
+ * command in it inherits them. */
+const THROWAWAY_CLONE = ['-c', 'maintenance.auto=false', '-c', 'gc.auto=0'];
+
 export interface GitBrokerCredential extends GitCredential {}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
 /** Called with the immutable tip actually transported, never a later world HEAD. */
@@ -79,7 +87,7 @@ export async function brokerEnrollRepository(
     const credential = await resolveCredential(auth, provisional);
     const { env } = materializeGitCredential(temp, credential);
     const clone = path.join(temp, 'repo');
-    const cloned = await git(temp, ['clone', '-q', '--no-checkout', spec.source, clone],
+    const cloned = await git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', spec.source, clone],
       { env, timeoutMs: 10 * 60_000 });
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
 
@@ -165,8 +173,8 @@ function uniqueEnrollmentName(repos: WorldRepo[], preferred: string): string {
   for (let suffix = 2; ; suffix++) if (!used.has(`${preferred}-${suffix}`)) return `${preferred}-${suffix}`;
 }
 
-/** Recursive removal can transiently report ENOTEMPTY/EBUSY after a Git child
- * exits on busy CI filesystems. Node only retries those errors when maxRetries
+/** Retries cover any other transient writer; the credential file inside must
+ * not outlive the operation. Node only retries ENOTEMPTY/EBUSY when maxRetries
  * is explicitly set. */
 function removeTemporaryDirectory(directory: string): void {
   fs.rmSync(directory, {
@@ -585,7 +593,7 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
   const clone = path.join(temp, 'repo');
-  const cloned = await git(temp, ['clone', '-q', '--no-checkout', '--branch', branch, '--single-branch', source, clone],
+  const cloned = await git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', '--branch', branch, '--single-branch', source, clone],
     { env, timeoutMs: 10 * 60_000 });
   if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
   return createGitBundle(args => git(clone, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
@@ -755,7 +763,7 @@ async function withTransferredRepo<T>(
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
     const clone = path.join(temp, 'repo');
-    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 }));
+    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 }));
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
     if (repo.baseSha) {
