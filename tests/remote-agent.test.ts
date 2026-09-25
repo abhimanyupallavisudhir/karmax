@@ -2,7 +2,7 @@ import { ProjectResourceService } from '../src/world/resources.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
@@ -172,14 +172,14 @@ describe('remote subscription agents', () => {
     const world = { handle: { root, id: 'spawn' }, async exec(command: string, args: string[], options: { timeoutMs?: number }) {
       const result = spawnSync(command, args, { cwd: root, encoding: 'utf8', timeout: options.timeoutMs });
       return { code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
+    }, async writeFile(file: string, content: string) {
+      fs.writeFileSync(path.join(root, file), content);
     }, async openPty(options: WorldPtySpec) {
       spec = options;
       return { onData: () => () => {}, onExit: () => () => {}, write: async () => {}, resize: async () => {}, close: async () => {} };
     } } as unknown as World;
     try {
-      await installMemoryGuard({ ...world, async writeFile(file: string, content: string) {
-        fs.writeFileSync(path.join(root, file), content);
-      } } as unknown as World);
+      await installMemoryGuard(world);
       const child = spawnRemoteAgentProcess({ world, provider: 'claude', command: '/sdk/claude', args: ['--output-format', 'stream-json'],
         cwd: root, env: { CLAUDE_CONFIG_DIR: home } });
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -203,6 +203,55 @@ describe('remote subscription agents', () => {
       process.kill(guardPid, 'SIGTERM');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
+
+  // Tasks 361/362: Daytona types the launcher into an interactive shell whose
+  // terminal is still in canonical mode, where the kernel keeps only 4095 bytes
+  // of a line. The ~9 KiB Claude launcher lost its tail, the shell waited for a
+  // closing quote, and the agent never started. Drive a real kernel PTY.
+  it.skipIf(spawnSync('script', ['--version']).status !== 0)('starts the agent through a canonical-mode PTY that truncates long lines', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-canonical-'));
+    const stubs = path.join(root, 'stubs');
+    const home = path.join(root, '.karmax-injection', 'agent', 'claude', 'home');
+    fs.mkdirSync(stubs); fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(stubs, 'npx'), `#!/bin/sh\necho ${stubs}/claude\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(stubs, 'claude'), '#!/bin/sh\nread line; echo "agent received $line"\n', { mode: 0o755 });
+    let typed = '';
+    const world = { handle: { root, id: 'canonical' },
+      async exec(command: string, args: string[]) {
+        const result = spawnSync(command, args, { cwd: root, encoding: 'utf8' });
+        return { code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
+      },
+      async writeFile(file: string, content: string) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), content);
+      },
+      async openPty(spec: WorldPtySpec): Promise<WorldPty> {
+        // A plain `sh` has no line editor, so the terminal stays canonical.
+        const terminal = spawn('script', ['-qefc', 'sh', '/dev/null'], { cwd: root,
+          env: { ...process.env, ...spec.env, PATH: `${stubs}:${process.env.PATH}` } });
+        typed = spec.command ?? '';
+        terminal.stdin.write(`${typed}\n`);
+        return {
+          onData: (listener) => { const read = (data: Buffer) => listener(data.toString()); terminal.stdout.on('data', read); return () => terminal.stdout.off('data', read); },
+          onExit: (listener) => { terminal.once('exit', (code) => listener(code)); return () => {}; },
+          write: async (data) => { terminal.stdin.write(data); },
+          resize: async () => {},
+          close: async () => { terminal.kill('SIGKILL'); },
+        };
+      } } as unknown as World;
+    try {
+      const child = spawnRemoteAgentProcess({ world, provider: 'claude', command: '/sdk/claude',
+        args: ['--output-format', 'stream-json'], cwd: root, env: { CLAUDE_CONFIG_DIR: home } });
+      let output = '';
+      child.stdout.on('data', (data) => { output += data; });
+      child.stdin.write('{"type":"control_request"}\n');
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 15_000))]);
+      expect(output).toContain('agent received {"type":"control_request"}');
+      expect(Buffer.byteLength(typed)).toBeLessThan(1024);
+      await child.stop().catch(() => undefined);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
 
   it('reports a signal as a signal and a lost sandbox stream as a transport failure, never as exit -1', async () => {
     const ending = async (termination: WorldPtyTermination) => {
@@ -496,14 +545,18 @@ describe('remote subscription agents', () => {
       platformRequest: async (method: string, requestPath: string) => { platformCalls.push(`${method} ${requestPath}`); return [{ type: 'ok' }]; } } as any);
 
     expect(result).toMatchObject({ termination: { kind: 'success', status: 'completed' }, session: '22222222-2222-4222-8222-222222222222', output: 'done remotely' });
-    expect(world.openedPty?.command).toContain('@openai/codex@0.156.1');
-    expect(world.openedPty?.command).toContain('/opt/karmax/bin/codex');
-    expect(world.openedPty?.command).toContain('app-server');
-    expect(world.openedPty?.command).toContain('stty raw -echo');
-    expect(world.openedPty?.command).toContain('exec sh -c');
-    expect(world.openedPty?.command).toContain('karmax-agent.pid');
-    expect(world.openedPty?.command).not.toContain('\u001eKARMAX_AGENT_READY\u001e');
-    expect(spawnSync('bash', ['-n', '-c', world.openedPty?.command ?? '']).status).toBe(0);
+    // The PTY only receives a short line; the launcher arrives through the file API.
+    const launcher = world.openedPty?.command?.match(/^exec sh '\/workspace\/([^']+)'$/)?.[1];
+    expect(launcher).toMatch(/^\.karmax-injection\/agent\/codex\/[0-9a-f]+\/launch-[0-9a-f-]+\.sh$/);
+    const script = world.files.get(launcher!)?.toString() ?? '';
+    expect(script).toContain('@openai/codex@0.156.1');
+    expect(script).toContain('/opt/karmax/bin/codex');
+    expect(script).toContain('app-server');
+    expect(script).toContain('stty raw -echo');
+    expect(script).toContain('exec sh -c');
+    expect(script).toContain('karmax-agent.pid');
+    expect(script).not.toContain('\u001eKARMAX_AGENT_READY\u001e');
+    expect(spawnSync('sh', ['-n', '-c', script]).status).toBe(0);
     expect(world.openedPty?.env?.DATABASE_URL).toBeUndefined();
     expect(world.openedPty?.env?.NODE_OPTIONS).not.toBe('--invalid-project-option');
     expect(world.openedPty?.env?.OPENAI_API_KEY).toBe('');

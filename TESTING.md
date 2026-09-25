@@ -204,3 +204,21 @@ The setup-snapshot build test needs `write:snapshots` and `delete:snapshots` on
 the Daytona API key and an explicit `KARMAX_DAYTONA_LIVE_BUILD=1`. Sandbox-only
 keys can exercise every other live test. Missing snapshot permission is tested
 as an actionable error at the SDK boundary.
+
+None of those tests run a real model. To prove a subscription Claude or Codex
+turn end to end in a remote sandbox — startup, Karmax platform tools, the
+browser MCP and a resumed session — run the smoke script against an existing,
+configured installation (it resolves the provider key and subscription login from
+that installation's database and vault, and deletes its sandbox afterwards):
+
+```bash
+KARMAX_LIVE_TASK_ID=<existing task id> KARMAX_LIVE_WORLD_PROVIDER=daytona \
+  KARMAX_LIVE_AGENT_PROVIDER=claude KARMAX_LIVE_BROWSER_URL=https://github.com \
+  npx tsx scripts/live-cloud-subscription.ts
+```
+
+`KARMAX_LIVE_WORLD_PROVIDER` is `e2b` (default) or `daytona`. Lower Daytona
+tiers only reach allowlisted hosts, so point `KARMAX_LIVE_BROWSER_URL` at one
+(the default, example.com, is blocked there). Mock-model tests could not catch
+tasks 361/362: Daytona typed the ~9 KiB Claude launcher into a terminal whose
+kernel line buffer keeps only 4 KiB, and the agent never started.

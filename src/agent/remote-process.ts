@@ -403,16 +403,25 @@ export function spawnRemoteAgentProcess(opts: {
     'printf \'%s\\n\' "$$" > "$pidfile"',
     trace('previous-process-stopped'),
     `guard=${quote(path.posix.join(opts.world.handle.root, MEMORY_GUARD))}; [ -f "$guard" ] && sh "$guard" start >/dev/null 2>&1`,
-    // Assemble the sentinel at runtime. The PTY echoes this whole shell command
-    // before `stty -echo` executes; embedding READY literally would make that
-    // command echo open the protocol gate before `exec agent`, allowing Bash to
-    // consume the JSON initialize line. The newline also forces prompt delivery
-    // through provider PTY streams that coalesce partial output.
+    // Assemble the sentinel at runtime so no echo of the launcher can open the
+    // protocol gate before `exec agent` and let the shell consume the JSON
+    // initialize line. The newline also forces prompt delivery through provider
+    // PTY streams that coalesce partial output.
     trace('protocol-ready'),
     "printf '\\036KARMAX_AGENT_%s\\036\\n' READY",
     `exec ${commandLine} 2>${quote(stderr)}`,
   ].join('; ');
-  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal, stderr, startupTrace);
+  // Never type the launcher itself. Providers type the PTY command into an
+  // interactive shell, and one whose terminal is still canonical (Daytona's zsh
+  // before its line editor starts) keeps only 4095 bytes of a line: the ~9 KiB
+  // Claude launcher lost its closing quote and the shell waited forever (tasks
+  // 361/362). Upload it through the file API and type a line of a few dozen bytes.
+  const launcher = path.posix.join(home, `launch-${crypto.randomUUID()}.sh`);
+  const relative = path.posix.relative(opts.world.handle.root, launcher);
+  if (relative.startsWith('..') || path.posix.isAbsolute(relative))
+    throw new Error(`remote agent home ${home} is outside the world root`);
+  return new RemoteSpawnedProcess(opts.world, `exec sh ${quote(launcher)}`, opts.cwd, opts.env, opts.signal,
+    stderr, startupTrace, { path: relative, script: `rm -f -- "$0"; ${shell}\n` });
 }
 
 export class RemoteSpawnedProcess extends EventEmitter {
@@ -444,10 +453,11 @@ export class RemoteSpawnedProcess extends EventEmitter {
   private received = new StartupProtocolTrace();
 
   constructor(private world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal,
-    private stderrFile?: string, private startupTraceFile?: string) {
+    private stderrFile?: string, private startupTraceFile?: string, launcher?: { path: string; script: string }) {
     super();
     this.protocolGate = new Promise<void>((resolve) => { this.openProtocolGate = resolve; });
-    this.ready = world.openPty({ command, cwd, env, cols: 200, rows: 40 }).then((pty) => {
+    const open = () => world.openPty({ command, cwd, env, cols: 200, rows: 40 });
+    this.ready = (launcher ? world.writeFile(launcher.path, launcher.script).then(open) : open()).then((pty) => {
       this.pty = pty;
       this.openedAt = Date.now();
       pty.onData((chunk) => this.onData(chunk));
