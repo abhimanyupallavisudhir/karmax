@@ -336,9 +336,10 @@ export class AcpAdapter implements AgentAdapter {
       throw new Error(
         `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where krmax itself runs. `
         + 'Choose a Claude or Codex agent for this task, or give the project a local/container world.');
-    const work = await openCodeWorkEnvironment(input);
+    const work = await openCodeWorkEnvironment(input, !!ctx.onSecretEnvChange);
+    const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAcpTurn(input, ctx, work.plugin); }
-    finally { work.cleanup(); }
+    finally { unsubscribe?.(); work.cleanup(); }
   }
 
   private async runAcpTurn(input: TurnInput, ctx: PlatformToolContext, workPlugin?: string): Promise<AdapterTurn> {
@@ -352,7 +353,7 @@ export class AcpAdapter implements AgentAdapter {
     // down in `finally` below — it must never outlive the activity whose result
     // it mutates (control-bridge.ts). Started after `harnessSpec`, which throws
     // for an unsupported provider before there is anything to clean up.
-    const control = await startControlBridge(platformToolHandlers(input.world, ctx, workEnvironment(input)));
+    const control = await startControlBridge(platformToolHandlers(input.world, ctx, () => workEnvironment(input)));
     const custody = createCustodyEnv(spec.env);
     spec.env = custody.env;
     const startupEnd = (await (await currentTiming())?.start('process.acp-startup'));

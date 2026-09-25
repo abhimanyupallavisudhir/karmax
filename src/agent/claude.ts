@@ -89,7 +89,7 @@ export class ClaudeAdapter implements AgentAdapter {
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx, workEnvironment(input)), ...mcp.handlers };
+    const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
 
     const messages: any[] = [];
@@ -284,9 +284,10 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    const work = await claudeWorkEnvironment(input);
+    const work = await claudeWorkEnvironment(input, !!ctx.onSecretEnvChange);
+    const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAgentSdkProcess(input, ctx, work.settings); }
-    finally { await work.cleanup(); }
+    finally { unsubscribe?.(); await work.cleanup(); }
   }
 
   private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
@@ -315,7 +316,7 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     const { query, createSdkMcpServer, tool } = sdk;
     const zod = (await import('zod')).z;
-    const handlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
+    const handlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     const remote = isRemoteAgentWorld(runtimeWorld);
     const configHome = input.resolvedAuth?.configHome;
     const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));

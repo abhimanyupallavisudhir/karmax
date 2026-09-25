@@ -62,16 +62,60 @@ describe('existing world secret refresh', () => {
     expect(JSON.stringify((await store.currentWorld(world.handle.id)))).not.toContain('fixture-value');
   });
 
-  it('does not enroll another project, disabled secrets, files, or snapshots on reopen', async () => {
+  it('does not enroll another project, disabled secrets, or snapshots on reopen', async () => {
     const other = (await store.createProject('Other')); (await add('FOREIGN_TOKEN', other.id));
     const disabled = (await add('DISABLED_TOKEN')); (await store.updateResourceAttachment(disabled.id, { enabled: false }));
-    const file = (await add('FILE_TOKEN')); (await store.updateResourceAttachment(file.id, { target: { kind: 'path', path: '.private-key' } }));
     (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id, name: 'Data',
       driver: 'volume@1', target: { kind: 'path', path: 'data' }, access: 'write', isolation: 'fork',
       source: {}, credentialHandles: [], publish: 'review' }));
     await resources.prepare(world);
     expect((await store.listResourceLeases(world.handle.id))).toEqual([]);
     expect((await resources.environmentFor(world.handle))).toEqual({});
+    expect(fs.existsSync(path.join(world.handle.root, 'data'))).toBe(false);
+  });
+
+  async function addFile(name = 'FILE_TOKEN', file = '.private-key') {
+    const secret = await add(name);
+    return (await store.updateResourceAttachment(secret.id, { target: { kind: 'path', path: file } }));
+  }
+  const fileAt = (file = '.private-key') => path.join(world.handle.root, file);
+
+  it('delivers late file secrets on reopen as private, Git-excluded projections that are never task output', async () => {
+    const secret = await addFile();
+    await resources.prepare(world);
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('fixture-value');
+    expect(fs.statSync(fileAt()).mode & 0o777).toBe(0o600);
+    expect((await world.exec('git', ['status', '--porcelain'])).stdout).toBe('');
+    // Checkpoints and forks skip recorded projections; the value itself is never persisted.
+    const current = (await store.currentWorld(world.handle.id))!;
+    expect((current.meta?.resourceProjections as any)?.[secret.id]?.target).toBe('.private-key');
+    expect(JSON.stringify(current)).not.toContain('fixture-value');
+    await resources.prepare(world);
+    expect((await store.listResourceLeases(world.handle.id))).toHaveLength(1);
+    await resources.scrubSecrets(world.handle, world);
+    expect(fs.existsSync(fileAt())).toBe(false);
+  });
+
+  it('keeps a running agent current without reopening: adds, rotates and withdraws secrets', async () => {
+    const opened = await resources.prepare(world);
+    expect(await resources.refresh(opened)).toEqual({});
+    const token = await add();
+    const file = await addFile();
+    expect(await resources.refresh(opened)).toEqual({ REFRESH_TEST_TOKEN: 'fixture-value' });
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('fixture-value');
+    // An unchanged project value does not clobber the agent's own edits...
+    fs.writeFileSync(fileAt(), 'agent edit');
+    await resources.refresh(opened);
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('agent edit');
+    // ...but a rotation in project settings reaches the running agent.
+    (await broker.registerHandle(file.credentialHandles[0]!, 'rotated-file'));
+    (await broker.registerHandle(token.credentialHandles[0]!, 'rotated-env'));
+    expect(await resources.refresh(opened)).toEqual({ REFRESH_TEST_TOKEN: 'rotated-env' });
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('rotated-file');
+    (await store.updateResourceAttachment(token.id, { enabled: false }));
+    expect(await resources.refresh(opened)).toEqual({});
+    expect((await store.listResourceLeases(world.handle.id))).toHaveLength(2);
+    expect((await world.exec('git', ['status', '--porcelain'])).stdout).toBe('');
   });
 
   it('retries a broker failure without persisting values or silently skipping the secret', async () => {

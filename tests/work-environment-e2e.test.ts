@@ -5,6 +5,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { runTurn } from '../src/agent/runtime.js';
 
 // Real pinned harnesses, local model fixtures, fake credentials. Prove that a
 // work command sees the project key but both surrounding model calls do not.
@@ -74,6 +75,58 @@ describe('project environment versus model authentication', () => {
     }
     expect(keys.length).toBeGreaterThanOrEqual(4);
     expect(new Set(keys)).toEqual(new Set(['Bearer sk-ant-oat01-fixture-subscription']));
+  }, 90_000);
+
+  it('a running Claude turn picks up a secret added to project settings mid-turn', async () => {
+    const { home, cwd } = directories();
+    let project: Record<string, string> = {};
+    const envFiles = () => {
+      const root = path.join(cwd, '.karmax-injection/work-env');
+      return fs.existsSync(root) ? fs.readdirSync(root).map(dir => path.join(root, dir, 'env.sh')) : [];
+    };
+    const url = await fixture(async (req, res) => {
+      let raw = ''; for await (const chunk of req) raw += chunk;
+      if (!req.url?.startsWith('/v1/messages') || req.url.includes('count_tokens')) {
+        res.setHeader('content-type', 'application/json'); res.end('{}'); return;
+      }
+      const body = JSON.parse(raw);
+      const results = JSON.stringify(body.messages).split('"tool_result"').length - 1;
+      if (results === 1) {
+        // The user adds the key in project settings while the agent is working.
+        project = { LATE_KEY: "added 'mid-turn'" };
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline && !envFiles().some(file => fs.readFileSync(file, 'utf8').includes('LATE_KEY')))
+          await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const step = ['before', 'after'][results];
+      const block = step ? { type: 'tool_use', id: `call_${step}`, name: 'Bash', input: {} } : { type: 'text', text: '' };
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const event of [
+        { type: 'message_start', message: { id: `msg_${results}`, type: 'message', role: 'assistant', model: body.model,
+          content: [], stop_reason: null, usage: { input_tokens: 10, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: block },
+        { type: 'content_block_delta', index: 0, delta: step
+          ? { type: 'input_json_delta', partial_json: JSON.stringify({ command: `printf "%s" "\${LATE_KEY-unset}" > ${step}.txt` }) }
+          : { type: 'text_delta', text: 'done' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: step ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: 10 } },
+        { type: 'message_stop' },
+      ]) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      res.end();
+    });
+    const result = await runTurn({
+      profile: { id: 'p', name: 'test', provider: 'claude', role: 'do', model: 'claude-opus-5-5', mcpConnections: [] },
+      world: { handle: { id: 'work-env', root: cwd, base: 'main', branch: 'task' } },
+      resolvedAuth: { configHome: home, oauthToken: 'sk-ant-oat01-fixture-subscription' },
+      extraEnv: { ANTHROPIC_BASE_URL: url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+      systemPrompt: 'Run the requested commands.', role: 'do',
+      messages: [{ id: 'm', role: 'user', text: 'Run the work commands now.', ts: 0 }],
+    } as any, { adapters: new Map([['claude', new ClaudeAdapter()]]), signal: AbortSignal.timeout(60_000),
+      pullSecretEnv: async () => project });
+    expect(result.output).toContain('done');
+    expect(fs.readFileSync(path.join(cwd, 'before.txt'), 'utf8')).toBe('unset');
+    expect(fs.readFileSync(path.join(cwd, 'after.txt'), 'utf8')).toBe("added 'mid-turn'");
+    expect(envFiles()).toEqual([]);
   }, 90_000);
 
   it.each(['app-server', 'exec'])('Codex %s gives shell tools project keys without changing the model key', async (mode) => {
