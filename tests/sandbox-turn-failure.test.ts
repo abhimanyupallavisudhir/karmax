@@ -5,6 +5,7 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import type { WorldDiagnosis } from '../src/world/types.js';
+import { withClaudeStartupDeadline } from '../src/agent/sdk-stream.js';
 
 /**
  * Tasks 348 and 349 escalated to a human because a sandbox frozen by memory
@@ -50,6 +51,21 @@ const exhausted: WorldDiagnosis = {
 };
 
 describe('sandbox-caused turn failures', () => {
+  it('routes a silent SDK startup through the automatic infrastructure retry path', async () => {
+    vi.useFakeTimers();
+    let failure: Error;
+    const abort = vi.fn();
+    try {
+      const silent = (async function* () { await new Promise(() => {}); })();
+      const failed = withClaudeStartupDeadline(silent, abort).next().catch(error => error);
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      failure = await failed;
+      expect(abort).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+    const { error } = await failTurn(failure!, undefined);
+    expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false, message: failure!.message });
+  });
+
   it('retries a turn the sandbox broke, and says why', async () => {
     for (const failure of [new Error('Claude Code process exited with code -1'),
       Object.assign(new Error('Sandbox is probably not running anymore'), { name: 'SandboxNotFoundError' })]) {

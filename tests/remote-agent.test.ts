@@ -169,7 +169,10 @@ describe('remote subscription agents', () => {
     fs.writeFileSync(path.join(stubs, 'npx'), `#!/bin/sh\ncase "$*" in *'-c command -v claude') echo ${stubs}/claude ;; *) echo "npx ran the agent" >&2; exit 9 ;; esac\n`, { mode: 0o755 });
     fs.writeFileSync(path.join(stubs, 'claude'), '#!/bin/sh\necho "parent=$(cat /proc/$PPID/comm) args=$*"\n', { mode: 0o755 });
     let spec: WorldPtySpec | undefined;
-    const world = { handle: { root, id: 'spawn' }, async openPty(options: WorldPtySpec) {
+    const world = { handle: { root, id: 'spawn' }, async exec(command: string, args: string[], options: { timeoutMs?: number }) {
+      const result = spawnSync(command, args, { cwd: root, encoding: 'utf8', timeout: options.timeoutMs });
+      return { code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
+    }, async openPty(options: WorldPtySpec) {
       spec = options;
       return { onData: () => () => {}, onExit: () => () => {}, write: async () => {}, resize: async () => {}, close: async () => {} };
     } } as unknown as World;
@@ -177,13 +180,24 @@ describe('remote subscription agents', () => {
       await installMemoryGuard({ ...world, async writeFile(file: string, content: string) {
         fs.writeFileSync(path.join(root, file), content);
       } } as unknown as World);
-      spawnRemoteAgentProcess({ world, provider: 'claude', command: '/sdk/claude', args: ['--output-format', 'stream-json'],
+      const child = spawnRemoteAgentProcess({ world, provider: 'claude', command: '/sdk/claude', args: ['--output-format', 'stream-json'],
         cwd: root, env: { CLAUDE_CONFIG_DIR: home } });
       await new Promise((resolve) => setTimeout(resolve, 0));
       const run = spawnSync('bash', ['-c', spec!.command!], { cwd: root, encoding: 'utf8',
         env: { ...process.env, ...spec!.env, PATH: `${stubs}:${process.env.PATH}` } });
       expect(run.stdout).toContain('\u001eKARMAX_AGENT_READY\u001e');
       expect(run.stdout).toContain('parent=node args=--print --output-format stream-json');
+      const snapshot = await child.startupDiagnostics() as any;
+      expect(snapshot.sandbox.status).toBe('ok');
+      expect(snapshot.sandbox.steps.map((step: any) => step.phase)).toEqual([
+        'shell-started', 'previous-process-check', 'previous-process-stopped', 'protocol-ready',
+        'cli-version-check', 'cli-resolve', 'cli-exec', 'relay-started', 'child-spawned', 'child-exited',
+      ]);
+      expect(snapshot.sandbox.steps.at(-1).exitCode).toBe(0);
+      expect(snapshot.sandbox.memory.totalKb).toBeGreaterThan(0);
+      const journals = fs.readdirSync(home).filter(file => file.startsWith('startup-'));
+      expect(journals).toHaveLength(1);
+      expect(fs.statSync(path.join(home, journals[0]!)).mode & 0o777).toBe(0o600);
       const guardPid = Number(fs.readFileSync(path.join(injection, 'memory-guard.pid'), 'utf8'));
       expect(spawnSync('kill', ['-0', String(guardPid)]).status).toBe(0);
       process.kill(guardPid, 'SIGTERM');

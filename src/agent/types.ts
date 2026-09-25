@@ -69,7 +69,7 @@ export interface PlatformToolContext {
   /** Stream incremental output to the task's live event log. */
   emit(text: string, source?: 'assistant' | 'tool'): void;
   /** Publish a structured provider item for the durable conversation timeline. */
-  emitActivity(activity: AgentActivity): void;
+  emitActivity(activity: AgentActivity): void | Promise<void>;
   /** Called as soon as the provider session id is known (mid-turn), so the task can
    *  publish it immediately — the drawer then shows a live "fork this agent" command
    *  WHILE the turn runs, not only after it ends (RESOLVE-PLAN #3). Fire-once per id. */

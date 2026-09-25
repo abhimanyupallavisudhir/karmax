@@ -12,7 +12,7 @@ export interface RunTurnDeps {
   /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
   onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
-  onActivity?: (activity: AgentActivity) => void;
+  onActivity?: (activity: AgentActivity) => void | Promise<void>;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
     request(ctx: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -232,8 +232,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     async emitActivity(activity) {
       const output = outputObserved();
       const firstText = activity.kind === 'message' && activity.title?.trim() ? trace?.markOnce('first.text') : undefined;
-      deps.onActivity?.(activity);
-      await Promise.all([output, firstText]);
+      await Promise.all([deps.onActivity?.(activity), output, firstText]);
       if ((await trace?.enabled()) && ['tool', 'command', 'search', 'file', 'subagent'].includes(activity.kind)) {
         if (activity.phase === 'started' && !observedTools.has(activity.id) && trace)
           observedTools.set(activity.id, (await trace.start('tool.provider-observed', { itemId: activity.id, operation: activity.kind })));
