@@ -8,6 +8,8 @@ on:
   # queue, required checks must report on the speculative landing candidate.
   # Personal/private deployments simply never emit this event.
   merge_group:
+  # Validate any branch on demand, e.g. a CI change before its PR exists.
+  workflow_dispatch:
 
 # A newer push to the same branch makes the in-flight run redundant. master is
 # excluded so every landed commit keeps a result of its own.
@@ -16,43 +18,17 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  test:
-    name: typecheck + tests
+  checks:
+    name: workflows + typecheck
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: karmax_test
-          POSTGRES_PASSWORD: karmax_test
-          POSTGRES_DB: karmax_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U karmax_test -d karmax_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    # The suite is sequential by design (vitest.config.ts forces singleFork):
-    # several concurrent Temporal servers would exhaust the runner. ~10 min of
-    # real work, with headroom for a slow runner.
-    timeout-minutes: 45
+    timeout-minutes: 10
     env:
-      # Live suites spend real money and need real provider keys. Docker-gated
-      # suites are covered by the deploy-artifacts job instead.
-      KARMAX_SKIP_LIVE: '1'
-      KARMAX_SKIP_DOCKER: '1'
-      KARMAX_TEST_PASS_INTEROP: '1'
-      KARMAX_TEST_PASS_BROWSER: '1'
-      TEMPORAL_CLI_VERSION: '1.7.2'
-      KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
       ACTIONLINT_VERSION: '1.7.12'
       ACTIONLINT_LINUX_AMD64_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
     steps:
       - uses: actions/checkout@v7
 
-      # This lives in the existing required check, so branch protection needs no
-      # new check name. Pin both the release and archive digest.
+      # Pin both the release and archive digest.
       - name: Install actionlint
         run: |
           archive="$RUNNER_TEMP/actionlint.tar.gz"
@@ -84,6 +60,56 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - run: npm run typecheck
+
+  test:
+    # Each shard runs its share of the files exactly as `npm test` does
+    # locally: one file at a time (vitest.config.ts), so no runner ever hosts
+    # more than one Temporal server. Shards are balanced by measured duration
+    # (tests/durations.json); no shard can finish faster than the slowest
+    # single file, so add one only while the shards are well above that.
+    name: tests ${{ matrix.shard }}/${{ strategy.job-total }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every shard's failures, not just the first one's.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: karmax_test
+          POSTGRES_PASSWORD: karmax_test
+          POSTGRES_DB: karmax_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U karmax_test -d karmax_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    # About three times a shard's normal runtime: slow runners have taken
+    # twice as long, while a genuine hang still fails reasonably soon.
+    timeout-minutes: 25
+    env:
+      # Live suites spend real money and need real provider keys. Docker-gated
+      # suites are covered by the deploy-artifacts job instead.
+      KARMAX_SKIP_LIVE: '1'
+      KARMAX_SKIP_DOCKER: '1'
+      KARMAX_TEST_PASS_INTEROP: '1'
+      KARMAX_TEST_PASS_BROWSER: '1'
+      TEMPORAL_CLI_VERSION: '1.7.2'
+      KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
 
       - name: Install Chromium for browser regressions
         run: npx playwright install --with-deps chromium
@@ -107,7 +133,10 @@ jobs:
             | tar -xz -C ~/.temporalio/bin temporal
           ~/.temporalio/bin/temporal --version
 
+      # The suite covers the current gopass release; the older one needs a
+      # single extra run of the interop file, not one per shard.
       - name: Verify gopass 1.16.1 compatibility
+        if: matrix.shard == 1
         run: |
           mkdir -p "$RUNNER_TEMP/gopass-1.16.1"
           archive="$RUNNER_TEMP/gopass-1.16.1.tar.gz"
@@ -116,11 +145,28 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/gopass-1.16.1" gopass
           GOPASS_BIN="$RUNNER_TEMP/gopass-1.16.1/gopass" npx vitest run tests/git-pass-interop.test.ts
 
-      - run: npm run typecheck
-      - run: npm test
+      # Includes the standalone UI and browser regressions: tests/web-regressions.test.ts
+      # runs every web/*.test.cjs.
+      - run: npm test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
 
-      - name: Run standalone UI and browser regressions
-        run: node --test --test-concurrency=1 web/*.test.cjs
+  # Branch protection requires this check. It stands for the jobs above, so it
+  # runs even after one of them failed or was cancelled, in order to fail too.
+  required:
+    name: typecheck + tests
+    if: always()
+    needs: [checks, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every check and test shard to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: ${RESULTS:-none}"
+          [ -n "$RESULTS" ] || exit 1
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done
 
   deploy-artifacts:
     name: deploy artifacts

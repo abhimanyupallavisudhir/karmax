@@ -317,6 +317,60 @@ describe('cloud Git broker', () => {
     expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
   });
 
+  // `git fetch` and `git commit` start `git maintenance run --auto`, which
+  // current Git detaches. Left running in a throwaway clone, it was still
+  // writing .git/objects when the broker deleted the clone, so CI saw a
+  // completed publish reported as failed with ENOTEMPTY.
+  it('never starts Git maintenance in its throwaway clones', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-maintenance-'));
+    cleanups.push(root);
+    const makeSource = async (name: string) => {
+      const source = path.join(root, name);
+      fs.mkdirSync(source);
+      await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(source);
+      fs.writeFileSync(path.join(source, 'README.md'), `# ${name}\n`);
+      await gitOrThrow(source, ['add', '-A']);
+      await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+      return source;
+    };
+    // Enrollment adds a checkout beside the others, so the world needs the
+    // multi-repository layout.
+    const repos = [await makeSource('first'), await makeSource('second')];
+    await gitOrThrow(root, ['init', '-q', '--bare', path.join(root, 'empty.git')]);
+    const env = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'git@example:',
+    };
+    const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: 'maintenance', repos, base: 'main' });
+    const trace = path.join(root, 'trace2.json');
+    const previous = process.env.GIT_TRACE2_EVENT;
+    process.env.GIT_TRACE2_EVENT = trace;
+    try {
+      const enrolled = await brokerEnrollRepository(world, {
+        source: 'git@example:empty.git', name: 'empty', branch: world.handle.branch, base: 'main', target: 'main',
+        identity: { name: 'Karmax Test', email: 'karmax@example.com' },
+      }, env);
+      fs.writeFileSync(path.join(enrolled.root, 'work.txt'), 'work\n');
+      await gitOrThrow(enrolled.root, ['add', '-A']);
+      await gitOrThrow(enrolled.root, ['commit', '-q', '-m', 'work']);
+      expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['first', 'second', 'empty'], skipped: [] });
+    } finally {
+      if (previous === undefined) delete process.env.GIT_TRACE2_EVENT;
+      else process.env.GIT_TRACE2_EVENT = previous;
+    }
+    const events = fs.readFileSync(trace, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const repository = new Map(events.filter((event) => event.event === 'def_repo').map((event) => [event.sid, event.worktree]));
+    const maintained = events
+      .filter((event) => ['start', 'child_start'].includes(event.event)
+        && /(^| )(maintenance run|gc --auto)( |$)/.test(event.argv.slice(1).join(' ')))
+      .map((event) => String(repository.get(event.sid)));
+    // The world's own checkout keeps Git's default, which shows the trace works.
+    expect(maintained.some((repo) => repo.startsWith(world.handle.root))).toBe(true);
+    expect(maintained.filter((repo) => /karmax-git-(broker|enroll)-/.test(repo))).toEqual([]);
+  });
+
   it('preserves the underlying error for every skipped repository', async () => {
     const world = {
       handle: {
