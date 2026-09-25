@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { previewLocation, toPublicPayload } from '../src/gateway/server.js';
 import { hashPreviewToken, previewCookieHeader, previewCookieValue, previewLeaseOrigin, previewTokenMatches } from '../src/gateway/previews.js';
-import { Store } from '../src/store/db.js';
+import { PREVIEW_TLS_GRACE_MS, Store } from '../src/store/db.js';
 
 const remoteWorld = {
   kind: 'e2b',
@@ -82,7 +82,34 @@ describe('public gateway payloads', () => {
     expect(previewLeaseOrigin('lease-a', env)).not.toBe(previewLeaseOrigin('lease-b', env));
   });
 
-  it('allows on-demand TLS only for an active opaque preview hostname', async () => {
+  // Task 364: the review server died two seconds after its lease was minted,
+  // the lease was revoked, and Caddy's refusal surfaced in the browser as
+  // ERR_SSL_PROTOCOL_ERROR. Liveness belongs to HTTP, which can say "stopped";
+  // TLS only needs to know the name is one karmax issued, and only for a while.
+  it('keeps a certificate available for a recently stopped preview so HTTP can explain it', async () => {
+    const previous = process.env.KARMAX_PREVIEW_ORIGIN;
+    process.env.KARMAX_PREVIEW_ORIGIN = 'https://preview.example.com';
+    try {
+      const store = (await Store.create(':memory:'));
+      const project = (await store.createProject('Preview'));
+      const task = (await store.createTask({ projectId: project.id, title: 'Run app', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'run it' } }));
+      const now = Date.now();
+      const lease = (await store.createPreviewLease({ id: 'preview-stopped', organizationId: project.organizationId!,
+        projectId: project.id, taskId: task.id, worldId: task.id, generation: 1, port: 4173, public: false,
+        provider: 'e2b', createdBy: 'system:review-action', createdAt: now, expiresAt: now + 60_000 }));
+      (await store.revokePreviewLease(lease.id));
+      expect((await store.previewHostnameAllowed(lease.hostname!, now))).toBe(true);
+      expect((await store.previewHostnameAllowed(lease.hostname!, now + 60_000 + PREVIEW_TLS_GRACE_MS - 1))).toBe(true);
+      expect((await store.previewHostnameAllowed(lease.hostname!, now + 60_000 + PREVIEW_TLS_GRACE_MS))).toBe(false);
+      expect((await store.previewHostnameAllowed('invented.preview.example.com', now))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_PREVIEW_ORIGIN;
+      else process.env.KARMAX_PREVIEW_ORIGIN = previous;
+    }
+  });
+
+  it('allows on-demand TLS only for an opaque preview hostname karmax issued', async () => {
     const previous = process.env.KARMAX_PREVIEW_ORIGIN;
     process.env.KARMAX_PREVIEW_ORIGIN = 'https://preview.example.com';
     try {
@@ -95,9 +122,9 @@ describe('public gateway payloads', () => {
         provider: 'e2b', createdBy: 'owner', createdAt: Date.now(), expiresAt: Date.now() + 60_000 }));
       expect(lease.hostname).toMatch(/^p-[a-f0-9]{24}\.preview\.example\.com$/);
       expect((await store.previewHostnameAllowed(lease.hostname!))).toBe(true);
+      expect((await store.previewHostnameAllowed(lease.hostname!.toUpperCase()))).toBe(true);
       expect((await store.previewHostnameAllowed('invented.preview.example.com'))).toBe(false);
-      (await store.revokePreviewLease(lease.id));
-      expect((await store.previewHostnameAllowed(lease.hostname!))).toBe(false);
+      expect((await store.previewHostnameAllowed(''))).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.KARMAX_PREVIEW_ORIGIN;
       else process.env.KARMAX_PREVIEW_ORIGIN = previous;

@@ -7989,11 +7989,11 @@ export class Gateway {
   private async serveLeasedPreview(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
     const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
     const lease = match ? (await this.deps.store.previewLease(match[1]!)) : undefined;
-    if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.json(res, 404, { error: 'preview not found or expired' });
+    if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.previewStopped(req, res, 404, 'preview not found or expired');
     if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase())
-      return this.json(res, 404, { error: 'preview not found or expired' });
+      return this.previewStopped(req, res, 404, 'preview not found or expired');
     const current = (await this.deps.store.currentWorld(lease.worldId));
-    if (!current || (current.generation ?? 1) !== lease.generation) return this.json(res, 410, { error: 'preview world generation is no longer current' });
+    if (!current || (current.generation ?? 1) !== lease.generation) return this.previewStopped(req, res, 410, 'preview world generation is no longer current');
     if (lease.tokenHash) {
       const queryToken = url.searchParams.get('token') ?? '';
       const cookieToken = previewCookieValue(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, lease.id);
@@ -8553,6 +8553,15 @@ export class Gateway {
     res.writeHead(response.status, headers);
     res.end(body);
   }
+  /** A preview a person opened in a tab says it stopped; API clients keep JSON. */
+  private previewStopped(req: http.IncomingMessage, res: http.ServerResponse, status: number, error: string) {
+    if (!String(req.headers.accept ?? '').includes('text/html')) return this.json(res, status, { error });
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+    res.end(PREVIEW_STOPPED_HTML);
+  }
+
   private json(res: http.ServerResponse, status: number, obj: unknown) {
     const body = JSON.stringify(toPublicPayload(obj ?? null));
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8',
@@ -8737,6 +8746,13 @@ export function untrustedContentHeaders(mediaType: string, filename: string): Re
     'x-content-type-options': 'nosniff',
   };
 }
+
+const PREVIEW_STOPPED_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>Preview stopped</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;
+font:15px/1.5 system-ui,sans-serif;color:CanvasText;background:Canvas}main{max-width:26rem;padding:2rem;text-align:center}
+h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;opacity:.7}</style></head><body><main><h1>This preview has stopped</h1>
+<p>Start it again from the task's Review.</p></main></body></html>`;
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);

@@ -7,6 +7,7 @@ import type { Store } from '../store/db.js';
 import type { RunnerPoolService } from '../world/runners.js';
 import { newId } from '../util/id.js';
 import { hashPreviewToken, newPreviewToken, previewLeaseUrl } from './previews.js';
+import { reclaimPorts } from '../world/reclaim-ports.js';
 
 /**
  * Runs a review "run" action's command in the task's on-disk world and streams
@@ -114,9 +115,19 @@ export class ReviewActionRunner {
       throw error;
     }
     let process: WorldProcess;
+    let notice = '';
     try {
       const opened = await this.worlds.open(opts.world);
       const world = this.resources ? await this.resources.prepare(opened) : opened;
+      // A server owns the ports it declares. In an isolated world, a listener
+      // already there is a leftover (usually the agent's own check of this
+      // server), and it would make this start fail with EADDRINUSE (task 364).
+      if (opts.server && this.worlds.get(opts.world.kind).capabilities?.remote) {
+        const ports = (opts.openUrls ?? []).map(loopbackPort).filter((port): port is number => port !== undefined);
+        for (const stopped of await reclaimPorts(world, ports).catch(() => []))
+          notice += `Stopped an earlier process on port ${stopped.port}: ${stopped.command || `pid ${stopped.pid}`}\n`;
+        if (notice) (await this.store.appendExecutionFrame(procId, notice, 'system'));
+      }
       process = await world.startProcess({ command: opts.command });
     } catch (error) {
       (await this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system'));
@@ -135,7 +146,7 @@ export class ReviewActionRunner {
       server: !!opts.server,
       openUrls,
       startedAt: Date.now(),
-      output: '',
+      output: notice,
       exitCode: null,
       running: true,
       process,
@@ -288,10 +299,9 @@ export class ReviewActionRunner {
 async function reviewUrl(store: Store, taskId: string, world: WorldHandle, value: string, leases: string[]): Promise<string> {
   if (['worktree', 'container', 'memory'].includes(world.kind)) return value;
   try {
+    const port = loopbackPort(value);
+    if (port === undefined) return value;
     const url = new URL(value);
-    if (!['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(url.hostname)) return value;
-    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
-    if (!Number.isInteger(port) || port < 1 || port > 65_535) return value;
     const task = (await store.getTask(taskId));
     const project = task ? (await store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) return value;
@@ -306,6 +316,17 @@ async function reviewUrl(store: Store, taskId: string, world: WorldHandle, value
   } catch {
     return value;
   }
+}
+
+/** The port of a URL on the world's own loopback, which is what a review
+ * server's `openUrls` name. */
+function loopbackPort(value: string): number | undefined {
+  try {
+    const url = new URL(value);
+    if (!['localhost', '127.0.0.1', '0.0.0.0', '[::1]'].includes(url.hostname)) return undefined;
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    return Number.isInteger(port) && port >= 1 && port <= 65_535 ? port : undefined;
+  } catch { return undefined; }
 }
 
 function redactPreviewToken(value: string): string {

@@ -436,6 +436,33 @@ describe('E2B cloud world provider', () => {
     expect(await new Promise<number | null>((resolve) => pty.onExit(resolve))).toBe(254);
   });
 
+  // Task 364: E2B's wait() rejects with CommandExitError for any nonzero exit.
+  // A review server that failed to bind (EADDRINUSE) must report exit 1, not
+  // the -1 reserved for a lost stream, and not echo "exit status 1" as output.
+  it('preserves the native exit code of a failed background process', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'process-exit', base: 'main' });
+    const endings: unknown[] = [
+      Object.assign(new Error('exit status 1'), { name: 'CommandExitError', exitCode: 1, error: 'exit status 1' }),
+      Object.assign(new Error('[unavailable] upstream connect error'), { name: 'ConnectError', code: 14 }),
+    ];
+    const seen: { code: number | null; output: string }[] = [];
+    for (const ending of endings) {
+      sandbox.commands.run = (async (_command: string, options: any) => {
+        options.onStderr?.('Error: listen EADDRINUSE: address already in use :::4173\n');
+        return { wait: async () => { throw ending; }, kill: async () => true };
+      }) as any;
+      const proc = await world.startProcess({ command: 'npm run preview' });
+      let output = '';
+      proc.onOutput((chunk) => { output += chunk; });
+      seen.push({ code: await new Promise<number | null>((resolve) => proc.onExit(resolve)), output });
+    }
+    expect(seen[0]).toEqual({ code: 1, output: 'Error: listen EADDRINUSE: address already in use :::4173\n' });
+    expect(seen[1]!.code).toBe(-1);
+    expect(seen[1]!.output).toContain('upstream connect error');
+  });
+
   it('replays a PTY exit that happens before the caller attaches', async () => {
     const sandbox = fakeSandbox(() => undefined);
     sandbox.pty.create = async () => ({ pid: 9, async wait() { return { exitCode: 23 }; } });
