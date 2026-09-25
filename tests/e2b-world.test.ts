@@ -446,6 +446,98 @@ describe('E2B cloud world provider', () => {
     const code = await new Promise<number | null>((resolve) => pty.onExit(resolve));
     expect(code).toBe(23);
   });
+
+  // Task 348: envd reports a signalled process as exit -1 with the reason in
+  // `error`, and a dropped stream rejects without any exit status at all. Both
+  // used to surface as "exited with code -1" although, in 348, the agent was
+  // still running in a sandbox frozen by memory exhaustion.
+  it('reports how a PTY process ended instead of a bare -1', async () => {
+    const endings = [
+      Object.assign(new Error('signal: killed'), { name: 'CommandExitError', exitCode: -1, error: 'signal: killed' }),
+      Object.assign(new Error('[unavailable] upstream connect error'), { name: 'ConnectError', code: 14 }),
+    ];
+    const seen: unknown[] = [];
+    for (const ending of endings) {
+      const sandbox = fakeSandbox(() => undefined);
+      sandbox.pty.create = async () => ({ pid: 9, async wait() { throw ending; } });
+      const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+      const world = await provider.create({ taskId: 'pty-ending', base: 'main' });
+      const pty = await world.openPty();
+      seen.push(await new Promise((resolve) => pty.onExit((code, termination) => resolve({ code, termination }))));
+    }
+    expect(seen[0]).toEqual({ code: null, termination: { signal: 'SIGKILL' } });
+    expect(seen[1]).toMatchObject({ code: null, termination: { lost: endings[1] } });
+  });
+
+  // Task 350: E2B's Hobby plan pauses a sandbox after one hour of continuous
+  // running whatever timeout karmax requests. The pause drops every stream,
+  // but the agent survives it, so resume the sandbox and follow the same PTY.
+  it('reattaches to a PTY whose stream dropped while its process survived', async () => {
+    const dropped = Object.assign(new Error('[unavailable] upstream connect error'), { name: 'ConnectError', code: 14 });
+    const run = async (connect: (pid: number, options: any) => Promise<any>, closeFirst = false) => {
+      const sandbox = fakeSandbox(() => undefined);
+      let drop!: () => void;
+      const resumed: unknown[] = [];
+      sandbox.pty.create = async () => ({ pid: 9, wait: () => new Promise((_resolve, reject) => { drop = () => reject(dropped); }) });
+      sandbox.pty.connect = connect;
+      sandbox.connect = async (options) => { resumed.push(options); return sandbox; };
+      const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+      const world = await provider.create({ taskId: 'pty-reattach', base: 'main' });
+      const pty = await world.openPty();
+      const output: string[] = [];
+      pty.onData((chunk) => output.push(chunk));
+      const ended = new Promise((resolve) => pty.onExit((code, termination) => resolve({ code, termination })));
+      if (closeFirst) await pty.close();
+      drop();
+      return { ending: await ended, output, resumed };
+    };
+
+    const reattached = await run(async (pid, options) => {
+      expect(pid).toBe(9);
+      options.onData(new TextEncoder().encode('after the pause'));
+      return { pid, wait: async () => ({ exitCode: 0 }) };
+    });
+    expect(reattached).toMatchObject({ ending: { code: 0 }, output: ['after the pause'], resumed: [expect.any(Object)] });
+
+    const gone = await run(async () => { throw Object.assign(new Error('process with pid 9 not found'), { name: 'NotFoundError' }); });
+    expect(gone.ending).toEqual({ code: null, termination: { lost: dropped } });
+
+    // A stream that keeps dropping is not a pause: stop after a few reattaches.
+    let reattaches = 0;
+    const flapping = await run(async (pid) => { reattaches++; return { pid, wait: async () => { throw dropped; } }; });
+    expect(flapping.ending).toEqual({ code: null, termination: { lost: dropped } });
+    expect(reattaches).toBe(3);
+
+    // karmax closed it (turn over, world parking): never resume a paused world.
+    const closed = await run(async () => { throw new Error('must not reattach'); }, true);
+    expect(closed).toMatchObject({ ending: { code: null, termination: { lost: dropped } }, resumed: [] });
+  });
+
+  it('diagnoses a sandbox that ran out of memory from provider metrics', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const at = (time: string) => new Date(`2026-09-24T${time}Z`);
+    const mb = 2 ** 20;
+    let asked: { start?: Date; end?: Date } | undefined;
+    sandbox.getMetrics = async (options) => {
+      asked = options;
+      return [
+        { timestamp: at('04:55:00'), memUsed: 796 * mb, memTotal: 1983 * mb },
+        { timestamp: at('04:55:30'), memUsed: 1604 * mb, memTotal: 1983 * mb },
+        { timestamp: at('04:56:00'), memUsed: 1961 * mb, memTotal: 1983 * mb },
+      ];
+    };
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'memory', base: 'main' });
+    const now = at('04:56:50').getTime();
+    const diagnosis = await world.diagnose!({ since: at('04:50:43').getTime(), now });
+    expect(diagnosis?.summary).toBe('sandbox memory reached 1961 of 1983 MB (99%) at 04:56:00 UTC');
+    expect(asked?.end?.getTime()).toBe(now);
+
+    sandbox.getMetrics = async () => [{ timestamp: at('04:56:30'), memUsed: 900 * mb, memTotal: 1983 * mb }];
+    expect(await world.diagnose!({ since: at('04:50:43').getTime(), now })).toBeUndefined();
+    sandbox.getMetrics = async () => { throw new Error('metrics service unavailable'); };
+    expect(await world.diagnose!({ since: at('04:50:43').getTime(), now })).toBeUndefined();
+  });
 });
 
 function fakeSandbox(onKill: () => void): E2BSandboxLike {

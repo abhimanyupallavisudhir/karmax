@@ -9,9 +9,10 @@ npm run test:coverage   # same suite, instrumented (needs `npm i` once for @vite
 ## Coverage
 
 `npm run test:coverage` is opt-in — instrumenting a run that already boots real
-Temporal servers roughly doubles it. The config sets `all: true` deliberately: a
-module with no tests at all shows up at 0% rather than vanishing from the report,
-which is the gap worth seeing. Report lands in `coverage/index.html`.
+Temporal servers roughly doubles it. The config's `coverage.include` lists every
+source module deliberately: a module with no tests at all shows up at 0% rather
+than vanishing from the report, which is the gap worth seeing. Report lands in
+`coverage/index.html`.
 
 ## Why tests are heavy (and how it's kept safe)
 
@@ -52,6 +53,31 @@ These files need **no** Temporal server (fast, cheap, run them freely):
 
 These boot a Temporal dev server (heavier, one at a time):
 `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
+
+## CI
+
+CI (`.github/workflows/ci.yml`) splits the suite across parallel runners with
+Vitest's `--shard`; each runner still runs its files one at a time. The
+required `typecheck + tests` check passes only when the typecheck and every
+shard pass. To reproduce a failing shard, run the same slice locally:
+
+```bash
+npx vitest run --shard=2/5
+```
+
+A few files take minutes while most take under a second, so shards are
+balanced by each file's measured duration (`tests/durations.json`, via
+`tests/helpers/duration-sequencer.ts`) rather than by file count. A new file
+counts as a typical one until measured. After larger test changes, refresh the
+measurements from a green CI run:
+
+```bash
+gh run view <run-id> --log | npm run test:durations
+```
+
+No shard can finish faster than the slowest single file (`pipeline.test.ts`,
+about 6.5 minutes in CI). Adding a number to the `test` job's `shard` list helps
+only while the shards are well above that; past it, split the slowest file.
 
 ## The live-agent test
 

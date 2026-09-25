@@ -28,7 +28,7 @@ npm run reset                                 # wipe Temporal durable state + ka
 
 ## Testing rules (important)
 
-Integration test files each boot a **real** Temporal dev server + Worker (via `tests/helpers/harness.ts` — real Temporal, real git, mock agent). `vitest.config.ts` forces sequential single-process execution (`singleFork`, `fileParallelism: false`, `maxConcurrency: 1`) and the Worker is resource-capped in `src/temporal/worker.ts`. **Do not re-enable parallelism** — several concurrent Temporal servers + workers can exhaust RAM and freeze the machine.
+Integration test files each boot a **real** Temporal dev server + Worker (via `tests/helpers/harness.ts` — real Temporal, real git, mock agent). `vitest.config.ts` forces sequential single-process execution (`singleFork`, `fileParallelism: false`, `maxConcurrency: 1`) and the Worker is resource-capped in `src/temporal/worker.ts`. **Do not re-enable parallelism** — several concurrent Temporal servers + workers can exhaust RAM and freeze the machine. CI parallelizes across machines instead: it splits the files between runners with Vitest's `--shard`, each still sequential (see TESTING.md).
 
 - Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
 - Heavy files (boot a Temporal server, one at a time): `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.

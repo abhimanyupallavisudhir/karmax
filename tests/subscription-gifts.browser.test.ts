@@ -14,6 +14,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { FakeSubscriptionProvider, SubscriptionBillingService } from '../src/billing/subscriptions.js';
+import { IdentityService } from '../src/auth/identity.js';
 
 it('gifts, changes, and removes plans from the organization billing screen through the real API', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'subscription-gift-browser-'));
@@ -85,12 +86,15 @@ it('gifts, changes, and removes plans from the organization billing screen throu
 
 it('opens a purchased subscription from the profile and upgrades or cancels it in Subscription billing', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'subscription-management-browser-'));
+  const port = await findFreePortFrom(48830);
+  const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}` });
+  const user = await identity.createUser({ name: 'Billing owner', email: 'billing-owner@example.test', password: 'long-fixture-password' });
   const store = await Store.create(':memory:', { hosted: true });
-  const org = await store.createOrganization({ name: 'Purchased workspace', ownerUserId: 'me' });
+  const org = await store.createOrganization({ name: 'Purchased workspace', ownerUserId: user.id });
   const provider = new FakeSubscriptionProvider();
   const billing = new SubscriptionBillingService(store, provider, true);
   const checkout = await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'browser-purchase');
-  await store.recordPolicyAcceptance({ userId: 'me', organizationId: org.id, context: 'checkout', versions: {},
+  await store.recordPolicyAcceptance({ userId: user.id, organizationId: org.id, context: 'checkout', versions: {},
     checkoutSessionReference: checkout.checkoutSessionReference });
   let sequence = 100;
   const subscription = async (plan: 'individual' | 'team', cancel = false) => billing.handleWebhook(Buffer.from(JSON.stringify({
@@ -107,17 +111,21 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
   const worlds = new WorldRegistry(), tokens = new TokenAuthority();
   const client = { workflow: { getHandle: () => ({ query: async () => [] }) } } as any;
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: directory });
-  const gateway = await Gateway.create({ store, tokens, worlds, client, api, hosted: true,
+  const gateway = await Gateway.create({ store, tokens, worlds, client, api, hosted: true, identity,
     authorization: await AuthorizationService.create(store), subscriptions: billing,
     taskQueue: 'test', staticDir: path.resolve('web'), bus: new KarmaxBus(), contributions: new ContributionRegistry(),
     overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'subscription management browser test' } });
-  const server = await gateway.listen(await findFreePortFrom(48830));
+  const server = await gateway.listen(port);
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
   try {
     const page = await browser.newPage({ serviceWorkers: 'block' });
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     page.on('dialog', dialog => dialog.accept());
+    const login = await page.request.post(`${server.url}/api/auth/sign-in/email`, {
+      headers: { origin: server.url }, data: { email: user.email, password: 'long-fixture-password' },
+    });
+    expect(login.status()).toBe(200);
     await page.goto(`${server.url}/profile`);
     await page.locator('#profile-paid-subscriptions').getByText(org.name, { exact: true }).waitFor({ timeout: 10_000 }).catch(async error => {
       throw new Error(`${error.message}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
@@ -145,6 +153,7 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
   } finally {
     await browser.close();
     await server.close();
+    await identity.close();
     await store.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }

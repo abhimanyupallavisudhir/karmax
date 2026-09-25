@@ -238,12 +238,15 @@ export function isTransportError(error: unknown): boolean {
       const status = Number(structured.statusCode ?? structured.status);
       if ([408, 500, 502, 503, 504, 529].includes(status)) return true;
       if (/timeout/i.test(String(structured.name ?? ''))) return true;
+      // E2B's name for a ConnectRPC `unavailable` from the sandbox daemon; the
+      // sandbox is usually alive but stalled (task 349), else retries escalate.
+      if (structured.name === 'SandboxNotFoundError') return true;
       if (inspect(structured.cause) || inspect(structured.error) || inspect(structured.response)) return true;
       if (Array.isArray(structured.errors) && structured.errors.some(inspect)) return true;
     }
     const lc = String(value instanceof Error ? value.message : value ?? '').toLowerCase();
     return (
-      /connection (closed|error|refused|reset|terminated|timed? out)|socket hang ?up|network error|network is unreachable|no route to host|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|request(?:\s+[a-z-]+){0,3}\s+timed?\s*out|operation (?:timed?\s*out|(?:was )?aborted due to (?:a )?timeout)|tls handshake timeout|temporary failure in name resolution|unexpected eof|broken pipe|econnreset|econnrefused|etimedout|epipe|enetunreach|ehostunreach|eai_again|enotfound|\boverloaded\b|service unavailable|gateway timeout|upstream (?:connect )?error|internal server error|\bserver_error\b/.test(
+      /connection (closed|error|refused|reset|terminated|timed? out)|lost the connection|socket hang ?up|network error|network is unreachable|no route to host|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|request(?:\s+[a-z-]+){0,3}\s+timed?\s*out|operation (?:timed?\s*out|(?:was )?aborted due to (?:a )?timeout)|tls handshake timeout|temporary failure in name resolution|unexpected eof|broken pipe|econnreset|econnrefused|etimedout|epipe|enetunreach|ehostunreach|eai_again|enotfound|\boverloaded\b|service unavailable|gateway timeout|upstream (?:connect )?error|internal server error|\bserver_error\b/.test(
         lc,
       ) ||
       // Codex app-server reports a dropped connection as a reconnect banner. In

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
-import { it } from 'vitest';
+import { expect, it } from 'vitest';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { Gateway } from '../src/gateway/server.js';
 import { Store } from '../src/store/db.js';
@@ -56,16 +56,16 @@ it('unified app search and resource defaults work in the real gateway UI', async
  assert.equal((await store.getSettings(project.id,'payments')),undefined);
  assert.equal((await store.getSettings(project.id,'vault')),undefined);
  await projectBox.locator('.payment-budget').fill('10');await projectBox.locator('.resource-save').click();
- await page.waitForFunction(async projectId=>((await (await fetch(`/api/settings/project/${projectId}/payments`)).json()) as any).budget===1000,project.id);
+ // Poll the store: Playwright's waitForFunction does not await an async
+ // predicate, so a fetch-based wait there returns before the save lands.
+ await expect.poll(async()=>(await store.getSettings(project.id,'payments'))?.budget,{timeout:10_000}).toBe(1000);
  assert.equal((await store.getSettings(project.id,'payments'))!.cardIds,undefined);
 
  await projectBox.locator('.resource-vault').click();await page.locator('.vault-grant-all').uncheck();await page.locator('[data-vault-apply]').click();
  await projectBox.locator('[data-remove="card_demo"]').click();await projectBox.locator('.payment-budget').fill('0');
  await projectBox.locator('.resource-save').click();
- await page.waitForFunction(async projectId=>{const r=await fetch(`/api/settings/project/${projectId}/vault`);return ((await r.json()) as any).credentialGrants?.length===0;},project.id);
- assert.deepEqual((await store.getSettings(project.id,'vault'))!.credentialGrants,[]);
- await page.waitForFunction(async projectId=>{const r=await fetch(`/api/settings/project/${projectId}/payments`);return ((await r.json()) as any).budget===0;},project.id);
- assert.deepEqual((await store.getSettings(project.id,'payments'))!.cardIds,[]);
+ await expect.poll(async()=>(await store.getSettings(project.id,'vault'))?.credentialGrants,{timeout:10_000}).toEqual([]);
+ await expect.poll(async()=>await store.getSettings(project.id,'payments'),{timeout:10_000}).toMatchObject({budget:0,cardIds:[]});
  await projectBox.scrollIntoViewIfNeeded();await shot('02-project-empty-overrides');
  await projectBox.locator('.resource-reset').click();
  await page.waitForFunction(()=>(globalThis as any).document.querySelector('[data-resource-defaults="project"] .tf-vault-count')?.textContent==='1 selected');

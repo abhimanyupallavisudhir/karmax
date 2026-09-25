@@ -38,6 +38,8 @@ global.authorizationSection = () => '';
 global.taskRecord = () => ({ params: {} });
 global.TERMINAL_STAGES = ['done', 'cancelled'];
 global.taskPaymentsHtml = () => '';
+global.paymentsLiveKey = () => '';
+global.esc = String;
 eval(extractFn('parametersTab'));
 for (const view of [{ stage: 'do' }, { stage: 'done' }, { stage: 'merge', pointOfNoReturnPassed: true }]) {
   const tab = parametersTab(view);

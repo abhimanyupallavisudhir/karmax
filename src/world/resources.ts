@@ -454,10 +454,13 @@ export class ProjectResourceService {
       ...(Object.keys(refs).length ? { serviceEnvironmentHandles: refs } : {}) } };
   }
 
-  /** Environment defaults apply at the next open/turn boundary, including worlds
-   * created before the attachment. Never rematerialize snapshots or overwrite
-   * files here, and never revive a previously released/failed lease. */
-  private async refreshEnvironmentLeases(handle: WorldHandle): Promise<void> {
+  /** Project secrets reach worlds created before them: at the next open, and
+   * mid-turn through refresh(). A late file secret is recorded as a projection
+   * before it is written, so checkpoints and forks never capture it as output.
+   * Never rematerialize snapshots here, and never revive a previously
+   * released/failed lease. */
+  private async refreshSecretLeases(world: World): Promise<void> {
+    const handle = world.handle;
     const task = (await this.store.getTask(handle.id));
     const current = (await this.store.currentWorld(handle.id));
     const generation = handle.generation ?? 1;
@@ -467,12 +470,17 @@ export class ProjectResourceService {
     const project = (await this.store.getProject(task.projectId));
     if (!project) return;
     const existing = new Set((await this.store.listResourceLeases(handle.id, generation)).map((lease) => lease.attachmentId));
-    for (const attachment of (await this.store.listResourceAttachments(project.id))) {
-      if (attachment.organizationId !== project.organizationId || !isSecretLike(attachment)
-        || attachment.target.kind === 'path' || existing.has(attachment.id)) continue;
-      // Resolve before recording the lease: a transient broker failure must
-      // fail this open, but remain retryable on the next one.
-      this.resolveSecret(attachment, task.id);
+    const late = (await this.store.listResourceAttachments(project.id)).filter((attachment) =>
+      attachment.organizationId === project.organizationId && isSecretLike(attachment) && !existing.has(attachment.id));
+    // Resolve before recording anything: a transient broker failure must fail
+    // this open, but remain retryable on the next one.
+    for (const attachment of late) this.resolveSecret(attachment, task.id);
+    const projections = Object.fromEntries(late.flatMap((attachment) => attachment.target.kind === 'path'
+      ? [[attachment.id, { target: worldWorkingRelativePath(handle, attachment.target.path), access: attachment.access }]] : []));
+    if (Object.keys(projections).length)
+      world.handle = (await this.store.updateWorldMeta(handle, { resourceProjections: {
+        ...(current.meta?.resourceProjections as Record<string, unknown> | undefined), ...projections } })) as WorldHandle;
+    for (const attachment of late) {
       const lease = (await this.store.createResourceLease({ attachmentId: attachment.id, taskId: task.id,
         worldId: handle.id, worldGeneration: generation, access: attachment.access, state: 'active',
         sealedDriverRef: JSON.stringify({ driver: attachment.driver }) }));
@@ -482,25 +490,48 @@ export class ProjectResourceService {
     }
   }
 
-  /** Rehydrate path credentials after a park/resume and wrap environment
-   * credentials for this one access. Provider snapshots are scrubbed first. */
-  async prepare(world: World): Promise<World> {
-    (await this.refreshEnvironmentLeases(world.handle));
+  /** Write every leased file secret (`changedOnly`: only those whose target or
+   * value differs from what this process last wrote, so a running agent's own
+   * edits survive until the project value actually changes). */
+  private async writeSecretFiles(world: World, changedOnly: boolean): Promise<void> {
     for (const lease of (await this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment?.enabled || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
       const target = resourcePath(world.handle, attachment);
-      await world.writeFile(target, this.resolveSecret(attachment, lease.taskId));
+      const value = this.resolveSecret(attachment, lease.taskId);
+      const key = `${writtenPrefix(world.handle)}${attachment.id}`;
+      const digest = sha256(Buffer.from(`${target}\0${value}`));
+      if (changedOnly && this.writtenSecrets.get(key) === digest) continue;
+      await world.writeFile(target, value);
       await world.exec('chmod', ['600', target], { cwd: world.handle.root });
       await ensureWorldExcluded(world, target);
+      this.writtenSecrets.set(key, digest);
     }
+  }
+  private writtenSecrets = new Map<string, string>();
+
+  /** Rehydrate path credentials after a park/resume and wrap environment
+   * credentials for this one access. Provider snapshots are scrubbed first. */
+  async prepare(world: World): Promise<World> {
+    (await this.refreshSecretLeases(world));
+    (await this.writeSecretFiles(world, false));
     return (await this.withEnvironment(world));
+  }
+
+  /** Keep an already-running agent current with project settings: enroll
+   * secrets added since the world was opened, rewrite changed files, and
+   * return the work-command environment as it stands now. */
+  async refresh(world: World): Promise<Record<string, string>> {
+    (await this.refreshSecretLeases(world));
+    (await this.writeSecretFiles(world, true));
+    return (await this.environmentFor(world.handle));
   }
 
   async scrubSecrets(handle: WorldHandle, liveWorld?: World): Promise<void> {
     const world = liveWorld ?? await this.worlds.open(handle).catch(() => undefined);
     if (!world) return;
+    for (const key of this.writtenSecrets.keys()) if (key.startsWith(writtenPrefix(handle))) this.writtenSecrets.delete(key);
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (attachment?.target.kind === 'path' && isSecretLike(attachment))
@@ -1041,7 +1072,11 @@ export class ProjectResourceService {
 }
 
 class EnvironmentWorld implements World {
-  constructor(private inner: World, private env: Record<string, string>) {}
+  /** Present only when the inner world has it: its absence marks a local world. */
+  readonly diagnose?: World['diagnose'];
+  constructor(private inner: World, private env: Record<string, string>) {
+    if (inner.diagnose) this.diagnose = (window) => inner.diagnose!(window);
+  }
   withoutProjectEnvironment(): World { return this.inner.withoutProjectEnvironment?.() ?? this.inner; }
   get handle() { return this.inner.handle; }
   set handle(value: WorldHandle) { this.inner.handle = value; }
@@ -1267,6 +1302,7 @@ function copyGlobRepoNames(sources: string[]): string[] {
   });
 }
 function safePath(value: string): string { return worldRelativePath(value); }
+function writtenPrefix(handle: WorldHandle): string { return `${handle.id}\0${handle.generation ?? 1}\0`; }
 function sha256(value: Buffer): string { return crypto.createHash('sha256').update(value).digest('hex'); }
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
 

@@ -11,7 +11,7 @@ import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platform
 import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
-import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
+import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
 import {
@@ -26,11 +26,12 @@ import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './cust
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity, toolActivityDetail } from './activity.js';
 import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-homes.js';
-import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess,
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, type RemoteSpawnedProcess,
   syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 import { recoverClaudeToolInputs } from './claude-history.js';
 import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
+import { boundedStartupProbe } from './startup-diagnostics.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -89,7 +90,7 @@ export class ClaudeAdapter implements AgentAdapter {
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx, workEnvironment(input)), ...mcp.handlers };
+    const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
 
     const messages: any[] = [];
@@ -284,9 +285,10 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    const work = await claudeWorkEnvironment(input);
+    const work = await claudeWorkEnvironment(input, !!ctx.onSecretEnvChange);
+    const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAgentSdkProcess(input, ctx, work.settings); }
-    finally { await work.cleanup(); }
+    finally { unsubscribe?.(); await work.cleanup(); }
   }
 
   private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
@@ -315,8 +317,15 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     const { query, createSdkMcpServer, tool } = sdk;
     const zod = (await import('zod')).z;
-    const handlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
+    const handlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     const remote = isRemoteAgentWorld(runtimeWorld);
+    const startupAt = Date.now();
+    const startupActivity = async (phase: 'started' | 'updated' | 'completed', step: string) => {
+      await ctx.emitActivity?.({ id: 'claude-startup', kind: 'status', phase,
+        title: phase === 'completed' ? 'Agent connected' : 'Starting agent',
+        detail: JSON.stringify({ step, elapsedMs: Date.now() - startupAt, remote, resumed: !!input.session }) });
+    };
+    await startupActivity('started', 'prepare-auth');
     const configHome = input.resolvedAuth?.configHome;
     const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));
     // Rotate the canonical host credential before projecting it. Mid-turn
@@ -348,9 +357,14 @@ export class ClaudeAdapter implements AgentAdapter {
         throw error;
       }
     }
+    await startupActivity('updated', 'prepare-environment');
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session,
+        input.profile.mcpConnections === undefined ? undefined : 'none', step => startupActivity('updated', step)))
       : undefined;
+    // The SDK only sees a codeless exit when the sandbox stream drops; the
+    // process knows the agent may still be running there (task 348).
+    let remoteProcess: RemoteSpawnedProcess | undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and
     // the config-home stdio bridge were both registered as `karmax`; the SDK
@@ -566,6 +580,7 @@ export class ClaudeAdapter implements AgentAdapter {
         Math.max(0, (settleDeadline ?? Date.now()) - Date.now()));
     };
     const startupEnd = (await (await currentTiming())?.start('process.sdk-startup.opaque'));
+    await startupActivity('updated', 'sdk-handshake');
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -643,7 +658,7 @@ export class ClaudeAdapter implements AgentAdapter {
             const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env);
             Object.assign(remoteEnv, subscriptionAuthEnv);
             if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
-            return spawnRemoteAgentProcess({
+            remoteProcess = spawnRemoteAgentProcess({
               world: runtimeWorld,
               provider: 'claude',
               command: o.command,
@@ -651,7 +666,8 @@ export class ClaudeAdapter implements AgentAdapter {
               cwd: worldWorkingDirectory(runtimeWorld.handle),
               env: remoteEnv,
               signal: o.signal,
-            }) as any;
+            });
+            return remoteProcess as any;
           }
           const custody = createCustodyEnv({ ...o.env, ...subscriptionAuthEnv });
           const child = spawn(o.command, o.args, {
@@ -684,8 +700,25 @@ export class ClaudeAdapter implements AgentAdapter {
       },
     });
     let publishedSession = false;
+    let firstSdkEvent = true;
+    let startupDiagnosticCaptured = false;
+    const diagnoseStartup = async (reason: 'timeout' | 'error') => {
+      if (startupDiagnosticCaptured) return;
+      startupDiagnosticCaptured = true;
+      const at = Date.now();
+      const snapshot = remoteProcess ? await remoteProcess.startupDiagnostics() : { process: 'not-observed' };
+      await ctx.emitActivity?.({ id: 'claude-startup-diagnostics', kind: 'error', phase: 'failed',
+        title: reason === 'timeout' ? 'Agent startup stalled' : 'Agent startup failed',
+        detail: JSON.stringify({ version: 1, at, reason, elapsedMs: at - startupAt,
+          remote, resumed: !!input.session, ...snapshot }) });
+    };
     try {
-      for await (const message of iterator) {
+      for await (const message of withClaudeStartupDeadline<any>(iterator, onAbort, () => diagnoseStartup('timeout'))) {
+        if (firstSdkEvent) {
+          firstSdkEvent = false;
+          remoteProcess?.startupComplete();
+          await startupActivity('completed', 'first-sdk-event');
+        }
         (await startupEnd?.());
         (await (await currentTiming())?.markOnce('provider.first-event'));
         if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {
@@ -915,7 +948,12 @@ export class ClaudeAdapter implements AgentAdapter {
       // throws an AbortError. The workflow already handled the cancel, so swallow
       // it (return the partial output); rethrow anything else as a real failure.
       if (!ctx.signal?.aborted) {
+        if (firstSdkEvent) {
+          try { await boundedStartupProbe(() => diagnoseStartup('error'), 5000, undefined); }
+          catch { /* retain the original startup failure */ }
+        }
         if (e instanceof ProviderFailure) throw e;
+        if (remoteProcess?.lost) throw remoteProcess.lost;
         const message = e instanceof Error ? e.message : String(e);
         const classified = providerErrorFromMessage('claude', message);
         if (classified instanceof ProviderFailure || !(e instanceof Error)) throw classified;
@@ -937,6 +975,7 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
     if (!successfulResult) {
+      if (remoteProcess?.lost) throw remoteProcess.lost;
       throw new Error('Claude Agent SDK stream ended unexpectedly without a successful result event');
     }
     // Only a subtype=success result is a turn boundary. `delivered` = every message

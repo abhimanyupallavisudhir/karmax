@@ -13,7 +13,7 @@ import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnE
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
-import { World, WorldHandle, WorldKind, WorldSpec, worldWorkingDirectory } from '../world/types.js';
+import { World, WorldHandle, WorldKind, WorldSpec, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import {
@@ -149,7 +149,7 @@ async function acquireConfirmLock(key: string): Promise<() => void> {
  * messages are preserved verbatim for display, while provider failure metadata
  * rides in ApplicationFailure.details for account rotation and auto-resolve.
  */
-function classifyTurnError(err: unknown, provider?: Provider): Error {
+function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagnosis?: WorldDiagnosis }): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
   // Admission happens before a provider process exists. Temporal coordinator
@@ -175,6 +175,16 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
       ...(metadata ? { details: [metadata] } : {}),
     });
   }
+  // A remote sandbox's own metrics outrank any reading of the error text: a
+  // frozen sandbox fails with whatever the next provider call happens to say
+  // (tasks 348/349: an exit "-1", "Sandbox is probably not running anymore").
+  if (sandbox?.diagnosis) {
+    const { summary, memoryExhausted } = sandbox.diagnosis;
+    return ApplicationFailure.create({ type: 'agent-infra', nonRetryable: false, cause,
+      message: `${msg} — ${summary}${memoryExhausted ? '; a command in the sandbox likely used more memory than it has.' : '.'}` });
+  }
+  // The control plane's memory says nothing about a kill inside a sandbox.
+  if (sandbox && isResourceKill(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   // A signal-9/SIGKILL agent death is environmental, not a code bug (karmax#4):
   // classify it as retryable 'agent-infra' with an ACTIONABLE message — the raw
   // "terminated by signal SIGKILL" tells an operator nothing. Temporal re-runs the
@@ -184,6 +194,11 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
   if (isTransportError(err)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
+}
+
+function parseInterruption(value: string | undefined): WorldDiagnosis | undefined {
+  try { const parsed = value ? JSON.parse(value) : undefined; return typeof parsed?.summary === 'string' ? parsed : undefined; }
+  catch { return undefined; }
 }
 
 class AgentAdmissionInfrastructureError extends Error {
@@ -1640,6 +1655,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
+      const attemptStarted = Date.now();
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
@@ -1751,11 +1767,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // `messages` is replaced by the single continuation notice below, so the
           // delivered-boundary from the workflow no longer applies — send all of it.
           deliveredMessages = 0;
+          const interruption = turnSessionKey ? parseInterruption(await store.kvGet(`${turnSessionKey}:interruption`)) : undefined;
           messages = [
             {
               id: `retry-${actx.info.attempt}`,
               role: 'user',
-              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
+              text: interruption
+                // Tell the agent what broke, or it reruns the command that froze the sandbox.
+                ? `(This turn was interrupted mid-run: ${interruption.summary}.${interruption.memoryExhausted
+                  ? ' Keep memory-hungry commands (type checks, test suites, builds) within the memory `free -m` reports as available.' : ''}`
+                  + ' Continue from where you left off; if the work was already finished, restate the final result.)'
+                : '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
               ts: 0,
             },
           ];
@@ -2405,6 +2427,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const chosenMcp = profile.mcpConnections === undefined ? [] : await timed('tool.connection.prepare', () => prepareConnections(
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
+        let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2439,6 +2462,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // now, at the activity boundary. Keep application secrets separate
             // from runtime env so they cannot change model auth or startup.
             const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
+            // Project settings keep applying while the agent runs (a secret added
+            // after it started must reach the command it runs next), not only at
+            // the next world open.
+            const resources = deps.resources;
+            if (resources) pullSecretEnv = async () => ({
+              ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv });
             return {
               ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
               ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
@@ -2452,6 +2481,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
           // Dropping them cuts the single biggest events-table growth driver
@@ -2656,7 +2686,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : err;
         }
-        throw classifyTurnError(err, profile.provider);
+        const failure = classifyTurnError(err, profile.provider);
+        // Provider limits and policy rejections are authoritative; anything else
+        // in a remote world may be the sandbox's fault, which its metrics can show.
+        if (!world.diagnose || !(failure instanceof ApplicationFailure) || !['agent-error', 'agent-infra'].includes(failure.type ?? '')) throw failure;
+        const diagnosis = await world.diagnose({ since: attemptStarted }).catch(() => undefined);
+        if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
+        throw classifyTurnError(err, profile.provider, { diagnosis });
       } finally {
         if (usageAdmissionId && !usageAdmissionFinished) (await store.finishUsageAdmission(usageAdmissionId, false));
         await releaseSlot();

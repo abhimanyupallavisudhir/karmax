@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
-import type { World, WorldPty } from '../world/types.js';
+import type { World, WorldPty, WorldPtyTermination } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
 import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, prepareCodexHistory, selectCodexHistoryCopy } from './codex-history.js';
 import { atomicPrivateWrite, publishLocalCodexHistory } from './codex-history-files.js';
@@ -16,6 +16,7 @@ import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
+import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -24,6 +25,13 @@ const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? PINNED_CODEX_PA
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? PINNED_REMOTE_NODE_VERSION;
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? PINNED_REMOTE_NPM_VERSION;
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
+const MEMORY_GUARD = `${REMOTE_ROOT}/memory-guard.sh`;
+
+/** Ship the sandbox memory guard (src/agent/memory-guard.sh); every remote
+ * agent start launches it if it is not already running. */
+export async function installMemoryGuard(world: World): Promise<void> {
+  await world.writeFile(MEMORY_GUARD, fs.readFileSync(fileURLToPath(new URL('./memory-guard.sh', import.meta.url)), 'utf8'));
+}
 /** Current Codex treats refresh-token *presence* as the ChatGPT login marker,
  * even with fresh ID/access tokens. Remote worlds receive this inert value so
  * the real rotating credential remains exclusively host-owned. */
@@ -50,15 +58,17 @@ export interface RemoteAgentHome {
  * projection and withholds rotating refresh tokens, so parallel task worlds
  * cannot fork and revoke one shared login's token family. */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
-  session?: string, browserOverride?: 'none'): Promise<RemoteAgentHome> {
+  session?: string, browserOverride?: 'none', onStartupStep?: (step: string) => Promise<void>): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
+  await onStartupStep?.('prepare-runtime');
   const runtimeBin = await timed('bootstrap.node', () => ensureRemoteNode(world));
   if (provider === 'codex') await timed('bootstrap.quiesce', () => quiesceRemoteCodexHome(world, absolute));
   // A single-repo world's root is itself a checkout. Keep injected auth out of
   // `git add -A` without modifying the user's tracked .gitignore.
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
+  await onStartupStep?.('prepare-config');
   const existing = await timed('bootstrap.list-home', () => remoteHomeFiles(world, absolute));
   const files = configFiles(localHome, provider, session);
   const rollouts = files.filter(file => provider === 'codex' && codexRolloutIdentity(file.relative.split(path.sep).join('/')));
@@ -88,7 +98,11 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // Ordinary files have distinct paths and no live reader until startup. Rollout
   // publication reconciles shared session identity, so keep it serialized.
   const rolloutSet = new Set(rollouts);
-  await timed('bootstrap.seed-files', () => mapBatches(files.filter(file => !rolloutSet.has(file)), seed));
+  await Promise.all([
+    timed('bootstrap.seed-files', () => mapBatches(files.filter(file => !rolloutSet.has(file)), seed)),
+    // A safety net, not a requirement: never fail a turn over it.
+    installMemoryGuard(world).catch(() => undefined),
+  ]);
   for (const file of rollouts) await seed(file);
   // Retries may restore exclusively from the host after the source world has
   // been deleted. Repair prior duplicate copies here too, before Codex opens its
@@ -97,8 +111,10 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     await timed('bootstrap.reconcile-session', () => reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session));
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
+  await onStartupStep?.('prepare-browser');
   const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, runtimeBin)) : undefined;
   if (provider === 'codex') await timed('bootstrap.config', () => seedRemoteCodexConfig(world, localHome, home, browserMcp));
+  await onStartupStep?.('protect-config');
   const permissions = await world.exec('bash', ['-lc',
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
   if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
@@ -334,30 +350,43 @@ export function spawnRemoteAgentProcess(opts: {
   const home = opts.env[opts.provider === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR']!;
   const pidFile = path.posix.join(home, 'karmax-agent.pid');
   const stderr = path.posix.join(home, 'agent-stderr.log');
+  const startupTrace = path.posix.join(home, `startup-${crypto.randomUUID()}.log`);
+  // Separate per-spawn journal: a retry cannot overwrite the failed launch's
+  // milestones. All labels are constants; no arguments or environments enter it.
+  const trace = (phase: string) => `printf '{"phase":"${phase}","pid":%s,"at":%s}\\n' "$$" "$(date +%s)" >> ${quote(startupTrace)}`;
   const bakedExecutable = `/opt/karmax/bin/${opts.provider}`;
+  const packageSpec = executable.args[1] ?? '';
   const forwardedArgs = executable.args.slice(2);
-  const expectedVersion = executable.args[1]?.slice(executable.args[1]!.lastIndexOf('@') + 1) ?? '';
+  const expectedVersion = packageSpec.slice(packageSpec.lastIndexOf('@') + 1);
   // A user may keep an older E2B/Daytona template after upgrading Karmax. Only
   // use its baked CLI when it is the version paired with this control-plane
   // adapter; otherwise npx installs the matching package into the sandbox cache.
   const bakedMatches = `[ -x ${quote(bakedExecutable)} ] && ${quote(bakedExecutable)} --version 2>/dev/null | grep -Fq -- ${quote(expectedVersion)}`;
+  // `command` is a shell expression (the resolved "$bin"); args are quoted.
   const invocation = (command: string, args: string[]) => {
-    if (opts.provider !== 'claude') return [command, ...args].map(quote).join(' ');
+    if (opts.provider !== 'claude') return [command, ...args.map(quote)].join(' ');
     // World transports are PTYs, but Claude's stream-json/print mode requires
     // non-interactive stdin. This foreground relay gives the CLI a real pipe,
     // forwards termination, and leaves its stdout/stderr on the provider PTY.
     const relay = [
       "const { spawn } = require('node:child_process')",
+      `const trace = (phase, pid = process.pid, extra = {}) => { try { require('node:fs').appendFileSync(${JSON.stringify(startupTrace)}, JSON.stringify({ phase, pid, at: Math.floor(Date.now()/1000), ...extra }) + '\\n') } catch {} }`,
+      "trace('relay-started'); let received = false",
       "const child = spawn(process.argv[1], process.argv.slice(2), { env: process.env, stdio: ['pipe', 'inherit', 'inherit'] })",
-      "process.stdin.on('data', (data) => { const end = data.indexOf(4); if (end < 0) child.stdin.write(data); else { if (end) child.stdin.write(data.subarray(0, end)); child.stdin.end(); } })",
+      "child.on('spawn', () => trace('child-spawned', child.pid))",
+      "process.stdin.on('data', (data) => { if (!received) { received = true; trace('stdin-received') } const end = data.indexOf(4); if (end < 0) child.stdin.write(data); else { if (end) child.stdin.write(data.subarray(0, end)); trace('stdin-ended'); child.stdin.end(); } })",
       "process.stdin.on('end', () => child.stdin.end())",
       "for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))",
-      "child.on('error', (error) => { console.error(error); process.exitCode = 1 })",
-      "child.on('exit', (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
+      "child.on('error', (error) => { trace('child-error', process.pid, { code: error.code }); console.error(error); process.exitCode = 1 })",
+      "child.on('exit', (code, signal) => { trace('child-exited', child.pid, { exitCode: code }); if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
     ].join('; ');
-    return ['node', '-e', relay, command, ...args].map(quote).join(' ');
+    return [...['node', '-e', relay].map(quote), command, ...args.map(quote)].join(' ');
   };
-  const selectedCommand = `if ${bakedMatches}; then exec ${invocation(bakedExecutable, forwardedArgs)}; else exec ${invocation(executable.command, executable.args)}; fi`;
+  // Resolve the paired CLI through npx's cache, then exec it directly: running
+  // it *under* npx kept a ~150 MB npm process alive for the whole session.
+  const resolved = `npx --yes --package=${quote(packageSpec)} -c ${quote(`command -v ${opts.provider}`)}`;
+  const selectedCommand = `${trace('cli-version-check')}; if ${bakedMatches}; then bin=${quote(bakedExecutable)}; else ${trace('cli-resolve')}; bin=$(${resolved}) || exit 127; fi; `
+    + `${trace('cli-exec')}; exec ${invocation('"$bin"', forwardedArgs)}`;
   const commandLine = `sh -c ${quote(selectedCommand)}`;
   // Raw mode is required for the line-oriented JSON protocols: canonical PTYs
   // truncate single lines around MAX_CANON (~4 KiB). The sandbox-local pidfile
@@ -367,18 +396,23 @@ export function spawnRemoteAgentProcess(opts: {
   // the real E2B process stays alive but never receives JSON-RPC input.
   const shell = [
     'stty raw -echo',
+    `(umask 077; ${trace('shell-started')})`,
     `pidfile=${quote(pidFile)}`,
+    trace('previous-process-check'),
     `if [ -s "$pidfile" ]; then old=$(cat "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
     'printf \'%s\\n\' "$$" > "$pidfile"',
+    trace('previous-process-stopped'),
+    `guard=${quote(path.posix.join(opts.world.handle.root, MEMORY_GUARD))}; [ -f "$guard" ] && sh "$guard" start >/dev/null 2>&1`,
     // Assemble the sentinel at runtime. The PTY echoes this whole shell command
     // before `stty -echo` executes; embedding READY literally would make that
     // command echo open the protocol gate before `exec agent`, allowing Bash to
     // consume the JSON initialize line. The newline also forces prompt delivery
     // through provider PTY streams that coalesce partial output.
+    trace('protocol-ready'),
     "printf '\\036KARMAX_AGENT_%s\\036\\n' READY",
     `exec ${commandLine} 2>${quote(stderr)}`,
   ].join('; ');
-  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal, stderr);
+  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal, stderr, startupTrace);
 }
 
 export class RemoteSpawnedProcess extends EventEmitter {
@@ -388,6 +422,9 @@ export class RemoteSpawnedProcess extends EventEmitter {
   readonly pid = undefined;
   killed = false;
   exitCode: number | null = null;
+  /** Set when the provider stream ended without the process exiting. The
+   * ChildProcess contract has no such state, so adapters must check it. */
+  lost?: Error;
   private pty?: WorldPty;
   private ready: Promise<WorldPty>;
   private protocolGate: Promise<void>;
@@ -396,15 +433,25 @@ export class RemoteSpawnedProcess extends EventEmitter {
   private protocolReady = false;
   private finished = false;
   private finishing = false;
+  private startup = true;
+  private startedAt = Date.now();
+  private openedAt?: number;
+  private readyAt?: number;
+  private readBytes = 0;
+  private writesStarted = 0;
+  private writesCompleted = 0;
+  private sent = new StartupProtocolTrace();
+  private received = new StartupProtocolTrace();
 
   constructor(private world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal,
-    private stderrFile?: string) {
+    private stderrFile?: string, private startupTraceFile?: string) {
     super();
     this.protocolGate = new Promise<void>((resolve) => { this.openProtocolGate = resolve; });
     this.ready = world.openPty({ command, cwd, env, cols: 200, rows: 40 }).then((pty) => {
       this.pty = pty;
+      this.openedAt = Date.now();
       pty.onData((chunk) => this.onData(chunk));
-      pty.onExit((code) => this.finish(code));
+      pty.onExit((code, termination) => this.finish(code, termination));
       return pty;
     }).catch((error) => {
       const failure = error instanceof Error ? error : new Error(String(error));
@@ -420,7 +467,9 @@ export class RemoteSpawnedProcess extends EventEmitter {
     // the shell can consume JSON as its next command.
     this.stdin = new Writable({
       write: (chunk, _encoding, done) => {
-        Promise.all([this.ready, this.protocolGate]).then(([pty]) => pty.write(Buffer.from(chunk).toString())).then(() => done(), done);
+        if (this.startup) { this.writesStarted++; this.sent.read(Buffer.from(chunk).toString()); }
+        Promise.all([this.ready, this.protocolGate]).then(([pty]) => pty.write(Buffer.from(chunk).toString()))
+          .then(() => { if (this.startup) this.writesCompleted++; done(); }, done);
       },
       final: (done) => { Promise.all([this.ready, this.protocolGate]).then(([pty]) => pty.write('\x04')).then(() => done(), done); },
     });
@@ -433,6 +482,21 @@ export class RemoteSpawnedProcess extends EventEmitter {
     const abort = () => { this.kill('SIGTERM'); };
     if (signal?.aborted) abort();
     else signal?.addEventListener('abort', abort, { once: true });
+  }
+
+  /** Clear the bounded protocol buffers as soon as the SDK yields. */
+  startupComplete(): void { this.startup = false; this.sent.clear(); this.received.clear(); }
+
+  async startupDiagnostics(): Promise<Record<string, unknown>> {
+    const transport = { elapsedMs: Date.now() - this.startedAt, ptyOpened: this.openedAt !== undefined,
+      ptyOpenMs: this.openedAt === undefined ? undefined : this.openedAt - this.startedAt,
+      protocolReady: this.protocolReady, readyMs: this.readyAt === undefined ? undefined : this.readyAt - this.startedAt,
+      readBytes: this.readBytes, writesStarted: this.writesStarted, writesCompleted: this.writesCompleted,
+      exited: this.finishing, exitCode: this.exitCode, connectionLost: !!this.lost,
+      sentFrames: this.sent.snapshot(), receivedFrames: this.received.snapshot() };
+    const sandbox = this.startupTraceFile && this.stderrFile
+      ? await collectStartupProbe(this.world, this.startupTraceFile, this.stderrFile) : { status: 'unavailable' };
+    return { transport, sandbox };
   }
 
   async stop(): Promise<void> {
@@ -457,10 +521,17 @@ export class RemoteSpawnedProcess extends EventEmitter {
     return true;
   }
 
-  private async finish(code: number | null): Promise<void> {
+  private async finish(code: number | null, termination?: WorldPtyTermination | NodeJS.Signals | null): Promise<void> {
     if (this.finishing) return;
     this.finishing = true;
     this.exitCode = code;
+    // Tolerate providers that forward Node's exit(code, signal) verbatim.
+    const ending: WorldPtyTermination | undefined = typeof termination === 'string' ? { signal: termination }
+      : termination && typeof termination === 'object' ? termination : undefined;
+    const signal = ending && 'signal' in ending ? ending.signal : null;
+    if (ending && 'lost' in ending) this.lost = new Error(
+      `lost the connection to the agent in the sandbox; it may still be running there (${ending.lost.message})`,
+      { cause: ending.lost });
     this.openProtocolGate();
     // The protocol owns PTY stdout; native stderr is redirected to a file.
     // Recover a bounded tail before close so startup failures retain their cause.
@@ -473,12 +544,13 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.finished = true;
     this.stdout.end();
     this.stderr.end();
-    this.emit('exit', code, null);
-    this.emit('close', code, null);
+    this.emit('exit', code, signal);
+    this.emit('close', code, signal);
   }
 
   private onData(chunk: string): void {
-    if (this.protocolReady) { this.stdout.write(chunk); return; }
+    if (this.startup) this.readBytes += Buffer.byteLength(chunk);
+    if (this.protocolReady) { if (this.startup) this.received.read(chunk); this.stdout.write(chunk); return; }
     this.preamble += chunk;
     const marker = this.preamble.indexOf(READY);
     if (marker < 0) {
@@ -487,10 +559,11 @@ export class RemoteSpawnedProcess extends EventEmitter {
       return;
     }
     this.protocolReady = true;
+    this.readyAt = Date.now();
     this.openProtocolGate();
     const rest = this.preamble.slice(marker + READY.length);
     this.preamble = '';
-    if (rest) this.stdout.write(rest);
+    if (rest) { if (this.startup) this.received.read(rest); this.stdout.write(rest); }
   }
 }
 

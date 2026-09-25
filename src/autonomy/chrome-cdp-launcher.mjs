@@ -98,7 +98,9 @@ function runMcp(browserUrl) {
   const args = MCP_BIN ? [] : ['-y', `chrome-devtools-mcp@${VERSION}`];
   if (browserUrl) args.push('--browserUrl', browserUrl);
   args.push(...EXTRA);
-  const mcp = spawn(command, args, { stdio: 'inherit' });
+  // Usage statistics add a resident watchdog process (~80 MB, a real share of
+  // a 2 GB sandbox) and would report tenants' browser-tool use to Google.
+  const mcp = spawn(command, args, { stdio: 'inherit', env: { ...process.env, CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: '1' } });
   const forward = (sig) => { try { mcp.kill(sig); } catch { /* already gone */ } };
   process.on('SIGTERM', () => forward('SIGTERM'));
   process.on('SIGINT', () => forward('SIGINT'));

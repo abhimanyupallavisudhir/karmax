@@ -69,7 +69,7 @@ export interface PlatformToolContext {
   /** Stream incremental output to the task's live event log. */
   emit(text: string, source?: 'assistant' | 'tool'): void;
   /** Publish a structured provider item for the durable conversation timeline. */
-  emitActivity(activity: AgentActivity): void;
+  emitActivity(activity: AgentActivity): void | Promise<void>;
   /** Called as soon as the provider session id is known (mid-turn), so the task can
    *  publish it immediately — the drawer then shows a live "fork this agent" command
    *  WHILE the turn runs, not only after it ends (RESOLVE-PLAN #3). Fire-once per id. */
@@ -86,6 +86,10 @@ export interface PlatformToolContext {
    *  Undefined when there is no live channel (a resumed retry, or a unit test with no
    *  workflow) — the adapter then just runs the snapshot it was given. */
   pullFollowUps?: (fromIndex: number) => Promise<Message[]>;
+  /** Subscribe to project-secret changes during this turn (added, rotated or
+   *  disabled in project settings); `input.secretEnv` is already current when a
+   *  listener runs. Absent without a live channel. Returns the unsubscribe. */
+  onSecretEnvChange?(listener: () => void | Promise<void>): () => void;
 }
 
 export interface TurnInput {
@@ -118,7 +122,8 @@ export interface TurnInput {
   /** Environment-shaped project secrets and per-world service endpoints, resolved
    *  JIT from resource leases/credential handles. Available only to work commands,
    *  never to the harness runtime or model authentication. Values are never
-   *  stored in a world handle or Temporal history. */
+   *  stored in a world handle or Temporal history. The runtime keeps this record
+   *  current in place mid-turn: read it at use time, never cache a copy. */
   secretEnv?: Record<string, string>;
   /** MCP servers the workflow gives its agents, beyond the platform baseline (SPEC §7.5). */
   agentMcp?: import('../contrib/manifests.js').AgentMcpServer[];

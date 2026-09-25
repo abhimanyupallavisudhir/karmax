@@ -6,6 +6,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { ServiceConnections, ComposioBackend, type ConnectionBackend } from '../src/integrations/service-connections.js';
+import * as network from '../src/mcp/connections/http.js';
 
 describe('service connections', () => {
   let home: string, store: Store, broker: CredentialBroker, service: ServiceConnections;
@@ -149,6 +150,40 @@ describe('service connections', () => {
     await expect(service.configure('wrong-project-key')).rejects.toThrow('provider could not complete');
     expect(broker.resolve('service-connections:composio:api-key', { caps: ['use-credential:*'] })).toBe('project-key-private');
   });
+  it('allows a later task to use an existing account without signing in again', async () => {
+    const account = await connected('task_a');
+    const request = (await service.request(org, 'gmail', 'task_b', 'do', 'Read more mail'));
+    expect((await service.reusable(org, 'alice', 'gmail')).map(c => c.id)).toEqual([account]);
+    expect((await service.reusable(org, 'bob', 'gmail'))).toEqual([]);
+    await expect(service.connect(org, 'bob', { id: request.id, useConnectionId: account })).rejects.toThrow('another person');
+    const result = await service.connect(org, 'alice', { id: request.id, useConnectionId: account });
+    expect(result).toEqual({ connection: expect.objectContaining({ id: request.id, status: 'active', ownerId: 'alice' }) });
+    expect(backend.authorize).toHaveBeenCalledTimes(1);
+    // A grant is not an account: it is never offered for reuse or granted onward.
+    expect((await service.reusable(org, 'alice', 'gmail')).map(c => c.id)).toEqual([account]);
+    expect(await service.execute(org, request.id, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+    expect(backend.execute).toHaveBeenLastCalledWith('session-private', 'GMAIL_FETCH_EMAILS', {});
+    await expect(service.execute(org, account, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('not been shared');
+    await expect(service.execute(org, request.id, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('not been shared');
+    const resumed: string[] = [];
+    await service.reconcile(async c => { resumed.push(`${c.taskId}:${c.id}:${c.status}`); return true; });
+    expect(resumed).toContain(`task_b:${request.id}:active`);
+
+    // Revoking the grant leaves the account and its other users intact.
+    await service.disconnect(org, request.id, 'alice');
+    expect(backend.disconnect).not.toHaveBeenCalled();
+    await expect(service.execute(org, request.id, 'task_b', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('Reconnect');
+    expect(await service.execute(org, account, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).toMatchObject({ successful: true });
+
+    // Disconnecting the account ends every grant made from it.
+    const later = (await service.request(org, 'gmail', 'task_c', 'do', 'Read mail'));
+    await service.connect(org, 'alice', { id: later.id, useConnectionId: account });
+    await service.disconnect(org, account, 'alice');
+    expect((await service.get(org, later.id)).status).toBe('disconnected');
+    await expect(service.execute(org, later.id, 'task_c', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('Reconnect');
+    await expect(service.connect(org, 'alice', { id: (await service.request(org, 'gmail', 'task_d', 'do', 'x')).id, useConnectionId: account }))
+      .rejects.toThrow('not connected');
+  });
   it('detects revoked access before execution; reconnects without widening grants', async () => {
     const id = await connected(); vi.mocked(backend.active).mockResolvedValue(false);
     await expect(service.execute(org, id, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('expired');
@@ -198,4 +233,92 @@ it('uses Composio v3.1 with pinned accounts, disabled workbench, and no automati
     expect(calls[2]!.body).toMatchObject({ user_id: 'tenant-user', connected_accounts: { gmail: ['ca_one'] },
       manage_connections: { enable: false }, workbench: { enable: false }, toolkits: { enable: ['gmail'] } });
   } finally { vi.unstubAllGlobals(); }
+});
+
+describe('native MCP connections', () => {
+  let home: string, store: Store, service: ServiceConnections, org: string, project: string;
+  const listTools = vi.fn(async () => ({ tools: [
+    { name: 'search_emails', description: 'Search Gmail messages', inputSchema: { type: 'object' } },
+    { name: 'list_labels', description: 'List labels', inputSchema: { type: 'object' } }] }));
+  const callTool = vi.fn(async () => ({ content: [{ type: 'text', text: 'Fixture mail' }] }));
+  const open = vi.fn(async () => ({ listTools, callTool, close: async () => {} }) as any);
+  beforeEach(async () => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-service-connections-'));
+    store = (await Store.create(':memory:'));
+    org = (await store.createOrganization({ name: 'Team', ownerUserId: 'alice' })).id;
+    project = (await store.createProject('Project', {}, org)).id;
+    // No Composio key: native MCP connections must not depend on it.
+    service = new ServiceConnections(store, new CredentialBroker(new Vault(path.join(home, 'vault'))), () => { throw new Error('Composio used'); }, open);
+    vi.spyOn(network, 'publicStreamFetch').mockResolvedValue(new Response('', { status: 401 }));
+    vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
+      const req = new Request(input, init); const body = await req.text();
+      const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+      if (req.url.includes('oauth-protected-resource')) return json({ resource: 'https://mail.example/mcp', authorization_servers: ['https://auth.example'] });
+      if (req.url.includes('.well-known')) return json({ issuer: 'https://auth.example', authorization_endpoint: 'https://auth.example/authorize', token_endpoint: 'https://auth.example/token',
+        registration_endpoint: 'https://auth.example/register', response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] });
+      if (req.url.endsWith('/register')) return json({ ...JSON.parse(body), client_id: 'client' });
+      if (req.url.endsWith('/token')) return json({ access_token: 'access-secret', token_type: 'Bearer', refresh_token: 'refresh-secret', expires_in: 3600 });
+      if (req.url.startsWith('https://registry.modelcontextprotocol.io/')) return json({ servers: [
+        { server: { name: 'com.example/keyed', version: '1.0.0', remotes: [{ type: 'streamable-http', url: 'https://keyed.example/mcp', headers: [{ name: 'Authorization', isRequired: true, isSecret: true }] }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
+        { server: { name: 'com.example/local', version: '1.0.0', packages: [{ registryType: 'npm', identifier: 'local-mcp', version: '1.0.0', transport: { type: 'stdio' } }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
+        { server: { name: 'com.example/gmail', title: 'Example Gmail', version: '2.0.0', remotes: [{ type: 'streamable-http', url: 'https://mail.example/mcp' }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
+      ] });
+      throw new Error(`Unexpected request ${req.url}`);
+    });
+  });
+  afterEach(async () => { (await store.close()); fs.rmSync(home, { recursive: true, force: true }); vi.restoreAllMocks(); open.mockClear(); callTool.mockClear(); });
+
+  it('resolves registry servers the user can sign in to, and explains the rest', async () => {
+    expect(await service.resolveMcp('com.example/gmail')).toEqual({ transport: { type: 'http', url: 'https://mail.example/mcp' },
+      label: 'Example Gmail', registry: { name: 'com.example/gmail', version: '2.0.0' } });
+    await expect(service.resolveMcp('com.example/keyed')).rejects.toThrow('needs an API key');
+    await expect(service.resolveMcp('com.example/local')).rejects.toThrow('local process');
+    await expect(service.resolveMcp('com.example/missing')).rejects.toThrow('No MCP Registry server');
+    expect((await service.resolveMcp('https://mail.example/mcp')).label).toBe('mail.example');
+    await expect(service.resolveMcp('https://127.0.0.1/mcp')).rejects.toThrow('Private');
+  });
+
+  it('signs the owner in, calls tools for the task, and reuses the account for later tasks', async () => {
+    const server = await service.resolveMcp('com.example/gmail');
+    const request = (await service.requestMcp(org, server, 'task_a', 'do', 'Read my mail'));
+    expect(request).toMatchObject({ status: 'requested', label: 'Example Gmail', mcp: { url: 'https://mail.example/mcp', auth: 'oauth' } });
+    expect((await service.requestMcp(org, server, 'task_a', 'do', 'Read my mail')).id).toBe(request.id);
+    await expect(service.connect(org, 'alice', { id: request.id })).rejects.toThrow('public Tavya URL');
+    const started = await service.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' });
+    expect(started).toMatchObject({ callback: 'mcp', connection: { status: 'connecting' } });
+    const state = new URL(started.url!).searchParams.get('state')!;
+    expect(new URL(started.url!).origin).toBe('https://auth.example');
+    await expect(service.finishMcp(org, request.id, 'bob', state, 'code')).rejects.toThrow('owner');
+    await expect(service.execute(org, request.id, 'task_a', project, 'search_emails', {})).rejects.toThrow('Reconnect');
+    expect(await service.finishMcp(org, request.id, 'alice', state, 'code')).toMatchObject({ status: 'active' });
+
+    expect((await service.tools(org, request.id, 'task_a', project, 'search mail')).map(t => t.slug)).toEqual(['search_emails']);
+    expect(open).toHaveBeenLastCalledWith({ type: 'http', url: 'https://mail.example/mcp' }, { Authorization: 'Bearer access-secret' });
+    expect(await service.execute(org, request.id, 'task_a', project, 'search_emails', { query: 'invoice' })).toEqual({ content: [{ type: 'text', text: 'Fixture mail' }] });
+    expect(callTool).toHaveBeenCalledWith({ name: 'search_emails', arguments: { query: 'invoice' } }, undefined, { timeout: 60_000 });
+    await expect(service.execute(org, request.id, 'task_b', project, 'search_emails', {})).rejects.toThrow('not been shared');
+    const views = JSON.stringify([await service.list(org, { ownerId: 'alice' }), await service.list(org, { taskId: 'task_a', projectId: project })]);
+    for (const secret of ['access-secret', 'refresh-secret', state]) expect(views).not.toContain(secret);
+
+    const later = (await service.requestMcp(org, server, 'task_b', 'do', 'Read more mail'));
+    expect((await service.reusable(org, 'alice', later)).map(c => c.id)).toEqual([request.id]);
+    expect((await service.reusable(org, 'alice', 'gmail'))).toEqual([]);
+    await service.connect(org, 'alice', { id: later.id, useConnectionId: request.id });
+    expect(await service.execute(org, later.id, 'task_b', project, 'search_emails', {})).toMatchObject({ content: expect.any(Array) });
+
+    await service.disconnect(org, request.id, 'alice');
+    await expect(service.execute(org, later.id, 'task_b', project, 'search_emails', {})).rejects.toThrow('Reconnect');
+    await expect(service.execute(org, request.id, 'task_a', project, 'search_emails', {})).rejects.toThrow('Reconnect');
+  });
+
+  it('connects servers without authentication immediately and expires abandoned sign-ins', async () => {
+    vi.mocked(network.publicStreamFetch).mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    const open = (await service.requestMcp(org, await service.resolveMcp('https://open.example/mcp'), 'task_a', 'do', 'Public data'));
+    expect(open.mcp!.auth).toBe('none');
+    expect(await service.connect(org, 'alice', { id: open.id })).toEqual({ connection: expect.objectContaining({ status: 'active' }) });
+    const oauth = (await service.requestMcp(org, await service.resolveMcp('https://mail.example/mcp'), 'task_a', 'do', 'Mail'));
+    await service.connect(org, 'alice', { id: oauth.id, redirect: 'https://tavya.example/mcp-callback' });
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60_000);
+    expect((await service.refresh(org, oauth.id)).status).toBe('expired');
+  });
 });

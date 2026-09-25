@@ -38,6 +38,9 @@ const ICON = {
   chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
   project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  // Window controls: a matched pair, drawn on the same grid and stroke.
+  minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
+  close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
 const DEFAULT_EXPLANATION_SETTINGS = {
@@ -1165,6 +1168,9 @@ function wireResumeReauthorization(root, host) {
   root.dataset.reauthorizeHost = '';
   root.querySelectorAll('.af-resume-reauth[hidden]').forEach((option) => { option.hidden = false; });
   let stash = null;
+  // A re-wired host (its controls were re-rendered) replaces the listener.
+  root.reauthorizeWiring?.abort();
+  const wiring = root.reauthorizeWiring = new AbortController();
   root.addEventListener('af-reauthorize', (event) => {
     const { enabled, authorization, credentialGrantIds, credentialPolicies } = event.detail;
     const editor = host.editor();
@@ -1178,7 +1184,7 @@ function wireResumeReauthorization(root, host) {
       stash = null;
     } else return;
     host.changed?.();
-  });
+  }, { signal: wiring.signal });
 }
 
 function resumeUploadInner(upload) {
@@ -3535,7 +3541,7 @@ function renderOnboarding() {
     host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
       <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
       <span><b>Setup complete</b><small>All required steps are finished.</small></span>
-      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">×</button>
+      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">${ICON.close}</button>
     </div>`;
     $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
     return;
@@ -3565,7 +3571,10 @@ function renderOnboarding() {
   const optional = state.steps.optional || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
     <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Set up ${siteNameMarkup()}</h2></div>
-      <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
+      <div class="onboarding-controls">
+        <button class="icon-btn" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">${ICON.minimize}</button>
+        <button class="icon-btn" id="onboarding-close" type="button" aria-label="Close setup guide" title="Close · restart anytime from your profile">${ICON.close}</button>
+      </div></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
     <ol class="onboarding-list">
@@ -3576,11 +3585,11 @@ function renderOnboarding() {
       ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
       ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
-  $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
+  $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
 }
 
@@ -7123,15 +7132,24 @@ function restoreConversationScroll(thread, state) {
   if (Math.abs(delta) > 0.5) thread.scrollTop += delta;
 }
 
-// Retain the scroll container AND its ancestors in the document. Detaching and
-// reinserting a scroller interrupts native wheel/touch scrolling even if its
-// scrollTop is restored. Everything outside this path is freshly rendered.
+// Retain live nodes — the conversation scroller, an edited parameter form, and
+// the async-hydrated Parameters sections — in the document while everything
+// around them is re-rendered. Detaching one drops its focus, caret, native
+// wheel/touch scrolling and hydrated content (repainting "Loading…" on every
+// websocket push made those sections flicker). Everything else is fresh.
 function patchTaskPage(main, html) {
   // Native resizing changes the inline height without an input event. Capture
   // it synchronously, even if a refresh arrives before ResizeObserver runs.
   main.querySelectorAll('.followup-input').forEach((ta) => ta.disposeSizing?.());
   const template = document.createElement('template');
   template.innerHTML = html;
+  const pairs = [];
+  // A section keyed on the server state it was built from keeps its hydrated
+  // content and any unsaved edits until that state changes.
+  for (const fresh of template.content.querySelectorAll('[data-live-key]')) {
+    const old = document.getElementById(fresh.id);
+    if (old && main.contains(old) && old.dataset.liveKey === fresh.dataset.liveKey) pairs.push([old, fresh]);
+  }
   const oldParams = main.querySelector('#tp-params');
   const newParams = template.content.querySelector('#tp-params');
   if (oldParams && newParams && oldParams.dataset.renderKey === newParams.dataset.renderKey) {
@@ -7142,57 +7160,75 @@ function patchTaskPage(main, html) {
     // Dirty fields belong to the local editor, including transient empty input
     // that the stored-value serializer deliberately omits. Clean fields must
     // still pick up changes from another operator or new server defaults.
-    if (fields.every((f) => isParamDraftField(draft, f.name) || sameJson(current[f.name], incoming[f.name]))) {
-      patchTaskAncestors(main, oldParams, newParams);
-      return false;
-    }
+    if (fields.every((f) => isParamDraftField(draft, f.name) || sameJson(current[f.name], incoming[f.name]))) pairs.push([oldParams, newParams]);
   }
   const previous = main.querySelector('#ck-thread');
   const next = template.content.querySelector('#ck-thread');
-  const same = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
   next?.querySelectorAll('[data-conversation-key]').forEach((row) => { row.conversationMarkup = row.outerHTML; });
-  if (!same) {
+  const sameThread = previous && next && previous.dataset.taskId === next.dataset.taskId && previous.dataset.role === next.dataset.role;
+  if (sameThread) pairs.push([previous, next]);
+  const retained = retainedTaskNodes(main, template.content, pairs);
+  if (!retained) {
     if (previous) window.MathJax?.typesetClear?.([previous]);
     main.replaceChildren(template.content);
     return false;
   }
-  const oldRows = new Map([...previous.querySelectorAll('[data-conversation-key]')].map((row) => [row.dataset.conversationKey, row]));
-  const list = previous.querySelector('.thread');
-  let cursor = list.firstChild;
-  for (const fresh of [...next.querySelector('.thread').childNodes]) {
-    const old = fresh.nodeType === 1 ? oldRows.get(fresh.dataset.conversationKey) : null;
-    const row = old && !old.querySelector('#review-resources') && old.conversationMarkup === fresh.conversationMarkup ? old : fresh;
-    if (old && row !== old) {
-      // A running tool can gain output without closing details already opened.
-      const details = [...old.querySelectorAll('details')];
-      row.querySelectorAll('details').forEach((detail, i) => { if (details[i]) detail.open = details[i].open; });
-    }
-    if (row === cursor) cursor = cursor.nextSibling;
-    else list.insertBefore(row, cursor);
-  }
-  while (cursor) {
-    const nextSibling = cursor.nextSibling;
-    if (cursor.nodeType === 1) window.MathJax?.typesetClear?.([cursor]);
-    cursor.remove();
-    cursor = nextSibling;
-  }
-  patchTaskAncestors(main, previous, next);
-  return true;
+  if (sameThread) patchConversationRows(previous, next);
+  for (const [fresh, old] of retained.ancestors) patchChildren(old, fresh, retained.nodes);
+  return !!sameThread;
 }
 
-function patchTaskAncestors(main, previous, next) {
-  // Walk both ancestor paths upward, replacing siblings without moving the
-  // retained child. These wrappers contain layout only, with no event handlers.
-  let oldChild = previous, newChild = next;
-  while (oldChild !== main) {
-    const parent = oldChild.parentNode, freshParent = newChild.parentNode;
-    for (const node of [...parent.childNodes]) if (node !== oldChild) node.remove();
-    const siblings = [...freshParent.childNodes];
-    const index = siblings.indexOf(newChild);
-    for (const node of siblings.slice(0, index)) parent.insertBefore(node, oldChild);
-    for (const node of siblings.slice(index + 1)) parent.appendChild(node);
-    oldChild = parent; newChild = freshParent;
+// Map each fresh node to the live node it keeps: the retained nodes, and the
+// ancestors of each (layout wrappers only, with no event handlers), paired
+// level by level. Null when the two trees disagree about where one sits.
+function retainedTaskNodes(main, fragment, pairs) {
+  if (!pairs.length) return null;
+  const nodes = new Map(), ancestors = new Map();
+  for (const [old, fresh] of pairs) {
+    nodes.set(fresh, old);
+    let o = old, f = fresh;
+    while (o !== main) {
+      o = o.parentNode; f = f.parentNode;
+      if (!o || !f || (f === fragment) !== (o === main)) return null;
+      if (ancestors.has(f) && ancestors.get(f) !== o) return null;
+      ancestors.set(f, o);
+    }
   }
+  for (const [fresh, old] of ancestors) if (!nodes.has(fresh)) nodes.set(fresh, old);
+  for (const [fresh] of pairs) ancestors.delete(fresh); // a retained node keeps its own children
+  return { nodes, ancestors };
+}
+
+// Give `old` the children of `fresh`, substituting retained nodes. Stale nodes
+// go first, so a retained node already in order is never moved (moving
+// detaches it, which is exactly what retaining it avoids).
+function patchChildren(old, fresh, keep, onRemove) {
+  const children = [...fresh.childNodes];
+  const kept = new Set(children.map((child) => keep.get(child)).filter(Boolean));
+  for (const node of [...old.childNodes]) if (!kept.has(node)) { onRemove?.(node); node.remove(); }
+  let cursor = old.firstChild;
+  for (const child of children) {
+    const node = keep.get(child) || child;
+    if (node === cursor) cursor = cursor.nextSibling;
+    else old.insertBefore(node, cursor);
+  }
+}
+
+function patchConversationRows(previous, next) {
+  const oldRows = new Map([...previous.querySelectorAll('[data-conversation-key]')].map((row) => [row.dataset.conversationKey, row]));
+  const list = next.querySelector('.thread');
+  const keep = new Map();
+  for (const fresh of list.children) {
+    const old = oldRows.get(fresh.dataset.conversationKey);
+    if (!old) continue;
+    if (!old.querySelector('#review-resources') && old.conversationMarkup === fresh.conversationMarkup) keep.set(fresh, old);
+    else {
+      // A running tool can gain output without closing details already opened.
+      const details = [...old.querySelectorAll('details')];
+      fresh.querySelectorAll('details').forEach((detail, i) => { if (details[i]) detail.open = details[i].open; });
+    }
+  }
+  patchChildren(previous.querySelector('.thread'), list, keep, (node) => { if (node.nodeType === 1) window.MathJax?.typesetClear?.([node]); });
 }
 
 function renderTaskPage() {
@@ -7309,9 +7345,11 @@ function renderTaskPage() {
     wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
-    wireTaskAuthorization(v);
-    wireTaskPayments($('#tp-payments'), rec?.projectId || S.projectId, rec?.params?.paymentPolicy, v.taskId);
-    renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
+    const projectId = rec?.projectId || S.projectId;
+    wireLiveSection($('#tp-auth'), () => wireTaskAuthorization(v));
+    const payments = $('#tp-payments');
+    if (!wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId))) payments?.refreshSpent?.();
+    wireLiveSection($('#cred-editor-task'), (el) => renderCredentialEditor(el, 'task', { projectId, taskId: v.taskId }));
   }
   wireCopyButtons();
   // Restore the pre-render scroll offsets + focus so the box the user was working
@@ -7335,6 +7373,15 @@ function renderTaskPage() {
   const scroller = thread || newBody;
   const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
   if (scroller && shouldFocusTaskBody(main, document.activeElement, overlayOpen)) scroller.focus({ preventScroll: true });
+}
+
+// Hydrate a data-live-key section once; a retained one keeps its handlers and
+// content. False when the section was already wired (or is absent).
+function wireLiveSection(el, wire) {
+  if (!el || el.liveWired) return false;
+  el.liveWired = true;
+  wire(el);
+  return true;
 }
 
 // A text walker over the thread that ignores math (its raw `$…$` is replaced by
@@ -9379,10 +9426,22 @@ function parametersTab(v) {
   return `
     ${paramsSection(v)}
     ${authorizationSection(v)}
-    ${!taskRecord(v.taskId)?.params?.draft && (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) ? taskPaymentsHtml("tp-payments", true) : ''}
+    ${taskRecord(v.taskId)?.params?.draft ? '' : taskPaymentsHtml('tp-payments', paymentsLiveKey(v))}
     <div class="section-h">Codex/Claude</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Drag to reorder, toggle to disable — for this task only.</p>
-    <div id="cred-editor-task">Loading…</div>`;
+    <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
+}
+
+// The server state each async-hydrated Parameters section is built from (see
+// patchTaskPage): while it is unchanged, a refresh keeps the section as is.
+function authorizationLiveKey(taskId) {
+  const rec = taskRecord(taskId);
+  const organizationId = S.projects.find((project) => project.id === rec?.projectId)?.organizationId;
+  return JSON.stringify([taskId, rec?.params?._authorization || null,
+    S.projects.filter((project) => project.organizationId === organizationId).map((project) => project.id)]);
+}
+function paymentsLiveKey(v) {
+  return JSON.stringify([v.taskId, taskRecord(v.taskId)?.params?.paymentPolicy || null, ['done', 'cancelled', 'failed'].includes(v.status)]);
 }
 
 // Agent authorization + per-task vault grants — the same controls the task form
@@ -9400,7 +9459,7 @@ function authorizationSection(v) {
     level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
     projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) };
   return `<div class="section-h">Authorization</div>
-    <div id="tp-auth" class="parameter-fields">
+    <div id="tp-auth" class="parameter-fields" data-live-key="${esc(authorizationLiveKey(v.taskId))}">
       <div class="form-row" data-row="__authorization">
         <div class="label-row"><label>Authorization</label></div>
         ${authorizationEditorHtml('tp-authorization', selected, projects, rec?.projectId)}
@@ -9412,7 +9471,6 @@ function authorizationSection(v) {
           <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
         </button>
       </div>
-      ${taskPaymentsHtml("tp-payments", true)}
       <div class="params-save-bar" data-save-state="saved">
         <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
@@ -9471,6 +9529,9 @@ async function wireTaskAuthorization(v) {
       const updated = await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(submitted) });
       const currentRecord = taskRecord(v.taskId);
       if (currentRecord && updated?.params) currentRecord.params = updated.params;
+      // The section already shows what was saved; don't repaint it for that.
+      const section = select.closest('[data-live-key]');
+      if (section) section.dataset.liveKey = authorizationLiveKey(v.taskId);
       draft.saved = submitted;
       toast('Authorization saved — applies at the next agent turn');
       setTimeout(refreshTasks, 400);
@@ -12869,7 +12930,7 @@ async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
     const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
-    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'New private files are delivered when a task world is created.' : 'Changes apply on the next agent turn. Restart existing shells and servers to refresh their environment. Removing a secret does not erase it from running processes.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
+    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
         <div class="project-form-grid">
@@ -14907,7 +14968,7 @@ function connectionRows(connections, inTask = false) {
   return connections.map(c => {
     const own = c.ownerId === userId;
     const canConnect = !c.ownerId || own;
-    const status = { requested: 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
+    const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
     return `<div class="approval-request" data-connection="${esc(c.id)}">
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
@@ -14918,10 +14979,11 @@ function connectionRows(connections, inTask = false) {
           <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
-        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm primary" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : 'Connect'}${inTask ? ' for this task' : ''}</button>` : ''}
+        ${canConnect && c.status === 'requested' ? (c.reusable || []).map(account => `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(account.id)}" title="Use your connected ${esc(account.label)} account — no new sign-in">${c.reusable.length > 1 ? `Use ${esc(account.label)}` : 'Allow'}</button>`).join('') : ''}
+        ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
-        ${own && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
-        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
+        ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
       </div></div>`;
   }).join('');
 }
@@ -14936,9 +14998,24 @@ function wireConnectionActions(root, organizationId, refresh) {
     if (popup) popup.opener = null;
     button.disabled = true;
     try {
-      if (action === 'connect' || action === 'restart') {
+      if (action === 'allow') {
+        await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, useConnectionId: button.dataset.useConnection }) });
+        await refresh();
+      } else if (action === 'connect' || action === 'restart') {
         const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });
-        if (result.url) {
+        if (result.url && result.callback === 'mcp') {
+          // The MCP server returns to Tavya's callback page, which finishes sign-in for this connection.
+          const state = new URL(result.url).searchParams.get('state');
+          if (popup) {
+            popup.sessionStorage.setItem(`mcp-oauth:${state}`, JSON.stringify({ path: `/api/connections/${encodeURIComponent(id)}/callback${oq}`, popup: true, back: location.pathname }));
+            const channel = new BroadcastChannel(`mcp-oauth:${state}`);
+            const timeout = setTimeout(() => channel.close(), 600000);
+            channel.onmessage = async (event) => { if (event.data === 'connected') { clearTimeout(timeout); channel.close(); await refresh(); } };
+            popup.location.replace(result.url);
+            row.querySelector('[data-connection-result]').innerHTML = '<p class="task-sub">Finish signing in in the new tab. This task continues automatically.</p>';
+          } else row.querySelector('[data-connection-result]').innerHTML = '<p class="task-sub">Allow pop-ups, then click Connect again.</p>';
+          button.hidden = !!popup;
+        } else if (result.url) {
           if (popup) popup.location.href = result.url;
           row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
           button.hidden = true;
@@ -19429,7 +19506,8 @@ async function finishMcpCallback() {
   try {
     if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
     if (params.get('error')) throw new Error('Authorization was declined. You can try again in connection settings.');
-    await api(`/api/mcp/${pending.id}/callback${pending.query}`, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
+    const path = typeof pending.path === 'string' && pending.path.startsWith('/api/connections/') ? pending.path : `/api/mcp/${pending.id}/callback${pending.query}`;
+    await api(path, { method: 'POST', body: JSON.stringify({ state, code: params.get('code') }) });
     sessionStorage.removeItem(key);
     if (pending.popup) {
       const channel = new BroadcastChannel(`mcp-oauth:${state}`); channel.postMessage('connected'); channel.close();
@@ -19441,8 +19519,10 @@ async function finishMcpCallback() {
 }
 
 
-function taskPaymentsHtml(id, live = false) {
-  return `<div class="task-payments" id="${id}">
+// `liveKey` marks a running task's own payments (spent + save, see paymentsLiveKey).
+function taskPaymentsHtml(id, liveKey) {
+  const live = liveKey != null;
+  return `<div class="task-payments" id="${id}"${live ? ` data-live-key="${esc(liveKey)}"` : ''}>
     <label class="payment-cards-label" for="${id}-search">Cards</label>
     <div class="payment-picker mcp-combo"><div class="mcp-input-wrap"><div class="mcp-chips"></div>
       <input id="${id}-search" class="payment-search" role="combobox" aria-expanded="false" aria-controls="${id}-options" aria-autocomplete="list" autocomplete="off" placeholder="Loading…" disabled>
@@ -19486,7 +19566,12 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
     budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);
     input.disabled = budget.disabled = box.querySelector('.payment-caret').disabled = false;
     input.placeholder = 'Choose cards…';
-    if (live) box.querySelector('.payment-spent').textContent = `${usd(live.spent)} spent`;
+    if (live) {
+      box.querySelector('.payment-spent').textContent = `${usd(live.spent)} spent`;
+      // A retained section still follows spending recorded while it is open.
+      box.refreshSpent = () => api(`/api/tasks/${encodeURIComponent(taskId)}/payments`)
+        .then(({ spent }) => { box.querySelector('.payment-spent').textContent = `${usd(spent)} spent`; }).catch(() => {});
+    }
     function expand(open) { menu.hidden = !open; input.setAttribute('aria-expanded', String(open)); active = -1; input.removeAttribute('aria-activedescendant'); }
     function paint() {
       box.dataset.policy = JSON.stringify({ cardIds: [...selected] });
@@ -19536,6 +19621,10 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
           const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/payments`, { method: 'PUT', body: JSON.stringify(policy) });
           delete S.paymentEdits?.[taskId];
           box.querySelector('.payment-spent').textContent = `${usd(result.spent)} spent`;
+          // The box already shows what was saved; don't repaint it for that.
+          const rec = taskRecord(taskId);
+          if (rec) rec.params = { ...rec.params, paymentPolicy: policy };
+          if (S.view?.taskId === taskId) box.dataset.liveKey = paymentsLiveKey(S.view);
           toast(result.released.length ? 'Budget saved; pending payment approved' : 'Payments saved');
         } catch (e) { save.disabled = false; toast(e.message, true); }
       };

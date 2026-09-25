@@ -229,7 +229,7 @@ export class CodexAdapter implements AgentAdapter {
     (await (await currentTiming())?.mark('provider.selected', { provider: 'codex', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
     try {
-    const handlers = { ...platformToolHandlers(input.world, ctx, workEnvironment(input)), ...mcp.handlers };
+    const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     // Responses API function tools are flat ({type:'function', name, ...}).
     const tools = [...RESPONSES_API_TOOLS, ...mcp.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }))];
 
@@ -444,7 +444,7 @@ export class CodexAdapter implements AgentAdapter {
       : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
-    const platformHandlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
+    const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     let stderr = '';
     child.stderr?.on('data', (d: Buffer | string) => { stderr += d.toString(); });
 
@@ -557,7 +557,8 @@ export class CodexAdapter implements AgentAdapter {
     child.once('error', (e: Error) => { turnError = turnError ?? `codex app-server spawn error: ${String(e)}`; turnActive = false; client.close(); settleTurn?.(); });
     child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
       if (!shuttingDown && !turnError) {
-        turnError = `codex app-server connection closed unexpectedly (code ${code ?? -1}${signal ? `, signal ${signal}` : ''})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
+        turnError = child.lost?.message
+          ?? `codex app-server connection closed unexpectedly (${signal ? `signal ${signal}` : `code ${code ?? -1}`})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
       }
       turnActive = false;
       client.close();
@@ -747,6 +748,7 @@ export class CodexAdapter implements AgentAdapter {
       await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
+      if (remote) child.startupComplete();
       (await startupEnd?.());
       try {
         await timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000));
@@ -988,7 +990,7 @@ export class CodexAdapter implements AgentAdapter {
     // with `-c` overrides rather than by writing the leased config home: the socket path
     // is per-turn, and two concurrent turns sharing a home would clobber each other.
     // Values are JSON, which is valid TOML for strings and arrays.
-    const control = await startControlBridge(platformToolHandlers(input.world, ctx, workEnvironment(input)));
+    const control = await startControlBridge(platformToolHandlers(input.world, ctx, () => workEnvironment(input)));
     if (control) {
       const spec = controlMcpServerSpec(control);
       flags.push('-c', `mcp_servers.${CONTROL_SERVER_NAME}.command=${JSON.stringify(spec.command)}`);

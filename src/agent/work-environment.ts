@@ -19,18 +19,45 @@ export function workEnvironment(input: TurnInput): Record<string, string> {
 
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 
+/** Rewrites of a live work-environment file are serialized, atomic (a command
+ * never sources half a file), and never land after cleanup has removed it. */
+function liveFile(write: () => Promise<void>) {
+  let closed = false;
+  let pending: Promise<void> = Promise.resolve();
+  return {
+    update: () => (pending = pending.catch(() => {}).then(() => closed ? undefined : write())),
+    close: async () => { closed = true; await pending.catch(() => {}); },
+  };
+}
+
 /** Only a file path enters hook settings/history. The private export file stays
- * in the task's excluded injection directory and is deleted at turn end. */
-export async function claudeWorkEnvironment(input: TurnInput) {
-  const env = workEnvironment(input);
-  if (!Object.keys(env).length) return { settings: undefined, cleanup: async () => {} };
+ * in the task's excluded injection directory and is deleted at turn end.
+ * `live` installs it even while empty, so `update()` can deliver secrets that
+ * project settings gain mid-turn: the hook sources the file before every command. */
+export async function claudeWorkEnvironment(input: TurnInput, live = false) {
+  if (!live && !Object.keys(workEnvironment(input)).length)
+    return { settings: undefined, update: async () => {}, cleanup: async () => {} };
   const world = input.world.withoutProjectEnvironment?.() ?? input.world;
   const relative = `.karmax-injection/work-env/${crypto.randomUUID()}`;
   const directory = path.join(world.handle.root, relative);
   const file = path.join(directory, 'env.sh');
-  const content = Object.entries(env).map(([name, value]) => `export ${name}=${quote(value)}\n`).join('');
+  const content = () => Object.entries(workEnvironment(input)).map(([name, value]) => `export ${name}=${quote(value)}\n`).join('');
   const remote = isRemoteAgentWorld(world);
+  const write = async () => {
+    const next = `${relative}/env.sh.${crypto.randomUUID()}`;
+    if (remote) {
+      await world.writeFile(next, content());
+      const moved = await world.exec('bash', ['-c', 'chmod 600 "$1" && mv -f "$1" "$2"', 'karmax-work-env',
+        path.join(world.handle.root, next), file]);
+      if (moved.code !== 0) throw new Error('Could not protect work environment');
+    } else {
+      fs.writeFileSync(path.join(world.handle.root, next), content(), { mode: 0o600, flag: 'wx' });
+      fs.renameSync(path.join(world.handle.root, next), file);
+    }
+  };
+  const writes = liveFile(write);
   const cleanup = async () => {
+    await writes.close();
     if (remote) {
       const result = await world.exec('rm', ['-rf', '--', directory]);
       if (result.code !== 0) throw new Error('Could not remove temporary work environment');
@@ -41,13 +68,8 @@ export async function claudeWorkEnvironment(input: TurnInput) {
     if (remote) {
       const created = await world.exec('mkdir', ['-p', '-m', '700', directory]);
       if (created.code !== 0) throw new Error('Could not prepare private work environment');
-      await world.writeFile(`${relative}/env.sh`, content);
-      const protectedFile = await world.exec('chmod', ['600', file]);
-      if (protectedFile.code !== 0) throw new Error('Could not protect work environment');
-    } else {
-      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(file, content, { mode: 0o600, flag: 'wx' });
-    }
+    } else fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    await write();
   } catch (error) { await cleanup(); throw error; }
   // A source statement avoids copying secret values into Claude's persistent
   // shell snapshot. Native SessionStart hooks run on fresh, resume and fork.
@@ -55,7 +77,7 @@ export async function claudeWorkEnvironment(input: TurnInput) {
   const settings = { hooks: { SessionStart: [{ hooks: [{ type: 'command' as const,
     command: `printf '%s\\n' ${quote(source)} >> "$CLAUDE_ENV_FILE"`,
   }] }] } };
-  return { settings, cleanup };
+  return { settings, update: writes.update, cleanup };
 }
 
 /** The legacy CLI cannot receive per-thread JSON config over stdin. A unique,
@@ -74,18 +96,24 @@ export function codexWorkProfile(input: TurnInput) {
 }
 
 /** OpenCode can run its Bash tool inside the server instead of calling ACP
- * terminal/create. Its documented shell.env hook covers that path too. */
-export async function openCodeWorkEnvironment(input: TurnInput) {
-  const env = workEnvironment(input);
-  if (input.profile.provider !== 'opencode' || !Object.keys(env).length)
-    return { plugin: undefined, cleanup() {} };
+ * terminal/create. Its documented shell.env hook covers that path too, and
+ * re-reads env.json per command, so `update()` reaches the running agent. */
+export async function openCodeWorkEnvironment(input: TurnInput, live = false) {
+  if (input.profile.provider !== 'opencode' || (!live && !Object.keys(workEnvironment(input)).length))
+    return { plugin: undefined, update: async () => {}, cleanup() {} };
   const world = input.world.withoutProjectEnvironment?.() ?? input.world;
   const directory = path.join(world.handle.root, '.karmax-injection', 'work-env', crypto.randomUUID());
   if (typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const cleanup = () => fs.rmSync(directory, { recursive: true, force: true });
+  const write = async () => {
+    const next = path.join(directory, `env.json.${crypto.randomUUID()}`);
+    fs.writeFileSync(next, JSON.stringify(workEnvironment(input)), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(next, path.join(directory, 'env.json'));
+  };
+  const writes = liveFile(write);
+  const cleanup = () => { void writes.close(); fs.rmSync(directory, { recursive: true, force: true }); };
   try {
-    fs.writeFileSync(path.join(directory, 'env.json'), JSON.stringify(env), { mode: 0o600, flag: 'wx' });
+    await write();
     const file = path.join(directory, 'plugin.mjs');
     fs.writeFileSync(file, `import { readFileSync } from 'node:fs';
 export default async () => ({
@@ -94,6 +122,6 @@ export default async () => ({
   },
 });
 `, { mode: 0o600, flag: 'wx' });
-    return { plugin: pathToFileURL(file).href, cleanup };
+    return { plugin: pathToFileURL(file).href, update: writes.update, cleanup };
   } catch (error) { cleanup(); throw error; }
 }

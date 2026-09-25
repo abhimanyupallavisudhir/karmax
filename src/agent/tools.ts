@@ -241,8 +241,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: {} },
   },
   {
-    name: 'request_connection', description: 'Use the optional Composio fallback when no suitable native MCP connection is available. Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in this task and it resumes automatically after authorization. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
-    parameters: { type: 'object', properties: { toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['toolkit', 'why'] },
+    name: 'request_connection', description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    parameters: { type: 'object', properties: { mcp: { type: 'string' }, toolkit: { type: 'string' }, why: { type: 'string' } }, required: ['why'] },
   },
   {
     name: 'search_connection_tools', description: 'Search tools and input schemas for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
@@ -876,7 +876,8 @@ export const SDK_CONTROL_TOOL_SCHEMAS: ToolSchema[] = PLATFORM_TOOL_SCHEMAS.filt
 export function platformToolHandlers(
   world: World,
   ctx: PlatformToolContext,
-  workEnv?: Record<string, string>,
+  /** Read per command: project secrets can change mid-turn. */
+  workEnv?: () => Record<string, string>,
 ): Record<string, (args: any) => Promise<string>> {
   const platformRequest = (method: string, requestPath: string, body?: unknown) => {
     if (!ctx.platformRequest) throw new Error('karmax gateway is unavailable to this agent');
@@ -885,7 +886,8 @@ export function platformToolHandlers(
   const handlers: Record<string, (args: any) => Promise<string>> = {
     async bash(args) {
       const cmd = String(args?.command ?? '');
-      const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000, ...(workEnv ? { env: workEnv } : {}) });
+      const env = workEnv?.();
+      const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000, ...(env ? { env } : {}) });
       ctx.emit(`$ ${cmd}`);
       const out = `exit ${r.code}\n${r.stdout}${r.stderr}`;
       return truncate(out);
@@ -1010,7 +1012,7 @@ export function platformToolHandlers(
       }));
     },
     async list_connections() { return JSON.stringify(await platformRequest('GET', '/api/connections')); },
-    async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { toolkit: args?.toolkit, why: args?.why })); },
+    async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { mcp: args?.mcp, toolkit: args?.toolkit, why: args?.why })); },
     async search_connection_tools(args) { return JSON.stringify(await platformRequest('GET', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/tools?search=${encodeURIComponent(String(args?.search ?? ''))}`)); },
     async execute_connection_tool(args) { return JSON.stringify(await platformRequest('POST', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/execute`, { tool: args?.tool, arguments: args?.arguments })); },
     async list_credentials() {

@@ -1,4 +1,8 @@
-export type HostedOnboardingDisplay = 'expanded' | 'minimized';
+/** `closed` hides the guide until the user restarts the walkthrough. */
+export type HostedOnboardingDisplay = 'expanded' | 'minimized' | 'closed';
+
+export const parseHostedOnboardingDisplay = (value: unknown): HostedOnboardingDisplay =>
+  value === 'minimized' || value === 'closed' ? value : 'expanded';
 
 export interface HostedOnboardingFacts {
   github: boolean;
@@ -26,7 +30,7 @@ export function parseHostedOnboardingRecord(raw: string | undefined): HostedOnbo
     const value = JSON.parse(raw) as Partial<HostedOnboardingRecord>;
     return {
       ...(value.replay === true ? { replay: true } : {}),
-      display: value.display === 'minimized' ? 'minimized' : 'expanded',
+      display: parseHostedOnboardingDisplay(value.display),
       ...(Number.isFinite(value.completedAt) ? { completedAt: Number(value.completedAt) } : {}),
     };
   } catch {
@@ -45,7 +49,7 @@ export function hostedOnboardingStatus(input: {
   return {
     organizationId: input.organizationId,
     eligible: input.hosted && Boolean(input.record),
-    visible: input.hosted && Boolean(input.record) && !complete,
+    visible: input.hosted && Boolean(input.record) && !complete && input.record?.display !== 'closed',
     complete,
     replay: input.record?.replay === true,
     display: input.record?.display ?? 'expanded' as HostedOnboardingDisplay,

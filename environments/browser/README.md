@@ -45,7 +45,12 @@ agents, then runs a real render/screenshot smoke test. It prints the template an
 build IDs. Select the verified template only after the runtime changes supporting
 the baked Node pair and E2B browser working directory have deployed. Building does
 not change any organization or project selector. The template uses 2 CPUs and
-2048 MiB; compare cost as well as latency with the current provider plan.
+2048 MiB; compare cost as well as latency with the current provider plan. The
+agent, Chrome and its MCP server use about 0.6 GiB of that, so a project whose
+type check or tests need more than ~1.2 GiB should select a larger variant built
+with `KARMAX_E2B_MEMORY_MB=4096` (E2B's own default size; about $0.03 more per
+running sandbox-hour). A sandbox memory guard kills the largest command before a
+2 GiB sandbox freezes, but it cannot make the work fit.
 
 Desktop worlds deliberately use each provider's desktop machinery: E2B's
 `desktop` template through `@e2b/desktop`, and Daytona Computer Use on Daytona's

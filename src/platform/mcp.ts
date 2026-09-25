@@ -581,8 +581,8 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     description: 'List app accounts explicitly shared with this task or project. Prefer these connections to requesting passwords. Tokens stay server-side.', inputSchema: {},
   }, async () => wrap(async () => (await ops.platformRequest('GET', '/api/connections'))));
   server.registerTool('request_connection', {
-    description: 'Use the optional Composio fallback when no suitable native MCP connection is available. Request sign-in to an app (Composio toolkit slug, e.g. gmail, googlecalendar, slack). A Connect button appears in the task; it resumes automatically after authorization. Continue independent work, but do not finish the task while the connection is pending. Reuse connected accounts from list_connections.',
-    inputSchema: { toolkit: z.string(), why: z.string() },
+    description: 'Request access to an app for this task. Prefer a native MCP server: pass mcp as its MCP Registry name (e.g. com.example/gmail, find one with GET /api/mcp/registry?search=) or its public HTTPS URL. Use toolkit (a Composio slug such as gmail or googlecalendar) only as the fallback when no suitable remote MCP server exists. The user allows an account they already connected or signs in; a Connect button appears in this task and it resumes automatically. Continue independent work, but do not finish while the connection is pending. Reuse accounts from list_connections.',
+    inputSchema: { mcp: z.string().optional(), toolkit: z.string().optional(), why: z.string() },
   }, async a => wrap(async () => (await ops.platformRequest('POST', '/api/connections/request', a))));
   server.registerTool('search_connection_tools', {
     description: 'Search the tools and input schemas available for a connected account. Use the exact returned tool slug and schema with execute_connection_tool.',
