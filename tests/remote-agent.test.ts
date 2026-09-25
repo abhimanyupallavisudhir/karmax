@@ -10,7 +10,7 @@ import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSessi
   reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL, installMemoryGuard,
   spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
-import { isTransportError } from '../src/agent/limits.js';
+import { classifyProviderTurnError, isTransportError, ProviderOutage } from '../src/agent/limits.js';
 import type { World, WorldPty, WorldPtySpec, WorldPtyTermination } from '../src/world/types.js';
 
 const codexIdToken = (expiresAt: number) =>
@@ -654,6 +654,41 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     }));
   });
 
+  // 2026-09-25 (openai/codex#48237): chatgpt.com rejected every model request
+  // from ChatGPT logins with 401 invalid_api_key, while those logins still
+  // refreshed and read their account. Parking the login as broken and asking a
+  // person to sign in again could not help; the outage had to be waited out.
+  it('reports a model rejection after a verified host refresh as a provider outage, not a dead login', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-outage-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
+    const usageStub = path.join(localHome, 'usage-stub.cjs');
+    fs.writeFileSync(usageStub, `#!/usr/bin/env node
+const readline = require('readline');
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') send({ id: request.id, result: {} });
+  else if (request.method === 'account/read') send({ id: request.id, result: { account: { type: 'chatgpt' } } });
+  else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: { rateLimits: {} } });
+});`);
+    fs.chmodSync(usageStub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
+    const world = fakeWorld(true, false, 2);
+
+    const failure = await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world, messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity() {}, platformRequest: async () => [{ type: 'ok' }] } as any).catch(error => error);
+
+    expect(failure).toBeInstanceOf(ProviderOutage);
+    expect(classifyProviderTurnError(failure).classification.limited).toBe(false);
+    expect(isTransportError(failure)).toBe(true);
+    expect(failure.message).toMatch(/OpenAI/);
+    expect(failure.message).not.toMatch(/sign in again/i);
+    expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
+  });
+
   it('refreshes an expired canonical ID token before seeding a remote Codex process', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-preflight-'));
     const expiredIdToken = codexIdToken(Date.now() - 60_000);
@@ -740,7 +775,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   });
 });
 
-function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = false): World & {
+function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolean | number = false): World & {
   files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
 } {
   const files = new Map<string, Buffer>();
@@ -837,13 +872,18 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
               turnStarts++;
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
-              if (expireFirstTurn && turnStarts === 1) {
+              if (turnStarts <= Number(expiredTurns)) {
                 // Current Codex can preserve this only on the failed terminal
-                // turn, not as a separate structured `error` notification.
+                // turn, not as a separate structured `error` notification. A
+                // retry reproduces what a sandbox reported on 2026-09-25 once its
+                // inert refresh marker could not recover a model-side 401.
                 send({ method: 'turn/completed', params: { turn: {
-                  id: 'remote-turn', status: 'failed', error: {
+                  id: 'remote-turn', status: 'failed', error: turnStarts === 1 ? {
                     message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, request id: req_remote_expired',
                     codexErrorInfo: 'other',
+                  } : {
+                    message: 'Your access token could not be refreshed. Please log out and sign in again.',
+                    codexErrorInfo: 'unauthorized',
                   },
                 } } });
                 continue;

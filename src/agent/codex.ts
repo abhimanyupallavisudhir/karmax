@@ -25,6 +25,7 @@ import {
   providerFailure,
   providerFailureDisplay,
   ProviderFailure,
+  ProviderOutage,
   ProviderPolicyFailure,
   isProviderPolicyRejection,
   type ProviderFailureMetadata,
@@ -216,7 +217,19 @@ export class CodexAdapter implements AgentAdapter {
         id: 'codex-credential-recovery', kind: 'status', phase: 'completed',
         title: 'Refreshed Codex access token; resuming turn',
       });
-      return this.runCodexAppServer({ ...input, ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx);
+      try {
+        return await this.runCodexAppServer({ ...input, ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx);
+      } catch (retryError) {
+        // The host just refreshed this login and read its account with the new
+        // token, so a model request still rejected with a credential error is
+        // OpenAI's fault, not the login's. On 2026-09-25 chatgpt.com answered
+        // every ChatGPT login with 401 invalid_api_key (openai/codex#48237);
+        // the sandbox could only report that its inert refresh marker failed.
+        if (ctx.signal?.aborted || !isRecoverableRemoteCodexCredentialFailure(retryError)) throw retryError;
+        throw new ProviderOutage('OpenAI is rejecting Codex model requests even though this ChatGPT login is valid '
+          + '(it refreshed and read its account just now). This is an OpenAI-side outage; Karmax will keep retrying.',
+          { cause: retryError });
+      }
     }
   }
 

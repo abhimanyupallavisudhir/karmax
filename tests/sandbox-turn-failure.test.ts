@@ -6,6 +6,7 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import type { WorldDiagnosis } from '../src/world/types.js';
 import { withClaudeStartupDeadline } from '../src/agent/sdk-stream.js';
+import { providerFailure, ProviderOutage } from '../src/agent/limits.js';
 
 /**
  * Tasks 348 and 349 escalated to a human because a sandbox frozen by memory
@@ -134,6 +135,16 @@ describe('sandbox-caused turn failures', () => {
 
   it('treats an unreachable sandbox as retryable even without metrics', async () => {
     const failure = Object.assign(new Error('Sandbox is probably not running anymore'), { name: 'SandboxNotFoundError' });
+    const { error } = await failTurn(failure, undefined);
+    expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false, message: failure.message });
+  });
+
+  // A login the provider has just proven valid must never be parked for a
+  // person to sign in again: that cannot fix an outage (2026-09-25).
+  it('retries a provider outage as infrastructure instead of parking the login', async () => {
+    const rejected = providerFailure('Codex credential rejected', { kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: { code: 'unauthorized', status: 401 } });
+    const failure = new ProviderOutage('OpenAI is rejecting Codex model requests even though this ChatGPT login is valid', { cause: rejected });
     const { error } = await failTurn(failure, undefined);
     expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false, message: failure.message });
   });
