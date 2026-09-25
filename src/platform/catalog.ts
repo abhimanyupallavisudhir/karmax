@@ -93,7 +93,7 @@ export const PLATFORM_API_CATALOG = {
   organizations: [
     'GET /api/organization-directory (verified user subject; names only, public or member organizations; operator sees all; does not grant resource access)',
     'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
-    'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display preference)',
+    'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display: expanded|minimized|closed)',
     'POST /api/user/onboarding/reset (restart the signed-in user’s hosted walkthrough in each organization)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     'GET|PUT /api/settings/installation (global operator-only installation identity; PUT body {siteName})',
