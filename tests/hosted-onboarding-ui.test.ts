@@ -12,7 +12,7 @@ describe('hosted onboarding UI', () => {
       'Connect GitHub',
       'Add agent logins',
       'Add an E2B or Daytona API key',
-      'Connect apps, and add payments and a payment card',
+      'Connect apps and payment cards',
       'Buy paid plan',
       'Create your first project',
     ];
@@ -28,11 +28,17 @@ describe('hosted onboarding UI', () => {
     expect(view).toContain('#settings-agents');
     expect(view).toContain('#settings-compute');
     expect(view).toContain('#settings-payments');
-    expect(view).toContain('#settings-connections');
     expect(view).toContain('#settings-plan');
     expect(view).toContain('Manage E2B/Daytona');
     expect(view).toContain("key === 'paidPlan'");
     expect(view).toContain("addEventListener('click', newProject)");
+  });
+
+  it('gives the optional apps-and-cards step a single action', () => {
+    const step = view.slice(view.indexOf("onboardingStep(4, 'optional'"), view.indexOf("onboardingStep(5,"));
+    expect(step.match(/class="btn sm/g)).toHaveLength(1);
+    expect(step).toContain('#settings-payments');
+    expect(step).not.toContain('onboarding-actions');
   });
 
   it('loads the newly created organization’s onboarding state before repainting the shell', () => {
