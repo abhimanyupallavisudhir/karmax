@@ -95,20 +95,33 @@ describe('public landing page', () => {
     expect(css).not.toMatch(/\.landing-checks[^-]/);
   });
 
-  it('defaults to the dark theme and lets visitors switch to light with the console preference', () => {
+  it('follows the system theme until the visitor pins one, sharing the console preference', () => {
     const { html } = renderLandingMarkup();
     expect(html).toContain('id="landing-theme"');
+    const helpers = app.slice(app.indexOf('function landingTheme()'), app.indexOf('function renderLanding()'));
+    const theme = (pinned: string | null, systemLight: boolean) => {
+      const attrs: Record<string, string> = pinned ? { 'data-theme': pinned } : {};
+      const stored: Record<string, string> = {};
+      const button = { title: '', label: '', setAttribute(_: string, value: string) { this.label = value; } };
+      const api = new Function('document', 'window', 'localStorage', `${helpers}; return { landingTheme, toggleLandingTheme };`)(
+        { documentElement: { getAttribute: (key: string) => attrs[key] ?? null, setAttribute: (key: string, value: string) => { attrs[key] = value; } } },
+        { matchMedia: (query: string) => ({ matches: query === '(prefers-color-scheme: light)' && systemLight }) },
+        { setItem: (key: string, value: string) => { stored[key] = value; } });
+      const before = api.landingTheme();
+      api.toggleLandingTheme(button);
+      return { before, after: attrs['data-theme'], stored: stored['karmax-theme'], label: button.label };
+    };
+    expect(theme(null, true)).toEqual({ before: 'light', after: 'dark', stored: 'dark', label: 'Switch to light theme' });
+    expect(theme(null, false)).toEqual({ before: 'dark', after: 'light', stored: 'light', label: 'Switch to dark theme' });
+    expect(theme('dark', true).before).toBe('dark');
+    expect(theme('light', false).before).toBe('light');
+    // Tokens resolve against the colour scheme: system by default, pinned by data-theme.
     const base = css.slice(css.indexOf('.landing-page {'), css.indexOf('}', css.indexOf('.landing-page {')));
-    expect(base).toContain('--l-bg: #0e1015');
-    expect(css).toContain('html[data-theme="light"] .landing-page {');
-    expect(css).toContain('body.landing-active { color-scheme: dark;');
-    expect(app).toContain("localStorage.setItem('karmax-theme', next)");
-    // First paint already matches for signed-out visitors, never for signed-in ones.
-    const index = fs.readFileSync(path.resolve('web/index.html'), 'utf8');
-    expect(index).toContain("localStorage.getItem('karmax-theme') !== 'light' && !localStorage.getItem('karmax-signed-in')");
-    expect(css).toContain('html.landing-boot body:not(:has(#app > *))');
-    expect(app).toContain("if (signedOut) localStorage.removeItem('karmax-signed-in');");
-    // The landing ignores the console's blue/serif leftovers and uses its tokens.
+    expect(base).toContain('color-scheme: light dark;');
+    expect(base).toContain('--l-bg: light-dark(#f6f7f9, #0e1015);');
+    expect(css).toContain('html[data-theme="light"] :is(body.landing-active, .landing-page) { color-scheme: light; }');
+    expect(css).toContain('html[data-theme="dark"] :is(body.landing-active, .landing-page) { color-scheme: dark; }');
+    // The landing ignores the old blue/serif palette and uses the console's tokens.
     expect(css).not.toContain('--land-');
   });
 

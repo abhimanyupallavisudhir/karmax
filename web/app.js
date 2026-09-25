@@ -2697,10 +2697,6 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
   }
   const session = await (await feedbackFetch('/api/session')).json();
-  const signedOut = session.authRequired && !session.authenticated && !session.token;
-  // Read by index.html before first paint (see landing-boot).
-  if (signedOut) localStorage.removeItem('karmax-signed-in');
-  else localStorage.setItem('karmax-signed-in', '1');
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -2711,7 +2707,7 @@ async function boot() {
   // card that a pending invitation is waiting, so a brand-new invitee knows to
   // create an account — with the address the invite was sent to.
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
-  if (signedOut) {
+  if (session.authRequired && !session.authenticated && !session.token) {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
@@ -18753,18 +18749,24 @@ function openPublicAuth(path, render) {
   render();
 }
 
-// Signed-out visitors see the dark landing unless they chose light. The choice
-// shares the console's `karmax-theme` key, so it carries into the app.
-function landingThemeLabel() {
-  return document.documentElement?.getAttribute('data-theme') === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+// The landing follows the system theme like the console; its toggle pins the
+// other one in the console's own `karmax-theme` preference.
+function landingTheme() {
+  const pinned = document.documentElement?.getAttribute('data-theme');
+  if (pinned === 'light' || pinned === 'dark') return pinned;
+  return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+function labelLandingTheme(button) {
+  button.title = landingTheme() === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+  button.setAttribute('aria-label', button.title);
 }
 
 function toggleLandingTheme(button) {
-  const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  const next = landingTheme() === 'light' ? 'dark' : 'light';
   document.documentElement.setAttribute('data-theme', next);
   localStorage.setItem('karmax-theme', next);
-  button.title = landingThemeLabel();
-  button.setAttribute('aria-label', button.title);
+  labelLandingTheme(button);
 }
 
 function renderLanding() {
@@ -18879,8 +18881,7 @@ function renderLanding() {
   ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', signUp));
   const theme = $('#landing-theme');
   if (theme) {
-    theme.title = landingThemeLabel();
-    theme.setAttribute('aria-label', theme.title);
+    labelLandingTheme(theme);
     theme.addEventListener('click', () => toggleLandingTheme(theme));
   }
   // The checklist ticks itself off as it scrolls into view. Without an

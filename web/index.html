@@ -14,14 +14,6 @@
     <link rel="icon" href="/brand/icon-192.png" type="image/png" />
     <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
     <link rel="stylesheet" href="/styles.css" />
-    <script>
-      // Signed-out visitors to the root get the landing's dark default from the
-      // first frame instead of an OS-theme flash while the app boots.
-      try {
-        if (location.pathname === '/' && localStorage.getItem('karmax-theme') !== 'light' && !localStorage.getItem('karmax-signed-in'))
-          document.documentElement.classList.add('landing-boot');
-      } catch {}
-    </script>
   </head>
   <body>
     <div class="action-progress" id="action-progress" role="progressbar" aria-label="Action in progress" hidden><span></span></div>

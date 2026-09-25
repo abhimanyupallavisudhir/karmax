@@ -1557,38 +1557,40 @@ a.ins-task-title:hover { color: var(--accent); }
    The product is the visual system: the console's Inter + monospace faces, its
    indigo action colour, and its task-list anatomy. The one addition is the gold
    of the brand's check mark, kept for things that are *done* — the hero's
-   "to-do list.", every tick in the checklist, the closing mark. Dark is the
-   default; html[data-theme="light"] (the console's own toggle) opts out. */
-body.landing-active { color-scheme: dark; background: #0e1015; color: #eceef3; overflow: auto; }
-html[data-theme="light"] body.landing-active { color-scheme: light; background: #f6f7f9; color: #15181e; }
-/* Before boot renders anything; set by index.html for likely landing visitors. */
-html.landing-boot body:not(:has(#app > *)) { color-scheme: dark; background: #0e1015; }
+   "to-do list.", every tick in the checklist, the closing mark. Like the console
+   it follows the system theme unless html[data-theme] pins one; every token is a
+   light-dark() pair resolved against that colour scheme. */
+body.landing-active { color-scheme: light dark; background: light-dark(#f6f7f9, #0e1015); color: light-dark(#15181e, #eceef3); overflow: auto; }
+html[data-theme="light"] :is(body.landing-active, .landing-page) { color-scheme: light; }
+html[data-theme="dark"] :is(body.landing-active, .landing-page) { color-scheme: dark; }
 /* Public documents use normal page scrolling; the console keeps its fixed viewport. */
 .landing-active #app, #app:has(> .legal-shell) { display: block; height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
 .landing-page {
-  --l-bg: #0e1015;
-  --l-surface: #161920;
-  --l-surface-2: #1c2029;
-  --l-line: #252a34;
-  --l-line-strong: #343b48;
-  --l-ink: #eceef3;
-  --l-ink-2: #9aa4b2;
-  --l-ink-3: #6a7383;
-  --l-accent: #8b8bf0;
-  --l-accent-ink: #0c0d12;
-  --l-accent-hover: #a3a3f5;
-  --l-accent-weak: #23233a;
-  --l-gold: #e3b344;
-  --l-gold-weak: rgba(227, 179, 68, .12);
-  --l-gold-text: linear-gradient(100deg, #d99a2b 0%, #f2cf78 100%);
-  --l-merged: #34c7ae;
-  --l-merged-weak: #11302b;
-  --l-working: #e6a04a;
-  --l-working-weak: #2e2616;
-  --l-frame-shadow: 0 40px 90px -30px rgba(0, 0, 0, .65), 0 0 0 1px rgba(255, 255, 255, .03);
-  --l-glow: rgba(139, 139, 240, .16);
-  --l-glow-gold: rgba(227, 179, 68, .10);
-  --l-nav: rgba(14, 16, 21, .72);
+  color-scheme: light dark;
+  --l-bg: light-dark(#f6f7f9, #0e1015);
+  --l-surface: light-dark(#ffffff, #161920);
+  --l-surface-2: light-dark(#fbfcfd, #1c2029);
+  --l-line: light-dark(#e3e6ec, #252a34);
+  --l-line-strong: light-dark(#d0d6df, #343b48);
+  --l-ink: light-dark(#15181e, #eceef3);
+  --l-ink-2: light-dark(#58616f, #9aa4b2);
+  --l-ink-3: light-dark(#8b95a5, #6a7383);
+  --l-accent: light-dark(#5b5bd6, #8b8bf0);
+  --l-accent-ink: light-dark(#ffffff, #0c0d12);
+  --l-accent-hover: light-dark(#4a4ac4, #a3a3f5);
+  --l-accent-weak: light-dark(#ecedfb, #23233a);
+  --l-gold: light-dark(#b27a14, #e3b344);
+  --l-gold-weak: light-dark(rgba(204, 144, 36, .12), rgba(227, 179, 68, .12));
+  --l-gold-text: linear-gradient(100deg, light-dark(#9c5f12, #d99a2b) 0%, light-dark(#c98d22, #f2cf78) 100%);
+  --l-merged: light-dark(#128474, #34c7ae);
+  --l-merged-weak: light-dark(#dcf1ec, #11302b);
+  --l-working: light-dark(#c77d1a, #e6a04a);
+  --l-working-weak: light-dark(#f8efdd, #2e2616);
+  --l-frame-shadow: 0 40px 90px -28px light-dark(rgba(30, 36, 60, .28), rgba(0, 0, 0, .65)),
+    0 2px 6px light-dark(rgba(30, 36, 60, .06), transparent), 0 0 0 1px light-dark(transparent, rgba(255, 255, 255, .03));
+  --l-glow: light-dark(rgba(91, 91, 214, .12), rgba(139, 139, 240, .16));
+  --l-glow-gold: light-dark(rgba(204, 144, 36, .10), rgba(227, 179, 68, .10));
+  --l-nav: light-dark(rgba(246, 247, 249, .78), rgba(14, 16, 21, .72));
   --l-wide: min(1180px, calc(100% - 48px));
   min-height: 100vh;
   background: var(--l-bg);
@@ -1598,31 +1600,6 @@ html.landing-boot body:not(:has(#app > *)) { color-scheme: dark; background: #0e
   line-height: 1.5;
   font-feature-settings: "cv11", "ss01";
   overflow: hidden;
-}
-html[data-theme="light"] .landing-page {
-  --l-bg: #f6f7f9;
-  --l-surface: #ffffff;
-  --l-surface-2: #fbfcfd;
-  --l-line: #e3e6ec;
-  --l-line-strong: #d0d6df;
-  --l-ink: #15181e;
-  --l-ink-2: #58616f;
-  --l-ink-3: #8b95a5;
-  --l-accent: #5b5bd6;
-  --l-accent-ink: #ffffff;
-  --l-accent-hover: #4a4ac4;
-  --l-accent-weak: #ecedfb;
-  --l-gold: #b27a14;
-  --l-gold-weak: rgba(204, 144, 36, .12);
-  --l-gold-text: linear-gradient(100deg, #9c5f12 0%, #c98d22 100%);
-  --l-merged: #128474;
-  --l-merged-weak: #dcf1ec;
-  --l-working: #c77d1a;
-  --l-working-weak: #f8efdd;
-  --l-frame-shadow: 0 40px 90px -24px rgba(30, 36, 60, .28), 0 2px 6px rgba(30, 36, 60, .06);
-  --l-glow: rgba(91, 91, 214, .12);
-  --l-glow-gold: rgba(204, 144, 36, .10);
-  --l-nav: rgba(246, 247, 249, .78);
 }
 .landing-page *, .landing-page *::before, .landing-page *::after { box-sizing: border-box; }
 .landing-page :where(button, a) { font: inherit; }
@@ -1658,8 +1635,13 @@ html[data-theme="light"] .landing-page {
 }
 .landing-theme:hover { color: var(--l-ink); border-color: var(--l-line); background: var(--l-surface); }
 .landing-theme svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+/* The toggle offers the other theme: a sun while dark, a moon while light. */
 .landing-theme .moon, html[data-theme="light"] .landing-theme .sun { display: none; }
 html[data-theme="light"] .landing-theme .moon { display: block; }
+@media (prefers-color-scheme: light) {
+  html:not([data-theme="dark"]) .landing-theme .sun { display: none; }
+  html:not([data-theme="dark"]) .landing-theme .moon { display: block; }
+}
 .landing-sign-in, .landing-start {
   min-height: 36px; padding: 0 14px; display: inline-flex; align-items: center; gap: 7px;
   border: 1px solid var(--l-line-strong); border-radius: 8px;
