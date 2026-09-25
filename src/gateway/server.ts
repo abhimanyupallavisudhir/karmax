@@ -2006,8 +2006,10 @@ export class Gateway {
           const organization = await store.getOrganization(subscription.organizationId);
           if (!organization) continue;
           const membership = await store.organizationMembership(organization.id, subject.userId);
-          const canManage = membership?.role === 'owner'
-            && (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
+          const paymentAllowed = this.deps.identity && session.userId === subject.userId && this.deps.authorization
+            ? allows(await this.deps.authorization.capabilities(`user:${subject.userId}`, undefined, organization.id), 'payment:write')
+            : (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
+          const canManage = membership?.role === 'owner' && paymentAllowed;
           subscriptions.push({ ...subscription, organizationName: organization.name, canManage: Boolean(canManage),
             settingsUrl: membership ? `${await organizationSettingsPath(store, organization.id)}#settings-plan` : null });
         }

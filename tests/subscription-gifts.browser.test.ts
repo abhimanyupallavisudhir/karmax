@@ -111,8 +111,10 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
   const worlds = new WorldRegistry(), tokens = new TokenAuthority();
   const client = { workflow: { getHandle: () => ({ query: async () => [] }) } } as any;
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: directory });
+  const authorization = await AuthorizationService.create(store);
+  await authorization.bootstrapOrganizationOwner('system:test', user.id, org.id);
   const gateway = await Gateway.create({ store, tokens, worlds, client, api, hosted: true, identity,
-    authorization: await AuthorizationService.create(store), subscriptions: billing,
+    authorization, subscriptions: billing,
     taskQueue: 'test', staticDir: path.resolve('web'), bus: new KarmaxBus(), contributions: new ContributionRegistry(),
     overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'subscription management browser test' } });
   const server = await gateway.listen(port);
@@ -123,15 +125,31 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
     page.on('pageerror', error => errors.push(error.message));
     page.on('dialog', dialog => dialog.accept());
     const login = await page.request.post(`${server.url}/api/auth/sign-in/email`, {
-      headers: { origin: server.url }, data: { email: user.email, password: 'long-fixture-password' },
+      // Better Auth's in-memory limiter is shared across identity instances.
+      // Give this fixture its own client address without disabling throttling.
+      headers: { origin: server.url, 'x-forwarded-for': '192.0.2.173' }, data: { email: user.email, password: 'long-fixture-password' },
     });
     expect(login.status()).toBe(200);
     await page.goto(`${server.url}/profile`);
     await page.locator('#profile-paid-subscriptions').getByText(org.name, { exact: true }).waitFor({ timeout: 10_000 }).catch(async error => {
       throw new Error(`${error.message}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
     });
+    expect(await page.locator('#profile-paid-subscriptions').innerText()).not.toContain('no longer have billing-management access');
+    expect((await fetch(`${server.url}/api/user/paid-subscriptions`)).status).toBe(401);
+    const otherUser = await identity.createUser({ name: 'Other user', email: 'other-billing@example.test', password: 'long-fixture-password' });
+    const otherContext = await browser.newContext();
+    try {
+      expect((await otherContext.request.post(`${server.url}/api/auth/sign-in/email`, {
+        headers: { origin: server.url, 'x-forwarded-for': '192.0.2.174' }, data: { email: otherUser.email, password: 'long-fixture-password' },
+      })).status()).toBe(200);
+      const otherList = await otherContext.request.get(`${server.url}/api/user/paid-subscriptions?userId=${user.id}`);
+      expect(otherList.status()).toBe(200);
+      expect(await otherList.json()).toEqual({ subscriptions: [] });
+    } finally { await otherContext.close(); }
     await page.locator('#profile-paid-subscriptions').getByRole('link', { name: 'Plans & billing' }).click();
-    await page.getByRole('button', { name: 'Upgrade to Team', exact: true }).click();
+    await page.getByRole('button', { name: 'Upgrade to Team', exact: true }).click({ timeout: 10_000 }).catch(async error => {
+      throw new Error(`${error.message}\nURL: ${page.url()}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
+    });
     await expect.poll(() => provider.calls.filter(call => call.method === 'changePlan').length).toBe(1);
     expect(provider.calls.find(call => call.method === 'changePlan')?.input.plan).toBe('team');
     // Provider confirmation, not a click alone, changes the displayed plan.

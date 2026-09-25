@@ -17,7 +17,7 @@ it.each([false, true])('lists only attributed, verified subscriptions (checkout 
       data: { object: { id: subscriptionId, customer: `cus_${org.id}`, status: 'active',
         items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] } } } })));
     if (!paddle) await billing.handleWebhook(Buffer.from(JSON.stringify({ id: `completed-${subscriptionId}`,
-      created: created + 1, type: 'checkout.session.completed',
+      created: created - 1, type: 'checkout.session.completed',
       data: { object: { id: checkoutId, subscription: subscriptionId, customer: `cus_${org.id}` } } })));
   };
   try {

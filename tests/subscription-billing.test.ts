@@ -500,6 +500,13 @@ describe('subscription administration HTTP authorization', () => {
     expect((await list(other.token)).status).toBe(403);
     const scoped = await tokens.mintPrincipal('user:me', ['payment:*'], undefined, undefined, org.id);
     expect((await list(scoped.token)).status).toBe(403);
+    const delegation = (await tokens.delegateHuman(scoped.token, { taskId: 'personal-billing-scoped', organizationId: org.id }))!;
+    const delegated = await tokens.mint({ taskId: 'personal-billing-scoped', principal: 'task:personal-billing-scoped',
+      profileId: 'administrator', organizationId: org.id, delegationId: delegation.id,
+      ceiling: ['payment:read'], grantorCaps: ['payment:*'] });
+    const scopedResponse = await list(delegated.token);
+    expect(scopedResponse.status).toBe(403);
+    expect(await scopedResponse.json()).toMatchObject({ error: 'unscoped personal access is required' });
     const agent = await tokens.mint({ taskId: 'task_personal_billing', profileId: 'developer', principal: 'agent:test',
       ceiling: ['payment:write'], grantorCaps: ['payment:write'] });
     expect((await list(agent.token)).status).toBe(403);
