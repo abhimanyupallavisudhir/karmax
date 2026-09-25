@@ -36,12 +36,42 @@ export interface RunTurnDeps {
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
+  /** Resolve the project's work-command secrets as they stand now, so a secret
+   *  added, rotated or disabled in project settings reaches the running turn. */
+  pullSecretEnv?: () => Promise<Record<string, string>>;
   platformRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
   fillPaymentCard?: (args: {
     requestId: string;
     cdpUrl: string;
     selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }) => Promise<{ filled: true; origin: string }>;
+}
+
+export const SECRET_ENV_POLL_MS = 5_000;
+
+/** Mirror project-settings changes into the turn's shared secret record and tell
+ * the adapter, which rewrites whatever its harness re-reads per command. A failed
+ * pull or delivery is retried on the next tick; it never fails the turn. */
+function pollSecretEnv(live: Record<string, string>, pull: () => Promise<Record<string, string>>,
+  listeners: Set<() => void | Promise<void>>): () => void {
+  const serialize = (env: Record<string, string>) => JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)));
+  let delivered = serialize(live);
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const next = await pull();
+      const serialized = serialize(next);
+      if (serialized === delivered) return;
+      for (const name of Object.keys(live)) if (!(name in next)) delete live[name];
+      Object.assign(live, next);
+      for (const listener of listeners) await listener();
+      delivered = serialized;
+    } catch { /* retried on the next tick */ } finally { busy = false; }
+  }, SECRET_ENV_POLL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 export const KARMAX_RUNTIME_PROTOCOL = 1 as const;
@@ -85,6 +115,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const skills: { name: string; content: string }[] = [];
   // Set only if the agent partitioned its change across another branch this turn.
   let worldHandle: import('../world/types.js').WorldHandle | undefined;
+  // Adapters copy `input` (e.g. to resume after a credential refresh), so live
+  // secrets are one record shared by every copy and updated in place.
+  const liveSecretEnv = deps.pullSecretEnv ? { ...input.secretEnv } : undefined;
+  if (liveSecretEnv) input = { ...input, secretEnv: liveSecretEnv };
+  const secretEnvListeners = new Set<() => void | Promise<void>>();
 
   const ctx: PlatformToolContext = {
     openPr() {
@@ -212,6 +247,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     onSession: deps.onSession,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
+    ...(liveSecretEnv ? { onSecretEnvChange(listener: () => void | Promise<void>) {
+      secretEnvListeners.add(listener);
+      return () => { secretEnvListeners.delete(listener); };
+    } } : {}),
     pullFollowUps: deps.pullFollowUps ? async (fromIndex) => {
       const messages = await deps.pullFollowUps!(fromIndex);
       for (const message of messages) (await trace?.markOnce('followup.offered', { requestId: `${trace.context.taskId}:${message.id}` }, `followup:${message.id}`));
@@ -232,6 +271,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
         }
       }, 1_000)
     : undefined;
+  const secretPoll = liveSecretEnv ? pollSecretEnv(liveSecretEnv, deps.pullSecretEnv!, secretEnvListeners) : undefined;
   let turn;
   deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' });
   try {
@@ -272,6 +312,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     throw error;
   } finally {
     if (hb) clearInterval(hb);
+    secretPoll?.();
   }
 
   return {

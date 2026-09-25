@@ -876,7 +876,8 @@ export const SDK_CONTROL_TOOL_SCHEMAS: ToolSchema[] = PLATFORM_TOOL_SCHEMAS.filt
 export function platformToolHandlers(
   world: World,
   ctx: PlatformToolContext,
-  workEnv?: Record<string, string>,
+  /** Read per command: project secrets can change mid-turn. */
+  workEnv?: () => Record<string, string>,
 ): Record<string, (args: any) => Promise<string>> {
   const platformRequest = (method: string, requestPath: string, body?: unknown) => {
     if (!ctx.platformRequest) throw new Error('karmax gateway is unavailable to this agent');
@@ -885,7 +886,8 @@ export function platformToolHandlers(
   const handlers: Record<string, (args: any) => Promise<string>> = {
     async bash(args) {
       const cmd = String(args?.command ?? '');
-      const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000, ...(workEnv ? { env: workEnv } : {}) });
+      const env = workEnv?.();
+      const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000, ...(env ? { env } : {}) });
       ctx.emit(`$ ${cmd}`);
       const out = `exit ${r.code}\n${r.stdout}${r.stderr}`;
       return truncate(out);

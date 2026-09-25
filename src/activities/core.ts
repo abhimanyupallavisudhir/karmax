@@ -2427,6 +2427,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const chosenMcp = profile.mcpConnections === undefined ? [] : await timed('tool.connection.prepare', () => prepareConnections(
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
+        let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2461,6 +2462,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // now, at the activity boundary. Keep application secrets separate
             // from runtime env so they cannot change model auth or startup.
             const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
+            // Project settings keep applying while the agent runs (a secret added
+            // after it started must reach the command it runs next), not only at
+            // the next world open.
+            const resources = deps.resources;
+            if (resources) pullSecretEnv = async () => ({
+              ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv });
             return {
               ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
               ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
@@ -2474,6 +2481,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
           // Dropping them cuts the single biggest events-table growth driver

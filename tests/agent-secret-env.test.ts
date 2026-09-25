@@ -39,7 +39,7 @@ describe('agent project-secret delivery', () => {
     let received: TurnInput | undefined;
     const adapter = {
       provider: 'mock' as const,
-      async runTurn(input: TurnInput) {
+      async runTurn(input: TurnInput, _ctx?: any) {
         received = input;
         return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'done' };
       },
@@ -93,6 +93,27 @@ describe('agent project-secret delivery', () => {
       (await store.updateResourceLease(leases.find((lease) => lease.attachmentId === late.id)!.id, 'released'));
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service' });
+      // A secret added while the agent is already running reaches that same turn.
+      const midHandle = 'resource:test:mid-turn-token';
+      (await broker.registerHandle(midHandle, 'mid-turn-token'));
+      let midTurn: Record<string, string> | undefined;
+      let midTurnWorld: TurnInput['world'] | undefined;
+      adapter.runTurn = async (input: TurnInput, ctx?: any) => {
+        received = input;
+        const changed = new Promise<void>((resolve) => ctx.onSecretEnvChange(resolve));
+        for (const target of [{ kind: 'environment', name: 'MID_TURN_TOKEN' }, { kind: 'path', path: '.mid-turn-key' }] as const)
+          (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+            name: target.kind, driver: 'secret@1', target, access: 'read', isolation: 'fork', source: {},
+            credentialHandles: [midHandle], publish: 'discard' }));
+        await changed;
+        midTurn = { ...input.secretEnv };
+        midTurnWorld = input.world;
+        return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'done' };
+      };
+      await resume();
+      expect(midTurn).toEqual({ DATABASE_URL: 'postgres://task-service', MID_TURN_TOKEN: 'mid-turn-token' });
+      expect(await midTurnWorld!.readFile('.mid-turn-key')).toBe('mid-turn-token');
+      expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('mid-turn-token');
       expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('late-project-token');
       expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('postgres://task-service');
       expect(JSON.stringify((await store.currentWorld(task.id)))).not.toContain('secret-project-token');
