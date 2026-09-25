@@ -114,17 +114,23 @@ describe('connection gateway flow', () => {
     for (const secret of ['exact-account', 'private-session', 'secret-api-key', '/link/private']) expect(exposed).not.toContain(secret);
   });
   it('pushes settings to existing sockets and hides timing events while off', async () => {
+    // Recorded while timing is on, before the socket connects, like the rows the
+    // previous test leaves behind. A new socket may legitimately receive those;
+    // only events recorded while timing is off must stay hidden.
+    (await store.appendEvent({taskId,type:'timing',ts:Date.now(),payload:{name:'recorded-while-on'}}));
     const ws = new WebSocket(base.replace('http:', 'ws:') + '/ws', {headers:{cookie:'test-user=alice'}});
     const messages: any[] = [];
     ws.on('message',data=>messages.push(JSON.parse(String(data))));
+    const timing = (name: string) => messages.some(e=>e.type==='timing' && e.payload?.name===name);
     try {
       await vi.waitFor(()=>expect(messages.some(e=>e.type==='timing.setting' && e.enabled===true)).toBe(true));
+      await vi.waitFor(()=>expect(timing('recorded-while-on')).toBe(true));
       (await store.setSettings('global','timing',{enabled:false}));
       await vi.waitFor(()=>expect(messages.some(e=>e.type==='timing.setting' && e.enabled===false)).toBe(true), {timeout:3000});
       (await store.appendEvent({taskId,type:'timing',ts:Date.now(),payload:{name:'hidden'}}));
       (await store.appendEvent({taskId,type:'fixture.visible',ts:Date.now(),payload:{}}));
       await vi.waitFor(()=>expect(messages.some(e=>e.type==='fixture.visible')).toBe(true));
-      expect(messages.some(e=>e.type==='timing')).toBe(false);
+      expect(timing('hidden')).toBe(false);
     } finally {ws.close();}
   });
   it('enforces task, tenant, owner, and execution capability independently', async () => {
