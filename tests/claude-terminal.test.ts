@@ -56,14 +56,21 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     // A lost startup can leave next() pending even after the SDK is aborted.
     sdkState.run = async function* () { await new Promise(() => {}); };
     let failure: any;
+    const activities: any[] = [];
     try {
-      const turn = new ClaudeAdapter().runTurn(input, ctx).catch(error => { failure = error; });
+      const turn = new ClaudeAdapter().runTurn(input, { ...ctx, emitActivity(activity: any) {
+        activities.push(activity);
+        if (activity.id === 'claude-startup-diagnostics') expect(sdkState.options.abortController.signal.aborted).toBe(false);
+      } }).catch(error => { failure = error; });
       await vi.waitFor(() => expect(sdkState.options).toBeDefined());
       await vi.advanceTimersByTimeAsync(5 * 60_000);
       expect(failure).toBeInstanceOf(Error);
       expect(failure.message).toContain('Claude agent did not respond during startup');
       expect(isTransportError(failure)).toBe(true);
       expect(sdkState.options.abortController.signal.aborted).toBe(true);
+      const diagnostic = activities.find(a => a.id === 'claude-startup-diagnostics');
+      expect(diagnostic).toMatchObject({ kind: 'error', phase: 'failed', title: 'Agent startup stalled' });
+      expect(JSON.parse(diagnostic.detail)).toMatchObject({ version: 1, remote: false, process: 'not-observed' });
       await turn;
       expect(vi.getTimerCount()).toBe(0);
     } finally { vi.useRealTimers(); }
@@ -88,6 +95,17 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       expect((await turn).termination.kind).toBe('success');
       expect(vi.getTimerCount()).toBe(0);
     } finally { vi.useRealTimers(); }
+  });
+
+  it('preserves diagnostic evidence and the original error for an early startup failure', async () => {
+    const failure = new Error('spawn failed');
+    sdkState.run = async function* () { throw failure; };
+    const activities: any[] = [];
+    await expect(new ClaudeAdapter().runTurn(input, { ...ctx, emitActivity: (activity: any) => { activities.push(activity); } }))
+      .rejects.toBe(failure);
+    const diagnostic = activities.find(a => a.id === 'claude-startup-diagnostics');
+    expect(diagnostic.title).toBe('Agent startup failed');
+    expect(JSON.parse(diagnostic.detail)).toMatchObject({ version: 1, reason: 'error', remote: false });
   });
 
   it('uses one stdio platform server plus a disjoint local-control server', async () => {

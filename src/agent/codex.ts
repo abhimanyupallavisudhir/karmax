@@ -748,6 +748,7 @@ export class CodexAdapter implements AgentAdapter {
       await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
+      if (remote) child.startupComplete();
       (await startupEnd?.());
       try {
         await timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000));

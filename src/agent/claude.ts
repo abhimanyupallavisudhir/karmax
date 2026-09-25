@@ -31,6 +31,7 @@ import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAge
 import { worldWorkingDirectory } from '../world/types.js';
 import { recoverClaudeToolInputs } from './claude-history.js';
 import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
+import { boundedStartupProbe } from './startup-diagnostics.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -317,6 +318,13 @@ export class ClaudeAdapter implements AgentAdapter {
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx, workEnvironment(input));
     const remote = isRemoteAgentWorld(runtimeWorld);
+    const startupAt = Date.now();
+    const startupActivity = async (phase: 'started' | 'updated' | 'completed', step: string) => {
+      await ctx.emitActivity?.({ id: 'claude-startup', kind: 'status', phase,
+        title: phase === 'completed' ? 'Agent connected' : 'Starting agent',
+        detail: JSON.stringify({ step, elapsedMs: Date.now() - startupAt, remote, resumed: !!input.session }) });
+    };
+    await startupActivity('started', 'prepare-auth');
     const configHome = input.resolvedAuth?.configHome;
     const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));
     // Rotate the canonical host credential before projecting it. Mid-turn
@@ -348,8 +356,10 @@ export class ClaudeAdapter implements AgentAdapter {
         throw error;
       }
     }
+    await startupActivity('updated', 'prepare-environment');
     const remoteHome = remote
-      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session, input.profile.mcpConnections === undefined ? undefined : 'none'))
+      ? await timed('bootstrap.home', () => seedRemoteAgentHome(runtimeWorld, 'claude', configHome ?? '', input.session,
+        input.profile.mcpConnections === undefined ? undefined : 'none', step => startupActivity('updated', step)))
       : undefined;
     // The SDK only sees a codeless exit when the sandbox stream drops; the
     // process knows the agent may still be running there (task 348).
@@ -569,6 +579,7 @@ export class ClaudeAdapter implements AgentAdapter {
         Math.max(0, (settleDeadline ?? Date.now()) - Date.now()));
     };
     const startupEnd = (await (await currentTiming())?.start('process.sdk-startup.opaque'));
+    await startupActivity('updated', 'sdk-handshake');
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -688,8 +699,25 @@ export class ClaudeAdapter implements AgentAdapter {
       },
     });
     let publishedSession = false;
+    let firstSdkEvent = true;
+    let startupDiagnosticCaptured = false;
+    const diagnoseStartup = async (reason: 'timeout' | 'error') => {
+      if (startupDiagnosticCaptured) return;
+      startupDiagnosticCaptured = true;
+      const at = Date.now();
+      const snapshot = remoteProcess ? await remoteProcess.startupDiagnostics() : { process: 'not-observed' };
+      await ctx.emitActivity?.({ id: 'claude-startup-diagnostics', kind: 'error', phase: 'failed',
+        title: reason === 'timeout' ? 'Agent startup stalled' : 'Agent startup failed',
+        detail: JSON.stringify({ version: 1, at, reason, elapsedMs: at - startupAt,
+          remote, resumed: !!input.session, ...snapshot }) });
+    };
     try {
-      for await (const message of withClaudeStartupDeadline<any>(iterator, onAbort)) {
+      for await (const message of withClaudeStartupDeadline<any>(iterator, onAbort, () => diagnoseStartup('timeout'))) {
+        if (firstSdkEvent) {
+          firstSdkEvent = false;
+          remoteProcess?.startupComplete();
+          await startupActivity('completed', 'first-sdk-event');
+        }
         (await startupEnd?.());
         (await (await currentTiming())?.markOnce('provider.first-event'));
         if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {
@@ -919,6 +947,10 @@ export class ClaudeAdapter implements AgentAdapter {
       // throws an AbortError. The workflow already handled the cancel, so swallow
       // it (return the partial output); rethrow anything else as a real failure.
       if (!ctx.signal?.aborted) {
+        if (firstSdkEvent) {
+          try { await boundedStartupProbe(() => diagnoseStartup('error'), 5000, undefined); }
+          catch { /* retain the original startup failure */ }
+        }
         if (e instanceof ProviderFailure) throw e;
         if (remoteProcess?.lost) throw remoteProcess.lost;
         const message = e instanceof Error ? e.message : String(e);

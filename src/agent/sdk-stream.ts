@@ -1,27 +1,36 @@
 import crypto from 'node:crypto';
 import { Message } from '../domain/types.js';
 import { anthropicUserContent } from './images.js';
+import { boundedStartupProbe } from './startup-diagnostics.js';
 
 /** Bound the SDK handshake separately from model/tool execution. Heartbeating
  * an unresponsive startup otherwise hides it until the whole turn times out.
  * Do not await iterator.return() on timeout: a stuck next() can block it too.
  * The caller aborts the provider process; its late next() outcome stays handled.
  */
-export async function* withClaudeStartupDeadline<T>(stream: AsyncIterable<T>, abort: () => void): AsyncGenerator<T> {
+export async function* withClaudeStartupDeadline<T>(stream: AsyncIterable<T>, abort: () => void,
+  beforeAbort?: () => Promise<void>): AsyncGenerator<T> {
   const iterator = stream[Symbol.asyncIterator]();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let first: IteratorResult<T>;
+  const timeout = Object.assign(new Error('Claude agent did not respond during startup within 5 minutes; retrying the session.'),
+    { code: 'ETIMEDOUT' });
   try {
     first = await Promise.race([
       iterator.next(),
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          reject(Object.assign(new Error('Claude agent did not respond during startup within 5 minutes; retrying the session.'),
-            { code: 'ETIMEDOUT' }));
-          abort();
-        }, 5 * 60_000);
+        timer = setTimeout(() => reject(timeout), 5 * 60_000);
       }),
     ]);
+  } catch (error) {
+    if (error === timeout) {
+      // Capture process state while it is still alive. A broken diagnostic
+      // transport or sink must never suppress the retry or strand the process.
+      try { if (beforeAbort) await boundedStartupProbe(beforeAbort, 5000, undefined); }
+      catch { /* diagnostics are best effort */ }
+      finally { abort(); }
+    }
+    throw error;
   } finally { clearTimeout(timer); }
   let next = first;
   try {
