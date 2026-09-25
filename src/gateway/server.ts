@@ -92,7 +92,7 @@ import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanation
 import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
 import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
 import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
-  type HostedOnboardingDisplay } from './hosted-onboarding.js';
+  parseHostedOnboardingDisplay } from './hosted-onboarding.js';
 import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
@@ -2024,8 +2024,7 @@ export class Gateway {
           if (!this.deps.hosted || !record)
             return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
           const b = await this.body(req);
-          const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
-          record = { ...record, display };
+          record = { ...record, display: parseHostedOnboardingDisplay(b.display) };
           finishReplay = b.finishReplay === true;
           (await store.kvSet(key, JSON.stringify(record)));
         }

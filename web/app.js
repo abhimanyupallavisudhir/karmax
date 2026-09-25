@@ -38,6 +38,9 @@ const ICON = {
   chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
   project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  // Window controls: a matched pair, drawn on the same grid and stroke.
+  minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
+  close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
 const DEFAULT_EXPLANATION_SETTINGS = {
@@ -3535,7 +3538,7 @@ function renderOnboarding() {
     host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
       <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
       <span><b>Setup complete</b><small>All required steps are finished.</small></span>
-      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">×</button>
+      <button class="icon-btn" id="onboarding-complete-close" type="button" aria-label="Close completed walkthrough" title="Close">${ICON.close}</button>
     </div>`;
     $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
     return;
@@ -3565,7 +3568,10 @@ function renderOnboarding() {
   const optional = state.steps.optional || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
     <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Set up ${siteNameMarkup()}</h2></div>
-      <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
+      <div class="onboarding-controls">
+        <button class="icon-btn" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">${ICON.minimize}</button>
+        <button class="icon-btn" id="onboarding-close" type="button" aria-label="Close setup guide" title="Close · restart anytime from your profile">${ICON.close}</button>
+      </div></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
     <ol class="onboarding-list">
@@ -3575,11 +3581,11 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
-  $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
+  $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
 }
 

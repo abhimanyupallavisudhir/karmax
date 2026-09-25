@@ -42,9 +42,22 @@ describe('hosted onboarding UI', () => {
     expect(source).toContain('queueMicrotask(() => refreshOnboarding())');
     expect(view).toContain('function pollOnboarding()');
     expect(view).toContain('aria-label="Minimize setup guide"');
+    expect(view).toContain('aria-label="Close setup guide"');
+    expect(view).toContain("setOnboardingDisplay('closed')");
     expect(view).toContain('aria-label="Open setup guide"');
     expect(view).toContain('role="progressbar"');
     expect(styles).toContain('.onboarding-minimized');
     expect(styles).toContain('@media (max-width: 760px)');
+  });
+
+  it('keeps window controls together in the header, not a Minimize button in the footer', () => {
+    const head = view.slice(view.indexOf('class="onboarding-head"'), view.indexOf('class="onboarding-progress"'));
+    expect(head.indexOf('id="onboarding-minimize"')).toBeGreaterThan(-1);
+    expect(head.indexOf('id="onboarding-minimize"')).toBeLessThan(head.indexOf('id="onboarding-close"'));
+    expect(head).toContain('ICON.minimize');
+    expect(head).toContain('ICON.close');
+    const foot = view.slice(view.indexOf('class="onboarding-foot"'));
+    expect(foot.slice(0, foot.indexOf('</section>'))).not.toContain('Minimize');
+    expect(view).not.toContain('onboarding-minimize-foot');
   });
 });

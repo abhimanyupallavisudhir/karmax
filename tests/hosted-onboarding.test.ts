@@ -108,6 +108,15 @@ describe('hosted onboarding status API', () => {
     expect(withOptional.steps.optional).toMatchObject({ complete: true, blocking: false, vault: true, card: true });
   });
 
+  it('closes the guide until the user restarts the walkthrough', async () => {
+    const { request, base, cookie } = await boot(true);
+    expect(await (await request('PUT', { display: 'closed' })).json())
+      .toMatchObject({ eligible: true, visible: false, complete: false, display: 'closed' });
+    expect(await (await request()).json()).toMatchObject({ visible: false, complete: false, display: 'closed' });
+    expect((await fetch(`${base}/api/user/onboarding/reset`, { method: 'POST', headers: { cookie } })).status).toBe(200);
+    expect(await (await request()).json()).toMatchObject({ visible: true, display: 'expanded', replay: true });
+  });
+
   it('recovers missing enrollment and retains unfinished progress across logout and login', async () => {
     const { store, identity, request, base, cookie } = await boot(true);
     const userId = (await identity.listUsers())[0]!.id;
@@ -260,7 +269,7 @@ describe('hosted onboarding completion semantics', () => {
     const database = path.join(dir, 'store.db');
     const records = [
       { display: 'expanded' }, { display: 'minimized' },
-      { display: 'expanded', completedAt: 123 }, { display: 'expanded', replay: true },
+      { display: 'expanded', completedAt: 123 }, { display: 'expanded', replay: true }, { display: 'closed' },
     ];
     const first = (await Store.create(database));
     (await __asyncCollections.forEach(records, async (record, i) => (await first.kvSet(`hosted:onboarding:user${i}:org1`, JSON.stringify(record)))));
@@ -272,7 +281,7 @@ describe('hosted onboarding completion semantics', () => {
         expect(saved).toEqual(record);
         expect(hostedOnboardingStatus({ hosted: true, organizationId: 'org1', record: saved,
           facts: { github: true, agentLogin: false, e2b: false, vault: false, card: false, project: true },
-        }).visible).toBe(i !== 2);
+        }).visible).toBe(i !== 2 && i !== 4);
       }));
     } finally { (await reopened.close()); }
   });

@@ -68,6 +68,7 @@ function onboardingContext() {
     clearTimeout: () => { timer = undefined; },
     setTimeout: (callback) => { timer = callback; return 1; },
   });
+  vm.runInContext(source.slice(source.indexOf('const ICON = {'), source.indexOf('const TAG_SECTION_QUERY')), ctx);
   vm.runInContext(source.slice(source.indexOf('async function refreshOnboarding()'),
     source.indexOf('/** Re-point the favicon')), ctx);
   return { ctx, host, tick: async () => { assert.ok(timer); await timer(); } };
@@ -192,4 +193,27 @@ test('finishing a replay through Done also shows completion feedback', async () 
   await vm.runInContext("setOnboardingDisplay('expanded', true)", ctx);
   assert.equal(host.hidden, false);
   assert.match(host.innerHTML, /Setup complete/);
+});
+
+test('the header minus minimizes and the header close hides the guide', async () => {
+  for (const [control, display] of [['#onboarding-minimize', 'minimized'], ['#onboarding-close', 'closed']]) {
+    const { ctx, host } = onboardingContext();
+    unfinishedOnboarding(ctx);
+    ctx.S.onboarding.steps = { github: {}, agentLogin: {}, e2b: {}, optional: {}, project: {} };
+    const handlers = {};
+    ctx.$ = selector => selector === '#hosted-onboarding' ? host
+      : { addEventListener: (_event, fn) => { handlers[selector] = fn; } };
+    Object.assign(ctx, { siteNameMarkup: () => 'Tavya', globalRoute: () => '/settings', esc: String, newProject: () => {} });
+    vm.runInContext('renderOnboarding()', ctx);
+    assert.doesNotMatch(host.innerHTML, />Minimize</);
+    const calls = [];
+    ctx.api = async (...args) => {
+      calls.push(args);
+      return { ...ctx.S.onboarding, display, visible: display !== 'closed' };
+    };
+    await handlers[control]();
+    assert.deepEqual(JSON.parse(calls[0][1].body), { display, finishReplay: false });
+    assert.equal(host.hidden, display === 'closed');
+    if (display === 'minimized') assert.match(host.innerHTML, /Finish setup/);
+  }
 });
