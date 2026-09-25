@@ -7,6 +7,7 @@ export interface HostedOnboardingFacts {
   vault: boolean;
   card: boolean;
   project: boolean;
+  paidPlan?: boolean;
 }
 
 export interface HostedOnboardingRecord {
@@ -62,6 +63,7 @@ export function hostedOnboardingStatus(input: {
         card: input.facts.card,
       },
       project: { complete: input.facts.project },
+      paidPlan: { complete: input.facts.paidPlan === true, blocking: false },
     },
   };
 }

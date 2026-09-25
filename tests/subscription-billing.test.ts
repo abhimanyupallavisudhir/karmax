@@ -475,6 +475,42 @@ describe('subscription administration HTTP authorization', () => {
       expect(await response.json()).toMatchObject({ error: 'a verified human subject is required' });
     });
 
+  it('lists personal subscriptions without trusting requested user IDs or widening scoped access', async () => {
+    const org = await store.createOrganization({ name: 'Profile billing workspace', ownerUserId: 'me' });
+    vi.spyOn(provider, 'createCheckout').mockResolvedValueOnce({ id: 'cs_profile_http', url: 'https://checkout.test/profile' });
+    expect((await post('checkout', org.id, browserToken)).status).toBe(200);
+    const list = (token = browserToken) => fetch(`${base}/api/user/paid-subscriptions?userId=someone-else`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect((await (await list()).json() as any).subscriptions).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ organizationId: org.id })]));
+    await billing.handleWebhook(event('profile-http-active', 'customer.subscription.updated', {
+      id: 'sub_profile_http', customer: `cus_${org.id}`, status: 'active',
+      items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] },
+    }));
+    await billing.handleWebhook(event('profile-http-complete', 'checkout.session.completed', {
+      id: 'cs_profile_http', subscription: 'sub_profile_http', customer: `cus_${org.id}`,
+    }, 101));
+    const result = await (await list()).json() as any;
+    expect(result.subscriptions).toContainEqual(expect.objectContaining({ organizationId: org.id,
+      organizationName: org.name, plan: 'individual', canManage: true, settingsUrl: `/${org.slug}/settings#settings-plan` }));
+    expect(JSON.stringify(result)).not.toMatch(/sub_profile_http|cs_profile_http|commercialTerms|customerId/);
+    const other = await tokens.mintPrincipal('user:someone-else', ['payment:*']);
+    // A bare principal token is not proof of a human subject.
+    expect((await list(other.token)).status).toBe(403);
+    const scoped = await tokens.mintPrincipal('user:me', ['payment:*'], undefined, undefined, org.id);
+    expect((await list(scoped.token)).status).toBe(403);
+    const agent = await tokens.mint({ taskId: 'task_personal_billing', profileId: 'developer', principal: 'agent:test',
+      ceiling: ['payment:write'], grantorCaps: ['payment:write'] });
+    expect((await list(agent.token)).status).toBe(403);
+    await billing.gift(org.id, 'team', 'user:operator', 'profile-owner-transfer');
+    await store.setOrganizationMembership(org.id, 'replacement-owner', 'owner');
+    await store.removeOrganizationMembership(org.id, 'me');
+    expect((await (await list()).json() as any).subscriptions).toContainEqual(expect.objectContaining({
+      organizationId: org.id, canManage: false, settingsUrl: null }));
+    await store.db.prepare('DELETE FROM policy_acceptances WHERE organizationId=?').run(org.id);
+  });
+
   it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
     'rejects an interactive non-owner from %s', async (action) => {
       const response = await post(action, memberOrganizationId, browserToken);

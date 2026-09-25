@@ -11,8 +11,9 @@ describe('hosted onboarding UI', () => {
     const labels = [
       'Connect GitHub',
       'Add agent logins',
-      'Add an E2B API key',
-      'Add passwords and a payment card',
+      'Add an E2B or Daytona API key',
+      'Connect apps, and add payments and a payment card',
+      'Buy paid plan',
       'Create your first project',
     ];
     for (let index = 1; index < labels.length; index++)
@@ -27,6 +28,10 @@ describe('hosted onboarding UI', () => {
     expect(view).toContain('#settings-agents');
     expect(view).toContain('#settings-compute');
     expect(view).toContain('#settings-payments');
+    expect(view).toContain('#settings-connections');
+    expect(view).toContain('#settings-plan');
+    expect(view).toContain('Manage E2B/Daytona');
+    expect(view).toContain("key === 'paidPlan'");
     expect(view).toContain("addEventListener('click', newProject)");
   });
 

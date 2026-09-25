@@ -82,3 +82,70 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     fs.rmSync(directory, { recursive: true, force: true });
   }
 }, 60_000);
+
+it('opens a purchased subscription from the profile and upgrades or cancels it in Subscription billing', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'subscription-management-browser-'));
+  const store = await Store.create(':memory:', { hosted: true });
+  const org = await store.createOrganization({ name: 'Purchased workspace', ownerUserId: 'me' });
+  const provider = new FakeSubscriptionProvider();
+  const billing = new SubscriptionBillingService(store, provider, true);
+  const checkout = await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'browser-purchase');
+  await store.recordPolicyAcceptance({ userId: 'me', organizationId: org.id, context: 'checkout', versions: {},
+    checkoutSessionReference: checkout.checkoutSessionReference });
+  let sequence = 100;
+  const subscription = async (plan: 'individual' | 'team', cancel = false) => billing.handleWebhook(Buffer.from(JSON.stringify({
+    id: `browser-${++sequence}`, created: sequence, type: 'customer.subscription.updated', data: { object: {
+      id: 'sub_browser', customer: `cus_${org.id}`, status: 'active', cancel_at_period_end: cancel,
+      current_period_end: Math.floor(Date.now() / 1000) + 86_400,
+      items: { data: [{ id: 'si', price: { id: plan === 'team' ? 'price_team_base' : 'price_individual' }, quantity: 1 }] },
+    } },
+  })));
+  await subscription('individual');
+  await billing.handleWebhook(Buffer.from(JSON.stringify({ id: 'browser-checkout', created: ++sequence,
+    type: 'checkout.session.completed', data: { object: { id: checkout.checkoutSessionReference,
+      subscription: 'sub_browser', customer: `cus_${org.id}` } } })));
+  const worlds = new WorldRegistry(), tokens = new TokenAuthority();
+  const client = { workflow: { getHandle: () => ({ query: async () => [] }) } } as any;
+  const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: directory });
+  const gateway = await Gateway.create({ store, tokens, worlds, client, api, hosted: true,
+    authorization: await AuthorizationService.create(store), subscriptions: billing,
+    taskQueue: 'test', staticDir: path.resolve('web'), bus: new KarmaxBus(), contributions: new ContributionRegistry(),
+    overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'subscription management browser test' } });
+  const server = await gateway.listen(await findFreePortFrom(48830));
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  try {
+    const page = await browser.newPage({ serviceWorkers: 'block' });
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    page.on('dialog', dialog => dialog.accept());
+    await page.goto(`${server.url}/profile`);
+    await page.locator('#profile-paid-subscriptions').getByText(org.name, { exact: true }).waitFor({ timeout: 10_000 }).catch(async error => {
+      throw new Error(`${error.message}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
+    });
+    await page.locator('#profile-paid-subscriptions').getByRole('link', { name: 'Plans & billing' }).click();
+    await page.getByRole('button', { name: 'Upgrade to Team', exact: true }).click();
+    await expect.poll(() => provider.calls.filter(call => call.method === 'changePlan').length).toBe(1);
+    expect(provider.calls.find(call => call.method === 'changePlan')?.input.plan).toBe('team');
+    // Provider confirmation, not a click alone, changes the displayed plan.
+    await subscription('team');
+    await page.reload();
+    await page.getByRole('button', { name: 'Downgrade to Individual', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Cancel online at period end', exact: true }).click();
+    await expect.poll(() => provider.calls.filter(call => call.method === 'cancelAtPeriodEnd').length).toBe(1);
+    await subscription('team', true);
+    await page.reload();
+    await page.locator('#org-subscription .chip').filter({ hasText: /^ends / }).waitFor();
+    expect(await page.getByRole('button', { name: 'Cancel online at period end', exact: true }).count()).toBe(0);
+    // A portal session is fetched only after an explicit user action.
+    await page.route('https://portal.test/**', route => route.fulfill({ body: 'Test billing portal' }));
+    await page.getByRole('button', { name: 'Billing portal', exact: true }).click();
+    await page.waitForURL('https://portal.test/session');
+    expect(provider.calls.filter(call => call.method === 'createPortal')).toHaveLength(1);
+    expect(errors).toEqual([]);
+  } finally {
+    await browser.close();
+    await server.close();
+    await store.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}, 60_000);

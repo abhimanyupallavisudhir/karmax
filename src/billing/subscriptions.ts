@@ -261,6 +261,41 @@ export class SubscriptionBillingService {
     return provider;
   }
 
+  /** Attribute a subscription to its checkout initiator, never to all owners or
+   * to a matching email address. Unfinished checkouts and gifts are not purchases.
+   * Keep this a local read: opening a profile must not contact the payment API. */
+  async paidSubscriptionsForUser(userId: string) {
+    if (!this.hosted) return [];
+    const rows = await this.store.db.prepare(`SELECT DISTINCT a.organizationId, a.plan, a.status,
+        a.cancelAtPeriodEnd, a.currentPeriodEnd
+      FROM policy_acceptances p
+      JOIN subscription_billing_checkouts c ON c.checkoutId=p.checkoutSessionReference
+        AND c.organizationId=p.organizationId
+      JOIN subscription_billing_accounts a ON a.organizationId=c.organizationId
+        AND a.provider=c.provider AND a.subscriptionId=c.subscriptionId
+      WHERE p.userId=? AND p.context='checkout' AND c.state='associated'
+        AND a.verifiedAt IS NOT NULL AND a.plan!='free'
+        AND a.status IN ('active','trialing','past_due','unpaid','paused','canceled')
+        AND NOT EXISTS (SELECT 1 FROM policy_acceptances earlier
+          WHERE earlier.organizationId=p.organizationId AND earlier.context='checkout'
+            AND earlier.checkoutSessionReference=p.checkoutSessionReference
+            AND (earlier.acceptedAt<p.acceptedAt OR (earlier.acceptedAt=p.acceptedAt AND earlier.id<p.id)))
+      ORDER BY a.organizationId`).all(userId) as Array<{
+        organizationId: string; plan: PaidHostedPlanId; status: SubscriptionStatus;
+        cancelAtPeriodEnd: number; currentPeriodEnd: number | null;
+      }>;
+    return rows.map(row => ({ organizationId: row.organizationId, plan: row.plan,
+      planName: HOSTED_PLANS[row.plan].name, status: row.status,
+      cancelAtPeriodEnd: Boolean(row.cancelAtPeriodEnd), currentPeriodEnd: row.currentPeriodEnd }));
+  }
+
+  async hasPaidSubscription(organizationId: string) {
+    if (!this.hosted) return false;
+    const account = await this.account(organizationId);
+    return Boolean(account?.subscriptionId && account.verifiedAt && account.plan !== 'free'
+      && ['active', 'trialing', 'past_due'].includes(account.status));
+  }
+
   async current(organizationId: string) {
     const members = (await this.store.listOrganizationMemberships(organizationId)).length;
     if (!this.hosted) return { managed: false, providerConfigured: false, plan: 'self_hosted', status: 'unmetered',
@@ -367,9 +402,9 @@ export class SubscriptionBillingService {
       if (pending && !session) await this.store.db.prepare("UPDATE subscription_billing_checkouts SET state='canceled' WHERE provider=? AND checkoutId=?")
         .run(provider.name, pending.checkoutId);
       session ??= await provider.createCheckout(input);
-      if (provider.customerMode === 'checkout') await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
-        (provider, checkoutId, organizationId, createdAt) VALUES (?, ?, ?, ?)`)
-        .run(provider.name, session.id, organizationId, Date.now());
+      await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
+        (provider, checkoutId, organizationId, createdAt, state) VALUES (?, ?, ?, ?, ?)`)
+        .run(provider.name, session.id, organizationId, Date.now(), provider.customerMode === 'checkout' ? 'pending' : 'unverified');
       return { ...checkoutResult, checkoutSessionReference: session.id, url: session.url };
     }, provider, intent);
   }
@@ -532,13 +567,20 @@ export class SubscriptionBillingService {
     if (provider.customerMode === 'checkout' && event.checkoutId && subscriptionId)
       await this.store.db.prepare("UPDATE subscription_billing_checkouts SET subscriptionId=?, state='associated' WHERE provider=? AND checkoutId=? AND organizationId=?")
         .run(subscriptionId, provider.name, event.checkoutId, account.organizationId);
+    // Association is independent of the entitlement clock: a checkout event
+    // can legitimately arrive after a newer subscription snapshot.
+    if (event.type === 'checkout.session.completed' && subscriptionId)
+      await this.store.db.prepare("UPDATE subscription_billing_checkouts SET subscriptionId=?, state='associated' WHERE provider=? AND checkoutId=? AND organizationId=?")
+        .run(subscriptionId, provider.name, String(object.id), account.organizationId);
     const eventAt = event.created * 1000;
     if (eventAt < account.lastEventAt) return;
     if (event.type === 'checkout.session.completed') {
       // This event associates the provider subscription but carries no verified
       // line-item snapshot. Do not advance the reconciliation clock: Stripe may
       // deliver the slightly older subscription.created event afterwards.
-      if (subscriptionId) (await this.patchAccount(account.organizationId, { subscriptionId }));
+      if (subscriptionId) {
+        await this.patchAccount(account.organizationId, { subscriptionId });
+      }
       return;
     }
     if (event.type.startsWith('customer.subscription.')) {
