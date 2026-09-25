@@ -11,7 +11,7 @@ import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platform
 import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
-import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
+import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
 import {
@@ -689,7 +689,7 @@ export class ClaudeAdapter implements AgentAdapter {
     });
     let publishedSession = false;
     try {
-      for await (const message of iterator) {
+      for await (const message of withClaudeStartupDeadline<any>(iterator, onAbort)) {
         (await startupEnd?.());
         (await (await currentTiming())?.markOnce('provider.first-event'));
         if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {

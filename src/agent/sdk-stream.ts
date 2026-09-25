@@ -2,6 +2,36 @@ import crypto from 'node:crypto';
 import { Message } from '../domain/types.js';
 import { anthropicUserContent } from './images.js';
 
+/** Bound the SDK handshake separately from model/tool execution. Heartbeating
+ * an unresponsive startup otherwise hides it until the whole turn times out.
+ * Do not await iterator.return() on timeout: a stuck next() can block it too.
+ * The caller aborts the provider process; its late next() outcome stays handled.
+ */
+export async function* withClaudeStartupDeadline<T>(stream: AsyncIterable<T>, abort: () => void): AsyncGenerator<T> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let first: IteratorResult<T>;
+  try {
+    first = await Promise.race([
+      iterator.next(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(Object.assign(new Error('Claude agent did not respond during startup within 5 minutes; retrying the session.'),
+            { code: 'ETIMEDOUT' }));
+          abort();
+        }, 5 * 60_000);
+      }),
+    ]);
+  } finally { clearTimeout(timer); }
+  let next = first;
+  try {
+    while (!next.done) {
+      yield next.value;
+      next = await iterator.next();
+    }
+  } finally { if (!next.done) await iterator.return?.(); }
+}
+
 /**
  * Streaming-input plumbing for the Claude Agent SDK's in-flight follow-up
  * injection (SPEC §5.6). The SDK's `query({ prompt })` accepts an

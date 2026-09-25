@@ -21,7 +21,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
-import { ProviderFailure } from '../src/agent/limits.js';
+import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
 
@@ -50,6 +50,45 @@ const ctx: any = {
 
 describe('Claude Agent SDK terminal outcome contract', () => {
   beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; sdkState.run = undefined; });
+
+  it('retries a silent SDK startup without waiting for the 45-minute activity timeout', async () => {
+    vi.useFakeTimers();
+    // A lost startup can leave next() pending even after the SDK is aborted.
+    sdkState.run = async function* () { await new Promise(() => {}); };
+    let failure: any;
+    try {
+      const turn = new ClaudeAdapter().runTurn(input, ctx).catch(error => { failure = error; });
+      await vi.waitFor(() => expect(sdkState.options).toBeDefined());
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toContain('Claude agent did not respond during startup');
+      expect(isTransportError(failure)).toBe(true);
+      expect(sdkState.options.abortController.signal.aborted).toBe(true);
+      await turn;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('removes the startup deadline after the first SDK event, including during quiet work', async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const working = new Promise<void>(resolve => { finish = resolve; });
+    sdkState.run = async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'started' };
+      await working;
+      yield { type: 'result', subtype: 'success', session_id: 'started' };
+    };
+    try {
+      const onSession = vi.fn();
+      const turn = new ClaudeAdapter().runTurn(input, { ...ctx, onSession });
+      await vi.waitFor(() => expect(onSession).toHaveBeenCalledWith('started'));
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(sdkState.options.abortController.signal.aborted).toBe(false);
+      finish();
+      expect((await turn).termination.kind).toBe('success');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
 
   it('uses one stdio platform server plus a disjoint local-control server', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
