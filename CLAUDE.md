@@ -19,6 +19,7 @@ karmax is built on three convictions (from the spec's §0):
 ```bash
 npm start                                     # boot Temporal (SQLite) + worker + gateway, prints UI URL
 npm run dev                                   # same, with tsx watch
+npm run preview:landing                       # public landing/pricing/policies only, no Temporal (port 4173)
 npm test                                      # full suite — sequential by design, see below
 npm run typecheck
 npx vitest run tests/store.test.ts            # one file

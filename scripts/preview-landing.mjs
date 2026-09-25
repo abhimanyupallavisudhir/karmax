@@ -4,7 +4,7 @@
 // step, so this is the exact markup and CSS production serves; only the three
 // bootstrap API calls are stubbed as a signed-out visitor would see them.
 //
-//   node scripts/preview-landing.mjs            # http://localhost:4173
+//   npm run preview:landing                     # http://localhost:4173
 //   PORT=5000 SITE_NAME=tavya BRAND_ICON=royal-gold-arrow node scripts/preview-landing.mjs
 import http from 'node:http';
 import fs from 'node:fs';
