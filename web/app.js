@@ -17663,7 +17663,8 @@ async function hydrateOrganizationView() {
   <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
   const providerInfo = {
     e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
-    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io' },
+    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io',
+      note: 'Note: <a href="https://www.daytona.io/docs/en/network-limits/" target="_blank" rel="noopener noreferrer">Daytona Tiers 1–2</a> only reach package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ instead.' },
   };
   $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
     const connection = connectionFor(provider); const config = connection?.config || {};
@@ -17672,6 +17673,7 @@ async function hydrateOrganizationView() {
     return `<div class="team-block provider-connection" data-provider="${provider}">
       <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
       <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
+      ${info.note ? `<p class="provider-note">${info.note}</p>` : ''}
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
       ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
