@@ -45,7 +45,8 @@ describe('public landing page', () => {
     const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
     expect(landing).toContain('<strong>vscode</strong><span>was a fancy <b>text editor.</b>');
     expect(landing).toContain('<strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b>');
-    expect(landing).toContain('The <em>correct</em> interface');
+    expect(landing).toContain('The interface for the era of');
+    expect(landing).not.toContain('correct</em>');
     expect(landing).toContain('managing agents');
     expect(landing).toContain('manually coding/working');
     expect(landing).toContain('Agents work parallelly in isolated cloud worlds.');

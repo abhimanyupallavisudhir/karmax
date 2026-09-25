@@ -18805,7 +18805,7 @@ function renderLanding() {
             <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
             <span><strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b></span></span>
           </h1>
-          <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
+          <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
           </div>
