@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { DurationSequencer } from './tests/helpers/duration-sequencer.js';
 
 export default defineConfig({
   test: {
@@ -38,14 +39,16 @@ export default defineConfig({
     // Make sure a hung integration test is killed rather than left holding a
     // Temporal server forever.
     teardownTimeout: 20_000,
+    // CI divides the files between runners with `--shard`. Balance the shards
+    // by each file's measured duration (tests/durations.json), not by count.
+    sequence: { sequencer: DurationSequencer },
     // Coverage is opt-in (`npm run test:coverage`) because instrumenting a run
-    // that already boots real Temporal servers is slow. `all: true` is the point
+    // that already boots real Temporal servers is slow. `include` is the point
     // of measuring at all here: without it a module with zero tests is simply
     // absent from the report rather than shown at 0%, which is exactly the gap
     // that needs to be visible.
     coverage: {
       provider: 'v8',
-      all: true,
       include: ['src/**/*.ts'],
       exclude: ['src/**/*.test.ts', 'src/types/**', 'src/scripts/**'],
       reporter: ['text-summary', 'html'],

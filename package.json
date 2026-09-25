@@ -16,6 +16,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:durations": "tsx scripts/test-durations.ts",
     "typecheck": "tsc --noEmit",
     "reset": "tsx src/scripts/reset.ts",
     "backup": "tsx src/scripts/backup.ts",
