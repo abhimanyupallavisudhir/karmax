@@ -18778,20 +18778,54 @@ function openPublicAuth(path, render) {
   render();
 }
 
+// The landing follows the system theme like the console; its toggle pins the
+// other one in the console's own `karmax-theme` preference.
+function landingTheme() {
+  const pinned = document.documentElement?.getAttribute('data-theme');
+  if (pinned === 'light' || pinned === 'dark') return pinned;
+  return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+function labelLandingTheme(button) {
+  button.title = landingTheme() === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+  button.setAttribute('aria-label', button.title);
+}
+
+function toggleLandingTheme(button) {
+  const next = landingTheme() === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('karmax-theme', next);
+  labelLandingTheme(button);
+}
+
 function renderLanding() {
+  // Seven real tasks the platform shipped. Each agent finishes at its own moment
+  // (`--d`), so the hero plays out as parallel work landing, then rests at done.
+  const tasks = [
+    ['Support e2b cloud environments for agents', 2.1],
+    ['Support Github auto-merge, merge queues in addition to native merge queue', 3.6],
+    ['Password vault: implement git-backed <code>unix pass</code> importer', 2.8],
+    ['Let agents create accounts with agentmail.to', 4.3],
+    ['Add spending limits for agents', 1.6],
+    ['MathJaX support in agent conversations', 3.1],
+    ['Wiki-based agent memory', 2.4],
+  ];
+  const tick = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.6 8.4l2.9 2.9 5.9-6.6"/></svg>';
+  const check = (title, detail = '') => `<li><span class="landing-tick">${tick}</span><div><h3>${title}</h3>${detail}</div></li>`;
   document.body.classList.add('landing-active');
   document.title = `${siteName()} — the to-do list for agents`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
-    <header class="landing-nav" aria-label="Primary navigation">
+    <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">
       <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
       <div class="landing-nav-actions">
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
+        <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
         <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
       </div>
-    </header>
+    </div></header>
 
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
@@ -18800,7 +18834,7 @@ function renderLanding() {
             <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
             <span><strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b></span></span>
           </h1>
-          <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
+          <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
           </div>
@@ -18822,74 +18856,46 @@ function renderLanding() {
             <div class="product-main">
               <div class="product-topline"><span>Tasks <b>7</b></span><span>Queues</span><span>Wiki</span><span>Settings</span><i>+ New task</i></div>
               <div class="product-compose"><span>What needs doing?</span><kbd>⌘ ↵</kbd></div>
-              <div class="product-list-head"><span>COMPLETED</span><span>7 tasks</span></div>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>Support e2b cloud environments for agents</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>Support Github auto-merge, merge queues in addition to native merge queue</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>Password vault: implement git-backed <code>unix pass</code> importer</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>Let agents create accounts with agentmail.to</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>Add spending limits for agents</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>MathJaX support in agent conversations</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
-              <article class="product-task">
-                <span class="product-check">✓</span>
-                <div><strong>Wiki-based agent memory</strong></div>
-                <div class="product-stage done">done</div>
-              </article>
+              <div class="product-list-head"><span>TODAY</span><span>7 tasks</span></div>
+              <div class="product-list">${tasks.map(([title, delay]) => `
+              <article class="product-task" style="--d:${delay}s">
+                <span class="product-check">${tick}</span>
+                <div><strong>${title}</strong></div>
+                <span class="product-pipe" aria-hidden="true"><i></i></span>
+                <div class="product-stages"><span class="product-stage working" aria-hidden="true">working</span><div class="product-stage done">done</div></div>
+              </article>`).join('')}
+              </div>
             </div>
           </div>
         </figure>
       </section>
 
       <section class="landing-principles" aria-labelledby="principles-title">
-        <div class="landing-principles-content">
-          <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
-          <div class="landing-checks">
-            <article><h3>Agents work parallelly in isolated cloud worlds.</h3></article>
-            <article><h3>Yes, gitignored files are handled correctly.</h3><p>secrets, databases, big files</p></article>
-            <article><h3>Bring your own key or OpenAI/Claude subscription</h3></article>
-            <article><h3>${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects</h3><p>if you authorize it.</p></article>
-            <article class="wide"><h3>Connect a password vault and a payment card, and let agents Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
-          </div>
-        </div>
+        <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
+        <ul class="landing-checklist">
+          ${check('Agents work parallelly in isolated cloud worlds.')}
+          ${check('Yes, gitignored files are handled correctly.', '<p>secrets, databases, big files</p>')}
+          ${check('Bring your own key or OpenAI/Claude subscription')}
+          ${check(`${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects`, '<p>if you authorize it.</p>')}
+          ${check('Connect your apps and a payment card, and let agents Just Do Things.',
+            `<p>E.g. just create a task</p><div class="landing-examples"><span><i></i>buy me a website and deploy to it</span><span><i></i>run the experiment on vast.ai</span></div>`)}
+        </ul>
       </section>
 
       <section class="landing-control" aria-labelledby="control-title">
-        <div class="landing-control-copy">
+        <div class="landing-control-head">
           <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
           <p>Want a human-managed to-do list of AI engineers? Want the automated company? ${siteNameMarkup()} can do both.</p>
         </div>
         <div class="landing-control-list">
-          <article><p>${siteNameMarkup()} MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
-          <article><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
-          <article><p>${siteNameMarkup()} comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
+          <article><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3v5M15 3v5M6.5 8h11v3.5a5.5 5.5 0 0 1-11 0zM12 17v4"/></svg><p>${siteNameMarkup()} MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
+          <article><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M3 19a5 5 0 0 1 10 0"/><rect x="14.5" y="4.5" width="6" height="6" rx="1.5"/><path d="M17.5 13v3.5M14 19.5h7M16 16.5h3"/></svg><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
+          <article><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.9-7.5-9.5V6z"/><path d="M8.8 12.2l2.2 2.2 4.2-4.6"/></svg><p>${siteNameMarkup()} comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
         </div>
       </section>
 
       <section class="landing-final" aria-labelledby="final-title">
-        <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+        <div class="landing-final-mark" aria-hidden="true">${brandMark()}</div>
         <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
         <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></button>
       </section>
@@ -18902,6 +18908,23 @@ function renderLanding() {
   const signUp = () => openPublicAuth('/signup', renderSignup);
   $('#landing-sign-in')?.addEventListener('click', signIn);
   ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', signUp));
+  const theme = $('#landing-theme');
+  if (theme) {
+    labelLandingTheme(theme);
+    theme.addEventListener('click', () => toggleLandingTheme(theme));
+  }
+  // The checklist ticks itself off as it scrolls into view. Without an
+  // observer the ticks simply render checked.
+  const checklist = $('.landing-checklist');
+  if (checklist && 'IntersectionObserver' in window) {
+    checklist.classList.add('will-tick');
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) return;
+      checklist.classList.add('ticked');
+      observer.disconnect();
+    }, { threshold: 0.3 });
+    observer.observe(checklist);
+  }
   window.onpopstate = () => boot();
 }
 

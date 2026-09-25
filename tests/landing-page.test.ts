@@ -5,6 +5,17 @@ import { describe, expect, it } from 'vitest';
 const app = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
 const css = fs.readFileSync(path.resolve('web/styles.css'), 'utf8');
 
+function renderLandingMarkup() {
+  const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
+  const root = { innerHTML: '' };
+  const document = { title: '', body: { classList: { add() {} } } };
+  const render = new Function('$', 'document', 'window', 'siteName', 'siteNameMarkup', 'brandMark', 'esc', 'location',
+    `${landing}; renderLanding();`);
+  render((selector: string) => selector === '#app' ? root : undefined, document, {},
+    () => 'tavya', () => 'tavya', () => '<img class="mark">', (value: string) => value, { host: 'tavya.io' });
+  return { html: root.innerHTML, document };
+}
+
 describe('public landing page', () => {
   it('renders Tavya in the homepage and representative screenshot, including its address bar', () => {
     const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
@@ -34,7 +45,8 @@ describe('public landing page', () => {
     const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
     expect(landing).toContain('<strong>vscode</strong><span>was a fancy <b>text editor.</b>');
     expect(landing).toContain('<strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b>');
-    expect(landing).toContain('The <em>correct</em> interface');
+    expect(landing).toContain('The interface for the era of');
+    expect(landing).not.toContain('correct</em>');
     expect(landing).toContain('managing agents');
     expect(landing).toContain('manually coding/working');
     expect(landing).toContain('Agents work parallelly in isolated cloud worlds.');
@@ -42,7 +54,10 @@ describe('public landing page', () => {
     expect(landing).toContain('secrets, databases, big files');
     expect(landing).toContain('Bring your own key or OpenAI/Claude subscription');
     expect(landing).toContain('${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects');
-    expect(landing).toContain('Connect a password vault and a payment card, and let agents Just Do Things.');
+    expect(landing).toContain('Connect your apps and a payment card, and let agents Just Do Things.');
+    expect(landing).not.toContain('password vault and a payment card');
+    expect(landing).toContain('buy me a website and deploy to it');
+    expect(landing).toContain('run the experiment on vast.ai');
     expect(landing).toContain('As human-in-the-loop');
     expect(landing).toContain('<strong>authorization system</strong>');
     expect(landing).toContain('Leave the permanent');
@@ -68,9 +83,47 @@ describe('public landing page', () => {
     expect(app).toContain('Add spending limits for agents');
     expect(app).toContain('MathJaX support in agent conversations');
     expect(app).toContain('Wiki-based agent memory');
-    expect(app.match(/class="product-stage done">done/g)).toHaveLength(7);
+    expect(renderLandingMarkup().html.match(/class="product-stage done">done/g)).toHaveLength(7);
     expect(app).not.toContain('Three isolated cloud worlds');
     expect(app).not.toContain('One calm list');
+  });
+
+  it('lists capabilities as a checklist, so an item without detail is just a shorter row', () => {
+    const { html } = renderLandingMarkup();
+    const checklist = html.slice(html.indexOf('<ul class="landing-checklist">'), html.indexOf('</ul>'));
+    expect(checklist.match(/<li><span class="landing-tick">/g)).toHaveLength(5);
+    expect(checklist).not.toMatch(/<article/);
+    expect(css).not.toMatch(/\.landing-checks[^-]/);
+  });
+
+  it('follows the system theme until the visitor pins one, sharing the console preference', () => {
+    const { html } = renderLandingMarkup();
+    expect(html).toContain('id="landing-theme"');
+    const helpers = app.slice(app.indexOf('function landingTheme()'), app.indexOf('function renderLanding()'));
+    const theme = (pinned: string | null, systemLight: boolean) => {
+      const attrs: Record<string, string> = pinned ? { 'data-theme': pinned } : {};
+      const stored: Record<string, string> = {};
+      const button = { title: '', label: '', setAttribute(_: string, value: string) { this.label = value; } };
+      const api = new Function('document', 'window', 'localStorage', `${helpers}; return { landingTheme, toggleLandingTheme };`)(
+        { documentElement: { getAttribute: (key: string) => attrs[key] ?? null, setAttribute: (key: string, value: string) => { attrs[key] = value; } } },
+        { matchMedia: (query: string) => ({ matches: query === '(prefers-color-scheme: light)' && systemLight }) },
+        { setItem: (key: string, value: string) => { stored[key] = value; } });
+      const before = api.landingTheme();
+      api.toggleLandingTheme(button);
+      return { before, after: attrs['data-theme'], stored: stored['karmax-theme'], label: button.label };
+    };
+    expect(theme(null, true)).toEqual({ before: 'light', after: 'dark', stored: 'dark', label: 'Switch to light theme' });
+    expect(theme(null, false)).toEqual({ before: 'dark', after: 'light', stored: 'light', label: 'Switch to dark theme' });
+    expect(theme('dark', true).before).toBe('dark');
+    expect(theme('light', false).before).toBe('light');
+    // Tokens resolve against the colour scheme: system by default, pinned by data-theme.
+    const base = css.slice(css.indexOf('.landing-page {'), css.indexOf('}', css.indexOf('.landing-page {')));
+    expect(base).toContain('color-scheme: light dark;');
+    expect(base).toContain('--l-bg: light-dark(#f6f7f9, #0e1015);');
+    expect(css).toContain('html[data-theme="light"] :is(body.landing-active, .landing-page) { color-scheme: light; }');
+    expect(css).toContain('html[data-theme="dark"] :is(body.landing-active, .landing-page) { color-scheme: dark; }');
+    // The landing ignores the old blue/serif palette and uses the console's tokens.
+    expect(css).not.toContain('--land-');
   });
 
   it('is responsive, keyboard-visible, and respects reduced motion', () => {
