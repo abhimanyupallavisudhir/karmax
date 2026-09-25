@@ -3515,7 +3515,7 @@ function onboardingStep(number, key, title, detail, action) {
   const step = S.onboarding?.steps?.[key] || {};
   return `<li class="onboarding-step ${step.complete ? 'complete' : ''}">
     <span class="onboarding-check" aria-hidden="true">${step.complete ? '✓' : number}</span>
-    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
+    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' || key === 'paidPlan' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
       <p>${detail}</p>${action}</div>
   </li>`;
 }
@@ -3580,9 +3580,10 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Add an E2B API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-compute">${state.steps.e2b.complete ? 'Manage E2B' : 'Set up E2B'}</a>`)}
-      ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
-      ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
+      ${onboardingStep(3, 'e2b', 'Add an E2B or Daytona API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-compute">${state.steps.e2b.complete ? 'Manage E2B/Daytona' : 'Set up E2B/Daytona'}</a>`)}
+      ${onboardingStep(4, 'optional', 'Connect apps, and add payments and a payment card', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-connections">Connect apps</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
+      ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
+      ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
@@ -16694,6 +16695,7 @@ function profileView() {
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
+    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><p class="task-sub">Paid-plan subscriptions started through your account. Organization owners can change or cancel them in Plans &amp; billing.</p><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
     <div class="card data-export-card">
       <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
       <div class="data-export-copy">
@@ -16813,6 +16815,32 @@ function wireNotificationsCard() {
   });
 }
 
+function profilePaidSubscriptionsMarkup(subscriptions) {
+  if (!subscriptions.length) return '<p class="task-sub">No paid subscriptions are linked to your account. Unfinished checkouts and gifted plans are not listed.</p>';
+  return subscriptions.map(subscription => {
+    const end = subscription.cancelAtPeriodEnd
+      ? ` · cancellation scheduled${subscription.currentPeriodEnd ? ` for ${new Date(subscription.currentPeriodEnd).toLocaleDateString()}` : ''}` : '';
+    return `<div class="member-row"><div><b>${esc(subscription.organizationName)}</b><p class="task-sub">${esc(subscription.planName)} · ${esc(subscription.status)}${esc(end)}</p>
+      ${!subscription.canManage ? '<p class="task-sub">You no longer have billing-management access. Contact an organization owner or <a href="/legal/billing">billing support</a> for changes or cancellation.</p>' : ''}</div>
+      ${subscription.settingsUrl ? `<a class="btn sm" data-spa href="${esc(subscription.settingsUrl)}">Plans &amp; billing</a>` : ''}</div>`;
+  }).join('');
+}
+
+async function hydrateProfilePaidSubscriptions() {
+  const box = $('#profile-paid-subscriptions');
+  if (!box) return;
+  const userId = S.user?.id;
+  try {
+    const result = await api('/api/user/paid-subscriptions');
+    if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
+    box.innerHTML = profilePaidSubscriptionsMarkup(result.subscriptions);
+  } catch (error) {
+    if ($('#profile-paid-subscriptions') !== box || S.user?.id !== userId) return;
+    box.innerHTML = `<p class="task-sub" role="alert">Could not load paid subscriptions: ${esc(error.message)}</p><button class="btn sm" type="button">Retry</button>`;
+    box.querySelector('button')?.addEventListener('click', () => hydrateProfilePaidSubscriptions());
+  }
+}
+
 function wireProfileView() {
   const reset = $('#profile-reset-onboarding');
   reset?.addEventListener('click', async () => {
@@ -16828,6 +16856,7 @@ function wireProfileView() {
   });
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
+  void hydrateProfilePaidSubscriptions();
   hydrateProfileGithub();
   wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
     const preference = await api('/api/user/default-organization', {

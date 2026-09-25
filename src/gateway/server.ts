@@ -167,7 +167,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p === '/api/users/erasure-cases' || /^\/api\/users\/[^/]+\/erasure(?:\/export)?$/.test(p)) return 'user:write';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export' || p === '/api/user/default-organization'
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/paid-subscriptions'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
@@ -1994,6 +1994,27 @@ export class Gateway {
         return this.json(res, 202, { ...request, privacyContact: privacyContact ?? null,
           next: 'We will verify ownership and organization/resource transfer needs before irreversible deletion.' });
       }
+      if (p === '/api/user/paid-subscriptions' && method === 'GET') {
+        const subject = requireHumanSubject(callerIdentity);
+        // Personal billing metadata is cross-organization. A scoped agent must
+        // not use its human delegation to enumerate unrelated organizations.
+        if (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
+          return this.json(res, 403, { error: 'unscoped personal access is required' });
+        if (!this.deps.subscriptions) return this.json(res, 503, { error: 'subscription billing is unavailable' });
+        const subscriptions = [];
+        for (const subscription of await this.deps.subscriptions.paidSubscriptionsForUser(subject.userId)) {
+          const organization = await store.getOrganization(subscription.organizationId);
+          if (!organization) continue;
+          const membership = await store.organizationMembership(organization.id, subject.userId);
+          const paymentAllowed = this.deps.identity && session.userId === subject.userId && this.deps.authorization
+            ? allows(await this.deps.authorization.capabilities(`user:${subject.userId}`, undefined, organization.id), 'payment:write')
+            : (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
+          const canManage = membership?.role === 'owner' && paymentAllowed;
+          subscriptions.push({ ...subscription, organizationName: organization.name, canManage: Boolean(canManage),
+            settingsUrl: membership ? `${await organizationSettingsPath(store, organization.id)}#settings-plan` : null });
+        }
+        return this.json(res, 200, { subscriptions });
+      }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
         const operator = allows(authRecord.caps, 'authorization:read');
@@ -2038,12 +2059,15 @@ export class Gateway {
           global: parsePolicy((await store.kvGet(credPolicyKey.organization(organizationId)))),
         });
         const e2b = (await store.getWorldProviderConnection(organizationId, 'e2b'));
+        const daytona = await store.getWorldProviderConnection(organizationId, 'daytona');
         const facts = {
           github: Boolean((await this.deps.identity?.providersForUser(subject.userId))?.includes('github')
             || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
             || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
-          e2b: Boolean(e2b?.enabled && this.deps.broker?.hasHandle(e2b.credentialHandle)),
+          e2b: [e2b, daytona].some(connection => connection?.enabled
+            && this.deps.broker?.hasHandle(connection.credentialHandle)),
+          paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: (await store.listOrganizationCards(organizationId)).length > 0,

@@ -18,6 +18,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { VaultItems } from '../src/autonomy/vault-items.js';
+import { FakeSubscriptionProvider, SubscriptionBillingService } from '../src/billing/subscriptions.js';
 
 const closers: Array<() => Promise<void>> = [];
 const tempDirs: string[] = [];
@@ -34,6 +35,7 @@ async function boot(hosted: boolean) {
   tempDirs.push(dir);
   const broker = new CredentialBroker(new Vault(dir));
   const providers = new WorldProviderConnectionService(store, broker);
+  const subscriptions = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), hosted);
   const gateway = (await Gateway.create({
     api: {} as any,
     store,
@@ -50,6 +52,7 @@ async function boot(hosted: boolean) {
     worlds: new WorldRegistry(),
     broker,
     providerConnections: providers,
+    subscriptions,
     hosted,
   }));
   const running = await gateway.listen(port);
@@ -67,10 +70,32 @@ async function boot(hosted: boolean) {
     },
   );
   const request = (method = 'GET', body?: object) => onboarding('org_personal', method, body);
-  return { store, identity, broker, providers, request, onboarding, base: running.url, cookie };
+  return { store, identity, broker, providers, subscriptions, request, onboarding, base: running.url, cookie };
 }
 
 describe('hosted onboarding status API', () => {
+  it('accepts Daytona instead of E2B and keeps the paid plan optional', async () => {
+    const { store, broker, providers, request, subscriptions } = await boot(true);
+    expect((await (await request()).json() as any).steps.paidPlan).toEqual({ complete: false, blocking: false });
+    await providers.save({ organizationId: 'org_personal', provider: 'daytona', apiKey: 'daytona-test' });
+    expect((await (await request()).json() as any).steps.e2b.complete).toBe(true);
+    await providers.delete('org_personal', 'daytona');
+    expect((await (await request()).json() as any).steps.e2b.complete).toBe(false);
+    await providers.save({ organizationId: 'org_personal', provider: 'daytona', apiKey: 'daytona-test' });
+    await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
+      installationId: 'daytona-onboarding', accountLogin: 'alice', accountType: 'User' });
+    await broker.registerHandle('openai:first', 'sk-test');
+    await store.createProject('Daytona project', {}, 'org_personal');
+    const complete = await (await request()).json() as any;
+    expect(complete).toMatchObject({ complete: true, completedRequired: 4, totalRequired: 4 });
+    expect(complete.steps.paidPlan).toEqual({ complete: false, blocking: false });
+    await subscriptions.checkout('org_personal', 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'optional-paid');
+    expect((await (await request()).json() as any).steps.paidPlan.complete).toBe(false);
+    await subscriptions.handleWebhook(Buffer.from(JSON.stringify({ id: 'optional-active', type: 'customer.subscription.updated',
+      created: 100, data: { object: { id: 'sub_optional', customer: 'cus_org_personal', status: 'active',
+        items: { data: [{ id: 'si', price: { id: 'price_individual' }, quantity: 1 }] } } } })));
+    expect((await (await request()).json() as any).steps.paidPlan).toEqual({ complete: true, blocking: false });
+  });
   it('persists display state, derives required steps from live state, and makes completion sticky', async () => {
     const { store, broker, providers, request } = await boot(true);
     const initial = await (await request()).json() as any;

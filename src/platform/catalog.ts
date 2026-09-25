@@ -16,7 +16,7 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/repositories/create',
       'GET /api/projects/:projectId/github-merge-eligibility',
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
-      'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
+      'GET /api/user/export', 'GET /api/user/paid-subscriptions', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
       'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
       'POST|PUT|DELETE /api/projects/:projectId/avatars/:avatarId (owner delegation; may not grant beyond token authority)',
       'PUT /api/organizations/:organizationId/usage-policy (funding/concurrency changes require owner delegation)',
@@ -93,6 +93,7 @@ export const PLATFORM_API_CATALOG = {
   organizations: [
     'GET /api/organization-directory (verified user subject; names only, public or member organizations; operator sees all; does not grant resource access)',
     'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
+    'GET /api/user/paid-subscriptions (unscoped verified human subject; subscriptions attributed to their checkout records, with organization settings links; excludes unpaid checkouts and gifts)',
     'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display: expanded|minimized|closed)',
     'POST /api/user/onboarding/reset (restart the signed-in user’s hosted walkthrough in each organization)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
