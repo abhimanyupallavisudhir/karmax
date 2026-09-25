@@ -8027,9 +8027,11 @@ function wireReviewActions(v) {
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
         const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
         reviewActionWs = ws;
+        let exited = false;
         ws.onmessage = (m) => {
           try {
             const msg = JSON.parse(m.data);
+            if (msg.type === 'exit') exited = true;
             if (!out) return;
             if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; }
             else if (msg.type === 'exit') { out.textContent += `\n[exited: code ${msg.code}]\n`; setStopBtn(false); }
@@ -8037,10 +8039,11 @@ function wireReviewActions(v) {
         };
         ws.onclose = () => setStopBtn(false);
         setStopBtn(true, r.procId, v.taskId);
-        // A server keeps running — open its pages once it's had a moment to boot.
+        // A server keeps running — open its pages once it's had a moment to boot,
+        // unless it already failed; its output then says why.
         const openable = (Array.isArray(r.openUrls) ? r.openUrls : []).filter((u) => /^https?:/i.test(String(u)));
         if (r.server && openable.length) {
-          setTimeout(() => openable.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+          setTimeout(() => { if (!exited) openable.forEach((u) => window.open(u, '_blank', 'noopener')); }, 1500);
         } else if (openable.length) {
           openable.forEach((u) => window.open(u, '_blank', 'noopener'));
         }

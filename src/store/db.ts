@@ -6680,9 +6680,14 @@ export class Store {
       .map(rowToPreviewLease);
   }
 
+  /** Caddy's on-demand TLS gate. It asks only whether karmax issued the name:
+   * a stopped or expired preview keeps its certificate for a grace period so
+   * the browser gets karmax's "preview stopped" page over HTTPS rather than a
+   * bare TLS failure (task 364). Liveness is enforced per request. */
   async previewHostnameAllowed(hostname: string, now = Date.now()): Promise<boolean> {
+    if (!hostname) return false;
     return Boolean((await this.db.prepare(`SELECT 1 FROM preview_leases
-      WHERE hostname=? AND revokedAt IS NULL AND expiresAt>? LIMIT 1`).get(hostname.toLowerCase(), now)));
+      WHERE hostname=? AND expiresAt>? LIMIT 1`).get(hostname.toLowerCase(), now - PREVIEW_TLS_GRACE_MS)));
   }
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
@@ -7674,6 +7679,10 @@ function rowToExecution(row: any): ExecutionRecord {
     runnerLeaseId: row.runnerLeaseId ?? undefined,
   };
 }
+
+/** How long after a preview lease's expiry its hostname may still get a
+ * certificate. Bounded so Caddy stops renewing certificates for dead names. */
+export const PREVIEW_TLS_GRACE_MS = 24 * 60 * 60_000;
 
 function rowToPreviewLease(row: any): PreviewLease {
   return {

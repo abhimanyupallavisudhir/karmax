@@ -517,9 +517,12 @@ class E2BWorld implements World {
       for (const listener of exits) listener(exitCode);
     }).catch((error) => {
       stopKeepAlive();
-      emit(error?.message ?? error);
+      // wait() rejects with CommandExitError for every nonzero exit; its stderr
+      // has already streamed. Only a lost stream has no status of its own.
+      const code = processExitCode(error);
+      if (code === undefined) emit(error?.message ?? error);
       exited = true;
-      exitCode = -1;
+      exitCode = code ?? -1;
       for (const listener of exits) listener(exitCode);
     });
     return {
@@ -732,6 +735,13 @@ function ptyEnding(error: any): { code: number | null; termination?: WorldPtyTer
     ? ENVD_SIGNALS[/^signal: (.+?)(?: \(core dumped\))?$/.exec(String(error.error ?? error.message ?? ''))?.[1] ?? '']
     : undefined;
   return signal ? { code: null, termination: { signal } } : { code: error.exitCode };
+}
+
+/** The status of a background process that exited nonzero; undefined when the
+ * stream ended without one or envd reports a signal (-1). */
+function processExitCode(error: any): number | undefined {
+  const code = error?.exitCode;
+  return typeof code === 'number' && Number.isInteger(code) && code >= 0 ? code : undefined;
 }
 
 /** E2B uses CommandExitError with a numeric exitCode for ordinary process

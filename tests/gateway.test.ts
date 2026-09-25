@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
+import { previewLeaseOrigin } from '../src/gateway/previews.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
 import { detectConversationImport } from '../src/store/conversation-imports.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
@@ -288,6 +289,22 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         request.on('error', reject); request.end();
       });
       expect(blocked).toBe(404);
+      // A stopped preview answers a person with a page and a program with JSON
+      // (task 364: the tab showed a TLS error and nothing else).
+      const stopped = (accept: string) => new Promise<{ status: number; type: string; body: string }>((resolve, reject) => {
+        const request = http.request({ hostname: target.hostname, port: target.port, path: '/preview/lease-gone/',
+          headers: { host: new URL(previewLeaseOrigin('lease-gone')).host, accept } }, (response) => {
+          let body = '';
+          response.on('data', (chunk) => { body += chunk; });
+          response.on('end', () => resolve({ status: response.statusCode ?? 0,
+            type: String(response.headers['content-type']), body }));
+        });
+        request.on('error', reject); request.end();
+      });
+      const page = await stopped('text/html,application/xhtml+xml');
+      expect(page).toMatchObject({ status: 404, type: expect.stringContaining('text/html') });
+      expect(page.body).toContain('This preview has stopped');
+      expect(JSON.parse((await stopped('application/json')).body)).toEqual({ error: 'preview not found or expired' });
       const redirected = await fetch(`${base}/preview/lease-1/`, { redirect: 'manual' });
       expect(redirected.status).toBe(307);
       expect(redirected.headers.get('location')).toMatch(/^http:\/\/p-[a-f0-9]{24}\.preview\.invalid\/preview\/lease-1\/$/);

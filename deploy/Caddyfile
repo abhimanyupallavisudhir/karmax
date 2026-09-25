@@ -95,8 +95,10 @@ www.{$KARMAX_DOMAIN} {
 }
 
 # Each live preview gets an opaque, isolated origin. Caddy asks Karmax whether
-# the lease is currently valid before obtaining a certificate, so this catch-all
-# cannot be abused to mint certificates for arbitrary names.
+# it issued the name (to a lease that is live or recently ended) before
+# obtaining a certificate, so this catch-all cannot be abused to mint
+# certificates for arbitrary names. A stopped preview therefore still answers
+# over HTTPS with a page saying so, instead of failing the TLS handshake.
 https:// {
 	tls {
 		on_demand
