@@ -1,8 +1,14 @@
 import { beforeAll, it } from 'vitest';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { Worker, bundleWorkflowCode } from '@temporalio/worker';
-import { temporal } from '@temporalio/proto';
+// @temporalio/proto 1.24 advertises index.d.ts but omits it from the package.
+const { temporal } = createRequire(import.meta.url)('@temporalio/proto') as {
+  temporal: { api: { history: { v1: { History: {
+    fromObject: (value: object) => Parameters<typeof Worker.runReplayHistory>[1];
+  } } } } };
+};
 
 // Minimal, sanitized Setup prefix from a softwareDev@1.26.0 execution that
 // recorded the temporary resource-aware setup patch. After an image rebuild
