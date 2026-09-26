@@ -1,9 +1,56 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
 describe('organization and collaboration domain', () => {
+  it('delivers task headers without hydrating full conversations', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const org = await store.createOrganization({ name: 'Delivery', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const task = await store.createTask({ projectId: project.id, title: 'Approval', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'credential.approval-requested', ts: Date.now(), payload: {} });
+      const getTask = vi.spyOn(store, 'getTask');
+      const delivered: string[] = [];
+      const dispatcher = new DeliveryDispatcher(store, { browser: { deliver: async ({ task }) => {
+        if (task) delivered.push(task.title);
+      } } });
+      await dispatcher.drain();
+      expect(delivered).toEqual(['Approval']);
+      expect(getTask).not.toHaveBeenCalled();
+    } finally { await store.close(); }
+  });
+
+  it('does not treat a longer team route as a reference to its prefix', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const org = await store.createOrganization({ name: 'Teams', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const dev = await store.createTeam({ organizationId: org.id, name: 'Dev' });
+      const developers = await store.createTeam({ organizationId: org.id, name: 'Developers' });
+      await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', responder: { kind: 'human', audience: ['@team:developers'] } } });
+      await store.deleteTeam(dev.id);
+      expect(await store.getTeam(dev.id)).toBeUndefined();
+      await expect(store.deleteTeam(developers.id)).rejects.toThrow(/still used/);
+    } finally { await store.close(); }
+  });
+
+  it('delivers simultaneous authorization asks even when request hashes collide', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']] as const)
+        await store.addAuthorizationInbox(org.id, ['owner'],
+          { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
+      const inbox = await store.listInbox('owner', org.id);
+      expect(inbox.map((row) => row.subject?.requestId).sort()).toEqual(['Aa', 'BB']);
+    } finally { await store.close(); }
+  });
+
   it('routes email by urgency for task and resource asks, retaining legacy defaults', async () => {
     const store = (await Store.create(':memory:'));
     const org = (await store.createOrganization({ name: 'Email', ownerUserId: 'owner' }));

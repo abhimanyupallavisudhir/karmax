@@ -217,6 +217,8 @@ export class WorldLifecycleManager {
         });
       }
     }
+    for (const [key, probedAt] of this.probedAt)
+      if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
     await this.reapOrphanSandboxes();
     let hibernated = 0;
     for (const candidate of (await this.store.listWorldInstances('parked'))) {

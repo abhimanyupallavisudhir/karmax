@@ -1029,7 +1029,7 @@ export class GitHubAppService {
       const observation = githubPrWebhookObservationKey(prEvent);
       if (observation) {
         const digest = crypto.createHash('sha256').update(observation).digest('hex');
-        if (!(await this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId)))
+        if (!(await this.store.claimGithubPrObservation(digest)))
           return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       }
       return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };

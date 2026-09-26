@@ -52,6 +52,15 @@ async function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Pr
 }
 
 describe('durable background collaboration requests', () => {
+  it('routes ordinary view updates from their payload without hydrating the task', async () => {
+    const f = await fixture();
+    const getTask = vi.spyOn(f.store, 'getTask');
+    f.bus.emit({ taskId: f.target.id, type: 'view.updated', ts: Date.now(),
+      payload: { stage: 'do', status: 'active' }, seq: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(getTask).not.toHaveBeenCalled();
+  });
+
   it('returns immediately after registering the requester and nudging the target', async () => {
     const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {

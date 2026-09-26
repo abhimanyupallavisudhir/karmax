@@ -4646,7 +4646,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         eventSeq: event.seq,
       }, event.seq));
     } else if (event.type === 'view.updated') {
-      const current = (await this.deps.store.getTask(event.taskId))?.lastView;
+      const payload = (event.payload ?? {}) as { stage?: unknown; status?: unknown };
+      const current = typeof payload.stage === 'string' && typeof payload.status === 'string'
+        ? undefined : (await this.deps.store.getTask(event.taskId))?.lastView;
       const issue = collaborationTargetIssueFromViewEvent(event.payload, current);
       if (issue) {
         settled = (await this.deps.store.settleCollaborationRequests(event.taskId, 'failed', {

@@ -32,6 +32,29 @@ describe('durable conversation publication', () => {
     } finally { ctx.mockRestore(); await store.close(); }
   });
 
+  it('prunes old terminal snapshots after the retry window while retaining the current reference', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const old = `view-conversation:${task.id}:run:0`;
+    const current = `view-conversation:${task.id}:run:1`;
+    await store.kvSet(old, JSON.stringify({ messages: [{ id: 'old', role: 'agent', text: 'old', ts: 1 }] }));
+    await store.kvSet(current, JSON.stringify({ messages: [{ id: 'new', role: 'agent', text: 'new', ts: 2 }] }));
+    await store.kvSet(`view-publication-fence:${task.id}:run:activity`, '1');
+    await store.kvSet(`turnsession:${task.id}#1`, 'session');
+    await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+      stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }, 'run:1');
+    try {
+      const result = await store.retentionSweep(30 * 24 * 60 * 60 * 1000);
+      expect(result.viewSnapshots).toBe(1);
+      expect(await store.kvGet(old)).toBeUndefined();
+      expect(await store.kvGet(current)).toBeDefined();
+      expect(await store.kvEntries(`view-publication-fence:${task.id}:`)).toEqual([]);
+      expect(await store.kvEntries(`turnsession:${task.id}#`)).toEqual([]);
+      expect((await store.getTask(task.id))?.lastView?.messages[0]?.text).toBe('new');
+    } finally { await store.close(); }
+  });
+
   it('reuses immutable snapshots across restarts, mutations, and late retries', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Publication', {}));

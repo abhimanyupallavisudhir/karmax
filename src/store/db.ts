@@ -167,7 +167,7 @@ export class Store {
     // credential registration) must not instantly kill a long agent turn's
     // event append with "database is locked" (that error cost a merge-agent
     // turn mid-conflict-resolution — the 05f9802 postmortem).
-    (await this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;'));
+    (await this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;'));
     (await this.migrate());
     (await this.migrateData());
     (await this.migrateConversations());
@@ -212,13 +212,12 @@ export class Store {
     });
   }
 
-  /** One-time data migrations (idempotent; run every boot). */
-  private async migrateData() {
+  /** One-time data migrations. Legacy imports explicitly rerun them after copying rows. */
+  private async migrateData(force = false) {
     return this.db.transaction(async () => {
-
-    // Notifications whose ask was already answered — the backlog older builds
-    // never removed, and a net for any closing event this install missed.
-    (await this.pruneStaleInbox());
+    const marker = process.env.KARMAX_DEPLOYMENT === 'hosted'
+      ? 'migration:data-2026-09-26:hosted' : 'migration:data-2026-09-26';
+    if (!force && await this.kvGet(marker)) return;
 
     // Early organization-policy builds expanded their infrastructure defaults
     // into every project. Those records accidentally became permanent project
@@ -361,6 +360,7 @@ export class Store {
     (await this.db.prepare(`DELETE FROM usage_events WHERE provider='e2b' AND kind='world.active'
       AND (metadata IS NULL OR json_extract(metadata, '$.source') IS NULL
         OR json_extract(metadata, '$.source') != 'provider-lifecycle')`).run());
+    (await this.kvSet(marker, '1'));
   
     });
   }
@@ -381,7 +381,7 @@ export class Store {
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, listId TEXT NOT NULL,
         title TEXT NOT NULL, workflow TEXT NOT NULL, workflowVersion TEXT NOT NULL,
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
-        parentTaskId TEXT, lastView TEXT, createdBy TEXT, assignee TEXT,
+        parentTaskId TEXT, lastView TEXT, completedAt INTEGER, createdBy TEXT, assignee TEXT,
         delegate TEXT, confirmationPolicy TEXT
       );
       CREATE TABLE IF NOT EXISTS organizations (
@@ -473,6 +473,9 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
         deliveryId TEXT PRIMARY KEY, event TEXT NOT NULL, receivedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS github_pr_observations (
+        digest TEXT PRIMARY KEY, createdAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS github_install_states (
         tokenHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
@@ -613,8 +616,12 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS scoped_tokens (
         tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE, json TEXT NOT NULL,
-        expiresAt INTEGER NOT NULL, revokedAt INTEGER
+        expiresAt INTEGER NOT NULL, revokedAt INTEGER, principal TEXT, organizationId TEXT
       );
+      CREATE TABLE IF NOT EXISTS scoped_token_projects (
+        tokenHash TEXT NOT NULL, projectId TEXT NOT NULL, PRIMARY KEY(tokenHash, projectId)
+      );
+      CREATE INDEX IF NOT EXISTS idx_scoped_token_projects_project ON scoped_token_projects(projectId, tokenHash);
       CREATE TABLE IF NOT EXISTS human_delegations (
         id TEXT PRIMARY KEY,
         json TEXT NOT NULL,
@@ -770,6 +777,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_inbox_task ON inbox(taskId, kind);
       CREATE INDEX IF NOT EXISTS idx_repositories_org ON repositories(organizationId, owner, name);
       CREATE INDEX IF NOT EXISTS idx_github_install_states_expiry ON github_install_states(expiresAt, usedAt);
+      CREATE INDEX IF NOT EXISTS idx_github_pr_observations_created ON github_pr_observations(createdAt);
       CREATE INDEX IF NOT EXISTS idx_scoped_tokens_expiry ON scoped_tokens(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_human_delegations_expiry ON human_delegations(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_world_instances_current ON world_instances(worldId, generation DESC);
@@ -791,6 +799,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
+      CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, taskId);
+      CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
@@ -801,6 +811,13 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `));
+    if (this.db.dialect === 'postgres')
+      await this.db.exec('CREATE INDEX IF NOT EXISTS idx_kv_key_c ON kv (k COLLATE "C")');
+    if (!(await this.kvGet('migration:github-pr-observations'))) {
+      await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+        .run('github:pr-observation:v1:', 'github:pr-observation:v1;');
+      await this.kvSet('migration:github-pr-observations', '1');
+    }
     // An installation belongs to a GitHub account, which may serve multiple
     // Tavya organizations. Rebuild the old inline UNIQUE constraint atomically;
     // IDs stay intact so repository links and cached credential handles survive.
@@ -849,6 +866,34 @@ export class Store {
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
+    const scopedTokenCols = await this.db.prepare('PRAGMA table_info(scoped_tokens)').all() as Array<{ name: string }>;
+    if (!scopedTokenCols.some((column) => column.name === 'principal'))
+      (await this.db.exec('ALTER TABLE scoped_tokens ADD COLUMN principal TEXT'));
+    if (!scopedTokenCols.some((column) => column.name === 'organizationId'))
+      (await this.db.exec('ALTER TABLE scoped_tokens ADD COLUMN organizationId TEXT'));
+    (await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_scoped_tokens_principal ON scoped_tokens(principal, revokedAt);
+      CREATE INDEX IF NOT EXISTS idx_scoped_tokens_organization ON scoped_tokens(organizationId, revokedAt)`));
+    for (const row of await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE principal IS NULL').all() as Array<{ tokenHash: string; json: string }>) {
+      let record: Record<string, unknown>;
+      try { record = JSON.parse(row.json); } catch { continue; }
+      (await this.db.prepare('UPDATE scoped_tokens SET principal=?, organizationId=? WHERE tokenHash=?')
+        .run(typeof record.principal === 'string' ? record.principal : '',
+          typeof record.organizationId === 'string' ? record.organizationId : null, row.tokenHash));
+      for (const projectId of await this.scopedTokenProjectIds(record))
+        (await this.db.prepare('INSERT OR IGNORE INTO scoped_token_projects(tokenHash,projectId) VALUES (?,?)')
+          .run(row.tokenHash, projectId));
+    }
+    if (!cols.some((c) => c.name === 'completedAt')) {
+      (await this.db.exec('ALTER TABLE tasks ADD COLUMN completedAt INTEGER'));
+      (await this.db.exec(`UPDATE tasks SET completedAt=(SELECT MIN(e.ts) FROM events e
+        WHERE e.taskId=tasks.id AND e.type='view.updated'
+          AND json_extract(e.payload, '$.status')='done')
+        WHERE EXISTS (SELECT 1 FROM events e WHERE e.taskId=tasks.id
+          AND e.type='view.updated' AND json_extract(e.payload, '$.status')='done');
+        UPDATE tasks SET completedAt=CAST(json_extract(lastView, '$.updatedAt') AS BIGINT)
+        WHERE completedAt IS NULL AND json_extract(lastView, '$.status')='done'`));
+    }
+    (await this.db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completedAt, projectId)'));
     const projectCols = (await this.db.prepare('PRAGMA table_info(projects)').all()) as any[];
     const cardCols = (await this.db.prepare('PRAGMA table_info(cards)').all()) as { name: string }[];
     if (!cardCols.some((c) => c.name === 'externalId')) (await this.db.exec('ALTER TABLE cards ADD COLUMN externalId TEXT'));
@@ -1474,6 +1519,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM world_leases WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM usage_admissions WHERE projectId=?').run(id));
       (await this.db.prepare('UPDATE usage_events SET projectId=NULL, taskId=NULL, worldId=NULL, metadata=NULL WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM settings WHERE scopeKey IN (?, ?)').run(id, `quick:${id}`));
       (await this.db.prepare('DELETE FROM cards WHERE scopeId=?').run(id));
@@ -1890,8 +1936,6 @@ export class Store {
    * their tasks and notifications, and their own authorization history. It must
    * never become a shortcut for downloading every organization they belong to. */
   async exportUserData(userId: string, email?: string): Promise<Record<string, unknown>> {
-    return this.db.transaction(async () => {
-
     const includeTiming = (await this.getSettings('global', 'timing'))?.enabled === true;
     const principalId = `user:${userId}`;
     const memberships = (await selectRows(this.db, 'organization_memberships', 'userId=?', [userId]));
@@ -2012,8 +2056,6 @@ export class Store {
         auditLog,
       },
     };
-  
-    });
   }
 
   async projectResources(projectId: string): Promise<{ worlds: WorldHandleRef[]; objectKeys: string[];
@@ -2379,9 +2421,8 @@ export class Store {
       for (const projectId of projectIds)
         (await this.db.prepare('DELETE FROM principal_grants WHERE principalId=? AND scopeKey=?').run(`user:${userId}`, `project:${projectId}`));
       (await this.db.prepare('DELETE FROM principal_grants WHERE principalId=? AND scopeKey=?').run(`user:${userId}`, `organization:${organizationId}`));
-      for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-        try { if (JSON.parse(row.json).principal === `user:${userId}`) (await this.revokeScopedToken({ tokenHash: row.tokenHash })); } catch {}
-      }
+      (await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE principal=? AND revokedAt IS NULL')
+        .run(Date.now(), `user:${userId}`));
       (await this.revokeHumanDelegations({ humanUserId: userId }));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -2462,7 +2503,7 @@ export class Store {
     // creation idempotent and prevent double-click/network retries from drawing
     // the same team twice.
     const existing = (await this.db.prepare(`SELECT * FROM teams WHERE organizationId=?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(organization.id, input.projectId ?? null, input.projectId ?? null, slug)) as any;
     if (existing) return rowToTeam(existing);
     const team: Team = { id: newId('team'), organizationId: organization.id, projectId: input.projectId,
@@ -2504,10 +2545,10 @@ export class Store {
     if (!name) throw new Error('team name is required');
     const slug = slugify(name);
     const conflict = (await this.db.prepare(`SELECT id FROM teams WHERE organizationId=? AND id<>?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug)) as any;
     const aliasConflict = (await this.db.prepare(`SELECT teamId FROM team_aliases WHERE organizationId=? AND teamId<>?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug)) as any;
     if (conflict || aliasConflict) throw new Error(`a team already uses @team:${slug}`);
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -2534,6 +2575,15 @@ export class Store {
     const selectors = [`team:${team.id}`, `@team:${team.slug}`,
       ...((await this.db.prepare('SELECT slug FROM team_aliases WHERE teamId=?').all(team.id)) as any[])
         .map((row) => `@team:${String(row.slug)}`)];
+    const mentionsTeam = (json: string | null): boolean => {
+      if (!json) return false;
+      const contains = (value: unknown): boolean => typeof value === 'string'
+        ? selectors.includes(value)
+        : Array.isArray(value) ? value.some(contains)
+          : value !== null && typeof value === 'object' && Object.values(value).some(contains);
+      try { return contains(JSON.parse(json)); }
+      catch { return selectors.some((selector) => json.includes(selector)); }
+    };
     const projectUse = (await this.db.prepare('SELECT COUNT(*) count FROM project_memberships WHERE principalKey=?')
       .get(`team:${team.id}`)) as any;
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(team.organizationId)) as any[])
@@ -2541,12 +2591,12 @@ export class Store {
     const settingScopes = new Set([`organization:${team.organizationId}`, `quick:organization:${team.organizationId}`,
       ...projectIds, ...projectIds.map((projectId) => `quick:${projectId}`)]);
     const settingUse = ((await this.db.prepare('SELECT scopeKey, json FROM settings').all()) as any[])
-      .some((row) => settingScopes.has(String(row.scopeKey)) && selectors.some((selector) => String(row.json).includes(selector)));
+      .some((row) => settingScopes.has(String(row.scopeKey)) && mentionsTeam(String(row.json)));
     const unfinishedUse = ((await this.db.prepare(`SELECT params, lastView FROM tasks t JOIN projects p ON p.id=t.projectId
       WHERE p.organizationId=?`).all(team.organizationId)) as any[]).some((row) => {
         let done = false;
         try { done = ['done', 'failed', 'cancelled'].includes(String(JSON.parse(row.lastView ?? '{}').status)); } catch {}
-        return !done && selectors.some((selector) => String(row.params).includes(selector) || String(row.lastView).includes(selector));
+        return !done && (mentionsTeam(row.params) || mentionsTeam(row.lastView));
       });
     if (Number(projectUse?.count ?? 0) || settingUse || unfinishedUse)
       throw new Error('This team is still used by project access or a workflow route. Remove those references before deleting it.');
@@ -3561,6 +3611,20 @@ export class Store {
     return (await this.attachTags(projectId, tasks));
   }
 
+  /** Reconciliation needs every live attempt, but neither tags nor full conversations. */
+  async listReconciliationCandidates(projectId: string): Promise<TaskRecord[]> {
+    const rows = await this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
+      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
+      notes, lastView FROM tasks WHERE projectId=?
+      AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND COALESCE(LOWER(CAST(json_extract(params, '$.draft') AS TEXT)), '') NOT IN ('true', '1')
+      AND COALESCE(json_extract(params, '$.triggerState'), '') <> 'armed'
+      AND COALESCE(LOWER(CAST(json_extract(params, '$.repeatable') AS TEXT)), '') NOT IN ('true', '1')
+      ORDER BY ord, createdAt`).all(projectId) as any[];
+    return rows.map(rowToTask);
+  }
+
   /** Tasks currently armed on a trigger (stored-not-started), across all projects.
    *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3).
    *
@@ -3609,9 +3673,10 @@ export class Store {
       JOIN tasks t ON t.id=s.taskId WHERE t.projectId=? ORDER BY s.createdAt`).all(projectId)) as any[];
     const bySubscriber = new Map<string, PrincipalRef[]>();
     for (const r of subscribers) (bySubscriber.get(r.taskId) ?? bySubscriber.set(r.taskId, []).get(r.taskId)!).push(JSON.parse(r.principal));
+    const readAudience = this.audienceReader();
     for (const t of tasks) {
       t.subscribers = bySubscriber.get(t.id) ?? [];
-      if (t.confirmationPolicy) t.reviewers = (await this.reviewAudience(t));
+      if (t.confirmationPolicy) t.reviewers = await runAudienceAsync(reviewAudience(t), readAudience);
     }
     return tasks;
   }
@@ -3665,10 +3730,12 @@ export class Store {
       } else {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
+        (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
       }
     } else {
       (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=?, conversationRef=NULL WHERE id=?')
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
     }
     if (view.stage === 'review' && view.status === 'waiting'
       && (prev?.lastView?.stage !== 'review' || prev.lastView.status !== 'waiting') && prev?.confirmationPolicy) {
@@ -4099,8 +4166,11 @@ export class Store {
   ): Promise<void> {
     return this.db.transaction(async () => {
 
-    const requestOffset = [...subject.requestId].reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) % 997, 0);
-    const eventSeq = createdAt * 1000 + requestOffset;
+    // Synthetic inbox events use negative, transaction-allocated sequence
+    // numbers; real event sequences are positive. Hashing request ids can
+    // collide for different simultaneous asks to the same user.
+    const eventSeq = Number(await this.kvGet('inbox:next-synthetic-seq') ?? '0') - 1;
+    await this.kvSet('inbox:next-synthetic-seq', String(eventSeq));
     for (const userId of new Set(userIds)) {
       (await this.deleteInbox("userId=? AND taskId=? AND kind='approval-requested'", [userId, `avatar:${subject.avatarId}`]));
       const item: InboxItem = {
@@ -5235,6 +5305,8 @@ export class Store {
         .prepare('INSERT INTO events (taskId, type, ts, payload, origin) VALUES (?, ?, ?, ?, ?)')
         .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload), PROCESS_EVENT_ORIGIN));
       const seq = Number(info.lastInsertRowid);
+      if (ev.type === 'view.updated' && ev.payload.status === 'done')
+        (await this.db.prepare('UPDATE tasks SET completedAt=? WHERE id=? AND completedAt IS NULL').run(ev.ts, ev.taskId));
       (await this.materializeInbox(seq, ev));
       if (!nested) (await this.db.exec('COMMIT'));
       return seq;
@@ -5260,6 +5332,11 @@ export class Store {
     }
     return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(taskId, seq)) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
+  async hasMergedTaskEvent(taskId: string): Promise<boolean> {
+    return !!(await this.db.prepare(`SELECT 1 FROM events WHERE taskId=? AND type='merge.result'
+      AND LOWER(CAST(json_extract(payload, '$.merged') AS TEXT)) IN ('true', '1') LIMIT 1`).get(taskId));
   }
 
   /** Sparse durable annotations should not disappear merely because a task has
@@ -6520,10 +6597,9 @@ export class Store {
       metadata: string | null; startedAt: number }>;
     cardSpend: Array<{ amount: number; currency: string; createdAt: number }>;
   }> {
-    const completions = (await this.db.prepare(`SELECT e.taskId AS taskId, MIN(e.ts) AS doneAt FROM events e
-      JOIN tasks t ON t.id=e.taskId JOIN projects p ON p.id=t.projectId
-      WHERE COALESCE(p.organizationId, 'org_personal')=? AND e.type='view.updated' AND e.payload LIKE ?
-      GROUP BY e.taskId HAVING MIN(e.ts)>=?`).all(organizationId, '%"status":"done"%', from)) as any[];
+    const completions = (await this.db.prepare(`SELECT t.id AS taskId, t.completedAt AS doneAt FROM tasks t
+      JOIN projects p ON p.id=t.projectId WHERE COALESCE(p.organizationId, 'org_personal')=?
+        AND t.completedAt>=?`).all(organizationId, from)) as any[];
     const admissions = (await this.db.prepare(`SELECT id, taskId, projectId, provider, model, state, createdAt, releasedAt
       FROM usage_admissions WHERE organizationId=? AND kind='agent' AND createdAt>=?`).all(organizationId, from)) as any[];
     const tokens = (await this.db.prepare(`SELECT id, taskId, projectId, provider, quantity, metadata, startedAt
@@ -7099,14 +7175,32 @@ export class Store {
 
   // ─── KV (misc small state) ───────────────────────────────────────────────────
 
+  private async scopedTokenProjectIds(record: Record<string, unknown>): Promise<string[]> {
+    const ids = new Set<string>();
+    if (typeof record.projectId === 'string') ids.add(record.projectId);
+    if (Array.isArray(record.projectIds))
+      for (const id of record.projectIds) if (typeof id === 'string') ids.add(id);
+    if (typeof record.taskId === 'string') {
+      const task = await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId) as { projectId: string } | undefined;
+      if (task) ids.add(task.projectId);
+    }
+    return [...ids];
+  }
+
   /** The raw bearer never enters SQLite; replicas verify its SHA-256 digest. */
   async putScopedToken(tokenHash: string, tokenId: string, record: Record<string, unknown>, expiresAt: number): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare(`INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt, revokedAt)
-      VALUES (?, ?, ?, ?, NULL) ON CONFLICT(tokenHash) DO UPDATE SET
-      tokenId=excluded.tokenId, json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL`)
-      .run(tokenHash, tokenId, JSON.stringify(record), expiresAt));
+    (await this.db.prepare(`INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt, revokedAt, principal, organizationId)
+      VALUES (?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(tokenHash) DO UPDATE SET
+      tokenId=excluded.tokenId, json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL,
+      principal=excluded.principal, organizationId=excluded.organizationId`)
+      .run(tokenHash, tokenId, JSON.stringify(record), expiresAt,
+        typeof record.principal === 'string' ? record.principal : '',
+        typeof record.organizationId === 'string' ? record.organizationId : null));
+    (await this.db.prepare('DELETE FROM scoped_token_projects WHERE tokenHash=?').run(tokenHash));
+    for (const projectId of await this.scopedTokenProjectIds(record))
+      (await this.db.prepare('INSERT INTO scoped_token_projects(tokenHash,projectId) VALUES (?,?)').run(tokenHash, projectId));
   
     });
   }
@@ -7186,23 +7280,18 @@ export class Store {
     });
   }
 
-  /** Revoke durable credentials whose serialized scope names a resource being
-   * deleted. Parsing keeps this compatible with pre-JSON1 SQLite builds and
-   * with historical token records that omitted newer scope fields. */
+  /** Revoke credentials by indexed scope rather than parsing every live token. */
   async revokeScopedTokens(scope: { projectId?: string; organizationId?: string }): Promise<number> {
     return this.db.transaction(async () => {
-
-    const update = this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE tokenHash=? AND revokedAt IS NULL');
     const now = Date.now();
     let revoked = 0;
-    for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-      let record: { projectId?: string; projectIds?: string[]; organizationId?: string; taskId?: string };
-      try { record = JSON.parse(row.json); } catch { continue; }
-        if ((scope.projectId && (record.projectId === scope.projectId || record.projectIds?.includes(scope.projectId)
-          || (record.taskId && (await this.taskProjectIdAsync(record.taskId)) === scope.projectId)))
-          || (scope.organizationId && record.organizationId === scope.organizationId))
-          revoked += Number((await update.run(now, row.tokenHash)).changes);
-    }
+    if (scope.projectId)
+      revoked += Number((await this.db.prepare(`UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL
+        AND tokenHash IN (SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)`)
+        .run(now, scope.projectId)).changes);
+    if (scope.organizationId)
+      revoked += Number((await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND organizationId=?')
+        .run(now, scope.organizationId)).changes);
     return revoked;
   
     });
@@ -7210,7 +7299,8 @@ export class Store {
 
   async purgeScopedTokens(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
-
+    (await this.db.prepare(`DELETE FROM scoped_token_projects WHERE tokenHash IN
+      (SELECT tokenHash FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL)`).run(now));
     return Number((await this.db.prepare('DELETE FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
   
     });
@@ -7240,6 +7330,16 @@ export class Store {
     });
   }
 
+  async claimGithubPrObservation(digest: string, now = Date.now()): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare(
+      'INSERT OR IGNORE INTO github_pr_observations(digest,createdAt) VALUES (?,?)')
+      .run(digest, now)).changes) === 1);
+  }
+
+  private kvRangeKey(): string {
+    return this.db.dialect === 'postgres' ? 'k COLLATE "C"' : 'k';
+  }
+
   /**
    * The periodic retention sweep. Every sweep here is idempotent and bounded, so
    * a caller can run it on any interval (hourly is plenty).
@@ -7255,15 +7355,56 @@ export class Store {
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
-    subscriptionRequests: number }> {
+    githubPrObservations: number; subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
+    events: number; auditEntries: number }> {
     return this.db.transaction(async () => {
+
+    // Keep immutable snapshots through a retry window. A late activity retry can
+    // still refer to an older revision while the workflow is live; settled tasks
+    // older than a week no longer need those superseded copies.
+    let viewSnapshots = 0, publicationFences = 0, turnSessions = 0;
+    const settled = await this.db.prepare(`SELECT id, conversationRef FROM tasks
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled')
+        AND CAST(json_extract(lastView, '$.updatedAt') AS BIGINT) < ?
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`)
+      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
+    for (const task of settled) {
+      const snapshotPrefix = `view-conversation:${task.id}:`;
+      viewSnapshots += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<? AND k<>?`)
+        .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);
+      const fencePrefix = `view-publication-fence:${task.id}:`;
+      publicationFences += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+        .run(fencePrefix, `view-publication-fence:${task.id};`)).changes);
+      const sessionPrefix = `turnsession:${task.id}#`;
+      turnSessions += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+        .run(sessionPrefix, `turnsession:${task.id}$`)).changes);
+      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:view:${task.id}`, '1'));
+    }
 
     return {
       scopedTokens: (await this.purgeScopedTokens(now)),
       humanDelegations: (await this.purgeHumanDelegations(now)),
       githubDeliveries: (await this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now)),
+      githubPrObservations: Number((await this.db.prepare(`DELETE FROM github_pr_observations WHERE digest IN
+        (SELECT digest FROM github_pr_observations WHERE createdAt<? ORDER BY createdAt LIMIT 10000)`)
+        .run(now - 30 * 86400_000)).changes),
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
+      viewSnapshots, publicationFences, turnSessions,
+      events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
+        (SELECT e.seq FROM events e WHERE e.ts<?
+          AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
+            'authorization.approval-requested', 'connection.requested')
+            OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
+              AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved',
+                'authorization.approval-resolved', 'connection.resolved',
+                'permission.approval-dismissed', 'authorization.approval-dismissed')
+              AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
+          ORDER BY e.ts, e.seq LIMIT 10000)`)
+        .run(now - 90 * 86400_000)).changes),
+      auditEntries: Number((await this.db.prepare(`DELETE FROM audit_log WHERE seq IN
+        (SELECT seq FROM audit_log WHERE ts<? ORDER BY ts, seq LIMIT 10000)`)
+        .run(now - 365 * 86400_000)).changes),
     };
   
     });
@@ -7327,7 +7468,22 @@ export class Store {
   }
 
   async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
-    return ((await this.db.prepare('SELECT k, v FROM kv WHERE k LIKE ? ORDER BY k').all(`${prefix}%`)) as any[])
+    const chars = Array.from(prefix);
+    let end: string | undefined;
+    for (let i = chars.length - 1; i >= 0; i--) {
+      const codePoint = chars[i]!.codePointAt(0)!;
+      if (codePoint < 0x10ffff) {
+        end = chars.slice(0, i).join('') + String.fromCodePoint(codePoint + 1);
+        break;
+      }
+    }
+    const key = this.kvRangeKey();
+    const rows = prefix
+      ? end
+        ? await this.db.prepare(`SELECT k, v FROM kv WHERE ${key} >= ? AND ${key} < ? ORDER BY ${key}`).all(prefix, end)
+        : await this.db.prepare(`SELECT k, v FROM kv WHERE ${key} >= ? ORDER BY ${key}`).all(prefix)
+      : await this.db.prepare('SELECT k, v FROM kv ORDER BY k').all();
+    return (rows as any[]).filter((row) => String(row.k).startsWith(prefix))
       .map((row) => ({ key: String(row.k), value: String(row.v) }));
   }
 
@@ -7393,7 +7549,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     (await this.migrate());
-    (await this.migrateData());
+    (await this.migrateData(true));
     (await this.migrateConversations());
   
     });
