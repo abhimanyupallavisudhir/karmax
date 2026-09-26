@@ -39,6 +39,7 @@ import { prepareCodexHistory } from './codex-history.js';
 import { readLocalCodexHistory, installLocalCodexSnapshot, publishLocalCodexHistory } from './codex-history-files.js';
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
+import { utf8Tail } from '../util/utf8-tail.js';
 import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
 
 /**
@@ -459,7 +460,7 @@ export class CodexAdapter implements AgentAdapter {
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     let stderr = '';
-    child.stderr?.on('data', (d: Buffer | string) => { stderr += d.toString(); });
+    child.stderr?.on('data', (d: Buffer | string) => { stderr = utf8Tail(stderr + d.toString(), 4096); });
 
     const cleanups: Array<() => void> = [];
     const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
@@ -571,7 +572,7 @@ export class CodexAdapter implements AgentAdapter {
     child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
       if (!shuttingDown && !turnError) {
         turnError = child.lost?.message
-          ?? `codex app-server connection closed unexpectedly (${signal ? `signal ${signal}` : `code ${code ?? -1}`})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
+          ?? `codex app-server connection closed unexpectedly (${signal ? `signal ${signal}` : `code ${code ?? -1}`})${stderr ? `: ${utf8Tail(stderr, 200)}` : ''}`;
       }
       turnActive = false;
       client.close();
@@ -936,7 +937,7 @@ export class CodexAdapter implements AgentAdapter {
       throw providerFailure(providerFailureDisplay(limit), limit);
     }
     if (turnError) {
-      throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderr.slice(0, 300)}` : ''}`);
+      throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${utf8Tail(stderr, 300)}` : ''}`);
     }
     if (terminalStatus !== 'completed') {
       throw new Error('codex app-server stream ended unexpectedly without a completed terminal event');
@@ -1137,7 +1138,7 @@ export class CodexAdapter implements AgentAdapter {
       }
     });
     child.stderr?.on('data', (d) => {
-      stderr += d.toString();
+      stderr = utf8Tail(stderr + d.toString(), 4096);
     });
 
     const exited: { code: number; signal?: NodeJS.Signals; spawnError?: string } = await new Promise((resolve) => {
@@ -1172,7 +1173,7 @@ export class CodexAdapter implements AgentAdapter {
     }
     if (exited.code !== 0) {
       const why = exited.signal ? `signal ${exited.signal}` : `exit ${exited.code}`;
-      const diagnostic = (exited.spawnError ?? turnFailure ?? stderr.slice(0, 500)) || '(no diagnostic)';
+      const diagnostic = (exited.spawnError ?? turnFailure ?? utf8Tail(stderr, 500)) || '(no diagnostic)';
       throw new Error(
         `codex exec connection terminated before successful completion (${why}): ${diagnostic}`,
       );

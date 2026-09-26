@@ -345,6 +345,11 @@ export class IdentityService {
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
   }
 
+  async userById(id: string): Promise<IdentityUser | undefined> {
+    const row = await this.db.prepare('SELECT id, email, name, role, createdAt FROM user WHERE id=?').get(id) as any;
+    return row ? { ...row, createdAt: new Date(row.createdAt) } : undefined;
+  }
+
   /** Connect Better Auth's user lifecycle to the organization namespace. */
   connectOrganizationNames(lookup: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>): void {
     this.organizationNames = lookup;

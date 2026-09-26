@@ -46,3 +46,27 @@ it('wipes inactive state while preserving stable instance lock files', () => {
     expect(fs.existsSync(path.join(home, 'state', 'instances', 'app.lock'))).toBe(true);
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+it('refuses to wipe state when a recorded pid belongs to another process', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-reset-pid-'));
+  const other = spawn('sleep', ['30'], { stdio: 'ignore' });
+  try {
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    fs.mkdirSync(path.join(home, 'temporal'), { recursive: true });
+    const sentinel = path.join(home, 'state', 'preserve');
+    fs.writeFileSync(sentinel, 'live');
+    fs.writeFileSync(path.join(home, 'temporal', 'dev-server.json'),
+      JSON.stringify({ pid: other.pid, address: '127.0.0.1:7233' }));
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/reset.ts'], {
+      cwd: path.join(import.meta.dirname, '..'),
+      env: { ...process.env, KARMAX_HOME: home }, encoding: 'utf8',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('is not the Temporal dev server');
+    expect(fs.readFileSync(sentinel, 'utf8')).toBe('live');
+    expect(() => process.kill(other.pid!, 0)).not.toThrow();
+  } finally {
+    other.kill();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

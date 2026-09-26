@@ -24,6 +24,9 @@ it('shares audience policy across sync and async reads and caches membership rea
   expect(page.tasks).toEqual(synchronous);
   expect(reads.mock.calls.filter(([sql]) => sql.includes('FROM team_memberships'))).toHaveLength(1);
   expect(page.tasks[0]?.reviewers).toEqual(['reviewer']);
+  reads.mockClear();
+  expect((await store.listTaskAttempts(project.id)).map((task) => task.reviewers)).toEqual(tasks.map(() => ['reviewer']));
+  expect(reads.mock.calls.filter(([sql]) => sql.includes('FROM team_memberships'))).toHaveLength(1);
   (await store.removeTeamMembership(team.id, 'reviewer'));
   expect((await store.taskSummaryPage(project.id)).tasks[0]?.reviewers).toEqual((await store.getTask(tasks[0]!.id))?.reviewers);
   expect((await store.taskSummaryPage(project.id)).tasks[0]?.reviewers).not.toContain('reviewer');
