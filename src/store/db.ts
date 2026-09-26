@@ -3653,10 +3653,12 @@ export class Store {
       } else {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
+        (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
       }
     } else {
       (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=?, conversationRef=NULL WHERE id=?')
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
     }
     if (view.stage === 'review' && view.status === 'waiting'
       && (prev?.lastView?.stage !== 'review' || prev.lastView.status !== 'waiting') && prev?.confirmationPolicy) {
@@ -7219,8 +7221,30 @@ export class Store {
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
-    subscriptionRequests: number }> {
+    subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number }> {
     return this.db.transaction(async () => {
+
+    // Keep immutable snapshots through a retry window. A late activity retry can
+    // still refer to an older revision while the workflow is live; settled tasks
+    // older than a week no longer need those superseded copies.
+    let viewSnapshots = 0, publicationFences = 0, turnSessions = 0;
+    const settled = await this.db.prepare(`SELECT id, conversationRef FROM tasks
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled')
+        AND CAST(json_extract(lastView, '$.updatedAt') AS BIGINT) < ?
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`)
+      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
+    for (const task of settled) {
+      const snapshotPrefix = `view-conversation:${task.id}:`;
+      viewSnapshots += Number((await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<? AND k<>?')
+        .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);
+      const fencePrefix = `view-publication-fence:${task.id}:`;
+      publicationFences += Number((await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<?')
+        .run(fencePrefix, `view-publication-fence:${task.id};`)).changes);
+      const sessionPrefix = `turnsession:${task.id}#`;
+      turnSessions += Number((await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<?')
+        .run(sessionPrefix, `turnsession:${task.id}$`)).changes);
+      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:view:${task.id}`, '1'));
+    }
 
     return {
       scopedTokens: (await this.purgeScopedTokens(now)),
@@ -7228,6 +7252,7 @@ export class Store {
       githubDeliveries: (await this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now)),
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
+      viewSnapshots, publicationFences, turnSessions,
     };
   
     });

@@ -57,6 +57,21 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('prunes superseded terminal view snapshots without losing the current conversation', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Retention');
+      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
+      await store.kvSet(`view-conversation:${task.id}:run:0`, '{"messages":[]}');
+      await store.kvSet(`view-conversation:${task.id}:run:1`, '{"messages":[]}');
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }, 'run:1');
+      expect((await store.retentionSweep(30 * 24 * 60 * 60 * 1000)).viewSnapshots).toBe(1);
+      expect(await store.kvGet(`view-conversation:${task.id}:run:0`)).toBeUndefined();
+      expect(await store.kvGet(`view-conversation:${task.id}:run:1`)).toBeDefined();
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);
