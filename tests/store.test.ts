@@ -47,7 +47,7 @@ describe('Store', () => {
     expect(((await store.db.prepare('PRAGMA synchronous').get()) as { synchronous: number }).synchronous).toBe(1);
     const now = Date.UTC(2026, 8, 26);
     const project = await store.createProject('Retention');
-    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: {} });
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
     await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: { text: 'old' } });
     await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 1 * 86400_000, payload: { text: 'new' } });
     await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
@@ -62,7 +62,7 @@ describe('Store', () => {
   it('retains old unresolved approval requests until their resolution is recorded', async () => {
     const now = Date.UTC(2026, 8, 26);
     const project = await store.createProject('Approvals');
-    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: {} });
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
     await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested',
       ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
     expect((await store.retentionSweep(now)).events).toBe(0);
@@ -150,6 +150,7 @@ describe('Store', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
+    (await legacy.kvDelete('migration:data-2026-09-26')); // Simulate a pre-migration database.
     const s1 = (await Store.create(dbPath));
     (await s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
       capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], maxTurns: 24 } as any));
@@ -183,6 +184,7 @@ describe('Store', () => {
       item({ id: 'vi_d', label: 'Conduit', domains: ['demo.realworld.show'],
         provenance: { source: 'task:task_x', taskId: 'task_x', at: 1 } }),
     ])));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
     const byId: Record<string, any> = Object.fromEntries(
@@ -212,6 +214,7 @@ describe('Store', () => {
       ...legacy, network: { unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [] },
     } as any));
     (await s1.close());
+    (await s1.kvDelete('migration:data-2026-09-26'));
 
     const s2 = (await Store.create(dbPath));
     expect((await s2.getProject(migrated.id))!.config).toEqual({
@@ -240,6 +243,7 @@ describe('Store', () => {
     expect((await migrated.getTag(tag.id))).toMatchObject({ name: 'frontend' });
     expect((await migrated.updateTag(tag.id, { description: 'Client-facing work.' }))?.description).toBe('Client-facing work.');
     (await migrated.close());
+    (await s1.kvDelete('migration:data-2026-09-26'));
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -282,6 +286,7 @@ describe('Store', () => {
     const leaf = (await store.createTag({ projectId: p.id, name: 'release/blocker', kind: 'flag' }));
     expect(leaf.kind).toBe('flag');
     const parent = (await store.getTag(leaf.parentId!))!;
+    (await legacy.kvDelete('migration:data-2026-09-26'));
     expect(parent).toMatchObject({ name: 'release', kind: 'flag' });
     // With no kind declared, the whole path defaults to topic.
     const plain = (await store.createTag({ projectId: p.id, name: 'frontend/web' }));

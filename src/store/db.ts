@@ -215,7 +215,9 @@ export class Store {
   /** One-time data migrations. Legacy imports explicitly rerun them after copying rows. */
   private async migrateData(force = false) {
     return this.db.transaction(async () => {
-    if (!force && await this.kvGet('migration:data-2026-09-26')) return;
+    const marker = process.env.KARMAX_DEPLOYMENT === 'hosted'
+      ? 'migration:data-2026-09-26:hosted' : 'migration:data-2026-09-26';
+    if (!force && await this.kvGet(marker)) return;
 
     // Early organization-policy builds expanded their infrastructure defaults
     // into every project. Those records accidentally became permanent project
