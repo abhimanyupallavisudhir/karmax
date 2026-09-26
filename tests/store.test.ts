@@ -121,6 +121,7 @@ describe('Store', () => {
     (await legacy.recordUsage({ id: 'provider-execution', organizationId: 'org_personal', provider: 'e2b',
       kind: 'world.active', quantity: 300, unit: 'second', costMicros: 9_075,
       startedAt: 1, endedAt: 2, metadata: { source: 'provider-lifecycle', executionId: 'execution-1' } }));
+    (await legacy.kvDelete('migration:data-2026-09-26')); // Simulate a pre-migration database.
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));
@@ -150,11 +151,11 @@ describe('Store', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
-    (await legacy.kvDelete('migration:data-2026-09-26')); // Simulate a pre-migration database.
     const s1 = (await Store.create(dbPath));
     (await s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
       capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], maxTurns: 24 } as any));
     (await s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
     expect((await s2.getProfile('do-default'))!.maxTurns).toBeUndefined(); // legacy cap stripped
@@ -213,8 +214,8 @@ describe('Store', () => {
     const intentional = (await s1.createProject('Intentional restriction', {
       ...legacy, network: { unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [] },
     } as any));
-    (await s1.close());
     (await s1.kvDelete('migration:data-2026-09-26'));
+    (await s1.close());
 
     const s2 = (await Store.create(dbPath));
     expect((await s2.getProject(migrated.id))!.config).toEqual({
@@ -243,7 +244,6 @@ describe('Store', () => {
     expect((await migrated.getTag(tag.id))).toMatchObject({ name: 'frontend' });
     expect((await migrated.updateTag(tag.id, { description: 'Client-facing work.' }))?.description).toBe('Client-facing work.');
     (await migrated.close());
-    (await s1.kvDelete('migration:data-2026-09-26'));
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -257,6 +257,7 @@ describe('Store', () => {
     const flagged = (await legacy.createTag({ projectId: project.id, name: 'no-merge', kind: 'flag' }));
     // An older build (and `tag_task` before this change) left `kind` NULL.
     (await legacy.db.prepare('UPDATE tags SET kind = NULL WHERE id = ?').run(bare.id));
+    (await legacy.kvDelete('migration:data-2026-09-26'));
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));
@@ -286,7 +287,6 @@ describe('Store', () => {
     const leaf = (await store.createTag({ projectId: p.id, name: 'release/blocker', kind: 'flag' }));
     expect(leaf.kind).toBe('flag');
     const parent = (await store.getTag(leaf.parentId!))!;
-    (await legacy.kvDelete('migration:data-2026-09-26'));
     expect(parent).toMatchObject({ name: 'release', kind: 'flag' });
     // With no kind declared, the whole path defaults to topic.
     const plain = (await store.createTag({ projectId: p.id, name: 'frontend/web' }));

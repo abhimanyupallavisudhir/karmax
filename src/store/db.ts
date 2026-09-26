@@ -3611,7 +3611,7 @@ export class Store {
     for (const r of subscribers) (bySubscriber.get(r.taskId) ?? bySubscriber.set(r.taskId, []).get(r.taskId)!).push(JSON.parse(r.principal));
     for (const t of tasks) {
       t.subscribers = bySubscriber.get(t.id) ?? [];
-      if (t.confirmationPolicy) t.reviewers = (await this.reviewAudience(t));
+      if (t.confirmationPolicy) t.reviewers = await runAudienceAsync(reviewAudience(t), readAudience);
     }
     return tasks;
   }
@@ -3629,6 +3629,7 @@ export class Store {
       .run(JSON.stringify((await this.withPendingReviewInfo(taskId, view))), taskId));
   
     });
+    const readAudience = this.audienceReader();
   }
 
   async withPendingReviewInfo(taskId: string, view: TaskView): Promise<TaskView> {
