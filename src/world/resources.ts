@@ -515,7 +515,7 @@ export class ProjectResourceService {
    * credentials for this one access. Provider snapshots are scrubbed first. */
   async prepare(world: World): Promise<World> {
     (await this.refreshSecretLeases(world));
-    (await this.writeSecretFiles(world, false));
+    (await this.writeSecretFiles(world, true));
     return (await this.withEnvironment(world));
   }
 
