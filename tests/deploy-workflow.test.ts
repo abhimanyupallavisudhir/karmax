@@ -59,6 +59,11 @@ describe('post-push deployment to the public instance', () => {
     expect(deploy.if).toContain("workflow_run.conclusion == 'success'");
   });
 
+  it('requires deployment artifacts to build before the required CI check succeeds', () => {
+    expect(ci.jobs.required.needs).toContain('deploy-artifacts');
+    expect(JSON.stringify(ci.jobs['deploy-artifacts'].steps)).toContain('docker run --rm karmax:ci');
+  });
+
   it('passes the exact SHA validated by CI instead of pulling an arbitrary newer master', () => {
     expect(JSON.stringify(deploy.env)).toContain('github.event.workflow_run.head_sha');
     expect(script).toContain("git show '$DEPLOY_SHA:deploy/karmax'");

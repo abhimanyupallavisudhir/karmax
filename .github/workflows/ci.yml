@@ -167,7 +167,7 @@ jobs:
   required:
     name: typecheck + tests
     if: always()
-    needs: [checks, test]
+    needs: [checks, test, deploy-artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -192,6 +192,9 @@ jobs:
 
       - name: Build the control-plane image
         run: docker build -f deploy/Dockerfile -t karmax:ci .
+
+      - name: Start the control-plane image and load native runtime modules
+        run: docker run --rm karmax:ci node -e "require('node:sqlite'); require('node-pty')"
 
       # rate_limit is a third-party module; Caddy refuses to start on a directive
       # it does not recognise, so building the edge is what makes the Caddyfile
