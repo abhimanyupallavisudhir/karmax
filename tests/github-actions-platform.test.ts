@@ -48,6 +48,9 @@ describe('task-scoped GitHub Actions authority', () => {
     ]);
     expect(JSON.stringify((await store.eventsSince(task.id, 0)))).not.toContain('token');
 
+    const human = (await tokens.mintPrincipal('user:owner', ['github:actions:read'], project.id)).token;
+    await expect(api.listGithubActionsWorkflows(human, { taskId: task.id })).resolves.toMatchObject({ workflows: [] });
+    await expect(api.listGithubActionsRuns(human, { taskId: task.id, repository: 'acme/outside' })).rejects.toBeInstanceOf(NotFoundError);
     const write = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:owner', projectId: project.id,
       ceiling: ['github:actions:write'], grantorCaps: ['github:actions:write'] })).token;
     await expect(api.manageGithubActionsRun(write, { repository: 'app', runId: 42, action: 'rerun-failed' }))
@@ -65,7 +68,7 @@ describe('task-scoped GitHub Actions authority', () => {
     expect(actions.dispatch).toHaveBeenCalledWith('acme/app', 'deploy.yml', 'refs/heads/main', { environment: 'production' });
     expect((await store.eventsSince(task.id, 0)).map((event) => event.type)).toEqual([
       'github.actions.runs-read', 'github.actions.run-inspected',
-      'github.actions.run-operated', 'github.actions.workflow-dispatched',
+      'github.actions.workflows-read', 'github.actions.run-operated', 'github.actions.workflow-dispatched',
     ]);
     for (const view of ['jobs', 'log', 'artifacts', 'annotations', 'pending-deployments'] as const) {
       await api.inspectGithubActionsRun(read, { runId: 42, view, attempt: 1, jobId: 99, page: 2 });

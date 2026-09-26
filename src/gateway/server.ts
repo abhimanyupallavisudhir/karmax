@@ -4832,6 +4832,7 @@ export class Gateway {
       }
       if (p === '/api/agent/github/actions/workflows' && method === 'GET') {
         try { return this.json(res, 200, await api.listGithubActionsWorkflows(token, {
+          taskId: url.searchParams.get('taskId') ?? undefined,
           repository: url.searchParams.get('repository') ?? undefined,
           page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
           perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
@@ -4841,7 +4842,8 @@ export class Gateway {
       if (p === '/api/agent/github/actions/runs' && method === 'GET') {
         try {
           return this.json(res, 200, await api.listGithubActionsRuns(token, {
-            repository: url.searchParams.get('repository') ?? undefined,
+            taskId: url.searchParams.get('taskId') ?? undefined,
+          repository: url.searchParams.get('repository') ?? undefined,
             branch: url.searchParams.get('branch') ?? undefined,
             event: url.searchParams.get('event') ?? undefined,
             status: (url.searchParams.get('status') as any) ?? undefined,
@@ -4855,6 +4857,7 @@ export class Gateway {
       const githubActionsRun = p.match(/^\/api\/agent\/github\/actions\/runs\/(\d+)$/);
       if (githubActionsRun && method === 'GET') {
         try { return this.json(res, 200, await api.inspectGithubActionsRun(token, {
+          taskId: url.searchParams.get('taskId') ?? undefined,
           repository: url.searchParams.get('repository') ?? undefined, runId: Number(githubActionsRun[1]),
           view: (url.searchParams.get('view') ?? undefined) as any,
           attempt: url.searchParams.has('attempt') ? Number(url.searchParams.get('attempt')) : undefined,
@@ -4871,7 +4874,7 @@ export class Gateway {
       if (githubActionsRun && method === 'POST') {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.manageGithubActionsRun(token, {
-          repository: b.repository ? String(b.repository) : undefined, runId: Number(githubActionsRun[1]),
+          taskId: b.taskId, repository: b.repository ? String(b.repository) : undefined, runId: Number(githubActionsRun[1]),
           action: String(b.action ?? '') as any,
         })); }
         catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
@@ -4880,7 +4883,7 @@ export class Gateway {
       if (p === '/api/agent/github/actions/dispatch' && method === 'POST') {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.dispatchGithubActionsWorkflow(token, {
-          repository: b.repository ? String(b.repository) : undefined,
+          taskId: b.taskId, repository: b.repository ? String(b.repository) : undefined,
           workflow: typeof b.workflow === 'number' ? b.workflow : String(b.workflow ?? ''),
           ref: String(b.ref ?? ''), inputs: b.inputs && typeof b.inputs === 'object' && !Array.isArray(b.inputs) ? b.inputs : undefined,
         })); }
