@@ -1057,10 +1057,12 @@ export class ProjectResourceService {
       });
       const handle = client.workflow.getHandle(workflowId);
       const deadline = Date.now() + 30 * 60_000;
+      let pollMs = 100;
       while (Date.now() < deadline) {
         const view = await handle.query<ResourcePublishView>(QRY_RESOURCE_PUBLISH);
         if (view.current?.token === token) { granted = true; break; }
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        pollMs = Math.min(pollMs * 2, 5000);
       }
       if (!granted) throw new Error('timed out waiting to publish resource');
       return await action();
