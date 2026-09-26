@@ -4293,6 +4293,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!PUBLIC_TASK_SIGNALS.has(signal)
       && !scopedTask.lastView?.actions?.some((action) => action.kind === 'signal' && action.name === signal))
       throw new ValidationError(`signal "${signal}" cannot be sent to a task`);
+    // A blank follow-up would resume the agent on an empty message.
+    if (signal === SIG.followUp && !text?.trim() && !images?.length && !files?.length)
+      throw new ValidationError('a follow-up needs text or an attachment');
     if (files?.length) (await this.validatePromptFiles(scopedTask.projectId, files));
     if (attemptChoice?.otherAttempts !== undefined && !['keep', 'cancel'].includes(attemptChoice.otherAttempts))
       throw new ValidationError('otherAttempts must be keep or cancel');

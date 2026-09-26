@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { KarmaxApi, CapabilityError, NotFoundError } from '../src/platform/api.js';
+import { KarmaxApi, CapabilityError, NotFoundError, ValidationError } from '../src/platform/api.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -423,5 +423,21 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
       await expect(signalling.signalTask(token, task.id, internal)).rejects.toThrow(/cannot be sent/);
     await signalling.signalTask(token, task.id, 'cancel');
     expect(signals).toEqual([{ id: task.id, name: 'cancel' }]);
+  });
+
+  /** An empty follow-up used to be delivered: the agent resumed on a blank
+   *  message (the console guards its own box, but the API and message_agent
+   *  did not). */
+  it('refuses a follow-up with neither text nor attachments', async () => {
+    const signals: string[] = [];
+    const client = { workflow: { getHandle: () => ({
+      signal: async (name: string) => { signals.push(name); },
+      describe: async () => ({ status: { name: 'RUNNING' } }),
+    }) } };
+    const signalling = new KarmaxApi({ store, client: client as any, taskQueue: 'karmax', tokens, contentDir, worlds: new WorldRegistry() });
+    const task = await store.createTask({ projectId: mine, title: 'Mine', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'x' } });
+    for (const text of [undefined, '', '  \n '])
+      await expect(signalling.signalTask(token, task.id, 'followUp', text)).rejects.toBeInstanceOf(ValidationError);
+    expect(signals).toEqual([]);
   });
 });
