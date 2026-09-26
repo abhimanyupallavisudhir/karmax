@@ -640,8 +640,18 @@ export class Gateway {
   private operationalMetrics?: GatewayMetrics;
   private timingPoll?: AsyncInterval;
   private timingValue = false;
+  private timingReadAt = -Infinity;
+  private timingRead?: Promise<void>;
+  private async cachedTimingEnabled(): Promise<boolean> {
+    if (Date.now() - this.timingReadAt >= 1000) {
+      this.timingRead ??= this.refreshTiming().finally(() => { this.timingRead = undefined; });
+      await this.timingRead;
+    }
+    return this.timingValue;
+  }
   private async refreshTiming(): Promise<void> {
-    const enabled = (await timingEnabled(this.deps.store));
+    const enabled = await timingEnabled(this.deps.store);
+    this.timingReadAt = Date.now();
     if (enabled === this.timingValue) return;
     this.timingValue = enabled;
     for (const listener of this.timingListeners) listener(enabled);
@@ -668,7 +678,7 @@ export class Gateway {
     if (ws.readyState !== WebSocketClient.OPEN) return;
     const scoped = (await this.deps.tokens.verify(auth.apiToken));
     const delivery = new TimingDelivery(async row => (await this.deps.store.appendEvent({ taskId: row.taskId,
-      type: 'timing', ts: row.wallMs, payload: { ...row } })), async () => (await timingEnabled(this.deps.store)),
+      type: 'timing', ts: row.wallMs, payload: { ...row } })), async () => (await this.cachedTimingEnabled()),
       async (context, sink) => (await installationTiming(this.deps.store, context, sink)));
     const syncTiming = (enabled: boolean) => {
       try { ws.send(JSON.stringify({ type: 'timing.setting', enabled })); } catch { /* disconnected */ }
@@ -688,7 +698,7 @@ export class Gateway {
         ws.close(1013, 'Client fell behind; reconnect to refresh');
         return;
       }
-      if (ev.type === 'timing' && !(await timingEnabled(this.deps.store))) return;
+      if (ev.type === 'timing' && !(await this.cachedTimingEnabled())) return;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
       if (!(await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined)).ok) {
         const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
@@ -1351,7 +1361,7 @@ export class Gateway {
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
-    const receivedAt = req.method === 'POST' && (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
+    const receivedAt = req.method === 'POST' && (await this.cachedTimingEnabled()) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
     const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
@@ -1866,7 +1876,7 @@ export class Gateway {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         ...(consoleRevision ? { consoleRevision } : {}),
-        timingEnabled: (await timingEnabled(this.deps.store)),
+        timingEnabled: (await this.cachedTimingEnabled()),
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
@@ -7410,7 +7420,7 @@ export class Gateway {
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
-        if (method === 'GET') return this.json(res, 200, wf === 'timing' ? { enabled: (await timingEnabled(store)) } : (await globalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf)));
+        if (method === 'GET') return this.json(res, 200, wf === 'timing' ? { enabled: (await this.cachedTimingEnabled()) } : (await globalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf)));
         if (method === 'PUT') {
           const b = await this.body(req);
           if (wf === 'timing' && typeof b.values?.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be a boolean' });
@@ -7514,8 +7524,10 @@ export class Gateway {
           if (!projectCache.has(id)) projectCache.set(id, (await store.getProject(id)));
           return projectCache.get(id);
         };
-        const events = (await __asyncCollections.filter((await store.allEventsSince(since, 300, !(await timingEnabled(store)))), async (e) => {
-          const projectId = (await store.getTask(e.taskId))?.projectId;
+        const recent = await store.allEventsSince(since, 300, !(await this.cachedTimingEnabled()));
+        const taskProjects = await store.taskProjectIds(recent.map(event => event.taskId));
+        const events = (await __asyncCollections.filter(recent, async (e) => {
+          const projectId = taskProjects.get(e.taskId);
           if (!projectId) return false;
           if (visibleProjects) return visibleProjects.has(projectId);
           return ((await projectOf(projectId))?.organizationId ?? 'org_personal') === visibleOrganization;
