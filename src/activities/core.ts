@@ -1003,7 +1003,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
     try {
       const snapshotFiles = new Map<string, string>();
-      for (const file of await world.listFiles()) {
+      const listed = await world.exec('bash', ['-lc',
+        "set -o pipefail; find . -type d '(' -name .git -o -name node_modules ')' -prune -o -type f '(' -name SKILL.md -o -name MEMORY.md ')' -print0 | head -c 2097153"],
+        { cwd: repo.root, timeoutMs: 30_000 });
+      if (listed.code !== 0 || Buffer.byteLength(listed.stdout) > 2 * 1024 * 1024)
+        throw new Error('project wiki listing failed or exceeded its limit');
+      const files = listed.stdout.split('\0').filter(Boolean);
+      if (files.length > 2000) throw new Error('project wiki contains too many pages');
+      for (const listedFile of files) {
+        const file = path.posix.join(prefix, listedFile.replace(/^\.\//, ''));
         if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
         const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
         if (!rel || rel === '.git' || rel.startsWith('.git/')) continue;
@@ -1178,7 +1186,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // Wait for an idle source, including workflow-owned Git operations.
             // A gap between two agent turns is not an idle world.
             const sourceBusy = async () => {
-              const view = (await store.getTask(forkSource.taskId))?.lastView;
+              const view = await store.taskExecutionState(forkSource.taskId);
               if (view && ['done', 'cancelled', 'failed'].includes(view.status)) return false;
               return view?.status === 'active' || Boolean(view?.agentTurn);
             };
@@ -1188,7 +1196,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               try { context = activityContext.current(); } catch { /* direct activity test */ }
               context?.cancellationSignal.throwIfAborted();
               context?.heartbeat({ waitingFor: 'fork-source', taskId: forkSource.taskId });
-              await new Promise((resolve) => setTimeout(resolve, 500));
+              await new Promise((resolve) => setTimeout(resolve, 2_000));
             }
             const source = (await store.currentWorld(forkSource.taskId)) as WorldHandle | undefined;
             if (!source) throw new Error('source world is unavailable; choose another starting branch to fork only the conversation');
@@ -1804,7 +1812,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Requesting human input is a non-removable safety valve for every task
       // agent. The API restricts task-scoped callers to their own task, so this
       // cannot be used to interrupt peer work or widen the agent's authority.
-      const storedAuthorization = (await store.getTask(args.taskId))?.params?._authorization as {
+      const preparationTask = await store.getTask(args.taskId);
+      const storedAuthorization = preparationTask?.params?._authorization as {
         capabilities?: string[];
         principal?: string;
         scope?: 'projects' | 'organization' | 'global';
@@ -2157,7 +2166,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? `
 - Goal mode is active. Continue autonomously across turns until the entire objective is complete and verified. A normal response does not finish the task: call signal_completion only when no required work remains. If you genuinely need a human decision, raise it with the appropriate task tool instead.`
         : '';
-      const builtinInstructions = goalSuffix ? `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}` : deps.globalInstructions;
+      const builtinInstructions = deps.globalInstructions;
       // Wiki context (SPEC §5.4 "global + project instructions"): the built-in
       // working instructions (a virtual unconditional wiki entry), then per
       // scope its unconditional entries in full and the indexed TOC. Read here
@@ -2176,8 +2185,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const taggedText = [args.task.prompt, ...args.messages.filter((m) => m.role === 'user').map((m) => m.text)]
           .filter(Boolean)
           .join('\n');
-        const wikiContext = (await store.getTask(args.taskId))?.params?.wikiContext;
-        wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
+        const wikiContext = preparationTask?.params?.wikiContext;
+        try {
+          wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
+        } catch { /* Keep organization and canonical project context available while the world is offline. */ }
         projectInstructions = buildWikiPromptContext({
           contentDir: deps.contentDir ?? paths().content,
           organizationId: (await store.getProject(args.task.projectId))?.organizationId,
@@ -2187,16 +2198,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           taggedText,
           contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
         }) || undefined;
+        if (goalSuffix) projectInstructions = `${projectInstructions ?? ''}${goalSuffix}`;
       } catch {
         globalInstructions = `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}`;
       } finally {
         wikiSnapshot?.release();
       }
-      const liveTarget = (await store.getTask(args.taskId))?.lastView?.targetBranch ?? args.task.target;
+      const liveTarget = preparationTask?.lastView?.targetBranch ?? args.task.target;
       const promptTask = liveTarget && liveTarget !== args.task.target
         ? { ...args.task, target: liveTarget }
         : args.task;
-      const forkOrigin = (await store.getTask(args.taskId))?.params._forkWorld as ForkWorldSource | undefined;
+      const forkOrigin = preparationTask?.params._forkWorld as ForkWorldSource | undefined;
       const forkContext = forkOrigin ? `\n\nThis task forks the conversation of ${forkOrigin.taskId}. Starting branch: ${args.task.base}. `
         + (forkOrigin.base !== args.task.base
           ? 'The starting branch was changed. This world uses normal project initialization; the source task’s unpublished files and private resource snapshots were not copied. Verify remembered work against the files present here.'

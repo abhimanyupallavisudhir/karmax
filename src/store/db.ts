@@ -3501,6 +3501,13 @@ export class Store {
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
   }
 
+  /** Poll task liveness without loading its conversation or subscriber graph. */
+  async taskExecutionState(id: string): Promise<{ status?: string; agentTurn: boolean } | undefined> {
+    const row = await this.db.prepare(`SELECT json_extract(lastView, '$.status') AS status,
+      json_extract(lastView, '$.agentTurn') IS NOT NULL AS agentTurn FROM tasks WHERE id = ?`).get(id) as any;
+    return row ? { status: row.status ?? undefined, agentTurn: Boolean(row.agentTurn) } : undefined;
+  }
+
   async getTask(id: string): Promise<TaskRecord | undefined> {
     const r = (await this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id = ?`).get(id)) as any;
