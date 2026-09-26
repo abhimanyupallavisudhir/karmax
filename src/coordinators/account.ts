@@ -198,6 +198,7 @@ const LEASE_TIMEOUT_MS = 5 * 60 * 1000;
 const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({ startToCloseTimeout: '20s' });
 
 export async function accountCoordinator(input: { state?: AccountCoordinatorState }): Promise<void> {
+  const boundedHistory = input.state?.historyPolicyVersion === 2;
   let accounts = input.state?.accounts ?? [];
   let queue = input.state?.queue ?? [];
   let granted = (input.state?.granted ?? []).map((g) => ({ ...g, grantedAt: g.grantedAt ?? Date.now() }));
@@ -310,6 +311,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     accounts = accounts.filter((a) => live.has(a.id) || a.inUse > 0);
   });
   setHandler(leaseAccountSignal, (req) => {
+    if (boundedHistory && granted.some((g) => g.taskId === req.taskId && g.turnId === req.turnId)) return;
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
       queue.push({ taskId: req.taskId, turnId: req.turnId, provider: req.provider, allowed: req.allowed });
     }
@@ -460,7 +462,6 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     ...granted.filter((g) => g.taskId === taskId).map((g) => g.turnId),
   ]);
 
-  const boundedHistory = input.state?.historyPolicyVersion === 2;
   const historyFull = () => processed >= CONTINUE_AFTER
     || workflowInfo().historyLength >= 10_000 || workflowInfo().continueAsNewSuggested;
   async function rotateIfNeeded() {
@@ -573,8 +574,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       } catch (e) {
         log.warn(`account grant signal to ${req.taskId} failed; freeing`, { e: String(e) });
         if (free) {
-          free.inUse--;
           const i = granted.findIndex((g) => g.taskId === req.taskId && g.turnId === req.turnId);
+          if (!boundedHistory || i >= 0) free.inUse--;
           if (i >= 0) granted.splice(i, 1);
         }
       }

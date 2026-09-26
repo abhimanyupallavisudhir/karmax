@@ -12,6 +12,7 @@ vi.mock('@temporalio/workflow', async (original) => ({
   condition: (...args: any[]) => state.condition(...args),
   patched: () => state.patches,
   allHandlersFinished: () => true,
+  log: { warn: vi.fn() },
   workflowInfo: () => ({ historyLength: 1, continueAsNewSuggested: false }),
 }));
 import { accountCoordinator } from '../src/coordinators/account.js';
@@ -56,4 +57,31 @@ it('WF-24: rotates a merge queue with a current holder and waiting tasks', async
   expect(state.rotate).toHaveBeenCalledWith({ domain: 'repo', state: { domain: 'repo', current: 'holder', queue: ['waiting'], processed: 0,
     historyPolicyVersion: 2 } });
   expect(state.signal).not.toHaveBeenCalled();
+});
+
+it('WF-23: a repeated lease signal does not queue an already granted turn', async () => {
+  state.condition.mockImplementation(async () => {
+    state.handlers.get('leaseAccount')!({ taskId: 'holder', turnId: 'held', allowed: ['login'] });
+    throw stop;
+  });
+  await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
+    status: 'available', inUse: 1, maxConcurrent: 1 }], queue: [],
+    granted: [{ taskId: 'holder', turnId: 'held', accountId: 'login', grantedAt: Date.now() }],
+    processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.handlers.get('accountTaskLeases')!('holder')).toEqual(['held']);
+});
+
+it('WF-22: failed grant delivery does not return an already cancelled lease twice', async () => {
+  state.signal.mockImplementationOnce(async () => {
+    state.handlers.get('cancelAccountLease')!({ taskId: 'holder', turnId: 'held' });
+    throw new Error('workflow closed');
+  });
+  state.condition.mockImplementation(async (predicate: () => boolean) => {
+    if (!predicate()) throw stop;
+    return true;
+  });
+  await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
+    status: 'available', inUse: 0, maxConcurrent: 1 }],
+    queue: [{ taskId: 'holder', turnId: 'held', allowed: ['login'] }], processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.handlers.get('accounts')!().accounts[0].inUse).toBe(0);
 });
