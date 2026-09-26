@@ -6,6 +6,19 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { WorldAccessService } from '../src/world/access.js';
 
 describe('runner capacity and world lifecycle', () => {
+  it('forgets stale provider probe timestamps during a lifecycle sweep', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const lifecycle = new WorldLifecycleManager(store, new WorldRegistry(), {} as any);
+      const probes = (lifecycle as any).probedAt as Map<string, number>;
+      probes.set('old:1', 1);
+      probes.set('recent:1', Date.now());
+      await lifecycle.sweep(Date.now());
+      expect(probes.has('old:1')).toBe(false);
+      expect(probes.has('recent:1')).toBe(true);
+    } finally { await store.close(); }
+  });
+
   it('inherits one organization execution policy and keeps project overrides sparse', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Infrastructure', ownerUserId: 'owner' }));
