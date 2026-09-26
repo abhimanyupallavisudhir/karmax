@@ -15400,11 +15400,17 @@ async function wireVaultCards(organizationId) {
       list.querySelectorAll('[data-vi]').forEach((row) => {
         const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
         const savePolicy = async () => {
+          const controls = row.querySelectorAll('select');
+          controls.forEach(control => { control.disabled = true; });
           try {
             const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
             Object.assign(item, updated.item || updated);
             toast('Policy saved');
-          } catch (e) { toast(e.message, true); }
+          } catch (e) {
+            row.querySelector('.vi-pol-use').value = item.policy?.use || 'auto';
+            row.querySelector('.vi-pol-reveal').value = item.policy?.reveal || 'ask';
+            toast(e.message, true);
+          } finally { controls.forEach(control => { control.disabled = false; }); }
         };
         row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
         row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
