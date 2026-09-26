@@ -2285,19 +2285,40 @@ esac
   });
 
   it('connects an existing AgentMail inbox for only that organization', async () => {
-    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
-    const orgId = orgs[0]?.id;
-    const connect = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
-      method: 'POST',
-      headers: auth(),
-      body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-test-key' }),
+    const originalFetch = globalThis.fetch;
+    let verified = 0;
+    const provider = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname !== 'api.agentmail.to') return originalFetch(input, init);
+      expect(url.pathname).toBe('/v0/inboxes/myinbox%40agentmail.to');
+      verified++;
+      const authorized = new Headers(init?.headers).get('authorization') === 'Bearer am-test-key';
+      return Response.json(authorized ? { inbox_id: 'myinbox@agentmail.to' } : { error: 'forbidden' },
+        { status: authorized ? 200 : 403 });
     });
-    expect(connect.status).toBe(200);
-    const mailbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
-    expect(mailbox.address).toBe('myinbox@agentmail.to');
-    expect(mailbox.configured).toBe(true);
-    expect((await h.store.kvGet(`agent-mail:provider:${orgId}`))).toContain('mailbox:agentmail:');
-    expect((await h.store.kvGet('agent-mail:provider'))).toBeUndefined();
+    try {
+      const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+      const orgId = orgs[0]?.id;
+      const before = await h.store.kvGet(`agent-mail:provider:${orgId}`);
+      const denied = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
+        method: 'POST', headers: auth(),
+        body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-denied' }),
+      });
+      expect(denied.status).toBe(400);
+      expect(await h.store.kvGet(`agent-mail:provider:${orgId}`)).toBe(before);
+      const connect = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-test-key' }),
+      });
+      expect(connect.status).toBe(200);
+      expect(verified).toBe(2);
+      const mailbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+      expect(mailbox.address).toBe('myinbox@agentmail.to');
+      expect(mailbox.configured).toBe(true);
+      expect((await h.store.kvGet(`agent-mail:provider:${orgId}`))).toContain('mailbox:agentmail:');
+      expect((await h.store.kvGet('agent-mail:provider'))).toBeUndefined();
+    } finally { provider.mockRestore(); }
   });
 
   it('configures the shared Stripe Connect application from the operator API without returning secrets', async () => {

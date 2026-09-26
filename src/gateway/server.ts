@@ -6654,8 +6654,12 @@ export class Gateway {
           if (result.status === 'connected' && result.config) {
             if (result.config.provider === 'agentmail') {
               const { verifyAgentMailInbox } = await import('../autonomy/mail-pull.js');
-              await verifyAgentMailInbox(String(b.apiKey), result.config.agentmailAddress!);
-              await new AgentMail(store, undefined, undefined, result.config.agentmailAddress).address(organizationId);
+              try {
+                await verifyAgentMailInbox(String(b.apiKey), result.config.agentmailAddress!);
+                await new AgentMail(store, undefined, undefined, result.config.agentmailAddress).address(organizationId);
+              } catch (error) {
+                return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+              }
             }
             // The provider secret (AgentMail key / IMAP password) → the vault under
             // an org-scoped handle the poller resolves; never echoed or stored raw.
