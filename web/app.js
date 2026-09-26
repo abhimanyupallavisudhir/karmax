@@ -9218,7 +9218,7 @@ function wireCheckinSidebar(v) {
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
-    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
+    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' }); window.open(session.url, '_blank', 'noopener'); }
     catch (error) { toast(error.message, true); }
   });
 }

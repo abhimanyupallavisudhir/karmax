@@ -1278,10 +1278,25 @@ export class Gateway {
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
+  private sameOriginRequest(req: http.IncomingMessage): boolean {
+    const site = req.headers['sec-fetch-site'];
+    if (site && site !== 'same-origin' && site !== 'none') return false;
+    const origin = req.headers.origin;
+    if (!origin) return true; // Non-browser API clients do not send Origin.
+    try {
+      const expected = process.env.KARMAX_PUBLIC_URL?.trim()
+        || `${(req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http'}://${req.headers.host}`;
+      return new URL(origin).origin === new URL(expected).origin;
+    } catch { return false; }
+  }
+
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const receivedAt = req.method === 'POST' && (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
+    const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
+    if (p.startsWith('/api/') && (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET') || sensitiveNavigation)
+      && !this.sameOriginRequest(req)) return this.json(res, 403, { error: 'cross-origin request forbidden' });
     const previewOrigin = configuredPreviewOrigin();
     const onPreviewOrigin = Boolean(previewOrigin && this.requestIsPreviewOrigin(req));
     // Repository applications are untrusted. In hosted mode they get an origin
@@ -5063,7 +5078,8 @@ export class Gateway {
         }
       }
       const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
-      if (desktopMatch && method === 'GET') {
+      if (desktopMatch && method !== 'POST') return this.json(res, 405, { error: 'use POST to open a desktop' });
+      if (desktopMatch && method === 'POST') {
         const taskId = desktopMatch[1]!;
         const task = (await store.getTask(taskId));
         const handle = worldHandleForView(task?.lastView, taskId, task ? (await store.effectiveProjectConfig(task.projectId)) : undefined);
@@ -5244,38 +5260,8 @@ export class Gateway {
         }
       }
       const previewMatch = p.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
-      if (previewMatch && PREVIEW_METHODS.has(method)) {
-        const taskId = previewMatch[1]!;
-        const port = Number(previewMatch[2]);
-        const task = (await store.getTask(taskId));
-        const project = task ? (await store.getProject(task.projectId)) : undefined;
-        const handle = worldHandleForView(task?.lastView, taskId, project ? (await store.effectiveProjectConfig(project)) : undefined);
-        if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
-        if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
-        const isolatedOrigin = configuredPreviewOrigin();
-        if (isolatedOrigin) {
-          const rawToken = newPreviewToken();
-          let runnerLeaseId: string | undefined;
-          if (this.deps.worlds.get(handle.kind).capabilities?.remote && this.deps.runners)
-            runnerLeaseId = (await this.deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind })).leaseId;
-          let lease: import('../domain/types.js').PreviewLease;
-          try {
-            lease = (await store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
-              projectId: project.id, taskId, worldId: handle.id, generation: handle.generation ?? 1, port,
-              public: false, tokenHash: hashPreviewToken(rawToken), runnerLeaseId, provider: handle.kind,
-              createdBy: authRecord?.principal ?? session.user, createdAt: Date.now(),
-              expiresAt: Date.now() + previewAccessTtlMs() }));
-          } catch (error) {
-            if (runnerLeaseId) (await this.deps.runners?.release(runnerLeaseId, handle.kind));
-            throw error;
-          }
-          res.writeHead(307, { location: previewLeaseUrl(lease.id,
-            `${previewMatch[3] ?? '/'}${url.search}`, rawToken), 'referrer-policy': 'no-referrer' });
-          return void res.end();
-        }
-        return this.servePreview(req, res, taskId, port,
-          `${previewMatch[3] ?? '/'}${url.search}`, `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`);
-      }
+      if (previewMatch) return this.json(res, 405,
+        { error: 'create a preview with POST /api/tasks/:id/preview-leases' });
       const previewLeases = p.match(/^\/api\/tasks\/([^/]+)\/preview-leases$/);
       if (previewLeases && method === 'GET') return this.json(res, 200,
         (await store.listPreviewLeases(previewLeases[1]!)).map((lease) => ({ ...lease, tokenHash: undefined })));
@@ -7974,6 +7960,8 @@ export class Gateway {
       headers['content-length'] = String(response.body.length);
       headers['referrer-policy'] = 'no-referrer';
       headers['x-content-type-options'] = 'nosniff';
+      if (!configuredPreviewOrigin() || !this.requestIsPreviewOrigin(req))
+        headers['content-security-policy'] = 'sandbox allow-scripts allow-forms allow-downloads';
       res.writeHead(response.status, headers);
       res.end(method === 'HEAD' ? undefined : response.body);
     } catch (error) {
