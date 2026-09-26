@@ -9773,8 +9773,9 @@ function conversationInputRequest(v, entries) {
 // copy that's safe to open even while the agent is running (it never mutates the live
 // session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
 function forkCommandFor(sess, worldPath) {
-  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
-  if (sess.provider === 'claude') return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  if (sess.provider === 'codex') return `cd ${quote(worldPath)} && CODEX_HOME=${quote(sess.home)} codex fork ${quote(sess.id)}`;
+  if (sess.provider === 'claude') return `cd ${quote(worldPath)} && CLAUDE_CONFIG_DIR=${quote(sess.home)} claude --resume ${quote(sess.id)} --fork-session`;
   // ACP makes forking available to karmax protocol-to-protocol. Until a harness
   // documents an equivalent safe terminal command, don't manufacture one.
   return '';
