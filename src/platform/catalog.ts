@@ -130,6 +130,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
+    'GET /api/search?q= (cross-project search; at least 2 characters; each project requires project:read and task:read; up to 100 tasks per project)',
     'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',
     'PATCH|DELETE /api/tags/:id', 'GET|POST /api/projects/:projectId/views',
     'PATCH|DELETE /api/views/:id', 'POST /api/views/:id/reorder',
@@ -317,6 +318,7 @@ export const PLATFORM_API_CATALOG = {
     // capabilities. An agent watches work through /ws and the task view instead.
     'GET /api/inbox?since= (verified user subject; delegation accepted — the inbox is per-user)',
     'PATCH /api/inbox/:itemId (verified user subject; delegation accepted)',
+    'PATCH /api/inbox?organizationId= (body {ids: string[]}, up to 500; marks owned items read; verified user subject, delegation accepted)',
     'GET|PUT /api/inbox/preferences (verified user subject; delegation accepted)',
     'GET /api/meta (deployment flags: hosted, hostLocal, safeMode — tells you which host-local routes exist here)',
     'POST /api/attachments (JSON dataUrl or image bytes)', 'POST /api/files (raw prompt file bytes)',

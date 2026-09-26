@@ -117,10 +117,8 @@ for (const partialFailure of [false, true]) test(`mark all read updates rows and
   let renders = 0;
   b.ctx.renderMain = () => { renders++; };
   b.ctx.renderRail = () => {};
-  b.ctx.api = async (url) => {
-    if (partialFailure && url.includes('/b?')) throw new Error('offline');
-    return { unread: false };
-  };
+  b.ctx.api = async (url, options) => JSON.parse(options.body).ids
+    .filter(id => !partialFailure || id !== 'b').map(id => ({ id, unread: false }));
   vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
   if (partialFailure) await assert.rejects(b.ctx.markVisibleInboxRead(), /1 notifications/);
   else await b.ctx.markVisibleInboxRead();
@@ -136,7 +134,7 @@ test('bulk read wins over an in-flight inbox fetch without hiding later arrivals
   b.ctx.inboxItems = () => b.state.inbox;
   b.ctx.renderMain = b.ctx.renderRail = () => {};
   let finishFetch;
-  b.ctx.api = async (url, options) => options ? { unread: false }
+  b.ctx.api = async (url, options) => options ? JSON.parse(options.body).ids.map(id => ({ id, unread: false }))
     : new Promise((resolve) => { finishFetch = resolve; });
   vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
   const pending = b.ctx.loadInbox();
@@ -178,10 +176,10 @@ test('bulk read uses each notification organization and completes across navigat
   b.ctx.inboxItems = () => b.state.inbox;
   b.ctx.renderMain = b.ctx.renderRail = () => {};
   const requests = [];
-  b.ctx.api = async url => { requests.push(url); b.state.organizationId = 'elsewhere'; return { unread: false }; };
+  b.ctx.api = async (url, options) => { requests.push(url); b.state.organizationId = 'elsewhere'; return JSON.parse(options.body).ids.map(id => ({ id, unread: false })); };
   vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
   await b.ctx.markVisibleInboxRead();
-  assert.deepEqual(requests, ['/api/inbox/a?organizationId=personal', '/api/inbox/b?organizationId=team']);
+  assert.deepEqual(requests, ['/api/inbox?organizationId=personal', '/api/inbox?organizationId=team']);
   assert.ok(b.state.inbox.every(item => !item.unread));
 });
 

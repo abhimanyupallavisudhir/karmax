@@ -229,3 +229,10 @@ describe('platform catalog covers the gateway route table', () => {
       .toEqual([]);
   });
 });
+
+it('discovers bounded aggregate search and bulk inbox reads (RQ-14/UI-18)', () => {
+  expect(PLATFORM_API_CATALOG.tasks.some(entry => entry.startsWith('GET /api/search?'))).toBe(true);
+  expect(PLATFORM_API_CATALOG.operations.some(entry => entry.startsWith('PATCH /api/inbox?'))).toBe(true);
+  expect(cap('GET', '/api/search')).toBe('none'); // handler authorizes each project
+  expect(cap('PATCH', '/api/inbox')).toBe('inbox:write');
+});
