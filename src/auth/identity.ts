@@ -114,6 +114,11 @@ export class IdentityService {
    *  it just cannot confirm addresses or reset passwords by mail. */
   mailer?: Mailer;
 
+  /** Whether account email (confirmation, password reset) can actually be sent. */
+  async canSendEmail(): Promise<boolean> {
+    return Boolean(this.mailer && (await this.mailer.configured()));
+  }
+
    oidcProviderId?: string;
   /** Whether "Continue with Google" is offered. Google is a *consumer* identity
    *  option and deliberately does not consume the single generic-OIDC enterprise

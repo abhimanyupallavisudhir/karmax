@@ -1347,6 +1347,7 @@ export class Gateway {
           const gitOnboarding = (await this.deps.store.kvGet(onboardingKey)) === 'pending';
           if (gitOnboarding) (await this.deps.store.kvSet(onboardingKey, 'seen'));
           return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user, gitOnboarding,
+          emailDelivery: (await this.deps.identity.canSendEmail?.()) ?? false,
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
           google: this.deps.identity.googleEnabled,
           github: this.deps.identity.githubEnabled });
@@ -1356,6 +1357,8 @@ export class Gateway {
           authenticated: false,
           setupRequired: !(await this.deps.identity.hasUsers()),
           signupAvailable: (await this.deps.identity.hasUsers()),
+          // Whether "Forgot password?" can deliver anything.
+          emailDelivery: (await this.deps.identity.canSendEmail?.()) ?? false,
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
           google: this.deps.identity.googleEnabled,
           github: this.deps.identity.githubEnabled,

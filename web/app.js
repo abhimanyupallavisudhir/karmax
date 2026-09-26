@@ -2698,6 +2698,8 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
   }
   const session = await (await feedbackFetch('/api/session')).json();
+  // Account email (confirmation, password reset) only when the installation can send it.
+  S.emailDelivery = session.emailDelivery === true;
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -3394,7 +3396,7 @@ async function refreshTasks() {
 // to actually resend through.
 function verificationBanner() {
   const u = S.user && typeof S.user === 'object' ? S.user : null;
-  if (!u || u.emailVerified !== false || !u.email || S.verifyBannerDismissed) return '';
+  if (!u || u.emailVerified !== false || !u.email || !S.emailDelivery || S.verifyBannerDismissed) return '';
   return `<div class="verify-banner" id="verify-banner">
     <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
     <button class="btn sm" id="verify-resend">Resend link</button>
@@ -4286,26 +4288,29 @@ function viewIdForQuery(q) {
 function viewsBar() {
   const active = viewIdForQuery(S.search);
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
   const saved = S.views
     .map(
-      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" role="button" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
-    <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
+    <div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>
   </div>`;
 }
 
 // Workflow params are searchable/organizable too, via synthetic fields the server
 // resolves on demand (src/domain/search.ts — keep this list of skipped types in step
-// with what fieldByKey understands). Scalar params become `param.<name>`; agent/confirmer/responder
+// with what fieldByKey understands). Scalar params become `param.<name>`; agent
 // params expand into three model sub-fields each — `agent_<role>.agent` (provider),
 // `.model`, `.effort` — so you can filter/group/sort by the model an agent ran on.
+// The menus offer only what a task itself carries: installation/project settings
+// (scopes without 'task') and the Review/Responder routing are not task attributes.
+// Typed queries still accept every field the server understands.
 const PARAM_SCALAR_SKIP = new Set(['agent', 'confirmer', 'responder', 'prompt', 'list']);
 const PARAM_NAME_SKIP = new Set(['repos', 'prompt']);
 const AGENT_SUBFIELDS = [
@@ -4317,8 +4322,9 @@ function paramMenuFields() {
   const seen = new Map();
   for (const s of S.schema || []) {
     for (const p of s.params || []) {
-      if (PARAM_NAME_SKIP.has(p.name)) continue;
-      if (p.type === 'agent' || p.type === 'confirmer' || p.type === 'responder') {
+      if (PARAM_NAME_SKIP.has(p.name) || (p.scopes && !p.scopes.includes('task'))) continue;
+      if (p.type === 'confirmer' || p.type === 'responder') continue;
+      if (p.type === 'agent') {
         for (const { sub, label } of AGENT_SUBFIELDS) {
           const key = `agent_${p.name}.${sub}`;
           if (!seen.has(key)) seen.set(key, { key, label: `${p.label || p.name} · ${label}`, type: 'text', param: true });
@@ -4424,7 +4430,9 @@ function tasksView() {
     ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
     : S.search
       ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
-      : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full task form.</div>`;
+      // Done and cancelled tasks archive themselves, so an empty default list
+      // does not mean the project has never had a task.
+      : `<div class="empty"><div class="big">No open tasks</div>Describe one above. Finished tasks move to 🗄 Archived.</div>`;
   return `
     <div class="composer">
       <div class="quick-task-field">
@@ -15834,14 +15842,14 @@ async function wireOutboundEmailCard() {
       <option value="smtp">SMTP server — any provider or relay</option>
     </select></div>
     <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
-    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
+    <div class="form-row"><label for="oe-from">From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
     <div id="oe-smtp" style="display:none">
-      <div class="form-row"><label>SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
+      <div class="form-row"><label for="oe-host">SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
       <div class="inline-form" style="align-items:center">
         <input id="oe-port" placeholder="port (587, or 465 for TLS)" style="max-width:220px">
         <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)"><input type="checkbox" id="oe-secure"> Implicit TLS (port 465)</label>
       </div>
-      <div class="form-row"><label>Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
+      <div class="form-row"><label for="oe-user">Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
     </div>
     <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
     <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
@@ -16630,7 +16638,7 @@ function profileView() {
             <span class="profile-row-value">${esc(email)}</span>
             ${u.emailVerified
               ? '<span class="chip success">verified</span>'
-              : '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>'}
+              : S.emailDelivery ? '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>' : ''}
             <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
               aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
           </div>
@@ -16763,7 +16771,7 @@ function notificationsCard() {
       </div>`).join('')}
     </div>
     <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
-      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : duration + ' seconds'}</option>`).join('')}</select></label>
+      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></label>
       <button class="btn sm" id="notify-preview">Preview sound</button></div>
     <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
     ${permissionNote}
@@ -18953,14 +18961,14 @@ function renderLogin() {
     <div class="brand" style="margin-bottom:18px">${brandMark()} ${siteNameMarkup()}</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? `<p class="task-sub">You've been invited to a ${siteNameMarkup()} organization. Sign in — or <b>create an account</b> — to accept it.</p>` : ''}
-    <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
+    <div class="form-row"><label for="email">Email</label><input type="email" id="email" autocomplete="username" /></div>
+    <div class="form-row"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${googleBtn('google-btn')}
     ${githubBtn('github-btn')}
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
-    <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
+    ${S.emailDelivery ? '<div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>' : ''}
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
   </div></div>`;
   const go = async () => {
@@ -18990,7 +18998,7 @@ function renderLogin() {
     } catch (error) { $('#login-err').textContent = error.message; }
   });
   $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
-  $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
+  $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
@@ -19001,7 +19009,7 @@ function renderForgotPassword() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Reset password</div>
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
-    <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
+    <div class="form-row"><label for="forgot-email">Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
     <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
     <button class="btn" id="forgot-back" style="width:100%;margin-top:8px">Back to sign in</button>
     <div id="forgot-msg" style="font-size:12px;margin-top:8px"></div>
@@ -19033,7 +19041,7 @@ function renderForgotPassword() {
 function renderResetPassword(token) {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Choose a new password</div>
-    ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
+    ${token ? `<div class="form-row"><label for="reset-pw">New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
       : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
     <button class="btn" id="reset-back" style="width:100%;margin-top:8px">Back to sign in</button>
@@ -19072,9 +19080,9 @@ function renderSignup() {
     ${S.pendingInvite
       ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
       : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
-    <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
-    <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
+    <div class="form-row"><label for="signup-name">Name</label><input id="signup-name" autocomplete="name" /></div>
+    <div class="form-row"><label for="signup-email">Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
+    <div class="form-row"><label for="signup-pw">Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
     ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
     ${googleBtn('signup-google-btn')}
@@ -19181,9 +19189,9 @@ function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Set up ${siteNameMarkup()}</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
-    <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
-    <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>
+    <div class="form-row"><label for="setup-name">Name</label><input id="setup-name" autocomplete="name" /></div>
+    <div class="form-row"><label for="setup-email">Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
+    <div class="form-row"><label for="setup-pw">Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="setup-btn" style="width:100%">Create administrator</button>
     <div id="setup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
