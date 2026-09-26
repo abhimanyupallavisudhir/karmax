@@ -42,7 +42,7 @@ describe('Paddle subscription billing', () => {
     const provider = new PaddleSubscriptionProvider(() => config, fetcher);
     const result = await provider.createCheckout({ organizationId: 'org_test', customerId: '', plan: 'team', seats: 3,
       successUrl: 'https://example.test/?checkout=success', cancelUrl: 'https://example.test/', idempotencyKey: 'checkout-test' });
-    expect(result).toEqual({ id: 'txn_test', url: 'https://example.test/billing/checkout?_ptxn=txn_test' });
+    expect(result).toEqual({ id: 'txn_test', url: 'https://example.test/billing/checkout?success=https%3A%2F%2Fexample.test%2F%3Fcheckout%3Dsuccess&_ptxn=txn_test' });
     expect(fetcher).toHaveBeenCalledWith('https://sandbox-api.paddle.com/transactions', expect.objectContaining({ method: 'POST' }));
     const request = JSON.parse((fetcher.mock.calls[0] as any)[1].body);
     expect(request.items).toEqual([{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_seat', quantity: 2 }]);

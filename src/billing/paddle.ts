@@ -40,7 +40,7 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
   }
   async createCheckout(input: Parameters<SubscriptionProvider['createCheckout']>[0]) {
     const items = await this.items(input.plan, input.seats);
-    const checkout = new URL('/billing/checkout', input.successUrl);
+    const checkout = checkoutUrl(input.successUrl);
     const transaction = await this.request('/transactions', 'POST', { items, collection_mode: 'automatic',
       custom_data: { karmax_request: input.idempotencyKey },
       checkout: { url: checkout.toString() } });
@@ -62,7 +62,7 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       await this.cancelCheckout(input.checkoutId);
       return null;
     }
-    const url = new URL('/billing/checkout', input.successUrl);
+    const url = checkoutUrl(input.successUrl);
     url.searchParams.set('_ptxn', input.checkoutId);
     return { id: input.checkoutId, url: url.toString() };
   }
@@ -191,7 +191,7 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     }
     if (found.collection_mode !== 'automatic' || !/^txn_[a-z0-9]+$/.test(found.id)
       || found.status === 'canceled' || !sameItems(found.items, await this.items(intent.plan, intent.seats))) return null;
-    const url = new URL('/billing/checkout', intent.successUrl);
+    const url = checkoutUrl(intent.successUrl);
     url.searchParams.set('_ptxn', found.id);
     return { id: found.id, url: url.toString() };
   }
@@ -231,4 +231,10 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
 function sameItems(actual: any, expected: Array<{ price_id: string; quantity: number }>): boolean {
   return Array.isArray(actual) && actual.length === expected.length && expected.every((item) =>
     actual.filter((candidate) => candidate.price?.id === item.price_id && candidate.quantity === item.quantity).length === 1);
+}
+
+function checkoutUrl(successUrl: string): URL {
+  const url = new URL('/billing/checkout', successUrl);
+  url.searchParams.set('success', successUrl);
+  return url;
 }
