@@ -207,10 +207,18 @@ export class ClaudeAdapter implements AgentAdapter {
       for (const use of toolUses) {
         const handler = handlers[use.name];
         ctx.emitActivity(claudeToolActivity(use, 'started'));
-        const result = handler ? await handler(use.input ?? {}) : `unknown tool ${use.name}`;
+        let result: unknown;
+        let failed = false;
+        try {
+          if (!handler) throw new Error(`unknown tool ${use.name}`);
+          result = await handler(use.input ?? {});
+        } catch (error) {
+          failed = true;
+          result = error instanceof Error ? error.message : String(error);
+        }
         ctx.emitActivity(claudeToolActivity(use, 'completed', result));
-        toolResults.push({ type: 'tool_result', tool_use_id: use.id, content: typeof result === 'string' ? result : JSON.stringify(result) });
-        if (use.name === 'signal_completion') completed = true;
+        toolResults.push({ type: 'tool_result', tool_use_id: use.id, ...(failed ? { is_error: true } : {}), content: typeof result === 'string' ? result : JSON.stringify(result) });
+        if (!failed && use.name === 'signal_completion') completed = true;
       }
       messages.push({ role: 'user', content: toolResults });
       if (completed) {
@@ -235,7 +243,7 @@ export class ClaudeAdapter implements AgentAdapter {
       delivered: deliveredIndex,
       usage: reportedUsage.total(),
     };
-    } finally { await mcp.close(); }
+    } finally { try { await mcp.close(); } catch { /* cleanup must not replace the turn outcome */ } }
   }
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
@@ -954,9 +962,6 @@ export class ClaudeAdapter implements AgentAdapter {
         }
         if (e instanceof ProviderFailure) throw e;
         if (remoteProcess?.lost) throw remoteProcess.lost;
-        const message = e instanceof Error ? e.message : String(e);
-        const classified = providerErrorFromMessage('claude', message);
-        if (classified instanceof ProviderFailure || !(e instanceof Error)) throw classified;
         throw e; // preserve the original stack for unrelated SDK failures
       }
     } finally {

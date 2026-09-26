@@ -25,6 +25,7 @@ import {
   providerFailure,
   providerFailureDisplay,
   ProviderFailure,
+  ProviderStreamError,
   ProviderOutage,
   ProviderPolicyFailure,
   isProviderPolicyRejection,
@@ -379,7 +380,15 @@ export class CodexAdapter implements AgentAdapter {
           title: String(call.name ?? 'Tool call'),
           ...(startedDetail ? { detail: startedDetail } : {}),
         });
-        const result = handler ? await handler(args) : `unknown tool ${call.name}`;
+        let result: unknown;
+        let failed = false;
+        try {
+          if (!handler) throw new Error(`unknown tool ${call.name}`);
+          result = await handler(args);
+        } catch (error) {
+          failed = true;
+          result = { is_error: true, error: error instanceof Error ? error.message : String(error) };
+        }
         const doneDetail = toolActivityDetail(call.name, result);
         ctx.emitActivity({
           id: String(call.call_id ?? `${call.name}-${i}`),
@@ -389,7 +398,7 @@ export class CodexAdapter implements AgentAdapter {
           ...(doneDetail ? { detail: doneDetail } : {}),
         });
         toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: typeof result === 'string' ? result : JSON.stringify(result) });
-        if (call.name === 'signal_completion') completed = true;
+        if (!failed && call.name === 'signal_completion') completed = true;
       }
       nextInput = toolOutputs;
       // A response containing function calls cannot be resumed until every
@@ -410,7 +419,7 @@ export class CodexAdapter implements AgentAdapter {
       delivered: deliveredIndex,
       usage: reportedUsage.total(),
     };
-    } finally { await mcp.close(); }
+    } finally { try { await mcp.close(); } catch { /* cleanup must not replace the turn outcome */ } }
   }
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
@@ -905,7 +914,7 @@ export class CodexAdapter implements AgentAdapter {
       // below classify a limit and rotate the login, or surface a partial result instead
       // of discarding output already produced (mirrors the exec/SDK error tolerance).
       if (!ctx.signal?.aborted) {
-        noteLimit(e, 'app-server request');
+        if (e instanceof ProviderStreamError) noteLimit(e, 'app-server request');
         turnError = turnError ?? String((e as Error)?.message ?? e);
       }
     } finally {
@@ -914,8 +923,10 @@ export class CodexAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       client.close();
-      if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
-      else await child.stop();
+      try {
+        if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
+        else await child.stop();
+      } catch { /* cleanup must not replace the turn outcome */ }
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
       if (remoteHome && input.resolvedAuth?.configHome) {
         const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome);
@@ -926,9 +937,6 @@ export class CodexAdapter implements AgentAdapter {
       }
     }
 
-    // A limit can also arrive as a rejected request (handshake/turn) or a subprocess
-    // death recorded in `turnError` — scan it so those paths rotate the login too.
-    if (turnError && !limit) noteLimit(turnError, 'app-server turn');
     if (policyFailure) throw policyFailure;
     if (limit) {
       // Same shape as the exec path so limits.ts computes the refresh instant and the
