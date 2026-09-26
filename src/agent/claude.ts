@@ -272,14 +272,21 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     }
     if (!hasClaudeNativeCredential(configHome)) return this.runAgentSdkAttempt(input, ctx);
+    const recovery = { deliveredMessages: input.deliveredMessages ?? 0 };
+    const messages = [...input.messages];
     let latestSession = input.session;
     let fork = input.fork;
     const retryCtx: PlatformToolContext = {
       ...ctx,
+      ...(ctx.pullFollowUps ? { pullFollowUps: async (from: number) => {
+        const news = await ctx.pullFollowUps!(from);
+        messages.splice(from, news.length, ...news);
+        return news;
+      } } : {}),
       onSession: (session) => { latestSession = session; fork = false; ctx.onSession?.(session); },
     };
     try {
-      return await this.runAgentSdkAttempt(input, retryCtx);
+      return await this.runAgentSdkAttempt(input, retryCtx, recovery);
     } catch (error) {
       // Native local refresh normally handles expiry; remote projections have
       // no refresh authority. Recover a terminal expiry once, before the
@@ -300,19 +307,23 @@ export class ClaudeAdapter implements AgentAdapter {
       if (ctx.signal?.aborted) throw error;
       ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'completed',
         title: 'Refreshed Claude access token; resuming turn' });
-      return this.runAgentSdkAttempt({ ...input, ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx);
+      return this.runAgentSdkAttempt({ ...input, messages, deliveredMessages: recovery.deliveredMessages,
+        ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx, recovery);
     }
   }
 
-  private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+  private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext, recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
     const work = await claudeWorkEnvironment(input, !!ctx.onSecretEnvChange);
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
-    try { return await this.runAgentSdkProcess(input, ctx, work.settings); }
-    finally { unsubscribe?.(); await work.cleanup(); }
+    try { return await this.runAgentSdkProcess(input, ctx, work.settings, recovery); }
+    finally {
+      try { unsubscribe?.(); } catch { /* cleanup must not replace the turn outcome */ }
+      try { await work.cleanup(); } catch { /* cleanup must not replace the turn outcome */ }
+    }
   }
 
   private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
-    workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings']): Promise<AdapterTurn> {
+    workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings'], recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
     const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
     let sdk: any;
     try {
@@ -450,9 +461,18 @@ export class ClaudeAdapter implements AgentAdapter {
     // (the orphan-settling result below has `num_turns: 0`).
     const unanswered = new Set<string>();
     let harnessEchoes = false;
-    const send = (content: string | any[]) => {
+    const sentBoundaries = new Map<string, number>();
+    const acknowledgeInput = () => {
+      for (const [id, boundary] of sentBoundaries) {
+        if (unanswered.has(id)) break;
+        if (recovery) recovery.deliveredMessages = boundary;
+        sentBoundaries.delete(id);
+      }
+    };
+    const send = (content: string | any[], boundary = deliveredIndex) => {
       const message = toSdkUserMessage(content);
       unanswered.add(message.uuid);
+      sentBoundaries.set(message.uuid, boundary);
       return message;
     };
     const injector = createFollowUpInjector([send(initialContent)]);
@@ -477,7 +497,7 @@ export class ClaudeAdapter implements AgentAdapter {
           // never send conversation system messages) — but count both so the index
           // stays aligned with the workflow's `msgs` array.
           if (m.role !== 'system' && m.role !== 'agent') {
-            injector.push(send(followUpContent(m)));
+            injector.push(send(followUpContent(m), deliveredIndex + 1));
             injected++;
           }
           deliveredIndex++;
@@ -767,6 +787,7 @@ export class ClaudeAdapter implements AgentAdapter {
           harnessIdle = false; // working again: a pending settle re-check must not close under it
           const answered: unknown = (message as any).user_message_uuids ?? [(message as any).user_message_uuid];
           if (Array.isArray(answered)) for (const id of answered) if (typeof id === 'string') { harnessEchoes = true; unanswered.delete(id); }
+          acknowledgeInput();
         }
         if (!subagents.size && !unanswered.size) settleDeadline = undefined; // drained ⇒ a fresh grace for the next batch
         if (message.type === 'assistant') {
@@ -969,7 +990,7 @@ export class ClaudeAdapter implements AgentAdapter {
             throw providerErrorFromMessage('claude', message);
           }
           successfulResult = result;
-          if (!harnessEchoes && result.num_turns !== 0) unanswered.clear();
+          if (!harnessEchoes && result.num_turns !== 0) { unanswered.clear(); acknowledgeInput(); }
           if (!harnessReportsState) await settleInput();
         }
       }
