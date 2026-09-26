@@ -2649,10 +2649,14 @@ function consoleRevisionChanged(current, next) {
 }
 
 async function checkConsoleRevision() {
+  if (document.hidden) return false;
   try {
     const meta = await api('/api/meta');
     if (consoleRevisionChanged(S.meta?.consoleRevision, meta.consoleRevision)) {
-      location.reload();
+      if (S.offeredConsoleRevision !== meta.consoleRevision) {
+        S.offeredConsoleRevision = meta.consoleRevision;
+        toast('Update available', false, { label: 'Reload', fn: () => location.reload() });
+      }
       return true;
     }
     applyTimingSetting(meta.timingEnabled);
