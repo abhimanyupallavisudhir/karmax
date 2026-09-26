@@ -581,6 +581,9 @@ describe('GitHub App integration', () => {
       providerId: '99', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
       defaultBranch: 'main', private: true }));
     (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    await store.setSettings(`organization:${organization.id}`, 'github-deployment-monitor', {
+      repositories: { [repository.id]: { sourceWorkflow: 'CI', workflow: 'Deploy', file: '.github/workflows/deploy.yml' } },
+    });
     const task = (await store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
       workflowVersion: '1.8.0', params: { prompt: 'do it' } }));
     // A task of a DIFFERENT tenant, whose branch name this installation must not
@@ -670,7 +673,7 @@ describe('GitHub App integration', () => {
     })]);
     const successfulCi = await deliver('workflow_run', 'workflow-ci-success', {
       installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
-      workflow_run: { id: 702, name: 'CI', status: 'completed', conclusion: 'success',
+      workflow_run: { event: 'push', head_repository: { id: 99 }, id: 702, name: 'CI', status: 'completed', conclusion: 'success',
         head_branch: 'main', head_sha: 'validated-sha', html_url: 'https://github.com/acme/app/actions/runs/702' },
     });
     expect(successfulCi).toMatchObject({ accepted: true });
@@ -689,7 +692,7 @@ describe('GitHub App integration', () => {
     // environment can leave a perfectly real deployment waiting for approval.
     await deliver('workflow_run', 'workflow-deploy-waiting', {
       installation: { id: 42 }, action: 'requested', repository: { id: 99, full_name: 'acme/app' },
-      workflow_run: { id: 703, name: 'Deploy', status: 'waiting', conclusion: null,
+      workflow_run: { event: 'workflow_run', head_repository: { id: 99 }, id: 703, name: 'Deploy', status: 'waiting', conclusion: null,
         head_branch: 'main', head_sha: 'validated-sha' },
     });
     expect((await store.kvEntries('github:deployment-expectation:'))).toEqual([]);
