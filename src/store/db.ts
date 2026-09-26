@@ -2564,6 +2564,15 @@ export class Store {
     const selectors = [`team:${team.id}`, `@team:${team.slug}`,
       ...((await this.db.prepare('SELECT slug FROM team_aliases WHERE teamId=?').all(team.id)) as any[])
         .map((row) => `@team:${String(row.slug)}`)];
+    const mentionsTeam = (json: string | null): boolean => {
+      if (!json) return false;
+      const contains = (value: unknown): boolean => typeof value === 'string'
+        ? selectors.includes(value)
+        : Array.isArray(value) ? value.some(contains)
+          : value !== null && typeof value === 'object' && Object.values(value).some(contains);
+      try { return contains(JSON.parse(json)); }
+      catch { return selectors.some((selector) => json.includes(selector)); }
+    };
     const projectUse = (await this.db.prepare('SELECT COUNT(*) count FROM project_memberships WHERE principalKey=?')
       .get(`team:${team.id}`)) as any;
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(team.organizationId)) as any[])
@@ -2571,12 +2580,12 @@ export class Store {
     const settingScopes = new Set([`organization:${team.organizationId}`, `quick:organization:${team.organizationId}`,
       ...projectIds, ...projectIds.map((projectId) => `quick:${projectId}`)]);
     const settingUse = ((await this.db.prepare('SELECT scopeKey, json FROM settings').all()) as any[])
-      .some((row) => settingScopes.has(String(row.scopeKey)) && selectors.some((selector) => String(row.json).includes(selector)));
+      .some((row) => settingScopes.has(String(row.scopeKey)) && mentionsTeam(String(row.json)));
     const unfinishedUse = ((await this.db.prepare(`SELECT params, lastView FROM tasks t JOIN projects p ON p.id=t.projectId
       WHERE p.organizationId=?`).all(team.organizationId)) as any[]).some((row) => {
         let done = false;
         try { done = ['done', 'failed', 'cancelled'].includes(String(JSON.parse(row.lastView ?? '{}').status)); } catch {}
-        return !done && selectors.some((selector) => String(row.params).includes(selector) || String(row.lastView).includes(selector));
+        return !done && (mentionsTeam(row.params) || mentionsTeam(row.lastView));
       });
     if (Number(projectUse?.count ?? 0) || settingUse || unfinishedUse)
       throw new Error('This team is still used by project access or a workflow route. Remove those references before deleting it.');

@@ -4,6 +4,21 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
 describe('organization and collaboration domain', () => {
+  it('does not treat a longer team route as a reference to its prefix', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const org = await store.createOrganization({ name: 'Teams', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const dev = await store.createTeam({ organizationId: org.id, name: 'Dev' });
+      const developers = await store.createTeam({ organizationId: org.id, name: 'Developers' });
+      await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', responder: { kind: 'human', audience: ['@team:developers'] } } });
+      await store.deleteTeam(dev.id);
+      expect(await store.getTeam(dev.id)).toBeUndefined();
+      await expect(store.deleteTeam(developers.id)).rejects.toThrow(/still used/);
+    } finally { await store.close(); }
+  });
+
   it('delivers simultaneous authorization asks even when request hashes collide', async () => {
     const store = await Store.create(':memory:');
     try {

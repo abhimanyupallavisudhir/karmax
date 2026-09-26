@@ -26,6 +26,20 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('matches exact team selectors during deletion', async () => {
+    const store = await Store.create(url!);
+    try {
+      const org = await store.createOrganization({ name: 'Teams', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const dev = await store.createTeam({ organizationId: org.id, name: 'Dev' });
+      const developers = await store.createTeam({ organizationId: org.id, name: 'Developers' });
+      await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', responder: { kind: 'human', audience: ['@team:developers'] } } });
+      await store.deleteTeam(dev.id);
+      await expect(store.deleteTeam(developers.id)).rejects.toThrow(/still used/);
+    } finally { await store.close(); }
+  });
+
   it('allocates distinct synthetic inbox sequences for simultaneous asks', async () => {
     const store = await Store.create(url!);
     try {
