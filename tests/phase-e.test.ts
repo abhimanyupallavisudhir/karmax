@@ -26,9 +26,9 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
   it('reads only unsettled attempt metadata without conversations', async () => {
     const store = await Store.create(':memory:');
     const p = await store.createProject('P', {});
-    const live = await store.createTask({ projectId: p.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: {} });
-    const done = await store.createTask({ projectId: p.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
-    const draft = await store.createTask({ projectId: p.id, title: 'Draft', workflow: 'just-do', workflowVersion: '1', params: { draft: true } });
+    const live = await store.createTask({ projectId: p.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const done = await store.createTask({ projectId: p.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const draft = await store.createTask({ projectId: p.id, title: 'Draft', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture', draft: true } });
     await store.saveView(done.id, { taskId: done.id, title: done.title, workflow: done.workflow,
       stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
     const sql: string[] = [];
@@ -45,7 +45,7 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
     const store = await Store.create(':memory:');
     const p = await store.createProject('P', {});
     for (let i = 0; i < 12; i++) await store.createTask({ projectId: p.id, title: `T${i}`,
-      workflow: 'just-do', workflowVersion: '1', params: {} });
+      workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
     let active = 0, peak = 0;
     const client: any = { workflow: { getHandle: () => ({ describe: async () => {
       active++; peak = Math.max(peak, active);

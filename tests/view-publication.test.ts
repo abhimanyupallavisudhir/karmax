@@ -10,7 +10,7 @@ describe('durable conversation publication', () => {
   it('prunes old terminal snapshots after the retry window while retaining the current reference', async () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Retention');
-    const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
+    const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
     const old = `view-conversation:${task.id}:run:0`;
     const current = `view-conversation:${task.id}:run:1`;
     await store.kvSet(old, JSON.stringify({ messages: [{ id: 'old', role: 'agent', text: 'old', ts: 1 }] }));

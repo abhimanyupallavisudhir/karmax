@@ -49,8 +49,8 @@ integration('PostgreSQL cutover', () => {
     const store = await Store.create(url!);
     try {
       const project = await store.createProject('Reconciliation');
-      const live = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: {} });
-      const done = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const live = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      const done = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
       await store.saveView(done.id, { taskId: done.id, title: done.title, workflow: done.workflow,
         stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
       expect((await store.listReconciliationCandidates(project.id)).map((task) => task.id)).toEqual([live.id]);
@@ -61,7 +61,7 @@ integration('PostgreSQL cutover', () => {
     const store = await Store.create(url!);
     try {
       const project = await store.createProject('Retention');
-      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
       await store.kvSet(`view-conversation:${task.id}:run:0`, '{"messages":[]}');
       await store.kvSet(`view-conversation:${task.id}:run:1`, '{"messages":[]}');
       await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
@@ -88,7 +88,7 @@ integration('PostgreSQL cutover', () => {
     try {
       const now = Date.UTC(2026, 8, 26);
       const project = await store.createProject('Retention');
-      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
       await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: {} });
       await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested', ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
       await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
@@ -104,7 +104,7 @@ integration('PostgreSQL cutover', () => {
     try {
       const now = Date.UTC(2026, 8, 26);
       const project = await store.createProject('Insights');
-      const task = await store.createTask({ projectId: project.id, title: 'Shipped', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const task = await store.createTask({ projectId: project.id, title: 'Shipped', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
       await store.appendEvent({ taskId: task.id, type: 'view.updated', ts: now - 86400_000, payload: { status: 'done' } });
       await store.retentionSweep(now + 100 * 86400_000);
       expect((await store.insightRows('org_personal', now - 30 * 86400_000, now)).completions)
