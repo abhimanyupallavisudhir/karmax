@@ -70,3 +70,12 @@ it('WF-10: a confirm signal cannot bypass failed workflow checks', async () => {
   expect(wf.activities.publishView.mock.calls.some((call: any[]) => call[1].stage === 'merge')).toBe(false);
 });
 
+it('LT-14: just-do status publications reuse the conversation snapshot', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  await justDoV1_7(input);
+  const writes = wf.activities.publishView.mock.calls;
+  expect(writes.length).toBeGreaterThan(3);
+  expect(writes.filter((call: any[]) => call[1].messages)).toHaveLength(1);
+  expect(writes.every((call: any[]) => typeof call[2] === 'string')).toBe(true);
+});
+

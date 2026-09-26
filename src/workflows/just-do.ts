@@ -1,5 +1,6 @@
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
+import { conversationPublisher } from '../domain/view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -164,7 +165,10 @@ async function justDoImpl(
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
-  const publish = async () => publishTaskView(core, taskId, view());
+  const publishConversation = conversationPublisher(workflowInfo().runId,
+    (snapshot, reference) => publishTaskView(core, taskId, snapshot, reference));
+  const publish = async () => patched('just-do-conversation-reference-v1')
+    ? publishConversation(view()) : publishTaskView(core, taskId, view());
   const leaser = managedTurns
     ? createAgentTurnLeaser(core, coordinator, {
         taskId,
