@@ -25,7 +25,7 @@ describe('task PR head recovery', () => {
     expect((await expectedTaskRemoteHeads(store, task.id))).toEqual({ karmax: latest });
     const checkpointHead = '3'.repeat(40);
     (await store.appendEvent({ taskId: task.id, type: 'push.head', ts: 4,
-      payload: { repo: 'karmax', branch: `karmax/${task.id}`, headSha: checkpointHead } }));
+      payload: { repo: 'karmax', branch: `tavya/${task.id}`, headSha: checkpointHead } }));
     expect((await expectedTaskRemoteHeads(store, task.id))).toEqual({ karmax: checkpointHead });
     (await store.close());
   });

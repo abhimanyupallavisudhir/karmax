@@ -1,3 +1,4 @@
+import { BRAND } from '../domain/brand.js';
 /**
  * The capability model + attenuation (SPEC §8.1, §8.2). A flat set of named
  * capabilities granted to principals. Agent tokens preserve the selected task
@@ -170,8 +171,8 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     id: 'resources', label: 'Host and resources', description: 'Sensitive operational access to the host, credentials, and spending.',
     capabilities: [
       ['diagnostic:read', 'View diagnostics', 'Read host health and agent admission diagnostics.'],
-      ['process:read', 'View processes', 'Inspect processes managed by karmax.'],
-      ['process:kill', 'Stop processes', 'Terminate processes managed by karmax.'],
+      ['process:read', 'View processes', `Inspect processes managed by ${BRAND}.`],
+      ['process:kill', 'Stop processes', `Terminate processes managed by ${BRAND}.`],
       ['credential:read', 'View credential metadata', 'Discover credential handles, vault items, and non-secret policy.'],
       ['connection:use', 'Use connected apps', 'Execute app tools using accounts explicitly shared with the task or project.'],
       ['credential:write', 'Manage credentials', 'Create, replace, delete, configure, and inspect plaintext credentials and vault items; resolve credential access requests.'],

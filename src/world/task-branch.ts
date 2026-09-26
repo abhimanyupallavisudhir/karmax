@@ -1,5 +1,6 @@
 import type { World, WorldRepo } from './types.js';
 import { worldRepos, worldRepoTarget } from './types.js';
+import { BRAND } from '../domain/brand.js';
 
 export interface TaskBranchAncestryResult {
   repaired: Array<{ repo: string; previousHead: string; head: string; baseSha: string; targetSha: string }>;
@@ -104,7 +105,7 @@ export async function ensureTaskBranchAncestry(
       'commit-tree', `${plan.head}^{tree}`,
       '-p', plan.head,
       '-p', plan.baseSha,
-      '-m', 'karmax: preserve provisioned task ancestry',
+      '-m', `${BRAND}: preserve provisioned task ancestry`,
     ], { cwd: repo.root });
     if (commit.code !== 0 || !commit.stdout.trim()) {
       errors[repo.name] = ancestryViolation(repo,

@@ -13,6 +13,7 @@
  */
 
 import type { TaskPullRequest, TaskView } from '../domain/types.js';
+import { taskIdOfBranch, BRAND } from '../domain/brand.js';
 
 export interface GithubPullRequest {
   number: number;
@@ -202,11 +203,8 @@ export function githubSlug(remote: string): string | undefined {
   return match?.[1];
 }
 
-/** The task branch a PR head belongs to, for correlating GitHub back to karmax. */
-export function taskIdOfBranch(branch: string | undefined): string | undefined {
-  const match = branch?.match(/^karmax\/(.+)$/);
-  return match?.[1];
-}
+/** The task a PR head belongs to (re-exported for existing importers). */
+export { taskIdOfBranch };
 
 function normalize(raw: any): GithubPullRequest {
   return {
@@ -621,7 +619,7 @@ export class GithubPrApi {
       return this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
         'x-github-api-version': '2022-11-28', 'content-type': 'application/json',
-        'user-agent': 'karmax', ...(init.headers ?? {}),
+        'user-agent': BRAND, ...(init.headers ?? {}),
       } });
     };
     let response = await send();

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { wikiRoot } from './wiki.js';
 import { materializeGitCredential, type GitCredential } from '../world/git-credential.js';
+import { BRAND } from '../domain/brand.js';
 
 export const PROJECT_WIKI_BRANCH = 'main';
 
@@ -77,13 +78,13 @@ export function ensureProjectWikiRepository(contentDir: string, projectId: strin
   fs.mkdirSync(root, { recursive: true });
   if (!fs.existsSync(path.join(root, '.git'))) {
     execFileSync('git', ['init', '-q', '-b', PROJECT_WIKI_BRANCH, root]);
-    git(root, ['config', 'user.name', 'karmax']);
-    git(root, ['config', 'user.email', 'karmax@localhost']);
+    git(root, ['config', 'user.name', BRAND]);
+    git(root, ['config', 'user.email', `${BRAND}@localhost`]);
   }
   try { git(root, ['rev-parse', '--verify', 'HEAD']); }
   catch {
     git(root, ['add', '-A']);
-    git(root, ['commit', '-q', '--allow-empty', '-m', 'karmax: initialize project wiki']);
+    git(root, ['commit', '-q', '--allow-empty', '-m', `${BRAND}: initialize project wiki`]);
   }
   try { git(root, ['rev-parse', '--verify', `refs/heads/${PROJECT_WIKI_BRANCH}`]); }
   catch { git(root, ['branch', PROJECT_WIKI_BRANCH, 'HEAD']); }
@@ -208,9 +209,9 @@ async function reconcileProjectWikiRemote(root: string, remote: string, credenti
           // rather than overwriting either side. Unrelated history is possible
           // when a repository was initialized manually before it was connected.
           await gitAsync(root, [
-            '-c', 'user.name=karmax', '-c', 'user.email=karmax@localhost',
+            '-c', `user.name=${BRAND}`, '-c', `user.email=${BRAND}@localhost`,
             'merge', '--no-edit', '--allow-unrelated-histories',
-            '-m', `karmax: sync origin/${PROJECT_WIKI_BRANCH}`,
+            '-m', `${BRAND}: sync origin/${PROJECT_WIKI_BRANCH}`,
             tracking,
           ]);
         } catch (error) {

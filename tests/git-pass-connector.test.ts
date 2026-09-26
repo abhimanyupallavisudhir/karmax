@@ -81,9 +81,9 @@ describe('Git-backed unix pass connector', () => {
     const updated = fixture.decrypt(path.join(audit, '.password-store', 'sites', 'example.com.gpg'));
     expect(updated).toContain('rotated-password\nusername: alice\nkeep this note');
     expect(updated).toContain('secret=OLDSEED');
-    const created = fs.readdirSync(path.join(audit, '.password-store', 'karmax')).filter((file) => file.endsWith('.gpg'));
+    const created = fs.readdirSync(path.join(audit, '.password-store', 'tavya')).filter((file) => file.endsWith('.gpg'));
     expect(created).toHaveLength(1);
-    expect(fixture.decrypt(path.join(audit, '.password-store', 'karmax', created[0]!)))
+    expect(fixture.decrypt(path.join(audit, '.password-store', 'tavya', created[0]!)))
       .toBe('generated-password\nusername: new-user\n  retain this too  ');
     expect(Number(run('git', ['rev-list', '--count', 'HEAD'], { cwd: audit }).trim())).toBe(3);
 

@@ -22,7 +22,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
-import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
@@ -2117,7 +2117,7 @@ export class Gateway {
         };
         const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
           .split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'user';
-        return this.downloadJson(res, `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+        return this.downloadJson(res, `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (p === '/api/settings/access' && method === 'GET') {
         if (!requestedScope.projectId && !requestedScope.organizationId)
@@ -2454,7 +2454,7 @@ export class Gateway {
         const label = String(organization?.slug || organizationId).toLowerCase()
           .replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'organization';
         return this.downloadJson(res,
-          `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+          `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
         const organizationId = organizationMatch[1]!;
@@ -4781,7 +4781,7 @@ export class Gateway {
         for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
         this.terminalTickets.set(ticket, { taskId, session, expiresAt });
         // A path into this install's checkout only means something to the machine it lives on.
-        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))] : ['karmax'];
+        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/tavya.js', import.meta.url))] : [BRAND];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
@@ -7862,10 +7862,10 @@ export class Gateway {
         const name = (await this.siteName);
         const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
         data = Buffer.from(data.toString('utf8')
-          .replace(/^# krmax$/m, `# ${name}`)
-          .replace(/^> krmax is /m, `> ${name} is `)
-          .replace(/^krmax gives /m, `${name} gives `)
-          .replace(/https:\/\/krmax\.io/g, origin || 'https://krmax.io'));
+          .replace(/^# tavya$/m, `# ${name}`)
+          .replace(/^> tavya is /m, `> ${name} is `)
+          .replace(/^tavya gives /m, `${name} gives `)
+          .replace(/https:\/\/tavya\.io/g, origin || 'https://tavya.io'));
       }
       res.writeHead(200, staticAssetHeaders(file));
       res.end(data);

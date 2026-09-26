@@ -33,7 +33,7 @@ it('resets a fork’s base branch when its source becomes a dependency', async (
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir });
   const source = await store.createTask({ projectId: project.id, title: 'Unlanded source', workflow: 'software-dev',
     workflowVersion: '1.0.0', params: { prompt: 'source' } });
-  await store.saveView(source.id, { taskId: source.id, status: 'waiting', stage: 'review', branch: 'karmax/source',
+  await store.saveView(source.id, { taskId: source.id, status: 'waiting', stage: 'review', branch: 'tavya/source',
     actions: [], messages: [], state: {} } as any);
   await store.kvSet(`session:${source.id}:do`, 'source-session');
   const gateway = await Gateway.create({ store, tokens, worlds, client, api, bus: new KarmaxBus(),
@@ -54,7 +54,7 @@ it('resets a fork’s base branch when its source becomes a dependency', async (
     const base = page.locator('#tf-body [data-field="base"]');
     const dependency = page.locator('#tf-body .af-resume-add-dependency');
     const chips = page.locator('#dep-chips [data-depid]');
-    await expect.poll(() => base.inputValue()).toBe('karmax/source');
+    await expect.poll(() => base.inputValue()).toBe('tavya/source');
 
     await dependency.check();
     expect(await chips.count()).toBe(1);
@@ -63,7 +63,7 @@ it('resets a fork’s base branch when its source becomes a dependency', async (
     await page.locator('#tf-body summary', { hasText: 'Triggers' }).click();
     await page.locator(`#dep-chips [data-depx="${source.id}"]`).click();
     expect(await dependency.isChecked()).toBe(false);
-    expect(await base.inputValue()).toBe('karmax/source');
+    expect(await base.inputValue()).toBe('tavya/source');
 
     // A base branch the user chose is left alone either way.
     await base.fill('feature/mine');
@@ -74,7 +74,7 @@ it('resets a fork’s base branch when its source becomes a dependency', async (
     expect(await base.inputValue()).toBe('feature/mine');
 
     // The reset base is what gets saved.
-    await base.fill('karmax/source');
+    await base.fill('tavya/source');
     await base.dispatchEvent('change');
     await dependency.check();
     await page.locator('#tf-body textarea[data-field="prompt"]').fill('after the source lands');

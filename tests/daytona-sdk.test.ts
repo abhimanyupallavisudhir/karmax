@@ -72,7 +72,7 @@ describe('Daytona SDK boundary', () => {
       spec: { image: 'ubuntu:24.04', setup: ['echo built'] } as any,
       connection: { apiKey: 'secret' },
     })).rejects.toThrow('build failed');
-    expect(sdk.create).toHaveBeenCalledWith({ name: 'karmax-env-project-abc',
+    expect(sdk.create).toHaveBeenCalledWith({ name: 'tavya-env-project-abc',
       image: { base: 'ubuntu:24.04', commands: ['echo built'] } }, { timeout: 2700 });
     expect(sdk.dispose).toHaveBeenCalledOnce();
   });

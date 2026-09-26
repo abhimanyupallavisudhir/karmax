@@ -993,7 +993,7 @@ function renderField(f, own, inherited, withChips, alt) {
     // dynamic) option list — e.g. an inherited provider not connected locally.
     const opts = [...(f.options || [])];
     if (v !== '' && !opts.includes(v)) opts.push(v);
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(f.optionLabels?.[o] ?? o)}</option>`).join('')}</select></div>`;
   }
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
@@ -3435,7 +3435,7 @@ const BRAND_ICON_CHOICES = [
 
 /** Installation branding arrives from the public metadata endpoint so it is
  * available on landing, sign-in, setup and authenticated screens alike. */
-function siteName() { return S.meta?.siteName || 'krmax'; }
+function siteName() { return S.meta?.siteName || 'tavya'; }
 function siteNameMarkup() { return esc(siteName()); }
 
 function applyDocumentBrand() {
@@ -4619,14 +4619,15 @@ function taskRow(t, { showTags = true } = {}) {
     </div>`;
 }
 
-// Every task gets an isolated worktree on an auto-generated `karmax/<taskId>`
+// Every task gets an isolated worktree on an auto-generated `tavya/<taskId>`
 // branch — the taskId is a noisy random slug, so echoing it in the byline just
 // clutters the list/page (it's still reachable via the check-in terminal +
 // fork commands, which carry the world path). Only surface the branch when it's
 // a *custom* one the human would recognize — e.g. an existing branch checked out
 // by a merge-only workflow.
+// (`karmax/<taskId>` is the pre-rename name older tasks still carry.)
 function customBranch(v, taskId) {
-  return v.branch && v.branch !== `karmax/${taskId}`;
+  return v.branch && ![`tavya/${taskId}`, `karmax/${taskId}`].includes(v.branch);
 }
 
 // The task's GitHub pull requests (remote policy 'pr'), with their live state —
@@ -9218,17 +9219,17 @@ function portableForkCommandFor(session, cwd) {
   const sessionId = session.exportId || session.id;
   const source = `$HOME/Downloads/${filename}`;
   if (session.provider === 'codex') return [
-    'mkdir -p "$HOME/.codex/sessions/karmax"',
-    `cp -n "${source}" "$HOME/.codex/sessions/karmax/${filename}"`,
+    'mkdir -p "$HOME/.codex/sessions/tavya"',
+    `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
     `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.156.1"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
-    `krmax_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
-    `krmax_slug="$(printf '%s' "$krmax_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
-    'mkdir -p "$HOME/.claude/projects/$krmax_slug"',
-    `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${sessionId}.jsonl"`,
-    'cd "$krmax_cwd"',
+    `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
+    `tavya_slug="$(printf '%s' "$tavya_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
+    'mkdir -p "$HOME/.claude/projects/$tavya_slug"',
+    `cp "${source}" "$HOME/.claude/projects/$tavya_slug/${sessionId}.jsonl"`,
+    'cd "$tavya_cwd"',
     `CLAUDE_CONFIG_DIR="$HOME/.claude" claude --resume ${JSON.stringify(sessionId)} --fork-session`,
   ].join('\n');
   return '';
@@ -9413,7 +9414,7 @@ async function forkCloudSessionLocally(v, button) {
 async function copyNativeAttachCommand(v) {
   try {
     const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/terminal-ticket`, { method: 'POST', body: '{}' });
-    const command = [...(result.attachArgv || ['karmax']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
+    const command = [...(result.attachArgv || ['tavya']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
       .map((part) => JSON.stringify(String(part))).join(' ');
     await copyToClipboard(command);
     toast('One-time attach command copied');
@@ -16381,7 +16382,7 @@ function showVisualNotification(item) {
   const alert = document.createElement('div');
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
-  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
   alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
@@ -16398,7 +16399,7 @@ function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
-    const notification = new Notification(item.task?.title || item.resource?.name || 'karmax', {
+    const notification = new Notification(item.task?.title || item.resource?.name || siteName(), {
       body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
       silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
@@ -17689,8 +17690,8 @@ async function hydrateOrganizationView() {
     ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
     <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
       <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
-      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-karmax"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
-      <label class="form-row">Restricted prefix<input id="storage-prefix" value="karmax/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
+      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
+      <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
       <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
       <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
   const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');

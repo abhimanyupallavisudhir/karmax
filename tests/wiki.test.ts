@@ -703,13 +703,13 @@ describe('project wiki git branches', () => {
       const root = wikiRoot(contentDir, 'project', 'p1');
       writeWikiPage(root, 'notes/first', 'Before git.');
       ensureProjectWikiRepository(contentDir, 'p1');
-      execFileSync('git', ['-C', root, 'switch', '-q', '-c', 'karmax/task-1']);
+      execFileSync('git', ['-C', root, 'switch', '-q', '-c', 'tavya/task-1']);
       writeWikiPage(root, 'notes/first', 'Only on the task branch.');
       commitProjectWiki(root, 'wiki: task edit');
       execFileSync('git', ['-C', root, 'switch', '-q', 'main']);
       expect(readWikiPage(root, 'notes/first')!.content).toBe('Before git.');
-      expect(projectWikiBranches(root)).toEqual(expect.arrayContaining(['main', 'karmax/task-1']));
-      const view = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      expect(projectWikiBranches(root)).toEqual(expect.arrayContaining(['main', 'tavya/task-1']));
+      const view = projectWikiBranchView(contentDir, 'p1', 'tavya/task-1');
       expect(readWikiPage(view, 'notes/first')!.content).toBe('Only on the task branch.');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
@@ -742,14 +742,14 @@ describe('project wiki git branches', () => {
       writeWikiPage(root, 'notes/first', 'v1');
       ensureProjectWikiRepository(contentDir, 'p1');
       commitProjectWiki(root, 'wiki: v1');
-      execFileSync('git', ['-C', root, 'branch', 'karmax/task-1']);
+      execFileSync('git', ['-C', root, 'branch', 'tavya/task-1']);
 
-      const first = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      const first = projectWikiBranchView(contentDir, 'p1', 'tavya/task-1');
       const marker = path.join(first, '.reader-was-here');
       fs.writeFileSync(marker, 'reading');
       // A second reader of the same branch used to `worktree remove --force` the
       // directory the first was midway through reading.
-      const second = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      const second = projectWikiBranchView(contentDir, 'p1', 'tavya/task-1');
       expect(second).toBe(first);
       expect(fs.existsSync(marker)).toBe(true);
       expect(readWikiPage(second, 'notes/first')!.content).toBe('v1');
@@ -757,8 +757,8 @@ describe('project wiki git branches', () => {
       // A view that is BEHIND its branch still moves forward.
       writeWikiPage(root, 'notes/first', 'v2');
       commitProjectWiki(root, 'wiki: v2', ['notes/first']);
-      execFileSync('git', ['-C', root, 'branch', '-f', 'karmax/task-1', 'HEAD']);
-      const third = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      execFileSync('git', ['-C', root, 'branch', '-f', 'tavya/task-1', 'HEAD']);
+      const third = projectWikiBranchView(contentDir, 'p1', 'tavya/task-1');
       expect(third).toBe(first);
       expect(readWikiPage(third, 'notes/first')!.content).toBe('v2');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
@@ -887,9 +887,9 @@ describe('remote task wiki views', () => {
       workflowVersion: '1.0.0', params: { prompt: 'x' } }));
     const root = '/remote/world';
     const repoRoot = `${root}/project-wiki`;
-    const handle: any = { kind: 'fake-remote', id: task.id, root, branch: `karmax/${task.id}`, base: 'main',
+    const handle: any = { kind: 'fake-remote', id: task.id, root, branch: `tavya/${task.id}`, base: 'main',
       repos: [{ name: 'project-wiki', role: 'project-wiki', repo: 'git@github.com:acme/wiki.git',
-        root: repoRoot, branch: `karmax/${task.id}`, base: 'main', target: 'main' }] };
+        root: repoRoot, branch: `tavya/${task.id}`, base: 'main', target: 'main' }] };
     (await store.registerWorld(handle, project.id));
     const files = new Map<string, Buffer>([['project-wiki/notes/live/SKILL.md', Buffer.from('Live branch.')]]);
     const commits: string[] = [];

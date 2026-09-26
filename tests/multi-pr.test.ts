@@ -85,7 +85,7 @@ describe('multi-PR tasks (several branches in one world, real git)', () => {
     expect(repos[1]!.name).toBe('docs');
     expect(repos[1]!.repo).toBe(repos[0]!.repo);            // same source repo…
     expect(repos[1]!.branch).not.toBe(repos[0]!.branch);    // …different branch
-    expect(repos[1]!.branch).toBe('karmax/t-two-docs');
+    expect(repos[1]!.branch).toBe('tavya/t-two-docs');
     expect(repos[1]!.root).toBe(path.join(handle.root, 'docs'));
 
     await commitIn(repos[0]!.root, 'feature.js', 'export const f = 1;\n', 'feat');
@@ -101,8 +101,8 @@ describe('multi-PR tasks (several branches in one world, real git)', () => {
     expect((await git(repo, ['show', 'main:feature.js'])).code).toBe(0);
     expect((await git(repo, ['show', 'main:README.md'])).code).toBe(0);
     const log = (await git(repo, ['log', '--oneline', 'main'])).stdout;
-    expect(log).toMatch(/merge karmax\/t-two into main/);
-    expect(log).toMatch(/merge karmax\/t-two-docs into main/);
+    expect(log).toMatch(/merge tavya\/t-two into main/);
+    expect(log).toMatch(/merge tavya\/t-two-docs into main/);
     await world.destroy();
   });
 

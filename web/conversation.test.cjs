@@ -225,7 +225,7 @@ global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
 global.openTaskForm = (...args) => { global.openedForkForm = args; };
-const forkView = { taskId: 'source-task', status: 'done', branch: 'karmax/source-task', targetBranch: 'release', actions: [] };
+const forkView = { taskId: 'source-task', status: 'done', branch: 'tavya/source-task', targetBranch: 'release', actions: [] };
 for (const status of ['done', 'cancelled', 'waiting']) {
   forkView.status = status;
   for (const role of ['do', 'merge', 'confirm', 'resolve']) {
@@ -244,7 +244,7 @@ for (const status of ['done', 'cancelled', 'waiting']) {
     ok(workflow === 'software-dev' && !draft && !prompt
       && params['agent:do'].resumeFrom.taskId === 'source-task'
       && params['agent:do'].resumeFrom.role === role
-      && params.base === (status === 'done' ? 'release' : 'karmax/source-task'),
+      && params.base === (status === 'done' ? 'release' : 'tavya/source-task'),
       `${status} ${role} fork opens a new task form with the correct source, branch and an empty next instruction`);
   }
 }

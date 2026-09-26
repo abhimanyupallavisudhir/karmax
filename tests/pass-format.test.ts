@@ -30,7 +30,7 @@ describe('pass and gopass formats', () => {
   });
   it('converts bare seeds on write to interoperable OTP URIs', () => {
     const body = updatePassSecret('pw\nkeep\n', 'totp', seed);
-    expect(passSecrets(body).totp).toBe(`otpauth://totp/karmax?secret=${seed}`);
+    expect(passSecrets(body).totp).toBe(`otpauth://totp/tavya?secret=${seed}`);
   });
   it('exports notes and TOTP together, including OTP-only items', () => {
     expect(passSecrets(createPassBody({ password: 'pw', note: 'keep\n', totp: uri }))).toEqual({ password: 'pw', note: `keep\n${uri}\n`, totp: uri });

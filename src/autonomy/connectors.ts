@@ -17,6 +17,7 @@ import { ITEM_FIELDS, VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy
 import { unlockAgeIdentity, validateNativeAgeIdentity } from './age-identity.js';
 import { hostOf, passEntryMetadata } from './pass-path.js';
 import { passSecrets, updatePassSecret, createPassItem, parsePassItem } from './pass-format.js';
+import { BRAND } from '../domain/brand.js';
 export { passSecrets } from './pass-format.js';
 
 const pexec = promisify(execFile);
@@ -333,7 +334,7 @@ const createOnePasswordClient: OnePasswordClientFactory = async (token) => {
   const sdk = await import('@1password/sdk');
   return sdk.createClient({
     auth: token,
-    integrationName: 'Krmax',
+    integrationName: BRAND,
     integrationVersion: '1.0.0',
   });
 };
@@ -512,9 +513,16 @@ function itemFieldsFor(type: VaultItemType): VaultFieldName[] {
   return type === 'login' ? ['password'] : [...ITEM_FIELDS[type]];
 }
 
-/** A preview hint for Karmax's typed exports; decryption remains authoritative. */
+/** Folder of entries the vault exports into a password store. Earlier releases
+ * exported under `karmax/`; those entries keep their identity. */
+const PASS_EXPORT_FOLDER = BRAND;
+const PASS_EXPORT_FOLDERS = [PASS_EXPORT_FOLDER, 'karmax'];
+const PASS_EXPORT_IDENTITY = new RegExp(`^(?:${PASS_EXPORT_FOLDERS.join('|')})/[A-Za-z0-9._-]+$`);
+const isPassExport = (externalId: string) => PASS_EXPORT_FOLDERS.some((folder) => externalId.startsWith(`${folder}/`));
+
+/** A preview hint for typed exports; decryption remains authoritative. */
 function passPathType(externalId: string): VaultItemType {
-  const type=externalId.startsWith('karmax/') ? externalId.split('.').at(-1) : undefined;
+  const type=isPassExport(externalId) ? externalId.split('.').at(-1) : undefined;
   return type && Object.hasOwn(ITEM_FIELDS,type) ? type as VaultItemType : 'login';
 }
 
@@ -659,15 +667,15 @@ export class PassConnector implements CredentialConnector {
   }
 
   /**
-   * Write-back creates a NEW entry (under `karmax/…`) for an agent-created
+   * Write-back creates a NEW entry (under `tavya/…`) for an agent-created
    * credential — it never overwrites an entry that was mirrored IN, because a
    * real `pass` file usually carries notes/fields karmax didn't capture, and
    * blind-overwriting would destroy them. Updating a synced entry is a
    * deliberate, separate action, not a side effect of write-back.
    */
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
-    const name = item.externalId || `karmax/${safePassName(item.label)}-${randomUUID()}.${item.type}`;
-    if (!/^karmax\/[A-Za-z0-9._-]+$/.test(name)) throw new Error('Invalid export identity');
+    const name = item.externalId || `${PASS_EXPORT_FOLDER}/${safePassName(item.label)}-${randomUUID()}.${item.type}`;
+    if (!PASS_EXPORT_IDENTITY.test(name)) throw new Error('Invalid export identity');
     const body = createPassItem(item);
     return serializeGitPass(`local-pass:${this.storeDir}`, async () => {
       // Existing ciphertext is never blindly overwritten, even after a retry.
@@ -720,7 +728,7 @@ function gpgHint(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e);
   if (/no such file|not in the password store/i.test(msg)) return msg;
   if (/decrypt|gpg|passphrase|no secret key|inappropriate ioctl|pinentry/i.test(msg)) {
-    return 'pass could not decrypt — your GPG key is locked. Unlock it once in a terminal (e.g. `pass show <any-entry>` and enter your passphrase), so gpg-agent caches it, then retry. karmax deliberately does not store your GPG master passphrase.';
+    return 'pass could not decrypt — your GPG key is locked. Unlock it once in a terminal (e.g. `pass show <any-entry>` and enter your passphrase), so gpg-agent caches it, then retry. tavya deliberately does not store your GPG master passphrase.';
   }
   return msg;
 }
@@ -920,15 +928,15 @@ class GitPassStoreConnector implements CredentialConnector {
     return this.inRepository(async (connection, checkout, store, env) => {
       const body = createPassItem(item);
       const stem = safePassName(item.label)+(item.type === 'login' ? '' : `.${item.type}`);
-      let externalId = item.externalId || `karmax/${stem}`;
-      if (item.externalId && !/^karmax\/[A-Za-z0-9._-]+$/.test(item.externalId)) throw new Error('Invalid export identity');
+      let externalId = item.externalId || `${PASS_EXPORT_FOLDER}/${stem}`;
+      if (item.externalId && !PASS_EXPORT_IDENTITY.test(item.externalId)) throw new Error('Invalid export identity');
       if (item.externalId && fs.existsSync(this.entryFile(store, externalId))) {
         const existing = await this.withKeyContext(connection, home => this.decrypt(home, connection, this.entryFile(store, externalId)));
         if (existing !== body) throw new Error('Export destination already contains different data; it was not overwritten');
         return {externalId};
       }
       for (let suffix = 2; fs.existsSync(this.entryFile(store, externalId)); suffix += 1) {
-        externalId = `karmax/${stem}-${suffix}`;
+        externalId = `${externalId.slice(0, externalId.indexOf('/'))}/${stem}-${suffix}`;
       }
       const file = this.entryFile(store, externalId);
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -1199,7 +1207,7 @@ class GitPassStoreConnector implements CredentialConnector {
     env: Record<string, string>): Promise<void> {
     await gitOrThrow(checkout, ['add', '--', relative], { env });
     if ((await git(checkout, ['diff', '--cached', '--quiet'], { env })).code === 0) return;
-    await gitOrThrow(checkout, ['-c', 'user.name=karmax', '-c', 'user.email=karmax@localhost', 'commit', '-m', message], { env });
+    await gitOrThrow(checkout, ['-c', `user.name=${BRAND}`, '-c', `user.email=${BRAND}@localhost`, 'commit', '-m', message], { env });
     const pushed = await git(checkout, ['push', 'origin', 'HEAD'], { env });
     if (pushed.code !== 0) {
       throw new Error(`password-store changed remotely or could not be pushed; retry to refresh it: ${pushed.stderr || pushed.stdout}`);
@@ -1322,8 +1330,9 @@ export class GitPassConnector implements CredentialConnector {
 
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
     const stores = this.stores();
-    // A mount named karmax would shadow all root exports.
-    if (stores.some(store => store.prefix.startsWith('karmax/'))) throw new Error('The karmax mount reserves the export folder; rename that mount before exporting');
+    // A mount named like an export folder would shadow all root exports.
+    const shadowing = stores.find(store => isPassExport(store.prefix));
+    if (shadowing) throw new Error(`The ${shadowing.prefix.replace(/\/$/, '')} mount reserves the export folder; rename that mount before exporting`);
     return stores[0]!.connector.push(item);
   }
 }
@@ -2041,7 +2050,7 @@ export class Connectors {
     if (existing) return { externalId: existing };
     // A stable path survives lost responses and process restarts. The connector
     // checks existing content before acknowledging an idempotent creation.
-    const write = (await this.queueWrite(name, itemId, `karmax/${item.id}.${item.type}`));
+    const write = (await this.queueWrite(name, itemId, `${PASS_EXPORT_FOLDER}/${item.id}.${item.type}`));
     return this.executeWrite(write);
   }
 

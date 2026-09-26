@@ -2364,7 +2364,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: { title: string; prompt: string }[]) {
-    await core.commitWork(world as any, `karmax: snapshot before sub-tasks for ${taskId}`);
+    await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
     for (const s of list) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.
@@ -3288,10 +3288,10 @@ Inspect the complete current diff and specifically compare its delta from the re
           : providerQueueAccepted
           ? 'The configured provider owns landing order and is validating the integration candidate.'
           : frontHeldLanding
-            ? 'Waiting for the authoritative karmax landing slot for exact-candidate validation.'
+            ? 'Waiting for the authoritative tavya landing slot for exact-candidate validation.'
             : fairLanding
               ? 'Waiting for fair fallback admission unless the provider accepts landing ownership.'
-              : 'Waiting for a short krmax admission turn before handing landing to GitHub.',
+              : 'Waiting for a short tavya admission turn before handing landing to GitHub.',
       };
       if (providerQueueAccepted) mergeQueuePos = undefined;
     }
@@ -3723,7 +3723,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                   ? 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and return to this same Do conversation for verification before landing.'
                   : 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and integration-agent review before landing.'
                 : fairLanding
-                  ? 'The existing task intent is preserved, but this failure released every Karmax admission slot. After repair, repository policy decides whether fresh review is required, and the proposal requests landing again at the back.'
+                  ? 'The existing task intent is preserved, but this failure released every tavya admission slot. After repair, repository policy decides whether fresh review is required, and the proposal requests landing again at the back.'
                   : 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
               : 'This change invalidated the prior authorization, so the updated proposal must pass human Review.'}`
             : explicitPrCycle
@@ -4020,7 +4020,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (!lifecycleReplacement && githubPrLifecycle && world && prs.length
       && (githubAuthoritativeCancellation || prs.some((p) => p.state === 'open'))) {
       const reconciled = await core.closePrs(world as any, prs,
-        'The karmax task for this branch was cancelled; closing the pull request.').catch(() => undefined);
+        'The tavya task for this branch was cancelled; closing the pull request.').catch(() => undefined);
       prs = githubAuthoritativeCancellation && reconciled
         ? reconciled
         : prs.map((p) => ({ ...p, state: 'closed' as const }));

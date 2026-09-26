@@ -72,6 +72,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
 import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integrations/github-actions.js';
+import { BRAND } from '../domain/brand.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -520,7 +521,7 @@ export class KarmaxApi {
       `[Collaboration request ${request.id}]`,
       input.message?.trim() || `Task ${requester.num ? `#${requester.num}` : requester.id} needs your current branch.`,
       'Continue your work as needed, then commit all intended changes and call publish_task_branch.',
-      'Krmax will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.',
+      `${BRAND} will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.`,
     ].join('\n\n');
     try {
       await this.deliverWorkflowMessage(target.id, instruction, input.role ?? 'do');
@@ -3744,8 +3745,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized }));
     const message = action === 'approve'
-      ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
-      : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+      ? `[${BRAND} permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[${BRAND} permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
     const event = {
       taskId: request.taskId,
@@ -4212,7 +4213,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     messages.push({
       id: `recovery-${Date.now()}`,
       role: 'user',
-      text: `Krmax recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
+      text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
       ts: messages.length,
     });
     const session = (await this.deps.store.kvGet(`session:${taskId}:do`)) || undefined;
