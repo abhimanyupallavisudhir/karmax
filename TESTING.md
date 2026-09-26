@@ -93,8 +93,9 @@ KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 
 ## Docker test
 
-`tests/container.test.ts` uses Docker (image `node:22-slim`). It reports skipped
-tests if Docker isn't running; force-skip with `KARMAX_SKIP_DOCKER=1`.
+`tests/container.test.ts` and `tests/services-docker.test.ts` use Docker. An
+enabled suite fails if Docker is unavailable; explicitly skip them with
+`KARMAX_SKIP_DOCKER=1` on a machine without a Docker daemon.
 
 ## Cleaning up stray processes
 

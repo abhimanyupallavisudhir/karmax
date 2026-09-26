@@ -64,6 +64,10 @@ describe('post-push deployment to the public instance', () => {
     expect(JSON.stringify(ci.jobs['deploy-artifacts'].steps)).toContain('docker run --rm karmax:ci');
   });
 
+  it('runs the actual Docker integration suites on CI test shards', () => {
+    expect(ci.jobs.test.env?.KARMAX_SKIP_DOCKER).toBeUndefined();
+  });
+
   it('passes the exact SHA validated by CI instead of pulling an arbitrary newer master', () => {
     expect(JSON.stringify(deploy.env)).toContain('github.event.workflow_run.head_sha');
     expect(script).toContain("git show '$DEPLOY_SHA:deploy/karmax'");

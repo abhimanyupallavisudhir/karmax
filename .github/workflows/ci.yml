@@ -101,9 +101,7 @@ jobs:
     # twice as long, while a genuine hang still fails reasonably soon.
     timeout-minutes: 25
     env:
-      # Live suites spend real money and need real provider keys. Docker-gated
-      # suites are covered by the deploy-artifacts job instead.
-      KARMAX_SKIP_DOCKER: '1'
+      # Paid live suites remain opt-in. These shards run the Docker suites too.
       KARMAX_TEST_PASS_INTEROP: '1'
       KARMAX_TEST_PASS_BROWSER: '1'
       TEMPORAL_CLI_VERSION: '1.7.2'
