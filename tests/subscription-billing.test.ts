@@ -23,6 +23,20 @@ const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
 
 describe('hosted subscription billing', () => {
+  it('reconciles later organizations when an earlier entitlement update fails', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+      for (const name of ['First', 'Second']) {
+        const org = await store.createOrganization({ name, ownerUserId: 'owner' });
+        await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, `checkout-${name}`);
+      }
+      const reconcile = vi.spyOn(billing as any, 'reconcileAccount').mockRejectedValueOnce(new Error('one bad row')).mockResolvedValue(undefined);
+      await expect(billing.reconcileEntitlements()).rejects.toThrow();
+      expect(reconcile).toHaveBeenCalledTimes(2);
+    } finally { await store.close(); }
+  });
+
   it('ignores events for another subscription of an already-bound customer', async () => {
     const store = await Store.create(':memory:', { hosted: true });
     try {

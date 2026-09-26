@@ -373,7 +373,12 @@ export class SubscriptionBillingService {
   async reconcileEntitlements(now = Date.now()): Promise<void> {
     if (!this.hosted) return;
     const rows = (await this.store.db.prepare('SELECT * FROM subscription_billing_accounts').all()) as any[];
-    for (const row of rows) (await this.reconcileAccount(rowAccount(row)!, now));
+    const errors: unknown[] = [];
+    for (const row of rows) {
+      try { await this.reconcileAccount(rowAccount(row)!, now); }
+      catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Some subscription entitlements could not be reconciled');
   }
 
   async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
