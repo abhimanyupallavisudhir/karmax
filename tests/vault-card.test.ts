@@ -144,7 +144,7 @@ describe('BudgetService over the vault-card rail', () => {
 
   it('asks the human to raise the limit once the declared funds run out', async () => {
     const card = await provision(1_000);
-    const task_t2 = await store.createTask({ projectId: projectId, title: 't2', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const task_t2 = await store.createTask({ projectId: projectId, title: 't2', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
     const short = await budget.request({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4_000 });
     expect(short).toMatchObject({ status: 'needs_funding', shortfall: 3_000 });
     await provider.fund(card.id, 3_000);

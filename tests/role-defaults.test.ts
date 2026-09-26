@@ -120,7 +120,7 @@ it('delegates live parent card grants instead of stale start-time authority (RT-
   try {
     const project = await store.createProject('Live grant');
     const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1',
-      params: { _authorization: { capabilities: ['task:read', 'use-card:allowed'] } } });
+      params: { prompt: '', _authorization: { capabilities: ['task:read', 'use-card:allowed'] } } });
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
     const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work', project: {}, parentGrant: ['*'] });
     expect(child.grant).toContain('use-card:allowed');

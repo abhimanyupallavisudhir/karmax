@@ -25,7 +25,7 @@ it.each(['container', 'e2b'] as const)('fills the browser where the %s task runs
   const store = await Store.create(':memory:');
   const worlds = new WorldRegistry();
   const project = await store.createProject('Card routing');
-  const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: {} });
+  const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: { prompt: '' } });
   const card = { id: 'card', provider: 'test' };
   vi.spyOn(store, 'getCard').mockResolvedValue(card);
   vi.spyOn(BudgetService.prototype, 'claimFill').mockResolvedValue({ request: { id: 'request', cardId: 'card' }, domain: 'shop.example.com' });

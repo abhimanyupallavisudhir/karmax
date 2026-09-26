@@ -95,7 +95,7 @@ describe('BudgetService over the mock rail', () => {
   it('shares a parent budget across children and tasks created by agents (AU-9)', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Shared', cap: 10000 });
     await provider.fund(card.id, 10000);
-    const params = { paymentPolicy: { budget: 100, cardIds: [card.id] }, _authorization: { capabilities: ['use-card:*'] } };
+    const params = { prompt: '', paymentPolicy: { budget: 100, cardIds: [card.id] }, _authorization: { capabilities: ['use-card:*'] } };
     const parent = await store.createTask({ projectId, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params });
     const a = await store.createTask({ projectId, title: 'Child A', workflow: 'software-dev', workflowVersion: '1', params, parentTaskId: parent.id });
     const b = await store.createTask({ projectId, title: 'Child B', workflow: 'software-dev', workflowVersion: '1', params,
@@ -123,7 +123,7 @@ describe('BudgetService over the mock rail', () => {
   it('needs_funding when the card is short, then grants after funding', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
     await provider.fund(card.id, 1000);
-    const task_t2 = await store.createTask({ projectId: projectId, title: 't2', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const task_t2 = await store.createTask({ projectId: projectId, title: 't2', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
     let r = await budget.request({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4000 });
     expect(r.status).toBe('needs_funding');
     expect(r.shortfall).toBe(3000);
@@ -220,9 +220,9 @@ describe('BudgetService over the mock rail', () => {
     // because neither is counted until the gate decides. Approving both would put
     // 600 on a card capped at 500: the cumulative ceiling has to be re-counted
     // here, exactly as the budget coordinator does (src/coordinators/budget.ts).
-    const task_gate_a = await store.createTask({ projectId: projectId, title: 'gate-a', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const task_gate_a = await store.createTask({ projectId: projectId, title: 'gate-a', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
     const first = await budget.request({ projectId, taskId: task_gate_a.id , capabilities: ['use-card:*'] }, { amount: 300, cardId: card.id, why: 'first' });
-    const task_gate_b = await store.createTask({ projectId: projectId, title: 'gate-b', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const task_gate_b = await store.createTask({ projectId: projectId, title: 'gate-b', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
     const second = await budget.request({ projectId, taskId: task_gate_b.id , capabilities: ['use-card:*'] }, { amount: 300, cardId: card.id, why: 'second' });
     expect([first.status, second.status]).toEqual(['needs_approval', 'needs_approval']);
     expect((await budget.approve(first.requestId!, 'user:alice')).status).toBe('granted');
@@ -302,7 +302,7 @@ describe('task payment policy', () => {
     const second = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Personal', cap: 10000 });
     await provider.fund(first.id, 10000);
     await provider.fund(second.id, 10000);
-    const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do', workflowVersion: '1.0.0', params: { _authorization: { capabilities: ['use-card:*'] }, paymentPolicy: { cardIds: [first.id, second.id], budget: 100 } } } as any));
+    const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] }, paymentPolicy: { cardIds: [first.id, second.id], budget: 100 } } } as any));
     const ctx = { projectId: project.id, taskId: task.id , capabilities: ['use-card:*'] };
     expect((await budget.request(ctx, { amount: 100, cardName: 'Employer' })).status).toBe('granted');
     const pending = await budget.request(ctx, { amount: 200, cardName: 'Personal' });
@@ -338,7 +338,7 @@ describe('payment reservations under concurrency', () => {
     await provider.fund(card.id, 10000);
     (await store.setSettings(project.id, 'payments', { budget: 100 }));
     const one = new BudgetService(store, provider), two = new BudgetService(store, provider);
-    const task_concurrent = await store.createTask({ projectId: project.id, title: 'concurrent', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const task_concurrent = await store.createTask({ projectId: project.id, title: 'concurrent', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
     const ctx = { projectId: project.id, taskId: task_concurrent.id , capabilities: ['use-card:*'] };
     const results = await Promise.all([one.request(ctx, { amount: 100, why: 'one' }), two.request(ctx, { amount: 100, why: 'two' })]);
     expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);
@@ -356,7 +356,7 @@ describe('payment reservations under concurrency', () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 10000 });
     await provider.fund(card.id, 10000);
     (await store.setSettings(project.id, 'payments', { budget: 5000, cardIds: [card.id] }));
-    const task = (await store.createTask({ projectId: project.id, title: 'None', workflow: 'just-do', workflowVersion: '1.0.0', params: { _authorization: { capabilities: ['use-card:*'] }, paymentPolicy: { budget: 0, cardIds: [] } } } as any));
+    const task = (await store.createTask({ projectId: project.id, title: 'None', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] }, paymentPolicy: { budget: 0, cardIds: [] } } } as any));
     const service = new BudgetService(store, provider), ctx = { projectId: project.id, taskId: task.id , capabilities: ['use-card:*'] };
     expect((await service.request(ctx, { amount: 100, cardName: 'Expenses' })).status).toBe('denied');
     (await store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { budget: 0, cardIds: [card.id] } } as any));

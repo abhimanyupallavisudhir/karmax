@@ -323,7 +323,7 @@ describe('Stripe Issuing organization rail', () => {
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
       (await store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', budget: 1_000 }));
-    const task_task_gate = await store.createTask({ projectId: projectId, title: 'task_gate', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const task_task_gate = await store.createTask({ projectId: projectId, title: 'task_gate', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
       const ctx = { organizationId, projectId, taskId: task_task_gate.id , capabilities: ['use-card:*'] };
       const first = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'first' });
       const second = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'second' });
