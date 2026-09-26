@@ -532,3 +532,13 @@ it('does not ambiently inject another agent task’s environment item (AU-13)', 
   expect(await items.envFor('creator', ['use-credential:*'])).toHaveProperty('APP_TOKEN', 'value');
   expect(await items.envFor('other', [`use-credential:item:${item.id}`])).toHaveProperty('APP_TOKEN', 'value');
 });
+
+it('delivers SSH-key files inside the receiving remote world (AU-21)', async () => {
+  const { items } = makeService();
+  await items.save({ type: 'ssh-key', label: 'Remote key', envVar: 'APP_SSH_KEY', secrets: { privateKey: 'PRIVATE' } });
+  const writes: any[] = [];
+  const world = { handle: { root: '/sandbox' }, writeFile: async (...args: any[]) => { writes.push(args); }, exec: async () => ({ code: 0, stdout: '', stderr: '' }) } as any;
+  const env = await items.envFor('task', ['use-credential:*'], world);
+  expect(env.APP_SSH_KEY).toMatch(/^\/sandbox\/\.karmax-injection\/vault\//);
+  expect(writes[0]?.[1]).toBe('PRIVATE\n');
+});

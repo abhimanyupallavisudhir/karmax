@@ -73,6 +73,14 @@ describe('agent project-secret delivery', () => {
           task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any });
         expect(received?.secretEnv?.ANTHROPIC_API_KEY).toBe('granted-app-key');
         expect(received?.extraEnv ?? {}).not.toHaveProperty('ANTHROPIC_API_KEY');
+        const localWorld = await worlds.open(handle);
+        const open = vi.spyOn(worlds, 'open').mockResolvedValue(localWorld);
+        try {
+          await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: { ...handle, kind: 'e2b' }, messages: [],
+            task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any });
+          expect(received?.secretEnv?.ANTHROPIC_API_KEY).toBe('granted-app-key');
+        } finally { open.mockRestore(); }
+
       } finally { vaultEnvironment.mockRestore(); }
       // A resumed turn opens the same world, without materializing its files again.
       const lateHandle = 'resource:test:late-token';

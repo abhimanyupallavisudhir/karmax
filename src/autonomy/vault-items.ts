@@ -1,3 +1,4 @@
+import type { World } from '../world/types.js';
 import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -607,7 +608,7 @@ export class VaultItems {
    * `envVar`, `ssh-key` items a 0600 key file path under `envVar`. `ask` items
    * and unattached items never inject ambiently.
    */
-  async envFor(taskId: string, caps: Capability[]): Promise<Record<string, string>> {
+  async envFor(taskId: string, caps: Capability[], world?: World): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
@@ -624,7 +625,7 @@ export class VaultItems {
         } else if (item.type === 'api-key' && item.envVar && item.fields.includes('secret')) {
           env[item.envVar] = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
         } else if (item.type === 'ssh-key' && item.envVar && item.fields.includes('privateKey')) {
-          env[item.envVar] = (await this.materializeKey(item, { taskId }));
+          env[item.envVar] = (await this.materializeKey(item, { taskId }, world));
         }
       } catch (e) {
         // One corrupted/missing secret must not block every turn granted to it;
@@ -747,7 +748,16 @@ export class VaultItems {
   }
 
   /** Write a key to a 0600 file (idempotent per save) and return its path. */
-  private async materializeKey(item: VaultItem, ctx: { taskId?: string }): Promise<string> {
+  private async materializeKey(item: VaultItem, ctx: { taskId?: string }, world?: World): Promise<string> {
+    if (world) {
+      const secret = await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' });
+      const relative = `.karmax-injection/vault/${crypto.createHash('sha256').update(item.id).digest('hex')}.key`;
+      await world.writeFile(relative, secret.endsWith('\n') ? secret : `${secret}\n`);
+      const file = path.posix.join(world.handle.root, relative);
+      const mode = await world.exec('chmod', ['600', file]);
+      if (mode.code !== 0) throw new Error('could not restrict remote key file permissions');
+      return file;
+    }
     const file = path.join(this.keyDir(item.id), 'key');
     if (!fs.existsSync(file)) {
       const secret = (await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' }));

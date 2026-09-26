@@ -2466,10 +2466,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : (await gitEnvFor(args.worldHandle, args.taskId));
             // Granted `auto` vault items materialize into the work-command env
             // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
-            // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
+            // SSH keys as 0600 files inside the receiving world.
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
-            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : (await orgVaultItems.envFor(args.taskId, effective));
+            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, isRemote(args.worldHandle.kind) ? world : undefined);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
