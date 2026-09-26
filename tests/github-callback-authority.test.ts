@@ -37,7 +37,7 @@ describe('GitHub callbacks trust only what they can verify', () => {
     const conversions: string[] = [];
     const service = await GitHubAppService.create(store, broker, {
       ...(options.configured === false ? {} : { appId: '123', appSlug: 'tavya' }),
-      fetch: (async (input: RequestInfo | URL) => {
+      fetch: (async (input: string | URL | Request) => {
         const url = new URL(String(input));
         const conversion = url.pathname.match(/^\/app-manifests\/([^/]+)\/conversions$/);
         if (conversion) {

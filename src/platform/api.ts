@@ -97,6 +97,10 @@ export class ValidationError extends Error {
   status = 400;
 }
 
+/** Signals a person or agent may send to a task; a workflow may offer more as
+ *  declared actions (`TaskView.actions`, kind 'signal'). */
+const PUBLIC_TASK_SIGNALS = new Set<string>([SIG.followUp, SIG.confirm, SIG.openPr, SIG.approveCheckout, SIG.cancel, SIG.retry]);
+
 /**
  * The dispatcher hook (SPEC §3.3). A triggered task is stored-not-started and
  * *armed* through this so the in-process scheduler can start it when a trigger
@@ -4281,7 +4285,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const scopedTask = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId }));
-    if (files?.length && scopedTask) (await this.validatePromptFiles(scopedTask.projectId, files));
+    // Only a task's own workflow, and only with what a task takes from people
+    // and agents. Every workflow shares one namespace: a coordinator id has no
+    // project to scope-check, and internal signals (grants, sub-task replies,
+    // collaboration) carry payloads whose absence wedges the receiver.
+    if (!scopedTask) throw new NotFoundError(`no task ${taskId}`);
+    if (!PUBLIC_TASK_SIGNALS.has(signal)
+      && !scopedTask.lastView?.actions?.some((action) => action.kind === 'signal' && action.name === signal))
+      throw new ValidationError(`signal "${signal}" cannot be sent to a task`);
+    if (files?.length) (await this.validatePromptFiles(scopedTask.projectId, files));
     if (attemptChoice?.otherAttempts !== undefined && !['keep', 'cancel'].includes(attemptChoice.otherAttempts))
       throw new ValidationError('otherAttempts must be keep or cancel');
     if (attemptChoice?.saveOtherAttemptsDefault) {

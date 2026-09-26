@@ -402,4 +402,26 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
   it('refuses a priority write against a task that does not exist', async () => {
     await expect(api.setTaskPriority(token, 'task_missing', 2)).rejects.toBeInstanceOf(NotFoundError);
   });
+
+  /** `/api/tasks/:id/signal` used to forward any signal name to any workflow id
+   *  in the shared namespace: a coordinator singleton has no project to check
+   *  against, and its handlers crash on a missing payload — wedging every
+   *  tenant's admission, merges or account leases. */
+  it('signals only tasks, and only what a task offers', async () => {
+    const signals: Array<{ id: string; name: string }> = [];
+    const client = { workflow: { getHandle: (id: string) => ({
+      signal: async (name: string) => { signals.push({ id, name }); },
+      describe: async () => ({ status: { name: 'RUNNING' } }),
+    }) } };
+    const signalling = new KarmaxApi({ store, client: client as any, taskQueue: 'karmax', tokens, contentDir, worlds: new WorldRegistry() });
+    await expect(signalling.signalTask(token, 'account-coordinator', 'registerAccounts')).rejects.toBeInstanceOf(NotFoundError);
+    await expect(signalling.signalTask(token, 'agent-queue:org_other', 'setAgentCapacity')).rejects.toBeInstanceOf(NotFoundError);
+    const task = await store.createTask({ projectId: mine, title: 'Mine', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'x' } });
+    await store.saveView(task.id, { taskId: task.id, title: 'Mine', workflow: 'software-dev', stage: 'do', status: 'active',
+      messages: [], actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true }], state: {}, updatedAt: Date.now() });
+    for (const internal of ['mergeGranted', 'accountGranted', 'parentResponse', 'raiseFromChild', 'collaborationRequested', 'providerChanged'])
+      await expect(signalling.signalTask(token, task.id, internal)).rejects.toThrow(/cannot be sent/);
+    await signalling.signalTask(token, task.id, 'cancel');
+    expect(signals).toEqual([{ id: task.id, name: 'cancel' }]);
+  });
 });

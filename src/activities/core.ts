@@ -87,7 +87,7 @@ import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { allows, attenuate, CHILD_TASK_CAPABILITIES } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskResponse } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -430,6 +430,22 @@ export interface PrepareChildArgs {
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
+/** Keep an agent's sub-task replies to this task's own children. A reply
+ *  becomes a workflow signal (confirm / cancel / comment) to the id the agent
+ *  names, and every workflow — any tenant's task, any coordinator — shares one
+ *  namespace. No id means "every child awaiting a reply", which the workflow
+ *  resolves from its own children. Replay-safe: it only narrows the result. */
+export async function ownSubTaskResponses(store: Pick<Store, 'getTask'>, taskId: string,
+  responses: SubTaskResponse[] | undefined): Promise<{ kept?: SubTaskResponse[]; refused: string[] }> {
+  const kept: SubTaskResponse[] = [];
+  const refused: string[] = [];
+  for (const response of responses ?? []) {
+    if (!response.childTaskId || (await store.getTask(response.childTaskId))?.parentTaskId === taskId) kept.push(response);
+    else refused.push(response.childTaskId);
+  }
+  return { ...(kept.length ? { kept } : {}), refused };
+}
+
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
@@ -2741,6 +2757,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       // Adapters can also return review info directly without invoking the tool.
       if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, result.reviewInfo, true);
+      if (result.subTaskResponses?.length) {
+        const { kept, refused } = await ownSubTaskResponses(store, args.taskId, result.subTaskResponses);
+        result.subTaskResponses = kept;
+        if (refused.length) (await record(args.taskId, 'subtask.response_refused', { childTaskIds: refused }));
+      }
       (await record(args.taskId, 'turn.result', {
         completed: result.completed,
         providerCompleted: result.providerCompleted,
