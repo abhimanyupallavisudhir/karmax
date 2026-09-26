@@ -68,7 +68,7 @@ it('WF-9: denied credentials park just-do visibly and cancellation completes', a
 it('WF-10: a confirm signal cannot bypass failed workflow checks', async () => {
   wf.activities.accountPoolSize.mockResolvedValue(0);
   wf.activities.runWorkflowChecks = vi.fn(async () => ({ passed: false, detail: 'failing tests' }));
-  wf.activities.publishView.mockImplementation(async (_id, view) => {
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
     if (view.stage === 'review') wf.handlers.get('confirm')!();
   });
   wf.activities.finalizeMergeActivity = vi.fn();
@@ -121,7 +121,7 @@ it('WF-22: a grant racing cancellation is returned without running the agent', a
 
 it('WF-11: software-dev rechecks cancellation after publishing admission', async () => {
   wf.activities.accountPoolSize.mockResolvedValue(0);
-  wf.activities.publishView.mockImplementation(async (_id, view) => {
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
     if (view.waitingFor?.kind === 'agentSlot') wf.handlers.get('cancel')!();
   });
   expect(await softwareDevV1_26(input)).toEqual({ stage: 'cancelled' });
@@ -129,7 +129,7 @@ it('WF-11: software-dev rechecks cancellation after publishing admission', async
 });
 
 it('WF-22: software-dev returns an account granted concurrently with cancellation', async () => {
-  wf.activities.leaseAccount.mockImplementation(async (_id, turnId) => {
+  wf.activities.leaseAccount.mockImplementation(async (_id: string, turnId: string) => {
     wf.handlers.get('accountGranted')!({ turnId, accountId: 'login' });
     wf.handlers.get('cancel')!();
   });
@@ -144,7 +144,7 @@ it('WF-12: a human gate after an agent layer publishes a waiting state', async (
   wf.activities.runAgentTurn.mockImplementation(async ({ role }: any) => role === 'confirm'
     ? { confirmDecision: { action: 'confirm' } } : { openPrRequested: true, completed: true });
   let humanGate = false;
-  wf.activities.publishView.mockImplementation(async (_id, view) => {
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
     if (view.stage === 'review' && view.waitingFor?.kind === 'human') {
       humanGate = true;
       expect(view.status).toBe('waiting');
@@ -161,7 +161,7 @@ it.each([['just-do', justDoV1_7], ['merge-only', mergeOnlyV1_7]] as const)(
     wf.activities.accountPoolSize.mockResolvedValue(0);
     wf.activities.runAgentTurn.mockResolvedValue({ confirmDecision: { action: 'confirm' } });
     let humanGate = false;
-    wf.activities.publishView.mockImplementation(async (_id, view) => {
+    wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
       if (view.waitingFor?.kind === 'human') {
         humanGate = true;
         expect(view.status).toBe('waiting');
@@ -199,7 +199,7 @@ it('WF-8: lifecycle replacement preserves detached children', async () => {
   wf.activities.accountPoolSize.mockResolvedValue(0);
   wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
   wf.activities.runAgentTurn.mockResolvedValue({ subTasks: [{ title: 'child', prompt: 'work' }] });
-  wf.activities.publishView.mockImplementation(async (_id, view) => {
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
     if (view.subTasks?.length) wf.handlers.get('prepareLifecycleReplacement')!();
   });
   await softwareDevV1_26(input);
@@ -212,7 +212,7 @@ it('WF-8: a replacement parent restores its child barrier and pending questions'
   wf.activities.restoreChildTasks = vi.fn(async () => [{ taskId: 'child', title: 'Child',
     waiting: true, detail: 'Please review' }]);
   let restored = false;
-  wf.activities.publishView.mockImplementation(async (_id, view) => {
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
     if (view.subTasks?.includes('child')) { restored = true; wf.handlers.get('prepareLifecycleReplacement')!(); }
   });
   await softwareDevV1_26({ ...input, recovery: { messages: [], resumeStage: 'do' } });

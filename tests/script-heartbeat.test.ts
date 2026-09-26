@@ -8,7 +8,7 @@ it('WF-26: scripts heartbeat while their world command runs and clear the timer'
   const store = await Store.create(':memory:');
   const project = await store.createProject('Scripts');
   const task = await store.createTask({ projectId: project.id, title: 'Script', workflow: 'script-exec',
-    workflowVersion: '1.0.0', params: {} });
+    workflowVersion: '1.0.0', params: { prompt: 'held' } });
   let release!: (result: any) => void;
   let started!: () => void;
   const running = new Promise<void>(resolve => { started = resolve; });

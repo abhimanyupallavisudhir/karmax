@@ -1363,7 +1363,7 @@ async function softwareDevImpl(
   });
   // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
   if (recovery && patched('software-dev-preserve-replacement-children-v1'))
-    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => settled.push(result));
+    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => { settled.push(result); });
   setHandler(raiseFromChildSignal, (r) => {
     if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
