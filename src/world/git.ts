@@ -29,16 +29,28 @@ export function isolatedGitEnvironment(): Record<string, string> {
 
 /** Run a git command in `cwd`. Never throws on non-zero; returns the code.
  *  `opts.env` layers extra vars (e.g. a git profile's GIT_SSH_COMMAND) over the
- *  process env; interactive prompts stay disabled regardless. */
+ *  minimal host environment; interactive prompts stay disabled regardless. */
 export async function git(cwd: string, args: string[], opts: { timeoutMs?: number; env?: Record<string, string> } = {}): Promise<GitResult> {
   try {
     await validateGitDirectory(cwd);
+    const env = { ...hostGitEnvironment(), ...(opts.env ?? {}), GIT_TERMINAL_PROMPT: '0' };
+    const config = await pexec('git', ['config', '--null', '--get-regexp',
+      '^(filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver|diff\\..*\\.(command|textconv)|diff\\.external|core\\.(sshcommand|gitproxy|alternaterefscommand)|gpg(\\..*)?\\.program|credential(\\..*)?\\.helper)$'],
+      { cwd, env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 1024 * 1024 }).catch(error => {
+        if (error.code === 1 && !error.killed) return { stdout: '' };
+        throw error;
+      });
+    for (const setting of config.stdout.split('\0')) {
+      const separator = setting.indexOf('\n');
+      if (separator >= 0 && setting.slice(separator + 1).trim())
+        throw new Error(`refusing executable repository Git configuration: ${setting.slice(0, separator)}`);
+    }
     const { stdout, stderr } = await pexec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
-      '-c', 'core.quotePath=false', ...args], {
+      '-c', 'core.quotePath=false', '-c', 'protocol.ext.allow=never', ...args], {
       cwd,
       timeout: opts.timeoutMs ?? 120_000,
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...hostGitEnvironment(), ...(opts.env ?? {}), GIT_TERMINAL_PROMPT: '0' },
+      env,
     });
     return { stdout, stderr, code: 0 };
   } catch (e: any) {

@@ -45,3 +45,12 @@ it('validates the enclosing repository when Git runs in a subdirectory (RT-5)', 
   fs.writeFileSync(path.join(root, '.git'), `gitdir: ${foreign}/.git\n`);
   expect((await git(nested, ['status', '--porcelain'])).code).not.toBe(0);
 });
+it('refuses executable repository filters before host staging (RT-5)', async () => {
+  const root = await fixture();
+  const marker = path.join(root, 'filter-ran');
+  fs.writeFileSync(path.join(root, '.gitattributes'), '*.txt filter=untrusted\n');
+  fs.writeFileSync(path.join(root, 'file.txt'), 'content');
+  await gitOrThrow(root, ['config', 'filter.untrusted.clean', `touch '${marker}'; cat`]);
+  expect((await git(root, ['add', '.'])).code).not.toBe(0);
+  expect(fs.existsSync(marker)).toBe(false);
+});
