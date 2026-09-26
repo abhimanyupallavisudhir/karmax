@@ -1038,10 +1038,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ctx?.cancellationSignal.throwIfAborted();
       const superseding = Number.isSafeInteger(publicationSeq)
         ? (await store.eventsSince(taskId, publicationSeq, undefined, true)).find(event =>
-          event.type === 'conversation.message' || event.type === 'task.cancel-requested') : undefined;
+          event.type === 'conversation.message' || event.type === 'task.cancel-requested'
+            || event.type === 'task.transition-requested') : undefined;
       if (superseding) {
         await record(taskId, 'world.park-deferred', { reason: superseding.type === 'task.cancel-requested'
-          ? 'accepted-cancellation' : 'accepted-follow-up' });
+          ? 'accepted-cancellation' : superseding.type === 'task.transition-requested' ? 'accepted-transition' : 'accepted-follow-up' });
         return false;
       }
       if (await worlds.hasActiveAccess?.(waitingWorld.id)) return false;
@@ -1111,6 +1112,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     };
     try {
+      // Keep quick replies and Review decisions out of expensive checkpoint work.
+      // Do not hold the world's operation lock during this interruptible grace.
+      const idleUntil = Math.min(view.updatedAt + 15_000, Date.now() + 15_000);
+      while (Date.now() < idleUntil) {
+        if (!(await valid())) return;
+        await new Promise(resolve => setTimeout(resolve, Math.min(250, idleUntil - Date.now())));
+      }
       await parkingTrace.measure('lifecycle.waiting-publication', () => worlds.withOperation ? worlds.withOperation(waitingWorld.id, maintain) : maintain());
     } catch (error) {
       if (ctx?.cancellationSignal.aborted) throw error;

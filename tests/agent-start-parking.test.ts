@@ -81,7 +81,7 @@ describe('parking during agent admission', () => {
     } finally { ctx.mockRestore(); await store.close(); }
   });
 
-  it.each(['conversation.message', 'task.cancel-requested'])('stops checkpoint work at its next safe boundary after %s', async eventType => {
+  it.each(['conversation.message', 'task.cancel-requested', 'task.transition-requested'])('stops checkpoint work at its next safe boundary after %s', async eventType => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Interrupt capture');
     const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',

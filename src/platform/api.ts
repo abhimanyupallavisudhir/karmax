@@ -4589,6 +4589,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         if (signal === SIG.cancel) await this.deps.store.appendEvent({ taskId,
           type: 'task.cancel-requested', ts: Date.now(), payload: {} });
       }
+      if ([SIG.openPr, SIG.confirm, SIG.retry, SIG.approveCheckout].includes(signal as any))
+        await this.deps.store.appendEvent({ taskId, type: 'task.transition-requested', ts: Date.now(), payload: { signal } });
     } catch (e) {
       // Cancellation is idempotent at the task API boundary. The drawer can be
       // acting on a view published immediately before the workflow closes, in
