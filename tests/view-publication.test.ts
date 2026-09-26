@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { Context } from '@temporalio/activity';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
@@ -7,6 +8,30 @@ import { conversationPublisher, type PublishedView } from '../src/domain/view-pu
 import type { TaskView } from '../src/domain/types.js';
 
 describe('durable conversation publication', () => {
+  it.each(['done', 'cancelled', 'failed'] as const)('prunes completed turn retry records on %s while retaining resumable sessions', async status => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Turn cleanup');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: {} });
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    const retryKeys = [`turnsession:${task.id}#0`, `turnsession:${task.id}:run#1`,
+      'turnsession:legacy:run:activity', `turnresult:${task.id}:do:${task.id}:run#1`];
+    const retained = [`session:${task.id}:do`, `sessionmeta:${task.id}:do`,
+      `turnsession:${task.id}-other#0`, `turnsession:${task.id}-other:run#1`, 'turnsession:legacy:other:activity'];
+    const ctx = vi.spyOn(Context, 'current').mockReturnValue({ info: { workflowExecution: { runId: 'run' }, activityId: 'publish' } } as any);
+    try {
+      for (const key of [...retryKeys, ...retained]) await store.kvSet(key, 'saved');
+      const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+        messages: [], actions: [], state: {}, updatedAt: 1 } as TaskView;
+      await core.publishView(task.id, view);
+      for (const key of retryKeys) expect(await store.kvGet(key)).toBe('saved');
+      await core.publishView(task.id, { ...view, status });
+      for (const key of retryKeys) expect(await store.kvGet(key)).toBeUndefined();
+      for (const key of retained) expect(await store.kvGet(key)).toBe('saved');
+    } finally { ctx.mockRestore(); await store.close(); }
+  });
+
   it('reuses immutable snapshots across restarts, mutations, and late retries', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Publication', {}));
@@ -114,11 +139,14 @@ describe('durable conversation publication', () => {
     try {
       (await store.kvSet(key, 'conversation'));
       (await store.kvSet(nextKey, 'also task-owned'));
+      const retryKeys = [`turnsession:${task.id}:run#1`, `turnresult:${task.id}:do:${task.id}:run#1`];
+      for (const key of retryKeys) await store.kvSet(key, 'saved');
       (await store.kvSet('view-conversation:other-task:run:0', 'preserve'));
       if (scope === 'project') (await store.deleteProject(project.id));
       else (await store.deleteOrganization(organization.id));
       expect((await store.kvGet(key))).toBeUndefined();
       expect((await store.kvGet(nextKey))).toBeUndefined();
+      for (const key of retryKeys) expect(await store.kvGet(key)).toBeUndefined();
       expect((await store.kvGet('view-conversation:other-task:run:0'))).toBe('preserve');
     } finally { (await store.close()); }
   });

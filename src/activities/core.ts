@@ -4991,6 +4991,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       (await store.saveView(taskId, view, conversationReference));
+      if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
+        let runId: string | undefined;
+        try { runId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
+        await store.clearTurnCheckpoints(taskId, runId);
+      }
       // First Merge admission freezes whether sibling proposals remain eligible.
       // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {

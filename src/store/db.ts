@@ -5005,7 +5005,7 @@ export class Store {
       (await prefix.run(sharePrefix, sharePrefix));
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
   
@@ -7313,6 +7313,14 @@ export class Store {
   async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
     return ((await this.db.prepare('SELECT k, v FROM kv WHERE k LIKE ? ORDER BY k').all(`${prefix}%`)) as any[])
       .map((row) => ({ key: String(row.k), value: String(row.v) }));
+  }
+
+  async clearTurnCheckpoints(taskId: string, runId?: string): Promise<void> {
+    await this.db.transaction(async () => {
+      const remove = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
+      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`,
+        ...(runId ? [`turnsession:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
+    });
   }
 
   async kvDelete(k: string): Promise<void> {
