@@ -3535,6 +3535,20 @@ export class Store {
     return (await this.attachTags(projectId, tasks));
   }
 
+  /** Reconciliation needs every live attempt, but neither tags nor full conversations. */
+  async listReconciliationCandidates(projectId: string): Promise<TaskRecord[]> {
+    const rows = await this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
+      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
+      notes, lastView FROM tasks WHERE projectId=?
+      AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND COALESCE(LOWER(CAST(json_extract(params, '$.draft') AS TEXT)), '') NOT IN ('true', '1')
+      AND COALESCE(json_extract(params, '$.triggerState'), '') <> 'armed'
+      AND COALESCE(LOWER(CAST(json_extract(params, '$.repeatable') AS TEXT)), '') NOT IN ('true', '1')
+      ORDER BY ord, createdAt`).all(projectId) as any[];
+    return rows.map(rowToTask);
+  }
+
   /** Tasks currently armed on a trigger (stored-not-started), across all projects.
    *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3).
    *

@@ -45,6 +45,18 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('selects only unsettled attempt metadata for reconciliation', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Reconciliation');
+      const live = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const done = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
+      await store.saveView(done.id, { taskId: done.id, title: done.title, workflow: done.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      expect((await store.listReconciliationCandidates(project.id)).map((task) => task.id)).toEqual([live.id]);
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);

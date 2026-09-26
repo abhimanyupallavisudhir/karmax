@@ -23,6 +23,42 @@ describe('defaultBranch detection', () => {
 });
 
 describe('reconcileTasks (settle lost workflows on restart)', () => {
+  it('reads only unsettled attempt metadata without conversations', async () => {
+    const store = await Store.create(':memory:');
+    const p = await store.createProject('P', {});
+    const live = await store.createTask({ projectId: p.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: {} });
+    const done = await store.createTask({ projectId: p.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: {} });
+    const draft = await store.createTask({ projectId: p.id, title: 'Draft', workflow: 'just-do', workflowVersion: '1', params: { draft: true } });
+    await store.saveView(done.id, { taskId: done.id, title: done.title, workflow: done.workflow,
+      stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+    const sql: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((query: string) => { sql.push(query); return prepare(query); }) as typeof store.db.prepare;
+    try {
+      expect((await store.listReconciliationCandidates(p.id)).map((task) => task.id)).toEqual([live.id]);
+      expect(sql.some((query) => /FROM tasks WHERE projectId=\?/.test(query) && !/SELECT \*/.test(query)
+        && !/conversation/.test(query.toLowerCase()))).toBe(true);
+    } finally { await store.close(); }
+  });
+
+  it('bounds concurrent workflow describes during reconciliation', async () => {
+    const store = await Store.create(':memory:');
+    const p = await store.createProject('P', {});
+    for (let i = 0; i < 12; i++) await store.createTask({ projectId: p.id, title: `T${i}`,
+      workflow: 'just-do', workflowVersion: '1', params: {} });
+    let active = 0, peak = 0;
+    const client: any = { workflow: { getHandle: () => ({ describe: async () => {
+      active++; peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      return { status: { name: 'RUNNING' } };
+    } }) } };
+    try {
+      expect((await reconcileTasks(store, client)).checked).toBe(12);
+      expect(peak).toBe(8);
+    } finally { await store.close(); }
+  });
+
   it('preserves the server termination reason without fetching the full history', async () => {
     const store = (await Store.create(':memory:'));
     const p = (await store.createProject('P', {}));
