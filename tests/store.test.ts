@@ -13,6 +13,17 @@ describe('Store', () => {
     store = (await Store.create(':memory:'));
   });
 
+  it('removes project admission reservations with the project', async () => {
+    const project = await store.createProject('Reservations');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.db.prepare(`INSERT INTO usage_admissions
+      (id, organizationId, projectId, taskId, kind, provider, fundingSource, state, createdAt)
+      VALUES (?, ?, ?, ?, 'agent', 'mock', 'byok', 'active', 1)`)
+      .run('reservation', project.organizationId, project.id, task.id);
+    await store.deleteProject(project.id);
+    expect(await store.db.prepare('SELECT id FROM usage_admissions WHERE projectId=?').all(project.id)).toEqual([]);
+  });
+
   it('exports personal data without holding a database write transaction', async () => {
     vi.spyOn(store, 'getSettings').mockImplementation(async () => {
       expect(store.db.inTransaction()).toBe(false);

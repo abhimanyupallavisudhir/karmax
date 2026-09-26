@@ -26,6 +26,20 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('removes project admission reservations with the project', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Reservations');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.db.prepare(`INSERT INTO usage_admissions
+        (id, organizationId, projectId, taskId, kind, provider, fundingSource, state, createdAt)
+        VALUES (?, ?, ?, ?, 'agent', 'mock', 'byok', 'active', 1)`)
+        .run('reservation', project.organizationId, project.id, task.id);
+      await store.deleteProject(project.id);
+      expect(await store.db.prepare('SELECT id FROM usage_admissions WHERE projectId=?').all(project.id)).toEqual([]);
+    } finally { await store.close(); }
+  });
+
   it('scans only literal kv key prefixes', async () => {
     const store = await Store.create(url!);
     try {

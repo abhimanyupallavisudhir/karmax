@@ -1508,6 +1508,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM world_leases WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM usage_admissions WHERE projectId=?').run(id));
       (await this.db.prepare('UPDATE usage_events SET projectId=NULL, taskId=NULL, worldId=NULL, metadata=NULL WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM settings WHERE scopeKey IN (?, ?)').run(id, `quick:${id}`));
       (await this.db.prepare('DELETE FROM cards WHERE scopeId=?').run(id));
