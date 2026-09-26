@@ -851,8 +851,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * Git comparison. */
   async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
     const local = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
-    if (local.code === 0 || base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
     const remoteBase = `refs/remotes/origin/${base}`;
+    const remoteKnown = (await world.exec('git', ['rev-parse', '--verify', '--quiet', `${remoteBase}^{commit}`], { cwd: repo.root })).code === 0;
+    // GitHub compares against its own copy of the target. A local target ref is
+    // frozen at world setup, so a branch that merely caught up with the newer
+    // origin target (refresh_upstream + merge) must not count as ahead.
+    if (local.code === 0 && remoteKnown) {
+      const both = await world.exec('git', ['rev-list', '--count', repo.branch, '--not', base, remoteBase], { cwd: repo.root });
+      if (both.code === 0) return both;
+    }
+    if (local.code === 0) return local;
     const remote = await world.exec('git', ['rev-list', '--count', `${remoteBase}..${repo.branch}`], { cwd: repo.root });
     if (remote.code === 0) return remote;
     if (repo.baseSha) {
@@ -3316,7 +3325,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushError ? `: ${pushError}` : ''}`);
         }
-        const { pr, created } = await api.openOrUpdate(slug, {
+        const result = await api.openOrUpdate(slug, {
           head: repo.branch, base,
           // With several branches in flight the task title alone names none of
           // them; say which pull request this one is.
@@ -3324,7 +3333,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? `${details.title?.trim() || 'karmax'} (${repo.name})`
             : details.title?.trim() || `karmax: ${repo.branch}`,
           body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+        }).catch((error: unknown) => {
+          // GitHub is the authority on "ahead": its target may have moved past
+          // every ref this world has seen. Nothing to propose is not a failure.
+          if (/No commits between/i.test(error instanceof Error ? error.message : String(error))) return undefined;
+          throw error;
         });
+        if (!result) {
+          (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: `no commits ahead of ${base} on GitHub` }));
+          continue;
+        }
+        const { pr, created } = result;
         const ref: TaskPullRequest = {
           repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged,
           ...(pr.headSha ? { headSha: pr.headSha } : {}),

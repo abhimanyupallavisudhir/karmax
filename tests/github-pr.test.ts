@@ -1666,6 +1666,59 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  // Tasks 368–376 (2026-09-26): a sub-task's CI repair merged origin/<parent>,
+  // fast-forwarding an untouched checkout to the parent's newer tip. The stale
+  // local parent ref still counted those commits as "ahead", so krmax asked
+  // GitHub for a PR with no commits and escalated on its 422.
+  it('skips a checkout that only caught up with a newer remote target', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('caught-up');
+    const handle = await core.createWorld({ taskId: 'task_pr_caught_up', repo, base: 'main', target: 'main', kind: 'worktree' });
+    const checkout = handle.repos![0]!;
+    // The target moves on origin after the world was created (another task landed).
+    const upstream = path.join(tmp, 'caught-up-upstream');
+    await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'caught-up-origin.git'), upstream]);
+    await ensureIdentity(upstream);
+    fs.writeFileSync(path.join(upstream, 'landed.txt'), 'landed');
+    await gitOrThrow(upstream, ['add', '-A']);
+    await gitOrThrow(upstream, ['commit', '-q', '-m', 'landed elsewhere']);
+    await gitOrThrow(upstream, ['push', '-q', 'origin', 'main']);
+    // refresh_upstream + merge: the task branch now equals origin/main, while the
+    // local `main` ref is still the old tip.
+    await gitOrThrow(checkout.root, ['fetch', '-q', 'origin', 'main:refs/remotes/origin/main']);
+    await gitOrThrow(checkout.root, ['merge', '-q', '--ff-only', 'refs/remotes/origin/main']);
+    expect((await git(checkout.root, ['rev-list', '--count', `main..${checkout.branch}`])).stdout.trim()).toBe('1');
+
+    await expect(core.openPr(handle, 'main', { title: 'Nothing of its own' })).resolves.toEqual([]);
+    expect(gh.prs).toHaveLength(0);
+
+    fs.writeFileSync(path.join(checkout.root, 'own.txt'), 'own');
+    await git(checkout.root, ['add', '-A']);
+    await git(checkout.root, ['commit', '-q', '-m', 'own work']);
+    await expect(core.openPr(handle, 'main', { title: 'Own work' })).resolves.toHaveLength(1);
+    await core.destroyWorld(handle);
+  });
+
+  it('treats GitHub\'s "No commits between" as nothing to propose, not a failure', async () => {
+    const gh = fakeGithub();
+    const noCommits = { options: { ...gh.options, fetch: (async (url: string, init: RequestInit = {}) =>
+      (init.method === 'POST' && /\/pulls$/.test(new URL(String(url)).pathname))
+        ? new Response(JSON.stringify({ message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom',
+          message: 'No commits between main and karmax/task_pr_github_ahead' }] }), { status: 422, headers: { 'content-type': 'application/json' } })
+        : gh.fetcher(url, init)) as unknown as typeof fetch } };
+    const core = await coreFor(noCommits);
+    const repo = await repoWithGithubOrigin('github-ahead');
+    const handle = await core.createWorld({ taskId: 'task_pr_github_ahead', repo, base: 'main', target: 'main', kind: 'worktree' });
+    fs.writeFileSync(path.join(handle.root, 'x.txt'), 'x');
+    await git(handle.root, ['add', '-A']);
+    await git(handle.root, ['commit', '-q', '-m', 'work GitHub already has']);
+    await expect(core.openPr(handle, 'main', { title: 'Already upstream' })).resolves.toEqual([]);
+    const skipped = (await core.store.eventsSince('task_pr_github_ahead', 0)).filter((event) => event.type === 'pr.skipped');
+    expect(skipped.at(-1)?.payload).toMatchObject({ repo: 'github-ahead', reason: 'no commits ahead of main on GitHub' });
+    await core.destroyWorld(handle);
+  });
+
   it('compares against the recorded base when a dynamically enrolled checkout has no target refs', async () => {
     const gh = fakeGithub();
     const core = await coreFor(gh);
