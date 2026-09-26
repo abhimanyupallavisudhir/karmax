@@ -897,7 +897,8 @@ it('replays task histories recorded before the September workflow review fixes',
   const { temporal } = await import('@temporalio/proto');
   const { fileURLToPath } = await import('node:url');
   const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
-  for (const name of ['justDo', 'mergeOnly']) {
+  // Software Dev was recorded from fb5d3463 with stub activities through recovery, Review and cancellation.
+  for (const name of ['justDo', 'mergeOnly', 'softwareDev']) {
     const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/review-legacy-${name}.json`, import.meta.url), 'utf8')));
     await Worker.runReplayHistory({ workflowBundle }, history);
   }
