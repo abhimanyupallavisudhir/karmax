@@ -1254,6 +1254,7 @@ function humanAudienceOptions() {
   ];
 }
 function cfLayerHtml(f, layer, agentDefault) {
+  const audienceOptionsId = `human-audience-${humanAudienceOptions.nextId = (humanAudienceOptions.nextId || 0) + 1}`;
   const isAgent = layer.kind === 'agent';
   const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
   const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
@@ -1268,13 +1269,13 @@ function cfLayerHtml(f, layer, agentDefault) {
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
       <label class="form-row">Who confirms
-        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
+        <input class="cf-audience" list="${audienceOptionsId}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
       </label>
-      <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
-      <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
+      <datalist id="${audienceOptionsId}">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+      ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type [[ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review prompt ${policyTip('Sent at each review. Type [[ for wiki context. Variables: {{prompt}}, {{response}}, {{reviewInfo}}, {{changedFiles}}, {{transcript}}.')}</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -1337,6 +1338,7 @@ function normResponder(route) {
 function renderResponderField(f, own, inherited, alt) {
   const inh = inherited || {};
   const route = responderOf(own || inh);
+  const audienceOptionsId = `human-audience-${humanAudienceOptions.nextId = (humanAudienceOptions.nextId || 0) + 1}`;
   const isAgent = route.kind === 'agent';
   const agentDefault = inh.agentDefault || {};
   const audience = (route.audience?.length ? route.audience : ['@creator']).join(', ');
@@ -1348,9 +1350,9 @@ function renderResponderField(f, own, inherited, alt) {
         <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
       </div>
       <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
-        <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
-        <div class="task-sub">Comma-separated. Any selected person may answer this single input step.</div>
+        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="${audienceOptionsId}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
+        <datalist id="${audienceOptionsId}">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+        ${policyTip('Separate people or teams with commas. Any selected person may answer.')}
       </div>
       <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
         <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
@@ -8151,7 +8153,7 @@ function wireReviewActions(v) {
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
-          await refreshTask(v.taskId);
+          await refreshTask();
           return;
         }
         // kind === 'run': stream output; open follow-up URLs; offer Stop.

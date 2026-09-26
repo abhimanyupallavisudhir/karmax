@@ -15,3 +15,8 @@ test('UI-34: OAuth callback uses the configured brand', () => {
   assert.ok(!src.includes('Return to Tavya'));
   assert.ok(src.includes('Return to ${siteNameMarkup()}'));
 });
+test('UI-30/UI-33: review forms use compact help and unique audience lists', () => {
+  assert.ok(!src.includes('id="human-audience-options"'));
+  assert.ok(!src.includes('refreshTask(v.taskId)'));
+  assert.ok(!src.includes('<div class="task-sub">Comma-separated. Teams'));
+});
