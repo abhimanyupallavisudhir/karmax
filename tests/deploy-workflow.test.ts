@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
@@ -84,4 +86,40 @@ describe('post-push deployment to the public instance', () => {
     expect(update.indexOf('dc build --pull app')).toBeLessThan(update.indexOf('cmd_backup_candidate'));
     expect(operator).toContain('dc run --rm --no-deps app npm run backup');
   });
+});
+
+it.each(['trusted', 'unreviewed'])('checks ancestry before executing a %s deployment updater', (candidate) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-provenance-'));
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+  try {
+    git('init', '-q', '-b', 'master');
+    git('config', 'user.name', 'Deployment Test');
+    git('config', 'user.email', 'deploy@example.test');
+    fs.mkdirSync(path.join(root, 'deploy'));
+    fs.writeFileSync(path.join(root, 'deploy/karmax'), '#!/bin/sh\necho trusted > executed\n');
+    git('add', '.'); git('commit', '-qm', 'trusted');
+    const trusted = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/master', trusted);
+    git('checkout', '-qb', 'task');
+    fs.writeFileSync(path.join(root, 'deploy/karmax'), '#!/bin/sh\necho unreviewed > executed\n');
+    git('add', '.'); git('commit', '-qm', 'unreviewed');
+    const unreviewed = git('rev-parse', 'HEAD');
+    git('checkout', '-q', 'master');
+    const run = deploy.steps.find((step: any) => step.run?.includes('ssh -o')).run as string;
+    const result = spawnSync('bash', ['-c', `
+git() { if [ "$1" = fetch ]; then return 0; fi; command git "$@"; }
+ssh() { bash -c "\${@: -1}"; }
+export -f git
+` + run.replace('cd /opt/karmax', `cd '${root}'`).replaceAll('~/.ssh', `'${root}/ssh'`)], { cwd: root, encoding: 'utf8', env: {
+      ...process.env, DEPLOY_SHA: candidate === 'trusted' ? trusted : unreviewed,
+      SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target',
+    } });
+    if (candidate === 'trusted') {
+      expect(result.status, result.stderr).toBe(0);
+      expect(fs.readFileSync(path.join(root, 'executed'), 'utf8')).toBe('trusted\n');
+    } else {
+      expect(result.status, result.stderr).not.toBe(0);
+      expect(fs.existsSync(path.join(root, 'executed'))).toBe(false);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
