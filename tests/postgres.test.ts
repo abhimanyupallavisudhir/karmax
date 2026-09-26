@@ -26,6 +26,21 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('translates JSON draft booleans and arbitrary json_remove paths', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('JSON translation');
+      const task = await store.createTask({ projectId: project.id, title: 'Draft', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture', draft: true } });
+      const draft = await store.db.prepare("SELECT COALESCE(json_extract(params, '$.draft'), 0) AS draft FROM tasks WHERE id=?")
+        .get(task.id) as { draft: number };
+      expect(Number(draft.draft)).toBe(1);
+      const removed = await store.db.prepare("SELECT json_remove(params, '$.prompt', '$.draft', '$.missing', '$.nested.value') AS value FROM tasks WHERE id=?")
+        .get(task.id) as { value: string };
+      expect(JSON.parse(removed.value)).toEqual({});
+    } finally { await store.close(); }
+  });
+
   it('matches exact team selectors during deletion', async () => {
     const store = await Store.create(url!);
     try {

@@ -96,13 +96,16 @@ export function translate(statement) {
     .replace(/\(\s*([A-Za-z_][\w.]*)\s+COLLATE\s+NOCASE\s*\)/gi, '(lower($1))')
     .replace(/\bIFNULL\s*\(/gi, 'COALESCE(')
     .replace(/length\s*\(\s*CAST\s*\(\s*data\s+AS\s+BLOB\s*\)\s*\)/gi, "octet_length(convert_to(data, 'UTF8'))")
-    .replace(/json_remove\s*\(\s*([^,]+),\s*'\$\.([^']+)'\s*,\s*'\$\.([^']+)'\s*,\s*'\$\.([^']+)'\s*\)/gi,
-      (_match, expression, first, second, third) =>
-        `((${expression})::jsonb - '${first}' - '${second}' - '${third}')::text`)
+    .replace(/json_remove\s*\(\s*([\w.]+)\s*((?:,\s*'\$\.[^']+'\s*)+)\)/gi,
+      (_match, expression, paths) => {
+        const keys = [...paths.matchAll(/'\$\.([^']+)'/g)].map((match) => match[1].split('.').join(','));
+        return `(${keys.reduce((value, key) => `(${value} #- '{${key}}')`, `(${expression})::jsonb`)})::text`;
+      })
     .replace(/json_set\s*\(\s*([^,]+),\s*'\$\.([^']+)'\s*,\s*json\s*\(\s*\?\s*\)\s*\)/gi,
       (_match, expression, key) => `jsonb_set((${expression})::jsonb, '{${key}}', ?::jsonb)::text`)
     .replace(/COALESCE\s*\(\s*json_extract\(([^,]+),\s*'\$\.draft'\),\s*0\s*\)/gi,
-      "COALESCE(($1::jsonb #>> '{draft}')::integer, 0)")
+      (_match, expression) => `(CASE WHEN (${expression}::jsonb #>> '{draft}') IS NULL
+        OR lower((${expression}::jsonb #>> '{draft}')) IN ('false', '0', '0.0') THEN 0 ELSE 1 END)`)
     .replace(/json_extract\(([^,]+),\s*'\$\.([^']+)'\)/gi, (_match, expression, path) =>
       `(${expression}::jsonb #>> '{${String(path).split('.').join(',')}}')`)
     .replace(/(FROM\s+task_subscribers\b[\s\S]*?ORDER\s+BY\s+createdAt)\s*,\s*rowid/gi, '$1, principalKey')
@@ -116,4 +119,3 @@ export function translate(statement) {
     sql += ' RETURNING seq';
   return { sql };
 }
-
