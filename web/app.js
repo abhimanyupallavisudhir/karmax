@@ -5187,6 +5187,9 @@ function openTagsManager(initialEditId = null) {
   const draw = () => {
     const draft = [...root.querySelectorAll('.tagm-new input, .tagm-new select, .tagm-new textarea')]
       .map(control => ({ id: control.id, value: control.value, checked: control.checked }));
+    const editDraft = root.querySelector('.tagm-edit')?.dataset.tagId === editingId
+      ? [...root.querySelectorAll('.tagm-edit input, .tagm-edit select, .tagm-edit textarea')]
+        .map(control => ({ id: control.id, value: control.value, checked: control.checked })) : [];
     const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
       ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
@@ -5216,7 +5219,7 @@ function openTagsManager(initialEditId = null) {
       .filter((tag) => !blockedParents.has(tag.id))
       .map((tag) => `<option value="${esc(tag.id)}" ${editing?.parentId === tag.id ? 'selected' : ''}>${esc(tagPathStr(tag.id))}</option>`)
       .join('');
-    const editForm = editing ? `<div class="tagm-form tagm-edit">
+    const editForm = editing ? `<div class="tagm-form tagm-edit" data-tag-id="${esc(editing.id)}">
       <div class="tagm-form-head"><div><b>Edit tag</b><span class="pal-sub">${esc(tagPathStr(editing.id))}</span></div><button class="icon-btn" id="tagm-cancel-edit" aria-label="Close editor">✕</button></div>
       <label>Name<input id="tagm-edit-name" class="title-in" value="${esc(editing.name)}" /></label>
       <label>Parent<select id="tagm-edit-parent" class="q-sel"><option value="">No parent (top level)</option>${parentOptions}</select></label>
@@ -5239,7 +5242,7 @@ function openTagsManager(initialEditId = null) {
       </div>
       <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth); <b>flag</b> = an operational marker (no-merge).</div>
     </div></div>`;
-    for (const saved of draft) {
+    for (const saved of [...draft, ...editDraft]) {
       const control = root.querySelector('#' + saved.id);
       if (control) { control.value = saved.value; control.checked = saved.checked; }
     }
@@ -5250,13 +5253,14 @@ function openTagsManager(initialEditId = null) {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
         const kind = $('#tagm-kind').value || undefined;
+        const description = $('#tagm-description').value;
         await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
           name,
           kind,
           color: $('#tagm-use-color').checked ? $('#tagm-color').value : undefined,
-          description: $('#tagm-description').value,
+          description,
         }) });
-        if ($('#tagm-name').value.trim() === name) {
+        if ($('#tagm-name').value.trim() === name && $('#tagm-description').value === description) {
           $('#tagm-name').value = '';
           $('#tagm-description').value = '';
         }
