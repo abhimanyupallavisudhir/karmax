@@ -13,4 +13,10 @@ describe('repository guidance', () => {
     expect(read('TESTING.md')).toContain('KARMAX_RUN_LIVE=1');
     expect(read('CLAUDE.md')).toContain('KARMAX_RUN_LIVE=1');
   });
+
+  it('requires the first Node release with the SQLite APIs the app uses', () => {
+    const pkg = JSON.parse(read('package.json')) as { engines: { node: string } };
+    expect(pkg.engines.node).toBe('>=22.16.0');
+    expect(read('.nvmrc').trim()).toBe('22.16.0');
+  });
 });

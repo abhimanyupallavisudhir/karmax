@@ -5,7 +5,7 @@
   "type": "module",
   "description": "An agent-orchestration platform centered on a todo list, on a durable-execution substrate (Temporal).",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.16.0"
   },
   "bin": {
     "karmax": "bin/karmax.js"
