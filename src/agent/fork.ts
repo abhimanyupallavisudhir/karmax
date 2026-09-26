@@ -175,11 +175,18 @@ export function codexSessionFiles(opts: { session: string; forkHome?: string; sr
     files.push(file);
     const fd = fs.openSync(file, 'r');
     try {
-      const metadata = Buffer.alloc(64 * 1024);
-      const bytes = fs.readSync(fd, metadata, 0, metadata.length, 0);
-      if (bytes === metadata.length && !metadata.includes(10))
-        throw new CodexHistoryError('leading session metadata exceeds 64 KiB');
-      session = codexHistoryBase(metadata.subarray(0, bytes));
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      while (true) {
+        const chunk = Buffer.alloc(16 * 1024);
+        const bytes = fs.readSync(fd, chunk, 0, chunk.length, offset);
+        const end = chunk.subarray(0, bytes).indexOf(10);
+        chunks.push(chunk.subarray(0, end < 0 ? bytes : end));
+        if (end >= 0 || bytes < chunk.length) break;
+        offset += bytes;
+        if (offset >= 2 * 1024 * 1024) throw new CodexHistoryError('leading session metadata exceeds 2 MiB');
+      }
+      session = codexHistoryBase(Buffer.concat(chunks));
     } finally { fs.closeSync(fd); }
   }
   return files.reverse();

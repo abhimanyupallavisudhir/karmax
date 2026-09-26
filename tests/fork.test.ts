@@ -214,3 +214,14 @@ it('reads only bounded metadata when following Codex history lineage', () => {
     expect(readFile.mock.calls.filter(([name]) => name === file)).toHaveLength(1);
   } finally { readFile.mockRestore(); fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+it('accepts large valid Codex metadata without reading the rollout body', () => {
+  const home = tmp('karmax-lineage-tools-');
+  const session = sid();
+  const dir = path.join(home, 'sessions');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, `rollout-${session}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session, instructions: 'x'.repeat(80_000) } }) + '\n');
+  try { expect(codexSessionFiles({ session, forkHome: home, searchInstallation: false })).toEqual([file]); }
+  finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
