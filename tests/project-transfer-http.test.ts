@@ -38,7 +38,8 @@ async function fixture(options: { fullApp?: boolean } = {}) {
   const gateway = await Gateway.create({ api, store, tokens, client, worlds, authorization, taskQueue: 'test', staticDir: options.fullApp ? path.resolve('web') : dir,
     providerConnections: { resolve: (organizationId: string) => ({ apiKey: `test-key-${organizationId}`, config: {} }), list: () => [] } as any,
     bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
-    identity: { connectOrganizationNames: () => {}, session: async (headers: Headers) => headers.get('cookie') === 'test=alice'
+    identity: { sessionActive: async (id: string, userId: string) => id === 'session-alice' && userId === 'alice',
+      connectOrganizationNames: () => {}, session: async (headers: Headers) => headers.get('cookie') === 'test=alice'
       ? { user: { id: 'alice', name: 'Alice', email: 'alice@example.com' }, session: { id: 'session-alice' } } : undefined,
       providersForUser: () => [], providersForUserAsync: async () => [], listUsers: () => [] } as any,
     agentInfo: { provider: 'mock', reason: 'test' } });
