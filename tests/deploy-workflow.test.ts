@@ -37,6 +37,16 @@ describe('post-push deployment to the public instance', () => {
     expect(ciSource).toContain('unexpected key "queue"');
   });
 
+  it('pins downloaded workflow tools to immutable hashes', () => {
+    for (const job of Object.values(ci.jobs) as Array<{ steps?: Array<{ uses?: string }> }>) {
+      for (const step of job.steps ?? []) {
+        if (step.uses?.startsWith('actions/')) expect(step.uses).toMatch(/^actions\/[^@]+@[0-9a-f]{40}$/);
+      }
+    }
+    expect(ciSource).toContain('TEMPORAL_CLI_LINUX_AMD64_SHA256');
+    expect(ciSource).toContain('sha256sum -c -');
+  });
+
   it('exists, so a landed commit reaches the VPS without anyone SSHing in by hand', () => {
     expect(deploy).toBeDefined();
     expect(script).toContain("./deploy/.karmax-runner start '$DEPLOY_SHA'");
