@@ -298,16 +298,16 @@ export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals
   }
 }
 
-function signalAgentTree(pid: number, custodyId: string | undefined, signal: NodeJS.Signals): number {
+function signalAgentTree(pid: number, custodyId: string | undefined, signal: NodeJS.Signals, pidStart?: string): number {
   const marked = signalCustody(custodyId, signal);
   // Keep the original group kill as a fallback for legacy records and for a
   // descendant that deliberately scrubbed its environment.
-  killProcessGroup(pid, signal);
+  if (startMatches(pid, pidStart)) killProcessGroup(pid, signal);
   return marked;
 }
 
-function agentTreeAlive(pid: number, custodyId: string | undefined): boolean {
-  return alive(pid) || custodyProcesses(custodyId).length > 0;
+function agentTreeAlive(pid: number, custodyId: string | undefined, pidStart?: string): boolean {
+  return (startMatches(pid, pidStart) && alive(pid)) || custodyProcesses(custodyId).length > 0;
 }
 
 /**
@@ -321,10 +321,11 @@ export async function killAgent(
   custodyId = recordFor(pid)?.custodyId,
 ): Promise<void> {
   if (!pid) return;
-  signalAgentTree(pid, custodyId, 'SIGTERM');
+  const pidStart = recordFor(pid)?.pidStart;
+  signalAgentTree(pid, custodyId, 'SIGTERM', pidStart);
   const deadline = Date.now() + graceMs;
-  while (agentTreeAlive(pid, custodyId) && Date.now() < deadline) await delay(100);
-  if (agentTreeAlive(pid, custodyId)) signalAgentTree(pid, custodyId, 'SIGKILL');
+  while (agentTreeAlive(pid, custodyId, pidStart) && Date.now() < deadline) await delay(100);
+  if (agentTreeAlive(pid, custodyId, pidStart)) signalAgentTree(pid, custodyId, 'SIGKILL', pidStart);
   unregisterAgent(pid);
 }
 

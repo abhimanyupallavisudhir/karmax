@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { spawn } from 'node:child_process';
+import { scrubbedEnv } from '../src/autonomy/config-homes.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -90,6 +91,26 @@ afterEach(() => {
 });
 
 describe('process-tree custody', () => {
+  it('preserves the outer custody chain through the real environment scrubber', () => {
+    const prior = process.env.KARMAX_CUSTODY_CHAIN;
+    process.env.KARMAX_CUSTODY_CHAIN = 'outer-turn';
+    try {
+      const nested = custody.createCustodyEnv(scrubbedEnv({ provider: 'codex' }));
+      expect(nested.env[custody.CUSTODY_ENV]).toBe(`outer-turn,${nested.custodyId}`);
+    } finally {
+      if (prior === undefined) delete process.env.KARMAX_CUSTODY_CHAIN;
+      else process.env.KARMAX_CUSTODY_CHAIN = prior;
+    }
+  });
+
+  it('does not signal a recycled root pid during normal teardown', async () => {
+    const pid = spawnDetachedSleep();
+    custody.registerAgent({ pid, pidStart: '0', cmd: 'sleep', owner: process.pid, startedAt: Date.now() });
+    await custody.killAgent(pid, 0);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(isAlive(pid)).toBe(true);
+  });
+
   it('registers a pidfile and unregisters it', () => {
     const pid = spawnDetachedSleep();
     custody.registerAgent({ pid, cmd: 'sleep', owner: process.pid, startedAt: Date.now() });
