@@ -106,7 +106,7 @@ export interface E2BFactory {
    * handle — and, again, without resuming it first. */
   kill?(id: string, options: { apiKey?: string }): Promise<unknown>;
   /** Completed lifecycle executions from E2B's seven-day event feed. */
-  events?(options: { apiKey?: string }): Promise<unknown[]>;
+  events?(options: { apiKey?: string; since?: number }): Promise<unknown[]>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -344,10 +344,10 @@ export class E2BWorldProvider implements WorldProvider {
   /** E2B pause/kill events carry the exact execution time and actual template
    * resources. Those are the billable intervals; a karmax runner lease is only
    * admission capacity and can outlive an auto-paused sandbox by days. */
-  async listUsageEvents(organizationId: string): Promise<ProviderUsageEvent[]> {
+  async listUsageEvents(organizationId: string, since?: number): Promise<ProviderUsageEvent[]> {
     if (!this.factory.events) return [];
     const connection = (await this.connection(organizationId));
-    const events = await this.factory.events(connection?.apiKey ? { apiKey: connection.apiKey } : {});
+    const events = await this.factory.events({ ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}), since });
     const home = serviceHomeLabel();
     const normalized: ProviderUsageEvent[] = [];
     for (const raw of events) {
@@ -874,23 +874,24 @@ function defaultE2BFactory(): E2BFactory {
     },
     async events(options) {
       const result: unknown[] = [];
-      // E2B retains seven days. Drain every page on each sweep; the store's
-      // provider-execution key makes overlap/restarts harmless and avoids a
-      // fragile offset cursor while new events are arriving at the front.
+      // Cursor overlap and periodic full reconciliation are owned by the lifecycle
+      // service. Keep the whole boundary page for equal timestamps/late arrivals.
       for (let offset = 0; offset < 50_000; offset += 100) {
         const query = new URLSearchParams({ limit: '100', offset: String(offset), orderAsc: 'false' });
         query.append('types', 'sandbox.lifecycle.paused');
         query.append('types', 'sandbox.lifecycle.killed');
         const response = await fetch(`https://api.e2b.app/events/sandboxes?${query}`, {
           headers: options.apiKey ? { 'X-API-Key': options.apiKey } : {},
+          signal: AbortSignal.timeout(30_000),
         });
         if (!response.ok) throw new Error(`E2B lifecycle events failed (${response.status})`);
         const body: any = await response.json();
         const page = Array.isArray(body) ? body : Array.isArray(body?.events) ? body.events : [];
         result.push(...page);
-        if (page.length < 100) break;
+        if (page.length < 100 || (options.since !== undefined && page.some((event: any) =>
+          Number.isFinite(Date.parse(event.timestamp)) && Date.parse(event.timestamp) <= options.since))) return result;
       }
-      return result;
+      throw new Error('E2B lifecycle pagination limit exceeded; cursor was not advanced');
     },
   };
 }

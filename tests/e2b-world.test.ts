@@ -1,8 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('stops lifecycle pagination after the overlapping cursor (WD-18, LT-19)', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+      const offset = Number(new URL(String(input)).searchParams.get('offset'));
+      return Response.json(Array.from({ length: 100 }, (_, index) => ({ timestamp: new Date(10_000 - offset - index).toISOString() })));
+    });
+    try {
+      const provider = new E2BWorldProvider();
+      await provider.listUsageEvents('org', 9850);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+
   it('provisions each recorded checkout branch and directory (WD-11)', async () => {
     const commands: string[] = [];
     const sandbox = fakeSandbox(() => undefined);

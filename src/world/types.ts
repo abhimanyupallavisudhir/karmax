@@ -457,7 +457,7 @@ export interface WorldProvider {
   listSandboxes?(organizationId?: string): Promise<ProviderSandboxRef[]>;
   /** Completed provider-authoritative billable executions. Lease wall time is
    * not usage: providers can auto-pause while a local capacity lease is stale. */
-  listUsageEvents?(organizationId: string): Promise<ProviderUsageEvent[]>;
+  listUsageEvents?(organizationId: string, since?: number): Promise<ProviderUsageEvent[]>;
 }
 
 /** Provider-independent confinement for every file/process cwd crossing the

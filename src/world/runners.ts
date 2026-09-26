@@ -319,7 +319,11 @@ export class WorldLifecycleManager {
         let previous: Record<string, unknown> = {};
         try { previous = JSON.parse((await this.store.kvGet(syncKey)) ?? '{}'); } catch {}
         try {
-          const events = await provider.listUsageEvents!(organization.id);
+          const lastFullScanAt = Number(previous.lastFullScanAt ?? 0);
+          const fullScan = !lastFullScanAt || now - lastFullScanAt >= 24 * 60 * 60_000;
+          const cursor = Number(previous.lastSuccessfulAt);
+          const events = await provider.listUsageEvents!(organization.id,
+            !fullScan && Number.isFinite(cursor) ? cursor - 60 * 60_000 : undefined);
           // Providers return a rolling history. Check immutable execution IDs
           // in batches before doing attribution or writes, including after a
           // restart. A timestamp cursor would lose late-arriving executions.
@@ -357,7 +361,7 @@ export class WorldLifecycleManager {
           const coverageFrom = Number(previous.coverageFrom);
           (await this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: now,
             coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : now - retentionMs,
-            retentionDays: 7,
+            retentionDays: 7, lastFullScanAt: fullScan ? now : lastFullScanAt,
             ...(previous.gap === true || (Number.isFinite(lastSuccessfulAt) && now - lastSuccessfulAt > retentionMs)
               ? { gap: true } : {}) })));
         } catch (error) {

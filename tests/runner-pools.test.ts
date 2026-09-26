@@ -211,6 +211,7 @@ describe('runner capacity and world lifecycle', () => {
           startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
           activeMs: 300_000, cpu: 2, memoryMb: 512 }];
       } } as any);
+    const usage = vi.spyOn(worlds.get('e2b'), 'listUsageEvents');
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
 
     const record = vi.spyOn(store, 'recordUsage');
@@ -220,6 +221,9 @@ describe('runner capacity and world lifecycle', () => {
     // attribution, hydrating conversations, or issuing duplicate writes.
     await new WorldLifecycleManager(store, worlds, {} as any).sweep(Date.UTC(2026, 6, 31, 10, 7));
     expect(record).toHaveBeenCalledTimes(1);
+    expect(usage).toHaveBeenLastCalledWith(organization.id, Date.UTC(2026, 6, 31, 9, 6));
+    await lifecycle.sweep(Date.UTC(2026, 7, 1, 10, 7));
+    expect(usage).toHaveBeenLastCalledWith(organization.id, undefined);
     expect(hydrate).not.toHaveBeenCalled();
 
     // 5 minutes × (2 × $0.000014/vCPU/s + 0.5 × $0.0000045/GiB/s)
