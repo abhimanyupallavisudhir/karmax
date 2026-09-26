@@ -101,3 +101,10 @@ describe('credential leakage into the durable timeline', () => {
 it('redacts notes from generic JSON activity details', () => {
   expect(activityDetail({ status: 'granted', notes: 'private recovery text' })).not.toContain('private recovery text');
 });
+
+it('never archives generic platform-request results carrying mail or vault data (AU-19)', () => {
+  for (const name of ['platform_request', 'mcp__karmax__platform_request']) {
+    expect(toolActivityDetail(name, { messages: [{ text: 'code 123456', code: '123456', link: 'https://example.com/login/secret' }] })).toBeUndefined();
+    expect(toolActivityDetail(name, { method: 'POST', path: '/api/vault/items', body: { note: 'private' } })).toBeUndefined();
+  }
+});
