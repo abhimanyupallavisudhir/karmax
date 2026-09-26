@@ -172,6 +172,7 @@ describe('Krmax panagent bridge', () => {
       expect(records.some((record) => record.type === 'response_item'
         && record.payload?.role === 'assistant')).toBe(true);
       expect(fs.statSync(file).mode & 0o077).toBe(0);
+      expect(result.warnings?.some((item) => item.code === 'claude_file_history_snapshot_not_represented')).toBe(true);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
