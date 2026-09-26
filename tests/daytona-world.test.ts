@@ -2,6 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 import { DaytonaWorldProvider, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
 
 describe('Daytona cloud world provider', () => {
+  it('propagates exec transport failures instead of reporting command exit 1 (WD-16)', async () => {
+    const sandbox = fakeSandbox();
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'transport', base: 'main' });
+    sandbox.process.executeCommand = async () => { throw new Error('connection reset'); };
+    await expect(world.exec('true', [])).rejects.toThrow('connection reset');
+  });
+
   it('evicts destroyed sandboxes and lifecycle cache entries (WD-3, PS-10)', async () => {
     const sandbox = fakeSandbox();
     let opens = 0;

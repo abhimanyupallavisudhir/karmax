@@ -350,8 +350,9 @@ class DaytonaWorld implements World {
       return { stdout: String(result?.result ?? result?.stdout ?? result?.artifacts?.stdout ?? ''),
         stderr: String(result?.stderr ?? ''), code: Number(result?.exitCode ?? 0) };
     } catch (error: any) {
+      if (!Number.isInteger(error?.exitCode)) throw error;
       return { stdout: String(error?.stdout ?? ''), stderr: String(error?.stderr ?? error?.message ?? error),
-        code: Number(error?.exitCode ?? 1) };
+        code: error.exitCode };
     } finally {
       // A throw (timeout, transport error) skips the in-shell cleanup; never
       // leave a secret sitting in the sandbox's /tmp because of it.
