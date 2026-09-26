@@ -3,7 +3,7 @@
 ```bash
 npm test            # full suite (sequential, resource-capped)
 npm run typecheck
-npm run test:coverage   # same suite, instrumented (needs `npm i` once for @vitest/coverage-v8)
+npm run test:coverage   # same suite, instrumented; coverage dependency is installed by npm ci
 ```
 
 ## Coverage
@@ -19,14 +19,14 @@ than vanishing from the report, which is the gap worth seeing. Report lands in
 Most of karmax's behavior is only meaningful against the **real** durable engine,
 so the integration tests don't mock Temporal — each integration test file boots
 an actual `temporal server start-dev` process **and** a Temporal Worker (which
-bundles the workflow code and runs a reusable-VM pool). Six test files do this.
+bundles the workflow code and runs a reusable-VM pool). Many integration files do this.
 
-If those run **in parallel**, you get six full Temporal servers + six workers +
+If those run **in parallel**, you get multiple Temporal servers and workers with
 their thread pools at once, which can peg every core and exhaust RAM — enough to
 freeze a laptop. The config prevents that:
 
 - **`vitest.config.ts`** runs files **sequentially in a single process**
-  (`fileParallelism: false`, `singleFork: true`, `maxConcurrency: 1`), so at most
+  (`fileParallelism: false`, `maxWorkers: 1`, `isolate: false`, `maxConcurrency: 1`), so at most
   **one** Temporal server + worker is alive at a time.
 - **The Worker is resource-capped** (`src/temporal/worker.ts`):
   `maxCachedWorkflows`, `maxConcurrentWorkflowTaskExecutions`, and
@@ -49,7 +49,9 @@ npx vitest run tests/pipeline.test.ts -t "merge queue"
 ```
 
 These files need **no** Temporal server (fast, cheap, run them freely):
-`ports`, `store`, `world`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
+`ports`, `store`, `world`, `worktree-lock`, `merge`, `merge-wait`,
+`coordinator-health`, `stage-transitions`, `security`, `mcp`, `overlays`,
+`repo-path`, `deploy-edge`, `inbox`, `collaboration`, `web-regressions`.
 
 These boot a Temporal dev server (heavier, one at a time):
 `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
@@ -81,18 +83,18 @@ only while the shards are well above that; past it, split the slowest file.
 
 ## The live-agent test
 
-`tests/live-agent.test.ts` is **skipped unless** a real key is present. It spends
-real tokens, so it stays off by default:
+`tests/live-agent.test.ts`, `tests/cloud-live.test.ts`, and `tests/github-live.test.ts`
+require `KARMAX_RUN_LIVE=1` in addition to their credentials. They spend model or
+provider credit or write to a GitHub fixture, so ordinary `npm test` never runs them:
 
 ```bash
-OPENAI_API_KEY=…  npx vitest run tests/live-agent.test.ts
-KARMAX_SKIP_LIVE=1 npm test     # force-skip even if a key is set
+KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 ```
 
 ## Docker test
 
-`tests/container.test.ts` uses Docker (image `node:22-slim`). It self-skips if
-Docker isn't running; force-skip with `KARMAX_SKIP_DOCKER=1`.
+`tests/container.test.ts` uses Docker (image `node:22-slim`). It reports skipped
+tests if Docker isn't running; force-skip with `KARMAX_SKIP_DOCKER=1`.
 
 ## Cleaning up stray processes
 
@@ -101,12 +103,11 @@ Temporal dev server child can be orphaned and keep using RAM. Find and clear the
 
 ```bash
 pgrep -af 'temporal server start-dev'    # list any orphans
-pkill -f 'temporal server start-dev'     # kill them
-npm run reset                            # also wipes karmax's Temporal + local state
+ps -fp <pid>                             # identify the owning test before stopping it
 ```
 
-When stopping the app, prefer **Ctrl-C** (runs graceful shutdown, which kills the
-Temporal child) over `fuser -k <port>` / `kill -9` (leaves the child orphaned).
+Do not blanket-kill Temporal processes or run `npm run reset` on an active app:
+the shared dev server survives normal Ctrl-C shutdown and is reused by the next boot.
 
 ## Agent MCP connections
 
@@ -119,7 +120,7 @@ they do not spend model tokens. `mcp-workflow.test.ts` additionally runs a real
 Temporal task through Review and checks secret exclusion from workflow history.
 
 ```bash
-TEMPORAL_CLI=/path/to/temporal KARMAX_SKIP_LIVE=1 npx vitest run tests/mcp*.test.ts
+TEMPORAL_CLI=/path/to/temporal npx vitest run tests/mcp*.test.ts
 npm run typecheck
 ```
 
