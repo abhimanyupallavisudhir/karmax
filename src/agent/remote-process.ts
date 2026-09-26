@@ -69,7 +69,6 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // `git add -A` without modifying the user's tracked .gitignore.
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
   await onStartupStep?.('prepare-config');
-  const existing = await timed('bootstrap.list-home', () => remoteHomeFiles(world, absolute));
   const files = configFiles(localHome, provider, session);
   const rollouts = files.filter(file => provider === 'codex' && codexRolloutIdentity(file.relative.split(path.sep).join('/')));
   async function seed(file: { relative: string; content: Buffer }) {
@@ -87,13 +86,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     }
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
     const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
-    if (!existing.has(target) || controlledAuth) {
-      await world.writeFileBuffer(target, content);
-    } else if (authFreshness(provider, file.relative, file.content) !== undefined) {
-      const remote = await world.readFileBuffer(target);
-      if (authIsNewer(provider, file.relative, file.content, remote))
-        await world.writeFileBuffer(target, content);
-    }
+    await world.writeFileBuffer(target, content);
   }
   // Ordinary files have distinct paths and no live reader until startup. Rollout
   // publication reconciles shared session identity, so keep it serialized.
@@ -592,7 +585,7 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
       // real E2B filesystem request time out. Durable config, skills, rules,
       // commands, hooks, and plugin manifests continue through this walk; the one
       // requested session is materialized separately below.
-      if (top.startsWith('.karmax-history') || ['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
+      if (top === KARMAX_TOKEN_FILE || /^karmax-work-.*\.config\.toml$/.test(top) || top.startsWith('.karmax-history') || ['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
         || segments.some((segment) => ['cache', '.remote-plugin-install-staging'].includes(segment))
         || /^(?:logs?|state|goals|memories)(?:[_-].*)?\.sqlite(?:-(?:wal|shm))?$/.test(entry.name.toLowerCase())
         || ['history.jsonl', 'models_cache.json'].includes(entry.name.toLowerCase())) continue;

@@ -72,6 +72,30 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${remoteHome}/sessions/forked/host-task.jsonl`)?.toString()).toBe('host-only conversation');
   });
 
+  it('withholds host OAuth metadata and ephemeral work profiles from remote homes', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-seed-secrets-'));
+    fs.writeFileSync(path.join(localHome, 'karmax-oauth.json'), '{"secret":"host-only"}');
+    fs.writeFileSync(path.join(localHome, 'karmax-work-old.config.toml'), 'token = "host-secret"');
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(world.files.has(`${home.relative}/karmax-oauth.json`)).toBe(false);
+    expect(world.files.has(`${home.relative}/karmax-work-old.config.toml`)).toBe(false);
+  });
+
+  it('refreshes host-owned skills and settings on the next turn', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-seed-refresh-'));
+    fs.mkdirSync(path.join(localHome, 'skills'));
+    fs.writeFileSync(path.join(localHome, 'skills', 'SKILL.md'), 'old');
+    fs.writeFileSync(path.join(localHome, 'config.toml'), '[notice]\nvalue = "old"\n');
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'codex', localHome);
+    fs.writeFileSync(path.join(localHome, 'skills', 'SKILL.md'), 'new');
+    fs.writeFileSync(path.join(localHome, 'config.toml'), '[notice]\nvalue = "new"\n');
+    await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(world.files.get(`${home.relative}/skills/SKILL.md`)?.toString()).toBe('new');
+    expect(world.files.get(`${home.relative}/config.toml`)?.toString()).toContain('"new"');
+  });
+
   it('keeps a managed runtime even when task-installed system Node reports a modern version', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
     const world = fakeWorld();
