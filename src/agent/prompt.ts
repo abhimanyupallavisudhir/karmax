@@ -119,22 +119,15 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }
 
-/** Which project toolchain installs already ran, so agents neither redo nor
- * misdiagnose them, and where a missing step belongs so later tasks get it. */
+/** The project's install commands, run on demand, and where a missing step
+ * belongs so later tasks get it. */
 function describeEnvironment(world: WorldHandle): string {
   if (!world.meta?.projectId) return '';
   const installs = Array.isArray(world.meta.environmentInstall)
-    ? world.meta.environmentInstall as Array<{ repository: string; command: string; ok: boolean }> : [];
-  const list = (ok: boolean) => {
-    const byRepo = new Map<string, string[]>();
-    for (const entry of installs) if (entry.ok === ok)
-      byRepo.set(entry.repository, [...(byRepo.get(entry.repository) ?? []), `\`${entry.command}\``]);
-    return [...byRepo].map(([repo, commands]) => `${repo}: ${commands.join(', ')}`).join('; ');
-  };
-  const ran = list(true);
-  const failed = list(false);
+    ? world.meta.environmentInstall as Array<{ root: string; commands: string[] }> : [];
   return [
-    ...(ran || failed ? [`Project environment installs already ran: ${ran || 'none'}.${failed ? ` Failed: ${failed}.` : ''}`] : []),
+    ...(installs.length ? ['Before building or running tests, install this project\'s toolchain once per task: '
+      + installs.map((entry) => `in ${entry.root} run \`${entry.commands.join(' && ')}\``).join('; ') + '.'] : []),
     'If this project is missing a toolchain step that every task needs (dependencies, browsers, CLIs), work around it, '
       + 'then suggest the exact command for Project Settings → Environment in your final response so future tasks start ready.',
   ].join(' ');

@@ -66,34 +66,23 @@ export async function activateProjectRuntime(args: {
     const setup = args.runSetupIfUnbuilt && !selection.built ? setupCommands(selection.spec) : [];
     if (setup.length)
       warnings.push('environment build is not ready; setup ran live (build it in Project Settings → Environment for faster worlds)');
-    const run = async (command: string, cwd?: string, where = '') => {
-      const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000, ...(cwd ? { cwd } : {}) });
+    for (const command of [...setup, ...bootCommands(selection.spec)]) {
+      const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
       if (result.code !== 0)
-        warnings.push(`environment command "${command}" failed${where}: ${(result.stderr || result.stdout).slice(-300)}`);
-      return result.code === 0;
-    };
-    for (const command of setup) await run(command);
-    // Snapshots cannot hold a checkout, so dependency installs run here, against
-    // exactly the code this world contains. Checkpoints exclude ignored files,
-    // so restored worlds need them again too.
-    const repos = worldRepos(world.handle);
-    const installed: Array<{ repository: string; command: string; ok: boolean }> = [];
-    for (const [name, commands] of Object.entries(selection.spec.install ?? {})) {
-      const repo = repos.find((candidate) => candidate.name === name);
-      if (!repo) {
-        warnings.push(`environment install for "${name}" skipped: this world has no repository with that name`);
-        continue;
-      }
-      // Later steps build on earlier ones (a browser download needs the packages).
-      for (const command of commands) {
-        const ok = await run(command, repo.root, ` in ${name}`);
-        installed.push({ repository: name, command, ok });
-        if (!ok) break;
-      }
+        warnings.push(`environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}`);
     }
-    if (installed.length) world.handle.meta = { ...world.handle.meta, environmentInstall: installed };
-    for (const command of bootCommands(selection.spec)) await run(command);
   }
+  // Dependency installs need the checkout, so no snapshot can hold them, and
+  // running them here would delay every task (~45 s for a typical Node project)
+  // though many never build or test. The agent runs them when it needs them.
+  const repos = worldRepos(world.handle);
+  const installs: Array<{ repository: string; root: string; commands: string[] }> = [];
+  for (const [name, commands] of Object.entries(selection.spec?.install ?? {})) {
+    const repo = repos.find((candidate) => candidate.name === name);
+    if (repo) installs.push({ repository: name, root: repo.root, commands });
+    else warnings.push(`environment install for "${name}" skipped: this world has no repository with that name`);
+  }
+  if (installs.length) world.handle.meta = { ...world.handle.meta, environmentInstall: installs };
 
   const declarations = args.services ?? (await new ProjectServices(args.store).list(args.projectId));
   const perWorld = declarations.filter((service) => service.kind === 'per-world');

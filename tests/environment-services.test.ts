@@ -82,38 +82,26 @@ describe('project environment proposals and builds', () => {
     expect(proposal.evidence).toContain('web: "npx playwright install --with-deps chromium" (package.json)');
   });
 
-  it('runs repository installs inside each checkout between setup and boot', async () => {
-    const calls: Array<{ command: string; cwd?: string }> = [];
+  it('hands repository installs to the agent instead of blocking world start on them', async () => {
+    const calls: string[] = [];
     const world = {
       handle: { id: 'w', kind: 'e2b', root: '/world', branch: 'b', base: 'x', target: 'main',
         repos: [
           { name: 'app', repo: 'git@github.com:acme/app.git', root: '/world/app', branch: 'b', base: 'x', target: 'main', targetPinned: false },
           { name: 'wiki', role: 'project-wiki', repo: 'git@github.com:acme/wiki.git', root: '/world/wiki', branch: 'b', base: 'x', target: 'main', targetPinned: false },
         ] },
-      async exec(_cmd: string, args: string[], opts: { cwd?: string } = {}) {
-        calls.push({ command: args[1]!, cwd: opts.cwd });
-        return args[1] === 'broken' ? { code: 1, stdout: '', stderr: 'no such tool' } : { code: 0, stdout: '', stderr: '' };
-      },
+      async exec(_cmd: string, args: string[]) { calls.push(args[1]!); return { code: 0, stdout: '', stderr: '' }; },
     } as unknown as World;
     const store = { listResourceAttachments: async () => [] } as any;
     const runtime = await activateProjectRuntime({ world, store, projectId: 'p', taskId: 't', services: [], runSetupIfUnbuilt: true,
       selection: { built: false, spec: { setup: ['apt-get install -y jq'], boot: ['npm run migrate'],
-        install: { app: ['npm ci', 'broken', 'npx playwright install --with-deps chromium'], missing: ['npm ci'] } } } });
-    expect(calls).toEqual([
-      { command: 'apt-get install -y jq', cwd: undefined },
-      { command: 'npm ci', cwd: '/world/app' },
-      { command: 'broken', cwd: '/world/app' },
-      // Later installs in a repository depend on earlier ones, so they are skipped.
-      { command: 'npm run migrate', cwd: undefined },
-    ]);
-    expect(runtime.warnings).toEqual(expect.arrayContaining([
-      expect.stringContaining('environment command "broken" failed in app: no such tool'),
-      'environment install for "missing" skipped: this world has no repository with that name',
-    ]));
+        install: { app: ['npm ci', 'npx playwright install --with-deps chromium'], missing: ['npm ci'] } } } });
+    // Installs cost ~45 s for a typical Node project; only tasks that build or test pay it.
+    expect(calls).toEqual(['apt-get install -y jq', 'npm run migrate']);
     expect(runtime.handle.meta?.environmentInstall).toEqual([
-      { repository: 'app', command: 'npm ci', ok: true },
-      { repository: 'app', command: 'broken', ok: false },
+      { repository: 'app', root: '/world/app', commands: ['npm ci', 'npx playwright install --with-deps chromium'] },
     ]);
+    expect(runtime.warnings).toContain('environment install for "missing" skipped: this world has no repository with that name');
   });
 
   it('realizes host and fake-E2B builds and includes Docker when requested', async () => {
