@@ -532,6 +532,19 @@ describe('remote access plan (SPEC §12)', () => {
     });
     expect((await controller.status()).fallbackCommands).toBeUndefined();
   });
+  it.each([
+    'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:41730',
+    JSON.stringify({ Web: { 'host.example.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:41730' } } } } }),
+  ])('does not disable a route whose port merely starts with the gateway port', async serve => {
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({ port: () => 4173, run: async args => {
+      calls.push(args);
+      return { stdout: args[0] === 'status'
+        ? JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }) : serve, stderr: '' };
+    } });
+    expect(await controller.disable()).toMatchObject({ state: 'conflict', canDisable: false });
+    expect(calls).not.toContainEqual(['serve', 'off']);
+  });
   it('turns Linux Serve permission errors into a one-time setup action', async () => {
     const denied = Object.assign(new Error('command failed'), {
       stderr: 'Access denied: serve config denied\nUse sudo tailscale serve.\nTo not require root, use sudo tailscale set --operator=$USER once.',
