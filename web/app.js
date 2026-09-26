@@ -17581,6 +17581,10 @@ function renderOrganizationRoles() {
   });
 }
 
+function setEventHandler(element, type, handler) {
+  if (element) element['on' + type] = handler;
+}
+
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -17741,7 +17745,7 @@ async function hydrateOrganizationView() {
     <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
     <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
   wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
-  $('#invite-member')?.addEventListener('click', async () => {
+  setEventHandler($('#invite-member'), 'click', async () => {
     try {
       const email = $('#invite-email').value;
       const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
@@ -17751,8 +17755,8 @@ async function hydrateOrganizationView() {
       $('#invite-email').value = '';
     } catch (e) { toast(e.message, true); }
   });
-  $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  $('#connect-github')?.addEventListener('click', async () => {
+  setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#connect-github'), 'click', async () => {
     try {
       await connectOrganizationGithub(organizationId, hydrateOrganizationView);
     } catch (error) { toast(error.message, true); }
@@ -17763,7 +17767,7 @@ async function hydrateOrganizationView() {
     history.replaceState(history.state, '', returned);
     connectOrganizationGithub(organizationId, hydrateOrganizationView).catch(error => toast(error.message, true));
   }
-  $('#org-github-custom')?.addEventListener('click', () => openGitIdentityDialog({
+  setEventHandler($('#org-github-custom'), 'click', () => openGitIdentityDialog({
     title: 'Custom automation identity', profile: githubIdentity.profile,
     endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: hydrateOrganizationView,
   }));
@@ -17787,7 +17791,7 @@ async function hydrateOrganizationView() {
     row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
     row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
-  $('#storage-connect')?.addEventListener('click', async () => {
+  setEventHandler($('#storage-connect'), 'click', async () => {
     try {
       const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
         name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
@@ -17812,11 +17816,11 @@ async function hydrateOrganizationView() {
       catch (error) { toast(error.message, true); }
     });
   });
-  $('#runner-create')?.addEventListener('click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#runner-create'), 'click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
   $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-  $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
-  $('#org-execution-save')?.addEventListener('click', async () => {
+  setEventHandler($('#org-execution-network'), 'change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
+  setEventHandler($('#org-execution-save'), 'click', async () => {
     const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
     const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
     try {
@@ -17830,7 +17834,7 @@ async function hydrateOrganizationView() {
       } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
     } catch (error) { toast(error.message, true); }
   });
-  $('#usage-policy-save')?.addEventListener('click', async () => {
+  setEventHandler($('#usage-policy-save'), 'click', async () => {
     const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
     const cap = $('#usage-managed-cap').value.trim();
     const agentCap = $('#usage-agent-active').value.trim();
@@ -17847,9 +17851,9 @@ async function hydrateOrganizationView() {
     } catch (error) { toast(error.message, true); }
   });
   $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
-  $('#save-identity')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
-  $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
-  $('#create-organization')?.addEventListener('click', createOrganization);
+  setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#create-organization'), 'click', createOrganization);
   $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
     const editor = row.querySelector('.authz-editor');
     wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
@@ -17882,7 +17886,7 @@ async function hydrateOrganizationView() {
     });
     block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   });
-  $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+  setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
   const renameOrganization = async () => {
     const name = $('#organization-name')?.value.trim();
     if (!name) return toast('Organization name is required', true);
@@ -17894,11 +17898,11 @@ async function hydrateOrganizationView() {
       renderMain();
     } catch (e) { toast(e.message, true); }
   };
-  $('#rename-organization')?.addEventListener('click', renameOrganization);
-  $('#organization-name')?.addEventListener('keydown', (event) => {
+  setEventHandler($('#rename-organization'), 'click', renameOrganization);
+  setEventHandler($('#organization-name'), 'keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
   });
-  $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
 }
 
 async function createOrganization() {
