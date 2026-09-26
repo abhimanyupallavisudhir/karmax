@@ -195,3 +195,19 @@ describe('bounded incremental Git handoffs', () => {
     expect(receipt).toHaveBeenCalledOnce();
   });
 });
+
+it('bounds hosted bundle downloads before reading bytes (WD-9)', async () => {
+  vi.stubEnv('KARMAX_DEPLOYMENT', 'hosted');
+  const readFileBuffer = vi.fn(async () => Buffer.alloc(0));
+  const world = { handle: { root: '/w' }, readFileBuffer,
+    exec: vi.fn(async () => ({ code: 0, stdout: String(2 * 1024 ** 3), stderr: '' })) } as any;
+  await expect(downloadGitBundle(world, 'bundle', '/tmp/must-not-create-git-bundle')).rejects.toThrow('policy');
+  expect(readFileBuffer).not.toHaveBeenCalled();
+});
+
+it('cancels bundle downloads before creating an output file (WD-9)', async () => {
+  const controller = new AbortController(); controller.abort(new Error('transfer cancelled'));
+  const world = { handle: { root: '/w' }, exec: vi.fn(async () => ({ code: 0, stdout: '0', stderr: '' })) } as any;
+  await expect(downloadGitBundle(world, 'bundle', '/tmp/must-not-create-git-bundle', controller.signal)).rejects.toThrow('transfer cancelled');
+  expect(world.exec).not.toHaveBeenCalled();
+});
