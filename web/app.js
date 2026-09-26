@@ -2557,7 +2557,15 @@ function wireMessageCopies(root = document) {
 
 // Shared with the public conversation reader; keep console callers unchanged.
 function renderMarkdown(src, opts = {}) {
-  return globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  const cache = renderMarkdown.cache ||= new Map();
+  const key = JSON.stringify([src, opts]);
+  if (cache.has(key)) return cache.get(key);
+  const html = globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  if (key.length + html.length <= 64_000) {
+    if (cache.size >= 128) cache.delete(cache.keys().next().value);
+    cache.set(key, html);
+  }
+  return html;
 }
 function ensureMathJax() {
   return globalThis.TavyaMarkdown.ensureMathJax();
@@ -3288,8 +3296,10 @@ function connectWs() {
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
     const patchedList = patchTaskListFromEvent(ev);
     if (S.selected && ev.taskId === S.selected) {
-      S.taskEvents.push(ev);
-      if (S.taskEvents.length > 400) S.taskEvents.shift();
+      if (ev.type !== 'agent.output') {
+        S.taskEvents.push(ev);
+        if (S.taskEvents.length > 400) S.taskEvents.shift();
+      }
       if (ev.type === 'agent.output' && ev.payload?.text) {
         // Provider adapters emit the current complete block, not a token delta.
         // Replacing avoids the old "H / He / Hello" cumulative transcript.
@@ -3312,7 +3322,7 @@ function connectWs() {
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask();
-      } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
+      } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
