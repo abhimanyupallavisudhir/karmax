@@ -1662,6 +1662,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const keys = ordered.map((c) => c.key);
+      if (!keys.length && profile && managedModelRailAvailable(store.hosted,
+        await store.getOrganizationUsagePolicy(organizationId), profile)) return [];
       // An empty compatible set must not fall through to an ambient/profile
       // credential and bypass an explicit disable. A non-existent allow-list
       // entry makes the coordinator deny the turn with a credential action.
@@ -1929,15 +1931,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
       }
-      const installationModelProvider = canonicalModelProvider(credentialProvider(profile));
       const usagePolicy = (await store.getOrganizationUsagePolicy(organizationId));
-      const managedInstallationRail = store.hosted
-        && !!usagePolicy.managedSpendCapMicros
-        && usagePolicy.managedModelProviders.includes(installationModelProvider)
-        && !!managedModelCostCeiling(installationModelProvider, profile.model)
-        && ((profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
-          || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
-          || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(installationModelProvider)]));
+      const managedInstallationRail = managedModelRailAvailable(store.hosted, usagePolicy, profile);
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
@@ -5130,6 +5125,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
  * Values are worst-case micro-dollar debits per admitted request, keyed by
  * `provider/model`, `provider/*`, or `provider`. Invalid/absent configuration
  * fails managed admission closed and never affects BYOK. */
+function managedModelRailAvailable(
+  hosted: boolean,
+  policy: { managedSpendCapMicros?: number | null; managedModelProviders: string[] },
+  profile: import('../domain/types.js').AgentProfile,
+): boolean {
+  const provider = canonicalModelProvider(credentialProvider(profile));
+  return hosted && !!policy.managedSpendCapMicros && policy.managedModelProviders.includes(provider)
+    && !!managedModelCostCeiling(provider, profile.model)
+    && ((profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+      || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+      || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(provider)]));
+}
+
 function managedModelCostCeiling(provider: string, model?: string): number | undefined {
   const raw = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
   if (!raw) return undefined;
