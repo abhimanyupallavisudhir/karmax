@@ -68,6 +68,25 @@ describe('BudgetService over the mock rail', () => {
     (await store.setSettings(projectId, 'payments', { budget: null }));
   });
 
+  it('limits settled card fills by expiry and attempt count (AU-4)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Fill', cap: 1000 });
+    await provider.fund(card.id, 1000);
+    const ctx = { projectId, taskId: 'fill-task' };
+    const result = await budget.request(ctx, { amount: 100, merchant: 'shop.example.com' });
+    for (let i = 0; i < 3; i++) expect((await budget.claimFill(ctx, result.requestId!)).domain).toBe('shop.example.com');
+    await expect(budget.claimFill(ctx, result.requestId!)).rejects.toThrow(/limit/);
+    await store.updatePaymentSpendRequest(result.requestId!, { expiresAt: Date.now() - 1 });
+    await expect(budget.claimFill(ctx, result.requestId!)).rejects.toThrow(/active/);
+  });
+
+  it('refuses public suffixes as checkout domains (AU-4)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Fill', cap: 1000 });
+    await provider.fund(card.id, 1000);
+    const ctx = { projectId, taskId: 'suffix-task' };
+    const result = await budget.request(ctx, { amount: 100, merchant: 'co.uk' });
+    await expect(budget.claimFill(ctx, result.requestId!)).rejects.toThrow(/domain/);
+  });
+
   it('needs_funding when no card is configured', async () => {
     const r = await budget.request({ projectId, taskId: 't1' }, { amount: 100 });
     expect(r.status).toBe('needs_funding');

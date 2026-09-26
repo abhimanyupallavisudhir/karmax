@@ -2563,12 +2563,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   cdpUrl: string;
                   selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
-                  const request = (await store.getPaymentSpendRequest(fill.requestId));
-                  // A webhook rail reserves ('authorized'); an immediate rail has
-                  // already drawn the spend down ('settled'). Both are fillable.
-                  if (!request || request.taskId !== args.taskId
-                    || !['authorized', 'settled'].includes(request.status))
-                    throw new Error('payment request is not an active reservation for this task');
+                  const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant,
+                  }, fill.requestId);
                   const card = request.cardId ? (await store.getCard(request.cardId)) : undefined;
                   if (!card) throw new Error('secure fill requires a reserved card');
                   if (!(await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).cards({
@@ -2579,13 +2576,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const provider = deps.paymentRegistry?.forCard(card as any);
                   if (!provider?.retrieveCardDetails)
                     throw new Error(`the ${card.provider} rail has no card that can be filled into a checkout`);
-                  const rawMerchant = String(request.merchant ?? '').trim();
-                  let domain = '';
-                  try {
-                    domain = new URL(rawMerchant.includes('://') ? rawMerchant : `https://${rawMerchant}`).hostname;
-                  } catch {}
-                  if (!domain || !domain.includes('.'))
-                    throw new Error('request_spend merchant must be the checkout domain before a card can be filled');
                   if (!fill.selectors.number || !fill.selectors.cvc
                     || (!fill.selectors.expiry && !(fill.selectors.expMonth && fill.selectors.expYear)))
                     throw new Error('number, CVC, and either combined expiry or month/year selectors are required');

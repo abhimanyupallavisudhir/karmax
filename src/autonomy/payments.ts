@@ -1,3 +1,4 @@
+import { getDomain } from 'tldts';
 import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -930,6 +931,31 @@ export class BudgetService {
     const selected = (await this.policy(ctx.projectId, ctx.taskId)).cardIds;
     return visible.filter(card => (!selected || selected.includes(card.id))
       && (!scoped.length || scoped.includes('use-card:*') || scoped.includes(`use-card:${card.id}`)));
+  }
+
+  async claimFill(ctx: SpendCtx, requestId: string): Promise<{ request: any; domain: string }> {
+    return this.store.paymentTransaction(async () => {
+      const request = await this.store.getPaymentSpendRequest(requestId);
+      if (!request || request.taskId !== ctx.taskId || request.projectId !== ctx.projectId
+        || !['authorized', 'settled'].includes(request.status)
+        || request.expiresAt <= Date.now() || request.createdAt + 30 * 60_000 <= Date.now())
+        throw new Error('payment request is not an active reservation for this task');
+      if (!(await this.cards(ctx)).some(card => card.id === request.cardId))
+        throw new Error('card is no longer selected for this task');
+      let domain = '';
+      try {
+        const raw = String(request.merchant ?? '');
+        const url = new URL(raw.includes('://') ? raw : `https://${raw}`);
+        if (url.protocol === 'https:' && !url.username && !url.password) domain = url.hostname;
+      } catch {}
+      if (!getDomain(domain, { allowPrivateDomains: true }))
+        throw new Error('request_spend merchant must be a checkout domain, not a public suffix');
+      const key = `payment-fill:${request.id}`;
+      const attempts = Number(await this.store.kvGet(key) ?? 0);
+      if (!Number.isSafeInteger(attempts) || attempts >= 3) throw new Error('payment fill attempt limit reached');
+      await this.store.kvSet(key, String(attempts + 1));
+      return { request, domain };
+    });
   }
 
   private async existing(ctx: SpendCtx, args: SpendArgs): Promise<any> {
