@@ -257,3 +257,18 @@ describe('account-pool discovery', () => {
     }).accountPoolSize()).rejects.toThrow('query task expired');
   });
 });
+
+describe('WF-13: lease-holder liveness', () => {
+  const activities = (describe: () => Promise<unknown>) => makeCoordinatorActivities({ client: { workflow: {
+    getHandle: () => ({ describe }),
+  } } as never, taskQueue: 'queue' });
+  it('propagates transient describe failures without reclaiming a live lease', async () => {
+    const error = new Error('UNAVAILABLE');
+    await expect(activities(async () => { throw error; }).isTaskAlive('task')).rejects.toBe(error);
+  });
+  it('reclaims only missing or closed executions', async () => {
+    expect(await activities(async () => { throw new WorkflowNotFoundError('missing', 'task'); }).isTaskAlive('task')).toBe(false);
+    expect(await activities(async () => ({ status: { name: 'COMPLETED' } })).isTaskAlive('task')).toBe(false);
+    expect(await activities(async () => ({ status: { name: 'RUNNING' } })).isTaskAlive('task')).toBe(true);
+  });
+});

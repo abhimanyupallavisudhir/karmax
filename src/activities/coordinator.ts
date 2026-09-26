@@ -223,8 +223,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       try {
         const desc = await client.workflow.getHandle(taskId).describe();
         return desc.status.name === 'RUNNING';
-      } catch {
-        return false;
+      } catch (error) {
+        if (error instanceof WorkflowNotFoundError) return false;
+        throw error;
       }
     },
 
