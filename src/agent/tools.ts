@@ -1,6 +1,7 @@
 import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
+import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
@@ -23,10 +24,7 @@ export interface ToolSchema {
 const MAX_OUTPUT = 12_000;
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
 
-/** Review captions are orientation, not a second place for the agent's final answer. */
-export const MAX_REVIEW_TEXT_LENGTH = 280;
-
-const reviewTextLength = (value: string) => [...value].length;
+export { MAX_REVIEW_TEXT_LENGTH };
 
 /** How loudly an ask asks. One shared parameter across every human-facing tool,
  * so an agent learns the vocabulary once. See `Urgency` in domain/types.ts. */
@@ -905,25 +903,22 @@ export function platformToolHandlers(
       return `wrote ${args?.path}`;
     },
     async create_review_info(args) {
-      // `summary` is no longer advertised, but validate it too for old/resumed
-      // sessions which may still call the legacy shape. Both fields occupy the
-      // same textual orientation slot in Review.
-      for (const field of ['caption', 'summary'] as const) {
-        const value = args?.[field];
-        if (typeof value !== 'string') continue;
-        const length = reviewTextLength(value);
-        if (length > MAX_REVIEW_TEXT_LENGTH) {
-          return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
-        }
+      // The runtime re-checks the accumulated total; either rejection goes back
+      // to the agent as a correctable tool result, never a lost attachment.
+      try {
+        await ctx.createReviewInfo(validateReviewInfoCall({
+          caption: args?.caption,
+          actions: args?.actions,
+          summary: args?.summary,
+          links: args?.links,
+          diff: args?.diff,
+          html: args?.html,
+        }));
+      } catch (error) {
+        if (error instanceof ReviewInfoRejected || (error as Error)?.name === 'ReviewInfoRejected')
+          return `review info rejected: ${(error as Error).message}`;
+        throw error;
       }
-      await ctx.createReviewInfo({
-        caption: args?.caption,
-        actions: Array.isArray(args?.actions) ? args.actions : undefined,
-        summary: args?.summary,
-        links: args?.links,
-        diff: args?.diff,
-        html: args?.html,
-      });
       return 'review info recorded';
     },
     async create_sub_task(args) {

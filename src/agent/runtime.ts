@@ -1,6 +1,7 @@
 import { currentTiming } from '../timing/index.js';
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
+import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
@@ -147,9 +148,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // Providers can dispatch tools concurrently. Serialize accumulation with
       // publication so an overlapping call cannot overwrite another's actions.
       const publication = reviewPublication.then(async () => {
-        const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
-        const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+        const call = validateReviewInfoCall(info);
+        const actions = call.actions ? [...(reviewInfo?.actions ?? []), ...call.actions] : reviewInfo?.actions;
+        const supplied = Object.fromEntries(Object.entries(call).filter(([, value]) => value !== undefined));
         const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
+        assertReviewInfoTotal(nextReviewInfo);
         await deps.onReviewInfo?.(nextReviewInfo, info);
         reviewInfo = nextReviewInfo;
       });
