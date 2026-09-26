@@ -1,3 +1,6 @@
+import dns from 'node:dns/promises';
+import { isIP } from 'node:net';
+import { publicAddress } from '../mcp/connections/http.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import { MailboxConfig, defaultMailboxRegistry } from './mailbox.js';
 import { extractMimeText, cleanAddress, htmlToText } from './agent-mail.js';
@@ -45,7 +48,7 @@ export interface Puller {
 
 // ── IMAP ──────────────────────────────────────────────────────────────────────
 
-export interface ImapOpts { host: string; port: number; secure: boolean; user: string; pass: string }
+export interface ImapOpts { servername?: string; host: string; port: number; secure: boolean; user: string; pass: string }
 export interface ImapMessage { uid: number; source: string }
 export interface ImapConn {
   fetchSince(lastUid: number): Promise<ImapMessage[]>;
@@ -61,7 +64,20 @@ export class ImapPuller implements Puller {
     const pass = this.deps.resolveSecret(passHandle);
     if (!imap || !pass) return 0;
     const open = this.deps.openImap ?? defaultOpenImap;
-    const conn = await open({ host: imap.host, port: imap.port, secure: imap.secure, user: imap.user, pass });
+    let host = imap.host;
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
+      if (!imap.secure || imap.port !== 993) throw new Error('hosted IMAP requires TLS on port 993');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const addresses = isIP(host) ? [{ address: host }] : await Promise.race([
+          dns.lookup(host, { all: true }),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('IMAP DNS lookup timed out')), 5000); }),
+        ]);
+        if (!addresses.length || addresses.some(a => !publicAddress(a.address))) throw new Error('IMAP host must resolve to public addresses, not private networks');
+        host = addresses[0]!.address;
+      } finally { clearTimeout(timer); }
+    }
+    const conn = await open({ host, servername: imap.host, port: imap.port, secure: imap.secure, user: imap.user, pass });
     let delivered = 0;
     const uidKey = `agent-mail:imap-uid:${this.deps.organizationId ?? 'legacy'}`;
     let maxUid = Number((await this.deps.store.kvGet(uidKey)) ?? 0);
@@ -95,8 +111,11 @@ async function defaultOpenImap(opts: ImapOpts): Promise<ImapConn> {
   } catch {
     throw new Error('IMAP support needs the "imapflow" package — run `npm install imapflow`.');
   }
-  const client = new ImapFlow({ host: opts.host, port: opts.port, secure: opts.secure, auth: { user: opts.user, pass: opts.pass }, logger: false });
-  await client.connect();
+  const client = new ImapFlow({ host: opts.host, servername: opts.servername, port: opts.port, secure: opts.secure,
+    connectionTimeout: 10_000, greetingTimeout: 10_000, socketTimeout: 15_000, maxLineLength: 65_536, maxLiteralSize: 65_536, auth: { user: opts.user, pass: opts.pass }, logger: false });
+  const deadline = setTimeout(() => client.close(), 30_000);
+  deadline.unref();
+  try { await client.connect(); } catch (error) { clearTimeout(deadline); client.close(); throw error; }
   return {
     async fetchSince(lastUid: number): Promise<ImapMessage[]> {
       const out: ImapMessage[] = [];
@@ -112,7 +131,8 @@ async function defaultOpenImap(opts: ImapOpts): Promise<ImapConn> {
       return out;
     },
     async close() {
-      await client.logout().catch(() => client.close?.());
+      clearTimeout(deadline);
+      client.close();
     },
   };
 }
