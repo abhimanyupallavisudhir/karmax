@@ -1014,7 +1014,7 @@ export class ClaudeAdapter implements AgentAdapter {
       (await injector.close()); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       if (remoteHome && input.resolvedAuth?.configHome) {
-        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'claude', remoteHome, input.resolvedAuth.configHome);
+        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'claude', remoteHome, input.resolvedAuth.configHome, session);
         if (failure) ctx.emitActivity({
           id: 'claude-remote-state-sync', kind: 'error', phase: 'failed',
           title: 'Could not preserve remote Claude state', detail: failure.message.slice(0, 1000),

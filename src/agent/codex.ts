@@ -945,7 +945,7 @@ export class CodexAdapter implements AgentAdapter {
       } catch { /* cleanup must not replace the turn outcome */ }
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
       if (remoteHome && input.resolvedAuth?.configHome) {
-        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome);
+        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome, threadId);
         if (failure) ctx.emitActivity({
           id: 'codex-remote-state-sync', kind: 'error', phase: 'failed',
           title: 'Could not preserve remote Codex state', detail: failure.message.slice(0, 1000),
