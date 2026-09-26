@@ -522,7 +522,7 @@ class E2BWorld implements World {
       // wait() rejects with CommandExitError for every nonzero exit; its stderr
       // has already streamed. Only a lost stream has no status of its own.
       const code = processExitCode(error);
-      if (code === undefined) emit(error?.message ?? error);
+      if (code === undefined) emit(error?.message ?? error, stderrDecoder);
       exited = true;
       exitCode = code ?? -1;
       for (const listener of exits) listener(exitCode);
