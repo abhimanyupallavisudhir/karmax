@@ -5068,8 +5068,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
         }));
       }
+      let idempotencyKey: string | undefined;
+      try {
+        const { info } = activityContext.current();
+        idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
+      } catch { /* Direct calls represent distinct requests. */ }
       let child = (await store.createTask({
         projectId: args.projectId,
+        idempotencyKey,
         listId: parent?.listId,
         title: args.title,
         workflow: 'software-dev',

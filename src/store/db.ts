@@ -3086,6 +3086,8 @@ export class Store {
 
   async createTask(input: {
     projectId: string;
+    /** Stable activity identity for retry-safe child creation. */
+    idempotencyKey?: string;
     listId?: string;
     title: string;
     workflow: string;
@@ -3102,6 +3104,19 @@ export class Store {
     confirmer?: unknown;
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
+
+    const creationKey = input.idempotencyKey ? `task-create:${input.idempotencyKey}` : undefined;
+    if (creationKey) {
+      // The no-op conflict update serializes concurrent retries on PostgreSQL too.
+      await this.db.prepare("INSERT INTO kv (k, v) VALUES (?, '') ON CONFLICT(k) DO UPDATE SET v = kv.v").run(creationKey);
+      const priorId = await this.kvGet(creationKey);
+      if (priorId) {
+        const prior = await this.getTask(priorId);
+        if (!prior || prior.projectId !== input.projectId || prior.parentTaskId !== input.parentTaskId)
+          throw new Error('task creation retry no longer matches its recorded child');
+        return prior;
+      }
+    }
 
     for (const principal of [input.createdBy, input.assignee, input.delegate])
       if (principal?.kind === 'user' && await this.kvGet(`account-closed:${principal.userId}`)) throw new Error('account is closed');
@@ -3190,6 +3205,7 @@ export class Store {
       (await this.db.prepare('INSERT INTO task_intents (id, principalAttemptId, confirmer, createdAt) VALUES (?, ?, ?, ?)')
         .run(intentId, id, input.confirmer === undefined ? null : JSON.stringify(input.confirmer), t.createdAt));
     }
+    if (creationKey) await this.kvSet(creationKey, t.id);
     return t;
   
     });
