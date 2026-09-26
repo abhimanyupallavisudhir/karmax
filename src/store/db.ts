@@ -130,7 +130,7 @@ const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
  * `github.pr.review` and `preview.requested` do not.
  */
 export const isReviewRequestEvent = (type: string): boolean =>
-  /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
+  !type.startsWith('github.') && /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
 
 /**
  * The metadata index. Temporal holds the authoritative live workflow state;

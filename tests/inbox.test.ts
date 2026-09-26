@@ -106,6 +106,7 @@ describe('inbox', () => {
     (await f.view({ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot' } }));
     (await f.view({ stage: 'merge', status: 'waiting', waitingFor: { kind: 'mergeSlot' } }));
     (await f.store.appendEvent({ taskId: f.task.id, type: 'review.built', ts: Date.now(), payload: { files: 12 } }));
+    await f.store.appendEvent({ taskId: f.task.id, type: 'github.pr.review_requested', ts: Date.now(), payload: {} });
     expect((await f.inbox())).toEqual([]);
   });
 
