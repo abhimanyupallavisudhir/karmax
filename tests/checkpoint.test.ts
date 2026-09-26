@@ -510,3 +510,30 @@ it('restores distinct branches of the same repository (WD-11)', async () => {
     await fork.destroy();
   } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('retires obsolete checkpoints while keeping current recovery and fork pins (WD-4)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-retention-'));
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const project = await store.createProject('Retention');
+  const task = await store.createTask({ projectId: project.id, title: 'Checkpoint', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  const objects = new LocalObjectStore(path.join(dir, 'objects'));
+  const service = new WorldCheckpointService(store, worlds, objects, new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    await world.writeFile('file', 'first');
+    const pinned = await service.checkpoint(world.handle);
+    await store.kvSet('fork-checkpoint:fork-task', pinned.id);
+    const obsolete = await service.checkpoint(world.handle);
+    const previous = await service.checkpoint(world.handle);
+    const current = await service.checkpoint(world.handle);
+    expect(await store.getWorldCheckpoint(obsolete.id)).toBeUndefined();
+    await expect(objects.get(obsolete.filesystemDelta!.objectKey)).rejects.toThrow();
+    for (const saved of [pinned, previous, current]) {
+      expect(await store.getWorldCheckpoint(saved.id)).toBeDefined();
+      expect((await objects.get(saved.filesystemDelta!.objectKey)).length).toBeGreaterThan(0);
+    }
+  } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});

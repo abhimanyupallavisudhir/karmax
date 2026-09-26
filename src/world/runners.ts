@@ -174,6 +174,7 @@ export class WorldLifecycleManager {
 
   private async sweepOnce(now: number): Promise<number> {
     (await this.runners?.reconcileWorldLeases(now));
+    await this.checkpoints.collectGarbage?.();
     await this.reconcileProviderUsage(now);
     for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
       (await this.store.deletePromotedArtifact(artifact.id));

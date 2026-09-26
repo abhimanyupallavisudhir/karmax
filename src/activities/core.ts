@@ -1209,7 +1209,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
               forkCheckpoint = await deps.checkpoints.checkpoint(sourceWorld.handle, { scrubSecrets: false });
             }
-            (await store.kvSet(`fork-checkpoint:${args.taskId}`, forkCheckpoint.id));
+            (await store.pinWorldCheckpointForFork(args.taskId, forkCheckpoint.id));
           }
           if (forkCheckpoint.worldId !== forkSource.taskId || forkCheckpoint.projectId !== projectId)
             throw new Error('fork checkpoint does not belong to the source task');

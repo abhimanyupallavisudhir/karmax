@@ -71,6 +71,8 @@ export class WorldCheckpointService {
   }
 
   async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void> } = {}): Promise<WorldCheckpoint> {
+    return this.worlds.withOperation(handleInput.id, async () => {
+    await this.store.pruneWorldCheckpoints(handleInput.id);
     await options.checkContinue?.();
     const handle = ((await this.store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
     (await this.store.assertCurrentWorld(handle));
@@ -192,18 +194,36 @@ export class WorldCheckpointService {
       metadata: { checkpointId, generation: checkpoint.generation } }));
     await options.checkContinue?.();
     if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
+    await this.store.pruneWorldCheckpoints(handle.id);
+    await this.collectGarbage(handle.id);
     return checkpoint;
+    });
+  }
+
+  async collectGarbage(onlyWorldId?: string): Promise<void> {
+    for (const pending of (await this.store.kvEntries('checkpoint-gc:')).slice(0, 100)) {
+      try {
+        const { worldId, objectKey } = JSON.parse(pending.value);
+        if (onlyWorldId && worldId !== onlyWorldId) continue;
+        await this.worlds.withOperation(worldId, async () => {
+          await this.objects.delete(objectKey);
+          await this.store.completeCheckpointDeletion(pending.key.slice('checkpoint-gc:'.length));
+        });
+      } catch { /* retry from the lifecycle sweep */ }
+    }
   }
 
   async restore(checkpointId: string, provider?: WorldKind, options?: RestoreOptions): Promise<WorldHandle> {
     const checkpoint = (await this.store.getWorldCheckpoint(checkpointId));
     if (!checkpoint?.filesystemDelta) throw new Error('checkpoint has no portable filesystem delta');
+    const filesystemDelta = checkpoint.filesystemDelta;
+    return this.worlds.withOperation(checkpoint.worldId, async () => {
     const project = (await this.store.getProject(checkpoint.projectId));
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
     const executionConfig = (await this.store.effectiveProjectConfig(project));
-    if (checkpoint.filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
-    const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
-    if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
+    if (filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
+    const encrypted = await this.objects.get(filesystemDelta.objectKey);
+    if (sha256(encrypted) !== filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
     const delta = JSON.parse((await gunzip(await this.decrypt(encrypted), { maxOutputLength: MAX_CHECKPOINT_JSON_BYTES })).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     // A checkpoint must be restorable after its sandbox disappears even when a
@@ -344,6 +364,7 @@ export class WorldCheckpointService {
       if (acquired) (await this.runners.release(acquired.leaseId, selected));
       throw error;
     }
+    });
   }
 
   /** Apply saved work to a freshly provisioned, independent task. Never registers
