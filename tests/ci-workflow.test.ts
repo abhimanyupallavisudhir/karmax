@@ -11,10 +11,10 @@ const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci
 describe('CI workflow', () => {
   // Branch protection and Karmax's merge gate both key on this check name, so
   // it has to stand for everything a landing needs, not just one job of it.
-  it('reports the required check after the static checks and every test shard', () => {
+  it('reports the required check after static checks, every test shard, and deploy artifacts', () => {
     const required = ci.jobs.required;
     expect(required.name).toBe('typecheck + tests');
-    expect([...required.needs].sort()).toEqual(['checks', 'test']);
+    expect([...required.needs].sort()).toEqual(['checks', 'deploy-artifacts', 'test']);
     // It must still run, and fail, when a needed job failed or was cancelled.
     expect(required.if).toBe('always()');
   });
@@ -25,10 +25,13 @@ describe('CI workflow', () => {
     // Without GitHub's implicit `-e`, so the script's own exits are what count.
     const verdict = (results: string) =>
       spawnSync('bash', ['-c', step.run], { env: { ...process.env, RESULTS: results } }).status;
-    expect(verdict('success success')).toBe(0);
+    expect(verdict('success success success')).toBe(0);
     for (const result of ['failure', 'cancelled', 'skipped']) {
-      expect(verdict(`success ${result}`)).not.toBe(0);
-      expect(verdict(`${result} success`)).not.toBe(0);
+      for (const index of [0, 1, 2]) {
+        const statuses = ['success', 'success', 'success'];
+        statuses[index] = result;
+        expect(verdict(statuses.join(' '))).not.toBe(0);
+      }
     }
     expect(verdict('')).not.toBe(0);
   });

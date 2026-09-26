@@ -164,7 +164,7 @@ export async function createBackup(options: {
 
 /** Verify every byte before replacing anything, then restore each component via
  * same-filesystem rename. A failed verification leaves the installation intact. */
-export async function restoreBackup(source: string, options: { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
+export function verifyBackup(source: string): BackupManifest {
   const directory = path.resolve(source);
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as BackupManifest;
   if (manifest.format !== 'karmax-backup' || manifest.version !== 1 || !Array.isArray(manifest.files))
@@ -188,6 +188,14 @@ export async function restoreBackup(source: string, options: { home?: string; al
     const relative = slash(path.relative(payload, file));
     if (!declared.has(relative)) throw new Error(`backup payload file is not listed in the manifest: ${relative}`);
   }
+
+  return manifest;
+}
+
+export async function restoreBackup(source: string, options: { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
+  const directory = path.resolve(source);
+  const manifest = verifyBackup(directory);
+  const payload = path.join(directory, 'payload');
 
   const home = path.resolve(options.home ?? paths().home);
   const p = paths(home);

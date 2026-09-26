@@ -3,10 +3,11 @@ import { DaytonaWorldProvider } from '../src/world/daytona.js';
 import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
 import { ensureRemoteNode, spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
 import type { World } from '../src/world/types.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
-// Opt in with DAYTONA_API_KEY. These tests spend provider credit and always
+// Opt in with KARMAX_RUN_LIVE=1 and DAYTONA_API_KEY. These tests spend provider credit and always
 // delete their own sandboxes. They never reap other tasks' sandboxes.
-const live = process.env.KARMAX_SKIP_LIVE !== '1' && !!process.env.DAYTONA_API_KEY;
+const live = liveEnabled() && !!process.env.DAYTONA_API_KEY;
 const deadline = <T>(promise: Promise<T>, ms = 30_000): Promise<T> => {
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([promise, new Promise<never>((_, reject) => {
