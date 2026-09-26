@@ -4711,6 +4711,8 @@ function stageLabel(v) {
   // where to resume. Direct provider blockers may supply a concise specific
   // summary; ordinary holds retain the stable "Needs input" label.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
+  // So is a turn parked on its credential or quota: nothing is working.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'account') return waitingText(v.waitingFor);
   // `do` and `merge` are the replay-stable workflow keys; a person reads them
   // as "working" and "landing" and never has to learn the internal names.
   return { do: 'working', merge: 'landing' }[v.stage || 'setup'] || v.stage || 'setup';
@@ -9675,7 +9677,7 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return w.earliestResetAt ? 'quota' : 'account';
+    case 'account': return w.earliestResetAt ? 'quota' : 'credential';
     case 'agentSlot': return 'agent';
     case 'mergeSlot': return 'merge';
     case 'github': return /\b(?:ci|checks?|validat(?:e|es|ed|ing|ion))\b/i.test(w.detail || '') ? 'CI' : 'GitHub';
@@ -9838,8 +9840,6 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       // and inherited Explainer-only render as the same binary Off state there.
       const mode = scope === 'task' ? (isOn ? 'on' : 'off')
         : c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
-      const login = loginByKey[key];
-      const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
       const loginActions = canManage && c.kind === 'login';
       const keyActions = canManage && c.kind === 'key' && c.key.startsWith('key:handle:') && c.account;
       // Compact inline chip: the kind is obvious from the label (a login is
@@ -9847,17 +9847,30 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
       const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
-      const stateControl = c.kind === 'key' && scope !== 'task'
+      // A login the provider signed out cannot run until someone signs in again;
+      // a Claude sign-in lapses about four weeks after it was made, so offer a
+      // renewal in its last three days rather than let tasks stall on it.
+      const renewInDays = !c.signedOut && c.signInExpiresAt && c.signInExpiresAt - Date.now() < 3 * 86_400_000
+        ? Math.max(0, Math.ceil((c.signInExpiresAt - Date.now()) / 86_400_000)) : undefined;
+      const renew = renewInDays === undefined ? ''
+        : canManage
+          ? `<button class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it to keep this login working">Renew</button>`
+          : `<span class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it in Settings → Credentials">renew</span>`;
+      const stateControl = c.signedOut
+        ? (canManage
+          ? '<button class="cred-signin" title="Signed out by the provider — sign in again to use it">Sign in</button>'
+          : '<span class="cred-signin" title="Signed out by the provider — sign in again in Settings → Credentials">signed out</span>')
+        : c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
             <option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
             <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>
           </select>`
         : `<button class="cred-toggle ${mode}" title="${mode === 'on' ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${mode}</button>`;
-      return `<div class="cred-row ${esc(mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
+      return `<div class="cred-row ${esc(c.signedOut ? 'signed-out' : mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
         ${stateControl}
-        <span class="cred-label mono">${icon}${esc(label)}${warn}</span>
+        <span class="cred-label mono">${icon}${esc(label)}</span>${renew}
         ${loginActions ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
         ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
@@ -9890,6 +9903,16 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
     const login = loginByKey[key];
     const credential = byKey[key];
+    // Reuse the Connect form below so the sign-in flow (URL, code entry) is one.
+    row.querySelector('button.cred-signin')?.addEventListener('click', () => {
+      const provider = $('#login-provider'), name = $('#login-name'), connect = $('#login-connect');
+      if (!provider || !name || !connect) return;
+      provider.value = credential.provider;
+      provider.dispatchEvent(new Event('change'));
+      name.value = credential.account;
+      connect.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      connect.click();
+    });
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = prompt(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;

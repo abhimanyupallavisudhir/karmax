@@ -23,6 +23,8 @@ describe('credential Retry end to end', () => {
   let headers: Record<string, string>;
   let healthy = false;
   let turns = 0;
+  let expectedHome = '';
+  let quotaFailures = 0;
   const accountId = 'login:claude:personal';
   const mock = new MockAdapter();
 
@@ -38,7 +40,13 @@ describe('credential Retry end to end', () => {
       provider: 'claude',
       async runTurn(input, ctx) {
         turns++;
-        expect(input.resolvedAuth?.configHome).toBe(home);
+        expect(input.resolvedAuth?.configHome).toBe(expectedHome || home);
+        if (quotaFailures > 0) {
+          quotaFailures--;
+          throw providerFailure('Claude usage limit reached · resets in 1s', {
+            kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: '5h', resetHint: 'in 1s',
+          });
+        }
         if (!healthy) throw providerFailure('API Error: 401 OAuth access token has expired', {
           kind: 'credential', permanence: 'hard', provider: 'claude', source: 'structured',
         });
@@ -57,7 +65,9 @@ describe('credential Retry end to end', () => {
   const accounts = async () => (await h.client.workflow.getHandle(accountCoordinatorId()).query('accounts')) as any;
   const status = async (id: string) => (await accounts()).accounts.find((a: any) => a.id === id)?.status;
 
-  it('retries an unpollable login, quarantines a persistent failure, then reaches Review after recovery', async () => {
+  // A login needing a person is a wait, not an escalation: the task parks on
+  // "Waiting for credential" and resumes by itself once a credential works.
+  it('waits for a quarantined login, re-checks it on Retry, then reaches Review after recovery', async () => {
     const repo = await h.makeRepo('recovered');
     const project = (await h.store.createProject('Retry', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
     const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
@@ -66,9 +76,18 @@ describe('credential Retry end to end', () => {
       params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
     });
     const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
-    await expect.poll(async () => (await view()).error, { timeout: 30_000 }).toMatch(/No usable claude credential/);
+    const credentialWait = {
+      stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'account', provider: 'claude', detail: 'Every allowed credential needs attention — sign in again or add one' },
+    };
+    await expect.poll(async () => view(), { timeout: 30_000 }).toMatchObject(credentialWait);
+    expect((await view()).error).toBeUndefined();
     expect(await status(accountId)).toBe('needs-attention');
     expect(turns).toBe(1);
+    const stored = async () => (await h.store.getTask(task.id))?.lastView as any;
+    await expect.poll(async () => (await stored())?.waitingFor?.kind, { timeout: 5000 }).toBe('account');
+    const apiView: any = await fetch(`${base}/api/tasks/${task.id}`, { headers }).then(r => r.json());
+    expect(apiView.actions.map((action: any) => action.name)).toContain('retry');
 
     const usage = await fetch(`${base}/api/organizations/org_personal/accounts/usage/recheck`, {
       method: 'POST', headers, body: JSON.stringify({ accountId }),
@@ -77,17 +96,15 @@ describe('credential Retry end to end', () => {
     expect(await usage.json()).toMatchObject({ usage: { [accountId]: { ok: false, reason: 'setup-token' } } });
     expect(await status(accountId)).toBe('needs-attention');
 
-    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.status, { timeout: 5000 }).toBe('blocked');
-    expect((await h.store.getTask(task.id))?.lastView?.error).toMatch(/No usable claude credential/);
     const retry = () => fetch(`${base}/api/tasks/${task.id}/signal`, {
       method: 'POST', headers, body: JSON.stringify({ signal: 'retry' }),
     });
     expect((await retry()).status).toBe(200);
     await expect.poll(() => turns, { timeout: 20_000 }).toBe(2);
-    await expect.poll(async () => (await view()).error, { timeout: 20_000 }).toMatch(/No usable claude credential/);
+    await expect.poll(async () => view(), { timeout: 20_000 }).toMatchObject(credentialWait);
     expect(await status(accountId)).toBe('needs-attention');
 
-    await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.status, { timeout: 5000 }).toBe('blocked');
+    await expect.poll(async () => (await stored())?.waitingFor?.kind, { timeout: 5000 }).toBe('account');
     healthy = true; // provider quota/login now works; usage remains unpollable
     expect((await retry()).status).toBe(200);
     await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
@@ -97,6 +114,87 @@ describe('credential Retry end to end', () => {
     expect(fs.readFileSync(path.join(world.workdir ?? world.root, 'recovered.txt'), 'utf8')).toContain('RECOVERED');
     await h.api.signalTask(token, task.id, 'cancel');
   }, 90_000);
+
+  // Signing in with a new account while tasks wait must resume them on it: their
+  // allow-lists predate the login, so the coordinator asks them to re-resolve.
+  it('resumes a task waiting for a credential on a newly connected login', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    healthy = false;
+    const before = turns;
+    const repo = await h.makeRepo('new-login');
+    const project = (await h.store.createProject('New login', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    await coordinator.setAccountAvailability({ accountId, status: 'needs-attention' });
+    const task = await h.api.createTask(token, { projectId: project.id, title: 'New login task',
+      prompt: '@write new-login.txt :: NEW LOGIN\n@run git add new-login.txt && git commit -m login\n@review New login',
+      params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+    });
+    const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+    await expect.poll(async () => (await view()).waitingFor?.kind, { timeout: 30_000 }).toBe('account');
+    expect(turns).toBe(before);
+
+    const fresh = homes.ensure('claude', 'fresh');
+    fs.writeFileSync(path.join(fresh, 'karmax-oauth.json'), JSON.stringify({ token: 'fresh-setup-token' }));
+    expectedHome = fresh;
+    healthy = true;
+    await coordinator.registerAccounts([
+      { id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 },
+      { id: 'login:claude:fresh', provider: 'claude', kind: 'login', configHome: fresh, maxConcurrent: 1 },
+    ]);
+    await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
+    expect(turns).toBe(before + 1);
+    await h.api.signalTask(token, task.id, 'cancel');
+    expectedHome = home;
+    homes.remove('claude', 'fresh');
+    await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
+  }, 90_000);
+
+  // Task 381: each quota failure on a leased login parks until the reported
+  // reset, so it is a wait, not a failed attempt to escalate after two retries.
+  it('keeps waiting through repeated quota limits instead of escalating', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    healthy = true;
+    quotaFailures = 4; // more than the Resolve attempt budget
+    const before = turns;
+    const repo = await h.makeRepo('quota');
+    const project = (await h.store.createProject('Quota', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const task = await h.api.createTask(token, { projectId: project.id, title: 'Quota task',
+      prompt: '@write quota.txt :: QUOTA\n@run git add quota.txt && git commit -m quota\n@review Quota',
+      params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+    });
+    const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+    await expect.poll(async () => (await view()).stage, { timeout: 60_000 }).toBe('review');
+    expect(turns).toBe(before + 5);
+    await h.api.signalTask(token, task.id, 'cancel');
+  }, 90_000);
+
+  // A login the provider signed out used to vanish from Credentials: the list
+  // held only runnable credentials, so there was nothing to click to sign in.
+  it('keeps a signed-out login listed so it can be signed in again', async () => {
+    const expired = homes.ensure('claude', 'expired');
+    fs.writeFileSync(path.join(expired, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: '', refreshToken: '', expiresAt: 0,
+    } }));
+    const listed: any = await fetch(`${base}/api/organizations/org_personal/credentials`, { headers }).then(r => r.json());
+    expect(listed.credentials.find((c: any) => c.key === 'login:claude:expired')).toEqual({
+      key: 'login:claude:expired', label: 'claude:expired', provider: 'claude', kind: 'login', account: 'expired', signedOut: true,
+    });
+    expect(listed.global.enabled).not.toContain('login:claude:expired');
+    expect(listed.credentials.find((c: any) => c.key === accountId)?.signedOut).toBeUndefined();
+    homes.remove('claude', 'expired');
+
+    // A healthy Claude sign-in reports when it lapses, so it can be renewed first.
+    const lapsing = homes.ensure('claude', 'lapsing');
+    const signInExpiresAt = Date.now() + 86_400_000;
+    fs.writeFileSync(path.join(lapsing, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 3_600_000, refreshTokenExpiresAt: signInExpiresAt,
+    } }));
+    const renewing: any = await fetch(`${base}/api/organizations/org_personal/credentials`, { headers }).then(r => r.json());
+    expect(renewing.credentials.find((c: any) => c.key === 'login:claude:lapsing')).toMatchObject({ signInExpiresAt });
+    homes.remove('claude', 'lapsing');
+  });
 
   it('preserves manual disables, known quota waits, task policy, and other providers', async () => {
     const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });

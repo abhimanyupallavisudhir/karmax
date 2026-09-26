@@ -363,7 +363,8 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
       note = modelLimit[1];
     }
   }
-  const resetMatch = m.match(/resets?\s+([^\n."']+?)(?:\s*[.\n"']|$)/i);
+  // "resets Jul 5, 2:19am" (Claude) · "try again at 5:55 PM" / "in 20 minutes" (Codex).
+  const resetMatch = m.match(/(?:resets?|try again)\s+(?:at\s+)?([^\n."']+?)(?:\s*[.\n"']|$)/i);
   const resetHint = resetMatch ? resetMatch[1]!.trim() : undefined;
   return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
 }

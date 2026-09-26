@@ -147,8 +147,8 @@ export async function bootHarness(
   let serverStopped = false;
 
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds,
-    refreshCredentialHealth: async (task, credentialProvider) => {
-      if (credentialProvider) await retryCredentials({ store, client, taskQueue: TASK_QUEUE, broker, configHomes: overrides.configHomes }, task, credentialProvider);
+    refreshCredentialHealth: async (task, credentialProvider, options) => {
+      if (credentialProvider) await retryCredentials({ store, client, taskQueue: TASK_QUEUE, broker, configHomes: overrides.configHomes }, task, credentialProvider, options);
     },
   });
   const gateways: Array<() => Promise<void>> = [];

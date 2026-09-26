@@ -15,7 +15,7 @@ import { sameProposalIdentity } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { RunnerPoolService } from '../src/world/runners.js';
 
-async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthorization = false) {
+async function fixture(refreshCredentialHealth?: (...args: any[]) => Promise<void>, withAuthorization = false) {
   const store = (await Store.create(':memory:'));
   (await store.claimPersonalOrganization('test'));
   const project = (await store.createProject('Transitions', { repos: ['/tmp'], defaultBase: 'main', defaultTarget: 'main' }));
@@ -332,6 +332,18 @@ describe('task stage transitions', () => {
     if (originalSignal.some((item) => item.id === f.task.id && item.signal === 'retry')) order.push('retry');
 
     expect(order).toEqual(['health', 'retry']);
+  });
+
+  it('re-arms the waited-on credentials, including quota, when a credential wait is retried', async () => {
+    const calls: unknown[][] = [];
+    const f = (await fixture(async (...args: unknown[]) => { calls.push(args); }));
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'account', provider: 'codex', earliestResetAt: Date.now() + 60_000 } }));
+    await f.api.signalTask(f.token, f.task.id, 'retry');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.slice(1)).toEqual(['codex', { includeExhausted: true }]);
+    // The coordinator grants the parked turn; the workflow has nothing to retry.
+    expect(f.signalled.filter((item) => item.signal === 'retry')).toEqual([]);
   });
 
   it('does not signal Retry when rearming the credential fails', async () => {
