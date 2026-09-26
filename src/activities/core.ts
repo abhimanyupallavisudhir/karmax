@@ -4800,11 +4800,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             await api.update(ref.slug, ref.number, { state: 'closed' }).catch(() => undefined);
           }
           const after = await api.get(ref.slug, ref.number);
-          await api.comment(ref.slug, ref.number,
+          await worlds.withOperation(handle.id, () => api.commentOnce(ref.slug, ref.number,
             after.merged ? `Merged into \`${outcome.target}\` by karmax${as}.`
             : landed ? `karmax merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
             : `karmax merged this branch into \`${outcome.target}\` locally${as}, but could not push`
-              + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`);
+              + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`,
+            JSON.stringify([handle.id, 'finalize', outcome.target, outcome.sha, landed])));
           const next = { ...ref, state: after.state, merged: after.merged };
           (await record(handle.id, after.merged ? 'pr.merged' : after.state === 'closed' ? 'pr.closed' : 'pr.open', next));
           settled.push(next);
@@ -4839,7 +4840,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (live.merged) (await record(handle.id, 'pr.merged', next));
             continue;
           }
-          await api.comment(ref.slug, ref.number, reason);
+          await worlds.withOperation(handle.id, () => api.commentOnce(ref.slug, ref.number, reason,
+            JSON.stringify([handle.id, 'close', reason])));
           const closed = await api.update(ref.slug, ref.number, { state: 'closed' });
           const next = { ...ref, state: closed.state, merged: closed.merged,
             ...(closed.headSha ? { headSha: closed.headSha } : {}) };

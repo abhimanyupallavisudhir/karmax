@@ -12,6 +12,7 @@
  * for automation and compatibility callers.
  */
 
+import { createHash } from 'node:crypto';
 import type { TaskPullRequest, TaskView } from '../domain/types.js';
 
 export interface GithubPullRequest {
@@ -285,6 +286,21 @@ export class GithubPrApi {
 
   async comment(slug: string, number: number, body: string): Promise<void> {
     await this.request(`/repos/${slug}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
+  }
+
+  /** Recover the provider-side receipt even when POST succeeded but its reply was lost. */
+  async commentOnce(slug: string, number: number, body: string, key: string): Promise<void> {
+    const marker = `<!-- karmax-comment:${createHash('sha256').update(key).digest('hex')} -->`;
+    for (let page = 1; page <= 100; page++) {
+      const comments = await this.request<Array<{ body?: string }>>(
+        `/repos/${slug}/issues/${number}/comments?per_page=100&page=${page}`);
+      if (comments.some(comment => comment.body?.includes(marker))) return;
+      if (comments.length < 100) {
+        await this.comment(slug, number, `${body}\n\n${marker}`);
+        return;
+      }
+    }
+    throw new Error('cannot verify comment receipt within the pull request comment limit');
   }
 
   /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
