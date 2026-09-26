@@ -6575,7 +6575,9 @@ export class Gateway {
                   await store.transaction(async () => {
                     const current = await vault.get(item.id);
                     if (!current || current.type !== 'passkey') return;
-                    const saved = JSON.parse(await vault.readSecret(current, 'passkey')) as any[];
+                    const secret = await vault.readSecret(current, 'passkey');
+                    if (secret === undefined) return;
+                    const saved = JSON.parse(secret) as any[];
                     for (const credential of saved) {
                       const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
                       if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
