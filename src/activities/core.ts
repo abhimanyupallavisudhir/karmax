@@ -3863,6 +3863,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           state,
         } : undefined;
         if (live.merged) {
+          if (ref.headSha && live.headSha !== ref.headSha) return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: 'The merged pull request does not contain the reviewed head. Open a new pull request for the current proposal.',
+          };
           if (!live.base) {
             return {
               status: 'retryable-error', prs: current, actorUserId,

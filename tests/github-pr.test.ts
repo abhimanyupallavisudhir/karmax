@@ -46,11 +46,12 @@ function fakeGithub() {
     tokens.push(new Headers(init.headers).get('authorization') ?? '');
     const json = (status: number, value: unknown) =>
       new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+    if (u.pathname.includes('/compare/')) return json(200, { ahead_by: 0 });
     const list = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
     if (list && method === 'GET') {
       const head = u.searchParams.get('head');
       const branch = head?.split(':')[1];
-      return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]));
+      return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]).reverse());
     }
     if (list && method === 'POST') {
       if (prs.some((pr) => pr.repo === list[1] && pr.head.ref === body.head && pr.state === 'open'))
@@ -470,6 +471,25 @@ describe('GitHub PR client', () => {
     expect(merged.pr.merged).toBe(true);
   });
 
+  it.each(['merged', 'closed'])('opens a fresh PR for new work after a %s PR', async (state) => {
+    const gh = fakeGithub();
+    const api = new GithubPrApi('t', gh.options);
+    const input = { head: 'karmax/followup', base: 'main', title: 'Follow-up', body: 'New work' };
+    const original = await api.openOrUpdate(SLUG, input);
+    gh.prs[0].state = 'closed';
+    if (state === 'merged') gh.prs[0].merged_at = '2026-01-01T00:00:00Z';
+    const followup = new GithubPrApi('t', { ...gh.options, fetch: (async (url: any, init: any = {}) => {
+      if (String(url).includes('/compare/')) return Response.json({ ahead_by: 2 });
+      if (init.method === 'PATCH') return Response.json({ message: 'Head branch was force pushed' }, { status: 422 });
+      return gh.fetcher(url, init);
+    }) as typeof fetch });
+    const result = await followup.openOrUpdate(SLUG, input);
+    expect(result.created).toBe(true);
+    expect(result.pr.number).not.toBe(original.pr.number);
+    expect(result.pr).toMatchObject({ state: 'open', merged: false });
+    expect((await api.openOrUpdate(SLUG, input)).pr.number).toBe(result.pr.number);
+  });
+
   it('adopts the existing PR when GitHub rejects the create as a duplicate', async () => {
     const gh = fakeGithub();
     const api = new GithubPrApi('t', gh.options);
@@ -530,6 +550,9 @@ describe('GitHub-authoritative merge activity', () => {
     const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 91,
       url: 'https://github.test/acme/widgets/pull/91', state: 'open', headSha: landedSha };
 
+    await expect(core.mergeGithubPrs(handle, [{ ...ref, headSha: 'new-unmerged-head' }])).resolves.toMatchObject({
+      status: 'needs-revision',
+    });
     await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
       status: 'merged', sha: landedSha,
     });

@@ -255,13 +255,23 @@ export class GithubPrApi {
   async openOrUpdate(slug: string, input: { head: string; base: string; title: string; body: string }):
   Promise<{ pr: GithubPullRequest; created: boolean }> {
     const existing = await this.findByHead(slug, input.head);
-    if (existing) {
-      const pr = await this.update(slug, existing.number, {
-        title: input.title, body: input.body, base: input.base,
-        // A PR closed without merging is reopened: the task is live again.
-        ...(existing.state === 'closed' && !existing.merged ? { state: 'open' as const } : {}),
-      });
-      return { pr, created: false };
+    if (existing?.merged) {
+      const comparison = await this.request<{ ahead_by: number }>(
+        `/repos/${slug}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`);
+      if (comparison.ahead_by === 0) return { pr: existing, created: false };
+      if (!Number.isSafeInteger(comparison.ahead_by) || comparison.ahead_by < 0)
+        throw new Error('GitHub did not report whether the branch contains new commits');
+    } else if (existing) {
+      try {
+        const pr = await this.update(slug, existing.number, {
+          title: input.title, body: input.body, base: input.base,
+          ...(existing.state === 'closed' ? { state: 'open' as const } : {}),
+        });
+        return { pr, created: false };
+      } catch (error) {
+        // GitHub cannot reopen some force-pushed heads. Create a replacement.
+        if (existing.state !== 'closed' || !(error instanceof GithubApiError) || error.status !== 422) throw error;
+      }
     }
     try {
       return { pr: normalize(await this.request(`/repos/${slug}/pulls`, {
@@ -271,7 +281,7 @@ export class GithubPrApi {
     } catch (error) {
       // Lost a race (or GitHub indexed the head late) — adopt the existing PR.
       const raced = await this.findByHead(slug, input.head).catch(() => undefined);
-      if (!raced) throw error;
+      if (!raced || raced.state !== 'open' || raced.merged) throw error;
       return { pr: raced, created: false };
     }
   }
