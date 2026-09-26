@@ -68,15 +68,61 @@ describe('BudgetService over the mock rail', () => {
     (await store.setSettings(projectId, 'payments', { budget: null }));
   });
 
+  it('limits settled card fills by expiry and attempt count (AU-4)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Fill', cap: 1000 });
+    await provider.fund(card.id, 1000);
+    const ctx = { projectId, taskId: 'fill-task' , capabilities: ['use-card:*'] };
+    const result = await budget.request(ctx, { amount: 100, merchant: 'shop.example.com' });
+    for (let i = 0; i < 3; i++) expect((await budget.claimFill(ctx, result.requestId!)).domain).toBe('shop.example.com');
+    await expect(budget.claimFill(ctx, result.requestId!)).rejects.toThrow(/limit/);
+    await store.updatePaymentSpendRequest(result.requestId!, { expiresAt: Date.now() - 1 });
+    await expect(budget.claimFill(ctx, result.requestId!)).rejects.toThrow(/active/);
+  });
+
+  it('refuses public suffixes as checkout domains (AU-4)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Fill', cap: 1000 });
+    await provider.fund(card.id, 1000);
+    const ctx = { projectId, taskId: 'suffix-task' , capabilities: ['use-card:*'] };
+    const result = await budget.request(ctx, { amount: 100, merchant: 'co.uk' });
+    await expect(budget.claimFill(ctx, result.requestId!)).rejects.toThrow(/domain/);
+  });
+
+  it('denies cards when no card capability is held (AU-7)', async () => {
+    await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Private', cap: 1000 });
+    expect(await budget.cards({ projectId, taskId: 'no-grant', capabilities: [] })).toEqual([]);
+  });
+
+  it('admits explicitly approved card capabilities in the live task grant (AU-7)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Approved', cap: 1000 });
+    const task = await store.createTask({ projectId, title: 'Approved', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: [] } } });
+    await store.kvSet(`permission:grant:${task.id}`, JSON.stringify({ do: [`use-card:${card.id}`] }));
+    expect(await budget.cards({ projectId, taskId: task.id, capabilities: [`use-card:${card.id}`] })).toHaveLength(1);
+    expect(await budget.cards({ projectId, taskId: task.id, capabilities: [] })).toEqual([]);
+  });
+
+  it('shares a parent budget across children and tasks created by agents (AU-9)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Shared', cap: 10000 });
+    await provider.fund(card.id, 10000);
+    const params = { prompt: '', paymentPolicy: { budget: 100, cardIds: [card.id] }, _authorization: { capabilities: ['use-card:*'] } };
+    const parent = await store.createTask({ projectId, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params });
+    const a = await store.createTask({ projectId, title: 'Child A', workflow: 'software-dev', workflowVersion: '1', params, parentTaskId: parent.id });
+    const b = await store.createTask({ projectId, title: 'Child B', workflow: 'software-dev', workflowVersion: '1', params,
+      createdBy: { kind: 'task-agent', taskId: parent.id, role: 'do' } });
+    expect((await budget.request({ projectId, taskId: a.id , capabilities: ['use-card:*'] }, { amount: 70 })).status).toBe('granted');
+    expect((await budget.request({ projectId, taskId: b.id , capabilities: ['use-card:*'] }, { amount: 70 })).status).toBe('needs_approval');
+    expect((await budget.request({ projectId, taskId: parent.id , capabilities: ['use-card:*'] }, { amount: 70 })).status).toBe('needs_approval');
+  });
+
   it('needs_funding when no card is configured', async () => {
-    const r = await budget.request({ projectId, taskId: 't1' }, { amount: 100 });
+    const r = await budget.request({ projectId, taskId: 't1' , capabilities: ['use-card:*'] }, { amount: 100 });
     expect(r.status).toBe('needs_funding');
   });
 
   it('grants within funds, decrements available, and records spend', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
     await provider.fund(card.id, 5000);
-    const r = await budget.request({ projectId, taskId: 't1' }, { amount: 2000 });
+    const r = await budget.request({ projectId, taskId: 't1' , capabilities: ['use-card:*'] }, { amount: 2000 });
     expect(r.status).toBe('granted');
     expect(r.transactionId).toBeTruthy();
     expect((await provider.getCard(card.id))!.available).toBe(3000);
@@ -86,15 +132,16 @@ describe('BudgetService over the mock rail', () => {
   it('needs_funding when the card is short, then grants after funding', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
     await provider.fund(card.id, 1000);
-    let r = await budget.request({ projectId, taskId: 't2' }, { amount: 4000 });
+    const task_t2 = await store.createTask({ projectId: projectId, title: 't2', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    let r = await budget.request({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4000 });
     expect(r.status).toBe('needs_funding');
     expect(r.shortfall).toBe(3000);
     // human funds the shortfall, then the held request settles
     await provider.fund(card.id, 3000);
-    r = await budget.settleApproved({ projectId, taskId: 't2' }, { amount: 4000, cardId: card.id });
+    r = await budget.settleApproved({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4000, cardId: card.id });
     expect(r.status).toBe('granted');
     expect((await provider.getCard(card.id))!.available).toBe(0);
-    const retry = await budget.request({ projectId, taskId: 't2' }, { amount: 4000, cardId: card.id });
+    const retry = await budget.request({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4000, cardId: card.id });
     expect(retry).toMatchObject({ status: 'granted', requestId: r.requestId, transactionId: r.transactionId });
     expect((await provider.getCard(card.id))!.available).toBe(0);
   });
@@ -102,7 +149,7 @@ describe('BudgetService over the mock rail', () => {
   it('denying an already-settled request does not refund the allowance', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
     await provider.fund(card.id, 5000);
-    const r = await budget.request({ projectId, taskId: 't-deny' }, { amount: 2000 });
+    const r = await budget.request({ projectId, taskId: 't-deny' , capabilities: ['use-card:*'] }, { amount: 2000 });
     expect(r.status).toBe('granted');
     const spentAfterCharge = Number((await store.kvGet('spent:t-deny')));
     expect(spentAfterCharge).toBe(2000);
@@ -123,7 +170,7 @@ describe('BudgetService over the mock rail', () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
     await provider.fund(card.id, 100000);
     (await store.setSettings(projectId, 'payments', { allowance: 1000 }));
-    const r = await budget.request({ projectId, taskId: 't3' }, { amount: 5000 });
+    const r = await budget.request({ projectId, taskId: 't3' , capabilities: ['use-card:*'] }, { amount: 5000 });
     expect(r.status).toBe('needs_approval');
   });
 
@@ -132,7 +179,7 @@ describe('BudgetService over the mock rail', () => {
     const otherProject = (await store.createProject('Other project', {}, other.id));
     const card = await provider.provisionCard({ scope: 'project', scopeId: otherProject.id, label: 'Other card', cap: 100000 });
     await provider.fund(card.id, 100000);
-    const r = await budget.request({ projectId, taskId: 't4' }, { amount: 100, cardId: card.id });
+    const r = await budget.request({ projectId, taskId: 't4' , capabilities: ['use-card:*'] }, { amount: 100, cardId: card.id });
     expect(r.status).toBe('denied');
     expect(r.reason).toContain('not available');
     expect((await provider.getCard(card.id))!.available).toBe(100000);
@@ -145,7 +192,7 @@ describe('BudgetService over the mock rail', () => {
     await provider.fund(card.id, 100000);
     (await store.setSettings('global', 'payments', { allowance: 1 }));
     (await store.setSettings(`organization:${other.id}`, 'payments', { allowance: 1000 }));
-    const r = await budget.request({ projectId: otherProject.id, organizationId: other.id, taskId: 't5' }, { amount: 100 });
+    const r = await budget.request({ projectId: otherProject.id, organizationId: other.id, taskId: 't5', capabilities: ['use-card:*'] }, { amount: 100 });
     expect(r.status).toBe('granted');
   });
 
@@ -166,9 +213,9 @@ describe('BudgetService over the mock rail', () => {
   it('enforces the card hard cap cumulatively, not once per purchase', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Capped', cap: 500 });
     await provider.fund(card.id, 2000);
-    expect((await budget.request({ projectId, taskId: 'cap-a' },
+    expect((await budget.request({ projectId, taskId: 'cap-a' , capabilities: ['use-card:*'] },
       { amount: 300, cardId: card.id, why: 'first' })).status).toBe('granted');
-    const second = await budget.request({ projectId, taskId: 'cap-b' },
+    const second = await budget.request({ projectId, taskId: 'cap-b' , capabilities: ['use-card:*'] },
       { amount: 300, cardId: card.id, why: 'second' });
     expect(second).toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
     expect((await provider.getCard(card.id))!.available).toBe(1700);
@@ -182,8 +229,10 @@ describe('BudgetService over the mock rail', () => {
     // because neither is counted until the gate decides. Approving both would put
     // 600 on a card capped at 500: the cumulative ceiling has to be re-counted
     // here, exactly as the budget coordinator does (src/coordinators/budget.ts).
-    const first = await budget.request({ projectId, taskId: 'gate-a' }, { amount: 300, cardId: card.id, why: 'first' });
-    const second = await budget.request({ projectId, taskId: 'gate-b' }, { amount: 300, cardId: card.id, why: 'second' });
+    const task_gate_a = await store.createTask({ projectId: projectId, title: 'gate-a', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const first = await budget.request({ projectId, taskId: task_gate_a.id , capabilities: ['use-card:*'] }, { amount: 300, cardId: card.id, why: 'first' });
+    const task_gate_b = await store.createTask({ projectId: projectId, title: 'gate-b', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const second = await budget.request({ projectId, taskId: task_gate_b.id , capabilities: ['use-card:*'] }, { amount: 300, cardId: card.id, why: 'second' });
     expect([first.status, second.status]).toEqual(['needs_approval', 'needs_approval']);
     expect((await budget.approve(first.requestId!, 'user:alice')).status).toBe('granted');
     expect(await budget.approve(second.requestId!, 'user:alice'))
@@ -196,7 +245,7 @@ describe('BudgetService over the mock rail', () => {
     await provider.fund(card.id, 5000);
     // Funds exceed the ceiling, so the ceiling is what is left.
     expect(cardRemaining((await provider.getCard(card.id))!, 0)).toBe(500);
-    await budget.request({ projectId, taskId: 'left' }, { amount: 300, cardId: card.id });
+    await budget.request({ projectId, taskId: 'left' , capabilities: ['use-card:*'] }, { amount: 300, cardId: card.id });
     const spent = (await store.cardPaymentSpent(card.id));
     expect(cardRemaining((await provider.getCard(card.id))!, spent)).toBe(200);
     // A rail with no ceiling of its own (the human's own card) can only run out
@@ -237,7 +286,7 @@ describe('task payment policy', () => {
       const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 1000 });
       await provider.fund(card.id, 1000);
       expect((await service.policy(project.id)).budget).toBe(0);
-      expect((await service.request({ projectId: project.id, taskId: 'default-budget' }, { amount: 1 })).status).toBe('needs_approval');
+      expect((await service.request({ projectId: project.id, taskId: 'default-budget' , capabilities: ['use-card:*'] }, { amount: 1 })).status).toBe('needs_approval');
       expect((await store.paymentSpent('default-budget'))).toBe(0);
       const org = `organization:${project.organizationId}`;
       (await store.setSettings(org, 'payments', { budget: 500 }));
@@ -262,8 +311,8 @@ describe('task payment policy', () => {
     const second = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Personal', cap: 10000 });
     await provider.fund(first.id, 10000);
     await provider.fund(second.id, 10000);
-    const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do', workflowVersion: '1.0.0', params: { paymentPolicy: { cardIds: [first.id, second.id], budget: 100 } } } as any));
-    const ctx = { projectId: project.id, taskId: task.id };
+    const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] }, paymentPolicy: { cardIds: [first.id, second.id], budget: 100 } } } as any));
+    const ctx = { projectId: project.id, taskId: task.id , capabilities: ['use-card:*'] };
     expect((await budget.request(ctx, { amount: 100, cardName: 'Employer' })).status).toBe('granted');
     const pending = await budget.request(ctx, { amount: 200, cardName: 'Personal' });
     expect(pending.status).toBe('needs_approval');
@@ -298,7 +347,8 @@ describe('payment reservations under concurrency', () => {
     await provider.fund(card.id, 10000);
     (await store.setSettings(project.id, 'payments', { budget: 100 }));
     const one = new BudgetService(store, provider), two = new BudgetService(store, provider);
-    const ctx = { projectId: project.id, taskId: 'concurrent' };
+    const task_concurrent = await store.createTask({ projectId: project.id, title: 'concurrent', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const ctx = { projectId: project.id, taskId: task_concurrent.id , capabilities: ['use-card:*'] };
     const results = await Promise.all([one.request(ctx, { amount: 100, why: 'one' }), two.request(ctx, { amount: 100, why: 'two' })]);
     expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);
     const pending = results.find(r => r.status === 'needs_approval')!;
@@ -315,8 +365,8 @@ describe('payment reservations under concurrency', () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 10000 });
     await provider.fund(card.id, 10000);
     (await store.setSettings(project.id, 'payments', { budget: 5000, cardIds: [card.id] }));
-    const task = (await store.createTask({ projectId: project.id, title: 'None', workflow: 'just-do', workflowVersion: '1.0.0', params: { paymentPolicy: { budget: 0, cardIds: [] } } } as any));
-    const service = new BudgetService(store, provider), ctx = { projectId: project.id, taskId: task.id };
+    const task = (await store.createTask({ projectId: project.id, title: 'None', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] }, paymentPolicy: { budget: 0, cardIds: [] } } } as any));
+    const service = new BudgetService(store, provider), ctx = { projectId: project.id, taskId: task.id , capabilities: ['use-card:*'] };
     expect((await service.request(ctx, { amount: 100, cardName: 'Expenses' })).status).toBe('denied');
     (await store.updateTaskParams(task.id, { ...task.params, paymentPolicy: { budget: 0, cardIds: [card.id] } } as any));
     const pending = await service.request(ctx, { amount: 100, cardName: 'Expenses' });

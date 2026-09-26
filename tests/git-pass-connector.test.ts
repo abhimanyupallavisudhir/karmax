@@ -102,3 +102,9 @@ describe('Git-backed unix pass connector', () => {
     await expect(connector.list()).rejects.toThrow(/HTTPS or SSH repository URL/i);
   });
 });
+
+it('rejects arbitrary hosted Git transport hosts (AU-16)', async () => {
+  const connector = new GitPassConnector(() => JSON.stringify({ repositoryUrl: 'https://127.0.0.1/passwords.git', gpgPrivateKey: 'key' }),
+    'org', undefined, undefined, { hosted: true });
+  await expect(connector.list()).rejects.toThrow(/hosted.*Git|public/);
+});

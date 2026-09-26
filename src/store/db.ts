@@ -6955,12 +6955,12 @@ export class Store {
   
     });
   }
-  async consumePaymentOAuthState(state: string): Promise<any> {
+  async consumePaymentOAuthState(state: string, userId?: string): Promise<any> {
     return this.db.transaction(async () => {
 
     const hash = sha256(state);
     const row = (await this.db.prepare('SELECT * FROM payment_oauth_states WHERE stateHash=?').get(hash)) as any;
-    if (!row || row.usedAt || row.expiresAt <= Date.now()) return undefined;
+    if (!row || !userId || row.userId !== userId || row.usedAt || row.expiresAt <= Date.now()) return undefined;
     const result = (await this.db.prepare('UPDATE payment_oauth_states SET usedAt=? WHERE stateHash=? AND usedAt IS NULL')
       .run(Date.now(), hash));
     return Number(result.changes) === 1 ? row : undefined;
@@ -7043,13 +7043,38 @@ export class Store {
   
     });
   }
-  async paymentSpent(taskId: string): Promise<number> {
+  async paymentBudgetFamily(taskId: string): Promise<{ taskIds: string[]; ancestorIds: string[] }> {
+    const projectId = await this.taskProjectIdAsync(taskId);
+    const organizationId = projectId ? await this.projectOrganizationAsync(projectId) : undefined;
+    if (!organizationId) return { taskIds: [taskId], ancestorIds: [] };
+    const rows = await this.db.prepare(`SELECT t.id, t.parentTaskId, t.createdBy FROM tasks t
+      JOIN projects p ON p.id=t.projectId WHERE p.organizationId=?`).all(organizationId) as any[];
+    const parents = new Map<string, string | undefined>(rows.map(row => {
+      const creator = row.createdBy ? JSON.parse(row.createdBy) : undefined;
+      return [row.id, row.parentTaskId ?? (creator?.kind === 'task-agent' ? creator.taskId : undefined)];
+    }));
+    const ancestors = (id: string) => {
+      const seen = new Set<string>([id]);
+      let parent = parents.get(id);
+      while (parent && parents.has(parent) && !seen.has(parent)) {
+        seen.add(parent);
+        parent = parents.get(parent);
+      }
+      return [...seen];
+    };
+    const lineage = ancestors(taskId);
+    const root = lineage[lineage.length - 1]!;
+    return { taskIds: rows.filter(row => ancestors(row.id).includes(root)).map(row => row.id), ancestorIds: lineage.slice(1) };
+  }
+
+  async paymentSpent(taskId: string, family = false): Promise<number> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
+    const ids = family ? (await this.paymentBudgetFamily(taskId)).taskIds : [taskId];
     const row = (await this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
-      WHERE taskId=? AND (status IN ('authorizing','consumed','settled')
-        OR (status='authorized' AND expiresAt>?))`).get(taskId, Date.now())) as any;
+      WHERE taskId IN (${ids.map(() => '?').join(',')}) AND (status IN ('authorizing','consumed','settled')
+        OR (status='authorized' AND expiresAt>?))`).get(...ids, Date.now())) as any;
     return Number(row?.amount ?? 0);
   
     });

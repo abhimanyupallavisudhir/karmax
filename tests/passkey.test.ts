@@ -16,7 +16,7 @@ async function mockBrowser(origin = 'https://github.com') {
       if (msg.method === 'Runtime.evaluate') result = { result: { value: origin } };
       else if (msg.method === 'WebAuthn.addVirtualAuthenticator') { const id = `auth-${state.authenticators.size + 1}`; state.authenticators.add(id); result = { authenticatorId: id }; }
       else if (msg.method === 'WebAuthn.addCredential') state.credentials.push(msg.params.credential);
-      else if (msg.method === 'WebAuthn.getCredentials') result = { credentials: [{ credentialId: 'cred1', rpId: 'github.com', privateKey: 'PEMKEY', isResidentCredential: true, signCount: 0 }] };
+      else if (msg.method === 'WebAuthn.getCredentials') result = { credentials: [{ credentialId: 'cred1', rpId: 'github.com', privateKey: 'PEMKEY', isResidentCredential: true, signCount: 4 }] };
       socket.send(JSON.stringify({ id: msg.id, result }));
     });
   });
@@ -36,19 +36,21 @@ describe('agent-enrolled passkeys over CDP (§8)', () => {
     const b = await mockBrowser();
     const mgr = new PasskeyManager();
     try {
-      const { authenticatorId, origin } = await mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'enroll' });
+      const { authenticatorId, origin } = await mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'enroll', owner: 'org:a:task:a' });
       expect(origin).toBe('https://github.com');
       expect(authenticatorId).toBeTruthy();
-      expect(b.state.authenticators.has(authenticatorId)).toBe(true);
+      expect(b.state.authenticators.size).toBe(1);
       // presence simulation is enabled so a headless enroll succeeds
       const addCall = b.state.calls.find((c) => c.method === 'WebAuthn.addVirtualAuthenticator');
       expect(addCall.params.options.automaticPresenceSimulation).toBe(true);
 
-      const creds = await mgr.harvest(authenticatorId);
+      await expect(mgr.harvest(authenticatorId, 'org:b:task:b')).rejects.toThrow(/owner/);
+      await expect(mgr.release(authenticatorId, 'org:b:task:b')).rejects.toThrow(/owner/);
+      const creds = await mgr.harvest(authenticatorId, 'org:a:task:a');
       expect(creds).toHaveLength(1);
       expect(creds[0]!.privateKey).toBe('PEMKEY');
       // released → a second harvest fails
-      await expect(mgr.harvest(authenticatorId)).rejects.toThrow(/no held/);
+      await expect(mgr.harvest(authenticatorId, 'org:a:task:a')).rejects.toThrow(/no held/);
     } finally {
       await b.close();
     }
@@ -59,9 +61,12 @@ describe('agent-enrolled passkeys over CDP (§8)', () => {
     const mgr = new PasskeyManager();
     try {
       const cred = { credentialId: 'cred1', rpId: 'github.com', privateKey: 'PEMKEY' };
-      const { authenticatorId } = await mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'login', credential: cred });
+      let persisted: any;
+      const { authenticatorId } = await mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'login', owner: 'org:a:task:a', credential: cred, onCredentials: async value => { persisted = value; } });
       expect(b.state.credentials[0]).toEqual(cred);
-      (await mgr.release(authenticatorId));
+      await expect(mgr.harvest(authenticatorId, 'org:a:task:a')).rejects.toThrow(/enrollment/);
+      (await mgr.release(authenticatorId, 'org:a:task:a'));
+      expect(persisted[0].signCount).toBe(4);
     } finally {
       await b.close();
     }
@@ -71,7 +76,7 @@ describe('agent-enrolled passkeys over CDP (§8)', () => {
     const b = await mockBrowser('https://evil.com');
     const mgr = new PasskeyManager();
     try {
-      await expect(mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'enroll' })).rejects.toThrow(/no open page matches/);
+      await expect(mgr.begin(`http://127.0.0.1:${b.port}`, { expectDomains: ['github.com'], mode: 'enroll', owner: 'org:a:task:a' })).rejects.toThrow(/no open page matches/);
       expect(b.state.authenticators.size).toBe(0);
     } finally {
       await b.close();

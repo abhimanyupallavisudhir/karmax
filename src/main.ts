@@ -568,11 +568,11 @@ async function main() {
       config: (await readMailboxConfig(organizationId)),
     }))),
     resolveSecret: (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
-    makeIngest: (_organizationId, config) => {
+    makeIngest: (organizationId, config) => {
       const domain = config.domain || config.hostedDomain || config.agentmailDomain || config.fixedAddress?.split('@')[1];
       const fixedLocal = config.fixedAddress?.split('@')[0];
       const mail = new AgentMail(store, domain, fixedLocal, config.agentmailAddress);
-      return async (msg) => (await mail.ingest(msg));
+      return async (msg) => (await mail.ingest(msg, organizationId));
     },
   });
   mailPoller.start();

@@ -120,3 +120,27 @@ describe('MailPoller loop', () => {
     expect(createPuller({ provider: 'self-managed', domain: 'x.com' }, deps)).toBeUndefined();
   });
 });
+
+it('verifies that an AgentMail key can access the requested inbox (AU-1)', async () => {
+  const { verifyAgentMailInbox } = await import('../src/autonomy/mail-pull.js');
+  const denied = async () => new Response('{}', { status: 403 });
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', denied as typeof fetch)).rejects.toThrow();
+  const mismatch = async () => new Response(JSON.stringify({ inbox_id: 'other@example.com' }));
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', mismatch as typeof fetch)).rejects.toThrow();
+  const allowed = async () => new Response(JSON.stringify({ inbox_id: 'victim@example.com' }));
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', allowed as typeof fetch)).resolves.toBeUndefined();
+});
+
+it('refuses hosted IMAP access to private addresses before opening a connection (AU-16)', async () => {
+  const old = process.env.KARMAX_DEPLOYMENT;
+  process.env.KARMAX_DEPLOYMENT = 'hosted';
+  let opened = false;
+  try {
+    const puller = new ImapPuller({ provider: 'imap', apiKeyHandle: 'key', imap: { host: '127.0.0.1', port: 993, secure: true, user: 'u' } }, {
+      store: store(), resolveSecret: () => 'secret', ingest: () => ({ delivered: false }),
+      openImap: async () => { opened = true; return { fetchSince: async () => [], close: async () => {} }; },
+    });
+    await expect(puller.poll()).rejects.toThrow(/private|public/);
+    expect(opened).toBe(false);
+  } finally { if (old === undefined) delete process.env.KARMAX_DEPLOYMENT; else process.env.KARMAX_DEPLOYMENT = old; }
+});

@@ -1,3 +1,6 @@
+import { getDomain } from 'tldts';
+import { allows, attenuate } from '../platform/capabilities.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -489,9 +492,9 @@ export class StripeIssuingProvider implements PaymentProvider {
     return { status: 'awaiting_oauth', url: url.toString(),
       detail: 'Authorize this organization’s Stripe account. Its Issuing balance remains separate from every other organization.' };
   }
-  async completeOAuth(state: string, code: string): Promise<any> {
+  async completeOAuth(state: string, code: string, userId: string): Promise<any> {
     if (!(await this.configured())) throw new Error('Stripe Connect is not configured');
-    const pending = (await this.store!.consumePaymentOAuthState(state));
+    const pending = (await this.store!.consumePaymentOAuthState(state, userId));
     if (!pending) throw new Error('Stripe connection state is invalid, expired, or already used');
     const form = new URLSearchParams({
       client_secret: this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY')!,
@@ -553,28 +556,41 @@ export class StripeIssuingProvider implements PaymentProvider {
         ? (await this.requireStore().getProject(spec.scopeId!))?.organizationId : 'org_personal');
     if (!organizationId) throw new Error('card organization is required');
     const connection = (await this.connection(organizationId));
+    if (!spec.label.trim() || (await this.requireStore().listOrganizationCards(organizationId))
+      .some(card => card.label.trim().toLowerCase() === spec.label.trim().toLowerCase()))
+      throw new Error('Card name must be unique in the organization');
+    const balance = await this.balance(organizationId);
     const id = newId('card');
     const currency = (spec.currency ?? 'usd').toLowerCase();
     const remote = await this.request('POST', '/v1/issuing/cards', connection.accountId, {
       cardholder: spec.cardholderId,
       currency,
       type: 'virtual',
-      status: 'active',
+      status: 'inactive',
       'spending_controls[spending_limits][0][amount]': spec.cap,
       'spending_controls[spending_limits][0][interval]': 'all_time',
       'spending_controls[spending_limits_currency]': currency,
       'metadata[karmax_card_id]': id,
       'metadata[karmax_organization_id]': organizationId,
     }, `karmax-card-${id}`);
-    const balance = await this.balance(organizationId);
     const card: Card = {
       id, provider: this.name, scope: spec.scope, scopeId: spec.scopeId, label: spec.label,
       cap: spec.cap, available: balance.available, merchantLock: spec.merchantLock,
-      externalId: remote.id, currency, status: remote.status, cardholderId: spec.cardholderId,
+      externalId: remote.id, currency, status: 'inactive', cardholderId: spec.cardholderId,
       last4: remote.last4, createdAt: Date.now(),
     };
-    (await this.requireStore().createCard(card));
-    return card;
+    try {
+      await this.requireStore().createCard(card);
+      await this.request('POST', `/v1/issuing/cards/${encodeURIComponent(remote.id)}`, connection.accountId,
+        { status: 'active' }, `karmax-activate-${id}`);
+      await this.requireStore().updateCard(id, { status: 'active' });
+      return { ...card, status: 'active' };
+    } catch (error) {
+      await this.request('POST', `/v1/issuing/cards/${encodeURIComponent(remote.id)}`, connection.accountId,
+        { status: 'canceled', cancellation_reason: 'lost' }, `karmax-failed-provision-${id}`);
+      await this.requireStore().updateCard(id, { status: 'canceled', available: 0 });
+      throw error;
+    }
   }
   async getCard(cardId: string): Promise<Card | undefined> {
     const card = (await this.store?.getCard(cardId)) as Card | undefined;
@@ -899,11 +915,18 @@ export class BudgetService {
   }
 
   async policy(projectId: string, taskId?: string): Promise<PaymentPolicy> {
-    return (await resolvePaymentPolicy(this.store, projectId, taskId));
+    const policy = await resolvePaymentPolicy(this.store, projectId, taskId);
+    if (taskId) for (const ancestorId of (await this.store.paymentBudgetFamily(taskId)).ancestorIds) {
+      const ancestor = await this.store.getTask(ancestorId);
+      const inherited = await resolvePaymentPolicy(this.store, ancestor!.projectId, ancestorId);
+      if (inherited.budget !== null) policy.budget = policy.budget === null ? inherited.budget : Math.min(policy.budget, inherited.budget);
+      if (inherited.cardIds) policy.cardIds = policy.cardIds ? policy.cardIds.filter(id => inherited.cardIds!.includes(id)) : inherited.cardIds;
+    }
+    return policy;
   }
 
   private async spent(taskId: string): Promise<number> {
-    return (await this.store.paymentSpent(taskId));
+    return (await this.store.paymentSpent(taskId, true));
   }
 
   /**
@@ -926,10 +949,46 @@ export class BudgetService {
     const visible = (await this.store.listCards(ctx.projectId, ctx.organizationId))
       .filter((card) => card.status !== 'canceled' && card.status !== 'inactive') as Card[];
     const storedCaps = ((await this.store.getTask(ctx.taskId))?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
-    const scoped = (ctx.capabilities ?? storedCaps ?? []).filter((capability) => capability.startsWith('use-card:'));
+    const permissions = new PermissionRequests(this.store,
+      ctx.organizationId ?? (await this.store.getProject(ctx.projectId))?.organizationId ?? 'org_personal');
+    const approved = await permissions.extensionCaps(ctx.taskId);
+    const liveCaps = storedCaps || approved.length ? [...(storedCaps ?? []), ...approved] : undefined;
+    let scoped = ctx.capabilities && liveCaps ? attenuate(ctx.capabilities, liveCaps) : ctx.capabilities ?? liveCaps ?? [];
+    for (const ancestorId of (await this.store.paymentBudgetFamily(ctx.taskId)).ancestorIds) {
+      const ancestor = await this.store.getTask(ancestorId);
+      scoped = attenuate(scoped, [
+        ...((ancestor?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? []),
+        ...await permissions.extensionCaps(ancestorId),
+      ]);
+    }
     const selected = (await this.policy(ctx.projectId, ctx.taskId)).cardIds;
     return visible.filter(card => (!selected || selected.includes(card.id))
-      && (!scoped.length || scoped.includes('use-card:*') || scoped.includes(`use-card:${card.id}`)));
+      && allows(scoped, `use-card:${card.id}`));
+  }
+
+  async claimFill(ctx: SpendCtx, requestId: string): Promise<{ request: any; domain: string }> {
+    return this.store.paymentTransaction(async () => {
+      const request = await this.store.getPaymentSpendRequest(requestId);
+      if (!request || request.taskId !== ctx.taskId || request.projectId !== ctx.projectId
+        || !['authorized', 'settled'].includes(request.status)
+        || request.expiresAt <= Date.now() || request.createdAt + 30 * 60_000 <= Date.now())
+        throw new Error('payment request is not an active reservation for this task');
+      if (!(await this.cards(ctx)).some(card => card.id === request.cardId))
+        throw new Error('card is no longer selected for this task');
+      let domain = '';
+      try {
+        const raw = String(request.merchant ?? '');
+        const url = new URL(raw.includes('://') ? raw : `https://${raw}`);
+        if (url.protocol === 'https:' && !url.username && !url.password) domain = url.hostname;
+      } catch {}
+      if (!getDomain(domain, { allowPrivateDomains: true }))
+        throw new Error('request_spend merchant must be a checkout domain, not a public suffix');
+      const key = `payment-fill:${request.id}`;
+      const attempts = Number(await this.store.kvGet(key) ?? 0);
+      if (!Number.isSafeInteger(attempts) || attempts >= 3) throw new Error('payment fill attempt limit reached');
+      await this.store.kvSet(key, String(attempts + 1));
+      return { request, domain };
+    });
   }
 
   private async existing(ctx: SpendCtx, args: SpendArgs): Promise<any> {

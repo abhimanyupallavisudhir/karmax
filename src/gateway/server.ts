@@ -1480,6 +1480,8 @@ export class Gateway {
       }
     }
     if (p === '/api/payments/stripe/callback' && method === 'GET') {
+      const callbackSession = await this.auth(req);
+      if (!callbackSession?.userId) return this.json(res, 401, { error: 'sign in to complete Stripe connection' });
       const code = url.searchParams.get('code') ?? '';
       const state = url.searchParams.get('state') ?? '';
       const oauthError = url.searchParams.get('error_description') ?? url.searchParams.get('error');
@@ -1489,7 +1491,7 @@ export class Gateway {
         const provider = this.deps.paymentRegistry?.get('stripe');
         const { StripeIssuingProvider } = await import('../autonomy/payments.js');
         if (!(provider instanceof StripeIssuingProvider)) throw new Error('Stripe Issuing is unavailable');
-        const connection = await provider.completeOAuth(state, code);
+        const connection = await provider.completeOAuth(state, code, callbackSession.userId);
         const destination = `${(await organizationSettingsPath(this.deps.store, connection.organizationId))}?payments=stripe-connected&organizationId=${encodeURIComponent(connection.organizationId)}`;
         res.writeHead(303, { location: destination });
         return void res.end();
@@ -2505,6 +2507,8 @@ export class Gateway {
           (await this.deps.broker?.deleteHandle(handle));
         this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
+        const { deleteOrganizationAutonomy } = await import('../autonomy/cleanup.js');
+        await deleteOrganizationAutonomy(store, this.deps.broker, organizationId);
         (await store.deleteOrganization(organizationId));
         for (const attachmentId of resources.attachmentIds)
           if (!(await store.attachmentIsScoped(attachmentId))) this.attachments.delete(attachmentId);
@@ -6350,11 +6354,11 @@ export class Gateway {
           const b = await this.body(req);
           const item = (await findItem(b));
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const field = (b.field as any) ?? defaultField(item.type);
+          if (!ITEM_FIELDS[item.type].includes(field) || !item.fields.includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           const decision = (await vault.access(caps, callerTaskId, item, 'reveal', { consume: true }));
           if (decision.status !== 'granted')
             return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'reveal', why: b.why })));
-          const field = (b.field as any) ?? defaultField(item.type);
-          if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           const value = field === 'totp'
             ? (await vault.totp(item, { taskId: callerTaskId, principal }))
             : (await vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' }));
@@ -6369,17 +6373,23 @@ export class Gateway {
           const b = await this.body(req);
           const item = (await findItem(b));
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
-          const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
+          const field = String(b.field ?? 'password');
+          if (item.type !== 'login' || !['username', 'password', 'totp'].includes(field))
+            return this.json(res, 400, { error: 'browser fill supports only login fields: username, password, totp' });
+          if (!item.domains?.length) return this.json(res, 400, { error: 'browser fill requires credential domains' });
+          const decision = (await vault.access(caps, callerTaskId, item, 'use'));
           if (decision.status !== 'granted')
             return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
-          const field = String(b.field ?? 'password');
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           if (field !== 'username' && !item.fields.includes(field as any)) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
-          const resolveText = async () => field === 'username'
-            ? item.username!
-            : field === 'totp'
-              ? (await vault.totp(item, { taskId: callerTaskId, principal }))
-              : (await vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' }));
+          const resolveText = async () => {
+            if (field === 'username') return item.username!;
+            const granted = await vault.access(caps, callerTaskId, item, 'use', { consume: true });
+            if (granted.status !== 'granted') throw new Error('credential approval is no longer available');
+            return field === 'totp'
+              ? await vault.totp(item, { taskId: callerTaskId, principal })
+              : await vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
+          };
           try {
             const origin = await this.fillCredential(callerTaskId, {
               selector: String(b.selector ?? ''), cdpUrl: b.cdpUrl, expectDomains: item.domains, resolveText,
@@ -6518,6 +6528,13 @@ export class Gateway {
 
         // ── agent-enrolled passkeys (§8) ──
         if (p.startsWith('/api/vault/passkey')) {
+          const passkeyTask = callerTaskId ? await store.getTask(callerTaskId) : undefined;
+          const passkeyWorld = passkeyTask ? worldHandleForView(passkeyTask.lastView, callerTaskId!,
+            await store.effectiveProjectConfig(passkeyTask.projectId)) : undefined;
+          if (this.deps.hosted || (passkeyWorld && (worldHandleIsRemote(passkeyWorld)
+            || this.deps.worlds.get(passkeyWorld.kind)?.capabilities?.remote)))
+            return this.json(res, 400, { error: 'passkeys require a local browser; remote passkey sessions are not available yet' });
+          const passkeyOwner = JSON.stringify([organizationId, principal, callerTaskId]);
           if (!this.passkeys) {
             const { PasskeyManager } = await import('../autonomy/passkey.js');
             this.passkeys = new PasskeyManager();
@@ -6527,11 +6544,11 @@ export class Gateway {
           try {
             if (p === '/api/vault/passkey/enroll' && method === 'POST') {
               const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll' });
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll', owner: passkeyOwner });
               return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/save' && method === 'POST') {
-              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''));
+              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''), passkeyOwner);
               if (!creds.length) return this.json(res, 400, { error: 'no passkey was created on the page — trigger the site\'s enroll button first' });
               const saved = (await vault.save({
                 type: 'passkey',
@@ -6554,11 +6571,26 @@ export class Gateway {
               if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
               const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
               const domains = item.domains;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0] });
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
+                onCredentials: async updated => {
+                  await store.transaction(async () => {
+                    const current = await vault.get(item.id);
+                    if (!current || current.type !== 'passkey') return;
+                    const secret = await vault.readSecret(current, 'passkey');
+                    if (secret === undefined) return;
+                    const saved = JSON.parse(secret) as any[];
+                    for (const credential of saved) {
+                      const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
+                      if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
+                        credential.signCount = next.signCount;
+                    }
+                    await vault.save({ id: current.id, type: 'passkey', secrets: { passkey: JSON.stringify(saved) } });
+                  });
+                } });
               return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/release' && method === 'POST') {
-              (await this.passkeys.release(String(b.authenticatorId ?? '')));
+              (await this.passkeys.release(String(b.authenticatorId ?? ''), passkeyOwner));
               return this.json(res, 200, { released: true });
             }
           } catch (e) {
@@ -6577,6 +6609,11 @@ export class Gateway {
         const organizationId = orgMail[1]!;
         const sub = orgMail[2];
         const { AgentMail } = await import('../autonomy/agent-mail.js');
+        if (!sub && method === 'DELETE') {
+          const { deleteAgentMail } = await import('../autonomy/cleanup.js');
+          await deleteAgentMail(store, this.deps.broker, organizationId);
+          return this.json(res, 200, { disconnected: true });
+        }
         if (!sub && method === 'GET') {
           const config = (await this.mailboxConfig(organizationId));
           const mail = new AgentMail(
@@ -6593,6 +6630,8 @@ export class Gateway {
           const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
           const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
           const config = (await this.mailboxConfig(organizationId));
+          if (!(await this.deps.tokens.check(token, 'credential:write')).ok)
+            return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider });
           // The push webhook URL (secret included) + Cloudflare worker are still
           // returned for the operator who wants them; the UI hides them for now.
           const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
@@ -6614,6 +6653,15 @@ export class Gateway {
             imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
           });
           if (result.status === 'connected' && result.config) {
+            if (result.config.provider === 'agentmail') {
+              const { verifyAgentMailInbox } = await import('../autonomy/mail-pull.js');
+              try {
+                await verifyAgentMailInbox(String(b.apiKey), result.config.agentmailAddress!);
+                await new AgentMail(store, undefined, undefined, result.config.agentmailAddress).address(organizationId);
+              } catch (error) {
+                return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+              }
+            }
             // The provider secret (AgentMail key / IMAP password) → the vault under
             // an org-scoped handle the poller resolves; never echoed or stored raw.
             const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));
@@ -8306,7 +8354,7 @@ export class Gateway {
    * gateway drives CDP directly (agent + gateway share the host). For a REMOTE
    * world the browser lives in the sandbox with no private path from the host,
    * so the fill runs INSIDE the world via `world.exec`, the secret handed over
-   * stdin (never argv/env/a file the co-resident agent could read). Either way
+   * stdin (never argv/env/a file). The agent still controls its browser. Either way
    * the live page origin is re-verified against the item's domains before typing.
    */
   private async fillCredential(callerTaskId: string | undefined, args: {

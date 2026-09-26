@@ -759,6 +759,7 @@ interface GitPassConnection {
 }
 
 interface GitPassOptions {
+  hosted?: boolean;
   /** Tests may use a local bare remote; production accepts remote URLs only. */
   allowLocalRepository?: boolean;
   /** Prefer an organization-owned repository attachment over profile/host Git. */
@@ -955,6 +956,12 @@ class GitPassStoreConnector implements CredentialConnector {
     const value = parsed as Partial<GitPassConnection>;
     const repositoryUrl = String(value.repositoryUrl ?? '').trim();
     if (!repositoryUrl) throw new Error('repository URL is required');
+    if (this.options.hosted) {
+      const url = new URL(repositoryUrl);
+      if (url.protocol !== 'https:' || !['github.com', 'gitlab.com', 'bitbucket.org'].includes(url.hostname)
+        || (url.port && url.port !== '443') || url.username || url.password)
+        throw new Error('hosted Git password stores require public GitHub, GitLab or Bitbucket HTTPS URLs');
+    }
     if (!this.options.allowLocalRepository && !isRemoteGitUrl(repositoryUrl)) {
       throw new Error('repository must use an HTTPS or SSH repository URL');
     }
@@ -1026,7 +1033,8 @@ class GitPassStoreConnector implements CredentialConnector {
       ...(await this.gitEnvironment(connection.gitProfile)),
       // Belt to the URL check's braces: git itself refuses any other transport
       // (`ext::`, `fd::`, or a helper smuggled in through a redirect).
-      GIT_ALLOW_PROTOCOL: this.options.allowLocalRepository ? 'https:ssh:file' : 'https:ssh',
+      GIT_ALLOW_PROTOCOL: this.options.hosted ? 'https' : this.options.allowLocalRepository ? 'https:ssh:file' : 'https:ssh',
+      ...(this.options.hosted ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.followRedirects', GIT_CONFIG_VALUE_0: 'false' } : {}),
     };
   }
 
@@ -2255,7 +2263,7 @@ export function defaultConnectors(store: ConnectorStore, items: VaultItems, brok
       return (await profiles.env(profile, {}));
     },
     undefined,
-    { repositoryCredential: (repositoryUrl) =>
+    { hosted: opts.hosted, repositoryCredential: (repositoryUrl) =>
       attachedRepositoryCredential(store, opts.githubApp, organizationId, repositoryUrl) },
   ));
   return connectors;

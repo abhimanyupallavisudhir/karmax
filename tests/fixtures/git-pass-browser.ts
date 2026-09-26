@@ -1,4 +1,4 @@
-/** Native browser + hosted gateway + authenticated HTTPS Git verification.
+/** Native browser + deployment policy + authenticated HTTPS Git verification.
  * Uses generated credentials only; no request interception or production accounts. */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -163,7 +163,7 @@ try {
   const port = await findFreePortFrom(48900);
   const base = `http://127.0.0.1:${port}`;
   identity = await IdentityService.open(path.join(root, 'identity.db'), { baseURL: base });
-  await harness.startGateway({ hosted: true, identity, port });
+  const hostedGateway = await harness.startGateway({ hosted: true, identity, port });
   const setup = await fetch(base + '/api/setup', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -216,23 +216,34 @@ try {
   await page.goto(`${base}/${org.slug}/settings#settings-payments`);
   await page.locator('#onboarding-minimize').click();
   const row = page.locator('[data-conn="pass-git"]');
-  await row.locator('[data-git-pass-connect]').click();
-  const form = page.locator('[data-git-pass-root]');
-  await form.locator('.git-pass-repo').fill(gitBase + '/root.git');
-  await form.locator('.git-pass-key').fill(gpgPrivateKey);
-  await form.locator('.git-pass-profile').selectOption('staging');
-  await page.locator('[data-git-pass-add]').click();
-  const mount = page.locator('[data-git-pass-mount]');
-  await mount.locator('.git-pass-mount-name').fill('work');
-  await mount.locator('.git-pass-repo').fill(gitBase + '/work.git');
-  await mount.locator('.git-pass-profile').selectOption('staging');
-  await mount.locator('.git-pass-crypto').selectOption('age');
-  await mount.locator('.git-pass-age-file').setInputFiles(encryptedAgeKey);
-  await mount.locator('.git-pass-age-passphrase').fill('browser-test-passphrase');
-  await mount.locator('.git-pass-verify-entry').fill('otp');
-  const connected = page.waitForResponse(r => r.url().includes('/connectors/pass-git/connect') && r.request().method() === 'POST');
-  await page.locator('[data-git-pass-save]').click();
-  const connection = await connected;
+  const connectFromBrowser = async () => {
+    await row.locator('[data-git-pass-connect]').click();
+    const form = page.locator('[data-git-pass-root]');
+    await form.locator('.git-pass-repo').fill(gitBase + '/root.git');
+    await form.locator('.git-pass-key').fill(gpgPrivateKey);
+    await form.locator('.git-pass-profile').selectOption('staging');
+    await page.locator('[data-git-pass-add]').click();
+    const mount = page.locator('[data-git-pass-mount]');
+    await mount.locator('.git-pass-mount-name').fill('work');
+    await mount.locator('.git-pass-repo').fill(gitBase + '/work.git');
+    await mount.locator('.git-pass-profile').selectOption('staging');
+    await mount.locator('.git-pass-crypto').selectOption('age');
+    await mount.locator('.git-pass-age-file').setInputFiles(encryptedAgeKey);
+    await mount.locator('.git-pass-age-passphrase').fill('browser-test-passphrase');
+    await mount.locator('.git-pass-verify-entry').fill('otp');
+    const connected = page.waitForResponse(r => r.url().includes('/connectors/pass-git/connect') && r.request().method() === 'POST');
+    await page.locator('[data-git-pass-save]').click();
+    return await connected;
+  };
+  const refused = await connectFromBrowser();
+  assert.equal(refused.status(), 400);
+  assert.match(await refused.text(), /hosted Git password stores require public/);
+  assert.equal(requests.length, 0, 'hosted rejection must happen before contacting the private Git server');
+  // A private HTTPS remote is supported only on the self-hosted deployment.
+  await hostedGateway.close();
+  await harness.startGateway({ hosted: false, identity, port });
+  await page.reload();
+  const connection = await connectFromBrowser();
   assert.equal(connection.status(), 200, await connection.text());
   const checks = (await connection.json()).connector.checks;
   assert.equal(checks.length, 2);
@@ -401,7 +412,8 @@ try {
   console.log(
     JSON.stringify({
       browserLogin: true,
-      hostedGateway: true,
+      hostedPrivateRemoteRejected: true,
+      selfHostedGateway: true,
       tlsVerified: true,
       gitChallengeResponse: true,
       gpgAndAgeMountImport: true,

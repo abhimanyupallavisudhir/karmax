@@ -75,9 +75,9 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     const mail = new AgentMail(store, 'inbound.postmarkapp.com', 'ab12cd');
     const a = (await mail.address('org_a'));
     expect(a).toMatch(/^ab12cd\+agent-[0-9a-f]{12}@inbound\.postmarkapp\.com$/);
-    // routes on the exact local, and on the tag alone (provider may rewrite base)
+    // Only the exact mailbox is owned; a rewritten base is a different address.
     expect((await mail.ownerOf(a))).toBe('org_a');
-    expect((await mail.ownerOf(a.replace('ab12cd+', 'whatever+')))).toBe('org_a');
+    expect((await mail.ownerOf(a.replace('ab12cd+', 'whatever+')))).toBeUndefined();
     expect((await mail.ingest({ from: 'x@y.com', to: a, text: 'code 123456' })).delivered).toBe(true);
   });
 
@@ -89,8 +89,8 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     expect(after).toBe(`${token}@agents.myco.com`);
     const fixed = (await new AgentMail(store, 'inbound.svc.com', 'base1').address('org_a'));
     expect(fixed).toBe(`base1+${token}@inbound.svc.com`);
-    // mail addressed to ANY historical form still routes to the org
-    expect((await new AgentMail(store).ownerOf(before))).toBe('org_a');
+    // Retired addresses no longer route to the organization.
+    expect((await new AgentMail(store).ownerOf(before))).toBeUndefined();
     expect((await new AgentMail(store).ownerOf(fixed))).toBe('org_a');
   });
 
@@ -184,4 +184,48 @@ describe('webhook body parsers + secret + worker script', () => {
     expect(script).toContain('message.raw');
     expect(script).toContain('async email(message');
   });
+});
+
+
+describe('mail ownership boundaries (AU-1)', () => {
+  it('refuses a second tenant claiming an exact address', async () => {
+    const store = memStore();
+    const mail = new AgentMail(store, undefined, undefined, 'shared@example.com');
+    await mail.address('org_a');
+    await expect(mail.address('org_b')).rejects.toThrow(/owned/);
+    expect(await mail.ownerOf('shared@example.com')).toBe('org_a');
+  });
+  it('preserves legacy full-address ownership and protects subaddresses during migration', async () => {
+    const store = memStore();
+    await store.kvSet('agent-mail:address:org_a', 'legacy@example.com');
+    await store.kvSet('agent-mail:owner:legacy', 'org_a');
+    const mail = new AgentMail(store, undefined, undefined, 'legacy@example.com');
+    await expect(mail.address('org_b')).rejects.toThrow(/owned/);
+    await expect(new AgentMail(store, undefined, undefined, 'legacy+login@example.com').address('org_b')).rejects.toThrow(/owned/);
+    expect(await mail.address('org_a')).toBe('legacy@example.com');
+    expect(await mail.ownerOf('legacy@example.com')).toBe('org_a');
+  });
+  it('does not route the same local part on a foreign domain or a rewritten base', async () => {
+    const store = memStore();
+    const mail = new AgentMail(store, 'example.com', 'base');
+    const address = await mail.address('org_a');
+    expect(await mail.ownerOf(address.replace('@example.com', '@evil.com'))).toBeUndefined();
+    expect(await mail.ownerOf(address.replace('base+', 'other+'))).toBeUndefined();
+  });
+  it('retires the old route when the provider changes', async () => {
+    const store = memStore();
+    const old = await new AgentMail(store, 'old.example').address('org_a');
+    await new AgentMail(store, 'new.example').address('org_a');
+    expect(await new AgentMail(store).ownerOf(old)).toBeUndefined();
+  });
+});
+
+it('bounds stored mail bodies and total inbox bytes (AU-6)', async () => {
+  const store = memStore();
+  const mail = new AgentMail(store);
+  const to = await mail.address('org_a');
+  for (let i = 0; i < 70; i++) await mail.ingest({ to, from: 'a@example.com', text: 'x'.repeat(100_000), subject: 's'.repeat(100_000) });
+  const raw = await store.kvGet('agent-mail:messages:org_a');
+  expect(Buffer.byteLength(raw!)).toBeLessThanOrEqual(1_048_576);
+  expect((await mail.recent('org_a'))[0]!.text.length).toBeLessThanOrEqual(16_384);
 });

@@ -23,6 +23,7 @@ it.each([false, true])('keeps browser state across MCP exits only when opted in 
 const fs = require('node:fs');
 const http = require('node:http');
 fs.writeFileSync(process.env.TEST_BROWSER_PID, String(process.pid));
+fs.writeFileSync(process.env.TEST_BROWSER_PID + '.args', JSON.stringify(process.argv));
 let visits = 0;
 http.createServer((req, res) => {
   res.setHeader('content-type', 'application/json');
@@ -41,6 +42,7 @@ fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/visit')
     const first = JSON.parse((await exec(process.execPath, [launcher], { env })).stdout);
     pid = first.pid;
     expect(first.visits).toBe(1);
+    expect(fs.readFileSync(pidFile + '.args', 'utf8')).not.toContain('--remote-allow-origins=*');
     // Its telemetry watchdog costs ~80 MB of a 2 GB sandbox and reports tenants' tool use.
     expect(first.telemetry).toBe('off');
     if (keepAlive) {
@@ -51,10 +53,23 @@ fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/visit')
         try { await fetch(`http://127.0.0.1:${port}/json/version`); return true; }
         catch { return false; }
       }).toBe(false);
+      expect(fs.existsSync(path.join(dir, 'profile'))).toBe(false);
     }
   } finally {
     if (!pid && fs.existsSync(pidFile)) pid = Number(fs.readFileSync(pidFile, 'utf8'));
     if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+
+it('refuses to attach to an unowned CDP endpoint (AU-20)', async () => {
+  const server = http.createServer((_req, res) => res.end('{}'));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  try {
+    await expect(exec(process.execPath, [launcher], { timeout: 3000, env: { ...process.env,
+      KARMAX_CDP_PORT: String(port), KARMAX_CDP_KEEP_ALIVE: '0', KARMAX_CDP_MCP_BIN: process.execPath,
+    } })).rejects.toThrow(/already in use/);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 });

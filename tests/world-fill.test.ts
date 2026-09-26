@@ -27,7 +27,8 @@ describe('fillInWorld (remote-world credential fill)', () => {
     // the dep-free helper is written into the world
     expect(calls.writes[0]!.path).toMatch(/cdp-fill\.mjs$/);
     expect(calls.writes[0]!.content).toContain('Input.insertText');
-    const ex = calls.execs[0]!;
+    const ex = calls.execs[1]!;
+    expect(calls.execs[0]!.opts.input).toBe('');
     expect(ex.cmd).toBe('node');
     expect(ex.args).toEqual(['.karmax/cdp-fill.mjs', '#pw', 'demo.realworld.show', 'http://127.0.0.1:9222']);
     // the secret travels ONLY on stdin — never in argv
@@ -81,4 +82,22 @@ describe('fillInWorld in a single-repo world (workdir nested under root)', () =>
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+
+it('rejects missing origin restrictions before resolving a secret (AU-3)', async () => {
+  let resolved = false;
+  const { world } = mockWorld(() => ({ stdout: '{"origin":"https://evil.example"}', stderr: '', code: 0 }));
+  await expect(fillInWorld(world, { selector: '#pw', cdpUrl: 'http://127.0.0.1:9222',
+    resolveText: () => { resolved = true; return 'secret'; } })).rejects.toThrow(/domains/);
+  expect(resolved).toBe(false);
+});
+
+
+it('validates a remote target before resolving a one-shot credential (AU-17)', async () => {
+  let resolved = false;
+  const { world } = mockWorld(() => ({ stdout: '{"error":"missing selector"}', stderr: '', code: 1 }));
+  await expect(fillInWorld(world, { selector: '#missing', expectDomains: ['example.com'], cdpUrl: 'http://127.0.0.1:9222',
+    resolveText: () => { resolved = true; return 'secret'; } })).rejects.toThrow(/selector/);
+  expect(resolved).toBe(false);
 });

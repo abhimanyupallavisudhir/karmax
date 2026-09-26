@@ -1,3 +1,4 @@
+import type { World } from '../world/types.js';
 import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -314,6 +315,10 @@ export class VaultItems {
     if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
     const label = args.label?.trim() || prior?.label;
     if (!label) throw new Error('a vault item needs a label');
+    if (!prior && (await this.list()).length >= 1000) throw new Error('organization vault item quota reached (1000)');
+    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
+    if (args.type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
+      throw new Error('a standalone note cannot be empty');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -418,9 +423,9 @@ export class VaultItems {
     return this.store.transaction(async () => {
     const item = (await this.get(id));
     (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
-    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
     for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
 
     });
   }
@@ -605,10 +610,12 @@ export class VaultItems {
    * `envVar`, `ssh-key` items a 0600 key file path under `envVar`. `ask` items
    * and unattached items never inject ambiently.
    */
-  async envFor(taskId: string, caps: Capability[]): Promise<Record<string, string>> {
+  async envFor(taskId: string, caps: Capability[], world?: World): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
+      if (item.provenance.taskId && item.provenance.taskId !== taskId
+        && !caps.includes(`use-credential:item:${item.id}`)) continue;
       if ((await this.access(caps, taskId, item, 'use', { ambient: true })).status !== 'granted') continue;
       try {
         if (item.type === 'env' && item.fields.includes('env')) {
@@ -620,7 +627,7 @@ export class VaultItems {
         } else if (item.type === 'api-key' && item.envVar && item.fields.includes('secret')) {
           env[item.envVar] = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
         } else if (item.type === 'ssh-key' && item.envVar && item.fields.includes('privateKey')) {
-          env[item.envVar] = (await this.materializeKey(item, { taskId }));
+          env[item.envVar] = (await this.materializeKey(item, { taskId }, world));
         }
       } catch (e) {
         // One corrupted/missing secret must not block every turn granted to it;
@@ -743,7 +750,16 @@ export class VaultItems {
   }
 
   /** Write a key to a 0600 file (idempotent per save) and return its path. */
-  private async materializeKey(item: VaultItem, ctx: { taskId?: string }): Promise<string> {
+  private async materializeKey(item: VaultItem, ctx: { taskId?: string }, world?: World): Promise<string> {
+    if (world) {
+      const secret = await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' });
+      const relative = `.karmax-injection/vault/${crypto.createHash('sha256').update(item.id).digest('hex')}.key`;
+      await world.writeFile(relative, secret.endsWith('\n') ? secret : `${secret}\n`);
+      const file = path.posix.join(world.handle.root, relative);
+      const mode = await world.exec('chmod', ['600', file]);
+      if (mode.code !== 0) throw new Error('could not restrict remote key file permissions');
+      return file;
+    }
     const file = path.join(this.keyDir(item.id), 'key');
     if (!fs.existsSync(file)) {
       const secret = (await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' }));

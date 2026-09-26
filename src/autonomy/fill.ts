@@ -30,6 +30,7 @@ export interface CdpFillArgs {
 }
 
 export async function fillViaCdp(args: CdpFillArgs): Promise<{ origin: string }> {
+  if (!args.expectDomains?.length) throw new Error('browser fill requires credential domains');
   const { session, origin } = await openPage(args.cdpUrl, { expectDomains: args.expectDomains, timeoutMs: args.timeoutMs });
   try {
     if (args.selector === '@tab') {

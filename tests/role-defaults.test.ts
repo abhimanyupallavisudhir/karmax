@@ -114,3 +114,27 @@ describe('autonomous role defaults', () => {
     } finally { await store.close(); }
   });
 });
+
+it('delegates live parent card grants instead of stale start-time authority (RT-16, WF-17, AU-7)', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const project = await store.createProject('Live grant');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['task:read', 'use-card:allowed'] } } });
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(child.grant).toContain('use-card:allowed');
+    await store.kvSet(`permission:grant:${parent.id}`, JSON.stringify({ do: ['use-card:approved'] }));
+    const approvedChild = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id,
+      title: 'Approved child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(approvedChild.grant).toContain('use-card:approved');
+    expect(allows(child.grant!, 'task:create')).toBe(false);
+    expect(allows(child.grant!, 'use-card:other')).toBe(false);
+    await store.updateTaskParams(parent.id, { ...parent.params, _authorization: {
+      principal: 'avatar:deleted', capabilities: ['*'],
+    } });
+    const revokedChild = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id,
+      title: 'Revoked child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(revokedChild.grant).toEqual([]);
+  } finally { await store.close(); }
+});

@@ -64,6 +64,8 @@ function redactString(text: string): string {
  * denylist can see through. The tool NAME is the one thing every rail agrees on.
  */
 export const SECRET_TOOL_NAMES = new Set([
+  // Generic requests can return mail bodies or secret-bearing connector data.
+  'platform_request',
   'get_credential',
   'check_agent_mail',
   'use_passkey',

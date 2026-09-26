@@ -518,9 +518,11 @@ integration('PostgreSQL cutover', () => {
       const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 10000 });
       await provider.fund(card.id, 10000);
       const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do',
-        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 } } }));
+        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 },
+          _authorization: { capabilities: [`use-card:${card.id}`] } } }));
       const service = new BudgetService(store, provider);
-      const ctx = { projectId: project.id, taskId: task.id };
+      const ctx = { projectId: project.id, taskId: task.id, capabilities: [`use-card:${card.id}`] };
+      expect(await service.cards({ ...ctx, capabilities: [] })).toEqual([]);
       const results = await Promise.all([service.request(ctx, { amount: 100, why: 'first' }),
         service.request(ctx, { amount: 100, why: 'second' })]);
       expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);

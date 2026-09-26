@@ -108,9 +108,37 @@ function runMcp(browserUrl) {
 }
 
 async function main() {
-  // If something already serves this port (another local agent's browser),
-  // reuse it rather than fighting over the port — attach and don't own it.
+  // Keep local launchers exclusive for their whole lifetime. Remote worlds
+  // have their own network namespace and may deliberately retain one browser.
+  if (!KEEP_ALIVE) {
+    const lock = path.join(os.tmpdir(), `karmax-cdp-${PORT}.lock`);
+    if (process.platform === 'linux') {
+      // flock shares the parent's open file description; process death releases
+      // it automatically, including SIGKILL. Never unlink a kernel lock file.
+      const fd = fs.openSync(lock, 'a', 0o600);
+      const acquired = spawnSync('flock', ['--exclusive', '--nonblock', '3'], {
+        stdio: ['ignore', 'ignore', 'ignore', fd], timeout: 5000,
+      });
+      if (acquired.status !== 0) {
+        fs.closeSync(fd);
+        throw new Error(`CDP port ${PORT} is already in use or its lock is unavailable`);
+      }
+      process.on('exit', () => fs.closeSync(fd));
+    } else {
+      try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); }
+      catch { throw new Error(`CDP port ${PORT} is already in use; if its launcher has exited, remove ${lock}`); }
+      process.on('exit', () => fs.rmSync(lock, { force: true }));
+    }
+  }
+  const profile = process.env.KARMAX_CDP_USER_DATA_DIR;
+  const ownerFile = profile ? path.join(profile, '.karmax-browser-owner.json') : undefined;
   if (await cdpUp(PORT)) {
+    let owner;
+    try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch { /* unowned endpoint */ }
+    if (!KEEP_ALIVE || owner?.port !== PORT || !Number.isSafeInteger(owner?.pid))
+      throw new Error(`CDP port ${PORT} is already in use by an unowned browser`);
+    try { process.kill(owner.pid, 0); }
+    catch { throw new Error(`CDP port ${PORT} is already in use by an unowned browser`); }
     log(`reusing existing CDP browser on :${PORT}`);
     const mcp = runMcp(`http://127.0.0.1:${PORT}`);
     mcp.on('exit', (code) => process.exit(code ?? 0));
@@ -128,14 +156,12 @@ async function main() {
   ensureOvercommit(); // remote sandboxes: let Chrome's V8 renderer reserve its CodeRange
   const userDataDir = process.env.KARMAX_CDP_USER_DATA_DIR
     || fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cdp-'));
+  const createdProfile = !profile || !fs.existsSync(userDataDir);
   fs.mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
+  if (!KEEP_ALIVE && createdProfile) process.on('exit', () => fs.rmSync(userDataDir, { recursive: true, force: true }));
   const headless = process.env.KARMAX_CDP_HEADFUL === '1' ? [] : ['--headless=new'];
   const chromeArgs = [
     ...headless, `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
-    // Loopback-only endpoint; allow WS clients that send an Origin header (the
-    // in-world cdp-fill helper's Node WebSocket, DevTools UIs) to connect. Only
-    // processes that can already reach 127.0.0.1:PORT — i.e. inside this world.
-    '--remote-allow-origins=*',
     `--user-data-dir=${userDataDir}`, '--no-first-run', '--no-default-browser-check',
     '--disable-features=Translate', 'about:blank',
   ];
@@ -173,6 +199,7 @@ async function main() {
     return;
   }
 
+  if (KEEP_ALIVE && ownerFile) fs.writeFileSync(ownerFile, JSON.stringify({ port: PORT, pid: browser.pid }), { mode: 0o600 });
   log(`Chrome ready on :${PORT}; attaching chrome-devtools-mcp`);
   const mcp = runMcp(`http://127.0.0.1:${PORT}`);
   const killChrome = () => { try { browser.kill('SIGKILL'); } catch { /* ignore */ } };

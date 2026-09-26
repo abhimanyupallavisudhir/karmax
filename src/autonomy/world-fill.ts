@@ -11,7 +11,8 @@ import type { World } from '../world/types.js';
  * private socket to the sandbox's loopback, so it runs the `cdp-fill.mjs`
  * helper INSIDE the world via `world.exec`. The secret is resolved host-side
  * (the vault never leaves the gateway) and handed to the helper over STDIN —
- * never argv/env/a file, so the co-resident agent cannot read it. The helper
+ * never argv/env/a file. The agent still controls the browser and sandbox; this
+ * avoids exposing secrets in tool results, not access by a hostile agent. The helper
  * re-verifies the live page origin against the item's domains before typing,
  * exactly like the local path.
  */
@@ -26,9 +27,18 @@ export async function fillInWorld(world: World, args: {
   resolveText: () => string | Promise<string>;
   timeoutMs?: number;
 }): Promise<{ origin: string }> {
+  if (!args.expectDomains?.length) throw new Error('browser fill requires credential domains');
   await world.writeFile(HELPER_REL, HELPER_SOURCE);
   // writeFile is root-relative but exec defaults to the workdir, which a
   // single-repo world nests below the root — run from where the helper lives.
+  const preflight = await world.exec('node', [HELPER_REL, args.selector, args.expectDomains.join(','), args.cdpUrl, '--check'], {
+    cwd: world.handle.root, input: '', timeoutMs: args.timeoutMs ?? 30_000,
+  });
+  if (preflight.code !== 0) {
+    let error = 'remote credential target validation failed';
+    try { error = JSON.parse(preflight.stdout).error || error; } catch {}
+    throw new Error(error);
+  }
   const res = await world.exec('node', [HELPER_REL, args.selector, (args.expectDomains ?? []).join(','), args.cdpUrl], {
     cwd: world.handle.root,
     input: (await args.resolveText()),

@@ -1910,7 +1910,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // resolve JIT; reserved environment-key references carry only the provider
       // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
-        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
+        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
         resolvedAuth = { apiKey };
       }
       // A remote world cannot inherit the host CLI's ambient subscription by
@@ -2477,10 +2477,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : (await gitEnvFor(args.worldHandle, args.taskId));
             // Granted `auto` vault items materialize into the work-command env
             // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
-            // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
+            // SSH keys as 0600 files inside the receiving world.
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
-            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : (await orgVaultItems.envFor(args.taskId, effective));
+            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, isRemote(args.worldHandle.kind) ? world : undefined);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
@@ -2566,7 +2566,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   projectId: args.task.projectId,
                   taskId: args.taskId,
                   organizationId: (await store.getProject(args.task.projectId))?.organizationId,
-                  capabilities: args.task.grant,
+                  capabilities: effective,
                 },
                 onSpend: async (req: any, outcome: any) => (await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason })),
                 fillPaymentCard: async (fill: {
@@ -2574,36 +2574,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   cdpUrl: string;
                   selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
-                  const request = (await store.getPaymentSpendRequest(fill.requestId));
-                  // A webhook rail reserves ('authorized'); an immediate rail has
-                  // already drawn the spend down ('settled'). Both are fillable.
-                  if (!request || request.taskId !== args.taskId
-                    || !['authorized', 'settled'].includes(request.status))
-                    throw new Error('payment request is not an active reservation for this task');
+                  const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
+                  }, fill.requestId);
                   const card = request.cardId ? (await store.getCard(request.cardId)) : undefined;
                   if (!card) throw new Error('secure fill requires a reserved card');
                   if (!(await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).cards({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
                   })).some(c => c.id === card.id)) throw new Error('card is no longer selected for this task');
                   // Any rail that can resolve a card's secret half is fillable; the
                   // mock rail deliberately cannot, because it moves no real money.
                   const provider = deps.paymentRegistry?.forCard(card as any);
                   if (!provider?.retrieveCardDetails)
                     throw new Error(`the ${card.provider} rail has no card that can be filled into a checkout`);
-                  const rawMerchant = String(request.merchant ?? '').trim();
-                  let domain = '';
-                  try {
-                    domain = new URL(rawMerchant.includes('://') ? rawMerchant : `https://${rawMerchant}`).hostname;
-                  } catch {}
-                  if (!domain || !domain.includes('.'))
-                    throw new Error('request_spend merchant must be the checkout domain before a card can be filled');
                   if (!fill.selectors.number || !fill.selectors.cvc
                     || (!fill.selectors.expiry && !(fill.selectors.expMonth && fill.selectors.expYear)))
                     throw new Error('number, CVC, and either combined expiry or month/year selectors are required');
                   const details = await provider.retrieveCardDetails(card.id);
                   const expected = [domain];
                   let origin: string;
-                  if (isRemote(world.handle.kind) || world.handle.kind === 'container') {
+                  if (isRemote(world.handle.kind)) {
                     origin = (await fillCardInWorld(world, {
                       cdpUrl: fill.cdpUrl, domain, selectors: fill.selectors, details,
                     })).origin;
@@ -5074,13 +5064,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
       // branch (which the parent owns and merges into). If no branch is known,
       // the child gets no merge capability — never a broad fallback.
-      const delegation = attenuate(
-        CHILD_TASK_CAPABILITIES,
-        args.parentGrant ?? DEFAULT_GRANT,
-      );
-      const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)
-        ? [`merge-into:${args.parentBranch}`]
-        : [];
+      let currentGrant = [
+        ...((parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? args.parentGrant ?? []),
+        ...await new PermissionRequests(store, currentProject?.organizationId ?? 'org_personal').extensionCaps(args.parentTaskId, 'do'),
+      ];
+      const authorizer = (parent?.params?._authorization as { principal?: string } | undefined)?.principal;
+      const parentAvatarId = (parent?.params?.['agent:do'] as { avatarId?: string } | undefined)?.avatarId
+        ?? (authorizer?.startsWith('avatar:') ? authorizer.slice(7) : undefined);
+      if (parentAvatarId) {
+        const avatar = await store.getAvatar(parentAvatarId);
+        currentGrant = attenuate(currentGrant, avatar
+          ? await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.projectId) : []);
+      }
+      const delegation = attenuate([...CHILD_TASK_CAPABILITIES, 'use-card:*'], currentGrant);
+      const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
+        ? [`merge-into:${args.parentBranch}`] : [];
       const grant = [...delegation, ...mergeBack];
       const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
       const humanDelegation = parentAuthorization?.delegationId && deps.tokens
