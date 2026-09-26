@@ -60,8 +60,10 @@ ${mode === 'refresh-failed' ? 'process.exit(1);' : `fs.writeFileSync(${JSON.stri
     const world: any = {
       handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'test-sealed', id: 'test', root, branch: 'task', base: 'main' },
       async openPty(spec: any) {
+        // The PTY receives `exec sh '<launcher>'`; the agent command line is in the uploaded launcher.
+        const launcher = /^exec sh '(.+)'$/.exec(spec.command)?.[1];
         const child = spawn(process.execPath, [server], {
-          env: { ...process.env, ...spec.env, KARMAX_TEST_REMOTE_COMMAND: spec.command },
+          env: { ...process.env, ...spec.env, KARMAX_TEST_REMOTE_COMMAND: launcher ? fs.readFileSync(launcher, 'utf8') : spec.command },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         return {
@@ -83,6 +85,7 @@ ${mode === 'refresh-failed' ? 'process.exit(1);' : `fs.writeFileSync(${JSON.stri
       },
       exec: async (command: string, args: string[]) => ({ stdout: '', stderr: '',
         code: command === 'test' && !fs.existsSync(args[1]!) ? 1 : 0 }),
+      writeFile: async (name: string, value: string) => { const dest = path.join(root, name); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, value); },
       writeFileBuffer: async (name: string, value: Buffer) => { const dest = path.join(root, name); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, value); },
       readFile: async (name: string) => fs.readFileSync(path.join(root, name), 'utf8'),
       readFileBuffer: async (name: string) => fs.readFileSync(path.join(root, name)),

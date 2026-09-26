@@ -80,6 +80,16 @@ export class ProviderFailure extends Error {
   }
 }
 
+/** A provider rejected requests from a login it had just proven valid. Neither
+ * a person signing in again nor login rotation can fix that, so it is retried
+ * as infrastructure until the provider recovers, never parked as a dead login. */
+export class ProviderOutage extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'ProviderOutage';
+  }
+}
+
 // A request-level safety decision says nothing about the shared login's health.
 export function isProviderPolicyRejection(value: unknown): boolean {
   const diagnostic = nativeProviderDiagnostic(value);
@@ -225,6 +235,7 @@ function termsNear(tokens: string[], left: Set<string>, right: Set<string>, dist
  * signal, not transport.
  */
 export function isTransportError(error: unknown): boolean {
+  if (error instanceof ProviderOutage) return true;
   if (isProviderPolicyRejection(error)) return false;
   const seen = new Set<unknown>();
   const inspect = (value: unknown): boolean => {
@@ -396,6 +407,7 @@ export function classifyProviderTurnError(
   provider?: ProviderFailureMetadata['provider'],
 ): { classification: LimitClassification; metadata?: ProviderFailureMetadata } {
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) return { classification: { limited: false } };
+  if (err instanceof ProviderOutage) return { classification: { limited: false } };
   if (err instanceof ProviderFailure) {
     const m = err.metadata;
     return {

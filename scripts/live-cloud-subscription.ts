@@ -6,6 +6,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { E2BWorldProvider } from '../src/world/e2b.js';
+import { DaytonaWorldProvider } from '../src/world/daytona.js';
 import { CodexAdapter } from '../src/agent/codex.js';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -13,7 +14,8 @@ import type { PlatformToolContext } from '../src/agent/types.js';
 import type { AgentActivity } from '../src/domain/types.js';
 
 /** Explicit, billable smoke test against an already-configured Karmax instance.
- * Unlike tests/cloud-live.test.ts, this resolves the E2B key from Karmax's vault
+ * Unlike tests/cloud-live.test.ts, this resolves the E2B or Daytona
+ * (`KARMAX_LIVE_WORLD_PROVIDER`) key from Karmax's vault
  * and proves that a subscription Claude or Codex process and browser MCP run in
  * the remote sandbox while Karmax tools traverse the provider control channel. */
 async function main() {
@@ -24,14 +26,23 @@ async function main() {
   if (agentProvider !== 'codex' && agentProvider !== 'claude')
     throw new Error('KARMAX_LIVE_AGENT_PROVIDER must be codex or claude');
   const testBrowser = process.env.KARMAX_LIVE_BROWSER !== '0';
+  // Daytona's lower tiers only reach allowlisted hosts (github.com, npm), not example.com.
+  const browserUrl = new URL(process.env.KARMAX_LIVE_BROWSER_URL ?? 'https://example.com');
+  const worldKind = process.env.KARMAX_LIVE_WORLD_PROVIDER ?? 'e2b';
+  if (worldKind !== 'e2b' && worldKind !== 'daytona')
+    throw new Error('KARMAX_LIVE_WORLD_PROVIDER must be e2b or daytona');
 
-  const store = await Store.create(path.join(home, 'state', 'karmax.db'));
+  const store = await Store.create(process.env.KARMAX_DATABASE_URL ?? path.join(home, 'state', 'karmax.db'));
   const task = await store.getTask(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
   const project = await store.getProject(task.projectId);
   if (!project?.organizationId) throw new Error('task project has no organization');
   const localHome = resolveSubscriptionHome(home, agentProvider);
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-live-${agentProvider}-home-`));
+  // Sandboxes are labelled with a hash of KARMAX_HOME, and a running
+  // installation's lifecycle sweep deletes labelled sandboxes that no task owns,
+  // mid-test. Label this one apart; every path above is already resolved.
+  process.env.KARMAX_HOME = isolatedHome;
   fs.cpSync(localHome, isolatedHome, { recursive: true });
   if (!testBrowser && agentProvider === 'claude') {
     const configFile = path.join(isolatedHome, '.claude.json');
@@ -42,20 +53,22 @@ async function main() {
 
   const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
   const connections = new WorldProviderConnectionService(store, broker);
-  const connection = await connections.get(project.organizationId, 'e2b');
-  if (!connection?.enabled || !connection.credentialConfigured) throw new Error('E2B is not enabled and credentialed for this organization');
-  const worldProvider = new E2BWorldProvider(undefined, undefined, undefined,
-    (organizationId, kind) => connections.resolve(organizationId, kind));
+  const connection = await connections.get(project.organizationId, worldKind);
+  if (!connection?.enabled || !connection.credentialConfigured) throw new Error(`${worldKind} is not enabled and credentialed for this organization`);
+  const resolve = (organizationId: string | undefined, kind: string) => connections.resolve(organizationId, kind);
+  const worldProvider = worldKind === 'e2b' ? new E2BWorldProvider(undefined, undefined, undefined, resolve)
+    : new DaytonaWorldProvider(undefined, undefined, undefined, undefined, resolve);
   const tokens = new TokenAuthority(store);
   const minted = await tokens.mint({ taskId, profileId: 'live-cloud-smoke', principal: 'system:live-cloud-smoke',
     projectId: task.projectId, organizationId: project.organizationId,
     ceiling: ['task:event:read'], grantorCaps: ['task:event:read'], ttlMs: 15 * 60_000 });
   let world: Awaited<ReturnType<E2BWorldProvider['create']>> | undefined;
   try {
-    console.error('[live-cloud] creating E2B sandbox');
-    world = await worldProvider.create({ taskId: `live-e2b-${agentProvider}-subscription-${Date.now()}`,
+    console.error(`[live-cloud] creating ${worldKind} sandbox`);
+    world = await worldProvider.create({ taskId: `live-${worldKind}-${agentProvider}-subscription-${Date.now()}`,
       organizationId: project.organizationId, base: 'main',
-      network: { allowDomains: ['example.com'] } });
+      // Daytona's lower tiers reject custom network rules; hosted tasks run unrestricted.
+      network: worldKind === 'daytona' ? { unrestricted: true } : { allowDomains: [browserUrl.hostname] } });
     const basic = await world.exec('bash', ['-lc', 'node --version && git --version']);
     if (basic.code !== 0) throw new Error(`sandbox toolchain failed: ${basic.stderr || basic.stdout}`);
     await world.writeFile('live-roundtrip.txt', 'round-trip');
@@ -74,7 +87,7 @@ async function main() {
       world,
       messages: [{ id: 'live', role: 'user', ts: Date.now(), text:
         `First call the Karmax list_events tool for taskId ${JSON.stringify(taskId)} with since 0. ` +
-        (testBrowser ? 'Then use the chrome-devtools MCP to open https://example.com and take a screenshot. ' : '') +
+        (testBrowser ? `Then use the chrome-devtools MCP to open ${browserUrl.href} and take a screenshot. ` : '') +
         `After ${testBrowser ? 'both tools' : 'the tool'} succeeds, reply with exactly READY and do not modify files.` }],
       systemPrompt: 'You are a live integration test. Follow the user request exactly and keep the final response terse.',
       role: 'do', resolvedAuth: { configHome: isolatedHome }, extraEnv: { KARMAX_TOKEN: minted.token },
@@ -116,7 +129,7 @@ async function main() {
       activity.kind === 'tool' && activity.phase === 'completed' && /list_events/i.test(activity.title))) {
       throw new Error(`resumed remote session lost its Karmax platform tools: ${JSON.stringify(resumedActivities)}`);
     }
-    console.log(JSON.stringify({ ok: true, worldProvider: 'e2b', agentProvider, template: connection.config.template,
+    console.log(JSON.stringify({ ok: true, worldProvider: worldKind, agentProvider, template: connection.config.template,
       sandboxToolchain: true, fileRoundTrip: true, subscriptionAgent: true,
       platformTools: true, resumedPlatformTools: true, browserMcp: testBrowser ? 'chrome-devtools' : false, session: true }));
   } catch (error) {

@@ -393,6 +393,8 @@ p.task-sub { display: block; line-height: 1.55; }
 p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
+.provider-note { font-size: 12px; margin: 6px 0; padding: 6px 9px; border-radius: var(--r-sm); color: var(--ink); background: var(--working-weak); border-left: 3px solid var(--working); }
+.provider-note a { color: inherit; text-decoration: underline; }
 .task-right { display: flex; align-items: center; gap: 12px; }
 
 /* ── real-link rows ─────────────────────────────────────────────
