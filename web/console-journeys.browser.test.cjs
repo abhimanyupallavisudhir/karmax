@@ -44,10 +44,10 @@ const { chromium } = require('playwright');
           tags.push(tag); data = tag;
         } else data = tags;
       }
-      else if (p === '/api/projects/p/search') {
+      else if (p === '/api/projects/p/search' || p === '/api/search') {
         if (searchDelay) await new Promise(resolve => setTimeout(resolve, searchDelay));
         if (failSearch) return route.fulfill({ status: 503, json: { error: 'Search temporarily unavailable' } });
-        data = { tasks: [task], total: 1 };
+        data = p === '/api/search' ? [{ projectId: 'p', tasks: [task], total: 1 }] : { tasks: [task], total: 1 };
       }
       else if (p === '/api/tasks/t') data = { taskId: 't', projectId: 'p', title: task.title, workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {} };
       else if (p.endsWith('/sessions')) data = {};
@@ -77,6 +77,12 @@ const { chromium } = require('playwright');
     await page.getByRole('button', { name: /Search everything/ }).click();
     searchDelay = 150;
     await page.locator('#gs-in').fill('Review');
+    await page.locator('.global-search-result').waitFor();
+    failSearch = true;
+    await page.locator('#gs-in').fill('offline');
+    await page.locator('#gs-list button').waitFor();
+    failSearch = false;
+    await page.locator('#gs-list button').click();
     await page.locator('.global-search-result').waitFor();
     await page.locator('#gs-close').click();
     await page.locator('[data-id="t"] .row-link').click();

@@ -18487,7 +18487,7 @@ function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
     })),
   );
   allTasks.sort((a, b) => b.score - a.score || (b.task.createdAt || 0) - (a.task.createdAt || 0));
-  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: allTasks.length };
+  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: (responses || []).reduce((total, row) => total + (row.result?.total ?? row.result?.tasks?.length ?? 0), 0) };
 }
 
 function openGlobalSearch() {
@@ -18517,6 +18517,12 @@ function openGlobalSearch() {
     if (state === 'prompt') {
       input.removeAttribute('aria-activedescendant');
       list.innerHTML = `<div class="global-search-empty"><b>Find work anywhere</b><span>Enter words, a task number, or a task filter. Results include archived work.</span></div>`;
+      return;
+    }
+    if (state === 'error') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = '<div class="global-search-empty">Search unavailable. <button class="btn sm">Retry</button></div>';
+      list.querySelector('button').onclick = search;
       return;
     }
     if (state === 'loading') {
@@ -18554,12 +18560,14 @@ function openGlobalSearch() {
     controller = new AbortController();
     state = 'loading';
     draw();
-    const responses = (await Promise.all(S.projects.map(async (project) => {
-      try {
-        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
-        return { project, result };
-      } catch { return null; } // project discovery and task-read grants can differ
-    }))).filter(Boolean);
+    let responses;
+    try {
+      const results = await api(`/api/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
+      responses = results.map(result => ({ project: projectById(result.projectId), result })).filter(row => row.project);
+    } catch (error) {
+      if (ownRequest !== request || !root.contains(input) || error.name === 'AbortError') return;
+      state = 'error'; draw(); return;
+    }
     if (ownRequest !== request || !root.contains(input)) return;
     const found = assembleGlobalSearchResults(q, S.projects, responses);
     items = [
