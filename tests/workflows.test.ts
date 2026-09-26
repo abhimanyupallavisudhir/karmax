@@ -31,6 +31,33 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await h?.stop();
   });
 
+  it('rotates busy coordinators without dropping their queues or held leases', async () => {
+    const cases = [
+      { type: 'accountCoordinator', query: 'accounts', input: { state: {
+        accounts: [{ id: 'login', provider: 'mock', configHome: '/fixture', status: 'available', maxConcurrent: 1, inUse: 1 }],
+        queue: [{ taskId: 'waiting', turnId: 'wait', allowed: ['login'] }],
+        granted: [{ taskId: 'holder', turnId: 'held', accountId: 'login', grantedAt: Date.now() }], processed: 1000,
+      } } },
+      { type: 'mergeQueue', query: 'queue', input: { domain: 'fixture', state: {
+        domain: 'fixture', current: 'holder', queue: ['waiting'], processed: 500,
+      } } },
+    ];
+    for (const item of cases) {
+      const handle = await h.client.workflow.start(item.type, { taskQueue: TASK_QUEUE,
+        workflowId: newId('rotation'), args: [item.input] });
+      try {
+        await expect.poll(async () => (await handle.describe()).runId, { timeout: 10_000 })
+          .not.toBe(handle.firstExecutionRunId);
+        const current = await handle.query<any>(item.query);
+        if (item.type === 'accountCoordinator') {
+          expect(current.waiting).toBe(1);
+          expect(current.accounts[0].inUse).toBe(1);
+          expect(await handle.query('accountTaskLeases', 'holder')).toEqual(['held']);
+        } else expect(current).toMatchObject({ current: 'holder', queue: ['waiting'] });
+      } finally { await handle.terminate(); }
+    }
+  });
+
   it('software-dev: cancelling Setup aborts provider provisioning and settles promptly', async () => {
     const project = (await h.store.createProject('Blocked setup', { worldProvider: 'blocked-setup' as any }));
     const task = (await h.store.createTask({ projectId: project.id, title: 'Cancel setup', workflow: 'software-dev',
@@ -864,3 +891,14 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.terminate('test done');
   });
 });
+
+it('replays task histories recorded before the September workflow review fixes', async () => {
+  const { Worker, bundleWorkflowCode } = await import('@temporalio/worker');
+  const { temporal } = await import('@temporalio/proto');
+  const { fileURLToPath } = await import('node:url');
+  const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
+  for (const name of ['justDo', 'mergeOnly']) {
+    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/review-legacy-${name}.json`, import.meta.url), 'utf8')));
+    await Worker.runReplayHistory({ workflowBundle }, history);
+  }
+}, 60_000);

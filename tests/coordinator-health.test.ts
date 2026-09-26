@@ -272,3 +272,15 @@ describe('WF-13: lease-holder liveness', () => {
     expect(await activities(async () => ({ status: { name: 'RUNNING' } })).isTaskAlive('task')).toBe(true);
   });
 });
+
+it('replays coordinator histories recorded before the history-policy migration', async () => {
+  const { Worker, bundleWorkflowCode } = await import('@temporalio/worker');
+  const { temporal } = await import('@temporalio/proto');
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
+  for (const name of ['accountCoordinator', 'mergeQueue']) {
+    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/review-legacy-${name}.json`, import.meta.url), 'utf8')));
+    await Worker.runReplayHistory({ workflowBundle }, history);
+  }
+}, 60_000);
