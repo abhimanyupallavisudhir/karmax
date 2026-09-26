@@ -580,7 +580,7 @@ export class CodexAdapter implements AgentAdapter {
 
     let policyFailure: ProviderPolicyFailure | undefined;
     const noteLimit = (native: unknown, operation = 'app-server notification') => {
-      if (isProviderPolicyRejection(native)) {
+      if (isProviderPolicyRejection(native, { providerOrigin: true })) {
         policyFailure ??= new ProviderPolicyFailure(native, 'codex', { model, operation });
         return;
       }
@@ -686,7 +686,7 @@ export class CodexAdapter implements AgentAdapter {
           // same top-level `error` channel as model failures. It can continue the
           // model turn without that MCP, so leave the already-emitted MCP status
           // visible and wait for the real turn terminal event.
-          if (!isProviderPolicyRejection(params) && isOptionalAppsMcpError(blob)) break;
+          if (!isProviderPolicyRejection(params, { providerOrigin: true }) && isOptionalAppsMcpError(blob)) break;
           // `willRetry=true` is an intermediate Responses-stream notification,
           // not the terminal result of the turn. Current Codex uses messages such
           // as "Reconnecting... 2/5" with `codexErrorInfo=unauthorized`; treating

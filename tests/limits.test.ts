@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ProviderFailure,
+  isProviderPolicyRejection,
   classifyProviderTurnError,
   classifyLimitError,
   isTransportError,
@@ -13,6 +14,12 @@ import {
 } from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
+  it('does not turn unrelated build output into a provider safety rejection', () => {
+    expect(isProviderPolicyRejection(new Error('tests/content_policy_violation.test.ts failed'))).toBe(false);
+    expect(isProviderPolicyRejection(new Error('fixture says blocked by our safety systems'))).toBe(false);
+    expect(isProviderPolicyRejection({ error: { code: 'content_policy_violation' } })).toBe(true);
+    expect(isProviderPolicyRejection({ code: 'test_content_policy_violation_fixture' })).toBe(false);
+  });
   it('keeps safety blocks task-local even when the envelope says unauthorized', () => {
     const message = 'misalignmentPolicyViolation HTTP 401 unauthorized: This request was blocked by our safety systems. Reason: Potentially unintended activity.';
     expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });
