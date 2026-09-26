@@ -7515,7 +7515,7 @@ function parseJsonOptional<T>(value: unknown): T | undefined {
 }
 
 export function slugify(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
+  return value.trim().normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
 }
 
 async function uniqueSlug(value: string, used: (candidate: string) => boolean | Promise<boolean>): Promise<string> {

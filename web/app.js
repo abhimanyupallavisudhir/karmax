@@ -284,7 +284,7 @@ function taskRecord(id) {
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
-  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+  return String(s || '').normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
