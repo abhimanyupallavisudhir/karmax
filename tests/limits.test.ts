@@ -233,6 +233,10 @@ describe('resetAtFromHint', () => {
 });
 
 describe('isTransportError', () => {
+  it.each(['500-iteration loop failed', 'expected 503 rows', 'request id 529'])('does not treat arbitrary numbers as HTTP failures: %s', (message) => {
+    expect(isTransportError(message)).toBe(false);
+  });
+
   it('recognizes the suspend/stream failures seen in production', () => {
     expect(isTransportError('Claude Code returned an error result: API Error: Connection closed mid-response. The response above may be incomplete.')).toBe(true);
     expect(isTransportError('fetch failed')).toBe(true);

@@ -282,7 +282,7 @@ export function isTransportError(error: unknown): boolean {
       // Short-lived host process-table / descriptor pressure. Disk-full and
       // permission errors are intentionally absent: those need intervention.
       /\b(?:eagain|emfile|enfile)\b/.test(lc) ||
-      /\b(?:408|50[0234]|529)\b/.test(lc)
+      /\b(?:http(?:\/\d(?:\.\d)?)?|(?:unexpected\s+)?status(?:\s+code)?|api(?:\s+error)?)\s*[:=]?\s*(?:408|50[0234]|529)\b/.test(lc)
     );
   };
   return inspect(error);
