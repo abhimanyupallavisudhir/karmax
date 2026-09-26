@@ -12949,9 +12949,11 @@ async function hydrateAvatarAvailability(scope, id) {
 }
 
 async function hydrateProjectSecrets(proj) {
-  const box = $('#project-secrets-box'); if (!box) return;
+  const box = $('#project-secrets-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    if (!renderIsCurrent()) return;
     box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
@@ -12963,35 +12965,36 @@ async function hydrateProjectSecrets(proj) {
       </details>
       <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      $('#project-secret-add').open = true; $('#project-secret-name').value = button.dataset.name; $('#project-secret-value').focus();
+      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name; box.querySelector('#project-secret-value').focus();
     }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Remove this secret and its vault value?')) return;
       try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    $('#project-secret-save')?.addEventListener('click', async () => {
-      const name = $('#project-secret-name').value.trim(), value = $('#project-secret-value').value;
+    box.querySelector('#project-secret-save')?.addEventListener('click', async () => {
+      const name = box.querySelector('#project-secret-name').value.trim(), value = box.querySelector('#project-secret-value').value;
       if (!name || !value) return toast('Name and value are required', true);
       try {
         await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name, value,
-          file: $('#project-secret-file').value.trim() || undefined }) });
+          file: box.querySelector('#project-secret-file').value.trim() || undefined }) });
         toast(`Saved ${name}`); await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-    $('#project-secret-import')?.addEventListener('click', async () => {
+    box.querySelector('#project-secret-import')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST',
-          body: JSON.stringify({ env: $('#project-secret-env').value }) });
+          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value }) });
         toast(`Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}`);
         await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectSecrets(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectSecrets(proj)); }
 }
 
 async function hydrateProjectData(proj) {
-  const box = $('#project-data-box'); if (!box) return;
+  const box = $('#project-data-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [all, storageLocations] = await Promise.all([
       api(`/api/projects/${encodeURIComponent(proj.id)}/resources`),
@@ -13001,6 +13004,7 @@ async function hydrateProjectData(proj) {
     const readyStorage = storageLocations.filter((location) => location.status === 'ready');
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when ${siteNameMarkup()} should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
@@ -13034,52 +13038,54 @@ async function hydrateProjectData(proj) {
         } catch (error) { toast(error.message, true); }
       });
     });
-    $('#data-discover')?.addEventListener('click', async () => {
+    box.querySelector('#data-discover')?.addEventListener('click', async () => {
       try {
-        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
+        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = box.querySelector('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
           || `<div class="project-empty">Nothing looks like project data. ${siteNameMarkup()} checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>`;
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
-          $('#data-add-panel').open = true;
-          $('#data-name').value = proposal.path.split('/').pop() || 'Data';
-          $('#data-path').value = proposal.suggested.target.path;
-          $('#data-access').value = proposal.suggested.access;
-          $('#data-publish').value = proposal.suggested.publish;
-          if ($('#data-source')) $('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          box.querySelector('#data-add-panel').open = true;
+          box.querySelector('#data-name').value = proposal.path.split('/').pop() || 'Data';
+          box.querySelector('#data-path').value = proposal.suggested.target.path;
+          box.querySelector('#data-access').value = proposal.suggested.access;
+          box.querySelector('#data-publish').value = proposal.suggested.publish;
+          if (box.querySelector('#data-source')) box.querySelector('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
+          box.querySelector('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#data-add')?.addEventListener('click', async () => {
-      const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
-      const files = [...$('#data-files').files, ...$('#data-folder').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
-      const button = $('#data-add'); button.disabled = true;
+    box.querySelector('#data-add')?.addEventListener('click', async () => {
+      const name = box.querySelector('#data-name').value.trim(); if (!name) return toast('Name is required', true);
+      const files = [...box.querySelector('#data-files').files, ...box.querySelector('#data-folder').files];
+      if (box.querySelector('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
+      const button = box.querySelector('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
-          name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
-          access: $('#data-access').value, isolation: 'fork', publish: $('#data-publish').value,
-          storageLocationId: $('#data-storage')?.value || undefined,
-          sourcePath: $('#data-source')?.value.trim() || undefined,
+          name, driver: 'volume@1', target: { kind: 'path', path: box.querySelector('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
+          access: box.querySelector('#data-access').value, isolation: 'fork', publish: box.querySelector('#data-publish').value,
+          storageLocationId: box.querySelector('#data-storage')?.value || undefined,
+          sourcePath: box.querySelector('#data-source')?.value.trim() || undefined,
         }) });
         if (files.length) await uploadResourceFiles(proj.id, created.id, files,
           (done, total) => { button.textContent = `Uploading ${Math.round(done / total * 100)}%`; });
         toast('Data resource added'); await hydrateProjectData(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add data'; }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectData(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectData(proj)); }
 }
 
 async function hydrateProjectServices(proj) {
-  const box = $('#project-services-box'); if (!box) return;
+  const box = $('#project-services-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [{ services }, resources] = await Promise.all([
       api(`/api/projects/${proj.id}/services`), api(`/api/projects/${proj.id}/resources`),
     ]);
     const secrets = resources.filter((resource) => ['secret@1', 'database@1', 'service@1'].includes(resource.driver));
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">↗</span><div><b>A service stays live.</b> Use an external service for an API, hosted database, or S3 bucket tasks call directly. Use a per-task container for an isolated development dependency such as Postgres or Redis. Credentials belong in Secrets.</div></div>
       ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
       <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
@@ -13102,9 +13108,9 @@ async function hydrateProjectServices(proj) {
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
       </details>`;
     const syncServiceFields = () => box.querySelectorAll('[data-service-kind]').forEach((fields) => {
-      fields.hidden = fields.dataset.serviceKind !== $('#service-kind').value;
+      fields.hidden = fields.dataset.serviceKind !== box.querySelector('#service-kind').value;
     });
-    $('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
+    box.querySelector('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
     box.querySelectorAll('.service-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm(`Remove ${button.dataset.name}?`)) return;
       try {
@@ -13112,9 +13118,9 @@ async function hydrateProjectServices(proj) {
         await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     }));
-    $('#service-discover')?.addEventListener('click', async () => {
+    box.querySelector('#service-discover')?.addEventListener('click', async () => {
       try {
-        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = $('#service-proposals');
+        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = box.querySelector('#service-proposals');
         target.innerHTML = proposals.map((service, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(service.name)}</b> <span class="chip">${esc(service.image)}</span>${service.urlEnv ? ` <span class="chip">${esc(service.urlEnv)}</span>` : ''}</div><button class="btn sm primary service-accept">Add</button></div>`).join('')
           || '<p class="task-sub">No importable Compose services found.</p>';
         target.querySelectorAll('.service-accept').forEach((button) => button.addEventListener('click', async () => {
@@ -13124,32 +13130,34 @@ async function hydrateProjectServices(proj) {
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#service-save')?.addEventListener('click', async () => {
-      const kind = $('#service-kind').value;
-      const name = $('#service-name').value.trim();
+    box.querySelector('#service-save')?.addEventListener('click', async () => {
+      const kind = box.querySelector('#service-kind').value;
+      const name = box.querySelector('#service-name').value.trim();
       if (!name) return toast('Service name is required', true);
-      if (kind === 'external' && !$('#service-connection').value) return toast('Choose a connection secret first', true);
+      if (kind === 'external' && !box.querySelector('#service-connection').value) return toast('Choose a connection secret first', true);
       try {
         await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify({
           name, kind,
-          ...(kind === 'external' ? { connectionResourceId: $('#service-connection').value } : {
-            image: $('#service-image').value.trim(), containerPort: Number($('#service-port').value) || undefined,
-            urlEnv: $('#service-url-env').value.trim() || undefined,
-            urlTemplate: $('#service-url-template').value.trim() || undefined,
-            seedResourceId: $('#service-seed').value || undefined,
-            seedContainerPath: $('#service-seed-path').value.trim() || undefined,
+          ...(kind === 'external' ? { connectionResourceId: box.querySelector('#service-connection').value } : {
+            image: box.querySelector('#service-image').value.trim(), containerPort: Number(box.querySelector('#service-port').value) || undefined,
+            urlEnv: box.querySelector('#service-url-env').value.trim() || undefined,
+            urlTemplate: box.querySelector('#service-url-template').value.trim() || undefined,
+            seedResourceId: box.querySelector('#service-seed').value || undefined,
+            seedContainerPath: box.querySelector('#service-seed-path').value.trim() || undefined,
           }),
         }) }); toast('Service saved'); await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectServices(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectServices(proj)); }
 }
 
 async function hydrateProjectEnvironment(proj) {
-  const box = $('#project-environment-box'); if (!box) return;
+  const box = $('#project-environment-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
@@ -13187,34 +13195,34 @@ async function hydrateProjectEnvironment(proj) {
         await hydrateProjectEnvironment(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
-    $('#environment-propose')?.addEventListener('click', async () => {
+    box.querySelector('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
-        if (proposal.spec.image) $('#environment-image').value = proposal.spec.image;
-        if (proposal.spec.setup?.length) $('#environment-setup').value = proposal.spec.setup.join('\n');
-        if (proposal.spec.includeDocker) $('#environment-docker').checked = true;
-        $('#environment-evidence').innerHTML = proposal.evidence.length
+        if (proposal.spec.image) box.querySelector('#environment-image').value = proposal.spec.image;
+        if (proposal.spec.setup?.length) box.querySelector('#environment-setup').value = proposal.spec.setup.join('\n');
+        if (proposal.spec.includeDocker) box.querySelector('#environment-docker').checked = true;
+        box.querySelector('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
           : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
       } catch (error) { toast(error.message, true); }
     });
-    $('#environment-save')?.addEventListener('click', async () => {
+    box.querySelector('#environment-save')?.addEventListener('click', async () => {
       try {
         await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
-          image: $('#environment-image').value.trim() || undefined,
-          setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
-          boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
-          includeDocker: $('#environment-docker').checked,
+          image: box.querySelector('#environment-image').value.trim() || undefined,
+          setup: box.querySelector('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          boot: box.querySelector('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          includeDocker: box.querySelector('#environment-docker').checked,
         }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
       } catch (error) { toast(error.message, true); }
     });
-    $('#environment-build')?.addEventListener('click', async () => {
+    box.querySelector('#environment-build')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/environment/build`, { method: 'POST', body: '{}' });
         toast(`Building for ${result.building.provider}…`); setTimeout(() => hydrateProjectEnvironment(proj), 1500);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectEnvironment(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectEnvironment(proj)); }
 }
 
 async function hydrateProjectResources(proj) {
