@@ -3,6 +3,20 @@ import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandbo
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('evicts destroyed sandboxes and lifecycle cache entries (WD-3, PS-10)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    let opens = 0;
+    const provider = new E2BWorldProvider({ create: async () => sandbox,
+      connect: async () => { opens++; throw new Error('deleted'); },
+      get: async () => { opens++; throw new Error('deleted'); } } as any);
+    const world = await provider.create({ taskId: 'cache', base: 'main' });
+    await world.destroy();
+    expect((provider as any).sandboxes.size).toBe(0);
+    expect((provider as any).states.size).toBe(0);
+    await expect(provider.open(world.handle)).rejects.toThrow('deleted');
+    expect(opens).toBe(1);
+  });
+
   it.each([
     [Object.assign(new Error('getaddrinfo ENOTFOUND api.provider'), { code: 'ENOTFOUND' }), undefined],
     [new Error('upstream returned 404 while resolving proxy'), undefined],

@@ -72,6 +72,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   private sandboxes = new Map<string, DaytonaSandboxLike>();
   private states = new Map<string, WorldLifecycleState>();
   private refKey: Buffer;
+  private destroyed = new WeakSet<WorldHandle>();
 
   private factories = new Map<string, DaytonaFactory>();
 
@@ -167,10 +168,14 @@ export class DaytonaWorldProvider implements WorldProvider {
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
         ...([...provisioned.warnings, ...resourceWarnings].length ? { warnings: [...provisioned.warnings, ...resourceWarnings] } : {}),
       };
-      return new DaytonaWorld(handle, sandbox, this.idleMs);
+      return new DaytonaWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.id);
+        this.states.delete(sandbox.id);
+        this.destroyed.add(handle);
+      });
     } catch (error) {
       await sandbox.delete(60).catch(() => undefined);
-      this.states.set(sandbox.id, 'missing');
+      this.states.delete(sandbox.id);
       this.sandboxes.delete(sandbox.id);
       throw error;
     }
@@ -188,7 +193,11 @@ export class DaytonaWorldProvider implements WorldProvider {
     }
     this.sandboxes.set(id, sandbox);
     this.states.set(id, 'ready');
-    return new DaytonaWorld(handle, sandbox, this.idleMs);
+    return new DaytonaWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.id);
+        this.states.delete(sandbox.id);
+        this.destroyed.add(handle);
+      });
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -208,6 +217,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   }
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
+    if (this.destroyed.has(handle)) return 'missing';
     return this.states.get(this.sandboxId(handle)) ?? 'ready';
   }
 
@@ -245,7 +255,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       destroy: async () => {
         await deleteSandbox(sandbox);
         this.sandboxes.delete(sandbox.id);
-        this.states.set(sandbox.id, 'missing');
+        this.states.delete(sandbox.id);
       },
     }));
   }
@@ -302,7 +312,7 @@ export class DaytonaWorldProvider implements WorldProvider {
 }
 
 class DaytonaWorld implements World {
-  constructor(public handle: WorldHandle, private sandbox: DaytonaSandboxLike, private idleMs = DEFAULT_IDLE_MS) {}
+  constructor(public handle: WorldHandle, private sandbox: DaytonaSandboxLike, private idleMs = DEFAULT_IDLE_MS, private onDestroy: () => void) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const line = [cmd, ...args].map(quote).join(' ');
@@ -505,7 +515,7 @@ class DaytonaWorld implements World {
     return addCheckoutViaExec(this, spec);
   }
 
-  async destroy(): Promise<void> { await deleteSandbox(this.sandbox); }
+  async destroy(): Promise<void> { await deleteSandbox(this.sandbox); this.onDestroy(); }
 
   /** Open processes need control-plane activity even when producing no output. */
   private async keepAlive(): Promise<() => void> {

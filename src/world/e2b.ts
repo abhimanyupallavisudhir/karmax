@@ -117,6 +117,7 @@ export class E2BWorldProvider implements WorldProvider {
   private sandboxes = new Map<string, E2BSandboxLike>();
   private states = new Map<string, WorldLifecycleState>();
   private refKey: Buffer;
+  private destroyed = new WeakSet<WorldHandle>();
 
   constructor(
     private factory: E2BFactory = defaultE2BFactory(),
@@ -232,11 +233,15 @@ export class E2BWorldProvider implements WorldProvider {
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
         ...(warnings.length ? { warnings } : {}),
       };
-      return new E2BWorld(handle, sandbox, this.idleMs);
+      return new E2BWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.sandboxId);
+        this.states.delete(sandbox.sandboxId);
+        this.destroyed.add(handle);
+      });
     } catch (error) {
       await sandbox.kill().catch(() => undefined);
       this.sandboxes.delete(sandbox.sandboxId);
-      this.states.set(sandbox.sandboxId, 'missing');
+      this.states.delete(sandbox.sandboxId);
       throw error;
     }
   }
@@ -254,7 +259,11 @@ export class E2BWorldProvider implements WorldProvider {
       this.sandboxes.set(sandboxId, sandbox);
     }
     this.states.set(sandboxId, 'ready');
-    return new E2BWorld(handle, sandbox, this.idleMs);
+    return new E2BWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.sandboxId);
+        this.states.delete(sandbox.sandboxId);
+        this.destroyed.add(handle);
+      });
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -273,6 +282,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
+    if (this.destroyed.has(handle)) return 'missing';
     const id = this.sandboxIdOf(handle);
     if (this.states.has(id)) return this.states.get(id)!;
     return 'ready'; // after a process restart the durable provider is authoritative on connect
@@ -315,7 +325,7 @@ export class E2BWorldProvider implements WorldProvider {
         if (this.factory.kill) await this.factory.kill(sandbox.sandboxId, apiKey);
         else await (await this.factory.connect(sandbox.sandboxId, { timeoutMs: this.idleMs, ...apiKey })).kill();
         this.sandboxes.delete(sandbox.sandboxId);
-        this.states.set(sandbox.sandboxId, 'missing');
+        this.states.delete(sandbox.sandboxId);
       },
     }));
   }
@@ -426,7 +436,7 @@ export class E2BWorldProvider implements WorldProvider {
 }
 
 class E2BWorld implements World {
-  constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number) {}
+  constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number, private onDestroy: () => void) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const line = [cmd, ...args].map(shellQuote).join(' ');
@@ -626,6 +636,7 @@ class E2BWorld implements World {
 
   async destroy(): Promise<void> {
     await this.sandbox.kill();
+    this.onDestroy();
   }
 
   /** E2B pauses a sandbox when its plan's continuous-runtime cap expires (one
