@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
-import { historyFromJSON, historyToJSON } from '@temporalio/common/lib/proto-utils';
+import { historyFromJSON, historyToJSON } from '@temporalio/common/lib/proto-utils.js';
 import type { Store } from '../store/db.js';
 
 /** Snapshot only this tenant's task histories; shared coordinators require the
