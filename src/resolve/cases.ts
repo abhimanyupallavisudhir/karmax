@@ -60,7 +60,7 @@ export function autoResolve(stage: string, error: string, rules?: ResolveRuleDec
     // Declared rules run on the shared worker thread. Keep a conservative
     // grammar and bounded input; complex patterns fall through to Resolve.
     if (r.match.length > 512 || !isSafeSearchPattern(r.match)
-      || /[{}]/.test(r.match) || (r.match.match(/[*+?]/g)?.length ?? 0) > 1) continue;
+      || /[(){}]/.test(r.match) || (r.match.match(/[*+?]/g)?.length ?? 0) > 1) continue;
     try {
       if (new RegExp(r.match, r.flags ?? 'i').test(error.slice(0, 2048))) return { resolved: true, action: r.action, note: r.note ?? r.name };
     } catch {
