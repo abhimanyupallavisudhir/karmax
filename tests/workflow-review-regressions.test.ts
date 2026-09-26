@@ -131,3 +131,37 @@ it('WF-22: software-dev returns an account granted concurrently with cancellatio
   expect(wf.activities.runAgentTurn).not.toHaveBeenCalled();
   expect(wf.activities.returnAccount).toHaveBeenCalledWith('login', { taskId: 'task', turnId: expect.any(String) });
 });
+
+it('WF-12: a human gate after an agent layer publishes a waiting state', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.runAgentTurn.mockImplementation(async ({ role }: any) => role === 'confirm'
+    ? { confirmDecision: { action: 'confirm' } } : { openPrRequested: true, completed: true });
+  let humanGate = false;
+  wf.activities.publishView.mockImplementation(async (_id, view) => {
+    if (view.stage === 'review' && view.waitingFor?.kind === 'human') {
+      humanGate = true;
+      expect(view.status).toBe('waiting');
+      wf.handlers.get('cancel')!();
+    }
+  });
+  wf.wait = () => wf.handlers.get('cancel')!();
+  expect(await softwareDevV1_26({ ...input, confirm: { layers: [{ kind: 'agent' }, { kind: 'human' }] } })).toEqual({ stage: 'cancelled' });
+  expect(humanGate).toBe(true);
+});
+
+it.each([['just-do', justDoV1_7], ['merge-only', mergeOnlyV1_7]] as const)(
+  'WF-12: %s restores waiting after agent confirmation', async (_name, workflow) => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.runAgentTurn.mockResolvedValue({ confirmDecision: { action: 'confirm' } });
+    let humanGate = false;
+    wf.activities.publishView.mockImplementation(async (_id, view) => {
+      if (view.waitingFor?.kind === 'human') {
+        humanGate = true;
+        expect(view.status).toBe('waiting');
+        wf.handlers.get('cancel')!();
+      }
+    });
+    wf.wait = () => wf.handlers.get('cancel')!();
+    await workflow({ ...input, branch: 'b', confirm: { layers: [{ kind: 'agent' }, { kind: 'human' }] } });
+    expect(humanGate).toBe(true);
+  });

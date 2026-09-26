@@ -391,6 +391,7 @@ async function justDoImpl(
         // no verdict → degrade this layer to the human gate below
       }
       // A human layer: one Confirm click passes ONE layer; a follow-up → back to Do.
+      if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
       waitingFor = { kind: 'human', audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);

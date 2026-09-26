@@ -1187,6 +1187,7 @@ async function softwareDevImpl(
             return 'do';
           }
         }
+        if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = {
           kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
