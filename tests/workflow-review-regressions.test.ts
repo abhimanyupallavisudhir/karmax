@@ -5,6 +5,7 @@ const wf = vi.hoisted(() => ({
   activities: {} as Record<string, any>,
   wait: undefined as undefined | (() => void),
   patches: true,
+  timeout: undefined as unknown,
   childSignal: vi.fn(async () => undefined),
 }));
 vi.mock('@temporalio/workflow', async (importOriginal) => ({
@@ -18,7 +19,8 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
   patched: () => wf.patches,
   isCancellation: () => false,
   log: { warn: vi.fn() },
-  condition: async (predicate: () => boolean) => {
+  condition: async (predicate: () => boolean, timeout?: unknown) => {
+    wf.timeout = timeout;
     if (!predicate()) wf.wait?.();
     if (!predicate()) throw new Error('test: unexpected wait');
     return true;
@@ -215,3 +217,18 @@ it('WF-8: a replacement parent restores its child barrier and pending questions'
   expect(restored).toBe(true);
   expect(wf.handlers.has('childSettled')).toBe(true);
 });
+
+it.each([['just-do', justDoV1_7], ['software-dev', softwareDevV1_26]] as const)(
+  'WF-3: %s waits for the durable connection notification without polling', async (_name, workflow) => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.pendingServiceConnections = vi.fn(async () => 1);
+    let waited = false;
+    wf.wait = () => {
+      expect(wf.handlers.get('view')!().waitingFor.detail).toContain('Connect the requested app');
+      expect(wf.timeout).toBeUndefined();
+      waited = true;
+      wf.handlers.get('cancel')!();
+    };
+    await workflow(input);
+    expect(waited).toBe(true);
+  });

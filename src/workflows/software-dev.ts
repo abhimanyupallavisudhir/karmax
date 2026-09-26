@@ -2806,7 +2806,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        else await condition(() => cancelled || msgs.length > seen, '30 seconds');
       }
       if (cancelled) return await abort();
       if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
