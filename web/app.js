@@ -3335,15 +3335,15 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
-        refreshTask();
+        refreshTask(ev.type);
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
-        refreshTask();
+        refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
-      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask();
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask(ev.type);
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
@@ -6861,29 +6861,40 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (S.taskTab === 'parameters') renderTaskPage();
   });
 }
-async function refreshTask() {
+async function refreshTask(reason = 'all') {
   if (!S.selected) return;
   // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
   if (taskRecord(S.selected)?.params?.repeatable) return;
+  const id = S.selected;
+  const pending = refreshTask.pending ||= new Map();
+  const existing = pending.get(id);
+  if (existing) { existing.reasons.add(reason); return existing.promise; }
+  const entry = { reasons: new Set([reason]) };
+  pending.set(id, entry);
+  entry.promise = (async () => {
+    do {
+      const reasons = new Set(entry.reasons);
+      entry.reasons.clear();
+      const full = reasons.has('all');
+      const has = (pattern) => full || [...reasons].some(value => pattern.test(value));
   try {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
-    const id = S.selected;
     const epoch = S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
-      api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
-      api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions),
-      api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
-      api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
-      api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
-      api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests),
-      api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
-      api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []),
+      has(/review|stage|turn.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
+      has(/session|turn.result|stage/) ? api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions) : S.sessions,
+      has(/attempt|turn.result|merge.result/) ? api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup) : S.attemptGroup,
+      has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
+      has(/permission\.approval/) ? api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests) : S.permissionRequests,
+      has(/authorization\.approval/) ? api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests) : S.authorizationRequests,
+      has(/credential\.approval/) ? api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems) : S.approvalItems,
+      has(/^connection\./) ? api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []) : S.connections,
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -6906,7 +6917,11 @@ async function refreshTask() {
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
     // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
   } catch {}
-  renderTaskPage();
+  if (S.selected === id) renderTaskPage();
+    } while (entry.reasons.size && S.selected === id);
+  })();
+  try { await entry.promise; }
+  finally { if (pending.get(id) === entry) pending.delete(id); }
 }
 // Close the task page by navigating back to the underlying list/queue; applyRoute()
 // then repaints the list. Kept as a navigation so the URL + history stay in sync
