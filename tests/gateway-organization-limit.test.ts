@@ -12,7 +12,7 @@ it('atomically caps organizations per owner before provisioning hosted storage (
       method: 'POST', headers: { authorization: 'Bearer browser-session', 'content-type': 'application/json' },
       body: JSON.stringify({ name: `Another ${n}` }),
     })));
-    expect(responses.map(r => r.status).sort(), await Promise.all(responses.map(r => r.text()))).toEqual([200, 429]);
+    expect(responses.map(r => r.status).sort(), JSON.stringify(await Promise.all(responses.map(r => r.text())))).toEqual([200, 429]);
     expect(await h.store.listOrganizations('limited-user')).toHaveLength(10);
     expect(provisions).toBe(1);
   } finally { await h.close(); }

@@ -13,4 +13,3 @@ it('rejects malformed settings JSON without overwriting stored settings (GW-5)',
     expect(await h.store.getSettings('global', 'test-settings')).toEqual({ siteName: 'Keep me' });
   } finally { await h.close(); }
 });
-

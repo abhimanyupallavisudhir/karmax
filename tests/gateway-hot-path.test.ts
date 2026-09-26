@@ -5,7 +5,7 @@ it('routes activity in a batch without hydrating task conversations (GW-6)', asy
   const h = await stubGateway();
   try {
     const project = await h.store.createProject('Activity Feed');
-    const task = await h.store.createTask({ projectId: project.id, title: 'History', workflow: 'just-do', workflowVersion: '1', params: {} });
+    const task = await h.store.createTask({ projectId: project.id, title: 'History', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
     for (let n = 0; n < 20; n++) await h.store.appendEvent({ taskId: task.id, type: 'fixture', ts: Date.now(), payload: {} });
     const token = (await h.tokens.mintPrincipal('user:test', ['*'], project.id)).token;
     const hydrate = vi.spyOn(h.store, 'getTask');
