@@ -1480,6 +1480,8 @@ export class Gateway {
       }
     }
     if (p === '/api/payments/stripe/callback' && method === 'GET') {
+      const callbackSession = await this.auth(req);
+      if (!callbackSession?.userId) return this.json(res, 401, { error: 'sign in to complete Stripe connection' });
       const code = url.searchParams.get('code') ?? '';
       const state = url.searchParams.get('state') ?? '';
       const oauthError = url.searchParams.get('error_description') ?? url.searchParams.get('error');
@@ -1489,7 +1491,7 @@ export class Gateway {
         const provider = this.deps.paymentRegistry?.get('stripe');
         const { StripeIssuingProvider } = await import('../autonomy/payments.js');
         if (!(provider instanceof StripeIssuingProvider)) throw new Error('Stripe Issuing is unavailable');
-        const connection = await provider.completeOAuth(state, code);
+        const connection = await provider.completeOAuth(state, code, callbackSession.userId);
         const destination = `${(await organizationSettingsPath(this.deps.store, connection.organizationId))}?payments=stripe-connected&organizationId=${encodeURIComponent(connection.organizationId)}`;
         res.writeHead(303, { location: destination });
         return void res.end();

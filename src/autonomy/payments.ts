@@ -489,9 +489,9 @@ export class StripeIssuingProvider implements PaymentProvider {
     return { status: 'awaiting_oauth', url: url.toString(),
       detail: 'Authorize this organization’s Stripe account. Its Issuing balance remains separate from every other organization.' };
   }
-  async completeOAuth(state: string, code: string): Promise<any> {
+  async completeOAuth(state: string, code: string, userId: string): Promise<any> {
     if (!(await this.configured())) throw new Error('Stripe Connect is not configured');
-    const pending = (await this.store!.consumePaymentOAuthState(state));
+    const pending = (await this.store!.consumePaymentOAuthState(state, userId));
     if (!pending) throw new Error('Stripe connection state is invalid, expired, or already used');
     const form = new URLSearchParams({
       client_secret: this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY')!,

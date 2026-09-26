@@ -6847,12 +6847,12 @@ export class Store {
   
     });
   }
-  async consumePaymentOAuthState(state: string): Promise<any> {
+  async consumePaymentOAuthState(state: string, userId?: string): Promise<any> {
     return this.db.transaction(async () => {
 
     const hash = sha256(state);
     const row = (await this.db.prepare('SELECT * FROM payment_oauth_states WHERE stateHash=?').get(hash)) as any;
-    if (!row || row.usedAt || row.expiresAt <= Date.now()) return undefined;
+    if (!row || !userId || row.userId !== userId || row.usedAt || row.expiresAt <= Date.now()) return undefined;
     const result = (await this.db.prepare('UPDATE payment_oauth_states SET usedAt=? WHERE stateHash=? AND usedAt IS NULL')
       .run(Date.now(), hash));
     return Number(result.changes) === 1 ? row : undefined;

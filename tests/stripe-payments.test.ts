@@ -56,8 +56,22 @@ describe('Stripe Issuing organization rail', () => {
     });
     expect(started.status).toBe('awaiting_oauth');
     const state = new URL(started.url!).searchParams.get('state')!;
-    return stripe.completeOAuth(state, 'ac_test');
+    return stripe.completeOAuth(state, 'ac_test', 'user_a');
   }
+
+  it('rejects a callback from a different user without consuming state (AU-2)', async () => {
+    const started = await stripe.connect({ organizationId, userId: 'user_a', redirectUri: 'https://karmax.example/callback' });
+    const state = new URL(started.url!).searchParams.get('state')!;
+    await expect(stripe.completeOAuth(state, 'code', 'user_b')).rejects.toThrow(/state/);
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(stripe.completeOAuth(state, 'code', 'user_a')).resolves.toMatchObject({ organizationId });
+  });
+
+  it('refuses linking the same Stripe account to another tenant (AU-2)', async () => {
+    await connect();
+    const other = await store.createOrganization({ name: 'Other' });
+    await expect(store.upsertPaymentConnection({ organizationId: other.id, provider: 'stripe', accountId: 'acct_tenant_a' })).rejects.toThrow();
+  });
 
   function signed(event: unknown) {
     const raw = Buffer.from(JSON.stringify(event));
@@ -95,7 +109,7 @@ describe('Stripe Issuing organization rail', () => {
     });
     expect(new URL(started.url!).searchParams.get('client_id')).toBe('ca_ui_managed');
     const state = new URL(started.url!).searchParams.get('state')!;
-    await managed.completeOAuth(state, 'ac_test');
+    await managed.completeOAuth(state, 'ac_test', 'user_a');
     const oauth = fetcher.mock.calls.find(([url]) => url === 'https://connect.stripe.com/oauth/token')!;
     expect(new URLSearchParams(String(oauth[1].body)).get('client_secret')).toBe('sk_test_ui_managed');
 
