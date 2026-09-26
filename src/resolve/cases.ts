@@ -3,6 +3,7 @@
  * signature. A hit returns a vetted action (e.g. retry); a miss falls through to
  * the Resolve agent. Agents extend this list through the reviewed PR path.
  */
+import { isSafeSearchPattern } from '../wiki/wiki.js';
 import { classifyLimitError, isResourceKill, isTransportError } from '../agent/limits.js';
 
 export interface ResolveOutcome {
@@ -55,9 +56,13 @@ const CASES: ResolveCase[] = [
 
 export function autoResolve(stage: string, error: string, rules?: ResolveRuleDecl[]): ResolveOutcome {
   // Workflow-declared rules first (more specific), then the platform defaults.
-  for (const r of rules ?? []) {
+  for (const r of (rules ?? []).slice(0, 100)) {
+    // Declared rules run on the shared worker thread. Keep a conservative
+    // grammar and bounded input; complex patterns fall through to Resolve.
+    if (r.match.length > 512 || !isSafeSearchPattern(r.match)
+      || /[{}]/.test(r.match) || (r.match.match(/[*+?]/g)?.length ?? 0) > 1) continue;
     try {
-      if (new RegExp(r.match, r.flags ?? 'i').test(error)) return { resolved: true, action: r.action, note: r.note ?? r.name };
+      if (new RegExp(r.match, r.flags ?? 'i').test(error.slice(0, 2048))) return { resolved: true, action: r.action, note: r.note ?? r.name };
     } catch {
       /* a bad regex in a declared rule shouldn't wedge resolve */
     }
