@@ -34,6 +34,17 @@ if (process.env.STUB_ENV_OUT) {
   }));
 }
 const mode = process.env.STUB_MODE || 'ok';
+if (mode === 'unicode') {
+  const line = Buffer.from(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'A😀B' } }) + '\\n');
+  const split = line.indexOf(Buffer.from('😀')) + 2;
+  process.stdout.write(line.subarray(0, split));
+  setTimeout(() => { process.stdout.write(line.subarray(split)); process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n'); }, 10);
+  return;
+}
+if (mode === 'stderr-tail') {
+  process.stderr.write('x'.repeat(200_000) + 'TAIL_DIAGNOSTIC', () => process.exit(1));
+  return;
+}
 if (mode === 'limit') {
   process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.failed', error: { type: 'UsageLimitReachedError', resets_in_seconds: 1800 } }) + '\\n');
@@ -113,6 +124,18 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     }) + '\n');
     const r = await adapter.runTurn({ ...makeInput(), session } as any, ctx);
     expect(r.usage).toBeUndefined();
+  });
+
+  it('decodes UTF-8 across exec stdout chunks', async () => {
+    process.env.STUB_MODE = 'unicode';
+    const output: string[] = [];
+    await adapter.runTurn(makeInput() as any, { emit: text => output.push(text) } as any);
+    expect(output).toContain('A😀B');
+  });
+
+  it('retains the bounded end of exec stderr diagnostics', async () => {
+    process.env.STUB_MODE = 'stderr-tail';
+    await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow('TAIL_DIAGNOSTIC');
   });
 
   it('delivers large prompts through stdin instead of argv', async () => {
