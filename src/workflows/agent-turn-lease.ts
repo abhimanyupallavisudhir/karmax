@@ -1,6 +1,7 @@
 import {
   CancellationScope,
   condition,
+  patched,
   defineSignal,
   setHandler,
   type ActivityInterfaceFor,
@@ -140,6 +141,7 @@ export function createAgentTurnLeaser(
     let queueId: string | undefined;
     try {
       return await scope.run(async () => {
+        if (patched('agent-turn-cancel-before-start-v1') && host.cancelled()) throw new AgentTurnCancelled();
         if (durableAdmission) {
           const world = host.world();
           if (!world) throw new Error('agent world is not ready');
@@ -187,6 +189,7 @@ export function createAgentTurnLeaser(
             await host.publish();
           }
         }
+        if (patched('agent-turn-cancel-before-start-v1') && host.cancelled()) throw new AgentTurnCancelled();
         return await fn({
           accountConfigHome: home,
           accountApiKeyHandle: key,

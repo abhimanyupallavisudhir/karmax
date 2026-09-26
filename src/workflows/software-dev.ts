@@ -1815,6 +1815,7 @@ async function softwareDevImpl(
               await publish();
             }
           }
+          if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
           return await fn(
             home,
             key,
@@ -1903,7 +1904,12 @@ async function softwareDevImpl(
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
       await publish();
     }
-    if (liveAgentStates && cancelled) throw new Cancelled();
+    if (liveAgentStates && cancelled) {
+      if (grant && grant.accountId !== '(passthrough)' && grant.accountId !== '(denied)'
+        && patched('software-dev-return-cancelled-grant-v1'))
+        await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
+      throw new Cancelled();
+    }
     // The coordinator denies a turn whose every allowed credential needs human action
     // (#5): escalate rather than run/park.
     if (grant?.accountId === '(denied)') {
@@ -1980,7 +1986,10 @@ async function softwareDevImpl(
     const scope = new CancellationScope({ cancellable: true });
     activeTurn = scope;
     try {
-      return await scope.run(fn);
+      return await scope.run(async () => {
+        if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+        return await fn();
+      });
     } finally {
       activeTurn = undefined;
     }

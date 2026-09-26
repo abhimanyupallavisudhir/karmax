@@ -26,6 +26,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
+import { softwareDevV1_26 } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 
 const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work',
@@ -79,3 +80,54 @@ it('LT-14: just-do status publications reuse the conversation snapshot', async (
   expect(writes.every((call: any[]) => typeof call[2] === 'string')).toBe(true);
 });
 
+it('WF-11: cancel during the pre-turn publication prevents invocation', async () => {
+  let cancelled = false;
+  const host = { taskId: 'task', projectId: 'project', task: () => input,
+    world: () => undefined, status: () => 'active' as const, setStatus: vi.fn(),
+    setWaitingFor: vi.fn(), setAgentTurn: vi.fn(), cancelled: () => cancelled,
+    publish: async () => { cancelled = true; } };
+  const leaser = createAgentTurnLeaser({} as any, { accountPoolSize: async () => 0 } as any, host);
+  await leaser.init();
+  const turn = vi.fn();
+  await expect(leaser.run('do', turn)).rejects.toThrow();
+  expect(turn).not.toHaveBeenCalled();
+});
+
+it('WF-22: a grant racing cancellation is returned without running the agent', async () => {
+  let cancelled = false;
+  const host = { taskId: 'task', projectId: 'project', task: () => input,
+    world: () => undefined, status: () => 'active' as const, setStatus: vi.fn(),
+    setWaitingFor: vi.fn(), setAgentTurn: vi.fn(), cancelled: () => cancelled,
+    publish: async () => undefined };
+  const coordinator = { accountPoolSize: async () => 1, returnAccount: vi.fn(async () => undefined),
+    leaseAccount: async (_task: string, turnId: string) => {
+      cancelled = true;
+      wf.handlers.get('accountGranted')!({ turnId, accountId: 'login' });
+    } };
+  const leaser = createAgentTurnLeaser(wf.activities as any, coordinator as any, host);
+  await leaser.init();
+  const turn = vi.fn();
+  await expect(leaser.run('do', turn)).rejects.toThrow();
+  expect(turn).not.toHaveBeenCalled();
+  expect(coordinator.returnAccount).toHaveBeenCalledWith('login', { taskId: 'task', turnId: expect.any(String) });
+});
+
+it('WF-11: software-dev rechecks cancellation after publishing admission', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.publishView.mockImplementation(async (_id, view) => {
+    if (view.waitingFor?.kind === 'agentSlot') wf.handlers.get('cancel')!();
+  });
+  expect(await softwareDevV1_26(input)).toEqual({ stage: 'cancelled' });
+  expect(wf.activities.runAgentTurn).not.toHaveBeenCalled();
+});
+
+it('WF-22: software-dev returns an account granted concurrently with cancellation', async () => {
+  wf.activities.leaseAccount.mockImplementation(async (_id, turnId) => {
+    wf.handlers.get('accountGranted')!({ turnId, accountId: 'login' });
+    wf.handlers.get('cancel')!();
+  });
+  wf.activities.returnAccount = vi.fn(async () => undefined);
+  expect(await softwareDevV1_26(input)).toEqual({ stage: 'cancelled' });
+  expect(wf.activities.runAgentTurn).not.toHaveBeenCalled();
+  expect(wf.activities.returnAccount).toHaveBeenCalledWith('login', { taskId: 'task', turnId: expect.any(String) });
+});
