@@ -35,6 +35,14 @@ describe('Store', () => {
     expect(indexes.map((row) => row.name)).toContain('idx_events_type');
   });
 
+  it('does not rescan completed row migrations on each boot', async () => {
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    await (store as any).migrateData();
+    expect(queries.some((sql) => /SELECT id, config FROM projects|SELECT k, v FROM kv WHERE k LIKE 'vault:items/.test(sql))).toBe(false);
+  });
+
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
     const project = (await store.createProject('Parameter patches'));
     const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',

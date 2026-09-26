@@ -212,13 +212,10 @@ export class Store {
     });
   }
 
-  /** One-time data migrations (idempotent; run every boot). */
-  private async migrateData() {
+  /** One-time data migrations. Legacy imports explicitly rerun them after copying rows. */
+  private async migrateData(force = false) {
     return this.db.transaction(async () => {
-
-    // Notifications whose ask was already answered — the backlog older builds
-    // never removed, and a net for any closing event this install missed.
-    (await this.pruneStaleInbox());
+    if (!force && await this.kvGet('migration:data-2026-09-26')) return;
 
     // Early organization-policy builds expanded their infrastructure defaults
     // into every project. Those records accidentally became permanent project
@@ -361,6 +358,7 @@ export class Store {
     (await this.db.prepare(`DELETE FROM usage_events WHERE provider='e2b' AND kind='world.active'
       AND (metadata IS NULL OR json_extract(metadata, '$.source') IS NULL
         OR json_extract(metadata, '$.source') != 'provider-lifecycle')`).run());
+    (await this.kvSet('migration:data-2026-09-26', '1'));
   
     });
   }
@@ -7388,7 +7386,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     (await this.migrate());
-    (await this.migrateData());
+    (await this.migrateData(true));
     (await this.migrateConversations());
   
     });

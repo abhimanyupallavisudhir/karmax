@@ -72,6 +72,17 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('skips completed PostgreSQL row migrations on repeated initialization', async () => {
+    const store = await Store.create(url!);
+    try {
+      const prepare = store.db.prepare.bind(store.db);
+      const queries: string[] = [];
+      store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+      await (store as any).migrateData();
+      expect(queries.some((sql) => sql.includes('SELECT id, config FROM projects'))).toBe(false);
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);

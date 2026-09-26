@@ -706,6 +706,10 @@ async function main() {
     cursor: relayCursor, onError: error => console.warn('  • Worker event relay failed:', error),
   });
   startupReady = true;
+  // Reconcile missed notification close events without delaying the first API response.
+  const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
+  void inboxCleanup.run().catch(error => console.warn('  • Inbox cleanup failed:', error));
+  inboxCleanup.unref();
 }
 
 main().catch((e) => {
