@@ -218,6 +218,7 @@ export class WorldCheckpointService {
     const environment = (await selectProjectEnvironment(this.store, checkpoint.projectId, selected,
       executionConfig.environment, checkpoint.environment));
     const primary = checkpoint.repos[0];
+    const pinnedHeads = checkpoint.repos.every(repo => /^[0-9a-f]{40,64}$/i.test(repo.headSha ?? ''));
     const linked = (await this.store.listProjectRepositories(checkpoint.projectId));
     const repositoryBranches = Object.fromEntries(checkpoint.repos.map((repo, index) => {
       const source = sources[index]!;
@@ -262,7 +263,7 @@ export class WorldCheckpointService {
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
         generation: checkpoint.generation + 1, organizationId: project.organizationId,
         repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
-        branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
+        branch: pinnedHeads ? undefined : primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
         network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     } catch (error) {
@@ -273,11 +274,20 @@ export class WorldCheckpointService {
       for (const [index, restoredRepo] of worldRepos(world.handle).entries()) {
         const manifestRepo = checkpoint.repos[index];
         const previous = manifestRepo ? previousFor(manifestRepo, index) : undefined;
+        // An idle checkpoint at the provisioned base need not publish a task ref.
+        // Clone normally, then restore the exact captured commit before its delta.
+        if (pinnedHeads && manifestRepo) {
+          const checkout = await world.exec('git', ['checkout', '-B', manifestRepo.branch, manifestRepo.headSha!], { cwd: restoredRepo.root });
+          if (checkout.code !== 0) throw new Error(`checkpoint commit ${manifestRepo.headSha} is unavailable: ${checkout.stderr}`);
+          restoredRepo.branch = manifestRepo.branch;
+          restoredRepo.baseSha = manifestRepo.baseSha;
+        }
         const role = manifestRepo?.role ?? previous?.role;
         if (role) restoredRepo.role = role;
         const targetPinned = manifestRepo?.targetPinned ?? previous?.targetPinned;
         if (targetPinned !== undefined) restoredRepo.targetPinned = targetPinned;
       }
+      if (pinnedHeads && primary) world.handle.branch = primary.branch;
       const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
       world.handle.workdir = developmentRepos.length === 1 ? developmentRepos[0]!.root : world.handle.root;
       if (this.resources) {

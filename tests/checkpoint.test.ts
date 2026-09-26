@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { provisionGitRepos } from '../src/world/provision-git.js';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store/db.js';
@@ -65,6 +68,62 @@ describe('portable world checkpoints', () => {
       world.handle = await store.registerWorld({ ...(await store.currentWorld(task.id))!, generation: 2 }, project.id) as typeof world.handle;
       expect((await capture()).id).not.toBe(changedRuntime.id);
     } finally { await world.destroy(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('restores an unpublished base checkpoint through cloud provisioning after the base advances', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-unpublished-checkpoint-'));
+    const source = path.join(dir, 'source'); fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']); await ensureIdentity(source);
+    await gitOrThrow(source, ['commit', '--allow-empty', '-qm', 'base']);
+    const baseSha = (await git(source, ['rev-parse', 'HEAD'])).stdout.trim();
+    const remote = path.join(dir, 'remote.git');
+    await gitOrThrow(dir, ['clone', '-q', '--bare', source, remote]);
+    const ssh = 'git@example:remote.git';
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Cloud recovery', { repos: [ssh], defaultBase: 'main' });
+    const task = await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: {} });
+    const worktrees = new WorktreeProvider(path.join(dir, 'unused'));
+    const worlds = new WorldRegistry();
+    const open = async (handle: any) => {
+      const world = await worktrees.open(handle);
+      world.destroy = async () => fs.rmSync(handle.root, { recursive: true, force: true });
+      return world;
+    };
+    const target = {
+      async run(command: string) {
+        try {
+          const { stdout, stderr } = await promisify(execFile)('bash', ['-c', command], { env: { ...process.env,
+            GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${dir}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' } });
+          return { stdout, stderr, code: 0 };
+        } catch (error: any) { return { stdout: error.stdout ?? '', stderr: error.stderr ?? '', code: 1 }; }
+      },
+      async writeFile(file: string, bytes: string | Buffer) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes); },
+    };
+    worlds.register({ kind: 'checkpoint-cloud', async create(spec) {
+      const root = path.join(dir, `cloud-${spec.generation ?? 1}`);
+      const provisioned = await provisionGitRepos(target, spec, { root, home: dir, sshUrlError: 'ssh only', copyGlobsWarning: '' });
+      return open({ id: task.id, kind: 'checkpoint-cloud', root, base: spec.base,
+        branch: provisioned.repos[0]!.branch, repos: provisioned.repos });
+    }, open });
+    const checkpoints = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+      new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+    try {
+      const world = await worlds.create('checkpoint-cloud', { taskId: task.id, repos: [ssh], base: 'main' });
+      world.handle.meta = { projectId: project.id };
+      world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+      await world.writeFile('draft.txt', 'uncommitted work');
+      const checkpoint = await checkpoints.checkpoint(world.handle);
+      expect((await git(remote, ['show-ref', '--verify', `refs/heads/${world.handle.branch}`])).code).not.toBe(0);
+      await gitOrThrow(source, ['commit', '--allow-empty', '-qm', 'new base']);
+      await gitOrThrow(source, ['push', remote, 'main']);
+      await world.destroy();
+      const handle = await checkpoints.restore(checkpoint.id, 'checkpoint-cloud');
+      const restored = await worlds.open(handle);
+      expect((await restored.exec('git', ['rev-parse', 'HEAD'])).stdout.trim()).toBe(baseSha);
+      expect((await restored.exec('git', ['branch', '--show-current'])).stdout.trim()).toBe(world.handle.branch);
+      expect(await restored.readFile('draft.txt')).toBe('uncommitted work');
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('encrypts a dirty binary delta, restores it into a new generation, and fences the stale generation', async () => {
