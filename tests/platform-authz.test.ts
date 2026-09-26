@@ -292,6 +292,22 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
 
     await expect(queued.reorderQueue(queueToken, 'unrelated:main', task.id))
       .rejects.toThrow(/not in that merge queue domain/);
+
+    // PL-5: without the complete list the guard used to pass everything, so any
+    // task could start and signal a merge-queue coordinator for any domain.
+    const legacy = (await store.createTask({ projectId: mine, title: 'Legacy', workflow: 'software-dev', workflowVersion: '1.8.0', params: { prompt: 'x' } as any }));
+    (await store.saveView(legacy.id, {
+      taskId: legacy.id, title: legacy.title, workflow: 'software-dev', stage: 'merge', status: 'waiting',
+      messages: [], transcripts: [], actions: [], updatedAt: 1, targetBranch: 'main',
+      world: { id: 'w', kind: 'worktree', root: '/w', branch: 'b', base: 'main', repos: [
+        { name: 'app', repo: 'app', localPath: 'app' }, { name: 'wiki', repo: 'wiki', localPath: 'wiki' }] },
+      state: { mergeDomain: 'app:main' },
+    } as any));
+    await queued.reorderQueue(queueToken, 'wiki:main', legacy.id); // derived from its world
+    await expect(queued.moveQueueItem(queueToken, 'unrelated:main', legacy.id)).rejects.toThrow(/not in that merge queue domain/);
+    const fresh = (await store.createTask({ projectId: mine, title: 'Never queued', workflow: 'software-dev', workflowVersion: '1.9.0', params: { prompt: 'x' } as any }));
+    await expect(queued.reorderQueue(queueToken, 'app:main', fresh.id)).rejects.toThrow(/not in that merge queue domain/);
+    expect(signals).toEqual(['app:main', 'wiki:main', 'wiki:main']);
   });
 
   /**

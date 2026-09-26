@@ -211,21 +211,25 @@ function stripPlatformMetadata<T extends Record<string, unknown>>(params: T): T 
 }
 
 /**
- * Reject a queue reorder aimed at a domain this task does not hold.
+ * Reject a queue reorder aimed at a domain this task does not hold — reorders
+ * signal-with-start the domain's coordinator, so an unchecked domain lets any
+ * task create and poke a coordinator for any string.
  *
  * A multi-repo task takes ONE merge slot PER REPO, so the check has to be
  * against the whole set. Views published before software-dev@1.9.0 / merge-only
- * @1.5.0 carry only `mergeDomain` — the *first* domain — which made this guard
- * reject a perfectly legitimate request to reorder any later one. So the
- * complete `mergeDomains` list wins when present, and the known-partial singular
- * is treated as evidence of membership rather than an exclusive whitelist: a
- * mismatch there falls through to the coordinator, which is authoritative and
- * safely no-ops when the task is not actually queued in that domain.
+ * @1.5.0 carry only `mergeDomain` — the *first* domain — so for those the set
+ * is derived from the task's world and target exactly as the workflow derives
+ * it (mergeQueueDomains), plus the recorded singular. A task with neither has
+ * never queued and holds no domain.
  */
 function assertInMergeDomain(task: TaskRecord, domain: string): void {
-  const state = task.lastView?.state as { mergeDomain?: unknown; mergeDomains?: unknown } | undefined;
-  const all = Array.isArray(state?.mergeDomains) ? (state!.mergeDomains as string[]) : undefined;
-  if (all && !all.includes(domain)) throw new Error('task is not in that merge queue domain');
+  const view = task.lastView;
+  const state = view?.state as { mergeDomain?: unknown; mergeDomains?: unknown } | undefined;
+  const held = Array.isArray(state?.mergeDomains) ? (state!.mergeDomains as string[]) : [
+    ...(typeof state?.mergeDomain === 'string' ? [state.mergeDomain] : []),
+    ...(view?.targetBranch ? mergeQueueDomains(view.world, view.targetBranch, task.projectId) : []),
+  ];
+  if (!held.includes(domain)) throw new Error('task is not in that merge queue domain');
 }
 
 
