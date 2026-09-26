@@ -27,3 +27,9 @@ describe('Better Auth identity hardening', () => {
     });
   }, 60_000);
 });
+
+it('invalidates browser-derived platform tokens and cache entries after a password change (GW-8)', () => {
+  const output = execFileSync(process.execPath,
+    ['--import', 'tsx', path.join(process.cwd(), 'tests/fixtures/identity-session-revocation.ts')], { encoding: 'utf8', timeout: 30_000 });
+  expect(output).toContain('session revocation passed');
+});

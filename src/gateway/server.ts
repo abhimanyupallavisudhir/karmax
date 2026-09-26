@@ -576,7 +576,7 @@ export class Gateway {
   /** Discovery spawns provider CLIs (seconds): pages read the last catalog while
    *  one background load per organization refreshes it. */
   private modelCatalog = new SwrCache<string, ModelCatalog>((organizationId) => this.discoverModels(organizationId), 5 * 60_000);
-  private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
+  private identityTokens = new Map<string, { apiToken: string; fingerprint: string; expiresAt: number; userId: string }>();
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
@@ -604,6 +604,13 @@ export class Gateway {
   private async initialize(deps: GatewayDeps) {
 
     if (deps.identity) {
+      deps.tokens.connectIdentitySessions((sessionId, userId) => deps.identity!.sessionActive(sessionId, userId));
+      deps.identity.connectSessionRevocation?.(async userId => {
+        for (const [key, cached] of this.identityTokens) if (cached.userId === userId) {
+          this.identityTokens.delete(key);
+          await deps.tokens.revoke(cached.apiToken);
+        }
+      });
       deps.identity.connectOrganizationNames(async () => (await deps.store.organizationNameReservations()));
       deps.identity.connectAccountClosure?.(async id => Boolean(await deps.store.kvGet(`account-closed:${id}`)));
       deps.store.connectUserNames(async () => (await deps.identity!.listUsers()));
@@ -8396,11 +8403,19 @@ export class Gateway {
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !(await this.deps.tokens.verify(cached.apiToken))) {
       if (cached) (await this.deps.tokens.revoke(cached.apiToken));
-      // Entries are keyed by session; a session that ended never comes back to
-      // evict its own, so sweep the expired ones when the cache has grown.
-      if (this.identityTokens.size >= 2_000)
-        for (const [key, entry] of this.identityTokens) if (!(await this.deps.tokens.verify(entry.apiToken))) this.identityTokens.delete(key);
-      cached = { apiToken: (await this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000, resolvedOrganizationId)).token, fingerprint };
+      const now = Date.now();
+      for (const [key, entry] of this.identityTokens) if (entry.expiresAt <= now) {
+        this.identityTokens.delete(key);
+        await this.deps.tokens.revoke(entry.apiToken);
+      }
+      if (this.identityTokens.size >= 2_000) {
+        const [key, entry] = this.identityTokens.entries().next().value!;
+        this.identityTokens.delete(key);
+        await this.deps.tokens.revoke(entry.apiToken);
+      }
+      const ttl = 10 * 60_000;
+      cached = { apiToken: (await this.deps.tokens.mintPrincipal(principal, caps, projectId, ttl,
+        resolvedOrganizationId, identity.session.id)).token, fingerprint, expiresAt: now + ttl, userId: identity.user.id };
       this.identityTokens.set(cacheKey, cached);
     }
     return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
