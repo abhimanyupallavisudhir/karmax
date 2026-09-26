@@ -6951,7 +6951,10 @@ async function refreshTask(reason = 'all') {
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
     // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
   } catch {}
-  if (S.selected === id) renderTaskPage();
+  if (S.selected === id) {
+    renderTaskPage();
+    if (full && typeof document !== 'undefined') $('#tp-payments')?.refreshSpent?.();
+  }
     } while (entry.reasons.size && S.selected === id);
   })();
   try { await entry.promise; }
@@ -8167,7 +8170,7 @@ function loadResourceReview(v, force = false, inventory = false) {
   const cache = inventory ? resourceInventoryCache : resourceReviewCache;
   const cached = cache.get(v.taskId);
   if (!force && cached && cached.view.stage === v.stage
-    && (inventory || JSON.stringify(cached.view.reviewInfo) === JSON.stringify(v.reviewInfo))) return cached.promise;
+    && (inventory || cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))) return cached.promise;
   const entry = { view: v, pending: true, at: Date.now() };
   entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : '?summary=metadata'}`)
     .then((result) => {

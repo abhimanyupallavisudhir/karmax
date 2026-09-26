@@ -20,6 +20,7 @@ async function main() {
   const view = { taskId: 'task', messages: [{ role: 'user', text: 'review' }] };
   const event = { seq: 10, type: 'agent.activity', payload: { role: 'do', kind: 'message', title: 'Findings' } };
   const c = vm.createContext({
+    document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
     S: { tasks: [], organizationId: 'org' }, term: null,
     DEFAULT_EXPLANATION_SETTINGS: {},
     taskRecord: () => ({ projectId: 'project', params: {} }),

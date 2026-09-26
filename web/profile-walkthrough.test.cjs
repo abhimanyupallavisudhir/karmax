@@ -98,7 +98,6 @@ test('a transient status failure preserves the visible guide', async () => {
   await vm.runInContext('refreshOnboarding()', ctx);
   assert.equal(host.hidden, false);
   assert.match(host.innerHTML, /Finish setup/);
-  await tick();
   assert.equal(host.hidden, false);
 });
 

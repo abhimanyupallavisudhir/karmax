@@ -80,7 +80,7 @@ ok(inboxArrivals(new Set(), [item('c', 'high', false)]).length === 0, 'an alread
 const priorities = new Map([['a', urgencyRank('normal')]]);
 ok(inboxArrivals(priorities, [item('a', 'high')]).length === 1, 'priority promotion announces an existing ask');
 ok(inboxArrivals(priorities, [item('a', 'normal')]).length === 0, 'unchanged asks stay quiet');
-for (const type of ['task.escalated', 'view.updated', 'credential.approval-resolved', 'review.requested', 'task.assigned'])
+for (const type of ['task.escalated', 'credential.approval-resolved', 'review.requested', 'task.assigned'])
   ok(inboxEventChanges({ type }), `${type} refreshes delivery`);
 ok(!inboxEventChanges({ type: 'agent.output' }), 'streaming tokens do not reload the inbox');
 

@@ -29,6 +29,7 @@ function browser() {
   const state = { organizationId: 'org', organizations: [{ id: 'org' }], inbox: [], activity: [], tab: 'inbox' };
   let response = [];
   const ctx = vm.createContext({
+    document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
     S: state, Map, Set, URGENCY_LEVELS: ['low', 'normal', 'high', 'critical'],
     location: { protocol: 'https:', host: 'example.test' },
     WebSocket: function () {},
