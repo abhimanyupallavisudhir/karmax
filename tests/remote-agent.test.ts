@@ -1,9 +1,20 @@
+import { CodexHistoryError } from '../src/agent/codex-history.js';
 import { ProjectResourceService } from '../src/world/resources.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Provider transport bounds are exercised in bounded-exec.test.ts; these world
+// fixtures execute the command against in-memory files or a local fake sandbox.
+vi.mock('../src/world/bounded-exec.js', () => ({
+  boundedExec: async (world: World, command: string, options: { maxBytes: number }) => {
+    const result = await world.exec('bash', ['-lc', command]);
+    if (Buffer.byteLength(result.stdout) > options.maxBytes) throw new Error('world command output exceeds capture limit');
+    return result;
+  },
+}));
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
@@ -186,6 +197,26 @@ describe('remote subscription agents', () => {
     const result = await ensureRemoteBrowser(world, 'playwright');
     expect(result.playwright?.command).toBe('/opt/karmax/bin/playwright-mcp');
     expect(result.playwright?.env?.PLAYWRIGHT_BROWSERS_PATH).toBe('/opt/karmax/browsers');
+  });
+
+  it('closes a remote protocol whose consumer stops draining output', async () => {
+    const world = fakeWorld();
+    let output!: (chunk: string) => void;
+    let closed = false;
+    world.openPty = async () => ({
+      onData(listener) { output = listener; return () => {}; }, onExit: () => () => {},
+      write: async () => {}, resize: async () => {}, close: async () => { closed = true; },
+    });
+    const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {});
+    await Promise.resolve();
+    output('\u001eKARMAX_AGENT_READY\u001e');
+    for (let i = 0; i < 40; i++) output('x'.repeat(512 * 1024));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(child.killed).toBe(true);
+    expect(closed).toBe(true);
+    expect(child.lost?.message).toMatch(/output buffer limit/);
+    expect(child.stdout.readableLength + child.stdout.writableLength).toBeLessThanOrEqual(8 * 1024 * 1024);
   });
 
   it('delivers remote stderr before close, including when diagnostics cannot be read', async () => {
@@ -438,6 +469,27 @@ describe('remote subscription agents', () => {
     expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\nnewer\n');
   });
 
+  it('rejects oversized histories before publishing any remote bytes', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-history-bound-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    const file = `${home.relative}/projects/world/current-session.jsonl`;
+    world.files.set(file, Buffer.alloc(16 * 1024 * 1024 + 1, 'x'));
+    await expect(syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session'))
+      .rejects.toThrow(/history.*limit/i);
+    expect(fs.existsSync(path.join(localHome, 'projects'))).toBe(false);
+  });
+
+  it('bounds aggregate history exports across duplicate sandbox paths', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-history-bound-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    for (let i = 0; i < 65; i++)
+      world.files.set(`${home.relative}/projects/world-${i}/current-session.jsonl`, Buffer.from('x'));
+    await expect(syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session'))
+      .rejects.toThrow(/history.*limit/i);
+  });
+
   it('does not export native histories before the adapter has a current session', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-session-export-'));
     const world = fakeWorld();
@@ -652,14 +704,41 @@ describe('remote subscription agents', () => {
     expect(world.dynamicTools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'list_events' })]));
   });
 
+  it.each(['stop', 'conflict'])('preserves successful Codex work after %s cleanup failure', async (failure) => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cleanup-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
+    const world = fakeWorld(true);
+    const open = world.openPty.bind(world);
+    world.openPty = async spec => {
+      const pty = await open(spec);
+      if (failure === 'stop') pty.close = async () => { throw new Error('exit unconfirmed'); };
+      return pty;
+    };
+    let exports = 0;
+    const exec = world.exec.bind(world);
+    world.exec = async (command, args, options) => {
+      if (command === 'bash' && args[1]?.includes('-type f -print') && world.requests.some(r => r.method === 'turn/start')) {
+        exports++;
+        if (failure === 'conflict') throw new CodexHistoryError('conflicting copies; preserving both');
+      }
+      return exec(command, args, options);
+    };
+    const activities: any[] = [];
+    const result = await new CodexAdapter().runTurn({
+      profile: { provider: 'codex' }, world, messages: [], systemPrompt: 'test', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity: (a: any) => activities.push(a), platformRequest: async () => [] } as any);
+    expect(result.termination.kind).toBe('success');
+    expect(exports).toBe(failure === 'stop' ? 0 : 1);
+    expect(activities).toContainEqual(expect.objectContaining({ kind: 'error', phase: 'failed' }));
+  });
+
   it('preserves a successful Codex turn when best-effort remote state export times out', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-sync-timeout-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const world = fakeWorld(true);
     const exec = world.exec.bind(world);
-    let stateListings = 0;
     world.exec = async (command, args, options) => {
-      if (command === 'bash' && args[1]?.includes('-type f -print') && ++stateListings > 1)
+      if (command === 'bash' && args[1]?.includes('-type f -print') && world.requests.some(request => request.method === 'turn/start'))
         throw new Error('[canceled] Request handshake timed out after 60000ms');
       return exec(command, args, options);
     };
@@ -871,6 +950,11 @@ function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolea
     handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'task', root: '/workspace', branch: 'task', base: 'main' },
     async exec(command, args) {
       commands.push([command, ...args].join(' '));
+      if (command === 'bash' && args[1]?.includes('head -c')) {
+        const match = args[1].match(/head -c (\d+) -- '([^']+)'/)!;
+        const content = files.get(match[2]!.replace('/workspace/', '')) ?? Buffer.alloc(0);
+        return { stdout: content.subarray(0, Number(match[1])).toString('base64'), stderr: '', code: 0 };
+      }
       if (command === 'bash' && args[1]?.includes('-type f -print')) {
         return { stdout: [...files.keys()].map((file) => `/workspace/${file}`).join('\n'), stderr: '', code: 0 };
       }

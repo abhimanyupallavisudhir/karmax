@@ -527,7 +527,8 @@ export class RemoteSpawnedProcess extends EventEmitter {
     // Recover a bounded tail before close so startup failures retain their cause.
     if (this.stderrFile) {
       try {
-        const result = await this.world.exec('tail', ['-c', '8192', this.stderrFile], { timeoutMs: 5000 });
+        const result = await boundedExec(this.world, `tail -c 8192 -- ${quote(this.stderrFile)}`,
+          { maxBytes: 8192, overflow: 'tail', timeoutMs: 5000 });
         if (result.code === 0 && result.stdout) this.stderr.write(result.stdout);
       } catch { /* diagnostics must not replace the process failure */ }
     }
@@ -538,9 +539,20 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.emit('close', code, signal);
   }
 
+  private writeProtocol(chunk: string): void {
+    if (this.stdout.readableLength + this.stdout.writableLength + Buffer.byteLength(chunk) > 8 * 1024 * 1024) {
+      this.kill();
+      void this.finish(null, { lost: new Error('agent output buffer limit exceeded') });
+      return;
+    }
+    if (this.startup) this.received.read(chunk);
+    this.stdout.write(chunk);
+  }
+
   private onData(chunk: string): void {
+    if (this.finishing || this.killed) return;
     if (this.startup) this.readBytes += Buffer.byteLength(chunk);
-    if (this.protocolReady) { if (this.startup) this.received.read(chunk); this.stdout.write(chunk); return; }
+    if (this.protocolReady) { this.writeProtocol(chunk); return; }
     this.preamble += chunk;
     const marker = this.preamble.indexOf(READY);
     if (marker < 0) {
@@ -553,7 +565,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.openProtocolGate();
     const rest = this.preamble.slice(marker + READY.length);
     this.preamble = '';
-    if (rest) { if (this.startup) this.received.read(rest); this.stdout.write(rest); }
+    if (rest) this.writeProtocol(rest);
   }
 }
 
