@@ -54,6 +54,7 @@ import { PermissionRequests, exactCapability, type PermissionRequest } from './p
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import { untrustedBlock } from '../domain/untrusted.js';
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
@@ -3197,9 +3198,9 @@ export class KarmaxApi {
           projectId: task.projectId,
           workflow: 'just-do',
           title: `${avatar.name}: respond to task #${task.num ?? task.id}`,
-          prompt: `The agent working on task #${task.num ?? task.id} (${task.title}) asked for your intervention:
+          prompt: `The agent working on task #${task.num ?? task.id} (${JSON.stringify(task.title)}) asked for your intervention:
 
-${detail}
+${untrustedBlock('request from the agent', detail)}
 
 Act according to your Avatar instructions. When ready, call signal_task for task id ${task.id} with signal "followUp" and the concrete guidance or decision in text. Address role "${caller.role ?? 'do'}" when relevant. Then briefly report what you sent.`,
           params: {
@@ -3341,7 +3342,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
             prompt: `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
 
 Requested capabilities: ${request.capabilities.join(', ')}
-${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}Reason from the requesting agent: ${request.reason}
+${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
 
 Act according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
             params: {
@@ -3528,7 +3529,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         await this.createTask(token, {
           projectId: input.projectId, workflow: 'just-do',
           title: `${avatar.name}: decide authorization request`,
-          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})\nMissing capabilities: ${request.missingCapabilities.join(', ')}\nReason: ${request.reason}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
           params: { 'agent:do': { avatarId: avatar.id, avatarPurpose: 'authorize', provider: avatar.runtime.provider,
             ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
             ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}) } },
