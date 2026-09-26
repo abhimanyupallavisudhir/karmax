@@ -1985,6 +1985,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             messages = [imported.message, ...args.messages];
             deliveredMessages = 0;
           }
+          if (imported.warnings?.length) await record(args.taskId, 'session.import.warnings', { warnings: imported.warnings });
           return imported.kind;
         };
         const upload = spec.resumeFrom.upload;
