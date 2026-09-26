@@ -13,6 +13,7 @@ import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
 import { beginOAuth, finishOAuth, mcpClientMetadata, MCP_CLIENT_METADATA_PATH } from '../mcp/connections/oauth.js';
+import { publicModelFetch, publicUrl } from '../mcp/connections/http.js';
 import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
 import { ServiceConnections, ConnectionError } from '../integrations/service-connections.js';
@@ -799,7 +800,13 @@ export class Gateway {
       if (typeof body[key] === 'string' && body[key].trim()) own[key] = body[key].trim();
     }
     // Validate the partial overlay in its inherited context before persisting it.
-    normalizeExplanationSettings(own, fallback);
+    try {
+      const effective = normalizeExplanationSettings(own, fallback);
+      // A hosted cell calls only public HTTPS endpoints (publicModelFetch): say so now, not on first use.
+      if (this.deps.hosted && own.endpoint) publicUrl(effective.endpoint);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : String(error));
+    }
     return own;
   }
 
@@ -5466,7 +5473,10 @@ export class Gateway {
           provider,
         });
         try {
-          const explanation = await requestExplanation({ settings, apiKey, message, userContext });
+          // A hosted cell shares its network with every tenant: only public
+          // HTTPS endpoints, resolved once and pinned (no DNS rebinding).
+          const explanation = await requestExplanation({ settings, apiKey, message, userContext,
+            ...(this.deps.hosted ? { fetchImpl: publicModelFetch } : {}) });
           const event = { taskId, type: 'conversation.explanation', ts: Date.now(), payload: {
             role, sourceKey, text: explanation, provider, model: settings.model,
             ...(sourceEvent ? { sourceEvent } : {}),

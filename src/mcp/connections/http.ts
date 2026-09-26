@@ -43,7 +43,7 @@ async function publicLookup(host: string) {
 
 /** Shared-host requests are bounded, never follow redirects, and never inherit
  * cookies, proxy settings or platform authorization. Also used for OAuth URLs. */
-function guardedFetch(stream: boolean): typeof fetch { return async (input, init) => {
+function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000): typeof fetch { return async (input, init) => {
   const request = new Request(input, init);
   const url = publicUrl(request.url);
   const host = url.hostname.replace(/^\[|\]$/g, '');
@@ -83,10 +83,12 @@ function guardedFetch(stream: boolean): typeof fetch { return async (input, init
         }));
       });
     });
-    const timer = setTimeout(() => req.destroy(new Error('Endpoint request timed out')), stream ? 65_000 : 15_000);
+    const timer = setTimeout(() => req.destroy(new Error('Endpoint request timed out')), timeoutMs);
     req.on('close', () => clearTimeout(timer)); req.on('error', reject);
     req.end(body);
   });
 }; }
 export const publicFetch = guardedFetch(false);
 export const publicStreamFetch = guardedFetch(true);
+/** The same guard for a single model completion, which can take a minute. */
+export const publicModelFetch = guardedFetch(false, 90_000);
