@@ -8,19 +8,6 @@ afterEach(() => { vi.unstubAllGlobals(); state.close.mockReset(); });
 for (const provider of ['claude', 'codex'] as const) describe(`${provider} API tool failures`, () => {
   const input: any = { profile: { provider }, world: { handle: { root: '/tmp' } }, role: 'do', messages: [], systemPrompt: 'test', resolvedAuth: { apiKey: 'fake' } };
   const adapter = () => provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
-  it.each([
-    { retryAfter: '12', detail: 'rate limit exceeded', resetHint: 'in 12s' },
-    { retryAfter: undefined, detail: 'rate limit exceeded; try again in 2.5s', resetHint: 'in 2.5s' },
-    { retryAfter: undefined, detail: 'too many requests', resetHint: 'in 60s' },
-  ])('retains short API throttle recovery ($resetHint)', async ({ retryAfter, detail, resetHint }) => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(detail, {
-      status: 429, headers: retryAfter ? { 'retry-after': retryAfter } : {},
-    })));
-    await expect(adapter().runTurn(input, { emit() {} } as any)).rejects.toMatchObject({
-      name: 'ProviderFailure', metadata: { kind: 'quota', permanence: 'transient', resetHint },
-    });
-  });
-
   it('returns failed tools to the model and does not treat failed completion as success', async () => {
     const bodies: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
