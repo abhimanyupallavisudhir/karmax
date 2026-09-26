@@ -117,3 +117,31 @@ it('keeps the existing ciphertext intact when a mutation fails and releases admi
   await vault.put('next', 'fixture-2');
   expect(vault.reveal('retained')).toBe('fixture');
 });
+
+it('bounds secret writes and reads only the requested entry (AU-5)', async () => {
+  const dir = directory();
+  const vault = new Vault(dir);
+  await expect(vault.put('oversized', 'x'.repeat(65_537))).rejects.toThrow(/size/);
+  await vault.put('one', 'first');
+  await vault.put('two', 'second');
+  const read = vi.spyOn(fs, 'readFileSync');
+  try {
+    expect(vault.reveal('one')).toBe('first');
+    expect(read.mock.calls.some(([file]) => String(file).endsWith('secrets.json'))).toBe(false);
+  } finally { read.mockRestore(); }
+});
+
+it('migrates legacy ciphertext without losing readable secrets (AU-5)', async () => {
+  const dir = directory();
+  const vault = new Vault(dir);
+  await vault.put('legacy', 'retained');
+  const entries = path.join(dir, 'entries');
+  const entry = JSON.parse(fs.readFileSync(path.join(entries, fs.readdirSync(entries).find(file => file.endsWith('.json'))!), 'utf8'));
+  fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({ [entry.handle]: entry.blob }));
+  fs.rmSync(entries, { recursive: true });
+  const reopened = new Vault(dir);
+  expect(reopened.reveal('legacy')).toBe('retained');
+  await reopened.put('next', 'new');
+  expect(new Vault(dir).reveal('legacy')).toBe('retained');
+  expect(reopened.list().sort()).toEqual(['legacy', 'next']);
+});

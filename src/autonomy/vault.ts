@@ -16,6 +16,7 @@ export class Vault {
   private keyPath: string;
   private dbPath: string;
   private key: Buffer;
+  private entriesPath: string;
 
   constructor(dir: string) {
     // The vault holds encrypted secrets and its key; keep the directory private
@@ -24,6 +25,8 @@ export class Vault {
     this.keyPath = path.join(dir, 'vault.key');
     this.dbPath = path.join(dir, 'secrets.json');
     this.key = this.loadOrCreateKey();
+    this.entriesPath = path.join(dir, 'entries');
+    fs.mkdirSync(this.entriesPath, { recursive: true, mode: 0o700 });
   }
 
   /**
@@ -101,52 +104,92 @@ export class Vault {
     return Buffer.concat([decipher.update(Buffer.from(parts[2]!, 'base64')), decipher.final()]).toString('utf8');
   }
 
-  private async mutate<T>(operation: (db: Record<string, string>) => T): Promise<T> {
+  private entryPath(handle: string): string {
+    return path.join(this.entriesPath, crypto.createHash('sha256').update(handle).digest('hex') + '.json');
+  }
+
+  private readEntry(handle: string): string | undefined {
+    const file = this.entryPath(handle);
+    if (fs.existsSync(file)) {
+      const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (entry.handle !== handle || typeof entry.blob !== 'string') throw new Error('vault entry is corrupt');
+      return entry.blob;
+    }
+    if (fs.existsSync(path.join(this.entriesPath, '.migrated'))) return undefined;
+    return this.readDb()[handle];
+  }
+
+  private writeEntry(handle: string, blob: string): void {
+    const file = this.entryPath(handle);
+    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ handle, blob }), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, file);
+  }
+
+  private validateSecret(secret: string): void {
+    if (Buffer.byteLength(secret, 'utf8') > 65_536) throw new Error('vault secret exceeds size limit (64 KiB)');
+  }
+
+  private async mutate<T>(operation: () => T): Promise<T> {
     const release = process.platform === 'linux'
       ? await acquireFileLock(`${this.dbPath}.lock`) : undefined;
     try {
-      const db = this.readDb();
-      const result = operation(db);
-      this.writeDb(db);
-      return result;
+      const marker = path.join(this.entriesPath, '.migrated');
+      if (!fs.existsSync(marker)) {
+        // Publish all entries before retiring the legacy map. A crash retries
+        // this migration while readers can still use the original ciphertext.
+        for (const [handle, blob] of Object.entries(this.readDb())) {
+          this.decrypt(blob);
+          this.writeEntry(handle, blob);
+        }
+        this.writeDb({});
+        fs.writeFileSync(marker, '', { mode: 0o600 });
+      }
+      return operation();
     } finally { release?.(); }
   }
 
   async put(handle: string, secret: string): Promise<void> {
-    await this.mutate(db => { db[handle] = this.encrypt(secret); });
+    this.validateSecret(secret);
+    await this.mutate(() => this.writeEntry(handle, this.encrypt(secret)));
   }
 
   async putIfAbsent(handle: string, secret: string): Promise<void> {
-    await this.mutate(db => { if (!Object.hasOwn(db, handle)) db[handle] = this.encrypt(secret); });
+    this.validateSecret(secret);
+    await this.mutate(() => { if (!this.has(handle)) this.writeEntry(handle, this.encrypt(secret)); });
   }
 
   async move(handle: string, nextHandle: string, replacement?: string): Promise<void> {
-    await this.mutate(db => {
-      const secret = replacement ?? (Object.hasOwn(db, handle) ? this.decrypt(db[handle]!) : undefined);
+    if (replacement !== undefined) this.validateSecret(replacement);
+    await this.mutate(() => {
+      const secret = replacement ?? this.reveal(handle);
       if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
-      db[nextHandle] = this.encrypt(secret);
-      if (nextHandle !== handle) delete db[handle];
+      this.writeEntry(nextHandle, this.encrypt(secret));
+      if (nextHandle !== handle) fs.rmSync(this.entryPath(handle), { force: true });
     });
   }
   has(handle: string): boolean {
-    return handle in this.readDb();
+    return this.readEntry(handle) !== undefined;
   }
   /** Internal: only the broker should call this. */
   reveal(handle: string): string | undefined {
-    const db = this.readDb();
-    return db[handle] ? this.decrypt(db[handle]!) : undefined;
+    const blob = this.readEntry(handle);
+    return blob === undefined ? undefined : this.decrypt(blob);
   }
   list(): string[] {
-    return Object.keys(this.readDb());
+    const handles = fs.readdirSync(this.entriesPath).filter(file => /^[a-f0-9]{64}\.json$/.test(file))
+      .map(file => JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8')).handle as string);
+    if (!fs.existsSync(path.join(this.entriesPath, '.migrated'))) handles.push(...Object.keys(this.readDb()));
+    return [...new Set(handles)];
   }
   async delete(handle: string): Promise<void> {
-    await this.mutate(db => { delete db[handle]; });
+    await this.mutate(() => fs.rmSync(this.entryPath(handle), { force: true }));
   }
 
   async deleteIfEqual(handle: string, observed: string): Promise<boolean> {
-    return this.mutate(db => {
-      if (!Object.hasOwn(db, handle) || this.decrypt(db[handle]!) !== observed) return false;
-      delete db[handle];
+    return this.mutate(() => {
+      if (this.reveal(handle) !== observed) return false;
+      fs.rmSync(this.entryPath(handle), { force: true });
       return true;
     });
   }

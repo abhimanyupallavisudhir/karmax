@@ -476,7 +476,7 @@ describe('zero-exposure CDP fill (§5B)', () => {
   });
 
   it('rejects non-loopback endpoints', async () => {
-    await expect(fillViaCdp({ cdpUrl: 'http://example.com:9222', selector: 'x', text: 'y' })).rejects.toThrow(/loopback/);
+    await expect(fillViaCdp({ cdpUrl: 'http://example.com:9222', expectDomains: ['example.com'], selector: 'x', text: 'y' })).rejects.toThrow(/loopback/);
   });
 
   it('explains how to recover when the browser has no reachable CDP endpoint', async () => {
@@ -488,7 +488,7 @@ describe('zero-exposure CDP fill (§5B)', () => {
     await expect(fillViaCdp({
       cdpUrl: `http://127.0.0.1:${port}`,
       selector: '#password',
-      text: 's3cret',
+      text: 's3cret', expectDomains: ['example.com'],
     })).rejects.toThrow(/Karmax-managed chrome-devtools browser.*cdpUrl/);
   });
 });
@@ -508,4 +508,18 @@ it('matches RFC 6238 SHA-256/SHA-512 vectors and a custom time step', () => {
   }
   const seed = encode('12345678901234567890');
   expect(totpCode(`otpauth://totp/test?secret=${seed}&period=60&digits=8`, 119000)).toBe('94287082');
+});
+
+it('rejects oversized item secrets before saving metadata or handles (AU-5)', async () => {
+  const { items, broker } = makeService();
+  await expect(items.save({ type: 'env', label: 'too big', secrets: { env: 'x'.repeat(65_537) } })).rejects.toThrow(/size/);
+  expect(await items.list()).toEqual([]);
+});
+
+it('bounds each organization independently and permits existing-item updates at quota (AU-5)', async () => {
+  const { items, store } = makeService();
+  const item = await items.save({ type: 'note', label: 'retained', secrets: { note: 'text' } });
+  await store.kvSet('vault:items:org_personal', JSON.stringify(Array.from({ length: 1000 }, (_, i) => ({ ...item, id: i ? `item_${i}` : item.id }))));
+  await expect(items.save({ type: 'note', label: 'extra' })).rejects.toThrow(/quota/);
+  await expect(items.save({ id: item.id, type: 'note', label: 'updated' })).resolves.toMatchObject({ label: 'updated' });
 });

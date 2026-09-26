@@ -314,6 +314,8 @@ export class VaultItems {
     if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
     const label = args.label?.trim() || prior?.label;
     if (!label) throw new Error('a vault item needs a label');
+    if (!prior && (await this.list()).length >= 1000) throw new Error('organization vault item quota reached (1000)');
+    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
