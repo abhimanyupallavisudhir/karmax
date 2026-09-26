@@ -55,6 +55,12 @@ describe('post-push deployment to the public instance', () => {
     expect(operator.split('cmd_update() {')[1]?.split('\n}')[0]).not.toContain('pull --ff-only');
   });
 
+  it('accepts only a successful push from this repository and checks ancestry before executing candidate code', () => {
+    expect(deploy.if).toContain("workflow_run.event == 'push'");
+    expect(deploy.if).toContain('workflow_run.head_repository.full_name == github.repository');
+    expect(script.indexOf('merge-base --is-ancestor')).toBeLessThan(script.indexOf("git show '$DEPLOY_SHA:deploy/karmax'"));
+  });
+
   it('serialises deploys using only GitHub-supported concurrency fields', () => {
     expect(deploy.concurrency.group).toBe('deploy-production');
     expect(deploy.concurrency['cancel-in-progress']).toBe(false);
