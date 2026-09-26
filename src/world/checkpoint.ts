@@ -218,8 +218,7 @@ export class WorldCheckpointService {
     const previousFor = (repo: WorldCheckpoint['repos'][number], index: number) =>
       repo.checkoutPath === '.' ? previousRepos[index]
         : previousRepos.find((candidate) => candidate.name === repo.checkoutPath) ?? previousRepos[index];
-    const sources = (await __asyncCollections.map(checkpoint.repos, async (repo, index) => (await this.store.getRepository(repo.repositoryId))?.sshUrl
-      ?? repo.source ?? (previousFor(repo, index) ? worldRepoSource(previousFor(repo, index)!) : undefined)
+    const sources = (await __asyncCollections.map(checkpoint.repos, async (repo, index) => repo.source ?? (await this.store.getRepository(repo.repositoryId))?.sshUrl ?? (previousFor(repo, index) ? worldRepoSource(previousFor(repo, index)!) : undefined)
       ?? project.config.repos?.[index]));
     if (sources.some((source) => !source)) throw new Error('checkpoint repository enrollment is missing');
     const organizationRepositories = (await this.store.listRepositories(project.organizationId));
@@ -364,9 +363,23 @@ export class WorldCheckpointService {
     const destinations = new Map<string, WorldRepo>();
     for (const repo of checkpoint.repos) {
       options.signal?.throwIfAborted();
-      const destination = worldRepos(world.handle).find((candidate) =>
+      let destination = worldRepos(world.handle).find((candidate) =>
         repo.source && sameRepository(worldRepoSource(candidate), repo.source)
         && (repo.checkoutPath === '.' || candidate.name === repo.checkoutPath));
+      if (!destination && repo.headSha && repo.checkoutPath !== '.' && world.addCheckout) {
+        const from = worldRepos(world.handle).find(candidate => repo.source && sameRepository(worldRepoSource(candidate), repo.source));
+        if (from) {
+          world.handle = await world.addCheckout({ name: repo.checkoutPath, from: from.name,
+            base: repo.headSha, target: repo.target });
+          destination = worldRepos(world.handle).find(candidate => candidate.name === repo.checkoutPath);
+          if (destination) {
+            destination.base = repo.branch;
+            destination.role = repo.role;
+            destination.targetPinned = repo.targetPinned;
+            destination.sourceAuthority = repo.sourceAuthority ?? from.sourceAuthority;
+          }
+        }
+      }
       if (!destination || !repo.headSha) throw new Error(`fork checkout is unavailable: ${repo.checkoutPath}`);
       if (destination.branch === repo.branch) throw new Error('fork cannot reuse a source branch');
       const reset = await world.exec('git', ['reset', '--hard', repo.headSha], { cwd: destination.root });
@@ -381,7 +394,7 @@ export class WorldCheckpointService {
       const repo = destinations.get(file.repo);
       const plain = checkpoint.repos.length === 0 && file.repo === '' && worldRepos(world.handle).length === 0;
       if ((!repo && !plain) || !safeDeltaPath(file.path)) throw new Error('invalid fork delta path');
-      const relative = worldRepos(world.handle).length > 1 ? `${repo!.name}/${file.path}` : file.path;
+      const relative = repo && repo.root !== world.handle.root ? `${repo.name}/${file.path}` : file.path;
       if (file.deleted) {
         const removed = await world.exec('rm', ['-f', '--', file.path], { cwd: repo?.root ?? world.handle.root });
         if (removed.code !== 0) throw new Error(`could not restore deletion: ${file.path}`);

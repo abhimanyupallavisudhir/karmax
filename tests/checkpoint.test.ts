@@ -503,5 +503,10 @@ it('restores distinct branches of the same repository (WD-11)', async () => {
     expect(await opened.readFile('extra/file')).toBe('extra edit');
     expect((await opened.exec('git', ['config', 'user.email'], { cwd: restored.repos![0]!.root })).stdout.trim()).toBe('original@test');
     await expect(opened.readFile('extra/-option')).rejects.toThrow();
+    const fork = await worlds.create('worktree', { taskId: 'independent-fork', repos: [repo], base: 'main', layout: 'nested' });
+    await service.applyFork(checkpoint.id, fork, project.id);
+    expect(await fork.readFile('extra/file')).toBe('extra edit');
+    expect(fork.handle.repos![1]!.branch).not.toBe('extra-branch');
+    await fork.destroy();
   } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
