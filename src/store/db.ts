@@ -379,7 +379,7 @@ export class Store {
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, listId TEXT NOT NULL,
         title TEXT NOT NULL, workflow TEXT NOT NULL, workflowVersion TEXT NOT NULL,
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
-        parentTaskId TEXT, lastView TEXT, createdBy TEXT, assignee TEXT,
+        parentTaskId TEXT, lastView TEXT, completedAt INTEGER, createdBy TEXT, assignee TEXT,
         delegate TEXT, confirmationPolicy TEXT
       );
       CREATE TABLE IF NOT EXISTS organizations (
@@ -849,6 +849,17 @@ export class Store {
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
+    if (!cols.some((c) => c.name === 'completedAt')) {
+      (await this.db.exec('ALTER TABLE tasks ADD COLUMN completedAt INTEGER'));
+      (await this.db.exec(`UPDATE tasks SET completedAt=(SELECT MIN(e.ts) FROM events e
+        WHERE e.taskId=tasks.id AND e.type='view.updated'
+          AND json_extract(e.payload, '$.status')='done')
+        WHERE EXISTS (SELECT 1 FROM events e WHERE e.taskId=tasks.id
+          AND e.type='view.updated' AND json_extract(e.payload, '$.status')='done');
+        UPDATE tasks SET completedAt=CAST(json_extract(lastView, '$.updatedAt') AS BIGINT)
+        WHERE completedAt IS NULL AND json_extract(lastView, '$.status')='done'`));
+    }
+    (await this.db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completedAt, projectId)'));
     const projectCols = (await this.db.prepare('PRAGMA table_info(projects)').all()) as any[];
     const cardCols = (await this.db.prepare('PRAGMA table_info(cards)').all()) as { name: string }[];
     if (!cardCols.some((c) => c.name === 'externalId')) (await this.db.exec('ALTER TABLE cards ADD COLUMN externalId TEXT'));
@@ -5224,6 +5235,8 @@ export class Store {
         .prepare('INSERT INTO events (taskId, type, ts, payload, origin) VALUES (?, ?, ?, ?, ?)')
         .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload), PROCESS_EVENT_ORIGIN));
       const seq = Number(info.lastInsertRowid);
+      if (ev.type === 'view.updated' && ev.payload.status === 'done')
+        (await this.db.prepare('UPDATE tasks SET completedAt=? WHERE id=? AND completedAt IS NULL').run(ev.ts, ev.taskId));
       (await this.materializeInbox(seq, ev));
       if (!nested) (await this.db.exec('COMMIT'));
       return seq;
@@ -6485,10 +6498,9 @@ export class Store {
       metadata: string | null; startedAt: number }>;
     cardSpend: Array<{ amount: number; currency: string; createdAt: number }>;
   }> {
-    const completions = (await this.db.prepare(`SELECT e.taskId AS taskId, MIN(e.ts) AS doneAt FROM events e
-      JOIN tasks t ON t.id=e.taskId JOIN projects p ON p.id=t.projectId
-      WHERE COALESCE(p.organizationId, 'org_personal')=? AND e.type='view.updated' AND e.payload LIKE ?
-      GROUP BY e.taskId HAVING MIN(e.ts)>=?`).all(organizationId, '%"status":"done"%', from)) as any[];
+    const completions = (await this.db.prepare(`SELECT t.id AS taskId, t.completedAt AS doneAt FROM tasks t
+      JOIN projects p ON p.id=t.projectId WHERE COALESCE(p.organizationId, 'org_personal')=?
+        AND t.completedAt>=?`).all(organizationId, from)) as any[];
     const admissions = (await this.db.prepare(`SELECT id, taskId, projectId, provider, model, state, createdAt, releasedAt
       FROM usage_admissions WHERE organizationId=? AND kind='agent' AND createdAt>=?`).all(organizationId, from)) as any[];
     const tokens = (await this.db.prepare(`SELECT id, taskId, projectId, provider, quantity, metadata, startedAt

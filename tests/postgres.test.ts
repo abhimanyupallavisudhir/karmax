@@ -99,6 +99,19 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('keeps completion dates after event retention', async () => {
+    const store = await Store.create(url!);
+    try {
+      const now = Date.UTC(2026, 8, 26);
+      const project = await store.createProject('Insights');
+      const task = await store.createTask({ projectId: project.id, title: 'Shipped', workflow: 'just-do', workflowVersion: '1', params: {} });
+      await store.appendEvent({ taskId: task.id, type: 'view.updated', ts: now - 86400_000, payload: { status: 'done' } });
+      await store.retentionSweep(now + 100 * 86400_000);
+      expect((await store.insightRows('org_personal', now - 30 * 86400_000, now)).completions)
+        .toContainEqual({ taskId: task.id, doneAt: now - 86400_000 });
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);
