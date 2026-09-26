@@ -123,6 +123,8 @@ export interface LimitClassifierOptions {
   /** Enables semantic phrase-family matching. Use only at the provider adapter
    * boundary; arbitrary build/git errors must remain on the Resolve path. */
   providerOrigin?: boolean;
+  /** Preserve message-only failure routing recorded by older workflow histories. */
+  legacy?: boolean;
 }
 
 const diagnosticText = (value: unknown, max = 500): string | undefined => {
@@ -333,7 +335,8 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
 
   // Stable human phrases retained for compatibility with old workflow histories and
   // with providers (notably subscription CLIs) that expose no machine error code.
-  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?|credit balance is too low/.test(lc);
+  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc)
+    || (!options.legacy && /credit balance is too low/.test(lc));
   const knownLimit =
     /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc);
 
@@ -375,7 +378,7 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
   const resetMatch = m.match(/resets?\s+([^\n."']+?)(?:\s*[.\n"']|$)/i);
   const retryMatch = m.match(/(?:try again in|retry (?:after|in))\s+(\d+(?:\.\d+)?)\s*(s|seconds?|m|minutes?|h|hours?)\b/i);
   const resetHint = resetMatch ? resetMatch[1]!.trim()
-    : retryMatch ? `in ${retryMatch[1]}${retryMatch[2]}` : undefined;
+    : !options.legacy && retryMatch ? `in ${retryMatch[1]}${retryMatch[2]}` : undefined;
   return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
 }
 

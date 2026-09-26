@@ -11,6 +11,15 @@ describe('workflow infrastructure failures', () => {
     expect(isInfraFailure(failure)).toBe(true);
   });
 
+  it.each(['credit balance is too low', '429: try again in 2.5s'])(
+    'preserves replay routing for an old untyped limit: %s', (message) => {
+      const cause = ApplicationFailure.nonRetryable(message, 'agent-limit');
+      const failure = new ActivityFailure('activity failed', 'runAgentTurn', '1',
+        'NON_RETRYABLE_FAILURE', 'worker', cause);
+      expect(limitFailureClassification(failure)).toEqual({ limited: true, kind: 'quota', window: '5h' });
+    },
+  );
+
   it('never quarantines or retries a serialized safety failure', () => {
     const cause = ApplicationFailure.nonRetryable('Codex safety rejection: misalignmentPolicyViolation HTTP 401', 'agent-policy');
     const failure = new ActivityFailure('activity failed', 'runAgentTurn', '1',
