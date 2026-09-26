@@ -52,13 +52,16 @@ describe('agent project-secret delivery', () => {
       serviceEnvironmentHandles: serviceHandle.meta?.serviceEnvironmentHandles,
     }));
     try {
+      await broker.registerHandle('leased:model-key', 'leased-secret');
       await core.runAgentTurn({
         taskId: task.id,
+        accountApiKeyHandle: 'leased:model-key',
         role: 'do',
         worldHandle: handle,
         messages: [{ id: 'm1', role: 'user', text: 'work', ts: 0 }],
         task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any,
       });
+      expect(received?.resolvedAuth?.apiKey).toBe('leased-secret');
       expect(received?.secretEnv).toEqual({
         DATABASE_URL: 'postgres://task-service',
         PROJECT_TOKEN: 'secret-project-token',

@@ -1900,7 +1900,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // resolve JIT; reserved environment-key references carry only the provider
       // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
-        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
+        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
         resolvedAuth = { apiKey };
       }
       // A remote world cannot inherit the host CLI's ambient subscription by
