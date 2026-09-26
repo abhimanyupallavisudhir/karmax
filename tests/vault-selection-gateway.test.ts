@@ -79,6 +79,14 @@ describe('credential selection ranking through HTTP', () => {
       expect((await vault.access([], task.id, login, 'use')).status).toBe('granted');
       expect((await fill('password', '#pw')).status).toBe(200);
       expect((await vault.access([], task.id, login, 'use')).status).toBe('needs_approval');
+      (gateway as any).deps.hosted = true;
+      const remotePasskey = await fetch(`${running.url}/api/vault/passkey/enroll`, {
+        method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ domain: 'example.com', cdpUrl: 'http://127.0.0.1:1' }),
+      });
+      expect(remotePasskey.status).toBe(400);
+      expect((await remotePasskey.json() as any).error).toMatch(/remote passkey sessions/);
+
 
     } finally {
       await close?.();

@@ -6527,6 +6527,13 @@ export class Gateway {
 
         // ── agent-enrolled passkeys (§8) ──
         if (p.startsWith('/api/vault/passkey')) {
+          const passkeyTask = callerTaskId ? await store.getTask(callerTaskId) : undefined;
+          const passkeyWorld = passkeyTask ? worldHandleForView(passkeyTask.lastView, callerTaskId!,
+            await store.effectiveProjectConfig(passkeyTask.projectId)) : undefined;
+          if (this.deps.hosted || (passkeyWorld && (worldHandleIsRemote(passkeyWorld)
+            || this.deps.worlds.get(passkeyWorld.kind)?.capabilities?.remote)))
+            return this.json(res, 400, { error: 'passkeys require a local browser; remote passkey sessions are not available yet' });
+          const passkeyOwner = JSON.stringify([organizationId, principal, callerTaskId]);
           if (!this.passkeys) {
             const { PasskeyManager } = await import('../autonomy/passkey.js');
             this.passkeys = new PasskeyManager();
@@ -6536,11 +6543,11 @@ export class Gateway {
           try {
             if (p === '/api/vault/passkey/enroll' && method === 'POST') {
               const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll' });
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll', owner: passkeyOwner });
               return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/save' && method === 'POST') {
-              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''));
+              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''), passkeyOwner);
               if (!creds.length) return this.json(res, 400, { error: 'no passkey was created on the page — trigger the site\'s enroll button first' });
               const saved = (await vault.save({
                 type: 'passkey',
@@ -6563,11 +6570,24 @@ export class Gateway {
               if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
               const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
               const domains = item.domains;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0] });
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
+                onCredentials: async updated => {
+                  await store.transaction(async () => {
+                    const current = await vault.get(item.id);
+                    if (!current || current.type !== 'passkey') return;
+                    const saved = JSON.parse(await vault.readSecret(current, 'passkey')) as any[];
+                    for (const credential of saved) {
+                      const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
+                      if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
+                        credential.signCount = next.signCount;
+                    }
+                    await vault.save({ id: current.id, type: 'passkey', secrets: { passkey: JSON.stringify(saved) } });
+                  });
+                } });
               return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/release' && method === 'POST') {
-              (await this.passkeys.release(String(b.authenticatorId ?? '')));
+              (await this.passkeys.release(String(b.authenticatorId ?? ''), passkeyOwner));
               return this.json(res, 200, { released: true });
             }
           } catch (e) {
