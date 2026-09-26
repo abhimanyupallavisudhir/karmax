@@ -31,6 +31,12 @@ describe('Untrusted MCP processes', () => {
     const client = await connectWorldMcp(world(), server('hang'), controller.signal); clients.push(client);
     const pending = expect(client.listTools()).rejects.toThrow(); controller.abort(); await pending; await exited();
   });
+  it('reaps a server that ignores graceful termination', async () => {
+    const client = await connectWorldMcp(world(), server('stubborn')); clients.push(client);
+    const pid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'));
+    try { await client.close(); await exited(); }
+    finally { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  }, 7000);
   it('handles an unavailable executable without a hanging initialization', async () => {
     await expect(connectWorldMcp(world(), { name: 'missing', command: path.join(dir, 'does-not-exist') })).rejects.toThrow(/could not start/);
   }, 5000);

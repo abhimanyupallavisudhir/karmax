@@ -20,13 +20,24 @@ export async function connectWorldMcp(world: World, server: AgentMcpServer, sign
     ? new RemoteSpawnedProcess(world, `stty raw -echo; printf '\\036KARMAX_AGENT_READY\\036'; exec ${[server.command, ...(server.args ?? [])].map(quote).join(' ')} 2>/dev/null`, world.handle.root, server.env ?? {}, signal)
     : spawn(server.command, server.args ?? [], { cwd: world.handle.root, env, stdio: ['pipe', 'pipe', 'ignore'] });
   let buffered = ''; let bufferedBytes = 0; const decoder = new StringDecoder('utf8');
+  let closed = false, stopping = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  child.once('close', () => { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', abort); });
+  const stop = () => {
+    if (closed || stopping) return;
+    stopping = true; buffered = ''; bufferedBytes = 0;
+    child.kill();
+    if (!(child instanceof RemoteSpawnedProcess))
+      killTimer = setTimeout(() => { if (!closed) child.kill('SIGKILL'); }, 1000).unref();
+  };
   const transport: Transport = {
     async start() {
       child.on('error', (e) => transport.onerror?.(e));
       child.on('close', () => transport.onclose?.());
-      child.stdin?.on('error', (error) => { child.kill(); transport.onerror?.(error); });
-      child.stdout?.on('error', (error) => { child.kill(); transport.onerror?.(error); });
+      child.stdin?.on('error', (error) => { stop(); transport.onerror?.(error); });
+      child.stdout?.on('error', (error) => { stop(); transport.onerror?.(error); });
       child.stdout!.on('data', (chunk: Buffer) => {
+        if (stopping) return;
         const decoded = decoder.write(chunk); buffered += decoded; bufferedBytes += Buffer.byteLength(decoded);
         try {
           let end: number;
@@ -37,12 +48,12 @@ export async function connectWorldMcp(world: World, server: AgentMcpServer, sign
             if (line.trim()) transport.onmessage?.(JSONRPCMessageSchema.parse(JSON.parse(line)));
           }
           if (bufferedBytes > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
-        } catch { child.kill(); transport.onerror?.(new Error('Invalid or oversized MCP response')); }
+        } catch { stop(); transport.onerror?.(new Error('Invalid or oversized MCP response')); }
 
       });
     },
     async send(message) { const data = serializeMessage(message); if (Buffer.byteLength(data) > 2 * 1024 * 1024) throw new Error('MCP request exceeds 2 MiB'); child.stdin!.write(data); },
-    async close() { signal?.removeEventListener('abort', abort); child.kill(); },
+    async close() { signal?.removeEventListener('abort', abort); stop(); },
   };
   const abort = () => { void transport.close(); };
   signal?.addEventListener('abort', abort, { once: true });

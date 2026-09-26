@@ -137,11 +137,18 @@ export class WorkflowRepoLoader {
     // Snapshot the exact commit into an immutable, .git-free version dir.
     const dir = path.join(nameDir, sha);
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-      const tarball = path.join(nameDir, `.${sha}.tar`);
-      await gitOrThrow(work, ['archive', '--format=tar', '-o', tarball, sha], { env });
-      await extractTar(tarball, dir);
-      fs.rmSync(tarball, { force: true });
+      const temporary = fs.mkdtempSync(path.join(nameDir, `.${sha}-`));
+      try {
+        const tarball = path.join(temporary, 'snapshot.tar'), tree = path.join(temporary, 'tree');
+        fs.mkdirSync(tree);
+        await gitOrThrow(work, ['archive', '--format=tar', '-o', tarball, sha], { env });
+        await extractTar(tarball, tree);
+        // A failed extraction must never look like a reusable immutable snapshot.
+        try { fs.renameSync(tree, dir); }
+        catch (error) {
+          if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '') || !fs.existsSync(dir)) throw error;
+        }
+      } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
     }
 
     const { manifest, workflowEntry } = await inspectDir(dir);
