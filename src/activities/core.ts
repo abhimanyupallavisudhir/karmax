@@ -2582,7 +2582,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const details = await provider.retrieveCardDetails(card.id);
                   const expected = [domain];
                   let origin: string;
-                  if (isRemote(world.handle.kind) || world.handle.kind === 'container') {
+                  if (isRemote(world.handle.kind)) {
                     origin = (await fillCardInWorld(world, {
                       cdpUrl: fill.cdpUrl, domain, selectors: fill.selectors, details,
                     })).origin;
