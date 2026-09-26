@@ -75,6 +75,11 @@ describe('classifyLimitError', () => {
     expect(c.hard).toBe(true);
   });
 
+  it('classifies Anthropic low credit balance as hard billing exhaustion', () => {
+    expect(classifyLimitError('Your credit balance is too low to access the Anthropic API.', { providerOrigin: true }))
+      .toMatchObject({ limited: true, hard: true, kind: 'quota' });
+  });
+
   it('generalizes novel provider wording by nearby state+noun phrase families', () => {
     const hard = classifyLimitError('Your prepaid balance has now been fully consumed.', { providerOrigin: true });
     expect(hard).toMatchObject({ limited: true, hard: true, kind: 'quota' });
@@ -217,6 +222,7 @@ describe('resetAtFromHint', () => {
   });
 
   it('parses relative "in Ns / N minutes / N hours" hints (Codex resets_in_seconds)', () => {
+    expect(resetAtFromHint('in 2.5s', '5h', now)).toBe(now + 2500);
     expect(resetAtFromHint('in 3600s', '5h', now)).toBe(now + 3600 * 1000);
     expect(resetAtFromHint('in 90 minutes', 'weekly', now)).toBe(now + 90 * 60_000);
     expect(resetAtFromHint('in 3 hours', '5h', now)).toBe(now + 3 * 3_600_000);

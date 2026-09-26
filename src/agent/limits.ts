@@ -333,7 +333,7 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
 
   // Stable human phrases retained for compatibility with old workflow histories and
   // with providers (notably subscription CLIs) that expose no machine error code.
-  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc);
+  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?|credit balance is too low/.test(lc);
   const knownLimit =
     /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc);
 
@@ -373,7 +373,9 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
     }
   }
   const resetMatch = m.match(/resets?\s+([^\n."']+?)(?:\s*[.\n"']|$)/i);
-  const resetHint = resetMatch ? resetMatch[1]!.trim() : undefined;
+  const retryMatch = m.match(/(?:try again in|retry (?:after|in))\s+(\d+(?:\.\d+)?)\s*(s|seconds?|m|minutes?|h|hours?)\b/i);
+  const resetHint = resetMatch ? resetMatch[1]!.trim()
+    : retryMatch ? `in ${retryMatch[1]}${retryMatch[2]}` : undefined;
   return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
 }
 
@@ -384,10 +386,18 @@ export function providerErrorFromMessage(
   provider: ProviderFailureMetadata['provider'],
   message: string,
   source: ProviderFailureSource = 'message',
+  apiThrottle?: { retryAfter: string | null; nowMs: number },
 ): Error {
   if (isProviderPolicyRejection(message)) return new ProviderPolicyFailure(message, provider);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
+  if (apiThrottle && !cls.hard) {
+    const raw = apiThrottle.retryAfter?.trim();
+    const seconds = raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw)
+      : raw ? (Date.parse(raw) - apiThrottle.nowMs) / 1000 : NaN;
+    cls.resetHint = seconds > 0 && seconds <= 14 * 24 * 3600
+      ? `in ${seconds}s` : cls.resetHint ?? 'in 60s';
+  }
   const diagnostic = nativeProviderDiagnostic(message);
   return new ProviderFailure(message, {
     kind: cls.kind ?? 'quota',
@@ -470,9 +480,9 @@ export function resetAtFromHint(resetHint: string | undefined, window: LimitWind
   // Relative forms (machine-readable, e.g. Codex's `resets_in_seconds`): "in 3600s",
   // "in 90 minutes", "in 3 hours". Checked BEFORE clock times so "3600s" isn't
   // misread as a wall-clock time. Bounded to ≤14 days to reject absurd values.
-  const rel = hint.match(/(?:in\s+)?(\d+)\s*(s|sec|secs|second|seconds)\b/);
+  const rel = hint.match(/(?:in\s+)?(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds)\b/);
   if (rel) {
-    const secs = parseInt(rel[1]!, 10);
+    const secs = Number(rel[1]!);
     if (secs > 0 && secs <= 14 * 24 * 3600) return nowMs + secs * 1000;
   }
   const relM = hint.match(/in\s+(\d+)\s*(m|min|mins|minute|minutes)\b/);

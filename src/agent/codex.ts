@@ -306,7 +306,8 @@ export class CodexAdapter implements AgentAdapter {
       });
       if (!res.ok) {
         const message = `OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`;
-        throw providerErrorFromMessage('codex', message, 'structured');
+        throw providerErrorFromMessage('codex', message, 'structured',
+            res.status === 429 ? { retryAfter: res.headers.get('retry-after'), nowMs: Date.now() } : undefined);
       }
       const data = (await res.json()) as any;
       (await (await currentTiming())?.markOnce('first.output'));
