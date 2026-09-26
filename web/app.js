@@ -5962,7 +5962,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
-      </footer>
+      </div>
     </div>`;
   wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
@@ -13329,104 +13329,6 @@ async function hydrateProjectEnvironment(proj) {
   } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectEnvironment(proj)); }
 }
 
-async function hydrateProjectResources(proj) {
-  const box = $('#project-resources'); if (!box) return;
-  try {
-    const resources = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
-    const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
-    box.innerHTML = `<div class="section-h">Attached resources</div>
-      <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
-      <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
-        <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
-          <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
-        <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
-      </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
-      <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
-      <div class="settings-grid">
-        <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
-        <label class="form-row">Kind<select id="resource-driver"><option value="volume@1">Versioned files / model / SQLite</option><option value="secret@1">Secret</option><option value="database@1">Shared database URL</option><option value="service@1">External service credential</option></select></label>
-        <label class="form-row">World path or variable<input id="resource-target" placeholder="resources/training-data"></label>
-        <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
-        <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
-        <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Upload files<input id="resource-files" type="file" multiple></label>
-        <label class="form-row">Upload a folder<input id="resource-folder" type="file" multiple webkitdirectory></label>
-      </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
-    const driverInput = $('#resource-driver');
-    const syncDefaults = () => {
-      const name = $('#resource-name').value.trim() || 'resource';
-      const fileKind = driverInput.value === 'volume@1';
-      $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-      $('#resource-secret').disabled = fileKind;
-      $('#resource-files').disabled = !fileKind;
-      $('#resource-folder').disabled = !fileKind;
-      if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
-    };
-    driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
-    $('#resource-scan')?.addEventListener('click', async () => {
-      const button = $('#resource-scan'); const results = $('#resource-scan-results');
-      button.disabled = true; button.textContent = 'Scanning…';
-      try {
-        const scan = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources/scan`);
-        results.innerHTML = scan.proposals.length ? `<div class="section-h">Suggested classifications</div>${scan.proposals.map((proposal, index) =>
-          `<div class="queue-item" data-proposal="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span>
-          <div class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</div></div><button class="btn sm resource-use-proposal">Use suggestion</button></div>`).join('')}`
-          : '<p class="task-sub">No likely resources found. You can still attach one below.</p>';
-        results.querySelectorAll('[data-proposal]').forEach((row) => row.querySelector('.resource-use-proposal').addEventListener('click', () => {
-          const proposal = scan.proposals[Number(row.dataset.proposal)];
-          $('#resource-name').value = proposal.path.split('/').pop().replace(/\.[^.]+$/, '') || proposal.kind;
-          $('#resource-driver').value = proposal.suggested.driver;
-          $('#resource-target').value = proposal.suggested.target.path || proposal.suggested.target.name;
-          $('#resource-access').value = proposal.suggested.access;
-          $('#resource-publish').value = proposal.suggested.publish;
-          if ($('#resource-source-path') && proposal.suggested.driver === 'volume@1')
-            $('#resource-source-path').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#resource-driver').dispatchEvent(new Event('change'));
-          if (proposal.suggested.driver === 'secret@1') $('#resource-secret').focus();
-          else $('#resource-add').focus();
-        }));
-      } catch (error) { results.textContent = error.message; }
-      finally { button.disabled = false; button.textContent = 'Scan ignored project files'; }
-    });
-    $('#resource-add').addEventListener('click', async () => {
-      const button = $('#resource-add'); const name = $('#resource-name').value.trim();
-      if (!name) return toast('Resource name is required', true);
-      const driver = driverInput.value; const isFiles = driver === 'volume@1';
-      const enteredTarget = $('#resource-target').value.trim();
-      const target = isFiles ? { kind: 'path', path: enteredTarget || `resources/${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}` }
-        : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
-      button.disabled = true; button.textContent = 'Attaching…';
-      try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files, ...$('#resource-folder').files] : [];
-        const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
-          access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
-          publish: $('#resource-publish').value, secret: $('#resource-secret').value,
-          sourcePath: $('#resource-source-path')?.value.trim() || undefined }) });
-        if (selectedFiles.length) {
-          button.textContent = 'Uploading…';
-          await uploadResourceFiles(proj.id, created.id, selectedFiles, (sent, total) => {
-            button.textContent = `Uploading ${Math.round(sent / Math.max(total, 1) * 100)}%…`;
-          });
-        }
-        toast('Resource attached'); await hydrateProjectResources(proj);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Attach resource'; }
-    });
-    box.querySelectorAll('[data-resource]').forEach((row) => {
-      const resource = resources.find((candidate) => candidate.id === row.dataset.resource);
-      row.querySelector('.resource-toggle').addEventListener('click', async () => {
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-      row.querySelector('.resource-delete').addEventListener('click', async () => {
-        if (!confirm(`Remove resource “${resource.name}”? Existing task snapshots and audit history may be retained, but new tasks will no longer receive it.`)) return;
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-    });
-  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
-}
 
 async function uploadResourceFiles(projectId, resourceId, files, progress) {
   const upload = await api(`/api/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/uploads`, { method: 'POST' });
@@ -19683,7 +19585,7 @@ async function finishMcpCallback() {
   const key = `mcp-oauth:${state}`; let pending;
   try { pending = JSON.parse(sessionStorage.getItem(key) || 'null'); } catch {}
   history.replaceState({}, '', '/mcp-callback');
-  document.querySelector('#app').innerHTML = '<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to Tavya</a></main>';
+  document.querySelector('#app').innerHTML = `<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to ${siteNameMarkup()}</a></main>`;
   const status = document.querySelector('.mcp-callback p');
   try {
     if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
