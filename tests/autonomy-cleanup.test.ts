@@ -39,3 +39,19 @@ it('deletes organization secrets, inbox routes and key files without touching pe
     expect(await mail.recent(org.id)).toEqual([]);
   } finally { await store.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+it('allows an empty organization without a broker but retains metadata if secret cleanup is unavailable (AU-15)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'autonomy-cleanup-empty-'));
+  const store = await Store.create(':memory:');
+  try {
+    const { deleteOrganizationAutonomy } = await import('../src/autonomy/cleanup.js');
+    const org = await store.createOrganization({ name: 'Empty' });
+    await expect(deleteOrganizationAutonomy(store, undefined, org.id, home)).resolves.toBeUndefined();
+    const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
+    const vault = new VaultItems(store, broker, home, org.id);
+    const item = await vault.save({ type: 'login', label: 'Retained', secrets: { password: 'retained-secret' } });
+    await expect(deleteOrganizationAutonomy(store, undefined, org.id, home)).rejects.toThrow(/broker/);
+    expect(await vault.get(item.id)).toBeDefined();
+    expect(broker.hasHandle(itemHandle(item.id, 'password'))).toBe(true);
+  } finally { await store.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});

@@ -23,12 +23,17 @@ export async function deleteAgentMail(store: Store, broker: CredentialBroker | u
  * until its destructive cleanup succeeds. All steps are safe to retry. */
 export async function deleteOrganizationAutonomy(store: Store, broker: CredentialBroker | undefined,
   organizationId: string, home = paths().state): Promise<void> {
-  if (!broker) throw new Error('credential broker is required for organization secret cleanup');
   const vault = new VaultItems(store, broker, home, organizationId);
-  for (const item of await vault.list()) await vault.delete(item.id);
-  for (const card of await store.listOrganizationCards(organizationId)) await broker.deleteHandle(`payment:card:${card.id}`);
-  for (const handle of broker.listHandles()) {
-    if (handle.startsWith(`connector:${organizationId}:`) || handle.startsWith(`connector-export:${organizationId}:`)) await broker.deleteHandle(handle);
+  const items = await vault.list();
+  const cards = await store.listOrganizationCards(organizationId);
+  if (!broker && (items.length || cards.length
+    || (await store.kvEntries(`vault:connector:${organizationId}:`)).length
+    || await store.kvGet(`agent-mail:provider:${organizationId}`)))
+    throw new Error('credential broker is required for organization secret cleanup');
+  for (const item of items) await vault.delete(item.id);
+  for (const card of cards) await broker!.deleteHandle(`payment:card:${card.id}`);
+  for (const handle of broker?.listHandles() ?? []) {
+    if (handle.startsWith(`connector:${organizationId}:`) || handle.startsWith(`connector-export:${organizationId}:`)) await broker!.deleteHandle(handle);
   }
   await deleteAgentMail(store, broker, organizationId);
   for (const prefix of [`vault:connector:${organizationId}:`, `pass-writeback:${organizationId}:`]) {
