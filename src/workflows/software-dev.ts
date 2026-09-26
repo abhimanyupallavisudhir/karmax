@@ -749,6 +749,8 @@ async function softwareDevImpl(
   // The epoch wakes a human pause so an accepted edit reroutes that same question.
   let liveResponder = input.responder;
   let responderEpoch = 0;
+  let responderRounds = 0;
+  let subtaskNags = 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, {
     accountId: string;
@@ -891,6 +893,7 @@ async function softwareDevImpl(
     if (mutableInputResponder && patch.responder && typeof patch.responder === 'object') {
       liveResponder = patch.responder as ResponderConfig;
       responderEpoch++;
+      responderRounds = 0;
       applied.push('responder');
     }
     for (const name of Object.keys(patch)) {
@@ -1270,6 +1273,8 @@ async function softwareDevImpl(
   });
   setHandler(followUpSignal, (m, role) => {
     manualPrConfirmer = undefined;
+    responderRounds = 0;
+    subtaskNags = 0;
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript). A turn currently
@@ -1360,6 +1365,7 @@ async function softwareDevImpl(
   if (recovery && patched('software-dev-preserve-replacement-children-v1'))
     setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => settled.push(result));
   setHandler(raiseFromChildSignal, (r) => {
+    if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
   });
@@ -2445,7 +2451,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         } catch {
           /* child already gone */
         }
-        awaitingResponse.delete(cid);
+        if (awaitingResponse.delete(cid)) subtaskNags = 0;
       }
     }
   }
@@ -2491,6 +2497,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     while (settled.length) {
       const s = settled.shift()!;
       if (recovery && patched('software-dev-preserve-replacement-children-v1') && !outstanding.has(s.childTaskId)) continue;
+      subtaskNags = 0;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
@@ -2766,7 +2773,11 @@ Inspect the complete current diff and specifically compare its delta from the re
         // so the parent's own Review/Merge never races ahead of its delegated work.
         // Stay responsive: wake on a child raise/settlement or a human follow-up.
         status = 'waiting';
-        waitingFor = { kind: 'subtask' };
+        const boundedNags = patched('software-dev-bounded-input-loops-v1');
+        const needsHuman = boundedNags && awaitingResponse.size > 0 && subtaskNags >= 3;
+        waitingFor = needsHuman
+          ? { kind: 'human', audience: ['@creator'], detail: 'The managing agent has not answered its children after three reminders. Send guidance to continue.' }
+          : { kind: 'subtask' };
         await publish();
         const wake = () => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen;
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
@@ -2776,8 +2787,10 @@ Inspect the complete current diff and specifically compare its delta from the re
         // and re-prompt the agent (the unresolved raise is still in the conversation)
         // until it acts — SPEC §5.3 "keep prompting". With nothing awaiting us, wait
         // indefinitely for the next child event or human follow-up.
-        if (awaitingResponse.size > 0) await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
-        else await condition(wake);
+        if (awaitingResponse.size > 0 && !needsHuman) {
+          if (boundedNags) subtaskNags++;
+          await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+        } else await condition(wake);
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
@@ -2985,7 +2998,9 @@ Inspect the complete current diff and specifically compare its delta from the re
             while (!prRequested && !cancelled && msgs.length <= seen) {
               const routeEpoch = responderEpoch;
               const route = liveResponder;
-              if (routedInputResponder && route?.kind === 'agent') {
+              const boundedResponses = patched('software-dev-bounded-input-loops-v1');
+              if (routedInputResponder && route?.kind === 'agent' && (!boundedResponses || responderRounds < 3)) {
+                if (boundedResponses) responderRounds++;
                 waitingFor = { kind: 'responder', detail: question };
                 await publish();
                 const answer = await responderTurn(route, question);
@@ -3013,7 +3028,8 @@ Inspect the complete current diff and specifically compare its delta from the re
                   audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
                     ? route.audience
                     : ['@creator'],
-                  detail: question,
+                  detail: boundedResponses && route?.kind === 'agent' && responderRounds >= 3
+                    ? `Three automated responses have not resolved this pause. ${question}` : question,
                 };
               }
               await publish();

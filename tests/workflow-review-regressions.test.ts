@@ -22,6 +22,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
   condition: async (predicate: () => boolean, timeout?: unknown) => {
     wf.timeout = timeout;
     if (!predicate()) wf.wait?.();
+    if (!predicate() && timeout !== undefined) return false;
     if (!predicate()) throw new Error('test: unexpected wait');
     return true;
   },
@@ -248,3 +249,33 @@ it('WF-4: recovered conversations are not copied into every agent task input', a
   expect(taskInput.recovery).toBeUndefined();
 });
 
+it('WF-14: repeated Do and Responder exchanges eventually wait for a human', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  let rounds = 0;
+  wf.activities.runAgentTurn.mockImplementation(async ({ role }: any) => {
+    if (role === 'responder') return { output: ++rounds <= 3 ? 'Continue working' : undefined };
+    return {};
+  });
+  wf.wait = () => {
+    expect(wf.handlers.get('view')!().waitingFor.kind).toBe('human');
+    wf.handlers.get('cancel')!();
+  };
+  await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] }, responder: { kind: 'agent' } });
+  expect(rounds).toBe(3);
+});
+
+it('WF-14: caps unanswered child nags and leaves a responsive human wait', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.restoreChildTasks.mockResolvedValue([{ taskId: 'child', title: 'Child', waiting: true, detail: 'Review' }]);
+  wf.activities.runAgentTurn.mockResolvedValue({ waitForSubtasks: true });
+  let waits = 0;
+  wf.wait = () => {
+    if (++waits < 4) return;
+    if (wf.handlers.get('view')!().stage === 'cancelled') return;
+    expect(wf.handlers.get('view')!().waitingFor.kind).toBe('human');
+    expect(wf.timeout).toBeUndefined();
+    wf.handlers.get('cancel')!();
+  };
+  await softwareDevV1_26({ ...input, recovery: { messages: [], resumeStage: 'do' } });
+  expect(waits).toBeGreaterThanOrEqual(4);
+});
