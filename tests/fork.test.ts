@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { materializeFork, claudeCwdSlug, findProviderSession } from '../src/agent/fork.js';
+import { materializeFork, claudeCwdSlug, findProviderSession, codexSessionFiles } from '../src/agent/fork.js';
 
 /**
  * Hermetic verification of fork materialization (SPEC §10.5 / the fork-bug fix):
@@ -196,4 +196,21 @@ describe('materializeFork — Codex (by id in the home)', () => {
       fs.rmSync(forkHome, { recursive: true, force: true });
     }
   });
+});
+
+
+it('reads only bounded metadata when following Codex history lineage', () => {
+  const home = tmp('karmax-lineage-bounded-');
+  const session = sid();
+  const dir = path.join(home, 'sessions');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, `rollout-${session}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session } }) + '\n');
+  fs.appendFileSync(file, ' '.repeat(2 * 1024 * 1024));
+  const readFile = vi.spyOn(fs, 'readFileSync');
+  try {
+    expect(codexSessionFiles({ session, forkHome: home, searchInstallation: false })).toEqual([file]);
+    // Selection validates copies once; lineage inspection must not read it again.
+    expect(readFile.mock.calls.filter(([name]) => name === file)).toHaveLength(1);
+  } finally { readFile.mockRestore(); fs.rmSync(home, { recursive: true, force: true }); }
 });
