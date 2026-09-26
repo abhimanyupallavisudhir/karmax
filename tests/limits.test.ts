@@ -13,6 +13,15 @@ import {
 } from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
+  it.each([
+    'organization model request rate limit exceeded',
+    'organization remote sandbox start rate limit exceeded',
+    'organization active model turn limit reached',
+    'E2B RateLimitError 429', 'npm registry HTTP 401 unauthorized', 'Disk quota exceeded',
+  ])('never parks a login for an untagged error: %s', (message) => {
+    expect(classifyProviderTurnError(new Error(message), 'claude').classification.limited).toBe(false);
+  });
+
   it('keeps safety blocks task-local even when the envelope says unauthorized', () => {
     const message = 'misalignmentPolicyViolation HTTP 401 unauthorized: This request was blocked by our safety systems. Reason: Potentially unintended activity.';
     expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });

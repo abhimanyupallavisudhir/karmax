@@ -1,3 +1,4 @@
+import { ProviderStreamError } from './limits.js';
 import type { Writable, Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -91,7 +92,7 @@ export class CodexAppServerClient {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
-      if (msg.error) p.reject(new Error(errorText(msg.error)));
+      if (msg.error) p.reject(new ProviderStreamError(errorText(msg.error)));
       else p.resolve(msg.result);
       return;
     }

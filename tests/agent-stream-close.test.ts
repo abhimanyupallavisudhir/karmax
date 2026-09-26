@@ -114,6 +114,12 @@ afterEach(() => {
 });
 
 describe('Claude Agent-SDK input stream vs. the harness control channel', () => {
+  it('does not convert SDK bootstrap errors into shared-login failures', async () => {
+    const error = Object.assign(new Error('E2B AuthenticationError HTTP 401 unauthorized'), { status: 401 });
+    fakeHarness(async function* () { throw error; });
+    await expect(runTurn([])).rejects.toBe(error);
+  });
+
   it('keeps the control channel alive while a backgrounded shell settles after the first result', async () => {
     const seen: string[] = [];
     fakeHarness(async function* (h) {

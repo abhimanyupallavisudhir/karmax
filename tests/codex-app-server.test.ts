@@ -35,6 +35,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       send({ id: 5000, method: 'item/tool/call', params: { callId: 'c1', tool: 'confirm_decision', arguments: { action: 'confirm' } } });
       return;
     }
+    if (mode === 'stderr-limit') { process.stderr.write('npm registry 429 rate limit exceeded'); process.exit(1); }
     if (mode === 'exit') process.exit(0);
     else if (mode === 'expired-app-token') {
       const detail = 'Provided authentication token is expired. Please try signing in again.';
@@ -234,6 +235,12 @@ describe('CodexAdapter app-server security policy', () => {
     });
     expect(requests.some((r) => r.method === 'thread/resume')).toBe(false);
     expect(requests.find((r) => r.method === 'turn/start')?.params.threadId).toBe('thread-forked');
+  });
+
+  it('does not classify subprocess stderr as a provider limit', async () => {
+    const error = await run(undefined, 'stderr-limit').catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).not.toBe('ProviderFailure');
   });
 
   it('rejects an interrupted terminal status even when partial assistant text exists', async () => {
