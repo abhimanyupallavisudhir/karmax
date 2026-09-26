@@ -199,6 +199,8 @@ describe('inbox', () => {
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));
+    // Production defers inbox reconciliation until the gateway is ready.
+    await migrated.pruneStaleInbox();
     const items = (await migrated.listInbox('owner', organization.id));
     expect(items).toHaveLength(1);                       // the finished task's 30 rows are gone
     expect(items[0]).toMatchObject({ taskId: live.id, kind: 'review-requested' });

@@ -191,7 +191,7 @@ integration('PostgreSQL cutover', () => {
     const store = await Store.create(url!);
     try {
       const now = Date.UTC(2026, 8, 26);
-      const project = await store.createProject('Insights');
+      const project = await store.createProject('Insight metrics');
       const task = await store.createTask({ projectId: project.id, title: 'Shipped', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
       await store.appendEvent({ taskId: task.id, type: 'view.updated', ts: now - 86400_000, payload: { status: 'done' } });
       await store.retentionSweep(now + 100 * 86400_000);

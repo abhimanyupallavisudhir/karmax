@@ -811,8 +811,10 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `));
+    if (this.db.dialect === 'postgres')
+      await this.db.exec('CREATE INDEX IF NOT EXISTS idx_kv_key_c ON kv (k COLLATE "C")');
     if (!(await this.kvGet('migration:github-pr-observations'))) {
-      await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<?')
+      await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
         .run('github:pr-observation:v1:', 'github:pr-observation:v1;');
       await this.kvSet('migration:github-pr-observations', '1');
     }
@@ -2501,7 +2503,7 @@ export class Store {
     // creation idempotent and prevent double-click/network retries from drawing
     // the same team twice.
     const existing = (await this.db.prepare(`SELECT * FROM teams WHERE organizationId=?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(organization.id, input.projectId ?? null, input.projectId ?? null, slug)) as any;
     if (existing) return rowToTeam(existing);
     const team: Team = { id: newId('team'), organizationId: organization.id, projectId: input.projectId,
@@ -2543,10 +2545,10 @@ export class Store {
     if (!name) throw new Error('team name is required');
     const slug = slugify(name);
     const conflict = (await this.db.prepare(`SELECT id FROM teams WHERE organizationId=? AND id<>?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug)) as any;
     const aliasConflict = (await this.db.prepare(`SELECT teamId FROM team_aliases WHERE organizationId=? AND teamId<>?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug)) as any;
     if (conflict || aliasConflict) throw new Error(`a team already uses @team:${slug}`);
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -7287,6 +7289,10 @@ export class Store {
       .run(digest, now)).changes) === 1);
   }
 
+  private kvRangeKey(): string {
+    return this.db.dialect === 'postgres' ? 'k COLLATE "C"' : 'k';
+  }
+
   /**
    * The periodic retention sweep. Every sweep here is idempotent and bounded, so
    * a caller can run it on any interval (hourly is plenty).
@@ -7317,13 +7323,13 @@ export class Store {
       .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
     for (const task of settled) {
       const snapshotPrefix = `view-conversation:${task.id}:`;
-      viewSnapshots += Number((await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<? AND k<>?')
+      viewSnapshots += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<? AND k<>?`)
         .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);
       const fencePrefix = `view-publication-fence:${task.id}:`;
-      publicationFences += Number((await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<?')
+      publicationFences += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
         .run(fencePrefix, `view-publication-fence:${task.id};`)).changes);
       const sessionPrefix = `turnsession:${task.id}#`;
-      turnSessions += Number((await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<?')
+      turnSessions += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
         .run(sessionPrefix, `turnsession:${task.id}$`)).changes);
       (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:view:${task.id}`, '1'));
     }
@@ -7424,10 +7430,11 @@ export class Store {
         break;
       }
     }
+    const key = this.kvRangeKey();
     const rows = prefix
       ? end
-        ? await this.db.prepare('SELECT k, v FROM kv WHERE k >= ? AND k < ? ORDER BY k').all(prefix, end)
-        : await this.db.prepare('SELECT k, v FROM kv WHERE k >= ? ORDER BY k').all(prefix)
+        ? await this.db.prepare(`SELECT k, v FROM kv WHERE ${key} >= ? AND ${key} < ? ORDER BY ${key}`).all(prefix, end)
+        : await this.db.prepare(`SELECT k, v FROM kv WHERE ${key} >= ? ORDER BY ${key}`).all(prefix)
       : await this.db.prepare('SELECT k, v FROM kv ORDER BY k').all();
     return (rows as any[]).filter((row) => String(row.k).startsWith(prefix))
       .map((row) => ({ key: String(row.k), value: String(row.v) }));
