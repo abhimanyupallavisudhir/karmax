@@ -28,7 +28,7 @@ import {
   MODEL_PROVIDERS,
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
-import { AgentAdapter } from '../agent/types.js';
+import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
@@ -1671,6 +1671,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const attemptStarted = Date.now();
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
+      let resultCheckpointed = false;
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined;
       let workflowRunId: string | undefined;
@@ -2339,8 +2340,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
-      let result;
-      let usageAdmissionId: string | undefined;
+      const resultKey = timingTurnId ? `turnresult:${args.taskId}:${args.role}:${timingTurnId}` : undefined;
+      const savedResult = resultKey ? await store.kvGet(resultKey) : undefined;
+      const checkpoint: { result: TurnResult; admissionId?: string } | undefined = savedResult ? JSON.parse(savedResult) : undefined;
+      let result = checkpoint?.result;
+      resultCheckpointed = !!checkpoint;
+      let providerInvoked = false;
+      let providerUsage: AdapterTurn['usage'];
+      let usageAdmissionId: string | undefined = checkpoint?.admissionId;
       let usageAdmissionFinished = false;
       const fundingSource: 'managed' | 'byok' | 'customer' = store.hosted
         ? ((args.accountApiKeyHandle || args.accountConfigHome || args.accountCredentialKind === 'login') ? 'byok' : 'managed')
@@ -2348,8 +2355,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
       const managedReservationMicros = fundingSource === 'managed'
         ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
+      const finishUsage = async (completed: boolean | undefined) => {
+        if (usageAdmissionId) {
+          const usage = result?.usage ?? providerUsage;
+          const completedUsageEvents: any[] = [];
+          if (usage) {
+            const quantity = usage.totalTokens ?? usage.inputTokens + usage.outputTokens;
+            completedUsageEvents.push({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource, costClassification: 'none',
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+                cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
+          }
+          if (fundingSource === 'managed') {
+            const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
+            completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
+              fundingSource, costClassification: actualized.classification,
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                ...actualized.metadata } });
+          }
+          // Completion and incurred/estimated cost actualization commit together:
+          // no concurrent admission can observe the reservation released before
+          // its durable replacement exists, and a duplicate retry sees completed.
+          (await store.finishUsageAdmission(usageAdmissionId, completed, Date.now(), completedUsageEvents));
+          usageAdmissionFinished = completed !== undefined;
+        }
+      };
       const admissionEnd = (await trace.start('admission.host'));
       try {
+        if (!result) {
         const signalTurnState = async (
           state: 'running' | 'waiting-host',
           detail?: string,
@@ -2381,9 +2419,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // before any provider process/API request. The stable turn id makes the
         // reservation retry-safe and binds every request to its org/project/task.
         if (profile.provider !== 'mock') {
-          const admissionId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}:${activityAttempt}`;
+          const turnId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}`;
+          const admissionId = activityAttempt > 1 ? `${turnId}:attempt:${activityAttempt}` : turnId;
           (await store.admitAgentUsage({ id: admissionId, organizationId, projectId: args.task.projectId,
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
+            ...(activityAttempt > 1 ? { retryOf: activityAttempt === 2 ? turnId : `${turnId}:attempt:${activityAttempt - 1}` } : {}),
             reservedCostMicros: managedReservationMicros }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).
@@ -2492,9 +2532,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           })()),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
-        } },
-        {
+        } }, {
           adapters: deps.adapters,
+          onProviderStart: async () => {
+            // The estimate survives a killed worker that cannot run finally. A
+            // provider-reported result refines it; unknown usage stays estimated.
+            if (fundingSource === 'managed') await finishUsage(undefined);
+            providerInvoked = true;
+          },
+          onProviderResult: turn => { providerUsage = turn.usage; },
           signal,
           heartbeat,
           pullFollowUps,
@@ -2635,7 +2681,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         },
         );
         if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
-        if (resultKey) await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
+        if (resultKey) {
+          await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
+          resultCheckpointed = true;
+        }
         }
         // Defence in depth around the activity boundary. `runTurn` rejects an
         // adapter return after abort, but cancellation can race the few synchronous
@@ -2644,34 +2693,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
         }
-        if (usageAdmissionId) {
-          const usage = result.usage;
-          const completedUsageEvents: any[] = [];
-          if (usage) {
-            const quantity = usage.totalTokens ?? usage.inputTokens + usage.outputTokens;
-            completedUsageEvents.push({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
-              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
-              kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource, costClassification: 'none',
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
-                metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-                cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
-                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
-          }
-          if (fundingSource === 'managed') {
-            const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
-            completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
-              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
-              kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
-              fundingSource, costClassification: actualized.classification,
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
-                ...actualized.metadata } });
-          }
-          // Completion and incurred/estimated cost actualization commit together:
-          // no concurrent admission can observe the reservation released before
-          // its durable replacement exists, and a duplicate retry sees completed.
-          (await store.finishUsageAdmission(usageAdmissionId, true, Date.now(), completedUsageEvents));
-          usageAdmissionFinished = true;
-        }
+        await finishUsage(true);
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
@@ -2679,10 +2701,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
         }
         if (confirmTranscript) {
-          if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
+          const outputId = timingTurnId ? `${timingTurnId}:out` : `${args.taskId}:out:${confirmTranscript.length}`;
+          if (result.output?.trim() && !confirmTranscript.some(m => m.id === outputId))
+            confirmTranscript.push({ id: outputId, role: 'agent', text: result.output, ts: confirmTranscript.length });
           if (result.confirmDecision) {
             const d = result.confirmDecision;
-            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+            const decisionId = timingTurnId ? `${timingTurnId}:decision` : `${args.taskId}:decision:${confirmTranscript.length}`;
+            if (!confirmTranscript.some(m => m.id === decisionId)) confirmTranscript.push({ id: decisionId, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
           }
           (await store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript)));
         }
@@ -2704,7 +2729,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
         throw classifyTurnError(err, profile.provider, { diagnosis });
       } finally {
-        if (usageAdmissionId && !usageAdmissionFinished) (await store.finishUsageAdmission(usageAdmissionId, false));
+        if (usageAdmissionId && !usageAdmissionFinished) {
+          if (providerInvoked || result) await finishUsage(false);
+          else await store.finishUsageAdmission(usageAdmissionId, false);
+        }
         await releaseSlot();
         releaseConfirm();
         await mcpCleanup?.();
@@ -2766,6 +2794,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }));
       return result;
       }, undefined, timingSignal));
+      } catch (error) {
+        if (timingSignal?.aborted) throw timingSignal.reason instanceof Error ? timingSignal.reason : error;
+        if (resultCheckpointed) throw ApplicationFailure.create({ type: 'agent-infra', nonRetryable: false,
+          message: error instanceof Error ? error.message : String(error), cause: error instanceof Error ? error : undefined });
+        throw error;
       } finally {
         if (keepAlive) clearInterval(keepAlive);
       }

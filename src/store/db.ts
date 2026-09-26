@@ -6307,7 +6307,7 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number }): Promise<{ reused: boolean }> {
+    reservedCostMicros?: number; now?: number; retryOf?: string }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -6337,12 +6337,25 @@ export class Store {
     }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
+      if (input.retryOf) {
+        const previous = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(input.retryOf)) as any;
+        if (previous) {
+          if (previous.organizationId !== input.organizationId || previous.projectId !== input.projectId
+            || previous.taskId !== input.taskId || previous.provider !== input.provider)
+            throw new Error('usage admission retry key belongs to different attributed work');
+          if (previous.state === 'completed')
+            throw new Error('this model turn was already completed; refusing duplicate provider admission');
+          await this.db.prepare("UPDATE usage_admissions SET state='released', releasedAt=? WHERE id=? AND state='active'")
+            .run(now, input.retryOf);
+        }
+      }
       const assertManagedCapacity = async () => {
         if (input.fundingSource !== 'managed') return;
         const month = monthWindow(now);
         const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
         const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
-          WHERE organizationId=? AND fundingSource='managed' AND state='active'`).get(input.organizationId)) as any).n);
+          WHERE organizationId=? AND fundingSource='managed' AND state='active'
+            AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`).get(input.organizationId)) as any).n);
         if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
           throw new Error('organization managed spend cap is exhausted');
       };
@@ -6391,14 +6404,24 @@ export class Store {
     });
   }
 
-  async finishUsageAdmission(id: string, completed: boolean, now = Date.now(),
+  /** Undefined completion checkpoints an in-flight cost estimate without releasing
+   * concurrency. Replace only estimates, so repeated finalization is idempotent. */
+  async finishUsageAdmission(id: string, completed: boolean | undefined, now = Date.now(),
     events: Array<Omit<UsageEvent, 'id'> & { id?: string }> = []): Promise<void> {
     return this.db.transaction(async () => {
 
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      for (const event of events) (await this.recordUsage(event));
-      (await this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
+      for (const event of events) {
+        await this.recordUsage(event);
+        if (event.id === `usage:cost:${id}` && event.kind === 'agent.cost') {
+          await this.db.prepare(`UPDATE usage_events SET costMicros=?, costClassification=?, metadata=?
+            WHERE id=? AND organizationId=? AND kind='agent.cost' AND costClassification='estimated'`)
+            .run(event.costMicros, event.costClassification ?? 'estimated', JSON.stringify(event.metadata ?? {}),
+              event.id, event.organizationId);
+        }
+      }
+      if (completed !== undefined) (await this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
         .run(completed ? 'completed' : 'released', now, id));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -6461,7 +6484,8 @@ export class Store {
       executions: Number(((await this.db.prepare(`SELECT COUNT(*) n FROM executions WHERE organizationId=?${scope} AND state IN ('starting','running','stop-requested')`).get(...args)) as any).n),
     };
     const activeReservationsMicros = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n
-      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'`)
+      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'
+        AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`)
       .get(...args)) as any).n);
     return { costMicros, incurredCostMicros: byCostClassification.incurred ?? 0,
       estimatedCostMicros: byCostClassification.estimated ?? 0, activeReservationsMicros,
