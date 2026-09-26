@@ -11,7 +11,7 @@ import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
 import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
-import { sameProposalIdentity } from '../src/workflows/software-dev.js';
+import { sameProposalIdentity, pullRequestSummary } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { RunnerPoolService } from '../src/world/runners.js';
 
@@ -1354,4 +1354,11 @@ describe('task stage transitions', () => {
     expect(f.starts[0]!.options.args[0].discardProgress).toBe(true);
     expect((await f.store.getTask(f.task.id))?.params._discardProgress).toBeUndefined();
   });
+});
+
+it('keeps conversation text out of public PR descriptions', () => {
+  const messages = [{ role: 'user', text: 'private instructions' }] as any;
+  expect(pullRequestSummary(undefined, messages)).toBeUndefined();
+  expect(pullRequestSummary('Public summary', messages)).toBe('Public summary');
+  expect(pullRequestSummary(undefined, messages, true)).toBe('user: private instructions');
 });

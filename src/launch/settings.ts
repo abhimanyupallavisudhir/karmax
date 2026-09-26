@@ -1,3 +1,4 @@
+import { rememberSubscriptionCatalog } from '../billing/catalog.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../billing/stripe-contract.js';
 import type { Store } from '../store/db.js';
@@ -212,6 +213,8 @@ export class PaidLaunchSettingsService {
   async configure(input: Record<string, unknown>, publicUrl: string) {
     if (this.provisioning) throw new Error('wait for Paddle setup to finish before editing settings');
     const current = (await this.stored());
+    await rememberSubscriptionCatalog(this.store, 'stripe-billing', await this.subscriptionConfig());
+    await rememberSubscriptionCatalog(this.store, 'paddle-billing', await this.paddleConfig());
     if (input.billingProvider !== undefined && input.billingProvider !== 'stripe' && input.billingProvider !== 'paddle')
       throw new Error('choose Stripe or Paddle');
     const paddleInput = input.paddle && typeof input.paddle === 'object' && !Array.isArray(input.paddle)
@@ -265,21 +268,22 @@ export class PaidLaunchSettingsService {
     const next: StoredPaidLaunchSettings = {
       billingProvider: (input.billingProvider as 'stripe' | 'paddle' | undefined) ?? current.billingProvider,
       paddle,
-      paidLaunch: input.paidLaunch === true,
-      founderReviewedPolicyVersion: input.founderReviewed === true ? POLICY_VERSION : undefined,
-      operatorName: clean(input.operatorName), operatorCountry: clean(input.operatorCountry),
-      governingLaw: clean(input.governingLaw), legalNoticeAddress: clean(input.legalNoticeAddress),
+      paidLaunch: input.paidLaunch === undefined ? current.paidLaunch : input.paidLaunch === true,
+      founderReviewedPolicyVersion: input.founderReviewed === undefined ? current.founderReviewedPolicyVersion
+        : input.founderReviewed === true ? POLICY_VERSION : undefined,
+      operatorName: input.operatorName === undefined ? current.operatorName : clean(input.operatorName), operatorCountry: input.operatorCountry === undefined ? current.operatorCountry : clean(input.operatorCountry),
+      governingLaw: input.governingLaw === undefined ? current.governingLaw : clean(input.governingLaw), legalNoticeAddress: input.legalNoticeAddress === undefined ? current.legalNoticeAddress : clean(input.legalNoticeAddress),
       contacts: {
-        legal: email(contactsInput.legal), privacy: email(contactsInput.privacy),
-        security: email(contactsInput.security), incident: email(contactsInput.incident),
-        dpa: email(contactsInput.dpa), billing: email(contactsInput.billing),
+        legal: contactsInput.legal === undefined ? current.contacts?.legal : email(contactsInput.legal), privacy: contactsInput.privacy === undefined ? current.contacts?.privacy : email(contactsInput.privacy),
+        security: contactsInput.security === undefined ? current.contacts?.security : email(contactsInput.security), incident: contactsInput.incident === undefined ? current.contacts?.incident : email(contactsInput.incident),
+        dpa: contactsInput.dpa === undefined ? current.contacts?.dpa : email(contactsInput.dpa), billing: contactsInput.billing === undefined ? current.contacts?.billing : email(contactsInput.billing),
       },
       stripe: input.stripe === undefined ? current.stripe : {
-        individualPriceId: id(stripeInput.individualPriceId, 'price'),
-        teamBasePriceId: id(stripeInput.teamBasePriceId, 'price'),
-        teamSeatPriceId: id(stripeInput.teamSeatPriceId, 'price'),
-        individualProductId: id(stripeInput.individualProductId, 'product'),
-        teamProductId: id(stripeInput.teamProductId, 'product'),
+        individualPriceId: stripeInput.individualPriceId === undefined ? current.stripe?.individualPriceId : id(stripeInput.individualPriceId, 'price'),
+        teamBasePriceId: stripeInput.teamBasePriceId === undefined ? current.stripe?.teamBasePriceId : id(stripeInput.teamBasePriceId, 'price'),
+        teamSeatPriceId: stripeInput.teamSeatPriceId === undefined ? current.stripe?.teamSeatPriceId : id(stripeInput.teamSeatPriceId, 'price'),
+        individualProductId: stripeInput.individualProductId === undefined ? current.stripe?.individualProductId : id(stripeInput.individualProductId, 'product'),
+        teamProductId: stripeInput.teamProductId === undefined ? current.stripe?.teamProductId : id(stripeInput.teamProductId, 'product'),
       },
       completedTasks: Array.isArray(input.completedTasks)
         ? [...new Set(input.completedTasks.filter((value): value is string => typeof value === 'string' && taskIds.has(value)))]

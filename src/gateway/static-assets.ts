@@ -37,7 +37,9 @@ export function staticAssetHeaders(file: string): Record<string, string> {
   if (path.extname(file) === '.html') {
     // The console is a surface of one-click approvals (Review, spending,
     // credential grants): another site must never frame it (clickjacking).
-    headers['content-security-policy'] = "frame-ancestors 'self'";
+    headers['content-security-policy'] = path.basename(file) === 'paddle-checkout.html'
+      ? "default-src 'none'; script-src 'self' https://cdn.paddle.com; connect-src 'self' https://*.paddle.com; frame-src https://*.paddle.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.paddle.com; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+      : "frame-ancestors 'self'";
     headers['x-frame-options'] = 'SAMEORIGIN';
   }
   return headers;

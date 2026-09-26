@@ -3904,10 +3904,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Resolve an Actions request through the calling task's project attachment.
    * Repository names supplied in prompts are never an authority source. */
   private async githubActionsTask(token: string, tool: 'list_github_actions_workflows' | 'list_github_actions_runs' | 'inspect_github_actions_run'
-    | 'manage_github_actions_run' | 'dispatch_github_actions_workflow', repositoryRef?: string) {
+    | 'manage_github_actions_run' | 'dispatch_github_actions_workflow', repositoryRef?: string, taskId?: string) {
     const caller = (await this.require(token, tool));
-    if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
-    const task = (await this.deps.store.getTask(caller.taskId));
+    if (caller.kind === 'agent' && taskId && taskId !== caller.taskId)
+      throw new CapabilityError('GitHub Actions requests must use the calling task');
+    const callingTaskId = caller.kind === 'agent' ? caller.taskId : taskId ?? caller.taskId;
+    if (!callingTaskId || callingTaskId === '*') throw new CapabilityError('taskId is required for GitHub Actions requests');
+    const task = (await this.deps.store.getTask(callingTaskId));
     if (!task) throw new NotFoundError('calling task not found');
     (await this.require(token, tool, { projectId: task.projectId, taskId: task.id }));
     if (!this.deps.githubApp) throw new Error('Connect GitHub in organization settings, then try again.');
@@ -3933,9 +3936,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     this.deps.bus?.emit({ ...event, seq });
   }
 
-  async listGithubActionsRuns(token: string, input: { repository?: string; branch?: string; event?: string;
+  async listGithubActionsRuns(token: string, input: { taskId?: string; repository?: string; branch?: string; event?: string;
     status?: GithubActionsStatus; workflow?: string | number; page?: number; perPage?: number }) {
-    const { task, repository, api } = (await this.githubActionsTask(token, 'list_github_actions_runs', input.repository));
+    const { task, repository, api } = (await this.githubActionsTask(token, 'list_github_actions_runs', input.repository, input.taskId));
     const result = await api.listRuns(`${repository.owner}/${repository.name}`, input);
     (await this.githubActionsEvent(task.id, 'github.actions.runs-read', {
       repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`,
@@ -3945,8 +3948,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return result;
   }
 
-  async listGithubActionsWorkflows(token: string, input: { repository?: string; page?: number; perPage?: number }) {
-    const { task, repository, api } = (await this.githubActionsTask(token, 'list_github_actions_workflows', input.repository));
+  async listGithubActionsWorkflows(token: string, input: { taskId?: string; repository?: string; page?: number; perPage?: number }) {
+    const { task, repository, api } = (await this.githubActionsTask(token, 'list_github_actions_workflows', input.repository, input.taskId));
     const result = await api.listWorkflows(`${repository.owner}/${repository.name}`, input);
     (await this.githubActionsEvent(task.id, 'github.actions.workflows-read', {
       repositoryId: repository.id, page: result.page, returned: result.workflows.length,
@@ -3954,9 +3957,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return result;
   }
 
-  async inspectGithubActionsRun(token: string, input: { repository?: string; runId: number } & GithubActionsInspectOptions) {
-    const { task, repository, api } = (await this.githubActionsTask(token, 'inspect_github_actions_run', input.repository));
-    const { repository: _repository, runId, ...options } = input;
+  async inspectGithubActionsRun(token: string, input: { taskId?: string; repository?: string; runId: number } & GithubActionsInspectOptions) {
+    const { task, repository, api } = (await this.githubActionsTask(token, 'inspect_github_actions_run', input.repository, input.taskId));
+    const { repository: _repository, taskId: _taskId, runId, ...options } = input;
     const result = await api.inspectRun(`${repository.owner}/${repository.name}`, runId, options);
     (await this.githubActionsEvent(task.id, 'github.actions.run-inspected', {
       repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`, runId,
@@ -3966,11 +3969,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async manageGithubActionsRun(token: string, input: {
-    repository?: string; runId: number; action: 'rerun-failed' | 'rerun' | 'cancel';
+    taskId?: string; repository?: string; runId: number; action: 'rerun-failed' | 'rerun' | 'cancel';
   }) {
     if (!['rerun-failed', 'rerun', 'cancel'].includes(input.action))
       throw new Error('action must be rerun-failed, rerun, or cancel');
-    const { task, repository, api } = (await this.githubActionsTask(token, 'manage_github_actions_run', input.repository));
+    const { task, repository, api } = (await this.githubActionsTask(token, 'manage_github_actions_run', input.repository, input.taskId));
     const slug = `${repository.owner}/${repository.name}`;
     const result = input.action === 'cancel'
       ? await api.cancel(slug, input.runId)
@@ -3982,12 +3985,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async dispatchGithubActionsWorkflow(token: string, input: {
-    repository?: string; workflow: string | number; ref: string;
+    taskId?: string; repository?: string; workflow: string | number; ref: string;
     inputs?: Record<string, string | number | boolean>;
   }) {
-    const { task, repository, api } = (await this.githubActionsTask(token, 'dispatch_github_actions_workflow', input.repository));
+    const { task, repository, api } = (await this.githubActionsTask(token, 'dispatch_github_actions_workflow', input.repository, input.taskId));
     const slug = `${repository.owner}/${repository.name}`;
-    const result = await api.dispatch(slug, input.workflow, input.ref, input.inputs);
+    const ref = `refs/heads/${repository.defaultBranch}`;
+    if (input.ref !== repository.defaultBranch && input.ref !== ref)
+      throw new CapabilityError('workflow dispatch requires the repository default branch');
+    const result = await api.dispatch(slug, input.workflow, ref, input.inputs);
     (await this.githubActionsEvent(task.id, 'github.actions.workflow-dispatched', {
       repositoryId: repository.id, slug, workflow: input.workflow, ref: input.ref,
       inputNames: Object.keys(input.inputs ?? {}).sort(),

@@ -46,11 +46,12 @@ function fakeGithub() {
     tokens.push(new Headers(init.headers).get('authorization') ?? '');
     const json = (status: number, value: unknown) =>
       new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+    if (u.pathname.includes('/compare/')) return json(200, { ahead_by: 0 });
     const list = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
     if (list && method === 'GET') {
       const head = u.searchParams.get('head');
       const branch = head?.split(':')[1];
-      return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]));
+      return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]).reverse());
     }
     if (list && method === 'POST') {
       if (prs.some((pr) => pr.repo === list[1] && pr.head.ref === body.head && pr.state === 'open'))
@@ -157,6 +158,14 @@ describe('GitHub PR client', () => {
     expect(githubSlug('/home/me/widgets')).toBeUndefined();
     expect(taskIdOfBranch('karmax/task_abc')).toBe('task_abc');
     expect(taskIdOfBranch('feature/x')).toBeUndefined();
+  });
+
+  it('refuses malformed repository slugs before making requests', async () => {
+    const gh = fakeGithub();
+    const api = new GithubPrApi('t', gh.options);
+    for (const slug of ['acme/app?x=1', 'acme/app#fragment', '../app', 'acme/..', 'acme/app/extra', 'acme/a%2Fb'])
+      await expect(api.get(slug, 7)).rejects.toThrow(/repository slug/);
+    expect(gh.calls).toEqual([]);
   });
 
   it('opens once, then updates the same PR instead of opening a second one', async () => {
@@ -470,6 +479,25 @@ describe('GitHub PR client', () => {
     expect(merged.pr.merged).toBe(true);
   });
 
+  it.each(['merged', 'closed'])('opens a fresh PR for new work after a %s PR', async (state) => {
+    const gh = fakeGithub();
+    const api = new GithubPrApi('t', gh.options);
+    const input = { head: 'karmax/followup', base: 'main', title: 'Follow-up', body: 'New work' };
+    const original = await api.openOrUpdate(SLUG, input);
+    gh.prs[0].state = 'closed';
+    if (state === 'merged') gh.prs[0].merged_at = '2026-01-01T00:00:00Z';
+    const followup = new GithubPrApi('t', { ...gh.options, fetch: (async (url: any, init: any = {}) => {
+      if (String(url).includes('/compare/')) return Response.json({ ahead_by: 2 });
+      if (init.method === 'PATCH') return Response.json({ message: 'Head branch was force pushed' }, { status: 422 });
+      return gh.fetcher(url, init);
+    }) as typeof fetch });
+    const result = await followup.openOrUpdate(SLUG, input);
+    expect(result.created).toBe(true);
+    expect(result.pr.number).not.toBe(original.pr.number);
+    expect(result.pr).toMatchObject({ state: 'open', merged: false });
+    expect((await api.openOrUpdate(SLUG, input)).pr.number).toBe(result.pr.number);
+  });
+
   it('adopts the existing PR when GitHub rejects the create as a duplicate', async () => {
     const gh = fakeGithub();
     const api = new GithubPrApi('t', gh.options);
@@ -530,6 +558,9 @@ describe('GitHub-authoritative merge activity', () => {
     const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 91,
       url: 'https://github.test/acme/widgets/pull/91', state: 'open', headSha: landedSha };
 
+    await expect(core.mergeGithubPrs(handle, [{ ...ref, headSha: 'new-unmerged-head' }])).resolves.toMatchObject({
+      status: 'needs-revision',
+    });
     await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
       status: 'merged', sha: landedSha,
     });
@@ -1639,6 +1670,10 @@ describe('PR stage (remote policy "pr")', () => {
     expect(again[0]!.number).toBe(1);
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Add a feature v2');
+    await core.openPr(handle, 'main', { summary: '😀'.repeat(70_000) });
+    expect(Buffer.byteLength(gh.prs[0].body, 'utf8')).toBeLessThanOrEqual(65_536);
+    expect(gh.prs[0].body).toContain('task_pr1');
+    expect(gh.prs[0].body).not.toContain('\uFFFD');
     await core.destroyWorld(handle);
   });
 
@@ -2133,9 +2168,24 @@ describe('GitHub PR state → task view', () => {
 describe('PR webhooks → karmax events', () => {
   const delivery = (action: string, over: Record<string, unknown> = {}) => ({
     action,
-    repository: { full_name: SLUG },
+    repository: { id: 99, full_name: SLUG },
     pull_request: { number: 7, html_url: `https://github.com/${SLUG}/pull/7`, state: 'open',
-      title: 'Work', head: { ref: 'karmax/task_abc' }, base: { ref: 'main' }, ...over },
+      title: 'Work', head: { ref: 'karmax/task_abc', repo: { id: 99 } }, base: { ref: 'main' }, ...over },
+  });
+
+  it('rejects fork PRs, fork checks and untrusted reviews naming a task branch', () => {
+    expect(pullRequestWebhookEvent('pull_request', delivery('closed', {
+      merged: true, head: { ref: 'karmax/task_abc', repo: { id: 100 } },
+    }))).toBeUndefined();
+    expect(pullRequestWebhookEvent('check_run', { action: 'completed', repository: { id: 99 },
+      check_run: { check_suite: { head_branch: 'karmax/task_abc' },
+        pull_requests: [{ head: { ref: 'karmax/task_abc', repo: { id: 100 } } }] },
+    })).toBeUndefined();
+    for (const association of ['NONE', 'FIRST_TIMER', 'CONTRIBUTOR', undefined]) {
+      expect(pullRequestWebhookEvent('pull_request_review', { ...delivery('submitted'),
+        review: { state: 'approved', author_association: association },
+      })).toBeUndefined();
+    }
   });
 
   it('maps a merged PR to github.pr.merged, correlated to its task', () => {
@@ -2150,7 +2200,7 @@ describe('PR webhooks → karmax events', () => {
     expect(pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed' }))?.type).toBe('github.pr.closed');
     expect(pullRequestWebhookEvent('pull_request', delivery('opened'))?.type).toBe('github.pr.opened');
     const review = pullRequestWebhookEvent('pull_request_review',
-      { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } });
+      { ...delivery('submitted'), review: { author_association: 'COLLABORATOR', state: 'approved', user: { login: 'ada' } } });
     expect(review).toMatchObject({ type: 'github.pr.review' });
     expect(review!.payload).toMatchObject({ review: 'approved', reviewer: 'ada' });
     // A human's own PR is not a karmax task's PR.
@@ -2161,9 +2211,10 @@ describe('PR webhooks → karmax events', () => {
 
   it('correlates a completed check run to the task branch for prompt reconciliation', () => {
     const event = pullRequestWebhookEvent('check_run', {
-      action: 'completed', repository: { full_name: SLUG }, check_run: {
+      action: 'completed', repository: { id: 99, full_name: SLUG }, check_run: {
         name: 'CI', status: 'completed', conclusion: 'failure', details_url: 'https://ci.test/run/1',
         check_suite: { head_branch: 'karmax/task_abc' },
+        pull_requests: [{ head: { ref: 'karmax/task_abc', repo: { id: 99 } } }],
       },
     });
     expect(event).toMatchObject({ taskId: 'task_abc', type: 'github.check.completed', payload: {
@@ -2194,11 +2245,12 @@ describe('PR webhooks → karmax events', () => {
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed' }))!,
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed', merged: true }))!,
       pullRequestWebhookEvent('pull_request_review',
-        { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } })!,
+        { ...delivery('submitted'), review: { author_association: 'COLLABORATOR', state: 'approved', user: { login: 'ada' } } })!,
       pullRequestWebhookEvent('check_run', {
-        action: 'completed', repository: { full_name: SLUG }, check_run: {
+        action: 'completed', repository: { id: 99, full_name: SLUG }, check_run: {
           name: 'CI', status: 'completed', conclusion: 'success', details_url: 'https://ci.test/run/1',
           check_suite: { head_branch: 'karmax/task_abc' },
+        pull_requests: [{ head: { ref: 'karmax/task_abc', repo: { id: 99 } } }],
         },
       })!,
     ];

@@ -730,6 +730,7 @@ export class Gateway {
     return !!durable && durable.taskId === taskId && durable.kind === 'review-action';
   }
 
+  private githubWebhookSweep?: Promise<void>;
   private connectionTimer?: ReturnType<typeof setInterval>;
   private connectionSweep?: Promise<void>;
   private connections(): ServiceConnections | undefined {
@@ -738,6 +739,11 @@ export class Gateway {
     return this.deps.serviceConnections;
   }
   private sweepConnections(): void {
+    if (!this.githubWebhookSweep && this.deps.githubApp?.retryWebhooks) {
+      this.githubWebhookSweep = this.deps.githubApp.retryWebhooks(async (result) => { await this.dispatchGithubWebhook(result); })
+        .catch((error) => console.warn('[github] webhook retry failed', error))
+        .finally(() => { this.githubWebhookSweep = undefined; });
+    }
     if (this.connectionSweep || !this.connections()) return;
     this.connectionSweep = this.connections()!.reconcile(async (c) => {
       const task = (await this.deps.store.getTask(c.taskId!));
@@ -952,6 +958,19 @@ export class Gateway {
         await connectors.autoSync('pass-git', 'backstop');
       });
     }
+  }
+
+  private async dispatchGithubWebhook(result: import('../integrations/github-app.js').GithubWebhookResult): Promise<number> {
+    for (const event of result.events ?? []) {
+      await this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
+      const task = await this.deps.store.getTask(event.taskId);
+      if (task && ['software-dev', 'goal'].includes(task.workflow)
+        && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
+        await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
+    }
+    const recoveries = await this.dispatchGithubRecoveryEvents(result.projectEvents ?? []);
+    for (const event of result.vaultPushes ?? []) await this.enqueueGitPassPush(event);
+    return recoveries;
   }
 
   /** Route both terminal GitHub runs and "no run was created" incidents through
@@ -1610,44 +1629,20 @@ export class Gateway {
       try {
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
         const deliveryId = String(req.headers['x-github-delivery'] ?? '');
-        const result = await this.deps.githubApp.handleWebhook(
+        let recoveries = 0;
+        const result = await this.deps.githubApp.deliverWebhook(
           String(req.headers['x-github-event'] ?? ''), deliveryId, raw,
           typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
+          async (result) => { recoveries = await this.dispatchGithubWebhook(result); },
         );
-        // GitHub's PR lifecycle enters karmax as ordinary task events, so the
-        // timeline and `event` triggers see it like any other happening (SPEC §5.4).
-        // The service already resolved each event to a task of the installing
-        // organization, so dispatch is unconditional here.
-        const { events, projectEvents, vaultPushes, ...body } = result;
-        for (const event of events ?? []) {
-          (await this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload }));
-          const task = (await this.deps.store.getTask(event.taskId));
-          if (task && ['software-dev', 'goal'].includes(task.workflow)
-            && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
-            await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
-        }
-        let recoveries = 0;
-        try {
-          recoveries = await this.dispatchGithubRecoveryEvents(projectEvents ?? []);
-        } catch (error) {
-          // handleWebhook already claimed this delivery. Release it when the
-          // downstream task dispatch fails so GitHub's redelivery can finish
-          // the recovery instead of being discarded as a duplicate.
-          (await this.deps.store.releaseGithubDelivery(deliveryId));
-          throw error;
-        }
-        for (const event of vaultPushes ?? []) (await this.enqueueGitPassPush(event));
-        return this.json(res, 200, { ...body,
-          ...(events?.length ? { dispatched: events.length } : {}),
+        return this.json(res, 200, { accepted: result.accepted,
+          ...(result.reconciled !== undefined ? { reconciled: result.reconciled } : {}),
+          ...(result.events?.length ? { dispatched: result.events.length } : {}),
           ...(recoveries ? { recoveries } : {}),
-          ...(vaultPushes?.length ? { vaultSyncsQueued: vaultPushes.length } : {}),
+          ...(result.vaultPushes?.length ? { vaultSyncsQueued: result.vaultPushes.length } : {}),
         });
       } catch (error) {
-        // Only a genuine signature failure is a 401. Answering 401 for ANY
-        // exception made GitHub redeliver — but `handleWebhook` has already
-        // inserted the delivery dedupe row by then, so the redelivery
-        // short-circuits as a duplicate and the reconcile is lost forever. A 5xx
-        // is the honest answer for a processing fault and is equally retried.
+        // Verified failures remain in the durable inbox for local retry.
         const message = error instanceof Error ? error.message : String(error);
         return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
       }
@@ -2762,7 +2757,6 @@ export class Gateway {
           const connections = (await store.listGitConnections(organizationId));
           if (!connections.some((connection) => connection.id === connectionId))
             return this.json(res, 404, { error: 'GitHub connection not found' });
-          if (connections.length <= 1) return this.json(res, 409, { error: 'Connect a new GitHub account first' });
           if (this.deps.githubApp) (await this.deps.githubApp.disconnectInstallation(connectionId));
           else (await store.deleteGitConnection(connectionId));
           return this.json(res, 200, { ok: true });
@@ -4959,6 +4953,7 @@ export class Gateway {
       }
       if (p === '/api/agent/github/actions/workflows' && method === 'GET') {
         try { return this.json(res, 200, await api.listGithubActionsWorkflows(token, {
+          taskId: url.searchParams.get('taskId') ?? undefined,
           repository: url.searchParams.get('repository') ?? undefined,
           page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
           perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
@@ -4968,7 +4963,8 @@ export class Gateway {
       if (p === '/api/agent/github/actions/runs' && method === 'GET') {
         try {
           return this.json(res, 200, await api.listGithubActionsRuns(token, {
-            repository: url.searchParams.get('repository') ?? undefined,
+            taskId: url.searchParams.get('taskId') ?? undefined,
+          repository: url.searchParams.get('repository') ?? undefined,
             branch: url.searchParams.get('branch') ?? undefined,
             event: url.searchParams.get('event') ?? undefined,
             status: (url.searchParams.get('status') as any) ?? undefined,
@@ -4982,6 +4978,7 @@ export class Gateway {
       const githubActionsRun = p.match(/^\/api\/agent\/github\/actions\/runs\/(\d+)$/);
       if (githubActionsRun && method === 'GET') {
         try { return this.json(res, 200, await api.inspectGithubActionsRun(token, {
+          taskId: url.searchParams.get('taskId') ?? undefined,
           repository: url.searchParams.get('repository') ?? undefined, runId: Number(githubActionsRun[1]),
           view: (url.searchParams.get('view') ?? undefined) as any,
           attempt: url.searchParams.has('attempt') ? Number(url.searchParams.get('attempt')) : undefined,
@@ -4998,7 +4995,7 @@ export class Gateway {
       if (githubActionsRun && method === 'POST') {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.manageGithubActionsRun(token, {
-          repository: b.repository ? String(b.repository) : undefined, runId: Number(githubActionsRun[1]),
+          taskId: b.taskId, repository: b.repository ? String(b.repository) : undefined, runId: Number(githubActionsRun[1]),
           action: String(b.action ?? '') as any,
         })); }
         catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
@@ -5007,7 +5004,7 @@ export class Gateway {
       if (p === '/api/agent/github/actions/dispatch' && method === 'POST') {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.dispatchGithubActionsWorkflow(token, {
-          repository: b.repository ? String(b.repository) : undefined,
+          taskId: b.taskId, repository: b.repository ? String(b.repository) : undefined,
           workflow: typeof b.workflow === 'number' ? b.workflow : String(b.workflow ?? ''),
           ref: String(b.ref ?? ''), inputs: b.inputs && typeof b.inputs === 'object' && !Array.isArray(b.inputs) ? b.inputs : undefined,
         })); }

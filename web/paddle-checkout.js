@@ -1,7 +1,14 @@
 (async () => {
   const status = document.getElementById('checkout-status');
   const retry = document.getElementById('checkout-retry');
-  const transactionId = new URLSearchParams(location.search).get('_ptxn');
+  const params = new URLSearchParams(location.search);
+  const transactionId = params.get('_ptxn');
+  let successUrl;
+  try {
+    const candidate = new URL(params.get('success') || '', location.origin);
+    if (params.has('success') && candidate.origin === location.origin
+      && !candidate.username && !candidate.password && candidate.pathname !== '/billing/checkout') successUrl = candidate.href;
+  } catch { /* Invalid return links leave the payment confirmation visible. */ }
   if (!/^txn_[a-z0-9]{26}$/.test(transactionId || '')) {
     status.textContent = 'Start checkout from your organization’s Plan & billing settings.';
     return;
@@ -18,6 +25,7 @@
         completed = true;
         status.textContent = 'Payment received. Your plan will update after Paddle confirms it.';
         retry.hidden = true;
+        if (successUrl) location.assign(successUrl);
       } else if (event.name === 'checkout.closed' && !completed) {
         status.textContent = 'Checkout closed.';
         retry.hidden = false;

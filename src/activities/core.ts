@@ -284,7 +284,21 @@ export interface OpenPrDetails {
 function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
   const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
   const task = num != null ? `karmax task #${num} (\`${handle.id}\`)` : `karmax task \`${handle.id}\``;
-  return `${summary}\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
+  const provenance = `\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
+  const suffix = '\n… (summary truncated)';
+  const budget = Math.max(0, 65_536 - Buffer.byteLength(provenance + suffix));
+  let bounded = summary;
+  if (Buffer.byteLength(summary) > budget) {
+    let bytes = 0;
+    bounded = '';
+    for (const character of summary) {
+      bytes += Buffer.byteLength(character);
+      if (bytes > budget) break;
+      bounded += character;
+    }
+    bounded += suffix;
+  }
+  return bounded + provenance;
 }
 
 export interface CreateWorldArgs {
@@ -721,7 +735,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (projectId && deps.githubApp) {
       const repository = authorizedRepository ?? (await enrolledGithubRepository(projectId, slug));
       const connection = repository?.gitConnectionId ? (await store.getGitConnection(repository.gitConnectionId)) : undefined;
-      if (connection) return await deps.githubApp.installationToken(connection);
+      if (connection && repository) return await deps.githubApp.installationToken(connection, [repository.providerId ?? '']);
     }
     // `isolatedGitEnvironment()` blanks GH_TOKEN: an organization without a
     // credentialed profile fails closed rather than borrowing the host's login.
@@ -3506,7 +3520,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return connection && typeof (deps.githubApp as any).installationToken === 'function'
           ? {
             api: new GithubPrApi(
-              () => deps.githubApp!.installationToken(connection),
+              () => deps.githubApp!.installationToken(connection, [repository!.providerId ?? '']),
               deps.githubPr ?? {},
             ),
             ...(repository && typeof (deps.githubApp as any).actions === 'function'
@@ -3878,6 +3892,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           state,
         } : undefined;
         if (live.merged) {
+          if (ref.headSha && live.headSha !== ref.headSha) return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: 'The merged pull request does not contain the reviewed head. Open a new pull request for the current proposal.',
+          };
           if (!live.base) {
             return {
               status: 'retryable-error', prs: current, actorUserId,

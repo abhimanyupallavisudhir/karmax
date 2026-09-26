@@ -37,6 +37,17 @@ export interface DeploymentMonitorGithub {
   repositoryFileStatus(repository: Repository, filePath: string): Promise<GitHubRepositoryFileStatus>;
 }
 
+async function monitorConfig(store: Store, repository: Repository): Promise<{
+  sourceWorkflow: string; workflow: string; file: string;
+} | undefined> {
+  const settings = await store.getSettings(`organization:${repository.organizationId}`, 'github-deployment-monitor');
+  const config = (settings?.repositories as Record<string, any> | undefined)?.[repository.id];
+  if (!config || typeof config.sourceWorkflow !== 'string' || !config.sourceWorkflow
+    || typeof config.workflow !== 'string' || !config.workflow
+    || typeof config.file !== 'string' || !/^\.github\/workflows\/[^/]+\.ya?ml$/.test(config.file)) return undefined;
+  return config;
+}
+
 function expectationKey(repositoryId: string, headSha: string): string {
   return `${EXPECTATION_PREFIX}${repositoryId}:${headSha}`;
 }
@@ -49,17 +60,19 @@ function expectationKey(repositoryId: string, headSha: string): string {
  */
 export async function observeDeploymentWorkflowRun(store: Store, repository: Repository, workflowRun: any,
   options: { now?: number; graceMs?: number } = {}): Promise<void> {
+  const config = await monitorConfig(store, repository);
+  if (!config || String(workflowRun?.head_repository?.id ?? '') !== repository.providerId) return;
   const branch = String(workflowRun?.head_branch ?? '');
   const headSha = String(workflowRun?.head_sha ?? '');
   const name = String(workflowRun?.name ?? '');
   if (!headSha || branch !== repository.defaultBranch) return;
   const key = expectationKey(repository.id, headSha);
-  if (name === DEPLOYMENT_WORKFLOW) {
+  if (name === config.workflow) {
     (await store.kvSet(`${MONITORED_REPOSITORY_PREFIX}${repository.id}`, '1'));
     (await store.kvDelete(key));
     return;
   }
-  if (name !== DEPLOYMENT_SOURCE_WORKFLOW
+  if (workflowRun?.event !== 'push' || name !== config.sourceWorkflow
     || String(workflowRun?.status ?? 'completed') !== 'completed'
     || String(workflowRun?.conclusion ?? '').toLowerCase() !== 'success') return;
   const runId = Number(workflowRun?.id);
@@ -71,12 +84,12 @@ export async function observeDeploymentWorkflowRun(store: Store, repository: Rep
     repository: `${repository.owner}/${repository.name}`,
     branch,
     headSha,
-    sourceWorkflow: DEPLOYMENT_SOURCE_WORKFLOW,
+    sourceWorkflow: config.sourceWorkflow,
     sourceRunId: runId,
     sourceRunUrl: String(workflowRun?.html_url ?? ''),
     ...(workflowRun?.updated_at ? { sourceCompletedAt: String(workflowRun.updated_at) } : {}),
-    expectedWorkflow: DEPLOYMENT_WORKFLOW,
-    expectedWorkflowFile: DEPLOYMENT_WORKFLOW_FILE,
+    expectedWorkflow: config.workflow,
+    expectedWorkflowFile: config.file,
     observedAt: now,
     deadlineAt: now + (options.graceMs ?? DEPLOYMENT_RUN_GRACE_MS),
   };
@@ -108,7 +121,12 @@ export class GitHubDeploymentMonitor {
       const repository = (await this.store.getRepository(expectation.repositoryId));
       if (!repository) { (await this.store.kvDelete(entry.key)); continue; }
 
+      const config = await monitorConfig(this.store, repository);
+      if (!config || config.workflow !== expectation.expectedWorkflow || config.file !== expectation.expectedWorkflowFile) {
+        await this.store.kvDelete(entry.key); continue;
+      }
       const file = await this.github.repositoryFileStatus(repository, expectation.expectedWorkflowFile);
+      if (file.status === 'unreadable') continue;
       // Auto-discover the convention without imposing Deploy on every connected
       // repository that happens to name its validation workflow CI. Once seen,
       // the durable marker remains so deleting deploy.yml is itself reported.
@@ -125,7 +143,7 @@ export class GitHubDeploymentMonitor {
       try {
         const result = await (await this.github.actions(repository)).listRuns(expectation.repository, {
           branch: expectation.branch,
-          workflow: 'deploy.yml',
+          workflow: expectation.expectedWorkflowFile.split('/').pop(),
           perPage: 100,
         });
         const matching = result.runs.find((run) => run.headSha === expectation.headSha);
@@ -158,7 +176,7 @@ export class GitHubDeploymentMonitor {
             } } : {}),
           };
         } catch (error2) {
-          query.fallback = { status: 'error', error: error2 instanceof Error ? error2.message : String(error2) };
+          continue;
         }
       }
       if (appeared) { (await this.store.kvDelete(entry.key)); continue; }

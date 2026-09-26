@@ -84,10 +84,11 @@ describe('shared GitHub installations', () => {
         }
         return new Response('not found', { status: 404 });
       }) as typeof fetch });
+      const tokens = new TokenAuthority();
       const gateway = await Gateway.create({ store, githubApp: service, broker,
-        identity: { session: async () => ({ user: { id: 'owner' } }),
+        identity: { session: async () => ({ user: { id: 'owner' }, session: { id: 'test-session' } }),
           connectOrganizationNames: () => {}, listUsers: () => [] } as any,
-        api: {} as any, client: {} as any, tokens: new TokenAuthority(),
+        api: {} as any, client: {} as any, tokens,
         taskQueue: 'test', staticDir: dir, bus: new KarmaxBus(), contributions: new ContributionRegistry(),
         overlays: new Overlays(), worlds: new WorldRegistry(), agentInfo: { provider: 'mock', reason: 'shared installation' } });
       server = await gateway.listen(await findFreePortFrom(48790));
@@ -134,14 +135,14 @@ describe('shared GitHub installations', () => {
         return project;
       }));
       const failed = await deliver('workflow_run', { action: 'completed', repository: { id: 7 },
-        workflow_run: { id: 123, name: 'CI', conclusion: 'failure', head_branch: 'main', head_sha: 'sha' } });
+        workflow_run: { event: 'push', head_repository: { id: 7 }, id: 123, name: 'CI', conclusion: 'failure', head_branch: 'main', head_sha: 'sha' } });
       expect(failed.projectEvents?.map(event => event.projectId)).toEqual(projects.map(project => project.id));
       const tasks = await Promise.all(projects.map(project => store.createTask({ projectId: project.id, title: 'Work',
         workflow: 'software-dev', workflowVersion: '1.8.0', params: { prompt: 'work' } })));
       for (const task of tasks) {
-        const result = await deliver('pull_request', { action: 'opened', repository: { full_name: 'acme/app' },
+        const result = await deliver('pull_request', { action: 'opened', repository: { id: 7, full_name: 'acme/app' },
           pull_request: { number: 1, state: 'open', html_url: 'https://github.com/acme/app/pull/1',
-            head: { ref: `karmax/${task.id}`, sha: 'head' }, base: { ref: 'main' } } });
+            head: { repo: { id: 7 }, ref: `karmax/${task.id}`, sha: 'head' }, base: { ref: 'main' } } });
         expect(result.events).toHaveLength(1);
         expect(result.events![0]!.taskId).toBe(task.id);
       }
@@ -175,7 +176,10 @@ describe('shared GitHub installations', () => {
       expect(await deliver('installation_repositories', { action: 'removed' }, 'retry')).toMatchObject({ accepted: true, reconciled: 0 });
       for (const org of organizations) expect(await store.listRepositories(org.id)).toEqual([]);
       expect(await deliver('installation_repositories', { action: 'removed' }, 'retry')).toEqual({ accepted: false });
-      await service.disconnectInstallation(second.connection.id);
+      const admin = await tokens.mintPrincipal('user:owner', ['repository:write'], undefined, 60_000, organizations[1]!.id);
+      const disconnect = await fetch(`${server!.url}/api/organizations/${organizations[1]!.id}/git-connections/${second.connection.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${admin.token}` } });
+      expect(disconnect.status, await disconnect.text()).toBe(200);
+      expect(await store.listGitConnections(organizations[1]!.id)).toEqual([]);
       expect(await store.getGitConnection(first.connection.id)).toBeDefined();
     } finally { await server?.close(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });

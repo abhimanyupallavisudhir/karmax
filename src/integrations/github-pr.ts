@@ -235,14 +235,14 @@ export class GithubPrApi {
   }
 
   async get(slug: string, number: number): Promise<GithubPullRequest> {
-    return normalize(await this.request(`/repos/${slug}/pulls/${number}`));
+    return normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}`));
   }
 
   /** The open-or-closed PR for a head branch in the same repository, if any. */
   async findByHead(slug: string, branch: string): Promise<GithubPullRequest | undefined> {
     const owner = slug.split('/')[0];
     const found = await this.request<any[]>(
-      `/repos/${slug}/pulls?state=all&per_page=1&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+      `/repos/${repositorySlug(slug)}/pulls?state=all&per_page=1&head=${encodeURIComponent(`${owner}:${branch}`)}`);
     return found?.length ? normalize(found[0]) : undefined;
   }
 
@@ -255,43 +255,53 @@ export class GithubPrApi {
   async openOrUpdate(slug: string, input: { head: string; base: string; title: string; body: string }):
   Promise<{ pr: GithubPullRequest; created: boolean }> {
     const existing = await this.findByHead(slug, input.head);
-    if (existing) {
-      const pr = await this.update(slug, existing.number, {
-        title: input.title, body: input.body, base: input.base,
-        // A PR closed without merging is reopened: the task is live again.
-        ...(existing.state === 'closed' && !existing.merged ? { state: 'open' as const } : {}),
-      });
-      return { pr, created: false };
+    if (existing?.merged) {
+      const comparison = await this.request<{ ahead_by: number }>(
+        `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`);
+      if (comparison.ahead_by === 0) return { pr: existing, created: false };
+      if (!Number.isSafeInteger(comparison.ahead_by) || comparison.ahead_by < 0)
+        throw new Error('GitHub did not report whether the branch contains new commits');
+    } else if (existing) {
+      try {
+        const pr = await this.update(slug, existing.number, {
+          title: input.title, body: input.body, base: input.base,
+          ...(existing.state === 'closed' ? { state: 'open' as const } : {}),
+        });
+        return { pr, created: false };
+      } catch (error) {
+        // GitHub cannot reopen some force-pushed heads. Create a replacement.
+        if (existing.state !== 'closed' || !(error instanceof GithubApiError) || error.status !== 422) throw error;
+      }
     }
     try {
-      return { pr: normalize(await this.request(`/repos/${slug}/pulls`, {
+      return { pr: normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls`, {
         method: 'POST',
         body: JSON.stringify({ title: input.title, body: input.body, head: input.head, base: input.base }),
       })), created: true };
     } catch (error) {
       // Lost a race (or GitHub indexed the head late) — adopt the existing PR.
       const raced = await this.findByHead(slug, input.head).catch(() => undefined);
-      if (!raced) throw error;
+      if (!raced || raced.state !== 'open' || raced.merged) throw error;
       return { pr: raced, created: false };
     }
   }
 
   async update(slug: string, number: number,
     patch: { title?: string; body?: string; base?: string; state?: 'open' | 'closed' }): Promise<GithubPullRequest> {
-    return normalize(await this.request(`/repos/${slug}/pulls/${number}`, {
+    return normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}`, {
       method: 'PATCH', body: JSON.stringify(patch),
     }));
   }
 
   async comment(slug: string, number: number, body: string): Promise<void> {
-    await this.request(`/repos/${slug}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
+    await this.request(`/repos/${repositorySlug(slug)}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
   }
 
   /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
    * review record. GitHub may reject self-approval or an already-settled review;
    * callers treat that as non-fatal and let repository policy decide at merge. */
   async approve(slug: string, number: number, headSha: string, body: string): Promise<void> {
-    await this.request(`/repos/${slug}/pulls/${number}/reviews`, {
+    await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}/reviews`, {
       method: 'POST', body: JSON.stringify({ commit_id: headSha, event: 'APPROVE', body }),
     });
   }
@@ -301,7 +311,7 @@ export class GithubPrApi {
    * and otherwise advances the exact validated head with force:false. */
   async merge(slug: string, number: number, headSha: string,
     mergeMethod: GithubMergeMethod = 'merge'): Promise<GithubMergeResult> {
-    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/merge`, {
+    const value = await this.request<any>(`/repos/${repositorySlug(slug)}/pulls/${number}/merge`, {
       method: 'PUT',
       body: JSON.stringify({ sha: headSha, merge_method: mergeMethod }),
     }, [405, 409, 422]);
@@ -362,7 +372,7 @@ export class GithubPrApi {
    * update instead of manufacturing a different, unvalidated merge result. */
   async fastForwardTarget(slug: string, target: string, headSha: string): Promise<GithubRefUpdateResult> {
     const value = await this.request<any>(
-      `/repos/${slug}/git/refs/heads/${target.split('/').map(encodeURIComponent).join('/')}`,
+      `/repos/${repositorySlug(slug)}/git/refs/heads/${target.split('/').map(encodeURIComponent).join('/')}`,
       { method: 'PATCH', body: JSON.stringify({ sha: headSha, force: false }) },
       [409, 422],
     );
@@ -375,7 +385,7 @@ export class GithubPrApi {
   /** Inspect the PR state GitHub uses when deciding whether and how it may
    * merge, including reviews, checks, queue state, and viewer capabilities. */
   async readiness(slug: string, number: number): Promise<GithubPullRequestReadiness> {
-    const [owner, name, ...extra] = slug.split('/');
+    const [owner, name, ...extra] = repositorySlug(slug).split('/');
     if (!owner || !name || extra.length) throw new Error(`Invalid GitHub repository slug: ${slug}`);
     const query = (checkLevel: 'details' | 'aggregate' | 'none') => `query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
@@ -507,9 +517,9 @@ export class GithubPrApi {
   async failedChecksForRef(slug: string, ref: string): Promise<GithubFailedCheck[]> {
     const encoded = encodeURIComponent(ref);
     const [runs, combined] = await Promise.all([
-      this.request<any>(`/repos/${slug}/commits/${encoded}/check-runs?per_page=100&filter=latest`)
+      this.request<any>(`/repos/${repositorySlug(slug)}/commits/${encoded}/check-runs?per_page=100&filter=latest`)
         .catch(() => undefined),
-      this.request<any>(`/repos/${slug}/commits/${encoded}/status?per_page=100`)
+      this.request<any>(`/repos/${repositorySlug(slug)}/commits/${encoded}/status?per_page=100`)
         .catch(() => undefined),
     ]);
     const candidates: Array<GithubFailedCheck & { databaseId?: number }> = [];
@@ -541,7 +551,7 @@ export class GithubPrApi {
     candidates: Array<GithubFailedCheck & { databaseId?: number }>): Promise<GithubFailedCheck[]> {
     for (const check of candidates) {
       if (!check.databaseId) continue;
-      const run = await this.request<any>(`/repos/${slug}/check-runs/${check.databaseId}`)
+      const run = await this.request<any>(`/repos/${repositorySlug(slug)}/check-runs/${check.databaseId}`)
         .catch(() => undefined);
       const output = run?.output
         ? [run.output.title, run.output.summary, run.output.text]
@@ -549,7 +559,7 @@ export class GithubPrApi {
           .filter(Boolean).join('\n')
         : '';
       const annotations = await this.request<any[]>(
-        `/repos/${slug}/check-runs/${check.databaseId}/annotations?per_page=100`,
+        `/repos/${repositorySlug(slug)}/check-runs/${check.databaseId}/annotations?per_page=100`,
       ).catch(() => undefined);
       const rendered = (Array.isArray(annotations) ? annotations : []).map((annotation) => {
         const location = annotation.path
@@ -589,7 +599,7 @@ export class GithubPrApi {
    * is mechanical and expected-head guarded: a real conflict is returned to the
    * caller, while a racing writer gets a 422 rather than being overwritten. */
   async updateBranch(slug: string, number: number, expectedHeadSha: string): Promise<GithubBranchUpdateResult> {
-    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/update-branch`, {
+    const value = await this.request<any>(`/repos/${repositorySlug(slug)}/pulls/${number}/update-branch`, {
       method: 'PUT', body: JSON.stringify({ expected_head_sha: expectedHeadSha }),
     }, [422]);
     const message = String(value?.message ?? 'GitHub accepted the pull-request branch update');
@@ -700,7 +710,12 @@ export function reconcilePullRequestView(
  * events: those are the ones that belong to a task's timeline.
  */
 export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWebhookEvent | undefined {
+  const repositoryId = payload?.repository?.id;
+  if (!repositoryId) return undefined;
   if (event === 'check_run') {
+    const heads = payload?.check_run?.pull_requests;
+    if (!Array.isArray(heads) || !heads.length || heads.some((pr: any) =>
+      pr.head?.repo?.id !== repositoryId || pr.head?.ref !== payload.check_run.check_suite?.head_branch)) return undefined;
     const taskId = taskIdOfBranch(payload?.check_run?.check_suite?.head_branch);
     if (!taskId || payload?.action !== 'completed') return undefined;
     const run = payload.check_run;
@@ -718,7 +733,7 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
   }
   const pr = payload?.pull_request;
   const taskId = taskIdOfBranch(pr?.head?.ref);
-  if (!taskId) return undefined;
+  if (!taskId || pr.head?.repo?.id !== repositoryId) return undefined;
   const base = {
     number: Number(pr.number),
     url: String(pr.html_url ?? ''),
@@ -738,10 +753,18 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
     return { taskId, type: `github.pr.${action}`, payload: { ...base, action } };
   }
   if (event === 'pull_request_review') {
+    if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(payload?.review?.author_association)) return undefined;
     const review = String(payload?.review?.state ?? '').toLowerCase();
     if (!review) return undefined;
     return { taskId, type: 'github.pr.review', payload: { ...base, review,
       ...(payload.review?.user?.login ? { reviewer: String(payload.review.user.login) } : {}) } };
   }
   return undefined;
+}
+
+function repositorySlug(slug: string): string {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug)
+    || slug.split('/').some((part) => part === '.' || part === '..'))
+    throw new Error('Invalid GitHub repository slug');
+  return slug;
 }

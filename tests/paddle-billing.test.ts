@@ -42,7 +42,7 @@ describe('Paddle subscription billing', () => {
     const provider = new PaddleSubscriptionProvider(() => config, fetcher);
     const result = await provider.createCheckout({ organizationId: 'org_test', customerId: '', plan: 'team', seats: 3,
       successUrl: 'https://example.test/?checkout=success', cancelUrl: 'https://example.test/', idempotencyKey: 'checkout-test' });
-    expect(result).toEqual({ id: 'txn_test', url: 'https://example.test/billing/checkout?_ptxn=txn_test' });
+    expect(result).toEqual({ id: 'txn_test', url: 'https://example.test/billing/checkout?success=https%3A%2F%2Fexample.test%2F%3Fcheckout%3Dsuccess&_ptxn=txn_test' });
     expect(fetcher).toHaveBeenCalledWith('https://sandbox-api.paddle.com/transactions', expect.objectContaining({ method: 'POST' }));
     const request = JSON.parse((fetcher.mock.calls[0] as any)[1].body);
     expect(request.items).toEqual([{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_seat', quantity: 2 }]);
@@ -96,6 +96,30 @@ describe('Paddle subscription billing', () => {
       event = signed(cancellation);
       await billing.handleWebhook(event.raw, event.signature);
       expect(await billing.current(org.id)).toMatchObject({ plan: 'free', status: 'canceled' });
+    } finally { await store.close(); }
+  });
+
+  it.each(['network', '503', 'malformed'])('releases billing reservations after a failed preflight read: %s', async (failure) => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'Retry reads', ownerUserId: 'owner' });
+      let fail = false;
+      const fetcher = vi.fn(async (_url: any, init: any) => {
+        if (init.method === 'GET' && fail) {
+          if (failure === 'network') throw new Error('connection lost');
+          return failure === '503' ? new Response('unavailable', { status: 503 }) : Response.json({});
+        }
+        return Response.json({ data: { id: 'txn_test', status: 'draft',
+          items: [{ price: { id: 'pri_individual' }, quantity: 1 }] } });
+      });
+      const billing = new SubscriptionBillingService(store, new PaddleSubscriptionProvider(() => config, fetcher), true);
+      const urls = { success: 'https://example.test/', cancel: 'https://example.test/' };
+      await billing.checkout(org.id, 'individual', urls, 'safe-read-first');
+      fail = true;
+      await expect(billing.checkout(org.id, 'individual', urls, 'safe-read-retry')).rejects.toThrow();
+      fail = false;
+      await expect(billing.checkout(org.id, 'individual', urls, 'safe-read-retry')).resolves.toMatchObject({ checkoutSessionReference: 'txn_test' });
+      expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
     } finally { await store.close(); }
   });
 

@@ -13,6 +13,7 @@ import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
+import type { GitHubAppService } from '../src/integrations/github-app.js';
 
 /**
  * The gateway half of the tag/view scope hole.
@@ -83,9 +84,11 @@ describe('gateway request scope for bare-id routes', () => {
       worlds: new WorldRegistry(),
       githubApp: {
         status: () => ({ userAuthorized: false }),
-        handleWebhook: async () => {
+        deliverWebhook: async (...args: Parameters<GitHubAppService['deliverWebhook']>) => {
           if (webhookFailure) throw webhookFailure;
-          return { accepted: true, events: [], projectEvents: webhookProjectEvents };
+          const result = { accepted: true, events: [], projectEvents: webhookProjectEvents };
+          await args[4](result);
+          return result;
         },
       },
     } as any));
@@ -391,10 +394,8 @@ describe('gateway request scope for bare-id routes', () => {
   });
 
   /**
-   * The webhook handler turned ANY exception into a 401, which makes GitHub
-   * redeliver — but `handleWebhook` has already inserted the delivery dedupe row
-   * by then, so the redelivery short-circuits as a duplicate and the reconcile is
-   * lost forever. Only a real signature failure may answer 401.
+   * Only signature failures are authentication errors. Processing failures
+   * return 500 and remain eligible for the durable inbox's local retries.
    */
   it('answers a GitHub webhook processing fault with 500, and a bad signature with 401', async () => {
     const deliver = () => fetch(`${base}/api/github/webhook`, {

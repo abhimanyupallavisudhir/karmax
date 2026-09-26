@@ -131,6 +131,7 @@ export interface GithubActionsApiOptions {
   maxLogExcerptChars?: number;
   /** Maximum failing job logs fetched for one inspection. */
   maxJobLogs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Views keep large evidence opt-in. Default retains legacy failure diagnostics. */
@@ -170,9 +171,11 @@ export class GithubActionsApi {
   private maxLogExcerptChars: number;
   private maxJobLogs: number;
   private seenTokens = new Set<string>();
+  private sleep: (ms: number) => Promise<void>;
 
   constructor(private token: string | GithubActionsTokenProvider, options: GithubActionsApiOptions = {}) {
     this.fetcher = options.fetch ?? fetch;
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
     this.maxLogDownloadBytes = positiveBound(options.maxLogDownloadBytes, DEFAULT_MAX_LOG_DOWNLOAD, 64 * 1024, 64 * 1024 * 1024);
     this.maxLogExcerptChars = positiveBound(options.maxLogExcerptChars, DEFAULT_MAX_LOG_EXCERPT, 4 * 1024, 256 * 1024);
@@ -415,8 +418,18 @@ export class GithubActionsApi {
 
   private async request<T = unknown>(pathname: string, init: RequestInit = {}): Promise<T> {
     const response = await this.send(pathname, init);
-    if (!response.ok)
-      throw new GithubActionsApiError(response.status, `GitHub Actions API request failed (${response.status})`);
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const body = await boundedTailText(response, 8192);
+        const message = JSON.parse(body.text).message;
+        if (typeof message === 'string') detail = message;
+      } catch { /* Retain the status when GitHub returns a non-JSON error. */ }
+      for (const token of this.seenTokens) if (token) detail = detail.split(token).join('[REDACTED]');
+      detail = redactActionsText(detail).slice(0, 1000);
+      throw new GithubActionsApiError(response.status,
+        `GitHub Actions API request failed (${response.status})${detail ? `: ${detail}` : ''}`);
+    }
     if (response.status === 204) return undefined as T;
     try {
       const text = await response.text();
@@ -451,6 +464,17 @@ export class GithubActionsApi {
     };
     let response = await once();
     if (response.status === 401 && typeof this.token === 'function') response = await once(true);
+    for (let attempt = 0; attempt < 3 && (response.status === 403 || response.status === 429); attempt++) {
+      const retryAfter = response.headers.get('retry-after');
+      const reset = response.headers.get('x-ratelimit-reset');
+      const wait = retryAfter !== null ? Number(retryAfter) * 1000
+        : response.headers.get('x-ratelimit-remaining') === '0' && reset ? Number(reset) * 1000 - Date.now()
+        : response.status === 429 ? 1000 * 2 ** attempt : undefined;
+      if (wait === undefined || !Number.isFinite(wait)) break;
+      await response.body?.cancel();
+      await this.sleep(Math.min(60_000, Math.max(0, wait)));
+      response = await once();
+    }
     return response;
   }
 }

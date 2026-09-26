@@ -130,7 +130,7 @@ const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
  * `github.pr.review` and `preview.requested` do not.
  */
 export const isReviewRequestEvent = (type: string): boolean =>
-  /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
+  !type.startsWith('github.') && /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
 
 /**
  * The metadata index. Temporal holds the authoritative live workflow state;
@@ -2767,10 +2767,15 @@ export class Store {
     return this.db.transaction(async () => {
 
     if (!/^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(input.sshUrl)) throw new Error('repository must use a GitHub SSH URL');
-    const existing = (await this.db.prepare('SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND owner=? AND name=?')
+    const byProvider = input.providerId ? await this.db.prepare(
+      'SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND providerId=?')
+      .get(input.organizationId, input.provider, input.providerId) as any : undefined;
+    const existing = byProvider ?? (await this.db.prepare('SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND owner=? AND name=?')
       .get(input.organizationId, input.provider, input.owner, input.name)) as any;
+    if (byProvider) await this.db.prepare('UPDATE repositories SET owner=?, name=? WHERE id=?')
+      .run(input.owner, input.name, byProvider.id);
     const now = Date.now();
-    const repository: Repository = { ...input, id: input.id ?? existing?.id ?? newId('repo'), createdAt: existing?.createdAt ?? now, updatedAt: now };
+    const repository: Repository = { ...input, id: existing?.id ?? input.id ?? newId('repo'), createdAt: existing?.createdAt ?? now, updatedAt: now };
     (await this.db.prepare(`INSERT INTO repositories (id, organizationId, provider, providerId, owner, name, sshUrl, defaultBranch, private, gitConnectionId, createdAt, updatedAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organizationId, provider, owner, name) DO UPDATE SET
       providerId=excluded.providerId, sshUrl=excluded.sshUrl, defaultBranch=excluded.defaultBranch,

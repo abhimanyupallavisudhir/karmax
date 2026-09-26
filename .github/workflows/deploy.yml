@@ -56,7 +56,11 @@ jobs:
             # Execute the updater implementation from the exact validated SHA.
             # This lets a new revision repair a bug in an older updater before
             # that bug can block the revision from checking itself out.
-            git fetch --prune origin master
+            git fetch --prune origin '+refs/heads/master:refs/remotes/origin/master'
+            # Validate here: code loaded from the candidate cannot validate itself.
+            git merge-base --is-ancestor '$DEPLOY_SHA' refs/remotes/origin/master || {
+              echo 'deployment SHA is not on master' >&2; exit 1;
+            }
             git show '$DEPLOY_SHA:deploy/karmax' > ./deploy/.karmax-update
             chmod 700 ./deploy/.karmax-update
             trap 'rm -f ./deploy/.karmax-update' EXIT
