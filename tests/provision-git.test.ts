@@ -31,6 +31,38 @@ describe('shared cloud world git provisioning', () => {
     delete process.env.KARMAX_WORLD_CLONE_RETRY_MS;
   });
 
+  it('clones independent repositories concurrently with a bounded fan-out (LT-3)', async () => {
+    let active = 0, peak = 0;
+    const { target } = fakeTarget(command => command.includes('rev-parse') ? { stdout: 'a'.repeat(40) } : undefined);
+    const run = target.run;
+    target.run = async (command, timeout) => {
+      if (!command.includes('git clone')) return run(command, timeout);
+      peak = Math.max(peak, ++active);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      active--;
+      return run(command, timeout);
+    };
+    const result = await provisionGitRepos(target, { taskId: 'parallel', base: 'main',
+      repos: Array.from({ length: 8 }, (_, i) => `git@github.com:org/repo${i}.git`) }, OPTIONS);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(result.repos.map(repo => repo.name)).toEqual(Array.from({ length: 8 }, (_, i) => `repo${i}`));
+  });
+
+  it('never uploads a personal key and prefers repository tokens (WD-5)', async () => {
+    const { target, commands } = fakeTarget(command => command.includes('rev-parse') ? { stdout: 'a'.repeat(40) } : undefined);
+    const writes: string[] = [];
+    target.writeFile = async (_path, data) => { writes.push(String(data)); };
+    const spec = { taskId: 'credentials', base: 'main', repo: 'git@github.com:acme/app.git',
+      gitCredentials: { sshKey: 'personal-key', repositories: { 'git@github.com:acme/app.git': 'repo-key' },
+        httpsTokens: { 'git@github.com:acme/app.git': 'repo-token' } } };
+    await provisionGitCredentials(target, spec, OPTIONS.home);
+    await provisionGitRepos(target, spec, OPTIONS);
+    expect(writes.join('')).not.toContain('personal-key');
+    expect(writes.join('')).not.toContain('repo-key');
+    expect(commands.find(command => command.includes('git clone'))).toContain('GIT_ASKPASS');
+  });
+
   it('creates a plain directory without invoking Git when there are no repositories', async () => {
     const { target, commands } = fakeTarget(() => undefined);
     const provisioned = await provisionGitRepos(target, { taskId: 't0', base: 'main', repos: [] }, OPTIONS);

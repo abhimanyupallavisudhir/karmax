@@ -1,3 +1,4 @@
+import { concurrentMap } from '../util/concurrent-map.js';
 import { missingBaseAdjustment } from './branch-fallback.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -40,8 +41,7 @@ export async function runOrThrow(target: ProvisionTarget, command: string, timeo
  * tokens use HTTPS askpass; legacy/non-GitHub sources may use SSH keys. The
  * caller deletes every karmax-auth-* file before the agent runs. */
 export async function provisionGitCredentials(target: ProvisionTarget, spec: WorldSpec, home: string): Promise<void> {
-  const values = [spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
-    .filter((value): value is string => Boolean(value));
+  const values = repositoryKeys(spec);
   const tokens = Object.values(spec.gitCredentials?.httpsTokens ?? {})
     .filter((value): value is string => Boolean(value));
   if (!values.length && !tokens.length) return;
@@ -49,12 +49,12 @@ export async function provisionGitCredentials(target: ProvisionTarget, spec: Wor
   await runOrThrow(target, `mkdir -p ${quote(ssh)} && chmod 700 ${quote(ssh)}`);
   if (values.length)
     await runOrThrow(target, `ssh-keyscan github.com >> ${quote(path.posix.join(ssh, 'known_hosts'))} 2>/dev/null || true`);
-  for (const [index, key] of [...new Set(values)].entries()) {
+  await concurrentMap([...new Set(values)], 3, async (key, index) => {
     const file = credentialFile(home, index);
     await target.writeFile(file, key.endsWith('\n') ? key : `${key}\n`);
     await runOrThrow(target, `chmod 600 ${quote(file)}`);
-  }
-  for (const [index, token] of [...new Set(tokens)].entries()) {
+  });
+  await concurrentMap([...new Set(tokens)], 3, async (token, index) => {
     const tokenFile = credentialTokenFile(home, index);
     const askpassFile = credentialAskpassFile(home, index);
     await target.writeFile(tokenFile, token);
@@ -65,7 +65,12 @@ case "$1" in
 esac
 `);
     await runOrThrow(target, `chmod 600 ${quote(tokenFile)} && chmod 700 ${quote(askpassFile)}`);
-  }
+  });
+}
+
+function repositoryKeys(spec: WorldSpec): string[] {
+  return Object.entries(spec.gitCredentials?.repositories ?? {})
+    .filter(([source, key]) => key && !spec.gitCredentials?.httpsTokens?.[source]).map(([, key]) => key);
 }
 
 export function credentialFile(home: string, index: number): string {
@@ -95,7 +100,6 @@ function githubHttpsAuthPrefix(home: string, index: number): string {
 
 export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec, options: ProvisionRepoOptions):
   Promise<{ root: string; repos: WorldRepo[]; warnings: string[]; workdir?: string; ephemeralPaths: string[] }> {
-  const branch = spec.branch ?? `karmax/${spec.taskId}`;
   const sources = (spec.repos?.length ? spec.repos : spec.repo ? [spec.repo] : []).map((value) => value.trim()).filter(Boolean);
   const warnings: string[] = [];
   const ephemeralPaths: string[] = [];
@@ -108,24 +112,25 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   const multi = sources.length > 1 || spec.scratch || spec.layout === 'nested';
   const allNames = uniqueNames([...(spec.scratch ? ['scratch'] : []), ...sources.map(remoteName)]);
   const scratchName = spec.scratch ? allNames[0]! : undefined;
-  const names = spec.scratch ? allNames.slice(1) : allNames;
+  const names = (spec.scratch ? allNames.slice(1) : allNames)
+    .map((name, index) => spec.checkouts?.[index]?.name ?? name);
   if (multi) await runOrThrow(target, `mkdir -p ${quote(root)}`);
   const workdir = spec.scratch ? path.posix.join(root, scratchName!) : undefined;
   if (workdir) {
     await runOrThrow(target, `mkdir -p ${quote(workdir)}`);
   }
-  const uniqueKeys = [...new Set([spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
-    .filter((value): value is string => Boolean(value)))];
+  const uniqueKeys = [...new Set(repositoryKeys(spec))];
   const uniqueTokens = [...new Set(Object.values(spec.gitCredentials?.httpsTokens ?? {})
     .filter((value): value is string => Boolean(value)))];
-  const repos: WorldRepo[] = [];
-  for (let index = 0; index < sources.length; index++) {
-    const source = sources[index]!;
-    const branchPolicy = spec.repositoryBranches?.[source];
+  const repos = await concurrentMap(sources, 3, async (source, index): Promise<WorldRepo> => {
+    const recorded = spec.checkouts?.[index];
+    const repoSpec = { ...spec, ...recorded };
+    const branch = recorded?.branch ?? spec.branch ?? `karmax/${spec.taskId}`;
+    const branchPolicy = recorded ?? spec.repositoryBranches?.[source];
     let base = branchPolicy?.base ?? spec.base;
     let targetBranch = branchPolicy?.target ?? spec.target;
     const repoRoot = multi ? path.posix.join(root, names[index]!) : root;
-    const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
+    const key = spec.gitCredentials?.httpsTokens?.[source] ? undefined : spec.gitCredentials?.repositories?.[source];
     const token = spec.gitCredentials?.httpsTokens?.[source];
     const keyIndex = key ? uniqueKeys.indexOf(key) : -1;
     const tokenIndex = token ? uniqueTokens.indexOf(token) : -1;
@@ -134,16 +139,16 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
       : tokenIndex >= 0 ? githubHttpsAuthPrefix(options.home, tokenIndex) : '';
     await cloneWithRetry(target, `${auth}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
     const localPath = spec.copySources?.[index];
-    const sourceAuthority = spec.repositoryAuthorities?.[source] ?? 'project';
+    const sourceAuthority = recorded?.sourceAuthority ?? spec.repositoryAuthorities?.[source] ?? 'project';
     if (localPath && sourceAuthority !== 'origin')
-      await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
-    const requested = spec.branch ?? base;
+      await seedFromLocalCheckout(target, repoRoot, localPath, [base, repoSpec.branch], names[index]!, warnings);
+    const requested = repoSpec.branch ?? base;
     let remoteRef = `refs/remotes/origin/${requested}`;
     const refCheck = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(remoteRef)}`, 120_000);
     const remoteRefExists = refCheck.code === 0;
-    if (spec.branch && !remoteRefExists) throw new Error(`repository "${source}" has no remote branch "${spec.branch}" to review`);
+    if (repoSpec.branch && !remoteRefExists) throw new Error(`repository "${source}" has no remote branch "${repoSpec.branch}" to review`);
     let branchAdjustment;
-    if (!spec.branch && !remoteRefExists) {
+    if (!repoSpec.branch && !remoteRefExists) {
       const fallback = await runOrThrow(target, `git -C ${quote(repoRoot)} symbolic-ref refs/remotes/origin/HEAD`);
       const prefix = 'refs/remotes/origin/';
       const ref = fallback.stdout.trim();
@@ -154,19 +159,19 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
       remoteRef = ref;
       warnings.push(branchAdjustment.warning);
     }
-    if (!spec.branch && targetBranch && targetBranch !== base) {
+    if (!repoSpec.branch && targetBranch && targetBranch !== base) {
       const check = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(`refs/remotes/origin/${targetBranch}`)}`, 120_000);
       if (check.code !== 0) throw new Error(`repository "${source}": target branch "${targetBranch}" does not exist; choose an existing target before starting the task`);
     }
     const resolved = await target.run(`git -C ${quote(repoRoot)} rev-parse ${quote(remoteRef)}`, 120_000);
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
-    await configureRepo(target, repoRoot, spec, branch, true, true, base);
-    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base,
+    await configureRepo(target, repoRoot, repoSpec, branch, true, true, base);
+    return { name: names[index]!, repo: source, root: repoRoot, branch, base,
       ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target || (branchAdjustment && index > 0)), baseSha,
       ...(branchAdjustment ? { branchAdjustment } : {}),
-      ...(localPath ? { localPath } : {}), ...(sourceAuthority === 'origin' ? { sourceAuthority } : {}) });
-  }
+      ...(localPath ? { localPath } : {}), ...(sourceAuthority === 'origin' ? { sourceAuthority } : {}) };
+  });
   if (repos[0]?.branchAdjustment) {
     for (const repo of repos.slice(1)) if (repo.target && repo.target !== repos[0].target) repo.targetPinned = true;
   }

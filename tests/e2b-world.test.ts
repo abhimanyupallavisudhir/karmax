@@ -1,8 +1,77 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('uses one provider inventory request before a new allocation (LT-3)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const list = vi.fn(async () => []);
+    await new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox, list })
+      .create({ taskId: 'new-allocation', base: 'main' });
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops lifecycle pagination after the overlapping cursor (WD-18, LT-19)', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+      const offset = Number(new URL(String(input)).searchParams.get('offset'));
+      return Response.json(Array.from({ length: 100 }, (_, index) => ({ timestamp: new Date(10_000 - offset - index).toISOString() })));
+    });
+    try {
+      const provider = new E2BWorldProvider();
+      await provider.listUsageEvents('org', 9850);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it('provisions each recorded checkout branch and directory (WD-11)', async () => {
+    const commands: string[] = [];
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async command => { commands.push(command); return { stdout: command.includes('rev-parse') ? 'a'.repeat(40) : '', stderr: '', exitCode: 0 }; };
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'restored', base: 'main',
+      repos: ['git@github.com:org/repo.git', 'git@github.com:org/repo.git'],
+      checkouts: [ { name: 'first', branch: 'saved-one', base: 'main', sourceAuthority: 'origin' },
+        { name: 'second', branch: 'saved-two', base: 'main', gitIdentity: { name: 'Saved', email: 'saved@test' } } ] });
+    expect(world.handle.repos?.map(repo => [repo.name, repo.branch])).toEqual([['first', 'saved-one'], ['second', 'saved-two']]);
+    expect(commands.join('\n')).toContain("checkout -q -B 'saved-two' 'origin/saved-two'");
+    expect(commands.join('\n')).toContain("config user.email 'saved@test'");
+  });
+
+  it('evicts destroyed sandboxes and lifecycle cache entries (WD-3, PS-10)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    let opens = 0;
+    const provider = new E2BWorldProvider({ create: async () => sandbox,
+      connect: async () => { opens++; throw new Error('deleted'); },
+      get: async () => { opens++; throw new Error('deleted'); } } as any);
+    const world = await provider.create({ taskId: 'cache', base: 'main' });
+    await world.destroy();
+    expect((provider as any).sandboxes.size).toBe(0);
+    expect((provider as any).states.size).toBe(0);
+    await expect(provider.open(world.handle)).rejects.toThrow('deleted');
+    expect(opens).toBe(1);
+  });
+
+  it.each([
+    [Object.assign(new Error('getaddrinfo ENOTFOUND api.provider'), { code: 'ENOTFOUND' }), undefined],
+    [new Error('upstream returned 404 while resolving proxy'), undefined],
+    [Object.assign(new Error('deleted'), { status: 404 }), 'missing'],
+  ])('requires authoritative missing status (WD-8): %s', async (error, expected) => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, info: async () => { throw error; } } as any);
+    const world = await provider.create({ taskId: 'probe', base: 'main' });
+    expect(await provider.probe(world.handle)).toBe(expected);
+  });
+
+  it('preserves undecidable sealed references during orphan comparison (WD-1)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, list: async () => [sandbox] } as any);
+    const world = await provider.create({ taskId: 'sealed', base: 'main' });
+    const [listed] = await provider.listSandboxes();
+    expect(listed!.matches!({ ...world.handle, sealedProviderRef: 'unreadable' })).toBeUndefined();
+  });
+
   it('normalizes only this deployment\'s completed provider executions for billing', async () => {
     const sandbox = fakeSandbox(() => undefined);
     const factory: E2BFactory = {
@@ -182,13 +251,15 @@ describe('E2B cloud world provider', () => {
     let terminalOutput = '';
     terminal.onData((chunk) => { terminalOutput += chunk; });
     ptyData?.(new TextEncoder().encode('ready'));
+    const utf8 = new TextEncoder().encode('🌍'); // AD-6: split a multibyte character across SDK chunks
+    ptyData?.(utf8.slice(0, 2)); ptyData?.({ data: utf8.slice(2) });
     await terminal.write('pwd\n');
     await terminal.resize(120, 40);
     await terminal.close();
     expect(timeoutRefreshes).toBeGreaterThanOrEqual(2); // process + PTY leases
     expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
     expect(ptyOptions.cmd).toBeUndefined();
-    expect(terminalOutput).toBe('ready');
+    expect(terminalOutput).toBe('ready🌍');
     expect(ptyInput).toBe('exec agent\npwd\n');
     expect(await world.previewSocketTarget!(3000, '/hmr?x=1')).toMatchObject({
       url: 'wss://3000-sbx_test.e2b.app/hmr?x=1', headers: { 'x-access-token': 'provider-secret' },
@@ -234,7 +305,7 @@ describe('E2B cloud world provider', () => {
         return sandbox;
       },
       async list(options) {
-        return options.metadata.karmaxGeneration === '3'
+        return options.metadata.karmaxTaskId === 'retry-create'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
@@ -262,7 +333,7 @@ describe('E2B cloud world provider', () => {
       },
       async connect(id) { expect(id).toBe('late-create'); connects++; return sandbox; },
       async list(options) {
-        return allocated && options.metadata.karmaxGeneration === '1'
+        return allocated && options.metadata.karmaxTaskId === 'late'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
@@ -296,7 +367,7 @@ describe('E2B cloud world provider', () => {
       taskId: 'private',
       base: 'main',
       repo: 'git@github.com:acme/private.git',
-      gitCredentials: { sshKey: 'PRIVATE CLONE KEY' },
+      gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'PRIVATE CLONE KEY' } },
     });
 
     expect(writes.get('/home/user/.ssh/karmax-auth-0')).toContain('PRIVATE CLONE KEY');

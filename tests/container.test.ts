@@ -63,7 +63,7 @@ describe.skipIf(process.env.KARMAX_SKIP_DOCKER === '1')('container world (Docker
       provider: 'container',
       projectId: 'container-test',
       digest: 'recipe-test',
-      spec: { image: 'node:22-slim', setup: ['printf karmax-ready >/karmax-environment-built'] },
+      spec: { image: 'node:22', setup: ['printf karmax-ready >/karmax-environment-built'] },
     });
     try {
       const provider = new ContainerWorldProvider(home);

@@ -5993,7 +5993,39 @@ export class Store {
     });
   }
 
+  async pruneWorldCheckpoints(worldId: string): Promise<void> {
+    await this.db.transaction(async () => {
+      const rows = await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE worldId=? ORDER BY createdAt DESC, id DESC').all(worldId) as any[];
+      const checkpoints = rows.map(row => JSON.parse(row.manifest) as WorldCheckpoint);
+      const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map(row => row.value));
+      for (const row of await this.db.prepare('SELECT handle FROM world_instances WHERE worldId=?').all(worldId) as any[]) {
+        const handle = JSON.parse(row.handle) as WorldHandleRef;
+        if (handle.checkpointId) pinned.add(handle.checkpointId);
+      }
+      for (const checkpoint of checkpoints.slice(2)) {
+        if (pinned.has(checkpoint.id)) continue;
+        if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`,
+          JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
+      }
+    });
+  }
+
+  async pinWorldCheckpointForFork(taskId: string, checkpointId: string): Promise<void> {
+    await this.db.transaction(async () => {
+      if (!(await this.getWorldCheckpoint(checkpointId))) throw new Error('fork checkpoint is no longer available');
+      await this.kvSet(`fork-checkpoint:${taskId}`, checkpointId);
+    });
+  }
+
+  async completeCheckpointDeletion(checkpointId: string): Promise<void> {
+    await this.db.transaction(async () => {
+      await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpointId);
+      await this.kvDelete(`checkpoint-gc:${checkpointId}`);
+    });
+  }
+
   async getWorldCheckpoint(id: string): Promise<WorldCheckpoint | undefined> {
+    if (await this.kvGet(`checkpoint-gc:${id}`)) return undefined;
     const r = (await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE id=?').get(id)) as any;
     return r ? JSON.parse(r.manifest) : undefined;
   }

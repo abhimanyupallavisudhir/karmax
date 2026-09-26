@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -94,6 +94,21 @@ describe('existing world secret refresh', () => {
     expect((await store.listResourceLeases(world.handle.id))).toHaveLength(1);
     await resources.scrubSecrets(world.handle, world);
     expect(fs.existsSync(fileAt())).toBe(false);
+  });
+
+  it('avoids rewriting unchanged secrets on reopen and restores scrubbed files (WD-19)', async () => {
+    const secret = await addFile();
+    const write = vi.spyOn(world, 'writeFile');
+    await resources.prepare(world);
+    await resources.prepare(world);
+    expect(write).toHaveBeenCalledTimes(1);
+    await resources.scrubSecrets(world.handle, world);
+    await resources.prepare(world);
+    expect(write).toHaveBeenCalledTimes(2);
+    await broker.registerHandle(secret.credentialHandles[0]!, 'rotated');
+    await resources.prepare(world);
+    expect(write).toHaveBeenCalledTimes(3);
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('rotated');
   });
 
   it('keeps a running agent current without reopening: adds, rotates and withdraws secrets', async () => {

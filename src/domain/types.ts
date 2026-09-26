@@ -265,6 +265,9 @@ export interface WorldCheckpoint {
      * this and recover it from the durable world handle or project config. */
     source?: string;
     checkoutPath: string;
+    localPath?: string;
+    sourceAuthority?: 'project' | 'origin';
+    gitIdentity?: { name: string; email: string };
     baseSha: string;
     branch: string;
     headSha?: string;

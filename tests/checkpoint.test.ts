@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -249,7 +249,8 @@ describe('portable world checkpoints', () => {
     const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, undefined, runners);
 
     const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
-    world.handle.meta = { projectId: project.id };
+    const originalLease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'sandbox-test' });
+    world.handle.meta = { projectId: project.id, worldLeaseId: originalLease.leaseId };
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.writeFile('tracked.txt', 'edited in the sandbox\n');
     const checkpoint = await checkpoints.checkpoint(world.handle);
@@ -379,7 +380,7 @@ describe('portable world checkpoints', () => {
     const bin = path.join(dir, 'bin'), dockerLog = path.join(dir, 'docker.log');
     fs.mkdirSync(bin);
     fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh
-printf '%s\\n' "$*" >> "$KARMAX_TEST_DOCKER_LOG"
+printf '%s\\n' "$*" >> '${dockerLog}'
 case "$1" in
   version) echo 27.0 ;;
   inspect) echo 172.17.0.8 ;;
@@ -451,4 +452,110 @@ esac
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+it('rejects oversized checkpoint files before reading them (WD-4)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-limit-'));
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const project = await store.createProject('Bounded checkpoint');
+  const task = await store.createTask({ projectId: project.id, title: 'Large file', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  const file = path.join(world.handle.root, 'large.bin');
+  fs.writeFileSync(file, ''); fs.truncateSync(file, 33 * 1024 * 1024);
+  const read = vi.spyOn(world, 'readFileBuffer');
+  vi.spyOn(worlds, 'open').mockResolvedValue(world);
+  const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    await expect(service.checkpoint(world.handle)).rejects.toThrow('checkpoint file limit');
+    expect(read).not.toHaveBeenCalled();
+  } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('restores distinct branches of the same repository (WD-11)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-checkouts-'));
+  const store = await Store.create(':memory:');
+  const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+  await gitOrThrow(repo, ['init', '-qb', 'main']); await ensureIdentity(repo);
+  fs.writeFileSync(path.join(repo, 'file'), 'base');
+  fs.writeFileSync(path.join(repo, '-option'), 'delete me');
+  await gitOrThrow(repo, ['add', '.']); await gitOrThrow(repo, ['commit', '-qm', 'init']);
+  const project = await store.createProject('Checkout checkpoint', { repos: [repo] });
+  const task = await store.createTask({ projectId: project.id, title: 'Branches', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main', layout: 'nested', gitIdentity: { name: 'Original', email: 'original@test' } });
+  await world.addCheckout!({ name: 'extra', base: 'main', branch: 'extra-branch' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  await world.writeFile('extra/file', 'extra edit');
+  fs.unlinkSync(path.join(world.handle.root, 'extra', '-option'));
+  const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    const checkpoint = await service.checkpoint(world.handle);
+    await world.destroy();
+    const restored = await service.restore(checkpoint.id, 'worktree');
+    expect(restored.repos?.map(repo => [repo.name, repo.branch])).toEqual(world.handle.repos?.map(repo => [repo.name, repo.branch]));
+    const opened = await worlds.open(restored);
+    expect(await opened.readFile('extra/file')).toBe('extra edit');
+    expect((await opened.exec('git', ['config', 'user.email'], { cwd: restored.repos![0]!.root })).stdout.trim()).toBe('original@test');
+    await expect(opened.readFile('extra/-option')).rejects.toThrow();
+    const fork = await worlds.create('worktree', { taskId: 'independent-fork', repos: [repo], base: 'main', layout: 'nested' });
+    await service.applyFork(checkpoint.id, fork, project.id);
+    expect(await fork.readFile('extra/file')).toBe('extra edit');
+    expect(fork.handle.repos![1]!.branch).not.toBe('extra-branch');
+    await fork.destroy();
+  } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('retires obsolete checkpoints while keeping current recovery and fork pins (WD-4)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-retention-'));
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const project = await store.createProject('Retention');
+  const task = await store.createTask({ projectId: project.id, title: 'Checkpoint', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  const objects = new LocalObjectStore(path.join(dir, 'objects'));
+  const service = new WorldCheckpointService(store, worlds, objects, new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    await world.writeFile('file', 'first');
+    const pinned = await service.checkpoint(world.handle);
+    await store.kvSet('fork-checkpoint:fork-task', pinned.id);
+    const obsolete = await service.checkpoint(world.handle);
+    const previous = await service.checkpoint(world.handle);
+    const current = await service.checkpoint(world.handle);
+    expect(await store.getWorldCheckpoint(obsolete.id)).toBeUndefined();
+    await expect(objects.get(obsolete.filesystemDelta!.objectKey)).rejects.toThrow();
+    for (const saved of [pinned, previous, current]) {
+      expect(await store.getWorldCheckpoint(saved.id)).toBeDefined();
+      expect((await objects.get(saved.filesystemDelta!.objectKey)).length).toBeGreaterThan(0);
+    }
+  } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('captures small dirty files in one bounded sandbox read (WD-19, LT-11)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-batch-'));
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const project = await store.createProject('Batch');
+  const task = await store.createTask({ projectId: project.id, title: 'Batch', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  vi.spyOn(worlds, 'open').mockResolvedValue(world);
+  const reads = vi.spyOn(world, 'readFileBuffer');
+  const exec = vi.spyOn(world, 'exec');
+  const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    for (let i = 0; i < 20; i++) await world.writeFile(`file-${i}`, `value ${i}`);
+    const checkpoint = await service.checkpoint(world.handle);
+    expect(checkpoint.filesystemDelta?.bytes).toBeGreaterThan(0);
+    expect(reads).not.toHaveBeenCalled();
+    expect(exec.mock.calls.filter(([command]) => command === 'node')).toHaveLength(1);
+  } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

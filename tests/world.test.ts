@@ -343,6 +343,21 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
+  it('bounds repositoryless review metadata (WD-20)', async () => {
+    const store = await Store.create(':memory:');
+    const worlds = new WorldRegistry();
+    const files = Array.from({ length: 20_000 }, (_, i) => `${i}-${'長'.repeat(100)}`);
+    const handle = { kind: 'memory', id: 'review-limit', root: '/w', branch: 'main', base: 'main' } as const;
+    worlds.register({ kind: 'memory', open: async () => ({ handle, listFiles: async () => files }) } as any);
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const review = await core.buildReview(handle, 'main');
+      expect(Buffer.byteLength(JSON.stringify(review))).toBeLessThan(300_000);
+      expect(review.summary).toContain('20000');
+      expect(review.summary).toContain('Showing');
+    } finally { await store.close(); }
+  });
+
   it('reports only this branch\'s changes when the base branch advances mid-task', async () => {
     const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();

@@ -535,3 +535,16 @@ function allFiles(root: string): string[] {
     return entry.isDirectory() ? allFiles(value) : [value];
   });
 }
+
+it('forwards addCheckout through environment wrappers (WD-13)', async () => {
+  const service = new ProjectResourceService({} as any, {} as any, {} as any, {} as any);
+  service.environmentFor = async () => ({ TOKEN: 'secret' });
+  const handle = { id: 'world', root: '/w' } as any;
+  let received: unknown;
+  const world = { handle, addCheckout: async (spec: unknown) => { received = spec; return handle; } } as any;
+  const wrapped = await service.withEnvironment(world);
+  expect(wrapped.addCheckout).toBeTypeOf('function');
+  expect(await wrapped.addCheckout!({ name: 'branch' })).toBe(handle);
+  expect(received).toEqual({ name: 'branch' });
+  expect((await service.withEnvironment({ handle } as any)).addCheckout).toBeUndefined();
+});

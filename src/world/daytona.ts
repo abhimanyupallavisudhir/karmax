@@ -1,3 +1,5 @@
+import type { WorldReferenceKeys } from './reference-keys.js';
+import { isMissingSandbox } from './provider-errors.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, ProviderSandboxRef, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
@@ -70,6 +72,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   private sandboxes = new Map<string, DaytonaSandboxLike>();
   private states = new Map<string, WorldLifecycleState>();
   private refKey: Buffer;
+  private destroyed = new WeakSet<WorldHandle>();
 
   private factories = new Map<string, DaytonaFactory>();
 
@@ -79,7 +82,8 @@ export class DaytonaWorldProvider implements WorldProvider {
     private image = process.env.KARMAX_DAYTONA_IMAGE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopSnapshot = process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
-    private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE) {
+    private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE,
+    private referenceKeys?: WorldReferenceKeys) {
     this.refKey = crypto.createHash('sha256').update(
       process.env.KARMAX_WORLD_REF_KEY ?? process.env.DAYTONA_API_KEY ?? 'karmax-development-world-ref',
     ).digest();
@@ -164,10 +168,14 @@ export class DaytonaWorldProvider implements WorldProvider {
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
         ...([...provisioned.warnings, ...resourceWarnings].length ? { warnings: [...provisioned.warnings, ...resourceWarnings] } : {}),
       };
-      return new DaytonaWorld(handle, sandbox, this.idleMs);
+      return new DaytonaWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.id);
+        this.states.delete(sandbox.id);
+        this.destroyed.add(handle);
+      });
     } catch (error) {
       await sandbox.delete(60).catch(() => undefined);
-      this.states.set(sandbox.id, 'missing');
+      this.states.delete(sandbox.id);
       this.sandboxes.delete(sandbox.id);
       throw error;
     }
@@ -185,7 +193,20 @@ export class DaytonaWorldProvider implements WorldProvider {
     }
     this.sandboxes.set(id, sandbox);
     this.states.set(id, 'ready');
-    return new DaytonaWorld(handle, sandbox, this.idleMs);
+    return new DaytonaWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.id);
+        this.states.delete(sandbox.id);
+        this.destroyed.add(handle);
+      });
+  }
+
+  async destroy(handle: WorldHandle): Promise<void> {
+    const reference = this.reference(handle);
+    const sandbox = await this.factoryFor(await this.connection(reference.organizationId)).get(reference.sandboxId);
+    await deleteSandbox(sandbox);
+    this.sandboxes.delete(reference.sandboxId);
+    this.states.delete(reference.sandboxId);
+    this.destroyed.add(handle);
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -205,6 +226,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   }
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
+    if (this.destroyed.has(handle)) return 'missing';
     return this.states.get(this.sandboxId(handle)) ?? 'ready';
   }
 
@@ -221,7 +243,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       if (['stopped', 'stopping', 'archived', 'archiving'].includes(state)) return 'parked';
       return 'ready';
     } catch (error) {
-      return /not\s*found|does not exist|404/i.test(String((error as Error)?.message ?? error)) ? 'missing' : undefined;
+      return isMissingSandbox(error) ? 'missing' : undefined;
     }
   }
 
@@ -237,17 +259,22 @@ export class DaytonaWorldProvider implements WorldProvider {
       ...(sandbox.labels?.karmaxTaskId ? { taskId: sandbox.labels.karmaxTaskId } : {}),
       matches: (handle) => {
         try { return handle.kind === this.kind && this.sandboxId(handle as WorldHandle) === sandbox.id; }
-        catch { return false; }
+        catch { return undefined; }
       },
       destroy: async () => {
         await deleteSandbox(sandbox);
         this.sandboxes.delete(sandbox.id);
-        this.states.set(sandbox.id, 'missing');
+        this.states.delete(sandbox.id);
       },
     }));
   }
 
   private reference(handle: WorldHandle): { sandboxId: string; organizationId?: string } {
+    if (handle.sealedProviderRef?.startsWith('KWR2.') && this.referenceKeys) {
+      const value = this.referenceKeys.open(handle.sealedProviderRef);
+      if (!value.sandboxId) throw new Error('invalid Daytona world handle');
+      return { sandboxId: value.sandboxId, organizationId: value.organizationId };
+    }
     if (handle.sealedProviderRef) {
       const blob = Buffer.from(handle.sealedProviderRef, 'base64url');
       if (blob.subarray(0, 4).toString() !== 'KWR1') throw new Error('invalid sealed provider reference');
@@ -285,6 +312,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   }
 
   private seal(value: Record<string, string>): string {
+    if (this.referenceKeys) return this.referenceKeys.seal(value);
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.refKey, iv);
     const body = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]);
@@ -293,7 +321,7 @@ export class DaytonaWorldProvider implements WorldProvider {
 }
 
 class DaytonaWorld implements World {
-  constructor(public handle: WorldHandle, private sandbox: DaytonaSandboxLike, private idleMs = DEFAULT_IDLE_MS) {}
+  constructor(public handle: WorldHandle, private sandbox: DaytonaSandboxLike, private idleMs = DEFAULT_IDLE_MS, private onDestroy: () => void) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const line = [cmd, ...args].map(quote).join(' ');
@@ -322,8 +350,9 @@ class DaytonaWorld implements World {
       return { stdout: String(result?.result ?? result?.stdout ?? result?.artifacts?.stdout ?? ''),
         stderr: String(result?.stderr ?? ''), code: Number(result?.exitCode ?? 0) };
     } catch (error: any) {
+      if (!Number.isInteger(error?.exitCode)) throw error;
       return { stdout: String(error?.stdout ?? ''), stderr: String(error?.stderr ?? error?.message ?? error),
-        code: Number(error?.exitCode ?? 1) };
+        code: error.exitCode };
     } finally {
       // A throw (timeout, transport error) skips the in-shell cleanup; never
       // leave a secret sitting in the sandbox's /tmp because of it.
@@ -496,7 +525,7 @@ class DaytonaWorld implements World {
     return addCheckoutViaExec(this, spec);
   }
 
-  async destroy(): Promise<void> { await deleteSandbox(this.sandbox); }
+  async destroy(): Promise<void> { await deleteSandbox(this.sandbox); this.onDestroy(); }
 
   /** Open processes need control-plane activity even when producing no output. */
   private async keepAlive(): Promise<() => void> {

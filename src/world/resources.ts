@@ -515,7 +515,7 @@ export class ProjectResourceService {
    * credentials for this one access. Provider snapshots are scrubbed first. */
   async prepare(world: World): Promise<World> {
     (await this.refreshSecretLeases(world));
-    (await this.writeSecretFiles(world, false));
+    (await this.writeSecretFiles(world, true));
     return (await this.withEnvironment(world));
   }
 
@@ -1074,7 +1074,9 @@ export class ProjectResourceService {
 class EnvironmentWorld implements World {
   /** Present only when the inner world has it: its absence marks a local world. */
   readonly diagnose?: World['diagnose'];
+  readonly addCheckout?: World['addCheckout'];
   constructor(private inner: World, private env: Record<string, string>) {
+    if (inner.addCheckout) this.addCheckout = spec => inner.addCheckout!(spec);
     if (inner.diagnose) this.diagnose = (window) => inner.diagnose!(window);
   }
   withoutProjectEnvironment(): World { return this.inner.withoutProjectEnvironment?.() ?? this.inner; }

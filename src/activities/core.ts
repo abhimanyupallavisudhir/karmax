@@ -1,3 +1,4 @@
+import { concurrentMap } from '../util/concurrent-map.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
@@ -1217,7 +1218,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
               forkCheckpoint = await deps.checkpoints.checkpoint(sourceWorld.handle, { scrubSecrets: false });
             }
-            (await store.kvSet(`fork-checkpoint:${args.taskId}`, forkCheckpoint.id));
+            (await store.pinWorldCheckpointForFork(args.taskId, forkCheckpoint.id));
           }
           if (forkCheckpoint.worldId !== forkSource.taskId || forkCheckpoint.projectId !== projectId)
             throw new Error('fork checkpoint does not belong to the source task');
@@ -1346,7 +1347,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
-        for (const [index, source] of worldSources.entries()) {
+        await concurrentMap(worldSources, 3, async (source, index) => {
           const transportSource = transportSources[index]!;
           const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, transportSource));
           const repository = linked?.repository
@@ -1363,12 +1364,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // enrollment. Under local policy it is the authority; under PR
             // policy an un-enrolled GitHub transport can still use an explicit
             // Git profile/host credential while origin owns the base.
-            if (sourceResolutions[index]?.localPath) continue;
+            if (sourceResolutions[index]?.localPath) return;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
-            continue;
+            return;
           }
           if (deps.githubApp) httpsTokens[source] = await deps.githubApp.repositoryCloneToken(repository);
-        }
+        });
         // Repository-scoped read-only installation tokens exist only during
         // trusted provisioning and are removed before the agent starts.
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
@@ -2797,7 +2798,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const changedFiles = (await world.listFiles()).map((file) => `${file} (new)`);
         const summary = changedFiles.length ? `${changedFiles.length} file(s) in the task workspace.` : 'No file changes detected.';
         (await record(handle.id, 'review.built', { files: changedFiles.length }));
-        return { summary, changedFiles };
+        return boundedReviewFiles(summary, changedFiles);
       }
       const roots = repos;
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
@@ -2830,7 +2831,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
       (await record(handle.id, 'review.built', { files: changedFiles.length }));
-      return { summary, changedFiles };
+      return boundedReviewFiles(summary, changedFiles);
     },
 
     /** Readiness check for the explicit Open PR transition. The Do agent owns
@@ -3139,7 +3140,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           // A transient provider failure remains visible, without rewriting a
           // replacement generation's state or retaining this run's capacity.
-          await store.setWorldState(current, 'degraded');
+          const pending = await store.updateWorldMeta(current, { teardownPending: true });
+          await store.setWorldState(pending, 'degraded');
           await record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) });
         } finally {
           if (await owns()) {
@@ -5213,3 +5215,15 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
 }
 
 export type coreActivities = ReturnType<typeof makeCoreActivities>;
+
+function boundedReviewFiles(summary: string, files: string[]): { summary: string; changedFiles: string[] } {
+  const changedFiles: string[] = [];
+  let bytes = 0;
+  for (const file of files) {
+    const size = Buffer.byteLength(JSON.stringify(file));
+    if (changedFiles.length >= 1_000 || bytes + size > 256 * 1024) break;
+    changedFiles.push(file); bytes += size;
+  }
+  return { changedFiles, summary: changedFiles.length < files.length
+    ? `${summary} Showing ${changedFiles.length} of ${files.length}; inspect the workspace for the full list.` : summary };
+}

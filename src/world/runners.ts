@@ -174,6 +174,7 @@ export class WorldLifecycleManager {
 
   private async sweepOnce(now: number): Promise<number> {
     (await this.runners?.reconcileWorldLeases(now));
+    await this.checkpoints.collectGarbage?.();
     await this.reconcileProviderUsage(now);
     for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
       (await this.store.deletePromotedArtifact(artifact.id));
@@ -217,11 +218,40 @@ export class WorldLifecycleManager {
         });
       }
     }
+    for (const candidate of await this.store.listWorldInstances('degraded')) {
+      if (!candidate.handle.meta?.teardownPending) continue;
+      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
+        const eligible = async () => {
+          const current = await this.store.worldStateSnapshot(candidate.handle.id);
+          const task = await this.store.taskMetadata(candidate.handle.id);
+          return current?.state === 'degraded' && current.generation === (candidate.handle.generation ?? 1)
+            && (!task || ['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? 'active'))
+            && !(await this.worlds.hasActiveAccess(candidate.handle.id))
+            && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0;
+        };
+        if (!(await eligible())) return;
+        try {
+          const provider = this.worlds.get(candidate.handle.kind);
+          if (provider.destroy) await provider.destroy(candidate.handle as any);
+          else {
+            const world = await this.worlds.open(candidate.handle as any);
+            if (!(await eligible())) return;
+            await world.destroy();
+          }
+        } catch {
+          if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) !== 'missing') return;
+        }
+        if (!(await eligible())) return;
+        await this.store.setWorldState(candidate.handle, 'released');
+        await this.recordLifecycle(candidate.handle, 'world.destroyed', { retried: true });
+      }));
+    }
     for (const [key, probedAt] of this.probedAt)
       if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
     await this.reapOrphanSandboxes();
     let hibernated = 0;
     for (const candidate of (await this.store.listWorldInstances('parked'))) {
+      try {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = (await this.store.getProject(projectId));
       const after = project ? (await this.store.effectiveProjectConfig(project)).hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
@@ -229,7 +259,7 @@ export class WorldLifecycleManager {
       // Selection is only a hint: a gateway or activity can resume this world
       // while the sweep awaits another provider. Own the complete destructive
       // transition, and recheck after every potentially slow preparation step.
-      await this.worlds.withOperation(candidate.handle.id, async () => {
+      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
         const eligible = async (checkSelection = false) => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);
           return !!current && current.generation === (candidate.handle.generation ?? 1)
@@ -245,11 +275,13 @@ export class WorldLifecycleManager {
           checkpoint = await this.checkpoints.checkpoint(candidate.handle);
         if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return;
         try {
-          const world = await this.worlds.open(candidate.handle as any);
-          // Recovery may replace a missing sandbox during open. Never destroy
-          // that new generation on the authority of the old parked candidate.
-          if (!(await eligible())) return;
-          await world.destroy();
+          const provider = this.worlds.get(candidate.handle.kind);
+          if (provider.destroy) await provider.destroy(candidate.handle as any);
+          else {
+            const world = await this.worlds.open(candidate.handle as any);
+            if (!(await eligible())) return;
+            await world.destroy();
+          }
         } catch (error) {
           // A timeout/5xx is not proof of eviction. Preserve the recoverable
           // state and let the next sweep retry unless the provider proves loss.
@@ -268,7 +300,12 @@ export class WorldLifecycleManager {
         await this.store.setWorldState(candidate.handle, 'hibernated');
         await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id });
         hibernated++;
-      });
+      }));
+      } catch (error) {
+        await this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return hibernated;
   }
@@ -285,7 +322,11 @@ export class WorldLifecycleManager {
         let previous: Record<string, unknown> = {};
         try { previous = JSON.parse((await this.store.kvGet(syncKey)) ?? '{}'); } catch {}
         try {
-          const events = await provider.listUsageEvents!(organization.id);
+          const lastFullScanAt = Number(previous.lastFullScanAt ?? 0);
+          const fullScan = !lastFullScanAt || now - lastFullScanAt >= 24 * 60 * 60_000;
+          const cursor = Number(previous.lastSuccessfulAt);
+          const events = await provider.listUsageEvents!(organization.id,
+            !fullScan && Number.isFinite(cursor) ? cursor - 60 * 60_000 : undefined);
           // Providers return a rolling history. Check immutable execution IDs
           // in batches before doing attribution or writes, including after a
           // restart. A timestamp cursor would lose late-arriving executions.
@@ -323,7 +364,7 @@ export class WorldLifecycleManager {
           const coverageFrom = Number(previous.coverageFrom);
           (await this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: now,
             coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : now - retentionMs,
-            retentionDays: 7,
+            retentionDays: 7, lastFullScanAt: fullScan ? now : lastFullScanAt,
             ...(previous.gap === true || (Number.isFinite(lastSuccessfulAt) && now - lastSuccessfulAt > retentionMs)
               ? { gap: true } : {}) })));
         } catch (error) {
@@ -376,7 +417,7 @@ export class WorldLifecycleManager {
           await this.worlds.withOperation(taskId, async () => {
             const task = (await this.store.taskMetadata(taskId));
             const current = task ? (await this.store.currentWorld(taskId)) : undefined;
-            const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
+            const duplicate = Boolean(task && current && sandbox.matches && sandbox.matches(current) === false);
             if (task && !duplicate) return;
             try {
               await sandbox.destroy();

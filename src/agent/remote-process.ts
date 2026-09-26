@@ -40,7 +40,7 @@ export const CODEX_REMOTE_REFRESH_SENTINEL = 'karmax-host-managed-refresh';
 /** A V2 provider world is the execution boundary: native agent subprocesses must
  * run there, not on the control-plane host against a virtual cwd. */
 export function isRemoteAgentWorld(world: World): boolean {
-  return world.handle.version === 2 && Boolean(world.handle.sealedProviderRef);
+  return world.handle.kind === 'container' || (world.handle.version === 2 && Boolean(world.handle.sealedProviderRef));
 }
 
 export interface RemoteAgentHome {
