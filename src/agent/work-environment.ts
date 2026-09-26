@@ -87,9 +87,17 @@ export function codexWorkProfile(input: TurnInput) {
   const env = workEnvironment(input);
   if (!Object.keys(env).length) return { args: [] as string[], cleanup() {} };
   const home = input.resolvedAuth?.configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
-  const name = `karmax-work-${crypto.randomUUID()}`;
-  const file = path.join(home, `${name}.config.toml`);
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  for (const entry of fs.readdirSync(home)) {
+    const owner = entry.match(/^karmax-work-(\d+)-[a-f0-9-]{36}\.config\.toml$/)?.[1];
+    if (!owner) continue;
+    try { process.kill(Number(owner), 0); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') fs.rmSync(path.join(home, entry), { force: true });
+    }
+  }
+  const name = `karmax-work-${process.pid}-${crypto.randomUUID()}`;
+  const file = path.join(home, `${name}.config.toml`);
   fs.writeFileSync(file, '[shell_environment_policy.set]\n' + Object.entries(env)
     .map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}\n`).join(''), { mode: 0o600, flag: 'wx' });
   return { args: ['--profile', name], cleanup() { fs.rmSync(file, { force: true }); } };
