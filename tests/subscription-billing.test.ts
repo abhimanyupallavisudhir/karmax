@@ -23,6 +23,23 @@ const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
 
 describe('hosted subscription billing', () => {
+  it('continues reconciling subscriptions sold under a retired price', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'Grandfathered', ownerUserId: 'owner' });
+      const catalog = { individualPriceId: 'price_old', teamBasePriceId: 'price_team', teamSeatPriceId: 'price_seat' };
+      const provider = new FakeSubscriptionProvider(catalog);
+      const billing = new SubscriptionBillingService(store, provider, true);
+      await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'old-price-checkout');
+      catalog.individualPriceId = 'price_new';
+      await billing.handleWebhook(event('old-price-active', 'customer.subscription.updated', {
+        id: 'sub_old', customer: `cus_${org.id}`, status: 'active',
+        items: { data: [{ id: 'si_old', price: 'price_old', quantity: 1 }] },
+      }));
+      expect(await billing.current(org.id)).toMatchObject({ plan: 'individual', status: 'active' });
+    } finally { await store.close(); }
+  });
+
   it('persists complimentary plans without Stripe and restores paid access after removal', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gifts-'));
     const database = path.join(directory, 'billing.db');

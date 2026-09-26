@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { rememberSubscriptionCatalog } from './catalog.js';
 import type { Store } from '../store/db.js';
 import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
@@ -656,14 +657,16 @@ export class SubscriptionBillingService {
   }
 
   private async mapSubscription(object: any, provider: SubscriptionProvider): Promise<{ plan: HostedPlanId; seats: number; items: Record<string, string> }> {
-    const catalog = (await provider.catalog());
-    if (!catalog) throw new Error('subscription catalog is not configured');
+    const currentCatalog = await provider.catalog();
+    if (!currentCatalog) throw new Error('subscription catalog is not configured');
+    const catalogs = await rememberSubscriptionCatalog(this.store, provider.name, currentCatalog);
     const items: Record<string, string> = {};
     let plan: HostedPlanId | undefined;
     let seats = HOSTED_PLANS.team.includedActiveUsers;
     for (const item of object.items?.data ?? []) {
       const price = stringId(item.price);
       const product = stringId(item.price?.product);
+      const catalog = catalogs.find((entry) => [entry.individualPriceId, entry.teamBasePriceId, entry.teamSeatPriceId].includes(price ?? '')) ?? currentCatalog;
       if (price === catalog.individualPriceId) {
         if (provider.customerMode === 'checkout' && item.quantity !== 1) throw new Error('base plan quantity must be one');
         if (plan) throw new Error('subscription contains multiple configured base plan prices');
@@ -784,6 +787,8 @@ export class SubscriptionBillingService {
     if (!this.hosted) throw new Error('hosted subscription billing is not used by self-hosted installations');
     const provider = await this.provider(name);
     if (!(await provider.configured())) throw new Error('hosted subscription billing is not configured');
+    const catalog = await provider.catalog();
+    if (catalog) await rememberSubscriptionCatalog(this.store, provider.name, catalog);
     return provider;
   }
   private requireKey(key: string): void {

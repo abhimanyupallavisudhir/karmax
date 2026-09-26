@@ -1,3 +1,4 @@
+import { rememberSubscriptionCatalog } from '../billing/catalog.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../billing/stripe-contract.js';
 import type { Store } from '../store/db.js';
@@ -212,6 +213,8 @@ export class PaidLaunchSettingsService {
   async configure(input: Record<string, unknown>, publicUrl: string) {
     if (this.provisioning) throw new Error('wait for Paddle setup to finish before editing settings');
     const current = (await this.stored());
+    await rememberSubscriptionCatalog(this.store, 'stripe-billing', await this.subscriptionConfig());
+    await rememberSubscriptionCatalog(this.store, 'paddle-billing', await this.paddleConfig());
     if (input.billingProvider !== undefined && input.billingProvider !== 'stripe' && input.billingProvider !== 'paddle')
       throw new Error('choose Stripe or Paddle');
     const paddleInput = input.paddle && typeof input.paddle === 'object' && !Array.isArray(input.paddle)

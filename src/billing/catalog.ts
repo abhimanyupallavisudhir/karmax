@@ -1,0 +1,22 @@
+import type { Store } from '../store/db.js';
+import type { SubscriptionCatalogConfig } from './subscriptions.js';
+
+/** Retired prices still identify subscriptions that were sold under them. */
+export async function rememberSubscriptionCatalog(store: Store, provider: string,
+  input: Partial<SubscriptionCatalogConfig>): Promise<SubscriptionCatalogConfig[]> {
+  const key = `billing:catalog-history:${provider}`;
+  return store.transaction(async () => {
+    const history = JSON.parse(await store.kvGet(key) ?? '[]') as SubscriptionCatalogConfig[];
+    if (!input.individualPriceId || !input.teamBasePriceId || !input.teamSeatPriceId) return history;
+    const catalog: SubscriptionCatalogConfig = {
+      individualPriceId: input.individualPriceId, teamBasePriceId: input.teamBasePriceId, teamSeatPriceId: input.teamSeatPriceId,
+      ...(input.individualProductId ? { individualProductId: input.individualProductId } : {}),
+      ...(input.teamProductId ? { teamProductId: input.teamProductId } : {}),
+    };
+    if (!history.some((entry) => JSON.stringify(entry) === JSON.stringify(catalog))) {
+      history.unshift(catalog);
+      await store.kvSet(key, JSON.stringify(history));
+    }
+    return history;
+  });
+}
