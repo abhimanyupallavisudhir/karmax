@@ -42,7 +42,7 @@ export class WorldProviderConnectionService {
     const handle = existing?.credentialHandle ?? worldProviderCredentialHandle(input.organizationId, input.provider);
     // Validate every non-secret field before rotating the vault handle. A bad
     // endpoint must leave the previous working credential/config untouched.
-    const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) });
+    const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
     if (key) (await this.broker.registerHandle(handle, key));
     if (!key && !this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
@@ -64,7 +64,7 @@ export class WorldProviderConnectionService {
         organizationId,
         provider,
         apiKey: this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
-        config: value.config,
+        config: cleanConfig(value.config, this.store.hosted),
       };
     }
     if (value && !value.enabled) throw new Error(`${providerName(provider)} is disabled for this organization`);
@@ -127,11 +127,13 @@ export class WorldProviderConnectionService {
   }
 }
 
-function cleanConfig(value: WorldProviderConnection['config']): WorldProviderConnection['config'] {
+function cleanConfig(value: WorldProviderConnection['config'], hosted = false): WorldProviderConnection['config'] {
   const one = (input: unknown, max = 500) => typeof input === 'string' && input.trim() ? input.trim().slice(0, max) : undefined;
   const apiUrl = one(value.apiUrl);
   if (apiUrl) {
     const url = new URL(apiUrl);
+    if (hosted && (url.origin !== 'https://app.daytona.io' || !['/api', '/api/'].includes(url.pathname)
+      || url.search || url.hash)) throw new Error('hosted Daytona connections must use https://app.daytona.io/api');
     if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname))
       throw new Error('provider API URL must use HTTPS');
     if (url.username || url.password) throw new Error('provider API URL must not contain credentials');
