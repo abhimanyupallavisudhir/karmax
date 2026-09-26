@@ -1,7 +1,10 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, expect, it, vi } from 'vitest';
 import type { PublishedView } from '../src/domain/view-publication.js';
 
-const mocks = vi.hoisted(() => ({ park: vi.fn(), current: true }));
+const mocks = vi.hoisted(() => {
+  vi.resetModules();
+  return { park: vi.fn(), current: true };
+});
 vi.mock('@temporalio/workflow', () => ({
   patched: (id: string) => id === 'waiting-world-lifecycle-v1' || mocks.current,
   proxyActivities: () => ({ parkWaitingWorld: mocks.park }),
@@ -9,6 +12,7 @@ vi.mock('@temporalio/workflow', () => ({
 }));
 import { publishTaskView } from '../src/workflows/view-publication.js';
 
+afterAll(() => { vi.doUnmock('@temporalio/workflow'); vi.resetModules(); });
 beforeEach(() => { mocks.park.mockReset(); mocks.current = true; });
 it.each(['agentSlot', 'subagent', 'shell'])('does not schedule lifecycle work during %s waits', async kind => {
   const core = { publishView: vi.fn(async () => 'fence'), recordEvent: vi.fn() };
