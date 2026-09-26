@@ -2506,6 +2506,8 @@ export class Gateway {
           (await this.deps.broker?.deleteHandle(handle));
         this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
+        const { deleteOrganizationAutonomy } = await import('../autonomy/cleanup.js');
+        await deleteOrganizationAutonomy(store, this.deps.broker, organizationId);
         (await store.deleteOrganization(organizationId));
         for (const attachmentId of resources.attachmentIds)
           if (!(await store.attachmentIsScoped(attachmentId))) this.attachments.delete(attachmentId);
@@ -6581,6 +6583,11 @@ export class Gateway {
         const organizationId = orgMail[1]!;
         const sub = orgMail[2];
         const { AgentMail } = await import('../autonomy/agent-mail.js');
+        if (!sub && method === 'DELETE') {
+          const { deleteAgentMail } = await import('../autonomy/cleanup.js');
+          await deleteAgentMail(store, this.deps.broker, organizationId);
+          return this.json(res, 200, { disconnected: true });
+        }
         if (!sub && method === 'GET') {
           const config = (await this.mailboxConfig(organizationId));
           const mail = new AgentMail(
