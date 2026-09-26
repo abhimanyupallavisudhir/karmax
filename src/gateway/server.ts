@@ -1596,7 +1596,14 @@ export class Gateway {
       const identity = await this.deps.identity.session(requestHeaders(req.headers));
       if (!identity || !code || !state) return (await this.githubCallbackPage(res, 400, 'The GitHub App setup callback is incomplete.'));
       const pending = (await this.deps.store.consumeGithubInstallState(state, identity.user.id));
-      if (!pending) return (await this.githubCallbackPage(res, 400, 'This GitHub App setup link is invalid, expired, or belongs to another user.'));
+      // Only a state minted by the App-creation route (which requires
+      // settings:write and an unconfigured App) may configure the shared App:
+      // any member can mint an ordinary GitHub state, and on a hosted cell this
+      // App serves every tenant.
+      if (!pending || pending.purpose !== 'manifest')
+        return (await this.githubCallbackPage(res, 400, 'This GitHub App setup link is invalid, expired, or belongs to another user.'));
+      if (this.deps.githubApp.configured())
+        return (await this.githubCallbackPage(res, 409, 'A GitHub App is already configured.'));
       try {
         await this.deps.githubApp.convertManifest(code);
         const installState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
@@ -1648,7 +1655,25 @@ export class Gateway {
       const pending = (await this.deps.store.consumeGithubInstallState(state, identity.user.id));
       if (!pending) return (await this.githubCallbackPage(res, 400, 'This GitHub installation link is invalid, expired, or belongs to another user.'));
       try {
-        await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
+        // `installation_id` is a public number in a URL anyone can forge, and on
+        // a hosted cell the App's installations belong to every tenant. Link
+        // one only when this person can administer it on GitHub.
+        const verification = (await this.deps.githubApp.status(identity.user.id));
+        if (verification.userAuthorized) {
+          await this.deps.githubApp.connectExistingInstallation(pending.organizationId, identity.user.id, installationId);
+        } else if (verification.oauthConfigured) {
+          // Verify through GitHub first; they then pick the installation they just made.
+          const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
+            { returnTo: 'installation' }));
+          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, (await this.githubPublicUrl(req))) });
+          return void res.end();
+        } else if (this.deps.hosted) {
+          return (await this.githubCallbackPage(res, 403, 'Connect your GitHub account first, then install the App.'));
+        } else {
+          // A self-hosted App configured without OAuth cannot verify anything;
+          // its installations are the operator's own.
+          await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
+        }
         const status = (await this.deps.githubApp.status(identity.user.id));
         if (pending.returnTo === 'profile' && status.oauthConfigured) {
           const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
@@ -2628,14 +2653,6 @@ export class Gateway {
                 error: error instanceof Error ? error.message : String(error) })),
           }))));
         }
-        if (method === 'POST' && !connectionId) {
-          const b = await this.body(req);
-          if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
-          const connected = await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? ''));
-          for (const project of (await store.listProjects()).filter((candidate) => candidate.organizationId === organizationId))
-            await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-          return this.json(res, 200, connected);
-        }
         if (method === 'DELETE' && connectionId) {
           const connections = (await store.listGitConnections(organizationId));
           if (!connections.some((connection) => connection.id === connectionId))
@@ -2695,7 +2712,7 @@ export class Gateway {
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = (await store.createGithubInstallState(githubManifest[1]!, subject.userId,
-          b.returnTo === 'profile' ? { returnTo: 'profile', selectAccount: true } : {}));
+          { purpose: 'manifest', ...(b.returnTo === 'profile' ? { returnTo: 'profile' as const, selectAccount: true } : {}) }));
         try {
           const publicUrl = (await this.githubPublicUrl(req, b.publicUrl));
           return this.json(res, 200, this.deps.githubApp.manifest(publicUrl, state));
