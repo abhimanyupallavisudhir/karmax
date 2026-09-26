@@ -184,7 +184,7 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit', 'project:create', 'diagnostic:read',
-    'process:*', 'credential:*', 'payment:*', 'settings:*', 'safe-mode:write',
+    'process:*', 'credential:*', 'payment:*', 'settings:*',
   ]],
 };
 

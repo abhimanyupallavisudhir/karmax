@@ -260,7 +260,6 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/subscriptions/webhook' || p === '/api/subscriptions/paddle/webhook'
     || p === '/api/subscriptions/paddle/checkout-config') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
-  if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
   // like the mailbox provider. The connected secret never leaves the vault.
   if (p === '/api/email' || p.startsWith('/api/email/')) return read ? 'settings:read' : 'settings:write';
@@ -568,7 +567,6 @@ export class Gateway {
    *  directly, so without this a password could be guessed online. */
   private loginFailures = new Map<string, { count: number; until: number }>();
   private server?: http.Server;
-  private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Host-machine affordances (`pass` import, host filesystem paths, a local
    *  checkout to `cd` into) are only offered to the machine karmax runs on. */
   private get hostLocal(): boolean { return this.deps.hostLocal ?? hostLocal(); }
@@ -1869,7 +1867,6 @@ export class Gateway {
         version: this.deps.version ?? '1.0.0',
         ...(consoleRevision ? { consoleRevision } : {}),
         timingEnabled: (await timingEnabled(this.deps.store)),
-        safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
@@ -7524,20 +7521,6 @@ export class Gateway {
           return ((await projectOf(projectId))?.organizationId ?? 'org_personal') === visibleOrganization;
         }));
         return this.json(res, 200, events);
-      }
-
-      // safe mode toggle
-      // Installation-wide: safe mode reboots the whole cell. The console renders
-      // every card for everyone, so the server has to say who may manage this —
-      // the same server-derived `canManage` the Stripe Connect card takes.
-      if (p === '/api/safe-mode' && method === 'GET') {
-        return this.json(res, 200, { safeMode: this.safeMode,
-          canManage: (await this.deps.tokens.check(token, 'safe-mode:write')).ok });
-      }
-      if (p === '/api/safe-mode' && method === 'POST') {
-        const b = await this.body(req);
-        this.safeMode = !!b.enabled;
-        return this.json(res, 200, { safeMode: this.safeMode });
       }
 
       return this.json(res, 404, { error: 'not found' });

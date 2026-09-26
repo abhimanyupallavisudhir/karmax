@@ -126,7 +126,7 @@ for (const l of lines.filter((l) => l.includes('use the host’s own Git setup')
 // All three fail closed the same way: the markup ships empty and `hidden`, and
 // only the server's `canManage` reveals it. Rendering first and removing later
 // would flash an operator control at a tenant on a slow connection.
-for (const [id, endpoint] of [['resilience-card', '/api/safe-mode'], ['outbound-email-card', '/api/email']]) {
+for (const [id, endpoint] of [['outbound-email-card', '/api/email']]) {
   ok(new RegExp(`id="${id}" hidden></div>`).test(src), `#${id} ships empty and hidden`);
   ok(new RegExp(`hydrateInstallationCard\\('#${id}', '${endpoint.replace(/\//g, '\\/')}'`).test(src),
     `#${id} is hydrated through the shared installation-card helper`);

@@ -100,7 +100,7 @@ remote target fails setup with an actionable error.
 | Config homes per (account × profile) + scrubbed env | ✅ |
 | Virtual-card **budget lease** (hard cap + review-gate threshold) | ✅ |
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |
-| Immutable defaults + overlay resolution + **global safe mode** + per-workflow fallback | ✅ |
+| Immutable defaults + overlay resolution + per-workflow fallback | ✅ |
 | Hosted control plane: organizations/teams/RBAC, GitHub App onboarding, runner pools, isolated previews, backup/restore, one-command VPS stack | ✅ |
 
 ## Architecture

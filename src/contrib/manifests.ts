@@ -212,7 +212,7 @@ const DO_ROLE: WorkflowRole = {
     'task:*', 'project:*', 'organization:*', 'team:*', 'repository:*', 'inbox:*',
     'queue:*', 'workflow:*', 'profile:*', 'skill:write',
     'diagnostic:read', 'process:*', 'credential:*', 'vault:store', 'use-credential:*',
-    'payment:*', 'use-card:*', 'settings:*', 'safe-mode:write',
+    'payment:*', 'use-card:*', 'settings:*',
     'authorization:*', 'user:*',
   ],
   promptTemplate: `{{toolsPreamble}}

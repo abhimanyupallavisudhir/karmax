@@ -116,7 +116,6 @@ function finish() {
   ok(src.includes('appendPendingInvitation(result.invitation, authorizationProjects);'), 'inviting a member updates Pending invitations');
   ok(src.includes("e.target.value = String(rec.params?.priority || 0)"), 'a rejected priority change restores the saved value');
   ok(src.includes('sel.value = sel.dataset.saved'), 'a rejected workflow pin restores the saved value');
-  ok(src.includes('e.target.checked = S.meta.safeMode'), 'a rejected safe-mode change restores the saved value');
   ok(src.includes("const editor = row.querySelector('.authz-editor')") && src.includes('toast(e.message, true); await hydrateOrganizationView();'), 'a rejected member authorization change reloads the durable value');
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

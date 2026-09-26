@@ -15792,7 +15792,7 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// ── installation-wide settings (safe mode, outbound email, Stripe platform) ──
+// ── installation-wide settings (outbound email, Stripe platform) ──
 // These belong to whoever runs the installation, and the console has no
 // capability model of its own, so each card asks its endpoint: a refusal (or
 // canManage:false) means the reader is a tenant here.
@@ -15809,22 +15809,6 @@ async function hydrateInstallationCard(selector, url, fill) {
     card.hidden = false;
     fill(card, data);
   } catch { /* refused: leave the card absent */ }
-}
-
-function hydrateResilienceCard() {
-  return hydrateInstallationCard('#resilience-card', '/api/safe-mode', (card, data) => {
-    S.meta.safeMode = data.safeMode;
-    card.innerHTML = `<div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${data.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>`;
-    card.querySelector('#safe-mode').addEventListener('change', async (e) => {
-      try {
-        const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
-        S.meta.safeMode = r.safeMode;
-        e.target.checked = r.safeMode;
-        toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
-      } catch (err) { e.target.checked = S.meta.safeMode; toast(err.message, true); }
-    });
-  });
 }
 
 function outboundEmailCard() {
@@ -17241,7 +17225,6 @@ function installationView() {
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
       ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
-      <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
 }
@@ -17423,7 +17406,6 @@ function wireInstallationSettings() {
   wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
-  hydrateResilienceCard();
   if (hostLocal()) hydratePhoneAccess();
 }
 
