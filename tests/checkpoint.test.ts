@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -452,4 +452,25 @@ esac
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+it('rejects oversized checkpoint files before reading them (WD-4)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-limit-'));
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const project = await store.createProject('Bounded checkpoint');
+  const task = await store.createTask({ projectId: project.id, title: 'Large file', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  const file = path.join(world.handle.root, 'large.bin');
+  fs.writeFileSync(file, ''); fs.truncateSync(file, 33 * 1024 * 1024);
+  const read = vi.spyOn(world, 'readFileBuffer');
+  vi.spyOn(worlds, 'open').mockResolvedValue(world);
+  const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    await expect(service.checkpoint(world.handle)).rejects.toThrow('checkpoint file limit');
+    expect(read).not.toHaveBeenCalled();
+  } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

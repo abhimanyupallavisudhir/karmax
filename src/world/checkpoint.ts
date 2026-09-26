@@ -19,6 +19,9 @@ import { sameRepository } from './repository-identity.js';
 import type { PortableDelta } from './checkpoint-encoding.js';
 import { encodeEncryptedCheckpoint, type CheckpointFile } from './checkpoint-executor.js';
 const gunzip = promisify(zlib.gunzip);
+const MAX_CHECKPOINT_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_CHECKPOINT_BYTES = 128 * 1024 * 1024;
+const MAX_CHECKPOINT_JSON_BYTES = 192 * 1024 * 1024;
 export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
 
@@ -126,10 +129,29 @@ export class WorldCheckpointService {
         files.push({ repo: '', path: file, readPath: file });
       }
     }
+    if (files.length > 100_000) throw new Error('checkpoint file count limit exceeded');
+    const paths = files.flatMap(file => file.readPath === undefined ? [] : [file.readPath]);
+    let expectedBytes = 0;
+    for (let offset = 0; offset < paths.length; offset += 128) {
+      const batch = paths.slice(offset, offset + 128);
+      const stat = await world.exec('stat', ['-c', '%s', '--', ...batch], { cwd: world.handle.root });
+      const sizes = stat.stdout.trim().split('\n').map(Number);
+      if (stat.code !== 0 || sizes.length !== batch.length || sizes.some(size => !Number.isSafeInteger(size) || size < 0))
+        throw new Error('could not size checkpoint files');
+      if (sizes.some(size => size > MAX_CHECKPOINT_FILE_BYTES)) throw new Error('checkpoint file limit exceeded');
+      expectedBytes += sizes.reduce((sum, size) => sum + size, 0);
+      if (expectedBytes > MAX_CHECKPOINT_BYTES) throw new Error('checkpoint total size limit exceeded');
+    }
     async function* contents(): AsyncGenerator<CheckpointFile> {
+      let total = 0;
       for (const { readPath, ...file } of files) {
         await options.checkContinue?.();
-        yield readPath === undefined ? file : { ...file, data: await world.readFileBuffer(readPath) };
+        if (readPath === undefined) { yield file; continue; }
+        const data = await world.readFileBuffer(readPath);
+        if (data.length > MAX_CHECKPOINT_FILE_BYTES) throw new Error(`checkpoint file limit exceeded: ${readPath}`);
+        total += data.length;
+        if (total > MAX_CHECKPOINT_BYTES) throw new Error('checkpoint total size limit exceeded');
+        yield { ...file, data };
       }
     }
     const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), await this.key());
@@ -174,9 +196,10 @@ export class WorldCheckpointService {
     const project = (await this.store.getProject(checkpoint.projectId));
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
     const executionConfig = (await this.store.effectiveProjectConfig(project));
+    if (checkpoint.filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted), { maxOutputLength: MAX_CHECKPOINT_JSON_BYTES })).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     // A checkpoint must be restorable after its sandbox disappears even when a
     // checkout is not a normal project enrollment (the project wiki is the
@@ -315,9 +338,10 @@ export class WorldCheckpointService {
     if (!checkpoint?.filesystemDelta || checkpoint.projectId !== projectId)
       throw new Error('fork checkpoint is unavailable in this project');
     if (checkpoint.worldId === world.handle.id) throw new Error('fork requires an independent world');
+    if (checkpoint.filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted), { maxOutputLength: MAX_CHECKPOINT_JSON_BYTES })).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
     const destinations = new Map<string, WorldRepo>();
     for (const repo of checkpoint.repos) {
