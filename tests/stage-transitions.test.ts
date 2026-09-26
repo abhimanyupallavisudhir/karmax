@@ -70,6 +70,7 @@ async function fixture(refreshCredentialHealth?: () => Promise<void>, withAuthor
     title: 'Move me',
     workflow: 'software-dev',
     workflowVersion: '1.4.0',
+    createdBy: { kind: 'user', userId: 'test' },
     params: { prompt: 'work', base: 'main', target: 'main' },
   }));
   const view: TaskView = {
@@ -1036,6 +1037,34 @@ describe('task stage transitions', () => {
     expect((await f.store.getTask(f.task.id))?.workflow).not.toBe('goal');
     await expect(f.api.changeWorkflow((await agent(['task:*'])), f.task.id, 'software-dev')).resolves.toBeTruthy();
     await expect(f.api.changeWorkflow((await agent(['task:*', 'review:approve'])), f.task.id, 'goal')).resolves.toBeTruthy();
+  });
+
+  /** PL-1: an agent stands in for the human it acts for, never for more. */
+  it('refuses a review:approve agent whose human is outside the Review audience, as it refuses that human', async () => {
+    const f = (await fixture());
+    (await f.store.setOrganizationMembership('org_personal', 'qa', 'member'));
+    (await f.store.saveView(f.task.id, {
+      ...f.view, stage: 'review', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['user:qa'] },
+      actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true }],
+    }));
+    const maintainerAgent = (await f.tokens.mint({
+      taskId: f.task.id, profileId: 'do', role: 'do', principal: `task-agent:${f.task.id}:do`,
+      projectId: f.project.id, ceiling: ['task:*', 'review:approve'], grantorCaps: ['task:*', 'review:approve'],
+    })).token;
+    // The task's creator is not the selected reviewer, and neither is their agent.
+    await expect(f.api.signalTask(f.token, f.task.id, 'confirm')).rejects.toThrow(/assigned to someone else/);
+    await expect(f.api.signalTask(maintainerAgent, f.task.id, 'confirm')).rejects.toThrow(/assigned to someone else/);
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(0);
+    // An agent acting for the selected reviewer confirms.
+    const reviewerTask = (await f.store.createTask({ projectId: f.project.id, title: 'QA helper', workflow: 'software-dev',
+      workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'qa' }, params: { prompt: 'review' } }));
+    const reviewerAgent = (await f.tokens.mint({
+      taskId: reviewerTask.id, profileId: 'do', role: 'do', principal: `task-agent:${reviewerTask.id}:do`,
+      projectId: f.project.id, ceiling: ['task:*', 'review:approve'], grantorCaps: ['task:*', 'review:approve'],
+    })).token;
+    await f.api.signalTask(reviewerAgent, f.task.id, 'confirm');
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(1);
   });
 
   it('consumes a current Review-hold confirmation once instead of restoring the hold again', async () => {

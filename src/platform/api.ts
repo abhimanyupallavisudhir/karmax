@@ -4355,7 +4355,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const delegatedReviewer = !userId && caller.kind === 'agent' && allows(caller.caps, 'review:approve');
       if (!userId && !delegatedReviewer)
         throw new CapabilityError('only a human selected by this workflow step, or an agent authorized with review:approve, can confirm');
-      if (userId && !(await this.deps.store.humanMayAct(taskId, userId)))
+      // An undelegated agent stands in for the human its task works for (the
+      // same resolution Avatar invocation uses), so it passes the audience
+      // check only where that human would.
+      const actingUserId = userId
+        ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined);
+      if (!actingUserId || !(await this.deps.store.humanMayAct(taskId, actingUserId)))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
       // Opening a proposal defers its confirmation until Review is ready.
       // Only a direct Confirm decision is journalled at this point.
