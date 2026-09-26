@@ -2316,7 +2316,7 @@ function api(path, opts = {}) {
     return fetchApi(path, opts).finally(() => { pending.clear(); defaults.clear(); });
   }
   if (opts.signal) return fetchApi(path, opts);
-  const key = JSON.stringify([S.token, path, opts]);
+  const key = JSON.stringify([S.token, typeof S.user === 'object' ? S.user?.id : S.user, path, opts]);
   const cached = defaults.get(key);
   if (cached && Date.now() - cached.at < 10_000) return Promise.resolve(JSON.parse(cached.json));
   defaults.delete(key);

@@ -46,3 +46,12 @@ test('RQ-4: a default read superseded by a mutation cannot refill the cache', as
   const cached = await ctx.api('/api/defaults/p/workflow'); cached.fresh = false;
   assert.equal((await ctx.api('/api/defaults/p/workflow')).fresh, true);
 });
+test('RQ-4/UI-22: cookie-authenticated users never share cached defaults', async () => {
+  let reads = 0;
+  const ctx = vm.createContext({ S: { token: null, user: { id: 'first' } }, fetchApi: async () => ({ value: ++reads }) });
+  vm.runInContext(fn('api'), ctx);
+  await ctx.api('/api/defaults/p/software-dev');
+  ctx.S.user = { id: 'second' };
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 2);
+});
