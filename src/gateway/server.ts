@@ -4,6 +4,8 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
 import { GatewayMetrics } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
+import { assetExists, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
+import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { TimingDelivery } from '../timing/delivery.js';
 import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
@@ -543,35 +545,6 @@ const PREVIEW_REQUEST_HEADERS = new Set([
   'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
 ]);
 
-export function staticAssetHeaders(file: string): Record<string, string> {
-  return {
-    'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
-    // The console has no build step or content-hashed asset names, so a cached
-    // app.js can keep running old UI code after a deploy. Force revalidation of
-    // the SPA shell and its assets; the service worker deliberately follows the
-    // network response instead of maintaining a second application cache.
-    'cache-control': 'no-cache',
-  };
-}
-
-const staticRevisionCache = new Map<string, { mtimeMs: number; size: number; revision: string }>();
-
-/** A content revision for the no-build console, used by already-open tabs to
- * notice that a deploy replaced the JavaScript they are currently executing. */
-export function staticAssetRevision(file: string): string | undefined {
-  try {
-    const stat = fs.statSync(file);
-    const cached = staticRevisionCache.get(file);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.revision;
-    const revision = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-    staticRevisionCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, revision });
-    return revision;
-  } catch {
-    // Minimal/test gateways may intentionally have no console static directory.
-    return undefined;
-  }
-}
-
 interface Session {
   user: string;
   apiToken: string;
@@ -599,7 +572,9 @@ export class Gateway {
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions!: ReviewActionRunner;
   private attachments = new AttachmentStore();
-  private modelCatalog = new Map<string, { at: number; value: ModelCatalog }>();
+  /** Discovery spawns provider CLIs (seconds): pages read the last catalog while
+   *  one background load per organization refreshes it. */
+  private modelCatalog = new SwrCache<string, ModelCatalog>((organizationId) => this.discoverModels(organizationId), 5 * 60_000);
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
@@ -1333,7 +1308,7 @@ export class Gateway {
       return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn }));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
-    if (p.startsWith('/brand/')) return this.brand(p, res);
+    if (p.startsWith('/brand/')) return this.brand(p, res, req);
     if (p === '/app.webmanifest' && req.method === 'GET') return (await this.webManifest(res));
     if (p.startsWith('/api/')) return (await this.api(req, res, url, receivedAt));
     if (p === '/ws') return; // handled by ws
@@ -7598,10 +7573,11 @@ export class Gateway {
   }
 
   private async availableModels(refresh = false, organizationId = 'org_personal'): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
-    const cached = this.modelCatalog.get(organizationId);
-    if (!refresh && cached && Date.now() - cached.at < 5 * 60_000) {
-      return { providers: cached.value, refreshedAt: cached.at };
-    }
+    const catalog = await this.modelCatalog.get(organizationId, { fresh: refresh });
+    return { providers: catalog.value, refreshedAt: catalog.at };
+  }
+
+  private async discoverModels(organizationId: string): Promise<ModelCatalog> {
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
     const creds = enumerateCredentials(gatherCredentialSources({
@@ -7658,17 +7634,14 @@ export class Gateway {
       grok: [],
       mock: [{ id: 'mock' }],
     };
-    const next = { at: Date.now(), value };
-    this.modelCatalog.set(organizationId, next);
-    return { providers: value, refreshedAt: next.at };
+    return value;
   }
 
-  /** For each agent field, resolve the concrete provider/model the server would
-   *  actually run (setting → seeded profile → code default), so the form can show
-   *  it as the inherited default. */
   /** Re-register the connected-login pool with the account coordinator so lease
    *  rotation reflects the current set (called after connect/rename/delete). */
   private async refreshLoginPool(): Promise<void> {
+    // Which models exist depends on which logins are connected.
+    this.modelCatalog.invalidate();
     if (!this.deps.configHomes || !this.deps.client) return;
     const { concurrencyFor } = await import('../platform/credential-sources.js');
     const creds = (await this.deps.store.listOrganizations()).flatMap((organization) =>
@@ -7794,22 +7767,18 @@ export class Gateway {
    * Serving them from one stable path is what lets the favicon, the installed
    * app icon and the pre-auth login mark all follow the setting with no client
    * knowledge of it — and no build step over `web/`. */
-  private async brand(p: string, res: http.ServerResponse) {
+  private async brand(p: string, res: http.ServerResponse, req: http.IncomingMessage) {
     const name = p.slice('/brand/'.length);
     // `/brand/<file>` follows the setting; `/brand/<variant>/<file>` addresses one
     // variant directly, which is how the settings picker previews the choices.
-    if (!BRAND_FILES.includes(name as (typeof BRAND_FILES)[number])) return (await this.static(p, res));
+    if (!BRAND_FILES.includes(name as (typeof BRAND_FILES)[number])) return (await this.static(p, res, req));
     const icon = brandIconOf((await this.deps.store.getSettings('global', 'appearance')));
-    try {
-      const data = await fs.promises.readFile(path.join(this.deps.staticDir, 'brand', icon, name));
-      // Favicons are cached hard by default; revalidating keeps a switch instant.
-      res.writeHead(200, { 'content-type': MIME[path.extname(name)]!, 'cache-control': 'no-cache' });
-      res.end(data);
-    } catch {
-      // A variant need not ship every format (only the diamond has an SVG); the
-      // browser falls through to the next <link rel="icon"> on a miss.
-      res.writeHead(404).end('not found');
-    }
+    const file = path.join(this.deps.staticDir, 'brand', icon, name);
+    // Favicons are cached hard by default; revalidating (by ETag) keeps a switch instant.
+    if (await assetExists(this.deps.staticDir, file)) return serveStaticAsset(req, res, file);
+    // A variant need not ship every format (only the diamond has an SVG); the
+    // browser falls through to the next <link rel="icon"> on a miss.
+    res.writeHead(404).end('not found');
   }
 
   /** Unlike the static asset shell, the installable-app name follows the live
@@ -7838,39 +7807,37 @@ export class Gateway {
 
   // ── static SPA ──
   private async static(p: string, res: http.ServerResponse, req?: http.IncomingMessage) {
-    let rel = p === '/' ? '/index.html' : p === '/billing/checkout' ? '/paddle-checkout.html' : p;
+    const rel = p === '/' ? '/index.html' : p === '/billing/checkout' ? '/paddle-checkout.html' : p;
     let file = path.join(this.deps.staticDir, rel);
-    if (!file.startsWith(this.deps.staticDir) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
-    }
+    if (unpublishedAsset(file)) return void res.writeHead(404).end('not found');
+    if (!(await assetExists(this.deps.staticDir, file))) file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
+    const name = path.basename(file);
+    // Brand the HTML response itself, not just the hydrated SPA. That avoids a
+    // flash of the default name and gives crawlers/non-JS clients the current
+    // installation identity. The checked-in shell remains a portable fallback.
+    const brandShell = async (data: Buffer) => {
+      const siteName = escapeHtml((await this.siteName));
+      return Buffer.from(data.toString('utf8')
+        .replace(/(<meta name="description" content=")[^"]*(" \/>)/, `$1${siteName} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.$2`)
+        .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, `$1${siteName}$2`)
+        .replace(/<title>[^<]*<\/title>/, `<title>${siteName}</title>`));
+    };
+    // `llms.txt` is also public product copy. Keep its checked-in version a
+    // useful default, then brand both its prose and same-origin links at the
+    // edge so hosted and self-hosted installations describe themselves.
+    const brandLlms = async (data: Buffer) => {
+      const siteName = (await this.siteName);
+      const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
+      return Buffer.from(data.toString('utf8')
+        .replace(/^# krmax$/m, `# ${siteName}`)
+        .replace(/^> krmax is /m, `> ${siteName} is `)
+        .replace(/^krmax gives /m, `${siteName} gives `)
+        .replace(/https:\/\/krmax\.io/g, origin || 'https://krmax.io'));
+    };
     try {
-      let data = await fs.promises.readFile(file);
-      // Brand the HTML response itself, not just the hydrated SPA. That avoids a
-      // flash of the default name and gives crawlers/non-JS clients the current
-      // installation identity. The checked-in shell remains a portable fallback.
-      if (path.basename(file) === 'index.html') {
-        const name = escapeHtml((await this.siteName));
-        data = Buffer.from(data.toString('utf8')
-          .replace(/(<meta name="description" content=")[^"]*(" \/>)/, `$1${name} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.$2`)
-          .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, `$1${name}$2`)
-          .replace(/<title>[^<]*<\/title>/, `<title>${name}</title>`));
-      }
-      // `llms.txt` is also public product copy. Keep its checked-in version a
-      // useful default, then brand both its prose and same-origin links at the
-      // edge so hosted and self-hosted installations describe themselves.
-      if (path.basename(file) === 'llms.txt') {
-        const name = (await this.siteName);
-        const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
-        data = Buffer.from(data.toString('utf8')
-          .replace(/^# krmax$/m, `# ${name}`)
-          .replace(/^> krmax is /m, `> ${name} is `)
-          .replace(/^krmax gives /m, `${name} gives `)
-          .replace(/https:\/\/krmax\.io/g, origin || 'https://krmax.io'));
-      }
-      res.writeHead(200, staticAssetHeaders(file));
-      res.end(data);
+      await serveStaticAsset(req, res, file, name === 'index.html' ? brandShell : name === 'llms.txt' ? brandLlms : undefined);
     } catch {
-      res.writeHead(404).end('not found');
+      if (!res.headersSent) res.writeHead(404).end('not found');
     }
   }
 

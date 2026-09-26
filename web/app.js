@@ -2737,18 +2737,18 @@ async function boot() {
       }
     }
   }
-  S.meta = await api('/api/meta');
   applyDocumentBrand();
   watchConsoleRevision();
-  try {
-    S.installationInfo = await api('/api/settings/installation');
-    S.installationAccess = S.installationInfo?.canManage === true;
-  } catch {
-    S.installationInfo = null;
-    S.installationAccess = false;
-  }
-  await loadOrganizations().catch(() => {});
-  try { await loadProjects(); }
+  // Independent reads run together; each used to wait for the one before it.
+  const projects = api('/api/projects');
+  projects.catch(() => {}); // awaited (and its error handled) by loadProjects below
+  const [installationInfo] = await Promise.all([
+    api('/api/settings/installation').catch(() => null),
+    loadOrganizations().catch(() => {}),
+  ]);
+  S.installationInfo = installationInfo;
+  S.installationAccess = installationInfo?.canManage === true;
+  try { await loadProjects(projects); }
   catch (e) {
     // A self-registered identity is real but intentionally starts with no
     // project grants. Give it an honest waiting room instead of a generic boot
@@ -2761,21 +2761,24 @@ async function boot() {
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
     history.replaceState({ kx: 1 }, '', profileRoute());
-  await loadCollaboration().catch(() => {});
   const projectScope = S.projectId
     ? `?projectId=${encodeURIComponent(S.projectId)}`
     : S.organizationId ? `?organizationId=${encodeURIComponent(S.organizationId)}` : '';
-  try {
-    S.contributions = await api(`/api/contributions${projectScope}`);
-    S.schema = await api(`/api/schema${projectScope}`);
-    S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
-    // The boot catalog is already scoped to the selected project's organization.
-    // Mark it as such so the first route reconciliation does not immediately fetch
-    // the same schema + model catalog again before it can paint.
-    S.catalogOrganizationId = S.organizationId;
-    if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
-  } catch {}
-  await refreshOnboarding();
+  loadModelCatalog(projectScope, S.organizationId);
+  await Promise.all([
+    loadCollaboration().catch(() => {}),
+    api(`/api/contributions${projectScope}`).then((contributions) => { S.contributions = contributions; }).catch(() => {}),
+    api(`/api/schema${projectScope}`).then((schema) => {
+      S.schema = schema;
+      // The boot catalog is already scoped to the selected project's organization.
+      // Mark it as such so the first route reconciliation does not immediately
+      // fetch the same catalog again before it can paint.
+      S.catalogOrganizationId = S.organizationId;
+    }).catch(() => {}),
+    S.organizationId && api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`)
+      .then((connections) => { S.worldProviderConnections = connections; }).catch(() => { S.worldProviderConnections = []; }),
+    refreshOnboarding(),
+  ]);
   connectWs();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
@@ -2806,8 +2809,8 @@ async function boot() {
   await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
-async function loadProjects() {
-  S.projects = await api('/api/projects');
+async function loadProjects(request = api('/api/projects')) {
+  S.projects = await request;
   if (!S.projectId) S.projectId = firstProjectForOrganization(S.organizationId)?.id || null;
   if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
 }
@@ -2817,18 +2820,25 @@ async function loadOrganizationRuntimeCatalog() {
   if (!organizationId || S.catalogOrganizationId === organizationId) return;
   const epoch = S.catalogLoadEpoch = (S.catalogLoadEpoch || 0) + 1;
   const query = `?organizationId=${encodeURIComponent(organizationId)}`;
+  loadModelCatalog(query, organizationId);
   try {
-    const [schema, models] = await Promise.all([
-      api(`/api/schema${query}`),
-      api(`/api/models${query}`),
-    ]);
+    const schema = await api(`/api/schema${query}`);
     if (S.catalogLoadEpoch !== epoch || S.organizationId !== organizationId) return;
     S.schema = schema;
-    S.modelCatalog = models.providers;
     S.catalogOrganizationId = organizationId;
   } catch {
     // Keep the last usable built-in catalog; task creation remains server-validated.
   }
+}
+
+/** Model pickers fall back to built-in presets, and discovery can take seconds
+ *  (the server asks each provider), so no page ever waits for this. */
+function loadModelCatalog(query, organizationId) {
+  const epoch = S.modelCatalogEpoch = (S.modelCatalogEpoch || 0) + 1;
+  return api(`/api/models${query}`).then((models) => {
+    if (S.modelCatalogEpoch !== epoch || S.organizationId !== organizationId) return;
+    S.modelCatalog = models.providers;
+  }).catch(() => {});
 }
 
 async function loadOrganizations() {
