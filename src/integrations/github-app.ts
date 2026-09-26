@@ -1023,7 +1023,11 @@ export class GitHubAppService {
       const prEvent = pullRequestWebhookEvent(event, payload);
       if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
         return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
-      const view = (await this.store.getTask(prEvent.taskId))?.lastView;
+      const task = await this.store.getTask(prEvent.taskId);
+      const attached = task ? await this.store.listProjectRepositories(task.projectId) : [];
+      if (!attached.some(({ repository }) => repository.providerId === String(payload.repository?.id)))
+        return { accepted: true };
+      const view = task?.lastView;
       if (view) {
         const reconciled = reconcilePullRequestView(view, prEvent.payload);
         if (reconciled !== view) (await this.store.saveView(prEvent.taskId, reconciled));

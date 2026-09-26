@@ -2079,9 +2079,24 @@ describe('GitHub PR state → task view', () => {
 describe('PR webhooks → karmax events', () => {
   const delivery = (action: string, over: Record<string, unknown> = {}) => ({
     action,
-    repository: { full_name: SLUG },
+    repository: { id: 99, full_name: SLUG },
     pull_request: { number: 7, html_url: `https://github.com/${SLUG}/pull/7`, state: 'open',
-      title: 'Work', head: { ref: 'karmax/task_abc' }, base: { ref: 'main' }, ...over },
+      title: 'Work', head: { ref: 'karmax/task_abc', repo: { id: 99 } }, base: { ref: 'main' }, ...over },
+  });
+
+  it('rejects fork PRs, fork checks and untrusted reviews naming a task branch', () => {
+    expect(pullRequestWebhookEvent('pull_request', delivery('closed', {
+      merged: true, head: { ref: 'karmax/task_abc', repo: { id: 100 } },
+    }))).toBeUndefined();
+    expect(pullRequestWebhookEvent('check_run', { action: 'completed', repository: { id: 99 },
+      check_run: { check_suite: { head_branch: 'karmax/task_abc' },
+        pull_requests: [{ head: { ref: 'karmax/task_abc', repo: { id: 100 } } }] },
+    })).toBeUndefined();
+    for (const association of ['NONE', 'FIRST_TIMER', 'CONTRIBUTOR', undefined]) {
+      expect(pullRequestWebhookEvent('pull_request_review', { ...delivery('submitted'),
+        review: { state: 'approved', author_association: association },
+      })).toBeUndefined();
+    }
   });
 
   it('maps a merged PR to github.pr.merged, correlated to its task', () => {
@@ -2096,7 +2111,7 @@ describe('PR webhooks → karmax events', () => {
     expect(pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed' }))?.type).toBe('github.pr.closed');
     expect(pullRequestWebhookEvent('pull_request', delivery('opened'))?.type).toBe('github.pr.opened');
     const review = pullRequestWebhookEvent('pull_request_review',
-      { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } });
+      { ...delivery('submitted'), review: { author_association: 'COLLABORATOR', state: 'approved', user: { login: 'ada' } } });
     expect(review).toMatchObject({ type: 'github.pr.review' });
     expect(review!.payload).toMatchObject({ review: 'approved', reviewer: 'ada' });
     // A human's own PR is not a karmax task's PR.
@@ -2107,9 +2122,10 @@ describe('PR webhooks → karmax events', () => {
 
   it('correlates a completed check run to the task branch for prompt reconciliation', () => {
     const event = pullRequestWebhookEvent('check_run', {
-      action: 'completed', repository: { full_name: SLUG }, check_run: {
+      action: 'completed', repository: { id: 99, full_name: SLUG }, check_run: {
         name: 'CI', status: 'completed', conclusion: 'failure', details_url: 'https://ci.test/run/1',
         check_suite: { head_branch: 'karmax/task_abc' },
+        pull_requests: [{ head: { ref: 'karmax/task_abc', repo: { id: 99 } } }],
       },
     });
     expect(event).toMatchObject({ taskId: 'task_abc', type: 'github.check.completed', payload: {
@@ -2140,11 +2156,12 @@ describe('PR webhooks → karmax events', () => {
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed' }))!,
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed', merged: true }))!,
       pullRequestWebhookEvent('pull_request_review',
-        { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } })!,
+        { ...delivery('submitted'), review: { author_association: 'COLLABORATOR', state: 'approved', user: { login: 'ada' } } })!,
       pullRequestWebhookEvent('check_run', {
-        action: 'completed', repository: { full_name: SLUG }, check_run: {
+        action: 'completed', repository: { id: 99, full_name: SLUG }, check_run: {
           name: 'CI', status: 'completed', conclusion: 'success', details_url: 'https://ci.test/run/1',
           check_suite: { head_branch: 'karmax/task_abc' },
+        pull_requests: [{ head: { ref: 'karmax/task_abc', repo: { id: 99 } } }],
         },
       })!,
     ];

@@ -700,7 +700,12 @@ export function reconcilePullRequestView(
  * events: those are the ones that belong to a task's timeline.
  */
 export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWebhookEvent | undefined {
+  const repositoryId = payload?.repository?.id;
+  if (!repositoryId) return undefined;
   if (event === 'check_run') {
+    const heads = payload?.check_run?.pull_requests;
+    if (!Array.isArray(heads) || !heads.length || heads.some((pr: any) =>
+      pr.head?.repo?.id !== repositoryId || pr.head?.ref !== payload.check_run.check_suite?.head_branch)) return undefined;
     const taskId = taskIdOfBranch(payload?.check_run?.check_suite?.head_branch);
     if (!taskId || payload?.action !== 'completed') return undefined;
     const run = payload.check_run;
@@ -718,7 +723,7 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
   }
   const pr = payload?.pull_request;
   const taskId = taskIdOfBranch(pr?.head?.ref);
-  if (!taskId) return undefined;
+  if (!taskId || pr.head?.repo?.id !== repositoryId) return undefined;
   const base = {
     number: Number(pr.number),
     url: String(pr.html_url ?? ''),
@@ -738,6 +743,7 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
     return { taskId, type: `github.pr.${action}`, payload: { ...base, action } };
   }
   if (event === 'pull_request_review') {
+    if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(payload?.review?.author_association)) return undefined;
     const review = String(payload?.review?.state ?? '').toLowerCase();
     if (!review) return undefined;
     return { taskId, type: 'github.pr.review', payload: { ...base, review,
