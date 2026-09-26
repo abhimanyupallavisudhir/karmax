@@ -1666,6 +1666,60 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  it('does not propose commits the fetched target already has when the local target is stale', async () => {
+    // refresh_upstream advances only origin/<target>; the world's local target
+    // stays at its provisioning commit. A task that merged the refreshed target
+    // has nothing of its own, and GitHub refuses that PR with 422 "No commits
+    // between" — which escalated tasks 368, 369, 372 and 373.
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('stale-local-target');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_stale_target', repo, base: 'main', target: 'main', kind: 'worktree',
+    });
+    const checkout = handle.repos![0]!;
+    const staleMain = (await gitOrThrow(checkout.root, ['rev-parse', 'main'])).trim();
+    fs.writeFileSync(path.join(checkout.root, 'landed-elsewhere.txt'), 'already on the target');
+    await gitOrThrow(checkout.root, ['add', '-A']);
+    await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'landed on the target by someone else']);
+    await gitOrThrow(checkout.root, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    expect((await gitOrThrow(checkout.root, ['rev-parse', 'main'])).trim()).toBe(staleMain);
+
+    await expect(core.openPr(handle, 'main', { title: 'Nothing new' })).resolves.toEqual([]);
+    expect(gh.prs).toHaveLength(0);
+
+    fs.writeFileSync(path.join(checkout.root, 'own.txt'), 'the task\'s own change');
+    await gitOrThrow(checkout.root, ['add', '-A']);
+    await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'task work']);
+    await expect(core.openPr(handle, 'main', { title: 'Own change' })).resolves.toHaveLength(1);
+    await core.destroyWorld(handle);
+  });
+
+  it('skips a checkout GitHub reports has no commits between its branch and the target', async () => {
+    const gh = fakeGithub();
+    const fetcher = gh.options.fetch;
+    gh.options.fetch = (async (url: string, init: RequestInit = {}) => {
+      if ((init.method ?? 'GET') === 'POST' && /\/pulls$/.test(new URL(String(url)).pathname))
+        return Response.json({ message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom',
+          message: 'No commits between main and karmax/task_pr_github_empty' }] }, { status: 422 });
+      return fetcher(url, init);
+    }) as typeof fetch;
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('github-empty');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_github_empty', repo, base: 'main', target: 'main', kind: 'worktree',
+    });
+    const checkout = handle.repos![0]!;
+    fs.writeFileSync(path.join(checkout.root, 'work.txt'), 'already landed upstream');
+    await gitOrThrow(checkout.root, ['add', '-A']);
+    await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'work GitHub already has']);
+
+    await expect(core.openPr(handle, 'main', { title: 'Empty on GitHub' })).resolves.toEqual([]);
+    expect((await core.store.eventsSince(handle.id, 0)).filter((event) => event.type === 'pr.skipped'))
+      .toEqual([expect.objectContaining({ payload: expect.objectContaining({ repo: checkout.name }) })]);
+    await core.destroyWorld(handle);
+  });
+
   it('compares against the recorded base when a dynamically enrolled checkout has no target refs', async () => {
     const gh = fakeGithub();
     const core = await coreFor(gh);

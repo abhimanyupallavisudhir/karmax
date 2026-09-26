@@ -859,18 +859,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
   }
 
-  /** Count task commits without assuming a cloud/restored checkout has a local
-   * copy of the protected branch. Restored worlds may hold it only as
-   * origin/<target>; dynamically enrolled checkouts intentionally receive no
-   * target ref at all, only the immutable starting commit in `baseSha`. Keep
-   * the configured name for the GitHub PR; these fallbacks are only for local
-   * Git comparison. */
+  /** Count the commits a PR would propose. GitHub compares against its own
+   * copy of the target, which a world knows only as of its last fetch: the
+   * local target branch stays at its provisioning commit while refresh_upstream
+   * advances just origin/<target>. Counting against the stale local branch made
+   * a task that merged the refreshed target "propose" commits GitHub already
+   * had, and its PR was refused with 422 "No commits between" (tasks 368, 369,
+   * 372, 373) — so count only commits reachable from neither. Restored worlds
+   * may hold the target only as origin/<target>; dynamically enrolled checkouts
+   * intentionally receive no target ref at all, only the immutable starting
+   * commit in `baseSha`. Keep the configured name for the GitHub PR; these refs
+   * are only for local Git comparison. */
   async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
-    const local = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
-    if (local.code === 0 || base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
-    const remoteBase = `refs/remotes/origin/${base}`;
-    const remote = await world.exec('git', ['rev-list', '--count', `${remoteBase}..${repo.branch}`], { cwd: repo.root });
-    if (remote.code === 0) return remote;
+    const dwim = () => world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return dwim();
+    const candidates = [`refs/heads/${base}`, `refs/remotes/origin/${base}`];
+    const listed = await world.exec('git', ['for-each-ref', '--format=%(refname)', ...candidates], { cwd: repo.root });
+    const lines = listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()) : [];
+    const present = candidates.filter((ref) => lines.includes(ref));
+    if (present.length) {
+      return world.exec('git', ['rev-list', '--count', repo.branch, ...present.map((ref) => `^${ref}`)], { cwd: repo.root });
+    }
     if (repo.baseSha) {
       const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, repo.branch], { cwd: repo.root });
       if (ancestor.code === 0) {
@@ -878,7 +887,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (recorded.code === 0) return recorded;
       }
     }
-    return local;
+    return dwim();
   }
 
   async function brokerAuthFor(handle: WorldHandle, taskId?: string): Promise<GitBrokerAuth> {
@@ -3338,15 +3347,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushError ? `: ${pushError}` : ''}`);
         }
-        const { pr, created } = await api.openOrUpdate(slug, {
-          head: repo.branch, base,
-          // With several branches in flight the task title alone names none of
-          // them; say which pull request this one is.
-          title: changed.length > 1
-            ? `${details.title?.trim() || 'karmax'} (${repo.name})`
-            : details.title?.trim() || `karmax: ${repo.branch}`,
-          body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
-        });
+        let opening: Awaited<ReturnType<typeof api.openOrUpdate>>;
+        try {
+          opening = await api.openOrUpdate(slug, {
+            head: repo.branch, base,
+            // With several branches in flight the task title alone names none of
+            // them; say which pull request this one is.
+            title: changed.length > 1
+              ? `${details.title?.trim() || 'karmax'} (${repo.name})`
+              : details.title?.trim() || `karmax: ${repo.branch}`,
+            body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+          });
+        } catch (error) {
+          // GitHub decides what the PR would contain. The local count can only
+          // overstate it (a fetch older than GitHub's target), never hide work,
+          // so its refusal of an empty proposal is a skip, not a failure.
+          if (!(error instanceof GithubApiError && error.status === 422 && /no commits between/i.test(error.message)))
+            throw error;
+          (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: `GitHub has no commits between ${base} and ${repo.branch}` }));
+          continue;
+        }
+        const { pr, created } = opening;
         const ref: TaskPullRequest = {
           repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged,
           ...(pr.headSha ? { headSha: pr.headSha } : {}),
