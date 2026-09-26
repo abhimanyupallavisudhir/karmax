@@ -786,9 +786,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     };
   }
 
-  async function publishTaskBranch(world: World, taskId: string) {
+  async function publishTaskBranch(world: World, taskId: string, idleCheckpoint = false) {
     return brokerPublishBranch(world, (await brokerAuthFor(world.handle, taskId)),
-      (await expectedTaskRemoteHeads(store, taskId)), recordOriginPublication(taskId));
+      (await expectedTaskRemoteHeads(store, taskId)), recordOriginPublication(taskId), { omitUnchangedBase: idleCheckpoint });
   }
 
   async function pushTaskBranches(
@@ -1088,13 +1088,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               if ((await store.listProjectRepositories(projectId)).length) {
                 await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
                 if (!(await valid())) return;
-                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId)));
+                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId, true)));
                 if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                 (await record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
               }
             }
             if (!(await valid())) return;
-            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld, { checkContinue }));
+            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld, { checkContinue, reuseClean: true }));
             (await record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
               generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
           } catch (error) {

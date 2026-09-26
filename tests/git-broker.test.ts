@@ -10,6 +10,32 @@ describe('cloud Git broker', () => {
   const cleanups: string[] = [];
   afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
+  it('omits an untouched base branch only for idle checkpoints', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-base-'));
+    cleanups.push(root);
+    const source = path.join(root, 'source'); fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    await gitOrThrow(source, ['commit', '--allow-empty', '-qm', 'base']);
+    const provider = new WorktreeProvider(path.join(root, 'worlds'));
+    const world = await provider.create({ taskId: 'base', repo: source, base: 'main' });
+    const exec = vi.spyOn(world, 'exec');
+    // Simulate a remote world whose task ref does not yet exist at origin.
+    world.handle.kind = 'e2b';
+    const repo = world.handle.repos![0]!;
+    repo.localPath = undefined;
+    repo.repo = 'git@example:base.git';
+    repo.sourceAuthority = 'origin';
+    const auth = vi.fn(async () => { throw new Error('transport should not be needed'); });
+    expect(await brokerPublishBranch(world, auth, {}, undefined, { omitUnchangedBase: true }))
+      .toEqual({ pushed: [], skipped: [] });
+    expect(auth).not.toHaveBeenCalled();
+    expect(exec.mock.calls.every(([cmd, args]) => cmd === 'git' && args[0] === 'rev-parse')).toBe(true);
+    // Explicit publication still needs a real task ref, including at the base.
+    expect((await brokerPublishBranch(world, auth)).skipped).toEqual([repo.name]);
+    expect(auth).toHaveBeenCalled();
+  });
+
   it('enrolls an attached empty private repo, publishes the parent, and bootstraps a child checkout/import without leaking credentials', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-enrollment-'));
     cleanups.push(root);

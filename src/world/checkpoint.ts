@@ -67,7 +67,7 @@ export class WorldCheckpointService {
     this.runners = runners ?? new RunnerPoolService(store);
   }
 
-  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void> } = {}): Promise<WorldCheckpoint> {
+  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void>; reuseClean?: boolean } = {}): Promise<WorldCheckpoint> {
     await options.checkContinue?.();
     const handle = ((await this.store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
     (await this.store.assertCurrentWorld(handle));
@@ -126,6 +126,25 @@ export class WorldCheckpointService {
         files.push({ repo: '', path: file, readPath: file });
       }
     }
+    const manifest = {
+      worldId: handle.id, generation: handle.generation ?? 1, projectId,
+      runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
+      repos, ...(resourceRefs.length ? { resources: resourceRefs } : {}),
+      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
+      ...(await snapshotProjectRuntime(this.store, projectId)),
+    };
+    // Git cleanliness alone is insufficient: resources, runtime settings and a
+    // previous dirty delta must also agree before reusing portable recovery data.
+    const cleanFingerprint = files.length === 0 ? sha256(Buffer.from(JSON.stringify(manifest))) : undefined;
+    const clean = handle.meta?.cleanCheckpoint as { id?: string; fingerprint?: string } | undefined;
+    if (options.reuseClean && cleanFingerprint && clean?.id === handle.checkpointId && clean?.fingerprint === cleanFingerprint) {
+      const previous = await this.store.getWorldCheckpoint(clean.id!);
+      if (previous?.filesystemDelta) {
+        await options.checkContinue?.();
+        if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
+        return previous;
+      }
+    }
     async function* contents(): AsyncGenerator<CheckpointFile> {
       for (const { readPath, ...file } of files) {
         await options.checkContinue?.();
@@ -146,18 +165,16 @@ export class WorldCheckpointService {
       throw error;
     }
     const checkpoint: WorldCheckpoint = {
-      id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
-      runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
-      repos, filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
-      ...(resourceRefs.length ? { resources: resourceRefs } : {}),
-      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
-      ...(await snapshotProjectRuntime(this.store, projectId)),
+      id: checkpointId, ...manifest,
+      filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
       createdAt: Date.now(),
     };
     try { (await this.store.saveWorldCheckpoint(checkpoint)); }
     catch (error) { await this.objects.delete(objectKey).catch(() => undefined); throw error; }
     finally { if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`)); }
     (await this.store.attachWorldCheckpoint(handle, checkpoint.id));
+    await this.store.updateWorldMeta(handle, { cleanCheckpoint: cleanFingerprint
+      ? { id: checkpoint.id, fingerprint: cleanFingerprint } : null });
     (await this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
       provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte', costMicros: 0,
       fundingSource: 'managed',

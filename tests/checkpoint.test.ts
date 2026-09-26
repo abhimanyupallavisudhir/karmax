@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,6 +18,55 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import { RunnerPoolService } from '../src/world/runners.js';
 
 describe('portable world checkpoints', () => {
+  it('reuses a clean checkpoint only while its generation, repositories and runtime remain unchanged', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-clean-checkpoint-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    await gitOrThrow(repo, ['commit', '--allow-empty', '-qm', 'base']);
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Clean', { repos: [repo] });
+    const task = await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: {} });
+    const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const put = vi.spyOn(objects, 'put');
+    let revisionId = 'original';
+    const resources = { checkpoint: async () => [{ attachmentId: 'data', revisionId }],
+      ignoredInventory: async () => undefined, scrubSecrets: vi.fn(async () => {}) };
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources as any);
+    const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+    const capture = () => checkpoints.checkpoint(world.handle, { reuseClean: true });
+    try {
+      const initial = await capture();
+      expect((await capture()).id).toBe(initial.id);
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(resources.scrubSecrets).toHaveBeenCalledTimes(2);
+      revisionId = 'changed-resource';
+      const changedResource = await capture();
+      expect(changedResource.id).not.toBe(initial.id);
+      expect((await capture()).id).toBe(changedResource.id);
+      await world.writeFile('new.txt', 'uncommitted');
+      const dirty = await capture();
+      expect(dirty.id).not.toBe(initial.id);
+      await world.exec('rm', ['new.txt']);
+      const cleaned = await capture();
+      expect(cleaned.id).not.toBe(dirty.id);
+      expect((await capture()).id).toBe(cleaned.id);
+      await world.exec('git', ['commit', '--allow-empty', '-qm', 'new head']);
+      const committed = await capture();
+      expect(committed.id).not.toBe(cleaned.id);
+      await new ProjectEnvironment(store).setSpec(project.id, { boot: ['echo new runtime'] });
+      const changedRuntime = await capture();
+      expect(changedRuntime.id).not.toBe(committed.id);
+      expect((await capture()).id).toBe(changedRuntime.id);
+      world.handle = await store.registerWorld({ ...(await store.currentWorld(task.id))!, generation: 2 }, project.id) as typeof world.handle;
+      expect((await capture()).id).not.toBe(changedRuntime.id);
+    } finally { await world.destroy(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('encrypts a dirty binary delta, restores it into a new generation, and fences the stale generation', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-checkpoint-'));
     const repo = path.join(dir, 'repo');
