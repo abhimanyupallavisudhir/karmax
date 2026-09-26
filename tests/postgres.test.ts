@@ -26,6 +26,17 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('scans only literal kv key prefixes', async () => {
+    const store = await Store.create(url!);
+    try {
+      await store.kvSet('case:A', 'one');
+      await store.kvSet('case:a', 'two');
+      await store.kvSet('case%literal', 'three');
+      expect(await store.kvEntries('case:A')).toEqual([{ key: 'case:A', value: 'one' }]);
+      expect(await store.kvEntries('case%')).toEqual([{ key: 'case%literal', value: 'three' }]);
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);

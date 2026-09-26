@@ -7276,7 +7276,21 @@ export class Store {
   }
 
   async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
-    return ((await this.db.prepare('SELECT k, v FROM kv WHERE k LIKE ? ORDER BY k').all(`${prefix}%`)) as any[])
+    const chars = Array.from(prefix);
+    let end: string | undefined;
+    for (let i = chars.length - 1; i >= 0; i--) {
+      const codePoint = chars[i]!.codePointAt(0)!;
+      if (codePoint < 0x10ffff) {
+        end = chars.slice(0, i).join('') + String.fromCodePoint(codePoint + 1);
+        break;
+      }
+    }
+    const rows = prefix
+      ? end
+        ? await this.db.prepare('SELECT k, v FROM kv WHERE k >= ? AND k < ? ORDER BY k').all(prefix, end)
+        : await this.db.prepare('SELECT k, v FROM kv WHERE k >= ? ORDER BY k').all(prefix)
+      : await this.db.prepare('SELECT k, v FROM kv ORDER BY k').all();
+    return (rows as any[]).filter((row) => String(row.k).startsWith(prefix))
       .map((row) => ({ key: String(row.k), value: String(row.v) }));
   }
 

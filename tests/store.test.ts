@@ -20,6 +20,16 @@ describe('Store', () => {
     await store.exportUserData('no-records');
   });
 
+  it('looks up literal kv prefixes through the primary-key range', async () => {
+    await store.kvSet('case:A', 'one');
+    await store.kvSet('case:a', 'two');
+    await store.kvSet('case%literal', 'three');
+    const prepare = vi.spyOn(store.db, 'prepare');
+    expect(await store.kvEntries('case:A')).toEqual([{ key: 'case:A', value: 'one' }]);
+    expect(await store.kvEntries('case%')).toEqual([{ key: 'case%literal', value: 'three' }]);
+    expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k >= \? AND k < \?/.test(sql))).toBe(true);
+  });
+
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
     const project = (await store.createProject('Parameter patches'));
     const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
