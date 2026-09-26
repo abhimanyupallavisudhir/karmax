@@ -2246,8 +2246,9 @@ export class Gateway {
         let organization;
         try {
           organization = (await store.createOrganization({ name: String(b.name ?? 'My organization'),
-            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId }));
-        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId,
+            ...(this.deps.hosted ? { maxOwned: 10 } : {}) }));
+        } catch (error) { return this.badRequest(res, error); }
         (await this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id));
         (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
         if (this.deps.hosted) (await this.enableHostedOnboarding(subject.userId, organization.id));
