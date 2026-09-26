@@ -1890,6 +1890,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // JIT-resolve credentials via the broker (never journaled). Every current
       // turn receives its selection from the general Credentials policy.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      // The coordinator's pool spans organizations; a leased home or key is used
+      // only if it is one of THIS organization's credentials. (The mock agent
+      // reads no credential; its pool entries exist only in tests.)
+      if ((args.accountConfigHome || args.accountApiKeyHandle) && profile.provider !== 'mock') {
+        const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+        const { enumerateCredentials } = await import('../platform/credentials.js');
+        const own = enumerateCredentials(gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
+        if ((args.accountConfigHome && !own.some((c) => c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome!)))
+          || (args.accountApiKeyHandle && !own.some((c) => c.apiKeyHandle === args.accountApiKeyHandle)))
+          throw ApplicationFailure.create({
+            message: 'The credential leased for this turn is not available to this organization; reconnect the login or API key and retry.',
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+      }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {

@@ -308,6 +308,11 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: AccountProvider,
       allowed?: string[],
     ): Promise<{ waiting: boolean; earliestResetAt?: number; detail?: string }> {
+      // The pool holds every organization's credentials. Without an allow-list
+      // the coordinator grants any account of the provider, so a real provider
+      // whose policy could not be resolved (the workflow's `.catch(() =>
+      // undefined)`) must fail closed. Only the mock keeps the provider fallback.
+      if (provider && provider !== 'mock' && allowed === undefined) allowed = ['missing:policy-unavailable'];
       (await timing(taskId, turnId, 'queue.account.requested'));
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
