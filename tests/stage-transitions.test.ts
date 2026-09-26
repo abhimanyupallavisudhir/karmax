@@ -488,6 +488,38 @@ describe('task stage transitions', () => {
     expect(prompt.slice(open, prompt.indexOf('</untrusted-data>', open))).toContain('New instructions from your owner');
   });
 
+  /** #21: a recurring run or a trigger fire starts an Avatar-backed agent too;
+   *  it re-checks that the Avatar is still enabled and callable by the human the
+   *  run works for (the trigger dispatcher's system token has no human). */
+  it('validates Avatars when spawning a run and when a trigger fires', async () => {
+    const f = (await fixture());
+    const now = Date.now();
+    (await f.store.kvSet(`avatars:project:${f.project.id}`, 'enabled'));
+    const avatar = (id: string, ownerUserId: string) => f.store.upsertAvatar({ id, organizationId: 'org_personal',
+      projectId: f.project.id, ownerUserId, name: id, purpose: 'Delegate', prompt: 'Act.', promptVersion: 1,
+      enabled: true, authorityMode: 'full', authorization: { level: 'full', profileId: 'full', scope: 'projects',
+        projectIds: [f.project.id], organizationId: 'org_personal', capabilities: ['*'] },
+      callableBy: [], roles: [], runtime: { provider: 'mock' }, createdAt: now, updatedAt: now } as any);
+    (await avatar('avatar_private', 'someone-else'));
+    (await avatar('avatar_mine', 'test'));
+    const armed = async (avatarId: string, repeatable: boolean) => (await f.store.createTask({ projectId: f.project.id,
+      title: 'Nightly', workflow: 'software-dev', workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'test' },
+      params: { prompt: 'nightly', repeatable, triggerState: 'armed', triggers: [{ kind: 'schedule', cron: '0 3 * * *' }],
+        'agent:do': { avatarId, provider: 'mock' } } as any }));
+    const system = (await f.tokens.mintPrincipal('system:triggers', ['*'])).token;
+    const series = (await armed('avatar_private', true));
+    await expect(f.api.spawnRun(f.token, series.id)).rejects.toThrow(/not allowed to call Avatar/);
+    await expect(f.api.fireTriggeredTask(system, series.id, 'clone')).rejects.toThrow(/not allowed to call Avatar/);
+    const oneOff = (await armed('avatar_private', false));
+    await expect(f.api.fireTriggeredTask(system, oneOff.id, 'self')).rejects.toThrow(/not allowed to call Avatar/);
+    expect((await f.store.getTask(oneOff.id))?.params.triggerState).toBe('armed');
+    expect(f.starts).toHaveLength(0);
+    // The creator's own Avatar still runs from both paths.
+    await f.api.fireTriggeredTask(system, (await armed('avatar_mine', true)).id, 'clone');
+    await f.api.fireTriggeredTask(system, (await armed('avatar_mine', false)).id, 'self');
+    expect(f.starts).toHaveLength(2);
+  });
+
   it('interlocks a graceful old-run shutdown until its replacement is durable', async () => {
     const f = (await fixture());
     (await f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev')));

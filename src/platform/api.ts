@@ -991,9 +991,12 @@ export class KarmaxApi {
   /** Resolve every Avatar referenced by the task's role fields and Review-agent
    * layers. Invocation is checked against the human who initiated the calling
    * chain, not against an arbitrary task-agent id. */
-  private async validateTaskAvatars(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap) {
+  private async validateTaskAvatars(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap, taskId?: string) {
+    // A system caller (the trigger dispatcher) starts a task for the human who
+    // created it; that human must still be allowed to call the Avatar.
     const callerUserId = caller.humanSubject?.userId
-      ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined);
+      ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined)
+      ?? (caller.kind === 'system' && taskId ? (await this.deps.store.taskCreatorUserId(taskId)) : undefined);
     const selected: Array<{ avatar: import('../domain/types.js').Avatar; role: string }> = [];
     const add = async (spec: unknown, role: string) => {
       const record = spec && typeof spec === 'object' && !Array.isArray(spec)
@@ -1658,7 +1661,7 @@ export class KarmaxApi {
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, files, _authorization,
       _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
-    if (caller) (await this.validateTaskAvatars(caller, project, manifest, resolved));
+    if (caller) (await this.validateTaskAvatars(caller, project, manifest, resolved, task.id));
     // Drafts re-resolve at queue time. Stamp that the resulting common branch
     // values already include repository fallback so provisioning must not apply
     // the repository default again over a project/task override.
@@ -2131,7 +2134,7 @@ export class KarmaxApi {
     }));
     run = (await this.inheritTaskDelegation(series, run));
     (await this.persistTaskCredentialPolicies(run));
-    const { startType, input } = await this.buildStart(run);
+    const { startType, input } = await this.buildStart(run, false, caller);
     try {
       await withTimeout(
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: run.id, args: [input] }),
@@ -2161,7 +2164,7 @@ export class KarmaxApi {
    */
   async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone'): Promise<{ startedTaskId: string }> {
     const task = (await this.deps.store.getTask(taskId));
-    (await this.require(token, 'create_task', { projectId: task?.projectId, taskId }));
+    const caller = (await this.require(token, 'create_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId)).id };
@@ -2170,7 +2173,7 @@ export class KarmaxApi {
     delete fired.triggerPending;
     (await this.deps.store.updateTaskParams(taskId, fired as any));
     try {
-      const { startType, input } = await this.buildStart({ ...task, params: fired as any });
+      const { startType, input } = await this.buildStart({ ...task, params: fired as any }, false, caller);
       await withTimeout(
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
         START_TIMEOUT_MS,
