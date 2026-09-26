@@ -9692,6 +9692,48 @@ function beginAsyncElementRender(element) {
   return () => element.isConnected && asyncElementRenderEpoch.get(element) === epoch;
 }
 
+// Start (or restart) a provider sign-in and walk the person through it in `out`:
+// the device URL, an authorization code when the provider asks for one, and the
+// result. Starting is an explicit re-authentication, so it is always forced —
+// otherwise an expired credential file reads as "Already signed in".
+async function runLoginFlow(out, { organizationId, provider, account, modelProvider, authMethod, onSignedIn }) {
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}/accounts`;
+  const show = (html, color) => { out.innerHTML = html; out.style.color = color; };
+  show(`Launching ${esc(provider)}:${esc(account)} sign-in…`, 'var(--ink-2)');
+  let r;
+  try {
+    r = await api(`${base}/connect`, {
+      method: 'POST',
+      body: JSON.stringify({ provider, account, browserMcp: 'none', modelProvider, authMethod, force: true }),
+    });
+  } catch (e) { out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; return false; }
+  if (r.status === 'logged_in') { show('🟢 Already signed in.', 'var(--ok, green)'); onSignedIn?.(); return true; }
+  if (r.status !== 'awaiting_oauth' || !r.loginUrl) {
+    out.textContent = `Could not start login: ${r.detail || r.status}`;
+    out.style.color = 'var(--bad, crimson)';
+    return false;
+  }
+  const codeEntry = r.requiresCode
+    ? '<br><label class="form-row">Authorization code shown after sign-in<input class="login-authorization-code" autocomplete="off" /></label><button class="btn sm login-code-submit">Submit code</button>'
+    : '';
+  show(`Open this URL to finish signing in ${esc(provider)}:${esc(account)} (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`, 'var(--ink-1)');
+  out.querySelector('.login-code-submit')?.addEventListener('click', async () => {
+    const code = out.querySelector('.login-authorization-code')?.value.trim();
+    if (!code) return toast('authorization code required', true);
+    const submit = out.querySelector('.login-code-submit');
+    submit.disabled = true;
+    try {
+      const completed = await api(`${base}/connect/code`, { method: 'POST', body: JSON.stringify({ provider, account, code }) });
+      if (completed.status === 'logged_in') { show('🟢 Signed in.', 'var(--ok, green)'); onSignedIn?.(); }
+      else out.textContent = completed.detail || 'Authorization code submitted.';
+    } catch (e) {
+      submit.disabled = false;
+      toast(e.message, true);
+    }
+  });
+  return true;
+}
+
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
   const renderIsCurrent = beginAsyncElementRender(el);
@@ -9762,18 +9804,18 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
       // A login the provider signed out cannot run until someone signs in again;
-      // a Claude sign-in lapses about four weeks after it was made, so offer a
-      // renewal in its last three days rather than let tasks stall on it.
+      // a Claude sign-in lapses about four weeks after it was made, so flag it in
+      // its last three days rather than let tasks stall on it. Either way the `!`
+      // starts the sign-in.
       const renewInDays = !c.signedOut && c.signInExpiresAt && c.signInExpiresAt - Date.now() < 3 * 86_400_000
         ? Math.max(0, Math.ceil((c.signInExpiresAt - Date.now()) / 86_400_000)) : undefined;
-      const renew = renewInDays === undefined ? ''
-        : canManage
-          ? `<button class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it to keep this login working">Renew</button>`
-          : `<span class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it in Settings → Credentials">renew</span>`;
-      const stateControl = c.signedOut
-        ? (canManage
-          ? '<button class="cred-signin" title="Signed out by the provider — sign in again to use it">Sign in</button>'
-          : '<span class="cred-signin" title="Signed out by the provider — sign in again in Settings → Credentials">signed out</span>')
+      const signInAlert = c.signedOut
+        ? 'Signed out — click to sign in again'
+        : renewInDays === undefined ? ''
+          : `Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — click to renew`;
+      const alertButton = signInAlert
+        ? `<button class="cred-signin" title="${esc(signInAlert)}" aria-label="${esc(signInAlert)}">!</button>` : '';
+      const stateControl = c.signedOut ? ''
         : c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
@@ -9784,12 +9826,12 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       return `<div class="cred-row ${esc(c.signedOut ? 'signed-out' : mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
         ${stateControl}
-        <span class="cred-label mono">${icon}${esc(label)}</span>${renew}
+        <span class="cred-label mono">${icon}${esc(label)}</span>${alertButton}
         ${loginActions ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
         ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
     })
-    .join('')}</div>`;
+    .join('')}</div><div class="cred-login-flow" hidden></div>`;
   const save = async (policy) => {
     // Local mode: keep the change client-side (applied when the task is created); else
     // persist immediately, keyed by taskId/projectId scope.
@@ -9817,15 +9859,13 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
     const login = loginByKey[key];
     const credential = byKey[key];
-    // Reuse the Connect form below so the sign-in flow (URL, code entry) is one.
-    row.querySelector('button.cred-signin')?.addEventListener('click', () => {
-      const provider = $('#login-provider'), name = $('#login-name'), connect = $('#login-connect');
-      if (!provider || !name || !connect) return;
-      provider.value = credential.provider;
-      provider.dispatchEvent(new Event('change'));
-      name.value = credential.account;
-      connect.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      connect.click();
+    row.querySelector('.cred-signin')?.addEventListener('click', () => {
+      const out = el.querySelector('.cred-login-flow');
+      out.hidden = false;
+      runLoginFlow(out, {
+        organizationId, provider: credential.provider, account: credential.account,
+        onSignedIn: () => renderCredentialEditor(el, scope, opts),
+      });
     });
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = prompt(`Rename login ${login.account} to:`, login.account);
@@ -16094,58 +16134,16 @@ function wireGlobalSettings(organizationId) {
   $('#login-connect')?.addEventListener('click', async () => {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
-    const browserMcp = 'none';
     const [modelProvider, authMethod] = provider === 'opencode'
       ? $('#login-opencode-target').value.split('|', 2)
       : [];
-    const out = $('#login-result');
     if (!account) return toast('account name required', true);
-    out.textContent = 'Launching provider login…';
-    out.style.color = 'var(--ink-2)';
-    try {
-      const btn = $('#login-connect'); btn.disabled = true;
-      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
-        method: 'POST',
-        // Clicking Connect is an explicit re-authentication request. Without
-        // force, an expired native credential file was mistaken for a healthy
-        // login and the UI misleadingly reported "Already signed in."
-        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod, force: true }),
-      });
-      btn.disabled = false;
-      if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
-      else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        const codeEntry = r.requiresCode
-          ? '<br><label class="form-row">Authorization code shown after sign-in<input id="login-authorization-code" autocomplete="off" /></label><button class="btn sm" id="login-code-submit">Submit code</button>'
-          : '';
-        out.innerHTML = `Open this URL to finish signing in (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`;
-        out.style.color = 'var(--ink-1)';
-        out.querySelector('#login-code-submit')?.addEventListener('click', async () => {
-          const code = out.querySelector('#login-authorization-code')?.value.trim();
-          if (!code) return toast('authorization code required', true);
-          const submit = out.querySelector('#login-code-submit');
-          submit.disabled = true;
-          try {
-            const completed = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect/code`, {
-              method: 'POST', body: JSON.stringify({ provider, account, code }),
-            });
-            if (completed.status === 'logged_in') {
-              out.innerHTML = '🟢 Signed in.';
-              out.style.color = 'var(--ok, green)';
-              hydrateAccounts(organizationId);
-              hydrateProfiles('global', undefined, organizationId);
-            } else {
-              out.textContent = completed.detail || 'Authorization code submitted.';
-            }
-          } catch (e) {
-            submit.disabled = false;
-            toast(e.message, true);
-          }
-        });
-      } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
-      $('#login-name').value = '';
-      hydrateAccounts(organizationId);
-      hydrateProfiles('global', undefined, organizationId);
-    } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
+    const btn = $('#login-connect');
+    btn.disabled = true;
+    const refresh = () => { hydrateAccounts(organizationId); hydrateProfiles('global', undefined, organizationId); };
+    const started = await runLoginFlow($('#login-result'), { organizationId, provider, account, modelProvider, authMethod, onSignedIn: refresh });
+    btn.disabled = false;
+    if (started) { $('#login-name').value = ''; refresh(); }
   });
   const syncLoginTarget = () => {
     const show = $('#login-provider')?.value === 'opencode';
