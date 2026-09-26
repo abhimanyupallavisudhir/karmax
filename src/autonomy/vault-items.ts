@@ -317,6 +317,8 @@ export class VaultItems {
     if (!label) throw new Error('a vault item needs a label');
     if (!prior && (await this.list()).length >= 1000) throw new Error('organization vault item quota reached (1000)');
     if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
+    if (args.type === 'note' && args.secrets?.note !== undefined && !args.secrets.note.trim())
+      throw new Error('a standalone note cannot be empty');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {

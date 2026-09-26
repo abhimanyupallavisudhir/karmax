@@ -145,3 +145,20 @@ it('migrates legacy ciphertext without losing readable secrets (AU-5)', async ()
   expect(new Vault(dir).reveal('legacy')).toBe('retained');
   expect(reopened.list().sort()).toEqual(['legacy', 'next']);
 });
+
+
+it('retains five encrypted prior values on rotation and deletes them with the handle (AU-22)', async () => {
+  const dir = directory();
+  const vault = new Vault(dir);
+  for (let i = 0; i < 8; i++) await vault.put('rotated', `rotation-secret-${i}`);
+  const reopened = new Vault(dir);
+  expect(reopened.reveal('rotated')).toBe('rotation-secret-7');
+  expect(reopened.reveal('rotated', 1)).toBe('rotation-secret-6');
+  expect(reopened.reveal('rotated', 5)).toBe('rotation-secret-2');
+  expect(reopened.reveal('rotated', 6)).toBeUndefined();
+  const files = fs.readdirSync(path.join(dir, 'entries')).filter(file => file.endsWith('.json'));
+  expect(files).toHaveLength(1);
+  expect(fs.readFileSync(path.join(dir, 'entries', files[0]!), 'utf8')).not.toContain('rotation-secret');
+  await reopened.delete('rotated');
+  expect(reopened.reveal('rotated', 1)).toBeUndefined();
+});

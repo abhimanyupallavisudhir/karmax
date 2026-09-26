@@ -542,3 +542,12 @@ it('delivers SSH-key files inside the receiving remote world (AU-21)', async () 
   expect(env.APP_SSH_KEY).toMatch(/^\/sandbox\/\.karmax-injection\/vault\//);
   expect(writes[0]?.[1]).toBe('PRIVATE\n');
 });
+
+
+it('rejects blank standalone notes without overwriting a stored note (AU-22)', async () => {
+  const { items } = makeService();
+  await expect(items.save({ type: 'note', label: 'Empty', secrets: { note: '' } })).rejects.toThrow(/empty/);
+  const item = await items.save({ type: 'note', label: 'Note', secrets: { note: 'retained' } });
+  await expect(items.save({ id: item.id, type: 'note', secrets: { note: '  ' } })).rejects.toThrow(/empty/);
+  expect(await items.resolveField(item, 'note', { mode: 'reveal' })).toBe('retained');
+});

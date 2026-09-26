@@ -119,10 +119,19 @@ export class Vault {
     return this.readDb()[handle];
   }
 
-  private writeEntry(handle: string, blob: string): void {
+  private history(handle: string): string[] {
+    const file = this.entryPath(handle);
+    if (!fs.existsSync(file)) return [];
+    const previous = JSON.parse(fs.readFileSync(file, 'utf8')).previous ?? [];
+    if (!Array.isArray(previous) || previous.length > 5 || previous.some(blob => typeof blob !== 'string'))
+      throw new Error('vault history is corrupt');
+    return previous;
+  }
+
+  private writeEntry(handle: string, blob: string, previous: string[] = []): void {
     const file = this.entryPath(handle);
     const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ handle, blob }), { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(tmp, JSON.stringify({ handle, blob, ...(previous.length ? { previous } : {}) }), { mode: 0o600, flag: 'wx' });
     fs.renameSync(tmp, file);
   }
 
@@ -151,7 +160,12 @@ export class Vault {
 
   async put(handle: string, secret: string): Promise<void> {
     this.validateSecret(secret);
-    await this.mutate(() => this.writeEntry(handle, this.encrypt(secret)));
+    await this.mutate(() => {
+      const prior = this.readEntry(handle);
+      if (prior !== undefined && this.decrypt(prior) === secret) return;
+      const previous = prior === undefined ? [] : [prior, ...this.history(handle)].slice(0, 5);
+      this.writeEntry(handle, this.encrypt(secret), previous);
+    });
   }
 
   async putIfAbsent(handle: string, secret: string): Promise<void> {
@@ -164,7 +178,10 @@ export class Vault {
     await this.mutate(() => {
       const secret = replacement ?? this.reveal(handle);
       if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
-      this.writeEntry(nextHandle, this.encrypt(secret));
+      const prior = this.readEntry(handle);
+      const previous = prior !== undefined && this.decrypt(prior) !== secret
+        ? [prior, ...this.history(handle)].slice(0, 5) : this.history(handle);
+      this.writeEntry(nextHandle, this.encrypt(secret), previous);
       if (nextHandle !== handle) fs.rmSync(this.entryPath(handle), { force: true });
     });
   }
@@ -172,8 +189,9 @@ export class Vault {
     return this.readEntry(handle) !== undefined;
   }
   /** Internal: only the broker should call this. */
-  reveal(handle: string): string | undefined {
-    const blob = this.readEntry(handle);
+  reveal(handle: string, revision = 0): string | undefined {
+    if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('invalid vault revision');
+    const blob = revision === 0 ? this.readEntry(handle) : this.history(handle)[revision - 1];
     return blob === undefined ? undefined : this.decrypt(blob);
   }
   list(): string[] {
