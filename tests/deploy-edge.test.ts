@@ -4,9 +4,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 const deployDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'deploy');
 const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8');
+
+it('bounds container memory and log growth in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const compose = parse(read(file)) as { services: Record<string, { mem_limit?: string; logging?: { options?: Record<string, string> } }> };
+    for (const [name, service] of Object.entries(compose.services)) {
+      expect(service.mem_limit, `${file}: ${name}`).toBeDefined();
+      expect(service.logging?.options?.['max-size'], `${file}: ${name}`).toBeDefined();
+      expect(service.logging?.options?.['max-file'], `${file}: ${name}`).toBeDefined();
+    }
+  }
+});
 
 /**
  * Run `deploy/karmax`'s `configure()` against a throwaway deployment directory.
