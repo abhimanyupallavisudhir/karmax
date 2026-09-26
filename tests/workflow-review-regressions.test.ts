@@ -165,3 +165,25 @@ it.each([['just-do', justDoV1_7], ['merge-only', mergeOnlyV1_7]] as const)(
     await workflow({ ...input, branch: 'b', confirm: { layers: [{ kind: 'agent' }, { kind: 'human' }] } });
     expect(humanGate).toBe(true);
   });
+
+it('WF-16: account pool lookup failures do not enable credential passthrough', async () => {
+  const error = new Error('coordinator unavailable');
+  const leaser = createAgentTurnLeaser({} as any, { accountPoolSize: async () => { throw error; } } as any, {} as any);
+  await expect(leaser.init()).rejects.toBe(error);
+});
+
+it('WF-16: refreshes a formerly empty pool before the next turn', async () => {
+  const coordinator = { accountPoolSize: vi.fn().mockResolvedValueOnce(0).mockResolvedValue(1),
+    leaseAccount: vi.fn(async (_task, turnId) => {
+      wf.handlers.get('accountGranted')!({ turnId, accountId: '(denied)' });
+    }) };
+  const host = { taskId: 'task', projectId: 'project', task: () => input,
+    world: () => undefined, status: () => 'active' as const, setStatus: vi.fn(), setWaitingFor: vi.fn(),
+    setAgentTurn: vi.fn(), cancelled: () => false, publish: async () => undefined };
+  const leaser = createAgentTurnLeaser(wf.activities as any, coordinator as any, host);
+  await leaser.init();
+  const turn = vi.fn();
+  await expect(leaser.run('do', turn)).rejects.toThrow('credential');
+  expect(turn).not.toHaveBeenCalled();
+  expect(coordinator.leaseAccount).toHaveBeenCalled();
+});

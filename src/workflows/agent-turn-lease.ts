@@ -222,7 +222,8 @@ export function createAgentTurnLeaser(
 
   return {
     async init(): Promise<void> {
-      accountPool = await coord.accountPoolSize().catch(() => 0);
+      accountPool = patched('agent-turn-account-pool-refresh-v1')
+        ? await coord.accountPoolSize() : await coord.accountPoolSize().catch(() => 0);
     },
 
     cancelActive(): void {
@@ -233,6 +234,7 @@ export function createAgentTurnLeaser(
       role: AgentRole,
       fn: (ctx: AgentTurnContext) => Promise<T>,
     ): Promise<T> {
+      if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coord.accountPoolSize();
       const turnId = agentTurnId(host.taskId, turnSeq++);
       if (accountPool <= 0) return admitted(turnId, role, undefined, fn);
 

@@ -1846,6 +1846,7 @@ async function softwareDevImpl(
       }
     };
 
+    if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coordinator.accountPoolSize();
     // v1 took this exact zero-activity passthrough. v1.1 still exposes host-slot
     // admission even when there is no configured account pool.
     if (accountPool <= 0) {
@@ -2540,7 +2541,9 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
-  accountPool = await coordinator.accountPoolSize().catch(() => 0);
+  accountPool = patched('agent-turn-account-pool-refresh-v1')
+    ? await withResolve('setup', () => coordinator.accountPoolSize())
+    : await coordinator.accountPoolSize().catch(() => 0);
 
   // A platform-requested human hold is deliberately outside the pipeline. Keep
   // the originating stage visible. An explicit Resume always wakes it; v1.7 also
