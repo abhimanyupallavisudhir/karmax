@@ -4982,15 +4982,19 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async queueView(token: string, domain: string, projectId?: string): Promise<{ queue: string[]; current?: string }> {
-    const caller = (await this.require(token, 'queue:read', projectId ? { projectId } : undefined));
-    // A merge-queue domain spans whatever tasks were enqueued into it. With no
-    // explicit project the raw view leaks other projects' task ids, so a
-    // project-scoped token filters to its own project by default.
-    const scopedTo = projectId ?? caller.projectId;
+    (await this.require(token, 'queue:read', projectId ? { projectId } : undefined));
+    // A merge-queue domain spans whatever tasks were enqueued into it — other
+    // projects', and other organizations' when they share a repository. Return
+    // only the ids this token could read queue state for (its project, project
+    // list or organization), narrowed to `projectId` when one is named.
     try {
       const view = (await this.deps.client.workflow.getHandle(mergeQueueId(domain)).query('queue')) as { queue: string[]; current?: string };
-      if (!scopedTo) return view;
-      const belongs = async (id: string | undefined) => !!id && (await this.deps.store.getTask(id))?.projectId === scopedTo;
+      const belongs = async (id: string | undefined) => {
+        const task = id ? (await this.deps.store.taskMetadataAsync(id)) : undefined;
+        if (!task || (projectId && task.projectId !== projectId)) return false;
+        const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+        return (await this.deps.tokens.check(token, 'queue:read', { projectId: task.projectId, taskId: task.id, organizationId })).ok;
+      };
       return { queue: (await __asyncCollections.filter(view.queue, async (id) => (await belongs(id)))), ...((await belongs(view.current)) ? { current: view.current } : {}) };
     } catch {
       return { queue: [] };

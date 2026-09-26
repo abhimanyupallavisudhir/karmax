@@ -212,6 +212,30 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     await expect(scoped.queueView(token, 'domain')).resolves.toEqual({ queue: [ours.id] });
   });
 
+  /** PL-3: a token scoped to several projects, or to a whole organization, has
+   *  no single `projectId`; it used to receive the unfiltered queue. */
+  it('filters the merge queue to what a multi-project or organization token may read', async () => {
+    const acme = (await store.getProject(mine))!.organizationId!;
+    const sibling = (await store.createProject('Sibling', {}, acme)).id;
+    const excluded = (await store.createProject('Excluded', {}, acme)).id;
+    const task = async (projectId: string) => (await store.createTask({ projectId, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any })).id;
+    const [ours, siblings, excludedTask, foreign] = [await task(mine), await task(sibling), await task(excluded), await task(theirs)];
+    const scoped = new KarmaxApi({
+      store, tokens, taskQueue: 'karmax', contentDir, worlds: new WorldRegistry(),
+      client: { workflow: { getHandle: () => ({ query: async () => ({
+        queue: [ours, siblings, excludedTask, foreign, 'task_deleted'], current: foreign }) }) } } as any,
+    });
+    const multi = (await tokens.mint({ taskId: '*', profileId: 'user', principal: 'user:a', projectIds: [mine, sibling],
+      organizationId: acme, ceiling: ['queue:read'], grantorCaps: ['queue:read'] })).token;
+    await expect(scoped.queueView(multi, 'domain')).resolves.toEqual({ queue: [ours, siblings] });
+    const organization = (await tokens.mintPrincipal('user:a', ['queue:read'], undefined, 60_000, acme)).token;
+    await expect(scoped.queueView(organization, 'domain')).resolves.toEqual({ queue: [ours, siblings, excludedTask] });
+    // Naming a project still narrows to it, and never widens past the token.
+    await expect(scoped.queueView(multi, 'domain', sibling)).resolves.toEqual({ queue: [siblings] });
+    await expect(scoped.queueView(multi, 'domain', excluded)).rejects.toBeInstanceOf(CapabilityError);
+  });
+
   /**
    * A multi-repo task takes ONE merge slot PER REPO. The guard used to compare
    * the requested domain against `state.mergeDomain`, which is only the FIRST of
