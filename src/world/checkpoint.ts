@@ -232,6 +232,12 @@ export class WorldCheckpointService {
     // `queued` lease row that nothing ever releases, permanently eating capacity.
     const remote = this.worlds.get(selected).capabilities?.remote === true;
     const hooks = options ?? ambientActivityHooks();
+    const previousLeaseId = previousHandle?.meta?.worldLeaseId;
+    if (remote && typeof previousLeaseId === 'string') {
+      const previousLease = await this.store.worldLease(previousLeaseId);
+      if (previousLease?.worldId === checkpoint.worldId && previousLease.taskId === checkpoint.worldId)
+        await this.runners.release(previousLeaseId, previousHandle!.provider ?? previousHandle!.kind);
+    }
     const acquired = remote
       ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
         provider: selected, priority: Number((await this.store.getTask(checkpoint.worldId))?.params.priority ?? 0),

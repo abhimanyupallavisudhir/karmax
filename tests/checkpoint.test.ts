@@ -249,7 +249,8 @@ describe('portable world checkpoints', () => {
     const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, undefined, runners);
 
     const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
-    world.handle.meta = { projectId: project.id };
+    const originalLease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'sandbox-test' });
+    world.handle.meta = { projectId: project.id, worldLeaseId: originalLease.leaseId };
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.writeFile('tracked.txt', 'edited in the sandbox\n');
     const checkpoint = await checkpoints.checkpoint(world.handle);
