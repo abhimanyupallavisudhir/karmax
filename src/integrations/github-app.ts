@@ -340,6 +340,7 @@ function retryDelayMs(response: Response, attempt = 0, method = 'GET'): number |
 export class GitHubAppService {
   private fetcher!: typeof fetch;
   private apiBase!: string;
+  private permissionSnapshots = new Map<string, { expiresAt: number; value: Promise<unknown> }>();
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
@@ -434,6 +435,7 @@ export class GitHubAppService {
     if (input.webhookSecret) (await this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret));
     if (input.clientSecret) (await this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret));
     this.tokenCache.clear();
+    this.permissionSnapshots.clear();
     return (await this.status());
   }
 
@@ -797,9 +799,9 @@ export class GitHubAppService {
   /** Observe the complete operational permission envelope at both GitHub
    * approval layers. The App owner changes the registration first; every
    * existing installation owner must then approve that expansion separately. */
-  async permissionStatus(connection?: GitConnection): Promise<GitHubAppPermissionStatus> {
+  async permissionStatus(connection?: GitConnection, options: { forceRefresh?: boolean } = {}): Promise<GitHubAppPermissionStatus> {
     if (!this.configured()) throw new Error('GitHub App is not configured');
-    const app = await this.appRequest<GitHubAppPayload>('/app');
+    const app = await this.permissionSnapshot<GitHubAppPayload>('/app', options.forceRefresh);
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
     (await this.rememberAppSlug(slug));
@@ -808,8 +810,8 @@ export class GitHubAppService {
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
       : `https://github.com/settings/apps/${encodeURIComponent(slug)}/permissions`;
     let installation: GitHubInstallationPayload | undefined;
-    if (connection) installation = await this.appRequest<GitHubInstallationPayload>(
-      `/app/installations/${encodeURIComponent(connection.installationId)}`,
+    if (connection) installation = await this.permissionSnapshot<GitHubInstallationPayload>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}`, options.forceRefresh,
     );
     const installationSettingsUrl = installation?.html_url?.startsWith('https://github.com/')
       ? installation.html_url
@@ -850,6 +852,18 @@ export class GitHubAppService {
   }
 
   /** Human-readable recovery for Git's remote-rejection message. */
+  private permissionSnapshot<T>(pathname: string, forceRefresh = false): Promise<T> {
+    const cached = this.permissionSnapshots.get(pathname);
+    if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.value as Promise<T>;
+    if (this.permissionSnapshots.size >= 1000) this.permissionSnapshots.clear();
+    const value = this.appRequest<T>(pathname).catch((error) => {
+      if (this.permissionSnapshots.get(pathname)?.value === value) this.permissionSnapshots.delete(pathname);
+      throw error;
+    });
+    this.permissionSnapshots.set(pathname, { expiresAt: Date.now() + 60_000, value });
+    return value;
+  }
+
   async workflowPermissionGuidance(repository: Repository): Promise<string> {
     const connection = repository.gitConnectionId
       ? (await this.store.getGitConnection(repository.gitConnectionId))
@@ -1020,6 +1034,7 @@ export class GitHubAppService {
 
   private async dispatchConnectionWebhook(event: string, payload: any, connection: GitConnection): Promise<GithubWebhookResult> {
     const installationId = connection.installationId;
+    if (event === 'installation') this.permissionSnapshots.clear();
     if (event === 'installation' && payload.action === 'new_permissions_accepted')
       this.clearInstallationTokens(connection.id);
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {

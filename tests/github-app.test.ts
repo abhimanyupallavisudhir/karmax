@@ -52,9 +52,13 @@ describe('GitHub App integration', () => {
       missingApp: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
       missingInstallation: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
     });
+    const calls = vi.spyOn(service as any, 'appRequest');
+    await Promise.all([service.permissionStatus(connection), service.permissionStatus(connection)]);
+    expect(calls).not.toHaveBeenCalled();
+    calls.mockRestore();
     appPermissions = { ...GITHUB_APP_PERMISSIONS };
     installationPermissions = { ...GITHUB_APP_PERMISSIONS };
-    await expect(service.permissionStatus(connection)).resolves.toMatchObject({
+    await expect(service.permissionStatus(connection, { forceRefresh: true })).resolves.toMatchObject({
       ready: true, missingApp: [], missingInstallation: [],
       permissions: expect.arrayContaining([
         expect.objectContaining({ key: 'actions', required: 'write', app: 'write', installation: 'write', ready: true }),
