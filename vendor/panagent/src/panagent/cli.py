@@ -112,8 +112,9 @@ def _load(args: argparse.Namespace, *, allow_url: bool) -> tuple[dict[str, Any],
         try:
             text = fetch_share(source, timeout=args.timeout)
             return reader(text, source_uri=source), source_format
-        except AcquisitionError:
-            if args.browser == "never":
+        except AcquisitionError as exc:
+            retryable = "anti-bot challenge" in str(exc) or "HTTP 403" in str(exc) or "HTTP 429" in str(exc)
+            if args.browser == "never" or not retryable:
                 raise
             text = fetch_share_browser(
                 source,
@@ -158,7 +159,7 @@ def _convert(args: argparse.Namespace) -> int:
         _write_output(args.report, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     if not args.quiet:
         _print_report(report, args.output)
-    return 3 if args.fail_on_warning and warnings else 0
+    return 3 if args.fail_on_warning and any(item.get("severity", "warning") != "info" for item in warnings) else 0
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -236,6 +237,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         return int(args.handler(args))
-    except (PanagentError, OSError) as exc:
+    except (PanagentError, OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
         print(f"panagent: error: {exc}", file=sys.stderr)
         return 2
