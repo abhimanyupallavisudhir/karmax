@@ -124,6 +124,10 @@ it('delegates live parent card grants instead of stale start-time authority (RT-
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
     const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work', project: {}, parentGrant: ['*'] });
     expect(child.grant).toContain('use-card:allowed');
+    await store.kvSet(`permission:grant:${parent.id}`, JSON.stringify({ do: ['use-card:approved'] }));
+    const approvedChild = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id,
+      title: 'Approved child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(approvedChild.grant).toContain('use-card:approved');
     expect(allows(child.grant!, 'task:create')).toBe(false);
     expect(allows(child.grant!, 'use-card:other')).toBe(false);
   } finally { await store.close(); }

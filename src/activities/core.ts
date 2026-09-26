@@ -5040,8 +5040,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
       // branch (which the parent owns and merges into). If no branch is known,
       // the child gets no merge capability — never a broad fallback.
-      const currentGrant = (parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities
-        ?? args.parentGrant ?? [];
+      const currentGrant = [
+        ...((parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? args.parentGrant ?? []),
+        ...await new PermissionRequests(store, currentProject?.organizationId ?? 'org_personal').extensionCaps(args.parentTaskId, 'do'),
+      ];
       const delegation = attenuate([...CHILD_TASK_CAPABILITIES, 'use-card:*'], currentGrant);
       const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
         ? [`merge-into:${args.parentBranch}`] : [];

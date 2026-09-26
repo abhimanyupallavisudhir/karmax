@@ -92,6 +92,15 @@ describe('BudgetService over the mock rail', () => {
     expect(await budget.cards({ projectId, taskId: 'no-grant', capabilities: [] })).toEqual([]);
   });
 
+  it('admits explicitly approved card capabilities in the live task grant (AU-7)', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Approved', cap: 1000 });
+    const task = await store.createTask({ projectId, title: 'Approved', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: [] } } });
+    await store.kvSet(`permission:grant:${task.id}`, JSON.stringify({ do: [`use-card:${card.id}`] }));
+    expect(await budget.cards({ projectId, taskId: task.id, capabilities: [`use-card:${card.id}`] })).toHaveLength(1);
+    expect(await budget.cards({ projectId, taskId: task.id, capabilities: [] })).toEqual([]);
+  });
+
   it('shares a parent budget across children and tasks created by agents (AU-9)', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Shared', cap: 10000 });
     await provider.fund(card.id, 10000);

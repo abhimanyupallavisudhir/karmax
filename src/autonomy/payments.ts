@@ -1,5 +1,6 @@
 import { getDomain } from 'tldts';
 import { allows, attenuate } from '../platform/capabilities.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -948,10 +949,17 @@ export class BudgetService {
     const visible = (await this.store.listCards(ctx.projectId, ctx.organizationId))
       .filter((card) => card.status !== 'canceled' && card.status !== 'inactive') as Card[];
     const storedCaps = ((await this.store.getTask(ctx.taskId))?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
-    let scoped = ctx.capabilities && storedCaps ? attenuate(ctx.capabilities, storedCaps) : ctx.capabilities ?? storedCaps ?? [];
+    const permissions = new PermissionRequests(this.store,
+      ctx.organizationId ?? (await this.store.getProject(ctx.projectId))?.organizationId ?? 'org_personal');
+    const approved = await permissions.extensionCaps(ctx.taskId);
+    const liveCaps = storedCaps || approved.length ? [...(storedCaps ?? []), ...approved] : undefined;
+    let scoped = ctx.capabilities && liveCaps ? attenuate(ctx.capabilities, liveCaps) : ctx.capabilities ?? liveCaps ?? [];
     for (const ancestorId of (await this.store.paymentBudgetFamily(ctx.taskId)).ancestorIds) {
       const ancestor = await this.store.getTask(ancestorId);
-      scoped = attenuate(scoped, (ancestor?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? []);
+      scoped = attenuate(scoped, [
+        ...((ancestor?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? []),
+        ...await permissions.extensionCaps(ancestorId),
+      ]);
     }
     const selected = (await this.policy(ctx.projectId, ctx.taskId)).cardIds;
     return visible.filter(card => (!selected || selected.includes(card.id))
