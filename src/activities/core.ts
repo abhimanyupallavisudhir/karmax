@@ -2798,7 +2798,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (timingSignal?.aborted) throw timingSignal.reason instanceof Error ? timingSignal.reason : error;
         if (resultCheckpointed) throw ApplicationFailure.create({ type: 'agent-infra', nonRetryable: false,
           message: error instanceof Error ? error.message : String(error), cause: error instanceof Error ? error : undefined });
-        throw error;
+        if (error instanceof ApplicationFailure) throw error;
+        throw classifyTurnError(error);
       } finally {
         if (keepAlive) clearInterval(keepAlive);
       }

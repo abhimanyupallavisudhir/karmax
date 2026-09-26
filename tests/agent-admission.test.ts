@@ -90,6 +90,20 @@ describe('agent turn admission', () => {
     } finally { await store.close(); }
   });
 
+  it('classifies failures while preparing a turn before provider admission', async () => {
+    const store = await Store.create(':memory:');
+    const worlds = new WorldRegistry();
+    const profiles = new ProfileResolver(store, 'mock');
+    vi.spyOn(profiles, 'resolve').mockRejectedValue(new Error('invalid turn profile'));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles });
+    try {
+      await expect(core.runAgentTurn({ taskId: 'task', role: 'do', messages: [],
+        worldHandle: { kind: 'memory', id: 'task' },
+        task: { projectId: 'project', title: 'Work', prompt: 'work', project: {} } } as any))
+        .rejects.toMatchObject({ type: 'agent-error', nonRetryable: true });
+    } finally { vi.restoreAllMocks(); await store.close(); }
+  });
+
   it('does not release another admission when a colliding turn is rejected', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Collision'));
