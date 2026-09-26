@@ -870,6 +870,7 @@ function defaultE2BFactory(): E2BFactory {
       return Sandbox.kill(id, options);
     },
     async events(options) {
+      const since = options.since;
       const result: unknown[] = [];
       // Cursor overlap and periodic full reconciliation are owned by the lifecycle
       // service. Keep the whole boundary page for equal timestamps/late arrivals.
@@ -885,8 +886,8 @@ function defaultE2BFactory(): E2BFactory {
         const body: any = await response.json();
         const page = Array.isArray(body) ? body : Array.isArray(body?.events) ? body.events : [];
         result.push(...page);
-        if (page.length < 100 || (options.since !== undefined && page.some((event: any) =>
-          Number.isFinite(Date.parse(event.timestamp)) && Date.parse(event.timestamp) <= options.since))) return result;
+        if (page.length < 100 || (since !== undefined && page.some((event: any) =>
+          Number.isFinite(Date.parse(event.timestamp)) && Date.parse(event.timestamp) <= since))) return result;
       }
       throw new Error('E2B lifecycle pagination limit exceeded; cursor was not advanced');
     },

@@ -543,7 +543,7 @@ it('captures small dirty files in one bounded sandbox read (WD-19, LT-11)', asyn
   const store = await Store.create(':memory:');
   const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
   const project = await store.createProject('Batch');
-  const task = await store.createTask({ projectId: project.id, title: 'Batch', workflow: 'software-dev', workflowVersion: '1.0.0', params: {} });
+  const task = await store.createTask({ projectId: project.id, title: 'Batch', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'test' } });
   const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
   world.handle = await store.registerWorld(world.handle, project.id) as any;
   vi.spyOn(worlds, 'open').mockResolvedValue(world);

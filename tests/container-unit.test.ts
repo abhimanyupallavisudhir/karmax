@@ -35,7 +35,7 @@ it('mounts the recorded checkout and Git admin directory at their real paths (WD
   const pty = await import('node-pty');
   const call = vi.mocked(pty.spawn).mock.calls.at(-1)!;
   expect(call[1]).toContain('exec sh /work/launch.sh');
-  expect(call[1]?.join(' ')).not.toContain('private-not-in-argv');
+  expect(JSON.stringify(call[1])).not.toContain('private-not-in-argv');
   expect(call[2]?.env?.TEST_PRIVATE).toBe('private-not-in-argv');
   await world.destroy();
 });
