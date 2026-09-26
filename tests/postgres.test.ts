@@ -26,6 +26,15 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('expires deduplicated GitHub PR observations', async () => {
+    const store = await Store.create(url!);
+    try {
+      expect(await store.claimGithubPrObservation('digest', 1000)).toBe(true);
+      expect(await store.claimGithubPrObservation('digest', 1001)).toBe(false);
+      expect((await store.retentionSweep(1000 + 31 * 86400_000)).githubPrObservations).toBe(1);
+    } finally { await store.close(); }
+  });
+
   it('translates JSON draft booleans and arbitrary json_remove paths', async () => {
     const store = await Store.create(url!);
     try {

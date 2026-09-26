@@ -13,6 +13,13 @@ describe('Store', () => {
     store = (await Store.create(':memory:'));
   });
 
+  it('deduplicates GitHub PR observations and expires them after a month', async () => {
+    expect(await store.claimGithubPrObservation('digest', 1000)).toBe(true);
+    expect(await store.claimGithubPrObservation('digest', 1001)).toBe(false);
+    expect((await store.retentionSweep(1000 + 31 * 86400_000)).githubPrObservations).toBe(1);
+    expect(await store.claimGithubPrObservation('digest', 1000 + 31 * 86400_000)).toBe(true);
+  });
+
   it('removes project admission reservations with the project', async () => {
     const project = await store.createProject('Reservations');
     const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });

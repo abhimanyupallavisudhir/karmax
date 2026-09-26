@@ -474,6 +474,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
         deliveryId TEXT PRIMARY KEY, event TEXT NOT NULL, receivedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS github_pr_observations (
+        digest TEXT PRIMARY KEY, createdAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS github_install_states (
         tokenHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, usedAt INTEGER,
@@ -774,6 +777,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_inbox_task ON inbox(taskId, kind);
       CREATE INDEX IF NOT EXISTS idx_repositories_org ON repositories(organizationId, owner, name);
       CREATE INDEX IF NOT EXISTS idx_github_install_states_expiry ON github_install_states(expiresAt, usedAt);
+      CREATE INDEX IF NOT EXISTS idx_github_pr_observations_created ON github_pr_observations(createdAt);
       CREATE INDEX IF NOT EXISTS idx_scoped_tokens_expiry ON scoped_tokens(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_human_delegations_expiry ON human_delegations(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_world_instances_current ON world_instances(worldId, generation DESC);
@@ -807,6 +811,11 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `));
+    if (!(await this.kvGet('migration:github-pr-observations'))) {
+      await this.db.prepare('DELETE FROM kv WHERE k>=? AND k<?')
+        .run('github:pr-observation:v1:', 'github:pr-observation:v1;');
+      await this.kvSet('migration:github-pr-observations', '1');
+    }
     // An installation belongs to a GitHub account, which may serve multiple
     // Tavya organizations. Rebuild the old inline UNIQUE constraint atomically;
     // IDs stay intact so repository links and cached credential handles survive.
@@ -7267,6 +7276,12 @@ export class Store {
     });
   }
 
+  async claimGithubPrObservation(digest: string, now = Date.now()): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare(
+      'INSERT OR IGNORE INTO github_pr_observations(digest,createdAt) VALUES (?,?)')
+      .run(digest, now)).changes) === 1);
+  }
+
   /**
    * The periodic retention sweep. Every sweep here is idempotent and bounded, so
    * a caller can run it on any interval (hourly is plenty).
@@ -7282,7 +7297,7 @@ export class Store {
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
-    subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
+    githubPrObservations: number; subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
     events: number; auditEntries: number }> {
     return this.db.transaction(async () => {
 
@@ -7312,6 +7327,9 @@ export class Store {
       scopedTokens: (await this.purgeScopedTokens(now)),
       humanDelegations: (await this.purgeHumanDelegations(now)),
       githubDeliveries: (await this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now)),
+      githubPrObservations: Number((await this.db.prepare(`DELETE FROM github_pr_observations WHERE digest IN
+        (SELECT digest FROM github_pr_observations WHERE createdAt<? ORDER BY createdAt LIMIT 10000)`)
+        .run(now - 30 * 86400_000)).changes),
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
       viewSnapshots, publicationFences, turnSessions,
