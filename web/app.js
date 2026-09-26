@@ -2833,6 +2833,13 @@ async function boot() {
   connectWs();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
+  installShellListeners();
+  await applyRoute(); // honor the initial URL (deep link / bookmark)
+}
+
+function installShellListeners() {
+  if (installShellListeners.installed) return;
+  installShellListeners.installed = true;
   bindKeys();
   installLinkRouter();
   installTagRouter();
@@ -2857,7 +2864,6 @@ async function boot() {
   document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
   document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
-  await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
 async function loadProjects(request = api('/api/projects')) {
@@ -3320,6 +3326,11 @@ function scheduleTaskListReload() {
 }
 
 function connectWs() {
+  clearTimeout(connectWs.retryTimer);
+  if (S.ws) {
+    S.ws.onclose = S.ws.onmessage = S.ws.onopen = null;
+    S.ws.close();
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
   S.ws = ws;
@@ -3410,7 +3421,7 @@ function connectWs() {
     wsHadDropped = true; setWsOnline(false);
     // Back off while the gateway is down (a restart, an expired session) instead
     // of hammering it from every open tab at a fixed 1.5 s.
-    setTimeout(connectWs, wsRetryMs);
+    connectWs.retryTimer = setTimeout(connectWs, wsRetryMs);
     wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
   };
 }
