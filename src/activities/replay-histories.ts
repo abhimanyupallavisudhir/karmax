@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
-import { historyFromJSON, historyToJSON } from '@temporalio/common/lib/proto-utils.js';
+import proto from '@temporalio/proto';
 import type { Store } from '../store/db.js';
 
 /** Snapshot only this tenant's task histories; shared coordinators require the
@@ -27,14 +27,14 @@ export async function snapshotReplayHistories(store: Store, client: Client, task
           namespace: client.options.namespace, execution: { workflowId: execution.workflowId, runId: execution.runId },
           maximumPageSize: 100, nextPageToken,
         });
-        const json = historyToJSON(response.history ?? { events: [] });
-        const bytes = Buffer.byteLength(json);
+        const encoded = proto.temporal.api.history.v1.History.encode(response.history ?? { events: [] }).finish();
+        const bytes = encoded.byteLength;
         historyBytes += bytes;
         totalBytes += bytes;
         if (historyBytes > limits.historyBytes || totalBytes > limits.totalBytes)
           throw new Error('organization replay history bytes exceed the replay limit');
-        const file = path.join(root, `${records.length}-${pages.length}.json`);
-        fs.writeFileSync(file, json, { mode: 0o600 });
+        const file = path.join(root, `${records.length}-${pages.length}.bin`);
+        fs.writeFileSync(file, encoded, { mode: 0o600 });
         pages.push(file);
         nextPageToken = response.nextPageToken?.length ? response.nextPageToken : undefined;
       } while (nextPageToken);
@@ -42,11 +42,11 @@ export async function snapshotReplayHistories(store: Store, client: Client, task
     }
     return { count: records.length, release, async *histories() {
       for (const record of records) {
-        const events: unknown[] = [];
+        const events: proto.temporal.api.history.v1.IHistoryEvent[] = [];
         for (const file of record.pages) {
-          for (const event of JSON.parse(fs.readFileSync(file, 'utf8')).events ?? []) events.push(event);
+          for (const event of proto.temporal.api.history.v1.History.decode(fs.readFileSync(file)).events ?? []) events.push(event);
         }
-        yield { workflowId: record.workflowId, history: historyFromJSON({ events }) };
+        yield { workflowId: record.workflowId, history: { events } };
       }
     } };
   } catch (error) { release(); throw error; }

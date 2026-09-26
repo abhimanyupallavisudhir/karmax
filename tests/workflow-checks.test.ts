@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { temporal } from '@temporalio/proto';
 import { snapshotReplayHistories } from '../src/activities/replay-histories.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -149,12 +150,13 @@ it('replays only organization task histories from a repeatable streamed snapshot
   const worlds = registerFakeWorld({ kind: 'scoped-world', remote: false, hasBundle: true, execs: [] });
   const executions: Array<{ workflowId: string; runId: string }> = [];
   const fetched: string[] = [];
-  const history = { events: [{ eventId: 1, eventType: 1, workflowExecutionStartedEventAttributes: { workflowType: { name: 'fixture' } } }] };
+  const history = { events: [{ eventId: 1, eventType: 1, workflowExecutionStartedEventAttributes: { workflowType: { name: 'fixture' }, input: { payloads: [{ data: Buffer.from([0, 255, 128]) }] } } }] };
   const client = { options: { namespace: 'fixture' }, workflow: {
     list: async function* () { yield* executions; },
     getHandle: (id: string) => ({ fetchHistory: async () => { fetched.push(id); return history; } }),
-  }, workflowService: { getWorkflowExecutionHistory: async ({ execution }: any) => {
-    fetched.push(execution.workflowId); return { history };
+  }, workflowService: { getWorkflowExecutionHistory: async ({ execution, nextPageToken }: any) => {
+    if (nextPageToken?.length) return { history: { events: [{ eventId: 2, eventType: 5, workflowTaskScheduledEventAttributes: {} }] } };
+    fetched.push(execution.workflowId); return { history, nextPageToken: Buffer.from('page-2') };
   } } };
   const { store, core } = await coreFor(worlds, root, client);
   const { Worker } = await import('@temporalio/worker');
@@ -165,6 +167,10 @@ it('replays only organization task histories from a repeatable streamed snapshot
     const ids: string[] = []; seen.push(ids);
     for await (const item of histories) {
       ids.push(item.workflowId);
+      const replayHistory = item.history as temporal.api.history.v1.IHistory;
+      expect(replayHistory.events?.map(event => Number(event.eventId))).toEqual([1, 2]);
+      expect(Buffer.from(replayHistory.events![0]!.workflowExecutionStartedEventAttributes!.input!.payloads![0]!.data!))
+        .toEqual(Buffer.from([0, 255, 128]));
       yield { workflowId: item.workflowId, runId: 'run',
         ...(item.workflowId.startsWith('foreign') && seen.length === 2 ? { error: new Error('foreign secret detail') } : {}) };
     }
