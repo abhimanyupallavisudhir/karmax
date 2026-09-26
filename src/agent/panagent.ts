@@ -125,7 +125,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
           const destination = path.join(opts.forkHome, 'projects', claudeCwdSlug(opts.worldPath), `${native.sessionId}.jsonl`);
           fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
           fs.writeFileSync(destination, native.content, { mode: 0o600 });
-          return { kind: 'native', sessionId: native.sessionId };
+          return { kind: 'native', sessionId: native.sessionId, warnings: native.warnings };
         }
       }
       let first: any;
@@ -187,10 +187,20 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
   }
 }
 
-function rewriteClaudeHistory(content: Buffer, sessionId: string): { sessionId: string; content: string } | undefined {
-  let records: any[];
-  try { records = content.toString('utf8').split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line)); }
-  catch { return undefined; }
+function rewriteClaudeHistory(content: Buffer, sessionId: string): { sessionId: string; content: string; warnings: PanagentWarning[] } | undefined {
+  const source = content.toString('utf8');
+  const lines = source.split(/\r?\n/);
+  const records: any[] = [];
+  const warnings: PanagentWarning[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    try { records.push(JSON.parse(line)); }
+    catch {
+      if (index !== lines.length - 1 || source.endsWith('\n')) return undefined;
+      warnings.push({ code: 'truncated_final_record', severity: 'warning',
+        message: 'Incomplete final JSONL record was skipped.', path: `records[${index}]` });
+    }
+  }
   if (!records.some((record) => ['user', 'assistant'].includes(record?.type) && typeof record.sessionId === 'string')) return undefined;
   const ids = new Map<string, string>();
   for (const record of records) if (typeof record.uuid === 'string') ids.set(record.uuid, crypto.randomUUID());
@@ -199,7 +209,7 @@ function rewriteClaudeHistory(content: Buffer, sessionId: string): { sessionId: 
     if (typeof record.parentUuid === 'string') record.parentUuid = ids.get(record.parentUuid) ?? record.parentUuid;
     if (typeof record.sessionId === 'string') record.sessionId = sessionId;
   }
-  return { sessionId, content: records.map((record) => JSON.stringify(record)).join('\n') + '\n' };
+  return { sessionId, content: records.map((record) => JSON.stringify(record)).join('\n') + '\n', warnings };
 }
 
 async function runPanagent(args: string[], reportFile: string): Promise<PanagentWarning[]> {

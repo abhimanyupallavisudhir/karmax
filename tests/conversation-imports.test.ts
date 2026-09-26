@@ -133,6 +133,19 @@ describe('Krmax panagent bridge', () => {
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
+  it('preserves valid Claude native records before a truncated tail', async () => {
+    const home = temporary('karmax-truncated-claude-import-');
+    try {
+      const result = await importWithPanagent({ source: { data: Buffer.from(CLAUDE_JSONL + '{"type":"assistant"') },
+        provider: 'claude', forkHome: home, worldPath: '/tmp/imported', mode: 'transcript', native: true });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      const file = path.join(home, 'projects', '-tmp-imported', `${result.sessionId}.jsonl`);
+      expect(fs.readFileSync(file, 'utf8').trim().split('\n')).toHaveLength(5);
+      expect(result.warnings?.some((item) => item.code === 'truncated_final_record')).toBe(true);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it('preserves native Codex tool and compaction payloads on upload under a fresh identity', async () => {
     const home = temporary('karmax-native-codex-import-');
     const records = [
