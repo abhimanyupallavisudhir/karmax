@@ -11,7 +11,7 @@
 // plus a directly constructed Gateway (see tests/fixtures/identity-smoke.ts).
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, vi } from 'vitest';
 import { IdentityService } from '../src/auth/identity.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { Gateway } from '../src/gateway/server.js';
@@ -220,7 +220,7 @@ describe('GitHub sign-in when configured', () => {
     expect(url.searchParams.get('client_id')).toBe(GITHUB.clientId);
     expect(url.searchParams.get('state')).toBeTruthy();
     expect(url.searchParams.get('redirect_uri')).toMatch(/\/api\/auth\/callback\/github$/);
-    expect(url.searchParams.get('scope')).toBe('');
+    expect(url.searchParams.get('scope') ?? '').toBe('');
   });
 
   it('hands new and refreshed GitHub App tokens to the personal connection', async () => {
@@ -348,6 +348,16 @@ describe('Google sign-in when configured', () => {
 });
 
 describe('Google and enterprise OIDC coexist', () => {
+  it('rejects a discovery document whose issuer differs from the configured issuer', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      issuer: 'https://other-idp.example.com',
+    }), { status: 200 }));
+    try {
+      await expect(IdentityService.create(':memory:', { oidc: { ...OIDC, issuer: 'https://idp.example.com' } }))
+        .rejects.toThrow(/issuer mismatch/);
+    } finally { fetcher.mockRestore(); }
+  });
+
   it('keeps Google, GitHub, and enterprise slots working together', async () => {
     const { identity, base } = await boot({ google: GOOGLE, github: GITHUB, oidc: OIDC });
     expect(identity.googleEnabled).toBe(true);
@@ -373,7 +383,7 @@ describe('Google and enterprise OIDC coexist', () => {
     expect(generic).toBeTruthy();
     const configured = generic.options?.config ?? generic.config;
     expect(configured).toEqual([expect.objectContaining({
-      providerId: 'enterprise', clientId: OIDC.clientId, pkce: true, requireIssuerValidation: true,
+      providerId: 'enterprise', clientId: OIDC.clientId, pkce: true, requireIdTokenVerification: true,
     })]);
   });
 });

@@ -210,7 +210,7 @@ release their execution lease when finished.
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
 ./deploy/karmax backup              # deploy/backups/<UTC timestamp>
-./deploy/karmax update              # backup, safe git fast-forward, rebuild
+./deploy/karmax update              # backup, validate commit ancestry, rebuild
 ./deploy/karmax down                # preserves all volumes and certificates
 ./deploy/karmax restore BACKUP_DIR  # verified, explicit destructive prompt
 ```
@@ -230,7 +230,8 @@ checkpoints on every deployment. To compact existing backups, run
 copy files out before editing them. The live data volume is never linked to a
 backup. The release workflow also retains its existing 14-day age limit.
 
-`restore` verifies Karmax's per-file hashes before changing data, restores the
+`restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
+secrets before stopping the running instance or changing data. It restores the
 Karmax and Temporal databases, reapplies the current Temporal schema, and retains the
 destination's domain. It requires typing `RESTORE` and will not delete Docker
 volumes as part of ordinary `down` or `update` operations.

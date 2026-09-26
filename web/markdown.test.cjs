@@ -148,6 +148,19 @@ ok(!withTexDelimiters.includes('<em>'), 'underscores inside TeX-delimited math a
 const noMath = renderMarkdown('cost $5 and $10 today', { math: false });
 ok(noMath.includes('cost $5 and $10 today'), 'currency $ untouched when math is off');
 
+// The lazily inserted CDN script must be byte-pinned before it executes.
+let mathjaxLoad = null;
+let mathjaxScript;
+global.window = {};
+global.document = { createElement: () => ({}), head: { appendChild: script => { mathjaxScript = script; } } };
+eval(extractFn('ensureMathJax'));
+ensureMathJax();
+ok(/^sha384-[A-Za-z0-9+/=]+$/.test(mathjaxScript.integrity), 'MathJax CDN script has integrity metadata');
+ok(mathjaxScript.crossOrigin === 'anonymous', 'MathJax integrity uses anonymous CORS');
+mathjaxScript.onerror();
+delete global.window;
+delete global.document;
+
 // GFM pipe tables.
 const table = renderMarkdown('| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |', {});
 ok(/<table class="md-table">/.test(table), 'table element emitted');

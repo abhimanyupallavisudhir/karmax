@@ -12,6 +12,11 @@ die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
 dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
+backup_checksums() {
+  destination=$1
+  (cd "$destination" && sha256sum *.dump deployment-secrets/* > SHA256SUMS)
+}
+
 compact_backups() {
   # Optional space optimization must never invalidate a verified backup or
   # prevent an emergency deployment on a host without util-linux hardlink.
@@ -195,8 +200,12 @@ cmd_backup() {
   destination=${1:-"$DEPLOY_DIR/backups/$stamp"}
   case "$destination" in /*) ;; *) destination="$PWD/$destination" ;; esac
   [ ! -e "$destination" ] || die "backup destination already exists: $destination"
-  mkdir -p "$destination"
-  chmod 700 "$destination"
+  staging="$destination.partial.$$"
+  [ ! -e "$staging" ] || die "backup staging path already exists: $staging"
+  mkdir -p "$(dirname "$destination")"
+  mkdir "$staging"
+  chmod 700 "$staging"
+  trap 'rm -rf "$staging"' EXIT
   temporary="/tmp/karmax-control-plane-$stamp"
   note 'Taking an online Karmax snapshot…'
   # The app is intentionally live here: SQLite uses its online backup API, and
@@ -205,14 +214,17 @@ cmd_backup() {
   # are not all taken at one instant; without this flag every automated update
   # fails before it can pull the commit that would fix the updater.
   dc exec -T app npm run backup -- --allow-running "$temporary"
-  dc cp "app:$temporary" "$destination/control-plane"
+  dc cp "app:$temporary" "$staging/control-plane"
   dc exec -T app rm -rf "$temporary"
   note 'Dumping Karmax and Temporal PostgreSQL data…'
-  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$destination/karmax.dump"
-  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$destination/temporal.dump"
-  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$destination/temporal-visibility.dump"
-  cp -R "$SECRETS_DIR" "$destination/deployment-secrets"
-  chmod -R go-rwx "$destination"
+  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$staging/karmax.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$staging/temporal.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$staging/temporal-visibility.dump"
+  cp -R "$SECRETS_DIR" "$staging/deployment-secrets"
+  backup_checksums "$staging"
+  chmod -R go-rwx "$staging"
+  mv "$staging" "$destination"
+  trap - EXIT
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
   compact_backups
@@ -225,7 +237,7 @@ cmd_backup() {
 # volume while the existing service remains untouched.
 cmd_backup_candidate() {
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  destination="$DEPLOY_DIR/backups/$stamp"
+  destination="$DEPLOY_DIR/backups/predeploy-$stamp"
   [ ! -e "$destination" ] || die "backup destination already exists: $destination"
   mkdir -p "$destination"
   chmod 700 "$destination"
@@ -258,6 +270,7 @@ cmd_backup_candidate() {
     rm -rf "$destination"; return 1
   fi
   if ! cp -R "$SECRETS_DIR" "$destination/deployment-secrets"; then rm -rf "$destination"; return 1; fi
+  if ! backup_checksums "$destination"; then rm -rf "$destination"; return 1; fi
   if ! chmod -R go-rwx "$destination"; then rm -rf "$destination"; return 1; fi
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
@@ -274,6 +287,18 @@ cmd_restore() {
   [ -f "$source/temporal-visibility.dump" ] || die 'backup is missing temporal-visibility.dump'
   [ -d "$source/deployment-secrets" ] || die 'backup is missing deployment-secrets'
   [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
+  [ -f "$source/SHA256SUMS" ] || die 'backup is missing checksums; cannot verify before restore'
+  (cd "$source" && sha256sum -c SHA256SUMS) || die 'backup checksum verification failed'
+  # Check the control-plane manifest and every payload file using the candidate
+  # app, while the live containers and all three databases are still untouched.
+  dc build app
+  dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- --verify /restore \
+    || die 'control-plane backup verification failed'
+  for dump in karmax temporal temporal-visibility; do
+    [ -f "$source/$dump.dump" ] || { [ "$dump" = karmax ] && continue; die "backup is missing $dump.dump"; }
+    dc run --rm --no-deps -T postgresql pg_restore -f /dev/null < "$source/$dump.dump" \
+      || die "PostgreSQL dump verification failed: $dump.dump"
+  done
   echo "This replaces Karmax and Temporal data on this instance with: $source"
   printf 'Type RESTORE to continue: '
   read answer
@@ -298,7 +323,6 @@ cmd_restore() {
   fi
   dc exec -T postgresql pg_restore -U temporal -d temporal < "$source/temporal.dump"
   dc exec -T postgresql pg_restore -U temporal -d temporal_visibility < "$source/temporal-visibility.dump"
-  dc build app
   dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- /restore
   dc up -d --remove-orphans
   wait_ready || die 'Karmax failed its readiness check after restore'
