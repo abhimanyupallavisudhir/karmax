@@ -175,7 +175,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
           'Do not claim that you generated the imported assistant messages.',
           '',
           '<imported_conversation>',
-          transcript,
+          transcript.replace(/<\/?imported_conversation>/gi, (delimiter) => `&lt;${delimiter.slice(1)}`),
           '</imported_conversation>',
           '',
           'Continue from this context with the next user request.',
