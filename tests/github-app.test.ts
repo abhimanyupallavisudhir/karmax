@@ -802,6 +802,27 @@ describe('GitHub App failure and suspension handling', () => {
     (await h.store.close()); fs.rmSync(h.dir, { recursive: true, force: true });
   });
 
+  it('retries failed webhook processing without a GitHub redelivery', async () => {
+    let failing = true;
+    const h = await harness(async (url) => {
+      if (url.pathname.endsWith('/access_tokens')) return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories') return failing ? new Response('unavailable', { status: 503 }) : Response.json({ repositories: [] });
+      return new Response('', { status: 404 });
+    });
+    try {
+      await h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github', installationId: '42', accountLogin: 'acme' });
+      const raw = Buffer.from(JSON.stringify({ installation: { id: 42 }, action: 'added' }));
+      const signature = `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`;
+      const results: unknown[] = [];
+      const dispatch = async (result: unknown) => { results.push(result); };
+      await expect(h.service.deliverWebhook('installation_repositories', 'durable', raw, signature, dispatch)).rejects.toThrow();
+      failing = false;
+      await h.service.retryWebhooks(dispatch, Date.now() + 600_000);
+      expect(results).toEqual([expect.objectContaining({ accepted: true, reconciled: 0 })]);
+      expect(await h.store.kvEntries('github:webhook-pending:')).toEqual([]);
+    } finally { await h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true }); }
+  });
+
   it('un-suspends an installation on the unsuspend webhook', async () => {
     const h = (await harness(async (url) => {
       if (url.pathname === '/app/installations/42/access_tokens')

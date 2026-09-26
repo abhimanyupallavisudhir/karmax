@@ -709,6 +709,7 @@ export class Gateway {
     return !!durable && durable.taskId === taskId && durable.kind === 'review-action';
   }
 
+  private githubWebhookSweep?: Promise<void>;
   private connectionTimer?: ReturnType<typeof setInterval>;
   private connectionSweep?: Promise<void>;
   private connections(): ServiceConnections | undefined {
@@ -717,6 +718,11 @@ export class Gateway {
     return this.deps.serviceConnections;
   }
   private sweepConnections(): void {
+    if (!this.githubWebhookSweep && this.deps.githubApp?.retryWebhooks) {
+      this.githubWebhookSweep = this.deps.githubApp.retryWebhooks((result) => this.dispatchGithubWebhook(result))
+        .catch((error) => console.warn('[github] webhook retry failed', error))
+        .finally(() => { this.githubWebhookSweep = undefined; });
+    }
     if (this.connectionSweep || !this.connections()) return;
     this.connectionSweep = this.connections()!.reconcile(async (c) => {
       const task = (await this.deps.store.getTask(c.taskId!));
@@ -922,6 +928,18 @@ export class Gateway {
         await connectors.autoSync('pass-git', 'backstop');
       });
     }
+  }
+
+  private async dispatchGithubWebhook(result: import('../integrations/github-app.js').GithubWebhookResult): Promise<void> {
+    for (const event of result.events ?? []) {
+      await this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
+      const task = await this.deps.store.getTask(event.taskId);
+      if (task && ['software-dev', 'goal'].includes(task.workflow)
+        && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
+        await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
+    }
+    await this.dispatchGithubRecoveryEvents(result.projectEvents ?? []);
+    for (const event of result.vaultPushes ?? []) await this.enqueueGitPassPush(event);
   }
 
   /** Route both terminal GitHub runs and "no run was created" incidents through
@@ -1508,44 +1526,17 @@ export class Gateway {
       try {
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
         const deliveryId = String(req.headers['x-github-delivery'] ?? '');
-        const result = await this.deps.githubApp.handleWebhook(
+        const result = await this.deps.githubApp.deliverWebhook(
           String(req.headers['x-github-event'] ?? ''), deliveryId, raw,
           typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
+          (result) => this.dispatchGithubWebhook(result),
         );
-        // GitHub's PR lifecycle enters karmax as ordinary task events, so the
-        // timeline and `event` triggers see it like any other happening (SPEC §5.4).
-        // The service already resolved each event to a task of the installing
-        // organization, so dispatch is unconditional here.
-        const { events, projectEvents, vaultPushes, ...body } = result;
-        for (const event of events ?? []) {
-          (await this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload }));
-          const task = (await this.deps.store.getTask(event.taskId));
-          if (task && ['software-dev', 'goal'].includes(task.workflow)
-            && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
-            await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
-        }
-        let recoveries = 0;
-        try {
-          recoveries = await this.dispatchGithubRecoveryEvents(projectEvents ?? []);
-        } catch (error) {
-          // handleWebhook already claimed this delivery. Release it when the
-          // downstream task dispatch fails so GitHub's redelivery can finish
-          // the recovery instead of being discarded as a duplicate.
-          (await this.deps.store.releaseGithubDelivery(deliveryId));
-          throw error;
-        }
-        for (const event of vaultPushes ?? []) (await this.enqueueGitPassPush(event));
-        return this.json(res, 200, { ...body,
-          ...(events?.length ? { dispatched: events.length } : {}),
-          ...(recoveries ? { recoveries } : {}),
-          ...(vaultPushes?.length ? { vaultSyncsQueued: vaultPushes.length } : {}),
+        return this.json(res, 200, { accepted: result.accepted,
+          ...(result.reconciled !== undefined ? { reconciled: result.reconciled } : {}),
+          ...(result.events?.length ? { dispatched: result.events.length } : {}),
         });
       } catch (error) {
-        // Only a genuine signature failure is a 401. Answering 401 for ANY
-        // exception made GitHub redeliver — but `handleWebhook` has already
-        // inserted the delivery dedupe row by then, so the redelivery
-        // short-circuits as a duplicate and the reconcile is lost forever. A 5xx
-        // is the honest answer for a processing fault and is equally retried.
+        // Verified failures remain in the durable inbox for local retry.
         const message = error instanceof Error ? error.message : String(error);
         return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
       }

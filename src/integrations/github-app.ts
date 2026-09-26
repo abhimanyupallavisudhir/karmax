@@ -297,8 +297,8 @@ const RETRYABLE_5XX_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
  * after ~10 s, so a `retry-after: 60` honoured three times would hold the HTTP
  * response open for minutes that nobody is listening to — and `reconcile` makes
  * many requests. Past the budget the error surfaces, the gateway answers 5xx, the
- * delivery claim is released, and GitHub redelivers: the retry still happens, on
- * GitHub's clock instead of inside our request handler.
+ * delivery claim is released, and the durable inbox retries it outside the
+ * HTTP request. GitHub does not automatically redeliver failed webhooks.
  */
 const WEBHOOK_RETRY_BUDGET_MS = 8_000;
 /** Epoch ms after which the ambient caller refuses to keep sleeping, if any. */
@@ -924,6 +924,53 @@ export class GitHubAppService {
     return repositories;
   }
 
+  async deliverWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined,
+    dispatch: (result: GithubWebhookResult) => Promise<void>): Promise<GithubWebhookResult> {
+    if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
+    if (!deliveryId) throw new Error('GitHub delivery id is required');
+    const key = `github:webhook-pending:${crypto.createHash('sha256').update(deliveryId).digest('hex')}`;
+    await this.store.kvClaim(key, JSON.stringify({ event, deliveryId, raw: raw.toString('base64'), signature,
+      attempts: 0, nextAt: 0, leaseUntil: 0 }));
+    return await this.processPendingWebhook(key, dispatch, Date.now()) ?? { accepted: false };
+  }
+
+  async retryWebhooks(dispatch: (result: GithubWebhookResult) => Promise<void>, now = Date.now()): Promise<void> {
+    for (const entry of (await this.store.kvEntries('github:webhook-pending:')).slice(0, 100)) {
+      try { await this.processPendingWebhook(entry.key, dispatch, now); }
+      catch { /* The durable entry carries the bounded retry deadline. */ }
+    }
+  }
+
+  private async processPendingWebhook(key: string, dispatch: (result: GithubWebhookResult) => Promise<void>, now: number):
+  Promise<GithubWebhookResult | undefined> {
+    const job = await this.store.transaction(async () => {
+      const saved = await this.store.kvGet(key);
+      if (!saved) return undefined;
+      const pending = JSON.parse(saved);
+      if (pending.nextAt > now || pending.leaseUntil > now) return undefined;
+      pending.leaseUntil = now + 10 * 60_000;
+      pending.attempts++;
+      await this.store.kvSet(key, JSON.stringify(pending));
+      return pending;
+    });
+    if (!job) return undefined;
+    try {
+      if (!job.result) {
+        if (job.attempts > 1) await this.store.releaseGithubDelivery(job.deliveryId);
+        job.result = await this.handleWebhook(job.event, job.deliveryId, Buffer.from(job.raw, 'base64'), job.signature);
+        await this.store.kvSet(key, JSON.stringify(job));
+      }
+      await dispatch(job.result);
+      await this.store.kvDelete(key);
+      return job.result;
+    } catch (error) {
+      job.leaseUntil = 0;
+      job.nextAt = now + Math.min(60 * 60_000, 5000 * 2 ** Math.min(job.attempts, 10));
+      await this.store.kvSet(key, JSON.stringify(job));
+      throw error;
+    }
+  }
+
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
   Promise<GithubWebhookResult> {
     if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
@@ -936,7 +983,7 @@ export class GitHubAppService {
     if (!(await this.store.recordGithubDelivery(deliveryId, event))) return { accepted: false };
     try {
       // Bounded retry budget: this call is inside GitHub's ~10 s delivery
-      // timeout, so a long backoff must fail fast and let GitHub redeliver
+      // timeout, so a long backoff must fail fast and let the inbox retry
       // rather than hold the response open (see WEBHOOK_RETRY_BUDGET_MS).
       return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw));
     } catch (error) {
