@@ -1,3 +1,4 @@
+import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import type { WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, ExecResult } from './types.js';
@@ -13,7 +14,7 @@ export function runLocalCommand(command: string, args: string[], opts: {
   cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; input?: string; maxBuffer?: number;
 } = {}): Promise<ExecResult> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd: opts.cwd, env: opts.env ?? process.env });
+    const child = spawn(command, args, { cwd: opts.cwd, env: opts.env ?? scrubbedEnv({ provider: 'mock' }) });
     const cap = opts.maxBuffer ?? 64 * 1024 * 1024;
     let out = '', err = '', outLen = 0, errLen = 0, done = false;
     const finish = (code: number, extraErr?: string) => {
@@ -42,7 +43,7 @@ export function startSpawnedProcess(command: string, args: string[], opts: {
 } = {}): WorldProcess {
   const child = spawn(command, args, {
     cwd: opts.cwd,
-    env: opts.env ?? process.env,
+    env: opts.env ?? scrubbedEnv({ provider: 'mock' }),
     detached: opts.detached ?? true,
   });
   return wrapChild(child, opts.detached ?? true);
@@ -51,7 +52,7 @@ export function startSpawnedProcess(command: string, args: string[], opts: {
 export function startLocalProcess(root: string, spec: WorldProcessSpec): WorldProcess {
   return startSpawnedProcess('bash', ['-lc', spec.command], {
     cwd: localCwd(root, spec.cwd),
-    env: { ...process.env, ...(spec.env ?? {}) },
+    env: scrubbedEnv({ provider: 'mock', extra: spec.env }),
     detached: true,
   });
 }
@@ -63,7 +64,7 @@ export async function openLocalPty(root: string, spec: WorldPtySpec = {}): Promi
     cols: spec.cols ?? 80,
     rows: spec.rows ?? 24,
     cwd: localCwd(root, spec.cwd),
-    env: { ...process.env, PS1: 'karmax:\\W$ ', ...(spec.env ?? {}) },
+    env: { ...scrubbedEnv({ provider: 'mock', extra: spec.env }), PS1: 'karmax:\\W$ ' },
   });
   return wrapPty(term);
 }
@@ -75,7 +76,7 @@ export async function openSpawnedPty(command: string, args: string[], spec: Worl
     cols: spec.cols ?? 80,
     rows: spec.rows ?? 24,
     cwd: process.cwd(),
-    env: { ...process.env, ...(spec.env ?? {}) },
+    env: scrubbedEnv({ provider: 'mock', extra: spec.env }),
   });
   return wrapPty(term);
 }

@@ -1,3 +1,4 @@
+import { scrubbedEnv } from '../autonomy/config-homes.js';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -48,7 +49,7 @@ class MemoryWorld implements World {
         cwd: opts.cwd ?? worldWorkingDirectory(this.handle),
         timeout: opts.timeoutMs ?? 60_000,
         maxBuffer: 32 * 1024 * 1024,
-        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        env: scrubbedEnv({ provider: 'mock', extra: opts.env }),
       });
       return { stdout, stderr, code: 0 };
     } catch (e: any) {

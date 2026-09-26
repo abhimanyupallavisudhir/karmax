@@ -1,3 +1,4 @@
+import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { missingBaseAdjustment } from './branch-fallback.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -439,7 +440,7 @@ class WorktreeWorld implements World {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const cwd = opts.cwd ?? worldWorkingDirectory(this.handle);
     if (cmd === 'git' && opts.input === undefined) return git(cwd, args, opts);
-    const env = opts.env ? { ...process.env, ...opts.env } : process.env;
+    const env = scrubbedEnv({ provider: 'mock', extra: opts.env });
     // STDIN (a secret fed to an in-world helper) needs a spawn-based path;
     // execFile cannot pass input. Keep the fast pexec path for the common case.
     if (opts.input !== undefined) {
