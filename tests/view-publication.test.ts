@@ -16,9 +16,9 @@ describe('durable conversation publication', () => {
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock') });
     const retryKeys = [`turnsession:${task.id}#0`, `turnsession:${task.id}:run#1`,
-      'turnsession:legacy:run:activity', `turnresult:${task.id}:do:${task.id}:run#1`];
+      'turnsession:legacy:run:activity', `turnresult:${task.id}:do:${task.id}:run#1`, `task-create:${task.id}:run:child`];
     const retained = [`session:${task.id}:do`, `sessionmeta:${task.id}:do`,
-      `turnsession:${task.id}-other#0`, `turnsession:${task.id}-other:run#1`, 'turnsession:legacy:other:activity'];
+      `turnsession:${task.id}-other#0`, `turnsession:${task.id}-other:run#1`, 'turnsession:legacy:other:activity', `task-create:${task.id}-other:run:child`];
     const ctx = vi.spyOn(Context, 'current').mockReturnValue({ info: { workflowExecution: { runId: 'run' }, activityId: 'publish' } } as any);
     try {
       for (const key of [...retryKeys, ...retained]) await store.kvSet(key, 'saved');
