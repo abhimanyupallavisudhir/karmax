@@ -6962,7 +6962,14 @@ async function refreshTask(reason = 'all') {
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
     // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
-  } catch {}
+  } catch (error) {
+    if (error.status === 404 && S.selected === id) {
+      S.tasks = S.tasks.filter(task => task.id !== id);
+      toast('This task was deleted');
+      await closeTask();
+      return;
+    }
+  }
   if (S.selected === id) {
     renderTaskPage();
     if (full && typeof document !== 'undefined') $('#tp-payments')?.refreshSpent?.();
