@@ -1,3 +1,4 @@
+import { concurrentMap } from '../util/concurrent-map.js';
 import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.js';
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
@@ -236,31 +237,21 @@ export async function brokerPublishBranch(
   world: World, auth: GitBrokerAuth, expectedRemoteHeads: Record<string, string> = {},
   onPublished?: OriginPublicationRecorder,
 ): Promise<GitBrokerPublishResult> {
-  const pushed: string[] = [];
-  const skipped: string[] = [];
-  const errors: Record<string, string> = {};
-  for (const repo of worldRepos(world.handle)) {
-    try {
-      // Worktree-backed worlds already share refs with their source repository.
-      // Trying to bundle/fetch the live branch back into that same repository
-      // either mistakes its local path for an SSH remote or hits Git's
-      // checked-out branch safety interlock. Verify the shared ref instead; no
-      // transfer is necessary for another task on this Karmax host to import
-      // it. Container worlds qualify too — they bind-mount the very same host
-      // worktree — so this must not be a `kind === 'worktree'` test, which used
-      // to fall all the way through to "Git broker requires an SSH remote".
-      const shared = sharesHostRefDatabase(world.handle.kind);
-      const local = await localAuthority(repo, shared);
-      if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
-      else if (local) await importBranchToLocal(world, repo, local);
-      else await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
-      pushed.push(repo.name);
-    } catch (error) {
-      skipped.push(repo.name);
-      errors[repo.name] = error instanceof Error ? error.message : String(error);
-    }
-  }
-  return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
+  return publishRepositories(worldRepos(world.handle), async repo => {
+    // Worktree-backed worlds already share refs with their source repository.
+    // Trying to bundle/fetch the live branch back into that same repository
+    // either mistakes its local path for an SSH remote or hits Git's
+    // checked-out branch safety interlock. Verify the shared ref instead; no
+    // transfer is necessary for another task on this Karmax host to import
+    // it. Container worlds qualify too — they bind-mount the very same host
+    // worktree — so this must not be a `kind === 'worktree'` test, which used
+    // to fall all the way through to "Git broker requires an SSH remote".
+    const shared = sharesHostRefDatabase(world.handle.kind);
+    const local = await localAuthority(repo, shared);
+    if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
+    else if (local) await importBranchToLocal(world, repo, local);
+    else await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
+  });
 }
 
 /** The host-local repository this repo is authoritative to, if any. A recorded
@@ -666,7 +657,7 @@ export async function brokerFinalizeMerge(
         if (pushTarget.code !== 0) throw new Error(`target push failed (protected or advanced concurrently): ${pushTarget.stderr || pushTarget.stdout}`);
         const head = await git(clone, ['rev-parse', 'HEAD']);
         return { merged: true, sha: head.stdout.trim(), landedFiles: files } satisfies MergeResult;
-      });
+      }, repoTarget);
       landedFiles.push(...one.landedFiles.map((file) => repos.length > 1 ? `${repo.name}/${file}` : file));
       if (!one.merged) return { ...one, landedFiles };
       sha = one.sha;
@@ -691,18 +682,29 @@ export async function brokerPushBranches(
   expectedRemoteHeads: Record<string, string> = {},
   onPublished?: OriginPublicationRecorder,
 ): Promise<GitBrokerPublishResult> {
-  const pushed: string[] = [];
-  const skipped: string[] = [];
-  const errors: Record<string, string> = {};
-  for (const repo of repos) {
-    try {
-      await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
-      pushed.push(repo.name);
-    } catch (error) {
-      skipped.push(repo.name);
-      errors[repo.name] = error instanceof Error ? error.message : String(error);
+  return publishRepositories(repos, repo => pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished));
+}
+
+async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) => Promise<void>): Promise<GitBrokerPublishResult> {
+  const groups = new Map<string, Array<{ repo: WorldRepo; index: number }>>();
+  repos.forEach((repo, index) => {
+    const key = canonicalRepositoryIdentity(worldRepoSource(repo));
+    const group = groups.get(key) ?? [];
+    group.push({ repo, index }); groups.set(key, group);
+  });
+  const failures: Array<string | undefined> = new Array(repos.length);
+  await concurrentMap([...groups.values()], 3, async group => {
+    for (const { repo, index } of group) {
+      try { await run(repo); }
+      catch (error) { failures[index] = error instanceof Error ? error.message : String(error); }
     }
-  }
+  });
+  const pushed: string[] = [], skipped: string[] = [];
+  const errors: Record<string, string> = {};
+  repos.forEach((repo, index) => {
+    if (failures[index] === undefined) pushed.push(repo.name);
+    else { skipped.push(repo.name); errors[repo.name] = failures[index]!; }
+  });
   return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
 }
 
@@ -756,7 +758,9 @@ async function withTransferredRepo<T>(
   repo: WorldRepo,
   auth: GitBrokerAuth,
   use: (clone: string, env: Record<string, string>) => Promise<T>,
+  branch?: string,
 ): Promise<T> {
+  if (branch && !validGitBranch(branch)) throw new Error('invalid broker clone branch');
   const source = worldRepoSource(repo);
   if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
@@ -765,7 +769,7 @@ async function withTransferredRepo<T>(
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
     const clone = path.join(temp, 'repo');
-    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 }));
+    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', '--single-branch', ...(branch ? ['--branch', branch] : []), source, clone], { env, timeoutMs: 10 * 60_000 }));
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
     if (repo.baseSha) {

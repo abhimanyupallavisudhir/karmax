@@ -10,6 +10,30 @@ describe('cloud Git broker', () => {
   const cleanups: string[] = [];
   afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
+  it('publishes independent repositories concurrently with bounded fan-out (LT-10)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-parallel-')); cleanups.push(root);
+    const repos: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const repo = path.join(root, `repo${i}`); fs.mkdirSync(repo);
+      await gitOrThrow(repo, ['init', '-qb', 'main']); await ensureIdentity(repo);
+      await gitOrThrow(repo, ['commit', '--allow-empty', '-qm', 'base']); repos.push(repo);
+    }
+    const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: 'parallel', repos, base: 'main' });
+    let active = 0, peak = 0;
+    const exec = world.exec.bind(world);
+    world.exec = async (...args) => {
+      peak = Math.max(peak, ++active);
+      try { await new Promise(resolve => setTimeout(resolve, 30)); return await exec(...args); }
+      finally { active--; }
+    };
+    const result = await brokerPublishBranch(world, {});
+    expect(result.skipped).toEqual([]);
+    expect(result.pushed).toEqual(world.handle.repos!.map(repo => repo.name));
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(3);
+    await world.destroy();
+  });
+
   it('enrolls an attached empty private repo, publishes the parent, and bootstraps a child checkout/import without leaking credentials', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-enrollment-'));
     cleanups.push(root);
@@ -369,6 +393,10 @@ describe('cloud Git broker', () => {
     // The world's own checkout keeps Git's default, which shows the trace works.
     expect(maintained.some((repo) => repo.startsWith(world.handle.root))).toBe(true);
     expect(maintained.filter((repo) => /karmax-git-(broker|enroll)-/.test(repo))).toEqual([]);
+    const clones = events.filter(event => event.event === 'start' && event.argv.includes('clone')
+      && event.argv.some((arg: string) => arg.includes('karmax-git-broker-')));
+    expect(clones.length).toBeGreaterThan(0);
+    expect(clones.every(event => event.argv.includes('--single-branch'))).toBe(true);
   });
 
   it('preserves the underlying error for every skipped repository', async () => {
