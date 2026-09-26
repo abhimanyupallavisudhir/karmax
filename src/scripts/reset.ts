@@ -21,8 +21,8 @@ try { server = JSON.parse(fs.readFileSync(rec, 'utf8')); }
 catch (error) {
   if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
 }
-if (server) {
-  if (!await stopRecordedDevServer(server, path.join(p.temporal, 'temporal.db')))
+if (server !== undefined) {
+  if (!server || !await stopRecordedDevServer(server, path.join(p.temporal, 'temporal.db')))
     throw new Error('Cannot verify the recorded Temporal process; stop it before resetting');
   console.log('stopped Temporal dev server (pid', server.pid + ')');
 }
