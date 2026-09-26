@@ -199,7 +199,7 @@ describe('Stripe Issuing organization rail', () => {
     registry.register(stripe);
     const budget = new BudgetService(store, registry);
     const spend = await budget.request(
-      { organizationId, projectId, taskId: 'task_a' },
+      { organizationId, projectId, taskId: 'task_a' , capabilities: ['use-card:*'] },
       { amount: 2_500, merchant: 'shop.example', why: 'test purchase', cardId: card.id },
     );
     expect(spend).toMatchObject({ status: 'granted', cardId: card.id });
@@ -249,7 +249,7 @@ describe('Stripe Issuing organization rail', () => {
       const registry = new PaymentRegistry(store);
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
-      const spend = await budget.request({ organizationId, projectId, taskId: 'task_a' },
+      const spend = await budget.request({ organizationId, projectId, taskId: 'task_a' , capabilities: ['use-card:*'] },
         { amount, merchant: 'shop.example', why: 'up to $100', cardId: card.id });
       expect(spend.status).toBe('granted');
       return { card, budget, spend };
@@ -278,7 +278,7 @@ describe('Stripe Issuing organization rail', () => {
       expect((await stripe.handleWebhook(capture.raw, capture.signature)).status).toBe(200);
       expect((await store.getPaymentSpendRequest(spend.requestId!))).toMatchObject({ status: 'settled', amount: 4_000 });
       // The 60 dollars the merchant never took are spendable again.
-      expect((await budget.request({ organizationId, projectId, taskId: 'task_b' },
+      expect((await budget.request({ organizationId, projectId, taskId: 'task_b' , capabilities: ['use-card:*'] },
         { amount: 8_000, cardId: card.id, why: 'second' })).status).toBe('granted');
     });
 
@@ -308,7 +308,8 @@ describe('Stripe Issuing organization rail', () => {
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
       (await store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', budget: 1_000 }));
-      const ctx = { organizationId, projectId, taskId: 'task_gate' };
+    const task_task_gate = await store.createTask({ projectId: projectId, title: 'task_gate', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+      const ctx = { organizationId, projectId, taskId: task_task_gate.id , capabilities: ['use-card:*'] };
       const first = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'first' });
       const second = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'second' });
       expect([first.status, second.status]).toEqual(['needs_approval', 'needs_approval']);

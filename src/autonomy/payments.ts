@@ -1,4 +1,5 @@
 import { getDomain } from 'tldts';
+import { allows, attenuate } from '../platform/capabilities.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -900,11 +901,18 @@ export class BudgetService {
   }
 
   async policy(projectId: string, taskId?: string): Promise<PaymentPolicy> {
-    return (await resolvePaymentPolicy(this.store, projectId, taskId));
+    const policy = await resolvePaymentPolicy(this.store, projectId, taskId);
+    if (taskId) for (const ancestorId of (await this.store.paymentBudgetFamily(taskId)).ancestorIds) {
+      const ancestor = await this.store.getTask(ancestorId);
+      const inherited = await resolvePaymentPolicy(this.store, ancestor!.projectId, ancestorId);
+      if (inherited.budget !== null) policy.budget = policy.budget === null ? inherited.budget : Math.min(policy.budget, inherited.budget);
+      if (inherited.cardIds) policy.cardIds = policy.cardIds ? policy.cardIds.filter(id => inherited.cardIds!.includes(id)) : inherited.cardIds;
+    }
+    return policy;
   }
 
   private async spent(taskId: string): Promise<number> {
-    return (await this.store.paymentSpent(taskId));
+    return (await this.store.paymentSpent(taskId, true));
   }
 
   /**
@@ -927,10 +935,14 @@ export class BudgetService {
     const visible = (await this.store.listCards(ctx.projectId, ctx.organizationId))
       .filter((card) => card.status !== 'canceled' && card.status !== 'inactive') as Card[];
     const storedCaps = ((await this.store.getTask(ctx.taskId))?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
-    const scoped = (ctx.capabilities ?? storedCaps ?? []).filter((capability) => capability.startsWith('use-card:'));
+    let scoped = ctx.capabilities && storedCaps ? attenuate(ctx.capabilities, storedCaps) : ctx.capabilities ?? storedCaps ?? [];
+    for (const ancestorId of (await this.store.paymentBudgetFamily(ctx.taskId)).ancestorIds) {
+      const ancestor = await this.store.getTask(ancestorId);
+      scoped = attenuate(scoped, (ancestor?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? []);
+    }
     const selected = (await this.policy(ctx.projectId, ctx.taskId)).cardIds;
     return visible.filter(card => (!selected || selected.includes(card.id))
-      && (!scoped.length || scoped.includes('use-card:*') || scoped.includes(`use-card:${card.id}`)));
+      && allows(scoped, `use-card:${card.id}`));
   }
 
   async claimFill(ctx: SpendCtx, requestId: string): Promise<{ request: any; domain: string }> {

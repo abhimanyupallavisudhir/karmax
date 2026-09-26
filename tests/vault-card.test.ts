@@ -137,17 +137,18 @@ describe('BudgetService over the vault-card rail', () => {
 
   it('grants autonomously within the declared limit — no approval step', async () => {
     await provision(50_000);
-    const r = await budget.request({ projectId, taskId: 't1' }, { amount: 2_000 });
+    const r = await budget.request({ projectId, taskId: 't1' , capabilities: ['use-card:*'] }, { amount: 2_000 });
     expect(r.status).toBe('granted');
     expect(r.transactionId).toBeTruthy();
   });
 
   it('asks the human to raise the limit once the declared funds run out', async () => {
     const card = await provision(1_000);
-    const short = await budget.request({ projectId, taskId: 't2' }, { amount: 4_000 });
+    const task_t2 = await store.createTask({ projectId: projectId, title: 't2', workflow: 'just-do', workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+    const short = await budget.request({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4_000 });
     expect(short).toMatchObject({ status: 'needs_funding', shortfall: 3_000 });
     await provider.fund(card.id, 3_000);
-    const settled = await budget.settleApproved({ projectId, taskId: 't2' }, { amount: 4_000, cardId: card.id });
+    const settled = await budget.settleApproved({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4_000, cardId: card.id });
     expect(settled.status).toBe('granted');
   });
 });

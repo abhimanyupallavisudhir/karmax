@@ -2555,7 +2555,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   projectId: args.task.projectId,
                   taskId: args.taskId,
                   organizationId: (await store.getProject(args.task.projectId))?.organizationId,
-                  capabilities: args.task.grant,
+                  capabilities: effective,
                 },
                 onSpend: async (req: any, outcome: any) => (await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason })),
                 fillPaymentCard: async (fill: {
@@ -2564,12 +2564,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
                   const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
                   }, fill.requestId);
                   const card = request.cardId ? (await store.getCard(request.cardId)) : undefined;
                   if (!card) throw new Error('secure fill requires a reserved card');
                   if (!(await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).cards({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
                   })).some(c => c.id === card.id)) throw new Error('card is no longer selected for this task');
                   // Any rail that can resolve a card's secret half is fillable; the
                   // mock rail deliberately cannot, because it moves no real money.
@@ -5040,13 +5040,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
       // branch (which the parent owns and merges into). If no branch is known,
       // the child gets no merge capability — never a broad fallback.
-      const delegation = attenuate(
-        CHILD_TASK_CAPABILITIES,
-        args.parentGrant ?? DEFAULT_GRANT,
-      );
-      const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)
-        ? [`merge-into:${args.parentBranch}`]
-        : [];
+      const currentGrant = (parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities
+        ?? args.parentGrant ?? [];
+      const delegation = attenuate([...CHILD_TASK_CAPABILITIES, 'use-card:*'], currentGrant);
+      const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
+        ? [`merge-into:${args.parentBranch}`] : [];
       const grant = [...delegation, ...mergeBack];
       const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
       const humanDelegation = parentAuthorization?.delegationId && deps.tokens
