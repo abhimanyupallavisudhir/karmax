@@ -317,10 +317,10 @@ async function main() {
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
     providerConnections, worlds,
     worldAccess, runners, resources, broker, githubApp, bus,
-    refreshCredentialHealth: async (task, credentialProvider) => {
+    refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (!credentialProvider) return;
       const { retryCredentials } = await import('./agent/credential-health.js');
-      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider);
+      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider, options);
     },
   });
 

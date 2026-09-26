@@ -1287,7 +1287,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await accounts.terminate('test complete').catch(() => {});
   });
 
-  it('semantically classifies novel provider quota wording and marks the credential needs-attention', async () => {
+  it('semantically classifies novel provider quota wording, marks the credential needs-attention, and waits for a credential', async () => {
     const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
     const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     await coord.registerAccounts([
@@ -1311,8 +1311,11 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       ],
     });
 
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
+    // A credential needing a person is a wait, never an escalation with an error.
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 })
+      .toBe('Every allowed credential needs attention — sign in again or add one');
     const v = await view(handle);
+    expect(v).toMatchObject({ stage: 'do', status: 'waiting', waitingFor: { kind: 'account' } });
     expect((v.transcripts ?? []).find((t: any) => t.role === 'resolve')?.messages?.length ?? 0).toBe(0);
     const auto = (await h.store.eventsSince(taskId, 0)).filter((e) => e.type === 'resolve.auto');
     expect(auto).toHaveLength(1);

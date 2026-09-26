@@ -338,7 +338,9 @@ export interface KarmaxApiDeps {
   bus?: KarmaxBus;
   /** Re-arm eligible automatic credential quarantines before replaying a credential
    * escalation. Production supplies this; lightweight API tests may omit it. */
-  refreshCredentialHealth?: (task: TaskRecord, provider?: string) => Promise<void>;
+  /** Re-arm the task's automatically quarantined credentials (and, on request,
+   * exhausted ones) so a parked turn can try them again. */
+  refreshCredentialHealth?: (task: TaskRecord, provider?: string, options?: { includeExhausted?: boolean }) => Promise<void>;
 }
 
 /**
@@ -2569,6 +2571,11 @@ export class KarmaxApi {
       && / — retrying .+ in \d+s \(\d+\/\d+\)$/.test(view.error);
     if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
       actions.unshift(RETRY_ACTION());
+    // A wait for a credential or its quota resumes by itself, but only a person
+    // knows they just topped up credits or that a limit lifted early.
+    if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
+      && !actions.some((action) => action.name === 'retry'))
+      actions.unshift(RETRY_ACTION());
 
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
@@ -4289,6 +4296,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
     }
     const heldView = scopedTask?.lastView;
+    if (signal === SIG.retry && scopedTask && heldView?.status === 'waiting'
+      && heldView.waitingFor?.kind === 'account' && heldView.waitingFor.provider) {
+      // The coordinator grants the parked turn as soon as a credential is usable
+      // again; the workflow itself has nothing to retry.
+      await this.deps.refreshCredentialHealth?.(scopedTask, heldView.waitingFor.provider, { includeExhausted: true });
+      return undefined;
+    }
     if (signal === SIG.retry && scopedTask && heldView?.stage === 'escalated'
       && heldView.status === 'blocked') {
       const credentialFailure = heldView.error?.match(/No usable\s+([^\s]+)\s+credential\b.*needs attention/i);

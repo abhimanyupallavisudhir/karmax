@@ -17,6 +17,8 @@ import {
   SIG_CANCEL_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_ACCOUNT_GRANTED,
+  RELIST_ACCOUNT_GRANT,
+  SIG_RELIST_ACCOUNT_LEASES,
   SIG_REGISTER_ACCOUNTS,
   SIG_REPORT_EXHAUSTED,
   SIG_SET_ACCOUNT_AVAILABILITY,
@@ -173,6 +175,7 @@ export const cancelAccountSignal = defineSignal<[{ taskId: string; turnId: strin
 export const returnAccountSignal =
   defineSignal<[{ accountId: string; taskId?: string; turnId?: string }]>(SIG_RETURN_ACCOUNT);
 export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccount[] }]>(SIG_REGISTER_ACCOUNTS);
+export const relistAccountLeasesSignal = defineSignal<[]>(SIG_RELIST_ACCOUNT_LEASES);
 /** Ground-truth exhaustion feed (from the reportAccountExhausted activity). */
 export const reportExhaustedSignal = defineSignal<[{ accountId: string; window: LimitWindow; resetAt: number; note?: string; transition?: AccountTransition }]>(SIG_REPORT_EXHAUSTED);
 /** Manual availability override (UI/MCP). `resetAt` sets a new reset instant. */
@@ -213,6 +216,14 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   // variable, never `patched()` directly, which keeps their behavior a pure
   // function of the reproduced activation order.
   let identifiedReturnsRelease = patched('account-coordinator-return-identity-v1');
+  // A credential wall (every allowed credential needs a person) parks like a
+  // quota wait instead of denying the turn, and parked requests re-resolve their
+  // allow-lists when credentials change. Pre-marker histories keep denying.
+  // Refreshed each loop pass, like the marker above.
+  let waitForCredentials = patched('account-coordinator-credential-wait-v1');
+  // Set when credentials changed under parked requests (a new credential or a
+  // policy edit); the loop then asks each parked owner to request again.
+  let relistRequested = false;
 
   /** Flip any exhausted account whose reset instant has passed back to available. */
   function refreshDue(): void {
@@ -287,6 +298,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         existing.credentialProvider = a.credentialProvider || undefined;
         if (a.maxConcurrent != null) existing.maxConcurrent = a.maxConcurrent; // apply raises/lowers
       } else {
+        // A parked allow-list was computed before this credential existed.
+        if (queue.length) relistRequested = true;
         accounts.push({
           id: a.id,
           configHome: a.configHome,
@@ -307,6 +320,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // still in-use; a later sync prunes them when their turn finishes.
     const live = new Set(incoming.map((a) => a.id));
     accounts = accounts.filter((a) => live.has(a.id) || a.inUse > 0);
+  });
+  setHandler(relistAccountLeasesSignal, () => {
+    if (queue.length) relistRequested = true;
   });
   setHandler(leaseAccountSignal, (req) => {
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
@@ -448,7 +464,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       earliestResetAt: Math.min(...resets),
       detail: 'Provider usage limit reached; the task resumes automatically when quota resets',
     };
-    return { waiting: true, detail: 'Waiting for a usable allowed credential' };
+    return { waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one' };
   });
   // Every turn of `taskId` this coordinator still owes something for — queued
   // requests AND granted leases. Shape stays `string[]` of turnIds so the caller
@@ -462,6 +478,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   for (;;) {
     refreshDue();
     identifiedReturnsRelease = patched('account-coordinator-return-identity-v1');
+    waitForCredentials = patched('account-coordinator-credential-wait-v1');
     // Keep the legacy branch byte-for-byte for histories created before this fix.
     // `patched` is deliberately evaluated on every loop: it remains false while
     // replaying marker-less history, then flips true at the live edge. That lets a
@@ -492,9 +509,24 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       // head-of-line blocking: each request carries its own ordered list).
       const idx = queue.findIndex((q) => serveable(q));
       if (idx < 0) {
-        // Deny any request that can never be served (all its credentials need human
-        // action) so the task escalates instead of parking forever.
-        const denyIdx = queue.findIndex((q) => deniable(q));
+        if (waitForCredentials && relistRequested) {
+          // Nothing here is serveable with the allow-lists it arrived with. Hand
+          // every parked request back so its owner re-resolves them against the
+          // current credentials and policy; the coordinator never guesses policy.
+          relistRequested = false;
+          for (const req of queue.splice(0)) {
+            processed++;
+            try {
+              await getExternalWorkflowHandle(req.taskId).signal(SIG_ACCOUNT_GRANTED, { turnId: req.turnId, accountId: RELIST_ACCOUNT_GRANT });
+            } catch (e) {
+              log.warn(`account relist signal to ${req.taskId} failed`, { e: String(e) });
+            }
+          }
+          continue;
+        }
+        // Historical behavior: deny a request that can never be served (all its
+        // credentials need human action) so the task escalates.
+        const denyIdx = waitForCredentials ? -1 : queue.findIndex((q) => deniable(q));
         if (denyIdx >= 0) {
           const req = queue.splice(denyIdx, 1)[0]!;
           processed++;
@@ -526,7 +558,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
           // otherwise the coordinator can remain asleep until the six-hour
           // backstop despite its query already reporting an empty queue. Manual
           // status changes that make a request deniable must wake it as well.
-          condition(() => queue.length === 0 || queue.some((q) => serveable(q) || deniable(q))).then(() => true),
+          condition(() => queue.length === 0 || (waitForCredentials
+            ? relistRequested || queue.some((q) => serveable(q))
+            : queue.some((q) => serveable(q) || deniable(q)))).then(() => true),
           sleep(parkMs).then(() => false),
         ]);
         if (sweepLeases && !woke && granted.length) await sweepDeadLeases();

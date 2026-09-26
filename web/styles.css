@@ -2077,6 +2077,13 @@ html[data-theme="dark"] .github-signin-btn:active,
   background: var(--surface-2); font-size: 12px; line-height: 1.6;
 }
 .cred-row.off { opacity: 0.5; }
+.cred-row.signed-out .cred-label { color: var(--ink-3); }
+.cred-signin {
+  font-size: 10px; font-weight: 700; padding: 0 7px; border-radius: 999px; flex: none;
+  border: 1px solid var(--warn, #e0b15a); background: transparent; color: var(--warn, #e0b15a); text-transform: uppercase;
+}
+button.cred-signin { cursor: pointer; }
+button.cred-signin:hover { background: var(--warn, #e0b15a); color: #fff; }
 .cred-row.dragging { opacity: 0.4; }
 .cred-drag { cursor: grab; color: var(--ink-3); user-select: none; font-size: 11px; line-height: 1; }
 .cred-drag:active { cursor: grabbing; }
