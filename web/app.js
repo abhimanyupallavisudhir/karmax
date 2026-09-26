@@ -17210,7 +17210,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>

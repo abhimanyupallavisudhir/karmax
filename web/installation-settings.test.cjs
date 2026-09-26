@@ -23,8 +23,10 @@ const project = slice('function settingsView(proj)', 'function cloudEnvironmentC
 
 for (const marker of [
   'installation-appearance', 'installation-health', 'installation-capacity', 'installation-github',
-  'installation-paid-launch', 'installation-stripe', 'installation-email', 'installation-access', 'installation-recovery',
+  'installation-paid-launch', 'installation-stripe', 'installation-email', 'installation-access',
 ]) ok(installation.includes(`id="${marker}"`), `Installation includes #${marker}`);
+
+ok(!installation.includes('installation-recovery') && !src.includes('hydrateResilienceCard'), 'Installation omits the inert safe-mode control');
 
 ok(src.includes("api('/api/settings/paid-launch')"), 'Paid launch loads persisted installation configuration');
 ok(src.includes("method: 'PUT'"), 'Paid launch saves configuration through the installation API');
