@@ -157,6 +157,35 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
   });
 
   /**
+   * RT-28: a task names its role profiles by id, and profile ids are scoped by
+   * prefix — `organization:<org>::…`, `<project>::…`, or installation-wide.
+   * Another tenant's profile (its prompt template, model, tool connections)
+   * must be neither accepted by the API nor loaded by the resolver.
+   */
+  it('keeps task role profiles inside the task’s project and organization', async () => {
+    const { ProfileResolver, organizationProfileId, projectProfileId } = await import('../src/agent/profiles.js');
+    const acme = (await store.getProject(mine))!.organizationId!;
+    const other = (await store.getProject(theirs))!.organizationId!;
+    const profile = (id: string, promptTemplate: string) => store.upsertProfile({ id, name: 'Agent', role: 'do', provider: 'mock', promptTemplate });
+    (await profile('do-default', 'installation default'));
+    (await profile(organizationProfileId(other, 'do'), 'their confidential instructions'));
+    (await profile(projectProfileId(theirs, 'do'), 'their project instructions'));
+    (await profile(organizationProfileId(acme, 'do'), 'our instructions'));
+    for (const foreign of [organizationProfileId(other, 'do'), projectProfileId(theirs, 'do')]) {
+      await expect(api.createTask(token, { projectId: mine, title: 'Borrow', prompt: 'go', draft: true,
+        profiles: { do: foreign } })).rejects.toThrow(/profile/i);
+      const resolved = await new ProfileResolver(store, 'mock').resolve('do', { do: foreign }, undefined, mine);
+      expect(resolved.promptTemplate).toBe('our instructions');
+    }
+    const draft = await api.createTask(token, { projectId: mine, title: 'Own', prompt: 'go', draft: true,
+      profiles: { do: organizationProfileId(acme, 'do') } });
+    await expect(api.updateArmedParams(token, draft.id, { profiles: { do: organizationProfileId(other, 'do') } }))
+      .rejects.toThrow(/profile/i);
+    expect((await new ProfileResolver(store, 'mock').resolve('do', { do: 'do-default' }, undefined, mine)).promptTemplate)
+      .toBe('installation default');
+  });
+
+  /**
    * The host agent queue is a queue surface. It asked for `get_task` while the
    * gateway route (after the fix) asks for `queue:read`/`queue:write`, and
    * `setAgentCapacity` took no token and performed no check at all.

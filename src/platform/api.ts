@@ -46,7 +46,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, sanitizeAttachmentName } from '../store/attachments.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
-import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
+import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, type AuthorizationService } from './authorization.js';
@@ -963,6 +963,16 @@ export class KarmaxApi {
   /** `base`/`target`/`branch` become positional `git` arguments on the host: a
    *  value git would not accept as a branch name (or that starts with `-`) is
    *  refused at intake, whichever route — form, MCP, in-flight edit — set it. */
+  /** A task's role → profile map names profiles by id; refuse ids scoped to
+   *  another project or organization (the resolver ignores them too). */
+  private assertProfilesVisible(profiles: unknown, project: Project): void {
+    if (profiles === undefined || profiles === null) return;
+    if (typeof profiles !== 'object' || Array.isArray(profiles)) throw new ValidationError('profiles must map roles to profile ids');
+    for (const [role, id] of Object.entries(profiles))
+      if (typeof id !== 'string' || !profileVisibleTo(id, project.id, project.organizationId ?? 'org_personal'))
+        throw new ValidationError(`the ${role} profile is not available in this project`);
+  }
+
   private assertBranchParams(values: Record<string, unknown>): void {
     for (const key of ['base', 'target', 'branch'] as const) {
       const value = values[key];
@@ -1129,6 +1139,7 @@ export class KarmaxApi {
       project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
     );
 
+    this.assertProfilesVisible(args.profiles, project);
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
     // Authority-owned fields are minted below. An API caller may never inject a
@@ -2247,6 +2258,8 @@ export class KarmaxApi {
     // (PL-2) — a legacy task with no stored `_authorization` would otherwise
     // adopt the caller's.
     params = stripPlatformMetadata({ ...params });
+    const project = (await this.deps.store.getProject(task.projectId));
+    if (project) this.assertProfilesVisible(params.profiles, project);
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
     (await this.validateAndAuthorizeResumeSources(token, params));
@@ -2280,7 +2293,6 @@ export class KarmaxApi {
       // snapshot shared by all attempts, so refresh that snapshot from the current
       // defaults instead of leaving a previously autosaved partial value behind.
       if (confirmer === undefined && opts.replace && start) {
-        const project = (await this.deps.store.getProject(task.projectId));
         if (project) confirmer = (await this.resolveTaskField(start.manifest, project, params as ValueMap, confirmerField.name));
       }
       if (confirmer !== undefined) {
