@@ -36,6 +36,21 @@ const complete = (enabled = true) => ({
 });
 
 describe('installation paid-launch settings', () => {
+  it('preserves omitted launch, contact and price settings in partial updates', async () => {
+    const { store, service } = await harness();
+    try {
+      await service.configure(complete(), 'https://krmax.test');
+      await service.configure({ contacts: { billing: 'new@krmax.test' }, stripe: { teamSeatPriceId: 'price_new' } }, 'https://krmax.test');
+      expect(await service.stored()).toMatchObject({ paidLaunch: true, founderReviewedPolicyVersion: POLICY_VERSION,
+        operatorName: 'Krmax Labs Ltd', contacts: { billing: 'new@krmax.test', legal: 'legal@krmax.test' },
+        stripe: { individualPriceId: 'price_individual', teamSeatPriceId: 'price_new' } });
+      await service.configure({ paidLaunch: false, founderReviewed: false, operatorName: '' }, 'https://krmax.test');
+      expect(await service.stored()).toMatchObject({ paidLaunch: false });
+      expect((await service.stored()).operatorName).toBeUndefined();
+      expect((await service.stored()).founderReviewedPolicyVersion).toBeUndefined();
+    } finally { await store.close(); }
+  });
+
   it('never carries bootstrap secrets or prices into a different Paddle environment', async () => {
     const { store, broker } = await harness();
     const service = new PaidLaunchSettingsService(store, broker, {
