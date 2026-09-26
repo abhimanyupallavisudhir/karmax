@@ -1,3 +1,4 @@
+import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.js';
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
@@ -640,8 +641,9 @@ export async function brokerFinalizeMerge(
       const one = await withTransferredRepo(world, repo, auth, async (clone, env) => {
         const fetched = await git(clone, ['fetch', 'origin', repoTarget], { env });
         if (fetched.code !== 0) throw new Error(`target "${repoTarget}" is unavailable: ${fetched.stderr || fetched.stdout}`);
-        const changed = await git(clone, ['diff', '--name-only', `origin/${repoTarget}...${repo.branch}`]);
-        const files = changed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+        const changed = await git(clone, ['diff', '-z', '--name-only', `origin/${repoTarget}...${repo.branch}`]);
+        if (changed.code !== 0) throw new Error(`could not list changed files: ${changed.stderr}`);
+        const files = changed.stdout.split('\0').filter(Boolean);
         const marked = await conflictMarkerFiles(clone, repo.branch, files);
         if (marked.length) return { merged: false, landedFiles: files, conflict: marked.join('\n'), note: 'conflict markers are committed in the branch' } satisfies MergeResult;
         const checkout = await git(clone, ['checkout', '-q', '-B', repoTarget, `origin/${repoTarget}`]);
@@ -797,14 +799,7 @@ function identityArgs(identity?: WorldGitIdentity): string[] {
 }
 
 async function conflictMarkerFiles(dir: string, branch: string, files: string[]): Promise<string[]> {
-  if (!files.length) return [];
-  const grep = async (pattern: string): Promise<Set<string>> => {
-    const result = await git(dir, ['grep', '-l', '-E', pattern, branch, '--', ...files]);
-    return new Set(result.stdout.split('\n').map((line) => line.replace(new RegExp(`^${escapeRegExp(branch)}:`), '').trim()).filter(Boolean));
-  };
-  const open = await grep('^<{7}( |$)');
-  const close = await grep('^>{7}( |$)');
-  return [...open].filter((file) => close.has(file));
+  return scanConflictMarkers(args => git(dir, args), branch, files);
 }
 
 function escapeRegExp(value: string): string {

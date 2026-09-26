@@ -1,3 +1,4 @@
+import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.js';
 import path from 'node:path';
 import { validGitBranch } from '../util/git-ref.js';
 import fs from 'node:fs';
@@ -148,9 +149,10 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
   // keeps the safety scan running rather than silently disabling it.
   const baseResolvable = (await git(root, ['rev-parse', '--verify', base])).code === 0;
   const changed = baseResolvable
-    ? await git(root, ['diff', '--name-only', `${base}...HEAD`])
-    : await git(root, ['ls-tree', '-r', '--name-only', 'HEAD']);
-  const landedFiles = changed.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    ? await git(root, ['diff', '-z', '--name-only', `${base}...HEAD`])
+    : await git(root, ['ls-tree', '-rz', '--name-only', 'HEAD']);
+  if (changed.code !== 0) throw new Error(`could not list changed files: ${changed.stderr}`);
+  const landedFiles = changed.stdout.split('\0').filter(Boolean);
   const baseNote = baseResolvable ? undefined : `base "${base}" not found — forked off HEAD; scanned all files at HEAD`;
 
   // 1b. Never land conflict markers as content: scan what this attempt changed.
@@ -264,17 +266,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
  * mention a single marker (docs, fixtures) from tripping the guard.
  */
 async function conflictMarkerFiles(dir: string, files: string[]): Promise<string[]> {
-  if (!files.length) return [];
-  const grep = async (pattern: string): Promise<Set<string>> => {
-    const r = await git(dir, ['grep', '-l', '-E', pattern, 'HEAD', '--', ...files]);
-    return new Set(
-      r.stdout.split('\n').map((l) => l.replace(/^HEAD:/, '').trim()).filter(Boolean),
-    );
-  };
-  const open = await grep('^<{7}( |$)');
-  if (!open.size) return [];
-  const close = await grep('^>{7}( |$)');
-  return [...open].filter((f) => close.has(f));
+  return scanConflictMarkers(args => git(dir, args), 'HEAD', files);
 }
 
 /** Find the worktree path (if any) that currently has `branch` checked out. */
