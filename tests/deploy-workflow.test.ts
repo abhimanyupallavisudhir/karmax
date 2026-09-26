@@ -13,6 +13,14 @@ const script: string = JSON.stringify(deploy.steps);
 const operator = fs.readFileSync(path.join(repoRoot, 'deploy', 'karmax'), 'utf8');
 
 describe('post-push deployment to the public instance', () => {
+  it('gives validation jobs read-only GitHub authority and does not persist checkout credentials', () => {
+    expect(ci.permissions).toEqual({ contents: 'read' });
+    for (const job of Object.values(ci.jobs) as Array<{ steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>) {
+      for (const step of job.steps ?? []) {
+        if (step.uses?.startsWith('actions/checkout@')) expect(step.with?.['persist-credentials']).toBe(false);
+      }
+    }
+  });
   it('schema-validates every workflow with a version-and-checksum-pinned actionlint', () => {
     expect(ciSource).toContain("ACTIONLINT_VERSION: '1.7.12'");
     expect(ciSource).toContain('ACTIONLINT_LINUX_AMD64_SHA256');

@@ -11,6 +11,9 @@ on:
   # Validate any branch on demand, e.g. a CI change before its PR exists.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 # A newer push to the same branch makes the in-flight run redundant. master is
 # excluded so every landed commit keeps a result of its own.
 concurrency:
@@ -27,6 +30,8 @@ jobs:
       ACTIONLINT_LINUX_AMD64_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Pin both the release and archive digest.
       - name: Install actionlint
@@ -95,7 +100,6 @@ jobs:
     env:
       # Live suites spend real money and need real provider keys. Docker-gated
       # suites are covered by the deploy-artifacts job instead.
-      KARMAX_SKIP_LIVE: '1'
       KARMAX_SKIP_DOCKER: '1'
       KARMAX_TEST_PASS_INTEROP: '1'
       KARMAX_TEST_PASS_BROWSER: '1'
@@ -103,6 +107,8 @@ jobs:
       KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -174,6 +180,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Build the control-plane image
         run: docker build -f deploy/Dockerfile -t karmax:ci .
