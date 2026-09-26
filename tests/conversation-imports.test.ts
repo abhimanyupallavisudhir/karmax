@@ -94,6 +94,25 @@ describe('conversation import storage', () => {
 });
 
 describe('Krmax panagent bridge', () => {
+  it('copies an uploaded Claude history without losing native records', async () => {
+    const home = temporary('karmax-native-claude-import-');
+    try {
+      const result = await importWithPanagent({ source: { data: Buffer.from(CLAUDE_JSONL) },
+        provider: 'claude', forkHome: home, worldPath: '/tmp/imported', mode: 'transcript', native: true });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      const file = path.join(home, 'projects', '-tmp-imported', `${result.sessionId}.jsonl`);
+      const imported = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const original = CLAUDE_JSONL.trim().split('\n').map((line) => JSON.parse(line));
+      expect(imported).toHaveLength(original.length);
+      expect(imported[0].snapshot).toEqual(original[0].snapshot);
+      expect(imported[3].message).toEqual(original[3].message);
+      expect(imported[3].uuid).not.toBe(original[3].uuid);
+      expect(imported[4].parentUuid).toBe(imported[3].uuid);
+      expect(imported[3].sessionId).toBe(result.sessionId);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it('preserves native Codex tool and compaction payloads on upload under a fresh identity', async () => {
     const home = temporary('karmax-native-codex-import-');
     const records = [

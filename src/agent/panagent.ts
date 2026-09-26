@@ -117,6 +117,15 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     if (!('url' in opts.source)) {
       const raw = fs.readFileSync(source);
       const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
+      if (opts.native && opts.provider === 'claude') {
+        const native = rewriteClaudeHistory(content, crypto.randomUUID());
+        if (native) {
+          const destination = path.join(opts.forkHome, 'projects', claudeCwdSlug(opts.worldPath), `${native.sessionId}.jsonl`);
+          fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(destination, native.content, { mode: 0o600 });
+          return { kind: 'native', sessionId: native.sessionId };
+        }
+      }
       let first: any;
       try { first = JSON.parse(content.subarray(0, content.indexOf(10) < 0 ? content.length : content.indexOf(10)).toString()); }
       catch { /* Other formats are handled by panagent. */ }
@@ -173,6 +182,21 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
+}
+
+function rewriteClaudeHistory(content: Buffer, sessionId: string): { sessionId: string; content: string } | undefined {
+  let records: any[];
+  try { records = content.toString('utf8').split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line)); }
+  catch { return undefined; }
+  if (!records.some((record) => ['user', 'assistant'].includes(record?.type) && typeof record.sessionId === 'string')) return undefined;
+  const ids = new Map<string, string>();
+  for (const record of records) if (typeof record.uuid === 'string') ids.set(record.uuid, crypto.randomUUID());
+  for (const record of records) {
+    if (typeof record.uuid === 'string') record.uuid = ids.get(record.uuid);
+    if (typeof record.parentUuid === 'string') record.parentUuid = ids.get(record.parentUuid) ?? record.parentUuid;
+    if (typeof record.sessionId === 'string') record.sessionId = sessionId;
+  }
+  return { sessionId, content: records.map((record) => JSON.stringify(record)).join('\n') + '\n' };
 }
 
 async function runPanagent(args: string[]): Promise<void> {
