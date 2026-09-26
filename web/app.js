@@ -4883,7 +4883,7 @@ function wireOrgControls() {
 
 // Persist the current working query as a named view (Save-view button).
 async function saveCurrentView() {
-  const name = prompt('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  const name = await promptText('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
   if (!name) return;
   try {
     // The API persists a structured TaskQuery, so parse the working string into one
@@ -8010,6 +8010,26 @@ function reviewActionBtn(a, i) {
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
+function promptText(title, initial = '') {
+  return new Promise(resolve => {
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'text-prompt';
+    dialog.setAttribute('aria-label', title);
+    dialog.innerHTML = `<form method="dialog"><label class="form-row">${esc(title)}<input value="${esc(initial)}" autocomplete="off"></label>
+      <div class="inline-form" style="justify-content:flex-end"><button type="button" class="btn">Cancel</button><button class="btn primary" value="submit">Continue</button></div></form>`;
+    dialog.querySelector('[type="button"]').onclick = () => dialog.close();
+    dialog.addEventListener('keydown', event => event.stopPropagation());
+    dialog.addEventListener('close', () => {
+      const value = dialog.returnValue === 'submit' ? dialog.querySelector('input').value : null;
+      dialog.remove(); previousFocus?.focus(); resolve(value);
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    dialog.querySelector('input').select();
+  });
+}
+
 /** Ask for a secret in a masked field. `window.prompt` shows the value in clear
  *  and keeps it in the browser's prompt history; every other secret input in the
  *  console is `type="password"`, so this one is too. Resolves null on cancel. */
@@ -9950,7 +9970,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     const login = loginByKey[key];
     const credential = byKey[key];
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
-      const to = prompt(`Rename login ${login.account} to:`, login.account);
+      const to = await promptText(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
       try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
@@ -11270,7 +11290,7 @@ async function renderAccountStatus(organizationId = S.organizationId || 'org_per
     });
   });
   box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
-    const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
+    const ans = await promptText('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
     if (!ans) return;
     const mins = Number(ans);
     const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
@@ -13310,7 +13330,7 @@ async function hydrateProjectEnvironment(proj) {
         : `Stop the builder or build job in ${record.provider} first, and remove its image or snapshot named “${artifact}”.`
           + (record.builderId ? ` Builder: ${record.builderId}.` : ' For older builds, locate the builder in the provider dashboard or on the build host.')
           + (record.buildHost ? ` Build host: ${record.buildHost}.` : '');
-      const note = prompt(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
+      const note = await promptText(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
       if (!note?.trim()) return;
       button.disabled = true;
       try {
@@ -14656,7 +14676,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = prompt(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
+      const amt = await promptText(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
       if (amt == null) return;
       if (!Number(amt) || Number(amt) < 0) return toast('Enter an amount greater than zero.', true);
       try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
@@ -15933,7 +15953,7 @@ async function wireOutboundEmailCard() {
       finally { btn.disabled = false; }
     });
     $('#oe-test').addEventListener('click', async () => {
-      const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+      const to = await promptText('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
       if (!to) return;
       const btn = $('#oe-test'); btn.disabled = true;
       try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
@@ -17949,11 +17969,11 @@ async function hydrateOrganizationView() {
   setEventHandler($('#organization-name'), 'keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
   });
-  setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = await promptText(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
 }
 
 async function createOrganization() {
-  const name = prompt('Organization name');
+  const name = await promptText('Organization name');
   if (!name) { syncOrganizationSwitcher(); return; }
   try {
     const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
@@ -19239,8 +19259,8 @@ function renderAccessPending() {
   </div></div>`;
   $('#pending-retry').addEventListener('click', () => boot());
   $('#pending-workspace').addEventListener('click', async () => {
-    const organizationName = prompt('Organization name'); if (!organizationName) return;
-    const projectName = prompt('First project name', 'My project'); if (!projectName) return;
+    const organizationName = await promptText('Organization name'); if (!organizationName) return;
+    const projectName = await promptText('First project name', 'My project'); if (!projectName) return;
     try {
       const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name: organizationName }) });
       await api(`/api/organizations/${organization.id}/projects`, { method: 'POST', body: JSON.stringify({ name: projectName, config: {} }) });
