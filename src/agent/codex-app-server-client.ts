@@ -17,6 +17,7 @@ import { StringDecoder } from 'node:string_decoder';
  */
 export class CodexAppServerClient {
   private fragments: string[] = [];
+  private fragmentBytes = 0;
   private readonly decoder = new StringDecoder('utf8');
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
@@ -27,6 +28,7 @@ export class CodexAppServerClient {
   constructor(
     private readonly stdin: Writable,
     stdout: Readable,
+    private readonly maxLineBytes = 64 * 1024 * 1024,
   ) {
     stdout.on('data', (d: Buffer | string) => {
       if (!this.closed) this.onData(typeof d === 'string' ? d : this.decoder.write(d));
@@ -62,13 +64,19 @@ export class CodexAppServerClient {
     let start = 0;
     for (;;) {
       const end = chunk.indexOf('\n', start);
-      if (end < 0) {
-        if (start < chunk.length) this.fragments.push(chunk.slice(start));
+      const tail = chunk.slice(start, end < 0 ? undefined : end);
+      const bytes = Buffer.byteLength(tail);
+      if (this.fragmentBytes + bytes > this.maxLineBytes || this.fragments.length >= 65_536) {
+        this.failTransport(new Error('protocol line exceeds the bounded transport limit'));
         return;
       }
-      const tail = chunk.slice(start, end);
+      if (end < 0) {
+        if (tail) { this.fragments.push(tail); this.fragmentBytes += bytes; }
+        return;
+      }
       const line = this.fragments.length ? [...this.fragments, tail].join('') : tail;
       this.fragments = [];
+      this.fragmentBytes = 0;
       if (line.trim()) this.handleLine(line);
       if (this.closed) return;
       start = end + 1;
@@ -144,6 +152,7 @@ export class CodexAppServerClient {
     if (this.closed) return;
     this.closed = true;
     this.fragments = [];
+    this.fragmentBytes = 0;
     const detail = cause instanceof Error ? cause.message : String(cause);
     const error = new Error(`codex app-server transport failed: ${detail}`);
     for (const p of this.pending.values()) p.reject(error);
@@ -155,6 +164,7 @@ export class CodexAppServerClient {
     if (this.closed) return;
     this.closed = true;
     this.fragments = [];
+    this.fragmentBytes = 0;
     for (const p of this.pending.values()) p.reject(new Error('codex app-server client closed'));
     this.pending.clear();
     try {
