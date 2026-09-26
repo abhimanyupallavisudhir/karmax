@@ -20,6 +20,23 @@ const run = (overrides: Record<string, unknown> = {}) => ({
   actor: { login: 'alice' }, triggering_actor: { login: 'bob' }, ...overrides,
 });
 
+it('backs off rate limits and preserves scrubbed GitHub error messages', async () => {
+  const delays: number[] = [];
+  let calls = 0;
+  const api = new GithubActionsApi('installation-secret', {
+    sleep: async (ms) => { delays.push(ms); },
+    fetch: (async () => {
+      calls++;
+      if (calls === 1) return Response.json({ message: 'API rate limit exceeded' }, { status: 403,
+        headers: { 'retry-after': '2' } });
+      return Response.json({ message: 'Workflow disabled for installation-secret' }, { status: 422 });
+    }) as typeof fetch,
+  });
+  await expect(api.listWorkflows('acme/app')).rejects.toThrow('Workflow disabled for [REDACTED]');
+  expect(delays).toEqual([2000]);
+  expect(calls).toBe(2);
+});
+
 describe('GitHub Actions API', () => {
   const inspection = (log: string, overrides: Partial<GithubActionsFailureInspection['run']> = {}): GithubActionsFailureInspection => ({
     run: {
