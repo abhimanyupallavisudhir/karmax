@@ -335,7 +335,7 @@ export class AcpAdapter implements AgentAdapter {
     if (isRemoteAgentWorld(input.world))
       throw new Error(
         `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where krmax itself runs. `
-        + 'Choose a Claude or Codex agent for this task, or give the project a local/container world.');
+        + 'Choose a Claude or Codex agent for this task, or give the project a local worktree world.');
     const work = await openCodeWorkEnvironment(input, !!ctx.onSecretEnvChange);
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAcpTurn(input, ctx, work.plugin); }

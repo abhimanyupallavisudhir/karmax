@@ -4,13 +4,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
+import { gitOrThrow } from './git.js';
+import { worldRepos } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
 import { boundedResponseBody } from './http.js';
 import { openSpawnedPty, runLocalCommand, startSpawnedProcess } from './local-execution.js';
 
 const pexec = promisify(execFile);
-const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22-slim';
+const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22';
 
 /**
  * Per-container resource caps (SPEC §11.2 isolation). Without them a single
@@ -29,9 +31,9 @@ function containerLimitArgs(): string[] {
   return args;
 }
 
-async function docker(args: string[], opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
+async function docker(args: string[], opts: { timeoutMs?: number; env?: Record<string, string> } = {}): Promise<ExecResult> {
   try {
-    const { stdout, stderr } = await pexec('docker', args, { timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout, stderr } = await pexec('docker', args, { timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, ...opts.env } });
     return { stdout, stderr, code: 0 };
   } catch (e: any) {
     return { stdout: e.stdout ?? '', stderr: e.stderr ?? String(e?.message ?? e), code: e.code ?? 1 };
@@ -67,19 +69,26 @@ export class ContainerWorldProvider implements WorldProvider {
     if (!(await dockerAvailable())) throw new Error('container world requested but Docker is not available');
     const base = await this.worktrees.create(spec); // host worktree on karmax/<taskId>
     const name = `karmax-${spec.taskId}`.replace(/[^a-zA-Z0-9_.-]/g, '-');
+    try {
+    const gitDirs = new Set<string>();
+    for (const repo of worldRepos(base.handle))
+      gitDirs.add(await gitOrThrow(repo.root, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
     await docker(['rm', '-f', name]); // clear any stale container
     const image = spec.environment?.image ?? IMAGE;
     const run = await docker([
       'run', '-d', '--name', name,
       ...containerLimitArgs(),
       '-v', `${base.handle.root}:/work`,
+      '-v', `${base.handle.root}:${base.handle.root}`,
+      ...[...gitDirs].flatMap(directory => ['-v', `${directory}:${directory}`]),
       '-w', '/work',
       image, 'sleep', 'infinity',
     ]);
     if (run.code !== 0) {
-      await base.destroy();
       throw new Error(`failed to start container: ${run.stderr}`);
     }
+    const git = await docker(['exec', name, 'git', '--version']);
+    if (git.code !== 0) throw new Error('container image must include Git; use node:22 or a prepared image with Git installed');
     // Keep the worktree's meta: it carries `ephemeralPaths` (copyGlobs and
     // materialized resources), which checkpointing reads to tell inputs apart
     // from project data. Spreading `base.handle` and then overwriting `meta`
@@ -87,6 +96,11 @@ export class ContainerWorldProvider implements WorldProvider {
     const handle: WorldHandle = { ...base.handle, kind: 'container',
       meta: { ...base.handle.meta, container: name, image } };
     return new ContainerWorld(handle);
+    } catch (error) {
+      await docker(['rm', '-f', name]);
+      await base.destroy();
+      throw error;
+    }
   }
 
   async open(handle: WorldHandle): Promise<World> {
@@ -135,11 +149,11 @@ class ContainerWorld implements World {
     // this channel). Without it the helper just gets EOF.
     if (opts.input !== undefined) dArgs.push('-i');
     dArgs.push('-w', this.containerCwdFromAny(opts.cwd ?? worldWorkingDirectory(this.handle)));
-    for (const [k, v] of Object.entries(opts.env ?? {})) dArgs.push('-e', `${k}=${v}`);
+    for (const key of Object.keys(opts.env ?? {})) dArgs.push('-e', key);
     dArgs.push(this.name, 'bash', '-lc', inner);
     if (opts.input !== undefined)
-      return runLocalCommand('docker', dArgs, { timeoutMs: opts.timeoutMs, input: opts.input });
-    return docker(dArgs, { timeoutMs: opts.timeoutMs });
+      return runLocalCommand('docker', dArgs, { timeoutMs: opts.timeoutMs, input: opts.input, env: { ...process.env, ...opts.env } });
+    return docker(dArgs, { timeoutMs: opts.timeoutMs, env: opts.env });
   }
 
   /**
@@ -200,14 +214,14 @@ class ContainerWorld implements World {
   async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
     const args = ['exec'];
     args.push('-w', this.containerCwdFromAny(spec.cwd ?? worldWorkingDirectory(this.handle)));
-    for (const [key, value] of Object.entries(spec.env ?? {})) args.push('-e', `${key}=${value}`);
+    for (const key of Object.keys(spec.env ?? {})) args.push('-e', key);
     args.push(this.name, 'bash', '-lc', spec.command);
-    return startSpawnedProcess('docker', args, { env: process.env, detached: true });
+    return startSpawnedProcess('docker', args, { env: { ...process.env, ...spec.env }, detached: true });
   }
   async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
     const args = ['exec', '-it', '-w', this.containerCwdFromAny(spec.cwd ?? worldWorkingDirectory(this.handle))];
-    for (const [key, value] of Object.entries(spec.env ?? {})) args.push('-e', `${key}=${value}`);
-    args.push(this.name, 'bash', '--norc', '-i');
+    for (const key of Object.keys(spec.env ?? {})) args.push('-e', key);
+    args.push(this.name, 'bash', ...(spec.command ? ['-lc', spec.command] : ['--norc', '-i']));
     return openSpawnedPty('docker', args, spec);
   }
   async listFiles(): Promise<string[]> {
