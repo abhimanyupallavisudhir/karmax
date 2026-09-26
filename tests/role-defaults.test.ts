@@ -130,5 +130,11 @@ it('delegates live parent card grants instead of stale start-time authority (RT-
     expect(approvedChild.grant).toContain('use-card:approved');
     expect(allows(child.grant!, 'task:create')).toBe(false);
     expect(allows(child.grant!, 'use-card:other')).toBe(false);
+    await store.updateTaskParams(parent.id, { ...parent.params, _authorization: {
+      principal: 'avatar:deleted', capabilities: ['*'],
+    } });
+    const revokedChild = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id,
+      title: 'Revoked child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(revokedChild.grant).toEqual([]);
   } finally { await store.close(); }
 });
