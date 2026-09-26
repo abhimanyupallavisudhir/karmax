@@ -764,7 +764,10 @@ export class CodexAdapter implements AgentAdapter {
         pollLock = false;
       }
     };
-    const followPoll = ctx.pullFollowUps ? setInterval(() => { void steerFollowUps(); }, 1200) : undefined;
+    let steering: Promise<void> | undefined;
+    const followPoll = ctx.pullFollowUps ? setInterval(() => {
+      if (!steering) steering = steerFollowUps().catch(() => {}).finally(() => { steering = undefined; });
+    }, 1200) : undefined;
 
     try {
       // ── Handshake ──
@@ -900,6 +903,7 @@ export class CodexAdapter implements AgentAdapter {
 
         // Collect follow-ups that weren't steered in (arrived after the last poll /
         // after completion) → drive a follow-on turn; else the turn is done.
+        await steering;
         nextInput = [];
         if (ctx.pullFollowUps) {
           for (const m of await ctx.pullFollowUps(deliveredIndex)) {

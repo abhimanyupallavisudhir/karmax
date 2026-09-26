@@ -26,10 +26,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     // Karmax answered our dynamic-tool call; now finish the turn.
     send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
   }
+  else if (msg.method === 'turn/steer') {
+    send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    setTimeout(() => send({ id: msg.id, result: {} }), 100);
+  }
   else if (msg.method === 'turn/start') {
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
     const mode = process.env.STUB_MODE || 'completed';
+    if (mode === 'steer-race') { send({ method: 'turn/started', params: { turn: { id: 'turn-1' } } }); return; }
     if (mode === 'tool') {
       // A server→client request: the model called a karmax dynamic tool.
       send({ id: 5000, method: 'item/tool/call', params: { callId: 'c1', tool: 'confirm_decision', arguments: { action: 'confirm' } } });
@@ -167,6 +172,17 @@ describe('CodexAdapter app-server security policy', () => {
     await run('11111111-1111-4111-8111-111111111111', 'usage');
     expect(lastResult.usage).toEqual({ inputTokens: 3000, outputTokens: 50, cacheReadTokens: 2400,
       inputTokensIncludeCacheRead: true, totalTokens: 3050 });
+  });
+
+  it('waits for in-flight steering before draining the idle boundary', async () => {
+    const offsets: number[] = [];
+    const records = await run(undefined, 'steer-race', false, { pullFollowUps: async (offset: number) => {
+      offsets.push(offset);
+      return offsets.length === 1 ? [{ role: 'user', text: 'follow-up' }] : [];
+    } });
+    expect(offsets).toEqual([1, 2]);
+    expect(lastResult.delivered).toBe(2);
+    expect(records.filter(r => r.method === 'turn/steer')).toHaveLength(1);
   });
 
   it('reports no usage when the app-server sent none', async () => {
