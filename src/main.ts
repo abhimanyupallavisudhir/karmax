@@ -88,6 +88,8 @@ async function main() {
   if (separateWorker && (process.platform !== 'linux' || !/^postgres(?:ql)?:\/\//i.test(process.env.KARMAX_DATABASE_URL ?? '')))
     throw new Error('process worker mode requires Linux and PostgreSQL');
   let startupReady = false;
+  const startupJobs: Array<() => Promise<unknown>> = [];
+  let startupMaintenance: Promise<unknown> | undefined;
   let eventRelay: ForeignEventRelay | undefined;
   const p = ensurePaths();
   const { provider, reason } = defaultProvider();
@@ -387,8 +389,10 @@ async function main() {
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
   if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live krmax instance untouched`);
-  const serviceOrphans = await sweepOrphanedServiceContainers(async (taskId) => (await store.worldState(taskId))).catch(() => 0);
-  if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
+  startupJobs.push(async () => {
+    const serviceOrphans = await sweepOrphanedServiceContainers(async (taskId) => (await store.worldState(taskId))).catch(() => 0);
+    if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
+  });
   // A concurrently running dogfooding instance can die after this app has
   // already booted. Sweep periodically so its detached agent/tool descendants
   // do not wait until the next host restart to be reaped.
@@ -407,9 +411,9 @@ async function main() {
     if (swept.scopedTokens || swept.githubDeliveries)
       console.log(`  • Purged ${swept.scopedTokens} expired token(s) and ${swept.githubDeliveries} aged webhook delivery id(s)`);
   };
-  (await sweepRetention());
   const retentionTimer = new AsyncInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
+  startupJobs.push(() => retentionTimer.run());
 
   // Re-derive effective plans from the last signed provider state at boot and
   // throughout the process lifetime. In particular, this closes past-due grace
@@ -421,9 +425,9 @@ async function main() {
         error instanceof Error ? error.message : String(error));
     }
   };
-  (await reconcileSubscriptionEntitlements());
   const subscriptionEntitlementTimer = new AsyncInterval(reconcileSubscriptionEntitlements, 60_000);
   subscriptionEntitlementTimer.unref();
+  startupJobs.push(() => subscriptionEntitlementTimer.run());
 
   // Membership hooks submit seat changes immediately; this bounded sweep makes
   // provider quantity reconciliation eventual after an outage or process crash.
@@ -444,12 +448,6 @@ async function main() {
   // Runs before task reconciliation so a merge queue that self-heals here is
   // already answering by the time tasks waiting on it are examined.
   const { healCoordinators } = await import('./platform/coordinator-health.js');
-  const health = await healCoordinators(client, TASK_QUEUE)
-    .catch(() => ({ checked: 0, wedged: [], rebuilt: [], reported: [] }));
-  if (health.rebuilt.length)
-    console.log(`  • Rebuilt ${health.rebuilt.length} unreplayable coordinator(s)`);
-  for (const { workflowId, reason } of health.reported)
-    console.warn(`  ! Coordinator ${workflowId} is wedged; left alone: ${reason}`);
 
   // Hosted plan/member writes are synchronous database boundaries, while the
   // organization agent queue is durable Temporal state. Reconcile immediately
@@ -465,8 +463,17 @@ async function main() {
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
-  const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));
-  if (recon.settled) console.log(`  • Reconciled ${recon.settled} task(s) lost/finished while offline`);
+  startupJobs.push(async () => {
+    const health = await healCoordinators(client, TASK_QUEUE)
+      .catch(() => ({ checked: 0, wedged: [], rebuilt: [], reported: [] }));
+    if (health.rebuilt.length)
+      console.log(`  • Rebuilt ${health.rebuilt.length} unreplayable coordinator(s)`);
+    for (const { workflowId, reason } of health.reported)
+      console.warn(`  ! Coordinator ${workflowId} is wedged; left alone: ${reason}`);
+
+    const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));
+    if (recon.settled) console.log(`  • Reconciled ${recon.settled} task(s) lost/finished while offline`);
+  });
 
   // …and keep reconciling while we run. A workflow can die *without* karmax
   // hearing about it — Temporal terminates one that exceeds its history limit,
@@ -514,8 +521,6 @@ async function main() {
 
   // Reload workflows installed in previous sessions (SPEC §4.2) and roll the
   // worker once so their tasks — new and in-flight — can run after a restart.
-  const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
-  if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency prerequisites are met and a schedule/event activates it. Runs
   // in-process off the same bus as the self-heal loop; the store is the durable
@@ -528,7 +533,11 @@ async function main() {
     log: (m) => console.log('  • ' + m),
   });
   api.setTriggerArmer(triggerScheduler);
-  (await triggerScheduler.start());
+  startupJobs.push(async () => {
+    const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
+    if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
+    if (!shuttingDown) await triggerScheduler.start();
+  });
   worldLifecycle.start();
   delivery.start();
 
@@ -598,14 +607,16 @@ async function main() {
 
   console.log(`\n  ✓ krmax is running:  ${url}\n`);
   if (!(await identity.hasUsers())) console.log('  (first run — create the initial administrator in the browser)');
-  try {
-    if (deployment.hostLocal) {
-      const remote = await remoteAccessPlan(port, { hasPassword: !!process.env.KARMAX_PASSWORD || (await identity.hasUsers()) });
-      console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
+  startupJobs.push(async () => {
+    try {
+      if (deployment.hostLocal) {
+        const remote = await remoteAccessPlan(port, { hasPassword: !!process.env.KARMAX_PASSWORD || (await identity.hasUsers()) });
+        console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
+      }
+    } catch {
+      /* ignore */
     }
-  } catch {
-    /* ignore */
-  }
+  });
 
   let shuttingDown = false;
   let replacementStarted = false;
@@ -639,6 +650,7 @@ async function main() {
     // service cannot consume the worker's shutdown grace period. The existing
     // process-exit backstop bounds shutdown; do not close Store under these jobs.
     const maintenanceDrain = Promise.allSettled([
+      startupMaintenance,
       retentionTimer.stop(), subscriptionEntitlementTimer.stop(), subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),
@@ -686,6 +698,16 @@ async function main() {
     cursor: relayCursor, onError: error => console.warn('  • Worker event relay failed:', error),
   });
   startupReady = true;
+  // Independent maintenance must not gate the console. Limit boot fan-out and
+  // drain already-started work before closing its store/client dependencies.
+  let nextStartupJob = 0;
+  startupMaintenance = Promise.allSettled(Array.from({ length: 2 }, async () => {
+    while (!shuttingDown && nextStartupJob < startupJobs.length) {
+      const job = startupJobs[nextStartupJob++]!;
+      try { await job(); }
+      catch (error) { console.warn('  • Startup maintenance failed:', error); }
+    }
+  }));
 }
 
 main().catch((e) => {
