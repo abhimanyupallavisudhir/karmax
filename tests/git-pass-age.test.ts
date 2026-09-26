@@ -260,8 +260,8 @@ it('verifies actual entry decryption and distinguishes transport from encryption
   expect((await c.validateSecret(JSON.stringify(f.config))).checks).toEqual([
     { store: 'root', entry: 'example', read: 'verified', encryption: true, push: true },
   ]);
-  await expect(c.validateSecret(JSON.stringify({ ...f.config, ageIdentity: wrong.config.ageIdentity }))).rejects.toThrow(/verification/);
-  await expect(c.validateSecret(JSON.stringify({ ...f.config, validationEntry: 'missing' }))).rejects.toThrow(/verification/);
+  await expect(c.validateSecret(JSON.stringify({ ...f.config, ageIdentity: wrong.config.ageIdentity }))).rejects.toThrow('Password store root: Git-backed pass could not decrypt or encrypt with the supplied age identity and recipients');
+  await expect(c.validateSecret(JSON.stringify({ ...f.config, validationEntry: 'missing' }))).rejects.toThrow('Password store root: Selected verification entry was not found');
   fs.writeFileSync(path.join(f.seed, '.age-recipients'), 'invalid-recipient\n');
   run('git', ['add', '.'], f.seed); run('git', ['commit', '-m', 'unusable encryption recipients'], f.seed); run('git', ['push'], f.seed);
   expect((await c.validateSecret(JSON.stringify(f.config))).checks?.[0]).toMatchObject({ read: 'verified', encryption: false });
@@ -374,6 +374,6 @@ it('accepts encrypted age identities, rejects wrong passphrases and cleans tempo
   expect((await c.pull(['example'])).items[0]?.secrets.password).toBe('pw');
   await c.updateSecret('example', 'password', 'encrypted-identity-rotation');
   expect((await c.pull(['example'])).items[0]?.secrets.password).toBe('encrypted-identity-rotation');
-  await expect(c.validateSecret(JSON.stringify({ ...config, agePassphrase: 'wrong' }))).rejects.toThrow(/verification/);
+  await expect(c.validateSecret(JSON.stringify({ ...config, agePassphrase: 'wrong' }))).rejects.toThrow('Password store root: Git-backed pass could not decrypt or encrypt with the supplied age identity and recipients');
   expect(fs.readdirSync(path.join(f.root, 'state')).filter(name => name.startsWith('.key-'))).toEqual([]);
 }, 60_000);
