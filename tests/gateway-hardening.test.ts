@@ -38,3 +38,39 @@ it('rejects cross-site mutations and cross-site side-effecting navigations (GW-3
       headers: { authorization: `Bearer ${token}`, origin: h.base, 'content-type': 'application/json' }, body: '{}' })).status).toBe(200);
   } finally { await h.close(); }
 });
+
+it('blocks preview scripts from reading console credentials and changing settings in Chromium (#16)', async () => {
+  const { chromium } = await import('playwright');
+  const h = await stubGateway({ hostLocal: false });
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const handle = { id: 'w', kind: 'e2b', root: '/app', branch: 'task', base: 'main', generation: 1 };
+    vi.spyOn(h.store, 'previewLease').mockResolvedValue({ id: 'lease', worldId: 'w', taskId: 't', projectId: 'p',
+      organizationId: 'org_personal', generation: 1, port: 3000, expiresAt: Date.now() + 60_000 } as any);
+    vi.spyOn(h.store, 'currentWorld').mockResolvedValue(handle as any);
+    vi.spyOn(h.store, 'getTask').mockResolvedValue({ projectId: 'p', lastView: { world: handle } } as any);
+    vi.spyOn(h.store, 'effectiveProjectConfig').mockResolvedValue({} as any);
+    await h.store.setSettings('global', 'test-settings', { siteName: 'Protected' });
+    (h.gateway as any).deps.worlds.open = async () => ({ fetchPort: async () => ({ status: 200,
+      headers: { 'content-type': 'text/html' }, body: Buffer.from(`<script>
+        window.probe = (async () => {
+          let cookieBlocked = false, storageBlocked = false, readBlocked = false;
+          try { document.cookie; } catch { cookieBlocked = true; }
+          try { localStorage.getItem('token'); } catch { storageBlocked = true; }
+          try { await (await fetch('/api/projects', { credentials: 'include' })).text(); } catch { readBlocked = true; }
+          await fetch('/api/settings/global/test-settings', { method: 'PUT', credentials: 'include',
+            headers: { 'content-type': 'application/json' }, body: JSON.stringify({ values: { siteName: 'Changed' } }) }).catch(() => {});
+          return { cookieBlocked, storageBlocked, readBlocked };
+        })();
+      </script>`) }) });
+    const context = await browser.newContext();
+    expect((await context.request.get(`${h.base}/api/session`)).status()).toBe(200);
+    expect((await context.request.get(`${h.base}/api/projects`)).status()).toBe(200);
+    const page = await context.newPage();
+    expect((await page.goto(`${h.base}/preview/lease/`))?.status()).toBe(200);
+    expect(await page.evaluate(() => (globalThis as any).probe)).toEqual({
+      cookieBlocked: true, storageBlocked: true, readBlocked: true,
+    });
+    expect(await h.store.getSettings('global', 'test-settings')).toEqual({ siteName: 'Protected' });
+  } finally { await browser.close(); await h.close(); }
+});
