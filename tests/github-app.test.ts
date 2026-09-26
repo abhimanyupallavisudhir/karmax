@@ -496,7 +496,7 @@ describe('GitHub App integration', () => {
     (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
     (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret'));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
-    let repositories = [{ id: 7, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
+    let repositories = [{ id: 7, archived: false, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
       default_branch: 'main', owner: { login: 'acme' } }];
     const calls: Array<{ path: string; method: string; body?: any; auth?: string }> = [];
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -537,6 +537,15 @@ describe('GitHub App integration', () => {
     expect((await service.handleWebhook('installation_repositories', 'delivery-1', payload, signature)).accepted).toBe(false);
     await expect(service.handleWebhook('installation_repositories', 'delivery-2', payload, 'sha256=bad')).rejects.toThrow(/signature/);
 
+    const project = await store.createProject('Rename', {}, organization.id);
+    await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+    repositories = [{ ...repositories[0]!, name: 'renamed', ssh_url: 'git@github.com:acme/renamed.git' }];
+    expect((await service.reconcile(connected.connection))[0]?.id).toBe(repository.id);
+    expect(await store.projectIdsForRepository(repository.id)).toEqual([project.id]);
+    repositories[0]!.archived = true;
+    await service.reconcile(connected.connection);
+    expect(await store.getRepository(repository.id)).toMatchObject({ name: 'renamed' });
+    expect(await store.projectIdsForRepository(repository.id)).toEqual([project.id]);
     repositories = [];
     await service.reconcile(connected.connection);
     expect((await store.getRepository(repository.id))).toBeUndefined();

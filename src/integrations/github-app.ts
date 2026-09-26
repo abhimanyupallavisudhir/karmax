@@ -908,7 +908,9 @@ export class GitHubAppService {
     }
     const active = new Set<string>();
     const repositories: Repository[] = [];
-    for (const item of remote.filter((repo) => !repo.archived)) {
+    const existing = await this.store.listRepositories(connection.organizationId);
+    for (const item of remote) {
+      if (item.archived && !existing.some((repo) => repo.providerId === String(item.id))) continue;
       const repository = (await this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
         providerId: String(item.id), owner: item.owner.login, name: item.name, sshUrl: item.ssh_url,
         defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id }));
