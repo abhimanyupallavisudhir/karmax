@@ -593,6 +593,7 @@ export class ClaudeAdapter implements AgentAdapter {
       prompt: promptArg,
       options: {
         abortController,
+        maxTurns: input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP,
         ...(workSettings ? { settings: workSettings } : {}),
         cwd: worldWorkingDirectory(runtimeWorld.handle),
         additionalDirectories: [runtimeWorld.handle.root],

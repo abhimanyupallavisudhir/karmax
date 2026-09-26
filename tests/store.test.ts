@@ -87,7 +87,7 @@ describe('Store', () => {
     expect((await store.usageSummary('org_personal', boundary, boundary + 10_000)).costMicros).toBe(50);
   });
 
-  it('migrates away legacy turn caps on role-default profiles (task 1a)', async () => {
+  it('preserves configured turn caps when migrating role-default profiles', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
@@ -97,7 +97,7 @@ describe('Store', () => {
     (await s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
-    expect((await s2.getProfile('do-default'))!.maxTurns).toBeUndefined(); // legacy cap stripped
+    expect((await s2.getProfile('do-default'))!.maxTurns).toBe(24); // explicit cap preserved
     expect((await s2.getProfile('do-default'))!.capabilities).toEqual(expect.arrayContaining(['task:git:publish', 'task:git:import']));
     expect((await s2.getProfile('do-default'))!.capabilities).not.toContain('task:world:read');
     expect((await s2.getProfile('custom-big'))!.maxTurns).toBe(99); // non-default profiles untouched

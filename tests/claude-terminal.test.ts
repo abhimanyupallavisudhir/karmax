@@ -51,6 +51,14 @@ const ctx: any = {
 describe('Claude Agent SDK terminal outcome contract', () => {
   beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; sdkState.run = undefined; });
 
+  it('passes explicit per-turn and profile caps to the SDK', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success' }];
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, maxTurns: 7 } }, ctx);
+    expect(sdkState.options.maxTurns).toBe(7);
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, maxTurns: 7 }, maxTurns: 3 }, ctx);
+    expect(sdkState.options.maxTurns).toBe(3);
+  });
+
   it('retries a silent SDK startup without waiting for the 45-minute activity timeout', async () => {
     vi.useFakeTimers();
     // A lost startup can leave next() pending even after the SDK is aborted.
