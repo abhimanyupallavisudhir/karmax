@@ -26,7 +26,7 @@
   --surface-2: #fbfcfd;
   --ink: #15181e;
   --ink-2: #58616f;
-  --ink-3: #8b95a5;
+  --ink-3: #626e7e;
   --line: #e5e8ed;
   --line-strong: #d4d9e1;
   --accent: #5b5bd6;
@@ -57,7 +57,7 @@ html[data-theme="dark"],
   --surface-2: #1f232c;
   --ink: #e7e9ef;
   --ink-2: #9aa4b2;
-  --ink-3: #6a7383;
+  --ink-3: #929dad;
   --line: #292e39;
   --line-strong: #353c49;
   --accent: #8b8bf0;
@@ -83,7 +83,7 @@ html[data-theme="dark"],
     --surface-2: #1f232c;
     --ink: #e7e9ef;
     --ink-2: #9aa4b2;
-    --ink-3: #6a7383;
+    --ink-3: #929dad;
     --line: #292e39;
     --line-strong: #353c49;
     --accent: #8b8bf0;
