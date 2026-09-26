@@ -1,9 +1,28 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
 describe('organization and collaboration domain', () => {
+  it('delivers task headers without hydrating full conversations', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const org = await store.createOrganization({ name: 'Delivery', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const task = await store.createTask({ projectId: project.id, title: 'Approval', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'credential.approval-requested', ts: Date.now(), payload: {} });
+      const getTask = vi.spyOn(store, 'getTask');
+      const delivered: string[] = [];
+      const dispatcher = new DeliveryDispatcher(store, { browser: { deliver: async ({ task }) => {
+        if (task) delivered.push(task.title);
+      } } });
+      await dispatcher.drain();
+      expect(delivered).toEqual(['Approval']);
+      expect(getTask).not.toHaveBeenCalled();
+    } finally { await store.close(); }
+  });
+
   it('does not treat a longer team route as a reference to its prefix', async () => {
     const store = await Store.create(':memory:');
     try {

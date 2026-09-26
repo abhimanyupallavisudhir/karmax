@@ -252,7 +252,7 @@ async function main() {
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
     ...(process.env.KARMAX_SLACK_DELIVERY_URL ? { slack: new WebhookDeliveryAdapter(process.env.KARMAX_SLACK_DELIVERY_URL, 'slack') } : {}),
   }, async (id) => {
-    const user = (await identity.listUsers()).find((candidate) => candidate.id === id);
+    const user = await identity.userById(id);
     return user ? { id: user.id, name: user.name, email: user.email } : undefined;
   });
   // Hosted-plan billing is deliberately a different provider and ledger from

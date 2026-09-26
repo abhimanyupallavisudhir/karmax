@@ -26,6 +26,15 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('looks up one identity user by primary key', async () => {
+    const identity = await IdentityService.open(':memory:', { databaseUrl: url!, baseURL: 'http://localhost:4599',
+      secret: 'fixture-only-identity-secret-32-characters' });
+    try {
+      const user = await identity.createUser({ name: 'Alice', email: 'alice@example.com', password: 'fixture-password-123' });
+      expect(await identity.userById(user.id)).toMatchObject({ id: user.id, email: user.email });
+    } finally { await identity.close(); }
+  });
+
   it('looks up merged task events without hydrating event history', async () => {
     const store = await Store.create(url!);
     try {
