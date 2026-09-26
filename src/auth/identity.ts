@@ -328,6 +328,9 @@ export class IdentityService {
     await runMigrations();
     if (opts.databaseUrl)
       service.migration = (await importSqliteDatabase(dbFile, service.db, 'identity', { sentinelTable: 'user' }));
+    // Better Auth's first request checks the schema using a separate checkout.
+    // Complete that check before bootstrap takes the SQLite transaction lock.
+    await service.auth.api.getSession({ headers: new Headers() });
     // Better Auth intentionally permits duplicate display names, but every
     // karmax user owns a same-named personal organization. This index closes the
     // concurrent-signup gap around the cross-store application check.
