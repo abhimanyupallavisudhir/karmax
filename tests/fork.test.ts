@@ -15,6 +15,22 @@ const tmp = (p: string) => fs.mkdtempSync(path.join(os.tmpdir(), p));
 const sid = () => crypto.randomUUID();
 
 describe('materializeFork — Claude (per config-home × cwd)', () => {
+  it('selects the most complete Claude copy even when a stale fork sorts first', () => {
+    const home = tmp('karmax-claude-copies-');
+    const session = sid();
+    try {
+      const stale = path.join(home, 'projects', 'a-fork', `${session}.jsonl`);
+      const latest = path.join(home, 'projects', 'z-original', `${session}.jsonl`);
+      fs.mkdirSync(path.dirname(stale), { recursive: true });
+      fs.mkdirSync(path.dirname(latest), { recursive: true });
+      fs.writeFileSync(stale, '{"type":"user","uuid":"1"}\n');
+      fs.writeFileSync(latest, fs.readFileSync(stale, 'utf8') + '{"type":"assistant","uuid":"2"}\n');
+      // Copying an old fork later must not make it authoritative.
+      fs.utimesSync(stale, new Date(), new Date(Date.now() + 60_000));
+      expect(findProviderSession({ provider: 'claude', session, srcHome: home })).toBe(latest);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it("copies the source session .jsonl into the fork's (home × world) project dir", () => {
     const srcHome = tmp('karmax-src-'), forkHome = tmp('karmax-fork-');
     const world = '/tmp/karmax-worlds/task-NEW';

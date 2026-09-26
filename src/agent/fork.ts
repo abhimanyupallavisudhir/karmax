@@ -71,16 +71,22 @@ function claudeHomeCandidates(srcHome?: string, forkHome?: string, searchInstall
 /** Find a Claude session `.jsonl` only in the explicitly selected homes. */
 function findClaudeSession(session: string, srcHome?: string, forkHome?: string,
   searchInstallation = false): string | undefined {
+  let best: { file: string; size: number; mtime: number } | undefined;
   for (const home of claudeHomeCandidates(srcHome, forkHome, searchInstallation)) {
     const projects = path.join(home, 'projects');
     let dirs: string[];
     try { dirs = fs.readdirSync(projects); } catch { continue; }
     for (const d of dirs) {
       const f = path.join(projects, d, `${session}.jsonl`);
-      if (fs.existsSync(f)) return f;
+      try {
+        const stat = fs.statSync(f);
+        if (stat.isFile() && (!best || stat.size > best.size
+          || (stat.size === best.size && stat.mtimeMs > best.mtime)))
+          best = { file: f, size: stat.size, mtime: stat.mtimeMs };
+      } catch { /* copy disappeared during discovery */ }
     }
   }
-  return undefined;
+  return best?.file;
 }
 
 /** Resolve a native Codex/Claude session. Search is limited to explicit homes
