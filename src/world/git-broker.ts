@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
 import { sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
-import { ensureIdentity, git, isGitRepo } from './git.js';
+import { ensureIdentity, git, gitOrThrow, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
 import { canonicalRepositoryIdentity } from './repository-identity.js';
@@ -778,6 +778,17 @@ async function withTransferredRepo<T>(
     const clone = path.join(temp, 'repo');
     const cloned = await timed('git-broker.clone', () => git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', '--single-branch', ...(branch ? ['--branch', branch] : []), source, clone], { env, timeoutMs: 10 * 60_000 }));
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
+    // Keep the task branch as a negotiation base without fetching unrelated
+    // branches. Otherwise an already-published checkpoint is transferred again.
+    if (branch !== repo.branch) {
+      const ref = `refs/heads/${repo.branch}`;
+      const advertised = await git(clone, ['ls-remote', '--exit-code', '--refs', 'origin', ref], { env });
+      if (advertised.code === 0) {
+        await gitOrThrow(clone, ['fetch', '--no-tags', 'origin', `+${ref}:refs/remotes/origin/${repo.branch}`], { env });
+      } else if (advertised.code !== 2) {
+        throw new Error(`task branch discovery failed: ${advertised.stderr || advertised.stdout}`);
+      }
+    }
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
