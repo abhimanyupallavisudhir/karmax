@@ -8,6 +8,7 @@ import {
   setHandler,
   condition,
   workflowInfo,
+  patched,
   ApplicationFailure,
   isCancellation,
   log,
@@ -453,7 +454,11 @@ async function mergeOnlyImpl(
   // no longer, so it freezes here rather than at queue time (SPEC §4.5/§5.5).
   confirmConsumed = true;
   await publish();
-  await condition(() => confirmed || cancelled);
+  if (patched('merge-only-enforce-failed-checks-v1')) {
+    await condition(() => cancelled || (confirmed && mayConfirm));
+  } else {
+    await condition(() => confirmed || cancelled);
+  }
   waitingFor = undefined;
   if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) return await finishCancelled();
 

@@ -57,3 +57,16 @@ it('WF-9: denied credentials park just-do visibly and cancellation completes', a
   expect(wf.activities.runAgentTurn).not.toHaveBeenCalled();
 });
 
+it('WF-10: a confirm signal cannot bypass failed workflow checks', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.runWorkflowChecks = vi.fn(async () => ({ passed: false, detail: 'failing tests' }));
+  wf.activities.publishView.mockImplementation(async (_id, view) => {
+    if (view.stage === 'review') wf.handlers.get('confirm')!();
+  });
+  wf.activities.finalizeMergeActivity = vi.fn();
+  wf.wait = () => wf.handlers.get('cancel')!();
+  expect(await mergeOnlyV1_7({ ...input, branch: 'proposal', workflowEdit: true })).toEqual({ stage: 'cancelled' });
+  expect(wf.activities.finalizeMergeActivity).not.toHaveBeenCalled();
+  expect(wf.activities.publishView.mock.calls.some((call: any[]) => call[1].stage === 'merge')).toBe(false);
+});
+
