@@ -160,6 +160,14 @@ describe('GitHub PR client', () => {
     expect(taskIdOfBranch('feature/x')).toBeUndefined();
   });
 
+  it('refuses malformed repository slugs before making requests', async () => {
+    const gh = fakeGithub();
+    const api = new GithubPrApi('t', gh.options);
+    for (const slug of ['acme/app?x=1', 'acme/app#fragment', '../app', 'acme/..', 'acme/app/extra', 'acme/a%2Fb'])
+      await expect(api.get(slug, 7)).rejects.toThrow(/repository slug/);
+    expect(gh.calls).toEqual([]);
+  });
+
   it('opens once, then updates the same PR instead of opening a second one', async () => {
     const gh = fakeGithub();
     const api = new GithubPrApi('t', gh.options);
