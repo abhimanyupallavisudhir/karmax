@@ -2909,7 +2909,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         (await record(args.taskId, 'checks.skip', { reason: 'no package.json' }));
         return { passed: true, detail: 'no test suite found' };
       }
-      const r = await world.exec('bash', ['-lc', 'npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
+      const r = await world.exec('bash', ['-lc', 'set -o pipefail; npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
       (await record(args.taskId, 'checks.done', { code: r.code }));
       if (r.code !== 0) return { passed: false, detail: r.stdout.slice(-600) };
 
