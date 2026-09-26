@@ -27,6 +27,7 @@ import {
 } from '../agent/provider-registry.js';
 import { AgentAdapter } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
+import { SecretScrubber } from '../agent/activity.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -2479,6 +2480,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
         let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
+        // Whatever the agent prints is archived (RT-12); scrub every value this
+        // turn was handed, including secrets that arrive mid-turn.
+        const secrets = new SecretScrubber();
+        secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2513,12 +2518,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // now, at the activity boundary. Keep application secrets separate
             // from runtime env so they cannot change model auth or startup.
             const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
+            secrets.add(...Object.values(secretEnv),
+              ...Object.entries(gitEnv).filter(([key]) => /token|password|secret|credential|key/i.test(key)).map(([, value]) => value));
             // Project settings keep applying while the agent runs (a secret added
             // after it started must reach the command it runs next), not only at
             // the next world open.
             const resources = deps.resources;
-            if (resources) pullSecretEnv = async () => ({
-              ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv });
+            if (resources) pullSecretEnv = async () => {
+              const refreshed = { ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv };
+              secrets.add(...Object.values(refreshed));
+              return refreshed;
+            };
             return {
               ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
               ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
@@ -2540,7 +2550,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           onEmit: async (t, source) => {
             if (t === lastEmit) return;
             lastEmit = t;
-            (await record(args.taskId, 'agent.output', { text: t, source, role: args.role,
+            (await record(args.taskId, 'agent.output', { text: secrets.scrub(t), source, role: args.role,
               turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt }));
           },
           onReviewInfo: async (info, supplied) => {
@@ -2556,6 +2566,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
             (await record(args.taskId, 'agent.activity', {
               ...activity,
+              title: secrets.scrub(activity.title),
+              ...(activity.detail !== undefined ? { detail: secrets.scrub(activity.detail) } : {}),
               role: args.role,
               attempt: activityAttempt, workflowRunId,
               ...(turnId ? { turnId } : {}),
@@ -2678,6 +2690,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+        // The final answer becomes a conversation message in the task view.
+        if (result.output) result = { ...result, output: secrets.scrub(result.output) };
         // Defence in depth around the activity boundary. `runTurn` rejects an
         // adapter return after abort, but cancellation can race the few synchronous
         // instructions between that check and this await continuation. Never report
