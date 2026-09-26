@@ -5,19 +5,16 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { BudgetService } from '../src/autonomy/payments.js';
-import { fillViaCdp } from '../src/autonomy/fill.js';
-import { fillCardInWorld } from '../src/autonomy/card-fill.js';
+import * as credentialFill from '../src/autonomy/fill.js';
+import * as cardFill from '../src/autonomy/card-fill.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
-vi.mock('../src/autonomy/fill.js', () => ({ fillViaCdp: vi.fn(async () => ({ origin: 'https://shop.example.com' })) }));
-vi.mock('../src/autonomy/card-fill.js', async importOriginal => ({
-  ...await importOriginal<typeof import('../src/autonomy/card-fill.js')>(),
-  fillCardInWorld: vi.fn(async () => ({ origin: 'https://shop.example.com' })),
-}));
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); });
 
 it.each(['container', 'e2b'] as const)('fills the browser where the %s task runs it (AU-11)', async kind => {
+  const fillViaCdp = vi.spyOn(credentialFill, 'fillViaCdp').mockResolvedValue({ origin: 'https://shop.example.com' });
+  const fillCardInWorld = vi.spyOn(cardFill, 'fillCardInWorld').mockResolvedValue({ origin: 'https://shop.example.com' });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-card-routing-'));
   vi.stubEnv('KARMAX_HOME', dir);
   vi.stubEnv('KARMAX_AGENT_MIN_FREE_MB', '0');
