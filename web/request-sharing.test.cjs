@@ -1,0 +1,20 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
+const fn = (name) => { const start = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm')); return src.slice(start, src.indexOf('\n}', start) + 2); };
+test('RQ-4: share pending identical reads, invalidate on mutations, and retry failures', async () => {
+  const pending = [];
+  const ctx = vm.createContext({ S: { token: 'a' }, Map, feedbackFetch: (path, opts) => new Promise((resolve, reject) => pending.push({ path, opts, resolve, reject })), fetchApi: (path, opts) => new Promise((resolve, reject) => pending.push({ path, opts, resolve, reject })) });
+  vm.runInContext(fn('api'), ctx);
+  const a = ctx.api('/read'), b = ctx.api('/read'); assert.equal(pending.length, 1);
+  pending[0].resolve({ value: 1 }); await Promise.all([a,b]);
+  const c = ctx.api('/read'); assert.equal(pending.length, 2); pending[1].resolve({}); await c;
+  const old = ctx.api('/read');
+  const write = ctx.api('/write', { method: 'POST' });
+  const fresh = ctx.api('/read'); assert.equal(pending.length, 5);
+  pending[2].resolve({}); pending[3].resolve({}); pending[4].resolve({}); await Promise.all([old,write,fresh]);
+  const failed = ctx.api('/fail'); pending[5].reject(new Error('offline')); await assert.rejects(failed);
+  const retry = ctx.api('/fail'); assert.equal(pending.length, 7); pending[6].resolve({}); await retry;
+});

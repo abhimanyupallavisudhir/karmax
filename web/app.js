@@ -2303,7 +2303,24 @@ function resetResponderField(box, attr = 'data-inherit') {
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
-async function api(path, opts = {}) {
+function api(path, opts = {}) {
+  const pending = api.pending ||= new Map();
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET') {
+    pending.clear();
+    return fetchApi(path, opts).finally(() => pending.clear());
+  }
+  if (opts.signal) return fetchApi(path, opts);
+  const key = JSON.stringify([S.token, path, opts]);
+  if (pending.has(key)) return pending.get(key);
+  const request = fetchApi(path, opts).finally(() => {
+    if (pending.get(key) === request) pending.delete(key);
+  });
+  pending.set(key, request);
+  return request;
+}
+
+async function fetchApi(path, opts = {}) {
   const res = await feedbackFetch(path, {
     ...opts,
     headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(opts.headers || {}) },
