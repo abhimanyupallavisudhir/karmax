@@ -2890,12 +2890,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runScript(args: { taskId: string; worldHandle: WorldHandle; command: string }): Promise<{ code: number; output: string }> {
-      const world = await openWorld(args.worldHandle, args.taskId);
-      (await record(args.taskId, 'script.start', { command: args.command }));
-      const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
-      const output = `${r.stdout}${r.stderr}`;
-      (await record(args.taskId, 'script.done', { code: r.code, output: output.slice(0, 4000) }));
-      return { code: r.code, output };
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct invocation */ }
+      const pulse = setInterval(() => { try { context?.heartbeat(); } catch { /* completion */ } }, 10_000);
+      try {
+        const world = await openWorld(args.worldHandle, args.taskId);
+        (await record(args.taskId, 'script.start', { command: args.command }));
+        const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
+        const output = `${r.stdout}${r.stderr}`;
+        (await record(args.taskId, 'script.done', { code: r.code, output: output.slice(0, 4000) }));
+        return { code: r.code, output };
+      } finally { clearInterval(pulse); }
     },
 
     async runWorkflowChecks(args: { taskId: string; worldHandle: WorldHandle }): Promise<{ passed: boolean; detail?: string }> {
