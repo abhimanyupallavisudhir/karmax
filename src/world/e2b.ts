@@ -1,3 +1,4 @@
+import { TextDecoder } from 'node:util';
 import type { WorldReferenceKeys } from './reference-keys.js';
 import { isMissingSandbox } from './provider-errors.js';
 import { timed } from '../timing/index.js';
@@ -531,8 +532,8 @@ class E2BWorld implements World {
       // with a spurious exit; 0 disables that bound, as openPty already does.
       // (keepAlive() below refreshes the *sandbox* lease, not this timeout.)
       timeoutMs: 0,
-      onStdout: data => emit(data, stdoutDecoder),
-      onStderr: data => emit(data, stderrDecoder),
+      onStdout: (data: unknown) => emit(data, stdoutDecoder),
+      onStderr: (data: unknown) => emit(data, stderrDecoder),
     });
     let exited = false;
     let exitCode: number | null = null;
@@ -549,7 +550,7 @@ class E2BWorld implements World {
       // wait() rejects with CommandExitError for every nonzero exit; its stderr
       // has already streamed. Only a lost stream has no status of its own.
       const code = processExitCode(error);
-      if (code === undefined) emit(error?.message ?? error);
+      if (code === undefined) emit(error?.message ?? error, stderrDecoder);
       exited = true;
       exitCode = code ?? -1;
       for (const listener of exits) listener(exitCode);
