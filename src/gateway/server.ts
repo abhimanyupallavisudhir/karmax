@@ -1,3 +1,4 @@
+import { socketLifetime } from './socket-lifetime.js';
 import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -659,6 +660,7 @@ export class Gateway {
 
   /** The live event stream (`/ws`): every durable event the caller may read. */
   private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+    const lifetime = socketLifetime(ws);
 
     const url = new URL(req.url ?? '/', 'http://localhost');
     const auth = await this.socketAuth(req, url);
@@ -672,8 +674,8 @@ export class Gateway {
       try { ws.send(JSON.stringify({ type: 'timing.setting', enabled })); } catch { /* disconnected */ }
     };
     const offTiming = (await this.watchTiming(syncTiming));
-    ws.on('close', offTiming);
-    ws.on('error', offTiming);
+    lifetime.add(offTiming);
+    if (lifetime.closed) return;
     ws.on('message', async data => {
       if (data.toString().length > 1024) return;
       try { (await delivery.acknowledge(JSON.parse(data.toString()))); } catch { /* invalid observation */ }
@@ -703,8 +705,7 @@ export class Gateway {
         ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     }, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
-    ws.on('close', off);
-    ws.on('error', off);
+    lifetime.add(off);
   }
 
   /** Whether a review-action process id was started for `taskId`. Ids are
@@ -1255,6 +1256,7 @@ export class Gateway {
    *  the client already started via POST /review-action. We replay the buffered
    *  output first, then push the live tail until it exits or the socket closes. */
   private async reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
+    const lifetime = socketLifetime(ws);
     const url = new URL(req.url ?? '/', 'http://localhost');
     const procId = url.searchParams.get('procId') ?? '';
     const rec = (await this.reviewActions.status(procId));
@@ -1280,8 +1282,7 @@ export class Gateway {
       if (chunk) send({ type: 'data', data: chunk });
       if (done) { send({ type: 'exit', code }); try { ws.close(); } catch {} }
     }));
-    ws.on('close', off);
-    ws.on('error', off);
+    lifetime.add(off);
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -8021,6 +8022,7 @@ export class Gateway {
    * preview. The browser sees only Karmax; provider URLs and access tokens stay
    * on this side of the trust boundary. */
   private async previewWebSocket(browser: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+    const lifetime = socketLifetime(browser);
     const url = new URL(req.url ?? '/', 'http://localhost');
     let taskId: string;
     let port: number;
@@ -8067,11 +8069,14 @@ export class Gateway {
     const handle = worldHandleForView(task?.lastView, taskId, task ? (await this.deps.store.effectiveProjectConfig(task.projectId)) : undefined);
     if (!handle) { browser.close(4404, 'world unavailable'); return; }
     const access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+    lifetime.add(() => access?.release());
+    if (lifetime.closed) return;
     const world = access?.world ?? await this.deps.worlds.open(handle);
-    if (!world.previewSocketTarget) { await access?.release(); browser.close(4400, 'provider has no WebSocket previews'); return; }
+    if (!world.previewSocketTarget) { lifetime.close(); browser.close(4400, 'provider has no WebSocket previews'); return; }
     let target: Awaited<ReturnType<NonNullable<typeof world.previewSocketTarget>>>;
     try { target = await world.previewSocketTarget(port, requestPath); }
-    catch { await access?.release(); browser.close(1011, 'preview upstream unavailable'); return; }
+    catch { lifetime.close(); browser.close(1011, 'preview upstream unavailable'); return; }
+    if (lifetime.closed) return;
     const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((value) => value.trim()).filter(Boolean);
     const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
     const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
@@ -8079,12 +8084,7 @@ export class Gateway {
       if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
       else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
     });
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      void access?.release();
-    };
+    const release = () => lifetime.close();
     browser.on('close', (code, reason) => {
       release();
       if (upstream.readyState === WebSocketClient.CONNECTING) upstream.terminate();
