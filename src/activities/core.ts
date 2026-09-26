@@ -4,7 +4,7 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import type { PublishedView, ViewConversation, LifecyclePublication } from '../domain/view-publication.js';
+import { hasLiveWorldWork, type PublishedView, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -1048,8 +1048,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
     const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
-    const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
-    if ((view.status !== 'waiting' && view.status !== 'blocked') || startingAgent
+    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view)
       || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
