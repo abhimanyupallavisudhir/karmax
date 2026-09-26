@@ -16351,21 +16351,22 @@ function wireInboxView() {
 
 async function markVisibleInboxRead() {
   const items = inboxItems().filter((item) => item.unread);
-  const results = await Promise.allSettled(items.map(async (item) => {
-    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, {
-      method: 'PATCH', body: JSON.stringify({ unread: false }),
+  const groups = new Map();
+  for (const item of items) {
+    if (!groups.has(item.organizationId)) groups.set(item.organizationId, []);
+    groups.get(item.organizationId).push(item.id);
+  }
+  const savedIds = new Set();
+  await Promise.allSettled([...groups].map(async ([organizationId, ids]) => {
+    const saved = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ ids }),
     });
-    if (!saved) throw new Error('Notification could not be marked read.');
+    for (const item of saved) savedIds.add(item.id);
   }));
-  items.forEach((item, index) => {
-    if (results[index].status !== 'fulfilled') return;
-    const current = S.inbox.find((candidate) => candidate.id === item.id);
-    if (current) current.unread = false;
-  });
-  // Invalidate reads started before the mutation; they may contain stale unread flags.
+  for (const item of S.inbox) if (savedIds.has(item.id)) item.unread = false;
   S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
   updateBell(); renderMain(); renderRail();
-  const failed = results.filter((result) => result.status === 'rejected');
+  const failed = items.filter(item => !savedIds.has(item.id));
   if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
 }
 

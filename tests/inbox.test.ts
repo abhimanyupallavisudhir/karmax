@@ -305,3 +305,20 @@ describe('inbox urgency', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('bulk inbox reads (UI-18)', () => {
+  it('updates only requested rows owned by the caller in the specified organization', async () => {
+    const f = await fixture();
+    try {
+      await f.view(humanWait('review'));
+      const [item] = await f.inbox();
+      expect(await f.store.markInboxMany('reviewer', 'another-org', [item!.id])).toEqual([]);
+      expect(await f.store.markInboxMany('another-user', f.organization.id, [item!.id])).toEqual([]);
+      expect((await f.inbox())[0]!.unread).toBe(true);
+      expect(await f.store.markInboxMany('reviewer', f.organization.id, [item!.id, 'missing']))
+        .toEqual([expect.objectContaining({ id: item!.id, unread: false })]);
+      expect((await f.inbox())[0]!.unread).toBe(false);
+      expect(await f.store.markInboxMany('reviewer', f.organization.id, [])).toEqual([]);
+    } finally { await f.store.close(); }
+  });
+});

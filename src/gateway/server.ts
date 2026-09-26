@@ -2990,6 +2990,14 @@ export class Gateway {
             ...(avatar ? { resource: { kind: 'avatar', id: avatar.id, name: avatar.name, projectId: avatar.projectId } } : {}) };
         })));
       }
+      if (p === '/api/inbox' && method === 'PATCH') {
+        const subject = requireHumanSubject(callerIdentity);
+        if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        const body = await this.body(req);
+        if (!Array.isArray(body.ids) || body.ids.length > 500 || body.ids.some((id: unknown) => typeof id !== 'string'))
+          return this.json(res, 400, { error: 'Pass up to 500 inbox item IDs' });
+        return this.json(res, 200, await store.markInboxMany(subject.userId, requestedScope.organizationId, body.ids));
+      }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
         const subject = requireHumanSubject(callerIdentity);

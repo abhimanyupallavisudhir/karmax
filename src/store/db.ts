@@ -4054,6 +4054,15 @@ export class Store {
     return out;
   }
 
+  async markInboxMany(userId: string, organizationId: string, ids: string[]): Promise<InboxItem[]> {
+    if (!ids.length) return [];
+    if (ids.length > 500) throw new Error('Too many inbox items');
+    const rows = await this.db.prepare(`UPDATE inbox SET unread=0, readAt=?
+      WHERE userId=? AND organizationId=? AND id IN (${ids.map(() => '?').join(',')}) RETURNING *`)
+      .all(Date.now(), userId, organizationId, ...ids);
+    return rows.map(rowToInbox);
+  }
+
   async markInbox(userId: string, id: string, unread: boolean): Promise<InboxItem | undefined> {
     return this.db.transaction(async () => {
 
