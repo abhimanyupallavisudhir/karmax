@@ -109,7 +109,7 @@ function extractConst(name) {
   assert.ok(/ws\.onopen/.test(src), 'no onopen handler: a reconnect cannot backfill');
   assert.ok(/wsHadDropped/.test(src), 'reconnect must know it is recovering from a gap');
   assert.ok(/id="ws-offline"/.test(src), 'no visible indication that live updates are paused');
-  const onclose = src.slice(src.indexOf('ws.onclose'), src.indexOf('ws.onclose') + 160);
+  const onclose = src.slice(src.indexOf('ws.onclose = () =>'), src.indexOf('ws.onclose = () =>') + 160);
   assert.ok(/setWsOnline\(false\)/.test(onclose), `onclose must flag the gap: ${onclose}`);
   const css = fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8');
   assert.ok(/\.ws-offline/.test(css), '.ws-offline has no styling');

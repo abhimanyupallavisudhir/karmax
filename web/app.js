@@ -18582,6 +18582,7 @@ function openGlobalSearch() {
   let active = 0;
   let timer = 0;
   let request = 0;
+  let controller = null;
   let state = 'prompt';
   let summary = '';
   const close = () => { clearTimeout(timer); request++; root.remove(); };
@@ -18622,12 +18623,14 @@ function openGlobalSearch() {
   const search = async () => {
     const q = input.value.trim();
     const ownRequest = ++request;
-    if (!q) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    if (q.length < 2) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    controller?.abort();
+    controller = new AbortController();
     state = 'loading';
     draw();
     const responses = (await Promise.all(S.projects.map(async (project) => {
       try {
-        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`);
+        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
         return { project, result };
       } catch { return null; } // project discovery and task-read grants can differ
     }))).filter(Boolean);
@@ -18654,7 +18657,7 @@ function openGlobalSearch() {
     state = 'done';
     draw();
   };
-  const schedule = () => { request++; clearTimeout(timer); timer = setTimeout(search, 160); };
+  const schedule = () => { controller?.abort(); request++; clearTimeout(timer); timer = setTimeout(search, 160); };
   const run = (i) => { const item = items[i]; if (!item) return; close(); item.run(); };
 
   input.addEventListener('input', schedule);
