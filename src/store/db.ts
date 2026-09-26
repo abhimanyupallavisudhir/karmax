@@ -1669,9 +1669,15 @@ export class Store {
     return value;
   }
 
-  async createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string }): Promise<Organization> {
+  async createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string; maxOwned?: number }): Promise<Organization> {
     return this.db.transaction(async () => {
 
+    if (input.ownerUserId && input.maxOwned != null) {
+      const count = (await this.db.prepare("SELECT COUNT(*) AS n FROM organization_memberships WHERE userId=? AND role='owner'")
+        .get(input.ownerUserId)) as { n: number };
+      if (Number(count.n) >= input.maxOwned)
+        throw Object.assign(new Error('organization limit reached'), { status: 429 });
+    }
     assertRoutableName('organization', input.name, input.slug);
     const name = (await this.assertOrganizationNameAvailable(input.name,
       input.kind === 'personal' ? { allowUserId: input.ownerUserId } : undefined));

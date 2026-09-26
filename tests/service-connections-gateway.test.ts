@@ -54,7 +54,7 @@ describe('connection gateway flow', () => {
     const gateway = (await Gateway.create({ store, tokens, api, client, worlds, broker, serviceConnections: service,
       bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
       taskQueue: 'test', staticDir: home, agentInfo: { provider: 'mock', reason: 'test' },
-      identity: { connectOrganizationNames: () => {}, listUsers: () => [], session: async (headers: Headers) => {
+      identity: { sessionActive: async (id: string, userId: string) => id === userId, connectOrganizationNames: () => {}, listUsers: () => [], session: async (headers: Headers) => {
         const user = headers.get('cookie')?.split('=')[1];
         return user ? { user: { id: user, name: user, email: `${user}@test.invalid` }, session: { id: user } } : undefined;
       } } as any,

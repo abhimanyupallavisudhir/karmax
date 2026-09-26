@@ -30,6 +30,7 @@ async function setup() {
     overlays: new Overlays(), agentInfo: { provider: 'mock', reason: 'folder rename test' },
     paidLaunchSettings: { publicLaunchInfo: () => ({ paidLaunch: false }) },
     identity: {
+      sessionActive: async (id: string, userId: string) => id === 'editor-session' && userId === 'editor',
       connectOrganizationNames: () => {}, listUsers: () => [],
       session: async (headers: Headers) => headers.get('cookie') === 'test-session=editor'
         ? { user: { id: 'editor', name: 'Editor', email: 'editor@example.com' }, session: { id: 'editor-session' } }

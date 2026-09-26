@@ -842,9 +842,10 @@ describe('existing project wiki remote backfill', () => {
       tokens: new TokenAuthority(),
       staticDir: fs.mkdtempSync(path.join(home, 'static-')),
     } as any));
+    let listening: Awaited<ReturnType<Gateway['listen']>> | undefined;
     try {
-      const listening = await gateway.listen(49_000);
-      expect(actors).toEqual(['owner']);
+      listening = await gateway.listen(49_000);
+      await expect.poll(() => actors, { timeout: 5_000 }).toEqual(['owner']);
       expect(inputs).toMatchObject([{ private: true }]);
       await expect.poll(async () => (await store.projectWiki(project.id))?.repository, { timeout: 5_000 }).toBeTruthy();
       const linked = (await store.projectWiki(project.id))!.repository;
@@ -857,8 +858,8 @@ describe('existing project wiki remote backfill', () => {
           return '';
         }
       }, { timeout: 5_000 }).toMatch(/^[0-9a-f]{40}$/);
-      await listening.close();
     } finally {
+      await listening?.close();
       (await store.close());
       if (previousHome === undefined) delete process.env.KARMAX_HOME;
       else process.env.KARMAX_HOME = previousHome;

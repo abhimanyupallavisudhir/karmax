@@ -302,3 +302,32 @@ it('WF-5: retries a lease acknowledgement from a coordinator continuing as new',
     expect(signalWithStart).toHaveBeenCalledTimes(1);
   } finally { vi.useRealTimers(); }
 });
+
+it('bounds a stalled visibility scan (PS-6)', async () => {
+  vi.useFakeTimers();
+  try {
+    const client = { workflow: { list: () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) }) } };
+    let finished = false;
+    const healing = healCoordinators(client as any, 'test').then(() => { finished = true; });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(finished).toBe(true);
+    await healing;
+  } finally { vi.useRealTimers(); }
+});
+
+it('probes independent coordinators with bounded concurrency (PS-6)', async () => {
+  let active = 0; let peak = 0;
+  const client = { workflow: {
+    list: ({ query }: { query: string }) => (async function* () {
+      if (query.includes("'mergeQueue'")) for (let n = 0; n < 12; n++) yield { workflowId: `merge-queue:${n}` };
+    })(),
+    getHandle: () => ({ query: async () => {
+      peak = Math.max(peak, ++active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+    } }),
+  } };
+  expect((await healCoordinators(client as any, 'test')).checked).toBe(12);
+  expect(peak).toBeGreaterThan(1);
+  expect(peak).toBeLessThanOrEqual(4);
+});

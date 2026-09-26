@@ -199,7 +199,8 @@ export class ConfigHomeManager {
             .map(([name, server]) => [name, claudeMcpServer(server)]),
         );
         cur.mcpServers = { ...existing, ...refreshed, karmax: claudeMcpServer(platform) };
-        replaceFileSync(file, JSON.stringify(cur, null, 2));
+        const updated = JSON.stringify(cur, null, 2);
+        if (!fs.existsSync(file) || fs.readFileSync(file, 'utf8') !== updated) replaceFileSync(file, updated);
       } else if (provider === 'codex') {
         const file = path.join(home, 'config.toml');
         const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
@@ -210,7 +211,8 @@ export class ConfigHomeManager {
           ...selectedBrowsers.map(([name]) => `mcp_servers.${name}`),
         ]);
         const browserToml = selectedBrowsers.map(([name, server]) => codexMcpServer(name, server)).join('');
-        replaceFileSync(file, preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform));
+        const updated = preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform);
+        if (existing !== updated) replaceFileSync(file, updated);
       }
     }
   }

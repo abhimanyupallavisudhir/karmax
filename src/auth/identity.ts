@@ -127,6 +127,16 @@ export class IdentityService {
   /** Whether GitHub sign-in is available through the deployment App (or the
    * legacy standalone OAuth fallback). */
    githubEnabled!: boolean;
+  private sessionsRevoked?: (userId: string) => Promise<void>;
+  connectSessionRevocation(listener: (userId: string) => Promise<void>): void { this.sessionsRevoked = listener; }
+
+  async sessionActive(sessionId: string, userId: string): Promise<boolean> {
+    const session = await this.db.prepare('SELECT expiresAt FROM session WHERE id=? AND userId=?').get(sessionId, userId) as { expiresAt: number | string | Date } | undefined;
+    if (!session) return false;
+    const expiry = typeof session.expiresAt === 'number' ? session.expiresAt : new Date(session.expiresAt).getTime();
+    return expiry > Date.now();
+  }
+
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
   }
 
@@ -202,6 +212,8 @@ export class IdentityService {
       databaseHooks: {
         session: { create: { before: async (session: Record<string, unknown>) => {
           if (await this.accountClosed?.(String(session.userId))) return false;
+        } }, delete: { after: async (session: Record<string, unknown>) => {
+          await this.sessionsRevoked?.(String(session.userId));
         } } },
         user: { create: { before: async (user: Record<string, unknown>) => {
           (await this.assertUserNameAvailable(String(user.name ?? '')));
@@ -212,7 +224,10 @@ export class IdentityService {
           }, ...(opts.github?.onAuthorization ? { after: adoptGithubAuthorization } : {}) },
           update: { before: async (account: Record<string, unknown>) => {
             if (account.userId && await this.accountClosed?.(String(account.userId))) return false;
-          }, ...(opts.github?.onAuthorization ? { after: adoptGithubAuthorization } : {}) },
+          }, after: async (account: Record<string, unknown>) => {
+            if (account.providerId === 'credential' && account.password) await this.revokeUserSessions(String(account.userId));
+            if (opts.github?.onAuthorization) await adoptGithubAuthorization(account);
+          } },
         },
       },
       // Account linking. A user who signed up with email+password and later uses
@@ -436,6 +451,7 @@ export class IdentityService {
     return this.db.transaction(async () => {
 
     (await this.db.prepare('DELETE FROM session WHERE userId=?').run(userId));
+    await this.sessionsRevoked?.(userId);
   
     });
   }

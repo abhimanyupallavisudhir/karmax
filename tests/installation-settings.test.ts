@@ -14,7 +14,7 @@ import { findFreePortFrom } from '../src/util/ports.js';
 /**
  * Installation-wide settings are the operator's, not the tenant's.
  *
- * Safe mode reboots the whole cell and outbound email is the one sender every
+ * Outbound email is the one sender every
  * organization's confirmations and invites go through — on a managed cell those
  * belong to whoever runs it, and the reader of an organization settings page is
  * generally not that person. The console does no capability gating of its own
@@ -58,7 +58,7 @@ describe('installation-wide settings report who may manage them', () => {
     const running = await gateway.listen(await findFreePortFrom(48_400));
     base = running.url;
     close = running.close;
-    operator = (await tokens.mintPrincipal('user:op', ['safe-mode:write', 'settings:write', 'settings:read'])).token;
+    operator = (await tokens.mintPrincipal('user:op', ['settings:write', 'settings:read'])).token;
     // An organization member with ordinary project authority and nothing installation-wide.
     tenant = (await tokens.mintPrincipal('user:tenant', ['project:read', 'project:settings:write', 'task:*'])).token;
   }, 30_000);
@@ -68,31 +68,22 @@ describe('installation-wide settings report who may manage them', () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  it('lets a caller read safe mode without holding the capability to change it', () => {
-    // Reading must not require safe-mode:write, or the console could never learn
-    // that it should hide the toggle.
-    expect(routeCapability('GET', '/api/safe-mode', new URL('http://x/api/safe-mode'))).not.toBe('safe-mode:write');
-    expect(routeCapability('POST', '/api/safe-mode', new URL('http://x/api/safe-mode'))).toBe('safe-mode:write');
+  it('does not bind or expose the removed safe-mode control', async () => {
+    expect(routeCapability('GET', '/api/safe-mode')).toBeUndefined();
+    expect(routeCapability('POST', '/api/safe-mode')).toBeUndefined();
+    const root = (await tokens.mintPrincipal('user:root', ['*'])).token;
+    for (const method of ['GET', 'POST']) {
+      const response = await fetch(`${base}/api/safe-mode`, { method, headers: as(root) });
+      expect(response.status).toBe(404);
+    }
   });
 
-  it('tells the operator they may manage safe mode, and the tenant they may not', async () => {
-    const forOperator = await (await fetch(`${base}/api/safe-mode`, { headers: as(operator) })).json() as any;
-    expect(forOperator).toMatchObject({ safeMode: false, canManage: true });
-
-    // `settings:read` is installation-scoped in its own right, so an ordinary
-    // member is refused the read outright rather than told `canManage: false`.
-    // Either answer means the same thing to the console: do not offer the toggle.
-    const forTenant = await fetch(`${base}/api/safe-mode`, { headers: as(tenant) });
-    if (forTenant.ok) expect((await forTenant.json() as any).canManage).toBe(false);
-    else expect(forTenant.status).toBe(403);
-  });
-
-  it('still refuses the write itself, not merely the button', async () => {
-    const refused = await fetch(`${base}/api/safe-mode`, {
-      method: 'POST', headers: as(tenant), body: JSON.stringify({ enabled: true }),
+  it('refuses installation writes by tenants', async () => {
+    const refused = await fetch(`${base}/api/settings/installation`, {
+      method: 'PUT', headers: as(tenant), body: JSON.stringify({ siteName: 'Changed' }),
     });
     expect(refused.status).toBe(403);
-    expect((await store.kvGet('safe-mode'))).toBeFalsy();
+    expect((await store.getSettings('global', 'appearance'))?.siteName).toBeUndefined();
   });
 
   it('reports the same for outbound email, which has no env path to fall back on', async () => {

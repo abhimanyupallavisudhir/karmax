@@ -60,7 +60,7 @@ Layers around that core:
 
 ## Environment variables
 
-`KARMAX_HOME` (data home, default `~/.karmax`), `KARMAX_PASSWORD` (require login), `KARMAX_SAFE_MODE`, `KARMAX_TEMPORAL_LOG=debug` (worker logs), worker caps `KARMAX_MAX_CACHED_WORKFLOWS` / `KARMAX_MAX_WFT` / `KARMAX_MAX_ACT`, provider overrides `KARMAX_AGENT_PROVIDER` / `KARMAX_CLAUDE_MODEL` / `KARMAX_OPENAI_MODEL`. The test harness isolates all state in `mkdtemp` dirs (worlds, vault, config homes) — never touches the real `~/.karmax`.
+`KARMAX_HOME` (data home, default `~/.karmax`), `KARMAX_PASSWORD` (require login), `KARMAX_TEMPORAL_LOG=debug` (worker logs), worker caps `KARMAX_MAX_CACHED_WORKFLOWS` / `KARMAX_MAX_WFT` / `KARMAX_MAX_ACT`, provider overrides `KARMAX_AGENT_PROVIDER` / `KARMAX_CLAUDE_MODEL` / `KARMAX_OPENAI_MODEL`. The test harness isolates all state in `mkdtemp` dirs (worlds, vault, config homes) — never touches the real `~/.karmax`.
 
 **Host admission control for agent turns** (memory-based backpressure, karmax#4 — prevents the OOM killer from SIGKILLing an agent under memory pressure; see `src/activities/agent-slots.ts`):
 

@@ -694,7 +694,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'platform_request',
     {
-      description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.',
+      description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.',
       // See PLATFORM_REQUEST_BODY_SCHEMA for why `body` must declare a concrete
       // shape; the zod union below is its zod twin (both are asserted equivalent
       // in tests/platform-surface.test.ts).

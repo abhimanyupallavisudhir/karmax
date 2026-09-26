@@ -31,7 +31,8 @@ it('exports only the authenticated user and records a deletion request without p
   // Stub only the identity provider; exercise the real HTTP authorization and export routes.
   const profile = { id: 'me', name: 'Fixture user', email: 'me@example.test' };
   const gateway = await Gateway.create({ store, tokens, worlds, client, api,
-    identity: { connectOrganizationNames: () => {},
+    identity: { sessionActive: async (id: string, userId: string) => id === 'fixture-session' && userId === profile.id,
+      connectOrganizationNames: () => {},
       session: async (headers: Headers) => headers.get('cookie') === 'fixture=me'
         ? { user: profile, session: { id: 'fixture-session' } } : null,
       listUsers: async () => [profile],

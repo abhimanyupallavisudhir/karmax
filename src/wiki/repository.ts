@@ -92,6 +92,29 @@ export function ensureProjectWikiRepository(contentDir: string, projectId: strin
   return root;
 }
 
+/** Gateway startup must not run Git synchronously on the HTTP event loop. */
+export async function ensureProjectWikiRepositoryAsync(contentDir: string, projectId: string): Promise<string> {
+  const root = wikiRoot(contentDir, 'project', projectId);
+  return serializeProjectWikiOperation(root, async () => {
+    await fs.promises.mkdir(root, { recursive: true });
+    if (!fs.existsSync(path.join(root, '.git'))) {
+      await gitAsync(root, ['init', '-q', '-b', PROJECT_WIKI_BRANCH]);
+      await gitAsync(root, ['config', 'user.name', 'karmax']);
+      await gitAsync(root, ['config', 'user.email', 'karmax@localhost']);
+    }
+    try { await gitAsync(root, ['rev-parse', '--verify', 'HEAD']); }
+    catch {
+      await gitAsync(root, ['add', '-A']);
+      await gitAsync(root, ['commit', '-q', '--allow-empty', '-m', 'karmax: initialize project wiki']);
+    }
+    try { await gitAsync(root, ['rev-parse', '--verify', `refs/heads/${PROJECT_WIKI_BRANCH}`]); }
+    catch { await gitAsync(root, ['branch', PROJECT_WIKI_BRANCH, 'HEAD']); }
+    const current = await gitAsync(root, ['branch', '--show-current']);
+    if (current && current !== PROJECT_WIKI_BRANCH) await gitAsync(root, ['switch', '-q', PROJECT_WIKI_BRANCH]);
+    return root;
+  });
+}
+
 /**
  * Commit wiki changes.
  *

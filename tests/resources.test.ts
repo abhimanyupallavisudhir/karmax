@@ -576,3 +576,23 @@ it('LT-20: backs off publish-slot queries while preserving immediate grant and r
     vi.useRealTimers();
   }
 });
+
+it('rejects oversized resource JSON before creating or importing a resource (GW-2)', async () => {
+  const { stubGateway } = await import('./helpers/stub-gateway.js');
+  const h = await stubGateway({ resources: {} as any });
+  try {
+    const project = await h.store.createProject('Bounded imports');
+    const token = (await h.tokens.mintPrincipal('user:test', ['*'])).token;
+    const resource = await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Existing', driver: 'volume@1', target: { kind: 'path', path: 'data' }, access: 'read',
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+    for (const suffix of ['', `/${resource.id}/import`]) {
+      const response = await fetch(`${h.base}/api/projects/${project.id}/resources${suffix}`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ files: [{ path: 'large', data: 'x'.repeat(2 * 1024 * 1024) }] }),
+      });
+      expect(response.status, await response.text()).toBe(413);
+    }
+    expect(await h.store.listResourceAttachments(project.id)).toHaveLength(1);
+  } finally { await h.close(); }
+});

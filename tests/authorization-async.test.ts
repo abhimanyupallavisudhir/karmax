@@ -60,6 +60,7 @@ it('refreshes browser authority asynchronously and revokes the cached token afte
   gateway.deps = { store, tokens, authorization,
     paidLaunchSettings: { publicLaunchInfo: () => ({ paidLaunch: false }) },
     identity: { session: async () => ({ user: { id: 'browser', name: 'Browser', email: 'browser@example.test' }, session: { id: 'session' } }) } };
+  tokens.connectIdentitySessions(async (id, userId) => id === 'session' && userId === 'browser');
   gateway.sessions = new Map();
   gateway.identityTokens = new Map();
   const sync = vi.spyOn(authorization, 'capabilities').mockImplementation(() => { throw Error('blocking permission read'); });
@@ -89,6 +90,7 @@ it('preserves signup acceptance, linked SSO provider, and verified-domain requir
   gateway.deps = { store, tokens, authorization,
     paidLaunchSettings: { publicLaunchInfo: () => ({ paidLaunch: true }) },
     identity: { session: async () => ({ user, session: { id: 'session' } }), providersForUserAsync: providers } };
+  tokens.connectIdentitySessions(async (id, userId) => id === 'session' && userId === 'browser');
   gateway.sessions = new Map(); gateway.identityTokens = new Map();
   vi.spyOn(store, 'policyAcceptances').mockImplementation(() => { throw Error('blocking policy scan'); });
   vi.spyOn(store, 'getOrganizationIdentityPolicy').mockImplementation(() => { throw Error('blocking SSO policy'); });

@@ -2406,7 +2406,7 @@ async function uploadConversationFile(file) {
 }
 
 function attachmentUrl(id, name) {
-  const query = new URLSearchParams({ projectId: S.projectId, token: S.token || '' });
+  const query = new URLSearchParams({ projectId: S.projectId });
   if (name) query.set('name', name);
   return `/api/attachments/${encodeURIComponent(id)}?${query}`;
 }
@@ -3344,7 +3344,7 @@ function connectWs() {
     S.ws.close();
   }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
   ws.onmessage = (m) => {
     let ev;
@@ -7949,7 +7949,7 @@ function openTerminal(taskId) {
   // which branch to land in. It is just a cwd — no second world, and the remote
   // case costs nothing extra for exactly that reason (SPEC §11.1).
   const checkout = document.getElementById('term-checkout')?.value;
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -8194,7 +8194,7 @@ function wireReviewActions(v) {
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
         reviewActionWs = ws;
         let exited = false;
         ws.onmessage = (m) => {
@@ -9367,7 +9367,7 @@ function wireCheckinSidebar(v) {
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
-    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
+    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' }); window.open(session.url, '_blank', 'noopener'); }
     catch (error) { toast(error.message, true); }
   });
 }
@@ -15858,7 +15858,7 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// ── installation-wide settings (safe mode, outbound email, Stripe platform) ──
+// ── installation-wide settings (outbound email, Stripe platform) ──
 // These belong to whoever runs the installation, and the console has no
 // capability model of its own, so each card asks its endpoint: a refusal (or
 // canManage:false) means the reader is a tenant here.
@@ -15875,22 +15875,6 @@ async function hydrateInstallationCard(selector, url, fill) {
     card.hidden = false;
     fill(card, data);
   } catch { /* refused: leave the card absent */ }
-}
-
-function hydrateResilienceCard() {
-  return hydrateInstallationCard('#resilience-card', '/api/safe-mode', (card, data) => {
-    S.meta.safeMode = data.safeMode;
-    card.innerHTML = `<div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${data.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>`;
-    card.querySelector('#safe-mode').addEventListener('change', async (e) => {
-      try {
-        const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
-        S.meta.safeMode = r.safeMode;
-        e.target.checked = r.safeMode;
-        toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
-      } catch (err) { e.target.checked = S.meta.safeMode; toast(err.message, true); }
-    });
-  });
 }
 
 function outboundEmailCard() {
@@ -17294,7 +17278,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>
@@ -17309,7 +17293,6 @@ function installationView() {
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
       ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
-      <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
 }
@@ -17491,7 +17474,6 @@ function wireInstallationSettings() {
   wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
-  hydrateResilienceCard();
   if (hostLocal()) hydratePhoneAccess();
 }
 

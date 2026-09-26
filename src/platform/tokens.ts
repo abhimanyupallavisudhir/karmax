@@ -52,6 +52,7 @@ export interface HumanDelegationArgs {
  * set. The platform MCP server checks each call against this token.
  */
 export interface ScopedToken {
+  identitySessionId?: string;
   id: string;
   taskId: string;
   profileId: string;
@@ -116,6 +117,11 @@ export class TokenAuthority {
   private tokens = new Map<string, ScopedToken>();
   private delegations = new Map<string, HumanDelegation>();
 
+  private sessionValidator?: (sessionId: string, userId: string) => Promise<boolean>;
+  connectIdentitySessions(validate: (sessionId: string, userId: string) => Promise<boolean>): void {
+    this.sessionValidator = validate;
+  }
+
   constructor(private store?: Store) {}
 
   private digest(token: string): string {
@@ -125,7 +131,7 @@ export class TokenAuthority {
   private async issue(record: ScopedToken): Promise<{ token: string; record: ScopedToken }> {
     const token = `kt_${record.id.slice(4)}.${crypto.randomBytes(32).toString('base64url')}`;
     const digest = this.digest(token);
-    this.tokens.set(digest, record);
+    if (!this.store) this.tokens.set(digest, record);
     (await this.store?.putScopedToken(digest, record.id, record as unknown as Record<string, unknown>, record.expiresAt));
     return { token, record };
   }
@@ -291,7 +297,7 @@ export class TokenAuthority {
   }
 
   /** Mint a token for a (non-task) principal such as a logged-in user. */
-  async mintPrincipal(principal: string, caps: Capability[], projectId?: string, ttlMs = 12 * 60 * 60 * 1000, organizationId?: string): Promise<{ token: string; record: ScopedToken }> {
+  async mintPrincipal(principal: string, caps: Capability[], projectId?: string, ttlMs = 12 * 60 * 60 * 1000, organizationId?: string, identitySessionId?: string): Promise<{ token: string; record: ScopedToken }> {
     const id = `tok_${crypto.randomBytes(12).toString('hex')}`;
     const userId = principal.startsWith('user:') && principal.length > 5 ? principal.slice(5) : undefined;
     const system = principal.startsWith('system:');
@@ -299,6 +305,7 @@ export class TokenAuthority {
       id,
       taskId: '*',
       profileId: 'user',
+      identitySessionId,
       principal,
       projectId,
       organizationId,
@@ -323,6 +330,11 @@ export class TokenAuthority {
       ? (await this.store.getScopedToken(digest)) as unknown as ScopedToken | undefined
       : this.tokens.get(digest);
     if (record && record.expiresAt > Date.now()) {
+      if (record.identitySessionId && !(await this.sessionValidator?.(record.identitySessionId,
+        record.principal.slice(5)).catch(() => false))) {
+        await this.revoke(token);
+        return undefined;
+      }
       const subject = record.humanSubject?.userId
         ?? (record.actor?.kind === 'interactive-human' ? record.actor.userId : undefined);
       const users = new Set([subject, record.principal.startsWith('user:') ? record.principal.slice(5) : undefined]);

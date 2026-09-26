@@ -1,3 +1,4 @@
+import { socketLifetime } from './socket-lifetime.js';
 import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -80,7 +81,7 @@ import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
-import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
@@ -260,7 +261,6 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/subscriptions/webhook' || p === '/api/subscriptions/paddle/webhook'
     || p === '/api/subscriptions/paddle/checkout-config') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
-  if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
   // like the mailbox provider. The connected secret never leaves the vault.
   if (p === '/api/email' || p.startsWith('/api/email/')) return read ? 'settings:read' : 'settings:write';
@@ -553,10 +553,12 @@ interface Session {
   apiToken: string;
   userId?: string;
   email?: string;
+  expiresAt?: number;
 }
 
 export class Gateway {
   private sessions = new Map<string, Session>();
+  private passwordlessSession?: Promise<{ sid: string; session: Session }>;
   private closing = false;
   private terminalStarts = new Set<Promise<void>>();
   private terminalStops = new Set<() => Promise<void>>();
@@ -567,7 +569,6 @@ export class Gateway {
    *  directly, so without this a password could be guessed online. */
   private loginFailures = new Map<string, { count: number; until: number }>();
   private server?: http.Server;
-  private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Host-machine affordances (`pass` import, host filesystem paths, a local
    *  checkout to `cd` into) are only offered to the machine karmax runs on. */
   private get hostLocal(): boolean { return this.deps.hostLocal ?? hostLocal(); }
@@ -578,10 +579,11 @@ export class Gateway {
   /** Discovery spawns provider CLIs (seconds): pages read the last catalog while
    *  one background load per organization refreshes it. */
   private modelCatalog = new SwrCache<string, ModelCatalog>((organizationId) => this.discoverModels(organizationId), 5 * 60_000);
-  private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
+  private identityTokens = new Map<string, { apiToken: string; fingerprint: string; expiresAt: number; userId: string }>();
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
+  private wikiWork = new Set<Promise<void>>();
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
   private wikiRemoteRetryAfter = new Map<string, number>();
@@ -606,6 +608,13 @@ export class Gateway {
   private async initialize(deps: GatewayDeps) {
 
     if (deps.identity) {
+      deps.tokens.connectIdentitySessions((sessionId, userId) => deps.identity!.sessionActive(sessionId, userId));
+      deps.identity.connectSessionRevocation?.(async userId => {
+        for (const [key, cached] of this.identityTokens) if (cached.userId === userId) {
+          this.identityTokens.delete(key);
+          await deps.tokens.revoke(cached.apiToken);
+        }
+      });
       deps.identity.connectOrganizationNames(async () => (await deps.store.organizationNameReservations()));
       deps.identity.connectAccountClosure?.(async id => Boolean(await deps.store.kvGet(`account-closed:${id}`)));
       deps.store.connectUserNames(async () => (await deps.identity!.listUsers()));
@@ -634,8 +643,18 @@ export class Gateway {
   private operationalMetrics?: GatewayMetrics;
   private timingPoll?: AsyncInterval;
   private timingValue = false;
+  private timingReadAt = -Infinity;
+  private timingRead?: Promise<void>;
+  private async cachedTimingEnabled(): Promise<boolean> {
+    if (Date.now() - this.timingReadAt >= 1000) {
+      this.timingRead ??= this.refreshTiming().finally(() => { this.timingRead = undefined; });
+      await this.timingRead;
+    }
+    return this.timingValue;
+  }
   private async refreshTiming(): Promise<void> {
-    const enabled = (await timingEnabled(this.deps.store));
+    const enabled = await timingEnabled(this.deps.store);
+    this.timingReadAt = Date.now();
     if (enabled === this.timingValue) return;
     this.timingValue = enabled;
     for (const listener of this.timingListeners) listener(enabled);
@@ -654,6 +673,7 @@ export class Gateway {
 
   /** The live event stream (`/ws`): every durable event the caller may read. */
   private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+    const lifetime = socketLifetime(ws);
 
     const url = new URL(req.url ?? '/', 'http://localhost');
     const auth = await this.socketAuth(req, url);
@@ -661,14 +681,14 @@ export class Gateway {
     if (ws.readyState !== WebSocketClient.OPEN) return;
     const scoped = (await this.deps.tokens.verify(auth.apiToken));
     const delivery = new TimingDelivery(async row => (await this.deps.store.appendEvent({ taskId: row.taskId,
-      type: 'timing', ts: row.wallMs, payload: { ...row } })), async () => (await timingEnabled(this.deps.store)),
+      type: 'timing', ts: row.wallMs, payload: { ...row } })), async () => (await this.cachedTimingEnabled()),
       async (context, sink) => (await installationTiming(this.deps.store, context, sink)));
     const syncTiming = (enabled: boolean) => {
       try { ws.send(JSON.stringify({ type: 'timing.setting', enabled })); } catch { /* disconnected */ }
     };
     const offTiming = (await this.watchTiming(syncTiming));
-    ws.on('close', offTiming);
-    ws.on('error', offTiming);
+    lifetime.add(offTiming);
+    if (lifetime.closed) return;
     ws.on('message', async data => {
       if (data.toString().length > 1024) return;
       try { (await delivery.acknowledge(JSON.parse(data.toString()))); } catch { /* invalid observation */ }
@@ -681,7 +701,7 @@ export class Gateway {
         ws.close(1013, 'Client fell behind; reconnect to refresh');
         return;
       }
-      if (ev.type === 'timing' && !(await timingEnabled(this.deps.store))) return;
+      if (ev.type === 'timing' && !(await this.cachedTimingEnabled())) return;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
       if (!(await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined)).ok) {
         const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
@@ -698,8 +718,7 @@ export class Gateway {
         ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId, ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     }, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
-    ws.on('close', off);
-    ws.on('error', off);
+    lifetime.add(off);
   }
 
   /** Whether a review-action process id was started for `taskId`. Ids are
@@ -884,8 +903,17 @@ export class Gateway {
     }
     const sid = `s_${crypto.randomBytes(18).toString('hex')}`;
     const apiToken = (await this.deps.tokens.mintPrincipal(`user:${user}`, USER_CAPS)).token;
-    const session: Session = { user, userId: user, apiToken };
+    const session: Session = { user, userId: user, apiToken, expiresAt: Date.now() + 12 * 60 * 60_000 };
+    for (const [key, value] of this.sessions) if ((value.expiresAt ?? Infinity) <= Date.now()) {
+      this.sessions.delete(key);
+      await this.deps.tokens.revoke(value.apiToken);
+    }
     this.sessions.set(sid, session);
+    while (this.sessions.size > 128) {
+      const [key, value] = this.sessions.entries().next().value!;
+      this.sessions.delete(key);
+      await this.deps.tokens.revoke(value.apiToken);
+    }
     return { sid, session };
   }
 
@@ -1000,6 +1028,31 @@ export class Gateway {
     return recoveries;
   }
 
+  private async upgradePrincipal(req: http.IncomingMessage, url: URL): Promise<string | undefined> {
+    if (url.pathname.startsWith('/preview/')) {
+      const id = url.pathname.match(/^\/preview\/([^/]+)/)?.[1];
+      const lease = id ? await this.deps.store.previewLease(id) : undefined;
+      if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return;
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) return;
+      const current = await this.deps.store.currentWorld(lease.worldId);
+      if (!current || (current.generation ?? 1) !== lease.generation) return;
+      if (lease.tokenHash) {
+        if (!previewTokenMatches(lease.tokenHash, previewCookieValue(req.headers.cookie, lease.id))) return;
+      } else {
+        const auth = await this.auth(req, lease.projectId, lease.organizationId);
+        if (!auth || !(await this.deps.tokens.check(auth.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId })).ok) return;
+      }
+      return `preview:${lease.id}`;
+    }
+    if (!['/ws', '/ws/terminal', '/ws/review-action'].includes(url.pathname) || !this.sameOriginRequest(req)) return;
+    const ticket = url.pathname === '/ws/terminal' ? this.terminalTickets.get(url.searchParams.get('ticket') ?? '') : undefined;
+    const auth = ticket && ticket.taskId === url.searchParams.get('taskId') && ticket.expiresAt > Date.now()
+      ? ticket.session : await this.socketAuth(req, url);
+    if (!auth) return;
+    const record = await this.deps.tokens.verify(auth.apiToken);
+    return record ? record.principal : undefined;
+  }
+
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
@@ -1015,25 +1068,34 @@ export class Gateway {
     // Two WebSocket endpoints, routed by path on upgrade:
     //  /ws          — the live event stream (SPEC §3.3 transport).
     //  /ws/terminal — a PTY against the task's world (cheap check-in, SPEC §5.5).
-    const wssEvents = new WebSocketServer({ noServer: true });
-    const wssTerm = new WebSocketServer({ noServer: true });
-    const wssAction = new WebSocketServer({ noServer: true });
-    const wssPreview = new WebSocketServer({ noServer: true });
+    const wssEvents = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+    const wssTerm = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+    const wssAction = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+    const wssPreview = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+    let pendingUpgrades = 0;
+    const socketCounts = new Map<string, number>();
     server.on('upgrade', (req, socket, head) => {
-      if (this.closing || this.deps.runtimeReady?.() === false) { socket.destroy(); return; }
-      const { pathname } = new URL(req.url ?? '/', 'http://localhost');
-      const isolatedPreview = Boolean(configuredPreviewOrigin());
-      const onPreviewOrigin = isolatedPreview && this.requestIsPreviewOrigin(req);
-      if (onPreviewOrigin && pathname.startsWith('/preview/'))
-        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
-      else if (onPreviewOrigin) socket.destroy();
-      else if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
-      else if (pathname === '/ws/terminal') wssTerm.handleUpgrade(req, socket, head, (ws) => wssTerm.emit('connection', ws, req));
-      else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
-      else if ((!isolatedPreview && pathname.startsWith('/preview/')) ||
-        (!isolatedPreview && /^\/api\/tasks\/[^/]+\/preview\/\d+/.test(pathname)))
-        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
-      else socket.destroy();
+      const total = wssEvents.clients.size + wssTerm.clients.size + wssAction.clients.size + wssPreview.clients.size;
+      if (this.closing || this.deps.runtimeReady?.() === false || pendingUpgrades >= 64 || total + pendingUpgrades >= 1024) {
+        socket.destroy(); return;
+      }
+      pendingUpgrades++;
+      void (async () => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        const principal = await withTimeout(this.upgradePrincipal(req, url), 5000);
+        if (!principal || socket.destroyed || this.closing || (socketCounts.get(principal) ?? 0) >= 32) { socket.destroy(); return; }
+        const onPreviewOrigin = Boolean(configuredPreviewOrigin() && this.requestIsPreviewOrigin(req));
+        const wss = url.pathname.startsWith('/preview/') && (!configuredPreviewOrigin() || onPreviewOrigin) ? wssPreview
+          : onPreviewOrigin ? undefined : url.pathname === '/ws' ? wssEvents
+          : url.pathname === '/ws/terminal' ? wssTerm : url.pathname === '/ws/review-action' ? wssAction : undefined;
+        if (!wss) { socket.destroy(); return; }
+        socketCounts.set(principal, (socketCounts.get(principal) ?? 0) + 1);
+        socket.once('close', () => {
+          const count = (socketCounts.get(principal) ?? 1) - 1;
+          if (count) socketCounts.set(principal, count); else socketCounts.delete(principal);
+        });
+        wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+      })().catch(() => socket.destroy()).finally(() => { pendingUpgrades--; });
     });
     wssEvents.on('connection', (ws, req) => {
       ws.on('error', () => {});
@@ -1054,10 +1116,14 @@ export class Gateway {
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
     });
 
-    // Initialize local canonical repos before binding so task starts cannot race
-    // that invariant. Remote provisioning is scheduled best-effort by
-    // ensureProjectWiki and deliberately does not gate the control plane.
-    for (const project of (await this.deps.store.listProjects())) await this.ensureProjectWiki(project);
+    // Wiki repair is best-effort; project/task mutations initialize their own
+    // canonical wiki before use, so unrelated projects never delay binding.
+    this.trackWikiWork((async () => {
+      for (const project of await this.deps.store.listProjects()) {
+        if (this.closing) break;
+        await this.ensureProjectWiki(project).catch(error => console.warn('[wiki] startup repair failed:', error));
+      }
+    })().catch(error => console.warn('[wiki] startup scan failed:', error)));
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
@@ -1086,6 +1152,7 @@ export class Gateway {
       port,
       close: async () => {
           this.closing = true;
+          while (this.wikiWork.size) await Promise.allSettled([...this.wikiWork]);
           if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
@@ -1250,6 +1317,7 @@ export class Gateway {
    *  the client already started via POST /review-action. We replay the buffered
    *  output first, then push the live tail until it exits or the socket closes. */
   private async reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
+    const lifetime = socketLifetime(ws);
     const url = new URL(req.url ?? '/', 'http://localhost');
     const procId = url.searchParams.get('procId') ?? '';
     const rec = (await this.reviewActions.status(procId));
@@ -1275,15 +1343,38 @@ export class Gateway {
       if (chunk) send({ type: 'data', data: chunk });
       if (done) { send({ type: 'exit', code }); try { ws.close(); } catch {} }
     }));
-    ws.on('close', off);
-    ws.on('error', off);
+    lifetime.add(off);
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
+  private secureRequest(req: http.IncomingMessage): boolean {
+    return this.deps.hosted === true || process.env.KARMAX_PUBLIC_URL?.startsWith('https://') === true
+      || (req.socket as { encrypted?: boolean })?.encrypted === true;
+  }
+
+  private sessionCookie(req: http.IncomingMessage, sid: string): string {
+    return `krmax_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sid ? 43200 : 0}${this.secureRequest(req) ? '; Secure' : ''}`;
+  }
+
+  private sameOriginRequest(req: http.IncomingMessage): boolean {
+    const site = req.headers['sec-fetch-site'];
+    if (site && site !== 'same-origin' && site !== 'none') return false;
+    const origin = req.headers.origin;
+    if (!origin) return true; // Non-browser API clients do not send Origin.
+    try {
+      const expected = process.env.KARMAX_PUBLIC_URL?.trim()
+        || `${(req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http'}://${req.headers.host}`;
+      return new URL(origin).origin === new URL(expected).origin;
+    } catch { return false; }
+  }
+
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
-    const receivedAt = req.method === 'POST' && (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
+    const receivedAt = req.method === 'POST' && (await this.cachedTimingEnabled()) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
+    const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
+    if (p.startsWith('/api/') && (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET') || sensitiveNavigation)
+      && !this.sameOriginRequest(req)) return this.json(res, 403, { error: 'cross-origin request forbidden' });
     const previewOrigin = configuredPreviewOrigin();
     const onPreviewOrigin = Boolean(previewOrigin && this.requestIsPreviewOrigin(req));
     // Repository applications are untrusted. In hosted mode they get an origin
@@ -1378,7 +1469,14 @@ export class Gateway {
       if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       const authRequired = !!this.deps.password;
       if (!authRequired) {
-        const { sid } = (await this.newSession());
+        if (this.passwordlessSession) {
+          const previous = await this.passwordlessSession;
+          if (!this.sessions.has(previous.sid) || (previous.session.expiresAt ?? 0) <= Date.now()) this.passwordlessSession = undefined;
+        }
+        const { sid } = await (this.passwordlessSession ??= this.newSession().catch(error => {
+          this.passwordlessSession = undefined; throw error;
+        }));
+        res.setHeader('set-cookie', this.sessionCookie(req, sid));
         return this.json(res, 200, { authRequired: false, token: sid, user: 'me' });
       }
       return this.json(res, 200, { authRequired: true });
@@ -1405,7 +1503,7 @@ export class Gateway {
         if (this.pendingPolicyAcceptances.size >= 10_000)
           return this.json(res, 429, { error: 'too many pending signup attempts; try again shortly' });
         this.pendingPolicyAcceptances.set(hash, { versions, expiresAt: now + 15 * 60_000 });
-        res.setHeader('set-cookie', `krmax_policy_acceptance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=900${this.deps.hosted ? '; Secure' : ''}`);
+        res.setHeader('set-cookie', `krmax_policy_acceptance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=900${this.secureRequest(req) ? '; Secure' : ''}`);
         return this.json(res, 200, { ok: true, versions });
       } catch (error) {
         return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -1724,6 +1822,7 @@ export class Gateway {
       if (this.deps.password && timingSafeEqualStr(String(b.password ?? ''), this.deps.password)) {
         this.clearLoginFailures(throttleKeys);
         const { sid } = (await this.newSession());
+        res.setHeader('set-cookie', this.sessionCookie(req, sid));
         return this.json(res, 200, { token: sid, user: 'me' });
       }
       this.noteLoginFailure(throttleKeys);
@@ -1787,8 +1886,7 @@ export class Gateway {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         ...(consoleRevision ? { consoleRevision } : {}),
-        timingEnabled: (await timingEnabled(this.deps.store)),
-        safeMode: this.safeMode,
+        timingEnabled: (await this.cachedTimingEnabled()),
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
@@ -1819,19 +1917,11 @@ export class Gateway {
       }
     }
 
-    // Serve an image attachment. Auth via `?token=` (session id) because a plain
-    // <img src> can't set an Authorization header; the token is the same session
-    // secret used everywhere else, so this is no weaker than the Bearer path.
+    // Browser attachments use HttpOnly session cookies; API clients use headers.
     const attGet = p.match(/^\/api\/attachments\/([^/]+)$/);
     if (attGet && method === 'GET') {
-      const sid = url.searchParams.get('token') ?? '';
       const projectId = url.searchParams.get('projectId') ?? undefined;
-      let attachmentSession = await this.auth(req, projectId);
-      if (!attachmentSession && sid) {
-        attachmentSession = this.sessions.get(sid);
-        const agent = (await this.deps.tokens.verify(sid));
-        if (!attachmentSession && agent) attachmentSession = { user: agent.principal, apiToken: sid };
-      }
+      const attachmentSession = await this.auth(req, projectId);
       if (!attachmentSession) return this.json(res, 401, { error: 'unauthorized' });
       if (projectId && !(await this.deps.tokens.check(attachmentSession.apiToken, 'task:read', { projectId })).ok)
         return this.json(res, 403, { error: 'missing capability task:read' });
@@ -1991,7 +2081,14 @@ export class Gateway {
       }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
-        if (bearer) this.sessions.delete(bearer);
+        const legacyId = bearer ?? req.headers.cookie?.split(';').map(value => value.trim())
+          .find(value => value.startsWith('krmax_session='))?.slice('krmax_session='.length);
+        if (legacyId) {
+          const legacy = this.sessions.get(legacyId);
+          this.sessions.delete(legacyId);
+          if (legacy) await this.deps.tokens.revoke(legacy.apiToken);
+        }
+        res.setHeader('set-cookie', this.sessionCookie(req, ''));
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
       }
@@ -2236,8 +2333,9 @@ export class Gateway {
         let organization;
         try {
           organization = (await store.createOrganization({ name: String(b.name ?? 'My organization'),
-            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId }));
-        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId,
+            ...(this.deps.hosted ? { maxOwned: 10 } : {}) }));
+        } catch (error) { return this.badRequest(res, error); }
         (await this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id));
         (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
         if (this.deps.hosted) (await this.enableHostedOnboarding(subject.userId, organization.id));
@@ -3898,7 +3996,7 @@ export class Gateway {
           revision: resource.currentRevisionId ? redactResourceRevision((await store.getResourceRevision(resource.currentRevisionId))) : undefined,
         }))));
         if (method === 'POST') {
-          const b = await this.body(req, 600 * 1024 * 1024);
+          const b = await this.body(req);
           const id = newId('resource');
           const driver = String(b.driver ?? 'volume@1');
           const secret = typeof b.secret === 'string' ? b.secret : undefined;
@@ -4130,7 +4228,7 @@ export class Gateway {
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
           { error: 'staged resource candidates cannot be modified before Review' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
-        const b = await this.body(req, 600 * 1024 * 1024);
+        const b = await this.body(req);
         try {
           const revision = typeof b.sourcePath === 'string'
             // Same host-filesystem gate as the create path above: `hostLocal`,
@@ -5083,7 +5181,8 @@ export class Gateway {
         }
       }
       const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
-      if (desktopMatch && method === 'GET') {
+      if (desktopMatch && method !== 'POST') return this.json(res, 405, { error: 'use POST to open a desktop' });
+      if (desktopMatch && method === 'POST') {
         const taskId = desktopMatch[1]!;
         const task = (await store.getTask(taskId));
         const handle = worldHandleForView(task?.lastView, taskId, task ? (await store.effectiveProjectConfig(task.projectId)) : undefined);
@@ -5264,38 +5363,8 @@ export class Gateway {
         }
       }
       const previewMatch = p.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
-      if (previewMatch && PREVIEW_METHODS.has(method)) {
-        const taskId = previewMatch[1]!;
-        const port = Number(previewMatch[2]);
-        const task = (await store.getTask(taskId));
-        const project = task ? (await store.getProject(task.projectId)) : undefined;
-        const handle = worldHandleForView(task?.lastView, taskId, project ? (await store.effectiveProjectConfig(project)) : undefined);
-        if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
-        if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
-        const isolatedOrigin = configuredPreviewOrigin();
-        if (isolatedOrigin) {
-          const rawToken = newPreviewToken();
-          let runnerLeaseId: string | undefined;
-          if (this.deps.worlds.get(handle.kind).capabilities?.remote && this.deps.runners)
-            runnerLeaseId = (await this.deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind })).leaseId;
-          let lease: import('../domain/types.js').PreviewLease;
-          try {
-            lease = (await store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
-              projectId: project.id, taskId, worldId: handle.id, generation: handle.generation ?? 1, port,
-              public: false, tokenHash: hashPreviewToken(rawToken), runnerLeaseId, provider: handle.kind,
-              createdBy: authRecord?.principal ?? session.user, createdAt: Date.now(),
-              expiresAt: Date.now() + previewAccessTtlMs() }));
-          } catch (error) {
-            if (runnerLeaseId) (await this.deps.runners?.release(runnerLeaseId, handle.kind));
-            throw error;
-          }
-          res.writeHead(307, { location: previewLeaseUrl(lease.id,
-            `${previewMatch[3] ?? '/'}${url.search}`, rawToken), 'referrer-policy': 'no-referrer' });
-          return void res.end();
-        }
-        return this.servePreview(req, res, taskId, port,
-          `${previewMatch[3] ?? '/'}${url.search}`, `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`);
-      }
+      if (previewMatch) return this.json(res, 405,
+        { error: 'create a preview with POST /api/tasks/:id/preview-leases' });
       const previewLeases = p.match(/^\/api\/tasks\/([^/]+)\/preview-leases$/);
       if (previewLeases && method === 'GET') return this.json(res, 200,
         (await store.listPreviewLeases(previewLeases[1]!)).map((lease) => ({ ...lease, tokenHash: undefined })));
@@ -7421,7 +7490,7 @@ export class Gateway {
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
-        if (method === 'GET') return this.json(res, 200, wf === 'timing' ? { enabled: (await timingEnabled(store)) } : (await globalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf)));
+        if (method === 'GET') return this.json(res, 200, wf === 'timing' ? { enabled: (await this.cachedTimingEnabled()) } : (await globalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf)));
         if (method === 'PUT') {
           const b = await this.body(req);
           if (wf === 'timing' && typeof b.values?.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be a boolean' });
@@ -7525,27 +7594,15 @@ export class Gateway {
           if (!projectCache.has(id)) projectCache.set(id, (await store.getProject(id)));
           return projectCache.get(id);
         };
-        const events = (await __asyncCollections.filter((await store.allEventsSince(since, 300, !(await timingEnabled(store)))), async (e) => {
-          const projectId = (await store.getTask(e.taskId))?.projectId;
+        const recent = await store.allEventsSince(since, 300, !(await this.cachedTimingEnabled()));
+        const taskProjects = await store.taskProjectIds(recent.map(event => event.taskId));
+        const events = (await __asyncCollections.filter(recent, async (e) => {
+          const projectId = taskProjects.get(e.taskId);
           if (!projectId) return false;
           if (visibleProjects) return visibleProjects.has(projectId);
           return ((await projectOf(projectId))?.organizationId ?? 'org_personal') === visibleOrganization;
         }));
         return this.json(res, 200, events);
-      }
-
-      // safe mode toggle
-      // Installation-wide: safe mode reboots the whole cell. The console renders
-      // every card for everyone, so the server has to say who may manage this —
-      // the same server-derived `canManage` the Stripe Connect card takes.
-      if (p === '/api/safe-mode' && method === 'GET') {
-        return this.json(res, 200, { safeMode: this.safeMode,
-          canManage: (await this.deps.tokens.check(token, 'safe-mode:write')).ok });
-      }
-      if (p === '/api/safe-mode' && method === 'POST') {
-        const b = await this.body(req);
-        this.safeMode = !!b.enabled;
-        return this.json(res, 200, { safeMode: this.safeMode });
       }
 
       return this.json(res, 404, { error: 'not found' });
@@ -7590,8 +7647,15 @@ export class Gateway {
    * connected and the creating human authorized, also create its private
    * companion remote; otherwise the local repo remains ready and this is
    * retried naturally when a project is next set up. */
+  private trackWikiWork(work: Promise<void>): void {
+    this.wikiWork.add(work);
+    void work.finally(() => this.wikiWork.delete(work)).catch(() => {});
+  }
+
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
-    const root = ensureProjectWikiRepository(paths().content, project.id);
+    if (this.closing) return;
+    const root = await ensureProjectWikiRepositoryAsync(paths().content, project.id);
+    if (this.closing) return;
     if (!(await this.deps.store.projectWiki(project.id))) (await this.deps.store.setProjectWikiRepository(project.id));
     const current = (await this.deps.store.projectWiki(project.id))?.repository;
     if (current && this.wikiRemotesReady.has(project.id)) return;
@@ -7605,7 +7669,7 @@ export class Gateway {
     if (current?.private && current.gitConnectionId) {
       if (this.wikiRemotesProvisioning.has(project.id)) return;
       this.wikiRemotesProvisioning.add(project.id);
-      void (async () => {
+      this.trackWikiWork((async () => {
         try {
           await setProjectWikiRemote(root, current.sshUrl, await githubApp.brokerCredentials(current));
           this.wikiRemotesReady.add(project.id);
@@ -7616,7 +7680,7 @@ export class Gateway {
         } finally {
           this.wikiRemotesProvisioning.delete(project.id);
         }
-      })();
+      })());
       return;
     }
     const organizationId = project.organizationId ?? 'org_personal';
@@ -7639,7 +7703,7 @@ export class Gateway {
     if (!connection) return;
     if (this.wikiRemotesProvisioning.has(project.id)) return;
     this.wikiRemotesProvisioning.add(project.id);
-    void (await (async () => {
+    this.trackWikiWork((async () => {
       try {
         const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
         // Preserve the remote identity across project renames. The deterministic
@@ -8038,6 +8102,8 @@ export class Gateway {
       headers['content-length'] = String(response.body.length);
       headers['referrer-policy'] = 'no-referrer';
       headers['x-content-type-options'] = 'nosniff';
+      if (!configuredPreviewOrigin() || !this.requestIsPreviewOrigin(req))
+        headers['content-security-policy'] = 'sandbox allow-scripts allow-forms allow-downloads';
       res.writeHead(response.status, headers);
       res.end(method === 'HEAD' ? undefined : response.body);
     } catch (error) {
@@ -8089,6 +8155,7 @@ export class Gateway {
    * preview. The browser sees only Karmax; provider URLs and access tokens stay
    * on this side of the trust boundary. */
   private async previewWebSocket(browser: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+    const lifetime = socketLifetime(browser);
     const url = new URL(req.url ?? '/', 'http://localhost');
     let taskId: string;
     let port: number;
@@ -8135,11 +8202,14 @@ export class Gateway {
     const handle = worldHandleForView(task?.lastView, taskId, task ? (await this.deps.store.effectiveProjectConfig(task.projectId)) : undefined);
     if (!handle) { browser.close(4404, 'world unavailable'); return; }
     const access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+    lifetime.add(() => access?.release());
+    if (lifetime.closed) return;
     const world = access?.world ?? await this.deps.worlds.open(handle);
-    if (!world.previewSocketTarget) { await access?.release(); browser.close(4400, 'provider has no WebSocket previews'); return; }
+    if (!world.previewSocketTarget) { lifetime.close(); browser.close(4400, 'provider has no WebSocket previews'); return; }
     let target: Awaited<ReturnType<NonNullable<typeof world.previewSocketTarget>>>;
     try { target = await world.previewSocketTarget(port, requestPath); }
-    catch { await access?.release(); browser.close(1011, 'preview upstream unavailable'); return; }
+    catch { lifetime.close(); browser.close(1011, 'preview upstream unavailable'); return; }
+    if (lifetime.closed) return;
     const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((value) => value.trim()).filter(Boolean);
     const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
     const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
@@ -8147,12 +8217,7 @@ export class Gateway {
       if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
       else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
     });
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      void access?.release();
-    };
+    const release = () => lifetime.close();
     browser.on('close', (code, reason) => {
       release();
       if (upstream.readyState === WebSocketClient.CONNECTING) upstream.terminate();
@@ -8458,10 +8523,15 @@ export class Gateway {
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
     const h = req.headers['authorization'];
-    const sid = h?.startsWith('Bearer ') ? h.slice(7) : undefined;
+    const sid = h?.startsWith('Bearer ') ? h.slice(7)
+      : req.headers.cookie?.split(';').map(value => value.trim()).find(value => value.startsWith('krmax_session='))?.slice('krmax_session='.length);
     if (sid) {
       const legacy = this.sessions.get(sid);
-      if (legacy) return legacy;
+      if (legacy) {
+        if ((legacy.expiresAt ?? Infinity) > Date.now() && await this.deps.tokens.verify(legacy.apiToken)) return legacy;
+        this.sessions.delete(sid);
+        await this.deps.tokens.revoke(legacy.apiToken);
+      }
       const agent = (await this.deps.tokens.verify(sid));
       if (agent) return { user: agent.principal, apiToken: sid };
     }
@@ -8487,26 +8557,25 @@ export class Gateway {
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !(await this.deps.tokens.verify(cached.apiToken))) {
       if (cached) (await this.deps.tokens.revoke(cached.apiToken));
-      // Entries are keyed by session; a session that ended never comes back to
-      // evict its own, so sweep the expired ones when the cache has grown.
-      if (this.identityTokens.size >= 2_000)
-        for (const [key, entry] of this.identityTokens) if (!(await this.deps.tokens.verify(entry.apiToken))) this.identityTokens.delete(key);
-      cached = { apiToken: (await this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000, resolvedOrganizationId)).token, fingerprint };
+      const now = Date.now();
+      for (const [key, entry] of this.identityTokens) if (entry.expiresAt <= now) {
+        this.identityTokens.delete(key);
+        await this.deps.tokens.revoke(entry.apiToken);
+      }
+      if (this.identityTokens.size >= 2_000) {
+        const [key, entry] = this.identityTokens.entries().next().value!;
+        this.identityTokens.delete(key);
+        await this.deps.tokens.revoke(entry.apiToken);
+      }
+      const ttl = 10 * 60_000;
+      cached = { apiToken: (await this.deps.tokens.mintPrincipal(principal, caps, projectId, ttl,
+        resolvedOrganizationId, identity.session.id)).token, fingerprint, expiresAt: now + ttl, userId: identity.user.id };
       this.identityTokens.set(cacheKey, cached);
     }
     return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
   }
-  /** Browser WebSockets carry Better Auth cookies. The legacy test/embed gateway
-   * instead has a JSON session id, which may be passed explicitly in the query
-   * just like attachment URLs; production task tokens are never synthesized. */
-  private async socketAuth(req: http.IncomingMessage, url: URL, projectId?: string): Promise<Session | undefined> {
-    const token = url.searchParams.get('token') ?? '';
-    if (token) {
-      const legacy = this.sessions.get(token);
-      if (legacy) return legacy;
-      const agent = (await this.deps.tokens.verify(token));
-      if (agent) return { user: agent.principal, apiToken: token };
-    }
+  /** Browser sockets use HttpOnly cookies; API clients use Authorization. */
+  private async socketAuth(req: http.IncomingMessage, _url: URL, projectId?: string): Promise<Session | undefined> {
     return this.auth(req, projectId);
   }
   /** Organization-scoped mailbox provider config (agent-mail §8). */
@@ -8677,7 +8746,7 @@ export class Gateway {
     try {
       return JSON.parse(value.toString('utf8'));
     } catch {
-      return {};
+      throw Object.assign(new Error('invalid JSON body'), { status: 400 });
     }
   }
   /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`. */
