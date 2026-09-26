@@ -112,6 +112,32 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('revokes scoped tokens through indexed project membership', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Tokens');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.putScopedToken('by-project', 'one', { principal: 'user:a', projectId: project.id }, Date.now() + 60_000);
+      await store.putScopedToken('by-task', 'two', { principal: 'user:b', taskId: task.id }, Date.now() + 60_000);
+      await store.putScopedToken('other', 'three', { principal: 'user:c', projectId: 'unrelated' }, Date.now() + 60_000);
+      expect(await store.revokeScopedTokens({ projectId: project.id })).toBe(2);
+      expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+        .toEqual([{ tokenHash: 'other' }]);
+    } finally { await store.close(); }
+  });
+
+  it('backfills legacy PostgreSQL scoped-token membership', async () => {
+    const db = openSqlDatabase(url!);
+    await db.exec(`CREATE TABLE scoped_tokens (tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE,
+      json TEXT NOT NULL, expiresAt INTEGER NOT NULL, revokedAt INTEGER)`);
+    await db.prepare('INSERT INTO scoped_tokens VALUES (?,?,?,?,NULL)').run('old-token', 'old-id',
+      JSON.stringify({ principal: 'user:old', projectIds: ['project-old'] }), Date.now() + 60_000);
+    await db.close();
+    const store = await Store.create(url!);
+    try { expect(await store.revokeScopedTokens({ projectId: 'project-old' })).toBe(1); }
+    finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);

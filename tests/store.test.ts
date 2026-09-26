@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { Store, isReviewRequestEvent, deleteRows } from '../src/store/db.js';
 
 describe('Store', () => {
@@ -69,6 +70,50 @@ describe('Store', () => {
     await store.appendEvent({ taskId: task.id, type: 'permission.approval-resolved',
       ts: now, payload: { requestId: 'ask' } });
     expect((await store.retentionSweep(now)).events).toBe(1);
+  });
+
+  it('revokes project-scoped tokens through indexed project membership', async () => {
+    const project = await store.createProject('Tokens');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.putScopedToken('by-project', 'one', { principal: 'user:a', projectId: project.id }, Date.now() + 1000);
+    await store.putScopedToken('by-task', 'two', { principal: 'user:b', taskId: task.id }, Date.now() + 1000);
+    await store.putScopedToken('other', 'three', { principal: 'user:c', projectIds: ['unrelated'] }, Date.now() + 1000);
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    expect(await store.revokeScopedTokens({ projectId: project.id })).toBe(2);
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+      .toEqual([{ tokenHash: 'other' }]);
+    expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
+  });
+
+  it('deprovisions a member without reading every live token body', async () => {
+    const org = await store.createOrganization({ name: 'Tokens', ownerUserId: 'owner' });
+    await store.setOrganizationMembership(org.id, 'member', 'member');
+    await store.putScopedToken('member-token', 'one', { principal: 'user:member', organizationId: org.id }, Date.now() + 60_000);
+    await store.putScopedToken('owner-token', 'two', { principal: 'user:owner', organizationId: org.id }, Date.now() + 60_000);
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    await store.deprovisionOrganizationUser(org.id, 'member');
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+      .toEqual([{ tokenHash: 'owner-token' }]);
+    expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
+  });
+
+  it('backfills indexed scopes on legacy durable tokens', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-token-scope-'));
+    const file = path.join(dir, 'store.db');
+    const legacy = new DatabaseSync(file);
+    legacy.exec(`CREATE TABLE scoped_tokens (tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE,
+      json TEXT NOT NULL, expiresAt INTEGER NOT NULL, revokedAt INTEGER)`);
+    legacy.prepare('INSERT INTO scoped_tokens VALUES (?,?,?,?,NULL)')
+      .run('old-token', 'old-id', JSON.stringify({ principal: 'user:old', projectIds: ['project-old'] }), Date.now() + 60_000);
+    legacy.close();
+    const migrated = await Store.create(file);
+    try {
+      expect(await migrated.revokeScopedTokens({ projectId: 'project-old' })).toBe(1);
+    } finally { await migrated.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {

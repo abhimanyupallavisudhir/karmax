@@ -360,7 +360,7 @@ export class Store {
     (await this.db.prepare(`DELETE FROM usage_events WHERE provider='e2b' AND kind='world.active'
       AND (metadata IS NULL OR json_extract(metadata, '$.source') IS NULL
         OR json_extract(metadata, '$.source') != 'provider-lifecycle')`).run());
-    (await this.kvSet('migration:data-2026-09-26', '1'));
+    (await this.kvSet(marker, '1'));
   
     });
   }
@@ -613,8 +613,12 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS scoped_tokens (
         tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE, json TEXT NOT NULL,
-        expiresAt INTEGER NOT NULL, revokedAt INTEGER
+        expiresAt INTEGER NOT NULL, revokedAt INTEGER, principal TEXT, organizationId TEXT
       );
+      CREATE TABLE IF NOT EXISTS scoped_token_projects (
+        tokenHash TEXT NOT NULL, projectId TEXT NOT NULL, PRIMARY KEY(tokenHash, projectId)
+      );
+      CREATE INDEX IF NOT EXISTS idx_scoped_token_projects_project ON scoped_token_projects(projectId, tokenHash);
       CREATE TABLE IF NOT EXISTS human_delegations (
         id TEXT PRIMARY KEY,
         json TEXT NOT NULL,
@@ -851,6 +855,23 @@ export class Store {
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
+    const scopedTokenCols = await this.db.prepare('PRAGMA table_info(scoped_tokens)').all() as Array<{ name: string }>;
+    if (!scopedTokenCols.some((column) => column.name === 'principal'))
+      (await this.db.exec('ALTER TABLE scoped_tokens ADD COLUMN principal TEXT'));
+    if (!scopedTokenCols.some((column) => column.name === 'organizationId'))
+      (await this.db.exec('ALTER TABLE scoped_tokens ADD COLUMN organizationId TEXT'));
+    (await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_scoped_tokens_principal ON scoped_tokens(principal, revokedAt);
+      CREATE INDEX IF NOT EXISTS idx_scoped_tokens_organization ON scoped_tokens(organizationId, revokedAt)`));
+    for (const row of await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE principal IS NULL').all() as Array<{ tokenHash: string; json: string }>) {
+      let record: Record<string, unknown>;
+      try { record = JSON.parse(row.json); } catch { continue; }
+      (await this.db.prepare('UPDATE scoped_tokens SET principal=?, organizationId=? WHERE tokenHash=?')
+        .run(typeof record.principal === 'string' ? record.principal : '',
+          typeof record.organizationId === 'string' ? record.organizationId : null, row.tokenHash));
+      for (const projectId of await this.scopedTokenProjectIds(record))
+        (await this.db.prepare('INSERT OR IGNORE INTO scoped_token_projects(tokenHash,projectId) VALUES (?,?)')
+          .run(row.tokenHash, projectId));
+    }
     if (!cols.some((c) => c.name === 'completedAt')) {
       (await this.db.exec('ALTER TABLE tasks ADD COLUMN completedAt INTEGER'));
       (await this.db.exec(`UPDATE tasks SET completedAt=(SELECT MIN(e.ts) FROM events e
@@ -2388,9 +2409,8 @@ export class Store {
       for (const projectId of projectIds)
         (await this.db.prepare('DELETE FROM principal_grants WHERE principalId=? AND scopeKey=?').run(`user:${userId}`, `project:${projectId}`));
       (await this.db.prepare('DELETE FROM principal_grants WHERE principalId=? AND scopeKey=?').run(`user:${userId}`, `organization:${organizationId}`));
-      for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-        try { if (JSON.parse(row.json).principal === `user:${userId}`) (await this.revokeScopedToken({ tokenHash: row.tokenHash })); } catch {}
-      }
+      (await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE principal=? AND revokedAt IS NULL')
+        .run(Date.now(), `user:${userId}`));
       (await this.revokeHumanDelegations({ humanUserId: userId }));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -3609,6 +3629,7 @@ export class Store {
       JOIN tasks t ON t.id=s.taskId WHERE t.projectId=? ORDER BY s.createdAt`).all(projectId)) as any[];
     const bySubscriber = new Map<string, PrincipalRef[]>();
     for (const r of subscribers) (bySubscriber.get(r.taskId) ?? bySubscriber.set(r.taskId, []).get(r.taskId)!).push(JSON.parse(r.principal));
+    const readAudience = this.audienceReader();
     for (const t of tasks) {
       t.subscribers = bySubscriber.get(t.id) ?? [];
       if (t.confirmationPolicy) t.reviewers = await runAudienceAsync(reviewAudience(t), readAudience);
@@ -3629,7 +3650,6 @@ export class Store {
       .run(JSON.stringify((await this.withPendingReviewInfo(taskId, view))), taskId));
   
     });
-    const readAudience = this.audienceReader();
   }
 
   async withPendingReviewInfo(taskId: string, view: TaskView): Promise<TaskView> {
@@ -7079,14 +7099,32 @@ export class Store {
 
   // ─── KV (misc small state) ───────────────────────────────────────────────────
 
+  private async scopedTokenProjectIds(record: Record<string, unknown>): Promise<string[]> {
+    const ids = new Set<string>();
+    if (typeof record.projectId === 'string') ids.add(record.projectId);
+    if (Array.isArray(record.projectIds))
+      for (const id of record.projectIds) if (typeof id === 'string') ids.add(id);
+    if (typeof record.taskId === 'string') {
+      const task = await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId) as { projectId: string } | undefined;
+      if (task) ids.add(task.projectId);
+    }
+    return [...ids];
+  }
+
   /** The raw bearer never enters SQLite; replicas verify its SHA-256 digest. */
   async putScopedToken(tokenHash: string, tokenId: string, record: Record<string, unknown>, expiresAt: number): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare(`INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt, revokedAt)
-      VALUES (?, ?, ?, ?, NULL) ON CONFLICT(tokenHash) DO UPDATE SET
-      tokenId=excluded.tokenId, json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL`)
-      .run(tokenHash, tokenId, JSON.stringify(record), expiresAt));
+    (await this.db.prepare(`INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt, revokedAt, principal, organizationId)
+      VALUES (?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(tokenHash) DO UPDATE SET
+      tokenId=excluded.tokenId, json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL,
+      principal=excluded.principal, organizationId=excluded.organizationId`)
+      .run(tokenHash, tokenId, JSON.stringify(record), expiresAt,
+        typeof record.principal === 'string' ? record.principal : '',
+        typeof record.organizationId === 'string' ? record.organizationId : null));
+    (await this.db.prepare('DELETE FROM scoped_token_projects WHERE tokenHash=?').run(tokenHash));
+    for (const projectId of await this.scopedTokenProjectIds(record))
+      (await this.db.prepare('INSERT INTO scoped_token_projects(tokenHash,projectId) VALUES (?,?)').run(tokenHash, projectId));
   
     });
   }
@@ -7166,23 +7204,18 @@ export class Store {
     });
   }
 
-  /** Revoke durable credentials whose serialized scope names a resource being
-   * deleted. Parsing keeps this compatible with pre-JSON1 SQLite builds and
-   * with historical token records that omitted newer scope fields. */
+  /** Revoke credentials by indexed scope rather than parsing every live token. */
   async revokeScopedTokens(scope: { projectId?: string; organizationId?: string }): Promise<number> {
     return this.db.transaction(async () => {
-
-    const update = this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE tokenHash=? AND revokedAt IS NULL');
     const now = Date.now();
     let revoked = 0;
-    for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-      let record: { projectId?: string; projectIds?: string[]; organizationId?: string; taskId?: string };
-      try { record = JSON.parse(row.json); } catch { continue; }
-        if ((scope.projectId && (record.projectId === scope.projectId || record.projectIds?.includes(scope.projectId)
-          || (record.taskId && (await this.taskProjectIdAsync(record.taskId)) === scope.projectId)))
-          || (scope.organizationId && record.organizationId === scope.organizationId))
-          revoked += Number((await update.run(now, row.tokenHash)).changes);
-    }
+    if (scope.projectId)
+      revoked += Number((await this.db.prepare(`UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL
+        AND tokenHash IN (SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)`)
+        .run(now, scope.projectId)).changes);
+    if (scope.organizationId)
+      revoked += Number((await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND organizationId=?')
+        .run(now, scope.organizationId)).changes);
     return revoked;
   
     });
@@ -7190,7 +7223,8 @@ export class Store {
 
   async purgeScopedTokens(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
-
+    (await this.db.prepare(`DELETE FROM scoped_token_projects WHERE tokenHash IN
+      (SELECT tokenHash FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL)`).run(now));
     return Number((await this.db.prepare('DELETE FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
   
     });
