@@ -6,7 +6,7 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 describe('agent turn admission', () => {
-  it.each(['failure', 'cancel', 'cancel-metered', 'timeout', 'post-turn'])('retains managed cost and retries safely after %s', async mode => {
+  it.each(['failure', 'cancel', 'cancel-metered', 'timeout', 'post-turn', 'billing'])('retains managed cost and retries safely after %s', async mode => {
     vi.stubEnv('ANTHROPIC_API_KEY', 'fake-managed-key');
     vi.stubEnv('KARMAX_MANAGED_MODEL_REQUEST_CEILINGS', JSON.stringify({ 'anthropic/test-model': 100_000 }));
     vi.stubEnv('KARMAX_MANAGED_MODEL_PRICING', mode === 'cancel-metered' ? JSON.stringify({ 'anthropic/test-model': { inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 1_000_000 } }) : '');
@@ -40,12 +40,17 @@ describe('agent turn admission', () => {
       if (mode === 'post-turn' && event.type === 'turn.result' && attempt === 1) throw new Error('result publication failed');
       return append(event);
     });
-    const args = { taskId: task.id, role: mode === 'post-turn' ? 'confirm' : 'do', agentTurnId: `${task.id}#0`,
+    const finish = store.finishUsageAdmission.bind(store);
+    vi.spyOn(store, 'finishUsageAdmission').mockImplementation(async (...params) => {
+      if (mode === 'billing' && params[1] !== undefined && attempt === 1) throw new Error('billing write failed');
+      return finish(...params);
+    });
+    const args = { taskId: task.id, role: ['post-turn', 'billing'].includes(mode) ? 'confirm' : 'do', agentTurnId: `${task.id}#0`,
       agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle, messages: [],
       task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
         agents: { do: { provider: 'claude', model: 'test-model' }, confirm: { provider: 'claude', model: 'test-model' } } } } as any;
     try {
-      if (mode === 'post-turn') await expect(core.runAgentTurn(args)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
+      if (mode === 'post-turn' || mode === 'billing') await expect(core.runAgentTurn(args)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
       else await expect(core.runAgentTurn(args)).rejects.toThrow();
       expect(costAtProviderStart).toBe(100_000);
       expect(await store.usageSummary(org.id)).toMatchObject({
@@ -53,7 +58,7 @@ describe('agent turn admission', () => {
         incurredCostMicros: mode === 'cancel-metered' ? 100 : 0, activeReservationsMicros: 0 });
       attempt = 2;
       abort = new AbortController();
-      if (mode === 'post-turn') {
+      if (mode === 'post-turn' || mode === 'billing') {
         await expect(core.runAgentTurn(args)).resolves.toMatchObject({ output: 'durable output' });
         expect(runTurn).toHaveBeenCalledTimes(1);
         expect(JSON.parse((await store.kvGet(`confirm-transcript:${task.id}`))!)).toHaveLength(1);
@@ -66,7 +71,7 @@ describe('agent turn admission', () => {
       vi.restoreAllMocks(); vi.unstubAllEnvs();
       await world.destroy(); await store.close();
     }
-  });
+  }, 2_000);
 
   it('replaces a lost attempt without releasing its cost or rerunning a completed admission', async () => {
     const store = await Store.create(':memory:');
@@ -81,11 +86,11 @@ describe('agent turn admission', () => {
         organizationId: project.organizationId!, projectId: project.id, taskId: task.id, provider: 'anthropic',
         kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: 100, costClassification: 'estimated',
         startedAt: Date.now(), endedAt: Date.now() }]);
-      await expect(store.admitAgentUsage({ ...admission, id: 'turn:attempt:2', retryOf: 'turn' } as any)).resolves.toEqual({ reused: false });
+      await expect(store.admitAgentUsage({ ...admission, id: 'turn:attempt:3', retryOf: ['turn', 'turn:attempt:2'] } as any)).resolves.toEqual({ reused: false });
       expect(await store.usageSummary(project.organizationId!)).toMatchObject({ estimatedCostMicros: 100 });
-      expect(await store.activeAgentUsageAdmissions(project.organizationId!)).toEqual([{ id: 'turn:attempt:2', taskId: task.id }]);
-      await store.finishUsageAdmission('turn:attempt:2', true);
-      await expect(store.admitAgentUsage({ ...admission, id: 'turn:attempt:3', retryOf: 'turn:attempt:2' } as any))
+      expect(await store.activeAgentUsageAdmissions(project.organizationId!)).toEqual([{ id: 'turn:attempt:3', taskId: task.id }]);
+      await store.finishUsageAdmission('turn:attempt:3', true);
+      await expect(store.admitAgentUsage({ ...admission, id: 'turn:attempt:4', retryOf: ['turn', 'turn:attempt:2', 'turn:attempt:3'] } as any))
         .rejects.toThrow('already completed');
     } finally { await store.close(); }
   });

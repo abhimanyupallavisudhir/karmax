@@ -2423,7 +2423,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const admissionId = activityAttempt > 1 ? `${turnId}:attempt:${activityAttempt}` : turnId;
           (await store.admitAgentUsage({ id: admissionId, organizationId, projectId: args.task.projectId,
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
-            ...(activityAttempt > 1 ? { retryOf: activityAttempt === 2 ? turnId : `${turnId}:attempt:${activityAttempt - 1}` } : {}),
+            ...(activityAttempt > 1 ? { retryOf: Array.from({ length: activityAttempt - 1 },
+              (_, index) => index === 0 ? turnId : `${turnId}:attempt:${index + 1}`) } : {}),
             reservedCostMicros: managedReservationMicros }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).
@@ -2729,14 +2730,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
         throw classifyTurnError(err, profile.provider, { diagnosis });
       } finally {
-        if (usageAdmissionId && !usageAdmissionFinished) {
-          if (providerInvoked || result) await finishUsage(false);
-          else await store.finishUsageAdmission(usageAdmissionId, false);
+        try {
+          if (usageAdmissionId && !usageAdmissionFinished) {
+            if (providerInvoked || result) await finishUsage(false);
+            else await store.finishUsageAdmission(usageAdmissionId, false);
+          }
+        } finally {
+          try { await releaseSlot(); }
+          finally {
+            releaseConfirm();
+            try { await mcpCleanup?.(); }
+            finally { await publishLegacyAgentState(undefined); }
+          }
         }
-        await releaseSlot();
-        releaseConfirm();
-        await mcpCleanup?.();
-        (await publishLegacyAgentState(undefined));
       }
       if (token) (await deps.tokens?.revoke(token));
       // Persist the session id so other tasks can resume from this one (§10.5), plus

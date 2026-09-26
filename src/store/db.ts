@@ -6323,7 +6323,7 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number; retryOf?: string }): Promise<{ reused: boolean }> {
+    reservedCostMicros?: number; now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -6353,8 +6353,8 @@ export class Store {
     }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      if (input.retryOf) {
-        const previous = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(input.retryOf)) as any;
+      for (const priorId of input.retryOf ? [input.retryOf].flat() : []) {
+        const previous = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(priorId)) as any;
         if (previous) {
           if (previous.organizationId !== input.organizationId || previous.projectId !== input.projectId
             || previous.taskId !== input.taskId || previous.provider !== input.provider)
@@ -6362,7 +6362,7 @@ export class Store {
           if (previous.state === 'completed')
             throw new Error('this model turn was already completed; refusing duplicate provider admission');
           await this.db.prepare("UPDATE usage_admissions SET state='released', releasedAt=? WHERE id=? AND state='active'")
-            .run(now, input.retryOf);
+            .run(now, priorId);
         }
       }
       const assertManagedCapacity = async () => {
