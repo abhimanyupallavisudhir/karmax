@@ -987,7 +987,7 @@ export class ClaudeAdapter implements AgentAdapter {
             const message =
               `Claude Agent SDK turn failed (${String(result.subtype ?? 'unknown')}): ` +
               String(detail || 'provider reported an unsuccessful result');
-            throw providerErrorFromMessage('claude', message);
+            throw new Error(message); // Aggregate execution errors can originate in tools or bootstrap.
           }
           successfulResult = result;
           if (!harnessEchoes && result.num_turns !== 0) { unanswered.clear(); acknowledgeInput(); }

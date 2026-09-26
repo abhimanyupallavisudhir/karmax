@@ -20,7 +20,7 @@ export class CodexAppServerClient {
   private fragmentBytes = 0;
   private readonly decoder = new StringDecoder('utf8');
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+  private readonly pending = new Map<number, { method: string; resolve: (v: any) => void; reject: (e: Error) => void }>();
   private notificationHandler?: (method: string, params: any) => void;
   private serverRequestHandler?: (method: string, params: any) => any | Promise<any>;
   private closed = false;
@@ -100,8 +100,14 @@ export class CodexAppServerClient {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
-      if (msg.error) p.reject(new ProviderStreamError(errorText(msg.error)));
-      else p.resolve(msg.result);
+      if (msg.error) {
+        const providerCode = msg.error.data?.codexErrorInfo;
+        const providerFailure = ['turn/start', 'turn/steer'].includes(p.method)
+          && ['usageLimitReached', 'unauthorized'].includes(providerCode);
+        p.reject(providerFailure
+          ? new ProviderStreamError(`${errorText(msg.error)} (${providerCode})`)
+          : new Error(errorText(msg.error)));
+      } else p.resolve(msg.result);
       return;
     }
     // Otherwise it's a notification.
@@ -123,7 +129,7 @@ export class CodexAppServerClient {
     return new Promise<T>((resolve, reject) => {
       if (this.closed) return reject(new Error('codex app-server client closed'));
       const id = this.nextId++;
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(id, { method, resolve, reject });
       this.writeLine({ id, method, params });
     });
   }

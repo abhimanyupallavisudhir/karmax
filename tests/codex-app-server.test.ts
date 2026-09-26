@@ -31,6 +31,8 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     setTimeout(() => send({ id: msg.id, result: {} }), 100);
   }
   else if (msg.method === 'turn/start') {
+    if (process.env.STUB_MODE === 'rpc-limit') { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: 'usageLimitReached' } } }); return; }
+    if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
     const mode = process.env.STUB_MODE || 'completed';
@@ -251,6 +253,17 @@ describe('CodexAdapter app-server security policy', () => {
     });
     expect(requests.some((r) => r.method === 'thread/resume')).toBe(false);
     expect(requests.find((r) => r.method === 'turn/start')?.params.threadId).toBe('thread-forked');
+  });
+
+  it.each(['disk', 'npm'])('keeps non-provider RPC errors task-local (%s)', async (kind) => {
+    const failure = await run(undefined, `rpc-local-${kind}`).catch(error => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.name).not.toBe('ProviderFailure');
+  });
+
+  it('preserves an account failure received as a provider RPC rejection', async () => {
+    await expect(run(undefined, 'rpc-limit')).rejects.toMatchObject({ name: 'ProviderFailure',
+      metadata: { kind: 'quota', permanence: 'transient' } });
   });
 
   it('does not classify subprocess stderr as a provider limit', async () => {

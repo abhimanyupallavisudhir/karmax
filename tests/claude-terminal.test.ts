@@ -370,19 +370,16 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     await expect(new ClaudeAdapter().runTurn(input, ctx)).rejects.toThrow(/error_during_execution.*stream disconnected/i);
   });
 
-  it('types novel credit-exhaustion wording from an SDK error result', async () => {
-    sdkState.messages = [
-      {
-        type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 's1',
-        errors: ['Your prepaid balance has now been fully consumed.'],
-      },
-    ];
-    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
-    expect(failure).toBeInstanceOf(ProviderFailure);
-    expect(failure.metadata).toMatchObject({
-      kind: 'quota', permanence: 'hard', provider: 'claude', source: 'message',
-    });
-  });
+  it.each(['Your prepaid balance has now been fully consumed.', 'Disk quota exceeded', 'npm 401 Unauthorized'])(
+    'keeps aggregate SDK errors task-local: %s', async (detail) => {
+      sdkState.messages = [{ type: 'result', subtype: 'error_during_execution', is_error: true,
+        session_id: 's1', errors: [detail] }];
+      const failure = await new ClaudeAdapter().runTurn(input, ctx).catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+      expect(failure.message).toContain(detail);
+    },
+  );
 
   it('uses the structured assistant rate-limit signal even when the SDK result lies about success', async () => {
     sdkState.messages = [

@@ -150,7 +150,7 @@ export class CodexAdapter implements AgentAdapter {
     catch (error) {
       // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
       // account health must come from a host-side provider request or probe.
-      if (isRemoteAgentWorld(input.world) && error instanceof ProviderFailure)
+      if (isRemoteAgentWorld(input.world) && (error instanceof ProviderFailure || error instanceof ProviderStreamError))
         throw new Error(error.message, { cause: error });
       throw error;
     }
@@ -605,7 +605,7 @@ export class CodexAdapter implements AgentAdapter {
         policyFailure ??= new ProviderPolicyFailure(native, 'codex', { model, operation });
         return;
       }
-      const blob = typeof native === 'string' ? native : JSON.stringify(native ?? {});
+      const blob = native instanceof Error ? native.message : typeof native === 'string' ? native : JSON.stringify(native ?? {});
       const cls = classifyLimitError(blob, { providerOrigin: true });
       if (!cls.limited) return;
       const m = blob.match(/"?(?:resets_in_seconds|resetInSeconds|retry_after|retryAfter)"?\s*[:=]\s*(\d+)/);
