@@ -10,6 +10,32 @@ describe('cloud Git broker', () => {
   const cleanups: string[] = [];
   afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
+  it('locks local landing worktree administration (WD-23)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-landing-lock-')); cleanups.push(root);
+    const source = path.join(root, 'source'); fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-qb', 'main']); await ensureIdentity(source);
+    await gitOrThrow(source, ['commit', '--allow-empty', '-qm', 'base']);
+    const sandbox = path.join(root, 'sandbox'); await gitOrThrow(root, ['clone', '-q', source, sandbox]);
+    const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: 'landing', repo: sandbox, base: 'main' });
+    await world.writeFile('feature', 'work');
+    await gitOrThrow(world.handle.root, ['add', '.']); await gitOrThrow(world.handle.root, ['commit', '-qm', 'work']);
+    Object.assign(world.handle.repos![0]!, { repo: 'git@example:repo.git', localPath: source });
+    world.handle.kind = 'e2b';
+    const gitModule = await import('../src/world/git.js');
+    const run = gitModule.git;
+    const locks: boolean[] = [];
+    const spy = vi.spyOn(gitModule, 'git').mockImplementation((cwd, args, opts) => {
+      if (args[0] === 'worktree' && args.some(arg => arg.includes('.karmax-land-')))
+        locks.push(fs.existsSync(path.join(source, '.git', 'karmax-worktree.lock')));
+      return run(cwd, args, opts);
+    });
+    try {
+      expect((await brokerFinalizeMerge(world, 'main', undefined, {})).merged).toBe(true);
+      expect(locks.length).toBeGreaterThanOrEqual(2);
+      expect(locks.every(Boolean)).toBe(true);
+    } finally { spy.mockRestore(); }
+  });
+
   it.each(['../escape', '/absolute', '.', '..', 'nested/name'])('rejects unsafe enrollment names before world access (WD-24): %s', async name => {
     const exec = vi.fn();
     const world = { handle: { root: '/workspace', repos: [] }, exec, writeFileBuffer: vi.fn() } as any;

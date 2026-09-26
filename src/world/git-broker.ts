@@ -1,3 +1,4 @@
+import { withWorktreeLock } from './worktree-lock.js';
 import { concurrentMap } from '../util/concurrent-map.js';
 import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.js';
 import { timed } from '../timing/index.js';
@@ -741,17 +742,21 @@ async function landLocalBranch(localRepo: string, repo: WorldRepo, target: strin
   // `worktree add` and the `finally` would otherwise litter their source tree
   // with a directory they never created.
   const tmp = path.join(scratchWorktreeHome(), `.karmax-land-${cryptoSafeName(worldId)}-${cryptoSafeName(repo.name)}`);
-  if (fs.existsSync(tmp)) {
-    await git(localRepo, ['worktree', 'remove', '--force', tmp]);
-    removeTemporaryDirectory(tmp);
-  }
-  const added = await git(localRepo, ['worktree', 'add', '--force', tmp, repo.branch]);
-  if (added.code !== 0) throw new Error(`could not check out the task branch for landing: ${added.stderr || added.stdout}`);
+  await withWorktreeLock(localRepo, async () => {
+    if (fs.existsSync(tmp)) {
+      await git(localRepo, ['worktree', 'remove', '--force', tmp]);
+      removeTemporaryDirectory(tmp);
+    }
+    const added = await git(localRepo, ['worktree', 'add', '--force', tmp, repo.branch]);
+    if (added.code !== 0) throw new Error(`could not check out the task branch for landing: ${added.stderr || added.stdout}`);
+  });
   try {
     return await finalizeMergeRepo({ ...repo, repo: localRepo, root: tmp }, target, worldId, identity);
   } finally {
-    await git(localRepo, ['worktree', 'remove', '--force', tmp]);
-    removeTemporaryDirectory(tmp);
+    await withWorktreeLock(localRepo, async () => {
+      await git(localRepo, ['worktree', 'remove', '--force', tmp]);
+      removeTemporaryDirectory(tmp);
+    });
   }
 }
 
