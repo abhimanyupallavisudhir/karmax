@@ -1121,6 +1121,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
+      let activitySignal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let cancellationHeartbeat: NodeJS.Timeout | undefined;
+      {
+        try {
+          const ctx = activityContext.current();
+          activitySignal = ctx.cancellationSignal;
+          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
+          // Temporal delivers activity cancellation at heartbeat boundaries.
+          // Keep that boundary live after admission while the provider allocates
+          // and provisions the sandbox.
+          cancellationHeartbeat = setInterval(() => {
+            try { ctx.heartbeat({ provisioning: args.kind }); } catch { /* cancellation is checked by provisioning */ }
+          }, 1_000);
+          cancellationHeartbeat.unref();
+        } catch {
+          // Direct activity unit tests have no ambient Temporal context.
+        }
+      }
+      const stopCancellationHeartbeat = () => {
+        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
+        cancellationHeartbeat = undefined;
+      };
+      try {
       const trace = (await installationTiming(store, { taskId: args.taskId }, async row => (await record(args.taskId, 'timing', { ...row }))));
       try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
       return (await withTiming(trace, () => trace.measure('world.prepare', async () => {
@@ -1343,27 +1367,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const environmentSelection = projectId
         ? (await selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment))
         : { built: false, environment: executionConfig?.environment };
-      let activitySignal: AbortSignal | undefined;
-      let heartbeat: (() => void) | undefined;
-      let cancellationHeartbeat: NodeJS.Timeout | undefined;
-      if (remote) {
-        try {
-          const ctx = activityContext.current();
-          activitySignal = ctx.cancellationSignal;
-          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
-          // Temporal delivers activity cancellation at heartbeat boundaries.
-          // Keep that boundary live after admission while the provider allocates
-          // and provisions the sandbox.
-          cancellationHeartbeat = setInterval(() => ctx.heartbeat({ provisioning: args.kind }), 500);
-          cancellationHeartbeat.unref();
-        } catch {
-          // Direct activity unit tests have no ambient Temporal context.
-        }
-      }
-      const stopCancellationHeartbeat = () => {
-        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
-        cancellationHeartbeat = undefined;
-      };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         try {
@@ -1519,6 +1522,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
       } finally { stopCancellationHeartbeat(); }
       })));
+      } finally { stopCancellationHeartbeat(); }
     },
 
     /** The effective provider for a role's turn (task override → seeded profile),
