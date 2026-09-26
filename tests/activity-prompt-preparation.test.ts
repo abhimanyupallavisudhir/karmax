@@ -18,7 +18,7 @@ async function fixture(options: { goal?: boolean; remoteWiki?: boolean } = {}) {
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-review-'));
   store = await Store.create(':memory:');
   const project = await store.createProject('Prompt');
-  const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do', workflowVersion: '1.0.0', params: {} });
+  const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
   const worlds = new WorldRegistry();
   world = await worlds.create('memory', { taskId: task.id, base: 'main' });
   vi.spyOn(worlds, 'open').mockResolvedValue(world);

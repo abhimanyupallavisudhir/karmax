@@ -29,7 +29,7 @@ describe('portable world checkpoints', () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Clean', { repos: [repo] });
     const task = await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: {} });
+      workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
     const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
@@ -82,7 +82,7 @@ describe('portable world checkpoints', () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Cloud recovery', { repos: [ssh], defaultBase: 'main' });
     const task = await store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: {} });
+      workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
     const worktrees = new WorktreeProvider(path.join(dir, 'unused'));
     const worlds = new WorldRegistry();
     const open = async (handle: any) => {
@@ -100,7 +100,7 @@ describe('portable world checkpoints', () => {
       },
       async writeFile(file: string, bytes: string | Buffer) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes); },
     };
-    worlds.register({ kind: 'checkpoint-cloud', async create(spec) {
+    worlds.register({ kind: 'checkpoint-cloud', parkable: true, async create(spec) {
       const root = path.join(dir, `cloud-${spec.generation ?? 1}`);
       const provisioned = await provisionGitRepos(target, spec, { root, home: dir, sshUrlError: 'ssh only', copyGlobsWarning: '' });
       return open({ id: task.id, kind: 'checkpoint-cloud', root, base: spec.base,

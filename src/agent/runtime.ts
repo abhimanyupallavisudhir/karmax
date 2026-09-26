@@ -290,7 +290,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       }, 1_000)
     : undefined;
   const secretPoll = liveSecretEnv ? pollSecretEnv(liveSecretEnv, deps.pullSecretEnv!, secretEnvListeners) : undefined;
-  let turn;
+  let turn: AdapterTurn;
   try {
     await observe(() => deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' }));
     if (observerFailed) throw observerError;

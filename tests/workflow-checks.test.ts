@@ -171,10 +171,10 @@ it('replays only organization task histories from a repeatable streamed snapshot
   });
   try {
     const project = await store.createProject('Owned replay');
-    const task = await store.createTask({ projectId: project.id, title: 'Owned', workflow: 'software-dev', workflowVersion: '1', params: {} });
+    const task = await store.createTask({ projectId: project.id, title: 'Owned', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
     const foreign = await store.createOrganization({ name: 'Foreign replay' });
     const foreignProject = await store.createProject('Foreign', {}, foreign.id);
-    const foreignTask = await store.createTask({ projectId: foreignProject.id, title: 'Private', workflow: 'software-dev', workflowVersion: '1', params: {} });
+    const foreignTask = await store.createTask({ projectId: foreignProject.id, title: 'Private', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
     executions.push({ workflowId: task.id, runId: 'owned-run' }, { workflowId: foreignTask.id, runId: 'foreign-run' }, { workflowId: 'merge-queue:global', runId: 'shared-run' });
     const result = await core.runWorkflowChecks({ taskId: task.id, worldHandle: { kind: 'scoped-world', id: task.id, root, branch: 'b', base: 'main' } as any });
     expect(result.passed, result.detail).toBe(true);
@@ -189,7 +189,7 @@ it('replays only organization task histories from a repeatable streamed snapshot
 it('RT-19 fails closed at snapshot byte limits and removes the private spool', async () => {
   const store = await Store.create(':memory:');
   const project = await store.createProject('Replay bound');
-  const task = await store.createTask({ projectId: project.id, title: 'Bound', workflow: 'software-dev', workflowVersion: '1', params: {} });
+  const task = await store.createTask({ projectId: project.id, title: 'Bound', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
   const client = { options: { namespace: 'fixture' }, workflow: {
     list: async function* () { yield { workflowId: task.id, runId: 'run' }; },
   }, workflowService: { getWorkflowExecutionHistory: async () => ({ history: { events: [{ eventId: 1, eventType: 1, workflowExecutionStartedEventAttributes: { workflowType: { name: 'fixture' } } }] } }) } } as any;

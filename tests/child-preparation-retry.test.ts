@@ -8,7 +8,7 @@ import { makeCoreActivities } from '../src/activities/core.js';
 it('RT-15 reuses the child after a post-create activity failure but distinguishes new requests', async () => {
   const store = await Store.create(':memory:');
   const project = await store.createProject('Children');
-  const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params: {} });
+  const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
   let activityId = 'prepare-1';
   vi.spyOn(Context, 'current').mockImplementation(() => ({ info: { activityId,
     workflowExecution: { workflowId: parent.id, runId: 'run-1' } } }) as any);

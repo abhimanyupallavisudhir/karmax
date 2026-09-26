@@ -12,7 +12,7 @@ describe('durable conversation publication', () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Turn cleanup');
     const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: {} });
+      workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
     const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
       profiles: new ProfileResolver(store, 'mock') });
     const retryKeys = [`turnsession:${task.id}#0`, `turnsession:${task.id}:run#1`,

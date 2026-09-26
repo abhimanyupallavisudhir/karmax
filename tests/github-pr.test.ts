@@ -1988,7 +1988,7 @@ describe('PR lifecycle after the merge', () => {
   it('RT-20 finds the accepted cancellation comment after its acknowledgement is lost', async () => {
     const { gh, core, handle, prs } = await withOpenPr();
     const original = GithubPrApi.prototype.comment;
-    const comment = vi.spyOn(GithubPrApi.prototype, 'comment').mockImplementationOnce(async function(slug, number, body) {
+    const comment = vi.spyOn(GithubPrApi.prototype, 'comment').mockImplementationOnce(async function(this: GithubPrApi, slug, number, body) {
       await original.call(this, slug, number, body);
       throw new Error('connection lost after comment');
     });

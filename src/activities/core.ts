@@ -1188,7 +1188,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // A gap between two agent turns is not an idle world.
             const sourceBusy = async () => {
               const view = await store.taskExecutionState(forkSource.taskId);
-              if (view && ['done', 'cancelled', 'failed'].includes(view.status)) return false;
+              if (view && ['done', 'cancelled', 'failed'].includes(view.status ?? '')) return false;
               return view?.status === 'active' || Boolean(view?.agentTurn);
             };
             if ((await sourceBusy())) (await record(args.taskId, 'world.fork-waiting', { sourceTaskId: forkSource.taskId }));
@@ -2607,7 +2607,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   organizationId: (await store.getProject(args.task.projectId))?.organizationId,
                   capabilities: args.task.grant,
                 },
-                onSpend: async (req: any, outcome: any) => (await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason })),
+                onSpend: async (req: any, outcome: any) => { await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }); },
                 fillPaymentCard: async (fill: {
                   requestId: string;
                   cdpUrl: string;
@@ -5080,7 +5080,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let idempotencyKey: string | undefined;
       try {
         const { info } = activityContext.current();
-        idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
+        if (info.workflowExecution) idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
       } catch { /* Direct calls represent distinct requests. */ }
       let child = (await store.createTask({
         projectId: args.projectId,
