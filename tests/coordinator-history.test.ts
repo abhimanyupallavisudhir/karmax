@@ -89,3 +89,10 @@ it('WF-22: failed grant delivery does not return an already cancelled lease twic
     queue: [{ taskId: 'holder', turnId: 'held', allowed: ['login'] }], processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
   expect(state.handlers.get('accounts')!().accounts[0].inUse).toBe(0);
 });
+
+it('WF-5: identifies acknowledgements served by a run continuing as new', async () => {
+  await expect(accountCoordinator({ state: { accounts: [], queue: [{ taskId: 'waiting', turnId: 'turn' }],
+    processed: 0 } })).rejects.toBe(stop);
+  expect(state.handlers.get('accountLease')!({ taskId: 'waiting', turnId: 'turn' }))
+    .toEqual({ waiting: false, continuingAsNew: true });
+});

@@ -317,13 +317,17 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_LEASE_ACCOUNT,
         signalArgs: [{ taskId, turnId, provider, allowed }],
       });
-      // A consistent query after signal acceptance observes the coordinator after
-      // it has either parked this request or sent its grant/denial signal. This
-      // lets the task publish a login-wait label only for a genuine queue wait.
-      return await client.workflow.getHandle(accountCoordinatorId()).query(
-        QRY_ACCOUNT_LEASE,
-        { taskId, turnId },
-      ) as { waiting: boolean; earliestResetAt?: number; detail?: string };
+      // A query may still be served by the closing run during continue-as-new.
+      // Retry that acknowledgement without issuing another lease request.
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const acknowledgement = await client.workflow.getHandle(accountCoordinatorId()).query(
+          QRY_ACCOUNT_LEASE,
+          { taskId, turnId },
+        ) as { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true };
+        if (!acknowledgement.continuingAsNew) return acknowledgement;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1000)));
+      }
+      throw new Error('Account coordinator is still continuing as new; retry lease acknowledgement');
     },
     /** Remove a not-yet-granted account request when its task/turn is cancelled. */
     async cancelAccount(taskId: string, turnId: string): Promise<void> {

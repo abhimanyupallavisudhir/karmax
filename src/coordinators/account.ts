@@ -182,7 +182,7 @@ export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; wi
 export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export const accountLeaseQuery = defineQuery<
-  { waiting: boolean; earliestResetAt?: number; detail?: string },
+  { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true },
   [{ taskId: string; turnId?: string }]
 >(QRY_ACCOUNT_LEASE);
 export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
@@ -203,6 +203,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   let queue = input.state?.queue ?? [];
   let granted = (input.state?.granted ?? []).map((g) => ({ ...g, grantedAt: g.grantedAt ?? Date.now() }));
   let processed = input.state?.processed ?? 0;
+  // Query-only metadata: never participates in workflow command decisions.
+  let continuingAsNew = false;
   // Whether `returnAccount` gives capacity back ONLY when it can attribute the
   // return to a granted-lease record (see the handler below). Gated like
   // `account-coordinator-lease-sweep-v1`: the pre-fix handler decremented `inUse`
@@ -438,6 +440,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     waiting: queue.length,
   }));
   setHandler(accountLeaseQuery, ({ taskId, turnId }) => {
+    if (continuingAsNew) return { waiting: false, continuingAsNew: true as const };
     const req = queue.find((r) => r.taskId === taskId && (turnId === undefined || r.turnId === turnId));
     if (!req) return { waiting: false };
     const compatible = accounts.filter((a) => req.allowed !== undefined
@@ -466,8 +469,10 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     || workflowInfo().historyLength >= 10_000 || workflowInfo().continueAsNewSuggested;
   async function rotateIfNeeded() {
     // Migrate at a command boundary; the new loop policy lives in the next run's input.
-    if ((!boundedHistory && patched('account-history-policy-v2')) || (boundedHistory && historyFull()))
+    if ((!boundedHistory && patched('account-history-policy-v2')) || (boundedHistory && historyFull())) {
+      continuingAsNew = true;
       await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, granted, processed: 0, historyPolicyVersion: 2 } });
+    }
   }
 
   for (;;) {
@@ -484,6 +489,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     } else if (!patched('account-coordinator-rotation-v2')) {
       await condition(() => queue.length > 0 || processed >= CONTINUE_AFTER);
       if (processed >= CONTINUE_AFTER && queue.length === 0 && !accounts.some((a) => a.status === 'exhausted')) {
+        continuingAsNew = true;
         await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, processed: 0 } });
       }
     } else {
@@ -497,6 +503,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       if (shouldRotate()) {
         // `granted` must survive rotation: dropping it would resurrect the leak it
         // exists to close (`inUse` would stay charged with no record of who owes it).
+        continuingAsNew = true;
         await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, granted, processed: 0 } });
       }
     }

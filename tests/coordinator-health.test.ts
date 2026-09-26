@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { WorkflowNotFoundError } from '@temporalio/client';
 import { healCoordinators } from '../src/platform/coordinator-health.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
@@ -273,14 +273,32 @@ describe('WF-13: lease-holder liveness', () => {
   });
 });
 
-it('replays coordinator histories recorded before the history-policy migration', async () => {
+it('replays coordinator histories recorded before the history-policy and acknowledgement changes', async () => {
   const { Worker, bundleWorkflowCode } = await import('@temporalio/worker');
   const { temporal } = await import('@temporalio/proto');
   const fs = await import('node:fs');
   const { fileURLToPath } = await import('node:url');
   const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
-  for (const name of ['accountCoordinator', 'mergeQueue']) {
-    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/review-legacy-${name}.json`, import.meta.url), 'utf8')));
+  // Policy v2 was recorded from 0cddcb35: grant, park, return, grant and return.
+  for (const name of ['review-legacy-accountCoordinator', 'review-legacy-mergeQueue', 'account-history-policy-v2']) {
+    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8')));
     await Worker.runReplayHistory({ workflowBundle }, history);
   }
 }, 60_000);
+
+it('WF-5: retries a lease acknowledgement from a coordinator continuing as new', async () => {
+  vi.useFakeTimers();
+  try {
+    const query = vi.fn().mockResolvedValueOnce({ waiting: false, continuingAsNew: true })
+      .mockResolvedValueOnce({ waiting: true, detail: 'Waiting for a free slot on an allowed account' });
+    const signalWithStart = vi.fn(async () => undefined);
+    const activity = makeCoordinatorActivities({ client: { workflow: {
+      signalWithStart, getHandle: () => ({ query }),
+    } } as never, taskQueue: 'queue' });
+    const pending = activity.leaseAccount('task', 'turn', 'mock');
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toEqual({ waiting: true, detail: 'Waiting for a free slot on an allowed account' });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(signalWithStart).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
+});
