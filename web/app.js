@@ -1323,7 +1323,7 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
+    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
@@ -1357,13 +1357,7 @@ function readResponder(box) {
     return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
   }
   const ab = box.querySelector('.agent-field');
-  const route = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
-  const model = ab.querySelector('.af-model').value.trim();
-  const effort = ab.querySelector('.af-effort').value;
-  if (model) route.model = model;
-  if (effort) route.effort = effort;
-  const resumeFrom = readResume(ab);
-  if (resumeFrom) route.resumeFrom = resumeFrom;
+  const route = { kind: 'agent', ...readAgentSpec(ab) };
   const prompt = box.querySelector('.rf-prompt')?.value ?? '';
   const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
