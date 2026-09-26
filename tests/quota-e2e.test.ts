@@ -3,6 +3,8 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { accountCoordinatorId } from '../src/coordinators/names.js';
 import { newId } from '../src/util/id.js';
+import { MockAdapter } from '../src/agent/mock.js';
+import { ProviderPolicyFailure } from '../src/agent/limits.js';
 
 /**
  * End-to-end park→refresh→resume at the WORKFLOW layer (RESOLVE-PLAN §2): a real
@@ -12,7 +14,19 @@ import { newId } from '../src/util/id.js';
  */
 describe('quota park → resume (software-dev task, mock agent)', () => {
   let h: Harness;
-  beforeAll(async () => { h = await bootHarness('mock'); }, 60_000);
+  beforeAll(async () => {
+    const mock = new MockAdapter();
+    h = await bootHarness('mock', {
+      provider: 'mock',
+      async runTurn(input, ctx) {
+        if (input.role === 'do' && input.messages.some(message => message.text.includes('@policy-fixture'))) {
+          throw new ProviderPolicyFailure({ code: 'misalignmentPolicyViolation',
+            message: 'HTTP 401: This request was blocked by our safety systems. Reason: Potentially unintended activity.' }, 'mock');
+        }
+        return mock.runTurn(input, ctx);
+      },
+    });
+  }, 60_000);
   afterAll(async () => { await h?.stop(); });
 
   it('escalates a safety block once while another task can use the same account', async () => {
@@ -30,7 +44,7 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
           project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } }],
       });
     };
-    const blocked = await start('@fail misalignmentPolicyViolation HTTP 401: This request was blocked by our safety systems. Reason: Potentially unintended activity.');
+    const blocked = await start('@policy-fixture');
     try {
       await expect.poll(async () => (await blocked.query('view') as any).stage, { timeout: 30_000 }).toBe('escalated');
       const view = await blocked.query('view') as any;
