@@ -284,7 +284,7 @@ export class AgentMail {
       const local = this.fixedLocal ? `${this.fixedLocal}+${token}` : token;
       const address = this.exactAddress ? cleanAddress(this.exactAddress)
         : existing && !this.domain ? existing : `${local}@${this.domain || 'agent.local'}`;
-      const owner = await this.store.kvGet(kvOwner(address));
+      const owner = await this.store.kvGet(kvOwner(address)) || await this.ownerOf(address);
       if (owner && owner !== organizationId) throw new Error('mailbox address is already owned by another organization');
       if (existing && existing !== address) await this.store.kvSet(kvOwner(existing), '');
       await this.store.kvSet(kvOwner(address), organizationId);

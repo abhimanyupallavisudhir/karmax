@@ -195,6 +195,16 @@ describe('mail ownership boundaries (AU-1)', () => {
     await expect(mail.address('org_b')).rejects.toThrow(/owned/);
     expect(await mail.ownerOf('shared@example.com')).toBe('org_a');
   });
+  it('preserves legacy full-address ownership and protects subaddresses during migration', async () => {
+    const store = memStore();
+    await store.kvSet('agent-mail:address:org_a', 'legacy@example.com');
+    await store.kvSet('agent-mail:owner:legacy', 'org_a');
+    const mail = new AgentMail(store, undefined, undefined, 'legacy@example.com');
+    await expect(mail.address('org_b')).rejects.toThrow(/owned/);
+    await expect(new AgentMail(store, undefined, undefined, 'legacy+login@example.com').address('org_b')).rejects.toThrow(/owned/);
+    expect(await mail.address('org_a')).toBe('legacy@example.com');
+    expect(await mail.ownerOf('legacy@example.com')).toBe('org_a');
+  });
   it('does not route the same local part on a foreign domain or a rewritten base', async () => {
     const store = memStore();
     const mail = new AgentMail(store, 'example.com', 'base');
