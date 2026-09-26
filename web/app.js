@@ -162,6 +162,7 @@ function rememberInteractionOrigin(event) {
   // Only activation keys count; ordinary typing must never be swallowed, and a
   // paste/drop into a text field is an upload, not an action on that field —
   // marking it pending would disable the field the user is typing in.
+  if (event.type === 'keydown' && (/^(?:INPUT|TEXTAREA)$/.test(control.tagName || '') || control.isContentEditable)) return;
   if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
   if ((event.type === 'paste' || event.type === 'drop') && /^(?:INPUT|TEXTAREA)$/.test(control.tagName || '')) return;
   if (control.classList?.contains('action-pending')) {
