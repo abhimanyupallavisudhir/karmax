@@ -17,7 +17,7 @@ import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
-import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
+import { AgentTurnCancelled, CredentialUnavailable, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
@@ -281,6 +281,16 @@ async function justDoImpl(
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
       if (managedTurns && cancelled && (err instanceof AgentTurnCancelled || isCancellation(err))) break;
+      if (err instanceof CredentialUnavailable && patched('just-do-credential-denial-v1')) {
+        status = 'waiting';
+        waitingFor = { kind: 'human', audience: ['@creator'], detail: err.message };
+        await publish();
+        await condition(() => cancelled || msgs.length > deliveredNow);
+        if (cancelled) break;
+        status = 'active';
+        waitingFor = undefined;
+        continue;
+      }
       // Infrastructure outage that outlived the activity retries: park with
       // backoff and re-run the turn (which resumes its session) rather than
       // failing the task. Anything else propagates as before.
