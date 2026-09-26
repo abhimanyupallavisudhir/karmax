@@ -9,6 +9,7 @@ import type { Message, Provider } from '../domain/types.js';
 import { claudeCwdSlug } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
 import { installLocalCodexSnapshot, readLocalCodexHistory } from './codex-history-files.js';
+import { publicFetch, publicUrl } from '../mcp/connections/http.js';
 
 const pexec = promisify(execFile);
 const VENDORED_PANAGENT = fileURLToPath(new URL('../../vendor/panagent/src', import.meta.url));
@@ -88,7 +89,7 @@ export async function exportConversationWithPanagent(opts: {
 
 export function publicConversationShare(value: string): string | undefined {
   let url: URL;
-  try { url = new URL(value); } catch { return undefined; }
+  try { url = publicUrl(value); } catch { return undefined; }
   const host = url.hostname.toLowerCase();
   const supported = (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'claude.ai' || host === 'www.claude.ai')
     && url.pathname.startsWith('/share/');
@@ -113,6 +114,16 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
       : 'path' in opts.source
         ? opts.source.path
         : path.join(temporary, safeSourceName(opts.source.name));
+    const format: string[] = [];
+    if ('url' in opts.source) {
+      const url = publicConversationShare(opts.source.url);
+      if (!url) throw new PanagentError('Use a public HTTPS ChatGPT or Claude share URL');
+      const response = await publicFetch(url);
+      if (!response.ok) throw new PanagentError(`Share request returned HTTP ${response.status}`);
+      source = path.join(temporary, 'share.html');
+      fs.writeFileSync(source, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
+      format.push('--from', new URL(url).hostname.endsWith('claude.ai') ? 'claude-share' : 'chatgpt-share');
+    }
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });
     if (!('url' in opts.source)) {
       const raw = fs.readFileSync(source);
@@ -140,7 +151,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
       const sessionId = crypto.randomUUID();
       const output = path.join(temporary, `${sessionId}.jsonl`);
       await runPanagent([
-        'convert', source, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
+        'convert', source, ...format, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
         '--mode', opts.mode, '--session-id', sessionId, '--cwd', opts.worldPath,
         '--browser', 'never', '--quiet', '-o', output,
       ]);
@@ -148,7 +159,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
       return { kind: 'native', sessionId };
     }
     const output = path.join(temporary, 'conversation.md');
-    await runPanagent(['convert', source, '--to', 'markdown', '--browser', 'never', '--quiet', '-o', output]);
+    await runPanagent(['convert', source, ...format, '--to', 'markdown', '--browser', 'never', '--quiet', '-o', output]);
     const transcript = fs.readFileSync(output, 'utf8').trim();
     if (!transcript) throw new PanagentError('panagent produced an empty conversation');
     return {
