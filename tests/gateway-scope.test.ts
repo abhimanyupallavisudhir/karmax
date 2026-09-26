@@ -102,6 +102,15 @@ describe('gateway request scope for bare-id routes', () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
+  it('audits denied reads but omits successful read traffic', async () => {
+    const count = async () => Number(((await store.db.prepare('SELECT COUNT(*) n FROM audit_log').get()) as any).n);
+    const before = await count();
+    expect((await fetch(`${base}/api/projects/${mine}`, { headers: auth() })).status).toBe(200);
+    expect(await count()).toBe(before);
+    expect((await fetch(`${base}/api/projects/${theirs}`, { headers: auth() })).status).toBe(403);
+    expect(await count()).toBe(before + 1);
+  });
+
   it('refuses PATCH/DELETE /api/tags/:id across a project and tenant boundary', async () => {
     const foreign = (await store.createTag({ projectId: theirs, name: 'security' }));
     const own = (await store.createTag({ projectId: mine, name: 'bug' }));

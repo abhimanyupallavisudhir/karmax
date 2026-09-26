@@ -1,15 +1,146 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { Store, isReviewRequestEvent, deleteRows } from '../src/store/db.js';
 
 describe('Store', () => {
   let store: Store;
   beforeEach(async () => {
     store = (await Store.create(':memory:'));
+  });
+
+  it('finds a merged result without loading the task event history', async () => {
+    const project = await store.createProject('Merge');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 1, payload: { merged: false } });
+    expect(await store.hasMergedTaskEvent(task.id)).toBe(false);
+    await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 2, payload: { merged: true } });
+    expect(await store.hasMergedTaskEvent(task.id)).toBe(true);
+  });
+
+  it('deduplicates GitHub PR observations and expires them after a month', async () => {
+    expect(await store.claimGithubPrObservation('digest', 1000)).toBe(true);
+    expect(await store.claimGithubPrObservation('digest', 1001)).toBe(false);
+    expect((await store.retentionSweep(1000 + 31 * 86400_000)).githubPrObservations).toBe(1);
+    expect(await store.claimGithubPrObservation('digest', 1000 + 31 * 86400_000)).toBe(true);
+  });
+
+  it('removes project admission reservations with the project', async () => {
+    const project = await store.createProject('Reservations');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.db.prepare(`INSERT INTO usage_admissions
+      (id, organizationId, projectId, taskId, kind, provider, fundingSource, state, createdAt)
+      VALUES (?, ?, ?, ?, 'agent', 'mock', 'byok', 'active', 1)`)
+      .run('reservation', project.organizationId, project.id, task.id);
+    await store.deleteProject(project.id);
+    expect(await store.db.prepare('SELECT id FROM usage_admissions WHERE projectId=?').all(project.id)).toEqual([]);
+  });
+
+  it('exports personal data without holding a database write transaction', async () => {
+    vi.spyOn(store, 'getSettings').mockImplementation(async () => {
+      expect(store.db.inTransaction()).toBe(false);
+      return undefined;
+    });
+    await store.exportUserData('no-records');
+  });
+
+  it('looks up literal kv prefixes through the primary-key range', async () => {
+    await store.kvSet('case:A', 'one');
+    await store.kvSet('case:a', 'two');
+    await store.kvSet('case%literal', 'three');
+    const prepare = vi.spyOn(store.db, 'prepare');
+    expect(await store.kvEntries('case:A')).toEqual([{ key: 'case:A', value: 'one' }]);
+    expect(await store.kvEntries('case%')).toEqual([{ key: 'case%literal', value: 'three' }]);
+    expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k >= \? AND k < \?/.test(sql))).toBe(true);
+  });
+
+  it('indexes event type with task id for inbox and approval scans', async () => {
+    const indexes = await store.db.prepare('PRAGMA index_list(events)').all() as Array<{ name: string }>;
+    expect(indexes.map((row) => row.name)).toContain('idx_events_type');
+  });
+
+  it('does not rescan completed row migrations on each boot', async () => {
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    await (store as any).migrateData();
+    expect(queries.some((sql) => /SELECT id, config FROM projects|SELECT k, v FROM kv WHERE k LIKE 'vault:items/.test(sql))).toBe(false);
+  });
+
+  it('expires old events and audit entries while retaining recent history', async () => {
+    expect(((await store.db.prepare('PRAGMA synchronous').get()) as { synchronous: number }).synchronous).toBe(1);
+    const now = Date.UTC(2026, 8, 26);
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: { text: 'old' } });
+    await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 1 * 86400_000, payload: { text: 'new' } });
+    await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
+    await store.appendAudit({ principalId: 'user:a', action: 'new', ts: now - 1 * 86400_000 });
+    const swept = await store.retentionSweep(now);
+    expect(swept.events).toBe(1);
+    expect(swept.auditEntries).toBe(1);
+    expect((await store.eventsSince(task.id, 0)).map((event) => event.payload.text)).toEqual(['new']);
+    expect((await store.db.prepare('SELECT action FROM audit_log ORDER BY seq').all())).toEqual([{ action: 'new' }]);
+  });
+
+  it('retains old unresolved approval requests until their resolution is recorded', async () => {
+    const now = Date.UTC(2026, 8, 26);
+    const project = await store.createProject('Approvals');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested',
+      ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
+    expect((await store.retentionSweep(now)).events).toBe(0);
+    await store.appendEvent({ taskId: task.id, type: 'permission.approval-resolved',
+      ts: now, payload: { requestId: 'ask' } });
+    expect((await store.retentionSweep(now)).events).toBe(1);
+  });
+
+  it('revokes project-scoped tokens through indexed project membership', async () => {
+    const project = await store.createProject('Tokens');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.putScopedToken('by-project', 'one', { principal: 'user:a', projectId: project.id }, Date.now() + 1000);
+    await store.putScopedToken('by-task', 'two', { principal: 'user:b', taskId: task.id }, Date.now() + 1000);
+    await store.putScopedToken('other', 'three', { principal: 'user:c', projectIds: ['unrelated'] }, Date.now() + 1000);
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    expect(await store.revokeScopedTokens({ projectId: project.id })).toBe(2);
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+      .toEqual([{ tokenHash: 'other' }]);
+    expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
+  });
+
+  it('deprovisions a member without reading every live token body', async () => {
+    const org = await store.createOrganization({ name: 'Tokens', ownerUserId: 'owner' });
+    await store.setOrganizationMembership(org.id, 'member', 'member');
+    await store.putScopedToken('member-token', 'one', { principal: 'user:member', organizationId: org.id }, Date.now() + 60_000);
+    await store.putScopedToken('owner-token', 'two', { principal: 'user:owner', organizationId: org.id }, Date.now() + 60_000);
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    await store.deprovisionOrganizationUser(org.id, 'member');
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+      .toEqual([{ tokenHash: 'owner-token' }]);
+    expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
+  });
+
+  it('backfills indexed scopes on legacy durable tokens', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-token-scope-'));
+    const file = path.join(dir, 'store.db');
+    const legacy = new DatabaseSync(file);
+    legacy.exec(`CREATE TABLE scoped_tokens (tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE,
+      json TEXT NOT NULL, expiresAt INTEGER NOT NULL, revokedAt INTEGER)`);
+    legacy.prepare('INSERT INTO scoped_tokens VALUES (?,?,?,?,NULL)')
+      .run('old-token', 'old-id', JSON.stringify({ principal: 'user:old', projectIds: ['project-old'] }), Date.now() + 60_000);
+    legacy.close();
+    const migrated = await Store.create(file);
+    try {
+      expect(await migrated.revokeScopedTokens({ projectId: 'project-old' })).toBe(1);
+    } finally { await migrated.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
@@ -62,6 +193,7 @@ describe('Store', () => {
     (await legacy.recordUsage({ id: 'provider-execution', organizationId: 'org_personal', provider: 'e2b',
       kind: 'world.active', quantity: 300, unit: 'second', costMicros: 9_075,
       startedAt: 1, endedAt: 2, metadata: { source: 'provider-lifecycle', executionId: 'execution-1' } }));
+    (await legacy.kvDelete('migration:data-2026-09-26')); // Simulate a pre-migration database.
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));
@@ -95,6 +227,7 @@ describe('Store', () => {
     (await s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
       capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], maxTurns: 24 } as any));
     (await s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
     expect((await s2.getProfile('do-default'))!.maxTurns).toBeUndefined(); // legacy cap stripped
@@ -124,6 +257,7 @@ describe('Store', () => {
       item({ id: 'vi_d', label: 'Conduit', domains: ['demo.realworld.show'],
         provenance: { source: 'task:task_x', taskId: 'task_x', at: 1 } }),
     ])));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
     const byId: Record<string, any> = Object.fromEntries(
@@ -152,6 +286,7 @@ describe('Store', () => {
     const intentional = (await s1.createProject('Intentional restriction', {
       ...legacy, network: { unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [] },
     } as any));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     (await s1.close());
 
     const s2 = (await Store.create(dbPath));
@@ -194,6 +329,7 @@ describe('Store', () => {
     const flagged = (await legacy.createTag({ projectId: project.id, name: 'no-merge', kind: 'flag' }));
     // An older build (and `tag_task` before this change) left `kind` NULL.
     (await legacy.db.prepare('UPDATE tags SET kind = NULL WHERE id = ?').run(bare.id));
+    (await legacy.kvDelete('migration:data-2026-09-26'));
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));

@@ -7,12 +7,14 @@ import { promisify } from 'node:util';
 import { ContainerWorldProvider, dockerAvailable } from '../src/world/container.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { buildEnvironment } from '../src/world/environment-build.js';
+import { requireDocker } from './helpers/docker-gate.js';
 
 const pexec = promisify(execFile);
 
 let DOCKER = false;
 beforeAll(async () => {
   DOCKER = await dockerAvailable();
+  if (process.env.KARMAX_SKIP_DOCKER !== '1') requireDocker(DOCKER);
 });
 
 describe.skipIf(process.env.KARMAX_SKIP_DOCKER === '1')('container world (Docker)', () => {
@@ -33,7 +35,6 @@ describe.skipIf(process.env.KARMAX_SKIP_DOCKER === '1')('container world (Docker
   });
 
   it('runs commands inside an isolated container over a host-mounted worktree', async () => {
-    if (!DOCKER) return; // skipped if no docker
     const provider = new ContainerWorldProvider(home);
     const world = await provider.create({ taskId: 'cw1', repo, base: 'main' });
     try {
@@ -58,7 +59,6 @@ describe.skipIf(process.env.KARMAX_SKIP_DOCKER === '1')('container world (Docker
   }, 120_000);
 
   it('builds an immutable environment image and uses it for new worlds', async () => {
-    if (!DOCKER) return;
     const built = await buildEnvironment({
       provider: 'container',
       projectId: 'container-test',

@@ -3,6 +3,9 @@
 node_modules
 coverage
 **/.secrets
+deploy/.turnkey.env*
+deploy/backups
+deploy/.updates
 **/.env
 **/.env.*
 !**/.env.example

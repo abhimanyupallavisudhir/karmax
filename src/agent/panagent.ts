@@ -29,8 +29,10 @@ export interface PanagentImportOptions {
 }
 
 export type PanagentImportResult =
-  | { kind: 'native'; sessionId: string }
-  | { kind: 'context'; message: Message };
+  | { kind: 'native'; sessionId: string; warnings?: PanagentWarning[] }
+  | { kind: 'context'; message: Message; warnings?: PanagentWarning[] };
+
+type PanagentWarning = { code: string; severity: string; message: string; path?: string };
 
 /** Render Karmax's durable, provider-neutral transcript as a resumable native
  * CLI history. API-backed conversations have no file to copy, so this is the
@@ -80,7 +82,7 @@ export async function exportConversationWithPanagent(opts: {
       'convert', input, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
       '--mode', 'transcript', '--session-id', opts.sessionId, '--cwd', opts.cwd ?? '.',
       '--browser', 'never', '--quiet', '-o', output,
-    ]);
+    ], path.join(temporary, 'report.json'));
     return fs.readFileSync(output);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
@@ -128,6 +130,15 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     if (!('url' in opts.source)) {
       const raw = fs.readFileSync(source);
       const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
+      if (opts.native && opts.provider === 'claude') {
+        const native = rewriteClaudeHistory(content, crypto.randomUUID());
+        if (native) {
+          const destination = path.join(opts.forkHome, 'projects', claudeCwdSlug(opts.worldPath), `${native.sessionId}.jsonl`);
+          fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(destination, native.content, { mode: 0o600 });
+          return { kind: 'native', sessionId: native.sessionId, warnings: native.warnings };
+        }
+      }
       let first: any;
       try { first = JSON.parse(content.subarray(0, content.indexOf(10) < 0 ? content.length : content.indexOf(10)).toString()); }
       catch { /* Other formats are handled by panagent. */ }
@@ -150,20 +161,21 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     if (opts.native && (opts.provider === 'claude' || opts.provider === 'codex')) {
       const sessionId = crypto.randomUUID();
       const output = path.join(temporary, `${sessionId}.jsonl`);
-      await runPanagent([
+      const warnings = await runPanagent([
         'convert', source, ...format, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
         '--mode', opts.mode, '--session-id', sessionId, '--cwd', opts.worldPath,
         '--browser', 'never', '--quiet', '-o', output,
-      ]);
+      ], path.join(temporary, 'report.json'));
       installNativeImport(opts.provider, output, sessionId, opts.forkHome, opts.worldPath);
-      return { kind: 'native', sessionId };
+      return { kind: 'native', sessionId, warnings };
     }
     const output = path.join(temporary, 'conversation.md');
-    await runPanagent(['convert', source, ...format, '--to', 'markdown', '--browser', 'never', '--quiet', '-o', output]);
+    const warnings = await runPanagent(['convert', source, ...format, '--to', 'markdown', '--browser', 'never', '--quiet', '-o', output], path.join(temporary, 'report.json'));
     const transcript = fs.readFileSync(output, 'utf8').trim();
     if (!transcript) throw new PanagentError('panagent produced an empty conversation');
     return {
       kind: 'context',
+      warnings,
       message: {
         id: `panagent-${crypto.randomUUID()}`,
         role: 'user',
@@ -174,7 +186,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
           'Do not claim that you generated the imported assistant messages.',
           '',
           '<imported_conversation>',
-          transcript,
+          transcript.replace(/<\/?imported_conversation>/gi, (delimiter) => `&lt;${delimiter.slice(1)}`),
           '</imported_conversation>',
           '',
           'Continue from this context with the next user request.',
@@ -186,18 +198,46 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
   }
 }
 
-async function runPanagent(args: string[]): Promise<void> {
+function rewriteClaudeHistory(content: Buffer, sessionId: string): { sessionId: string; content: string; warnings: PanagentWarning[] } | undefined {
+  const source = content.toString('utf8');
+  const lines = source.split(/\r?\n/);
+  const records: any[] = [];
+  const warnings: PanagentWarning[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    try { records.push(JSON.parse(line)); }
+    catch {
+      if (index !== lines.length - 1 || source.endsWith('\n')) return undefined;
+      warnings.push({ code: 'truncated_final_record', severity: 'warning',
+        message: 'Incomplete final JSONL record was skipped.', path: `records[${index}]` });
+    }
+  }
+  if (!records.some((record) => ['user', 'assistant'].includes(record?.type) && typeof record.sessionId === 'string')) return undefined;
+  const ids = new Map<string, string>();
+  for (const record of records) if (typeof record.uuid === 'string') ids.set(record.uuid, crypto.randomUUID());
+  for (const record of records) {
+    if (typeof record.uuid === 'string') record.uuid = ids.get(record.uuid);
+    if (typeof record.parentUuid === 'string') record.parentUuid = ids.get(record.parentUuid) ?? record.parentUuid;
+    if (typeof record.sessionId === 'string') record.sessionId = sessionId;
+  }
+  return { sessionId, content: records.map((record) => JSON.stringify(record)).join('\n') + '\n', warnings };
+}
+
+async function runPanagent(args: string[], reportFile: string): Promise<PanagentWarning[]> {
   const python = process.env.KARMAX_PANAGENT_PYTHON || 'python3';
-  const env = {
-    ...process.env,
-    PYTHONPATH: [VENDORED_PANAGENT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-  };
+  const env: NodeJS.ProcessEnv = { PYTHONPATH: VENDORED_PANAGENT };
+  for (const key of ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
   try {
-    await pexec(python, ['-m', 'panagent', ...args], {
+    await pexec(python, ['-m', 'panagent', ...args, '--report', reportFile], {
       env,
       timeout: Number(process.env.KARMAX_PANAGENT_TIMEOUT_MS || 90_000),
       maxBuffer: MAX_PANAGENT_OUTPUT,
     });
+    const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+    return Array.isArray(report.warnings) ? report.warnings : [];
   } catch (error: any) {
     const detail = String(error?.stderr || error?.message || error).trim().split(/\r?\n/).slice(-4).join(' ');
     throw new PanagentError(detail.replace(/^panagent:\s*error:\s*/i, '') || 'conversation conversion failed');

@@ -27,12 +27,14 @@ describe('Karmax conversation share acquisition', () => {
     vi.mocked(network.publicFetch).mockImplementation(async () => new Response('<html><div data-message-author-role="user">Guarded share message</div></html>'));
     const result = await importShare(`https://${host}/share/abc`);
     expect(result.kind).toBe('context');
+    expect(result.warnings?.some(warning => warning.code === 'dom_fallback')).toBe(true);
     if (result.kind === 'context') expect(result.message.text).toContain('Guarded share message');
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'share-home-'));
     try {
       const native = await importWithPanagent({ source: { url: `https://${host}/share/abc` }, provider: 'claude',
         forkHome: home, worldPath: '/work', mode: 'context', native: true });
       expect(native.kind).toBe('native');
+      expect(native.warnings?.some(warning => warning.code === 'dom_fallback')).toBe(true);
       expect(network.publicFetch).toHaveBeenCalledTimes(2);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });

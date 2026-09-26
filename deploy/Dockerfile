@@ -20,14 +20,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /bin/bash karmax \
     && mkdir -p /app /var/lib/karmax \
-    && chown -R karmax:karmax /app /var/lib/karmax
+    && chown -R karmax:karmax /var/lib/karmax
 
 WORKDIR /app
-COPY --from=dependencies --chown=karmax:karmax /app/node_modules ./node_modules
-COPY --chown=karmax:karmax package.json package-lock.json tsconfig.json ./
-COPY --chown=karmax:karmax src ./src
-COPY --chown=karmax:karmax web ./web
-COPY --chown=karmax:karmax vendor ./vendor
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY package.json package-lock.json tsconfig.json ./
+COPY src ./src
+COPY web ./web
+COPY vendor ./vendor
 USER karmax
 
 EXPOSE 4505

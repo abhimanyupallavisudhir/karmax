@@ -252,7 +252,7 @@ async function main() {
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
     ...(process.env.KARMAX_SLACK_DELIVERY_URL ? { slack: new WebhookDeliveryAdapter(process.env.KARMAX_SLACK_DELIVERY_URL, 'slack') } : {}),
   }, async (id) => {
-    const user = (await identity.listUsers()).find((candidate) => candidate.id === id);
+    const user = await identity.userById(id);
     return user ? { id: user.id, name: user.name, email: user.email } : undefined;
   });
   // Hosted-plan billing is deliberately a different provider and ledger from
@@ -690,8 +690,7 @@ async function main() {
     if (sourceRestartScheduled || process.env.npm_lifecycle_event === 'dev'
       || event.type !== 'view.updated'
       || (event.payload as { status?: string } | undefined)?.status !== 'done') return;
-    const landed = (await store.eventsSince(event.taskId, 0)).some((candidate) => candidate.type === 'merge.result'
-      && (candidate.payload as { merged?: boolean } | undefined)?.merged === true);
+    const landed = await store.hasMergedTaskEvent(event.taskId);
     if (!landed) return; // manual Done and no-merge workflows changed no live source
     const task = (await store.getTask(event.taskId));
     const handle = ((await store.currentWorld(event.taskId)) ?? task?.lastView?.world) as WorldHandle | undefined;
@@ -706,6 +705,10 @@ async function main() {
     cursor: relayCursor, onError: error => console.warn('  • Worker event relay failed:', error),
   });
   startupReady = true;
+  // Reconcile missed notification close events without delaying the first API response.
+  const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
+  void inboxCleanup.run().catch(error => console.warn('  • Inbox cleanup failed:', error));
+  inboxCleanup.unref();
 }
 
 main().catch((e) => {

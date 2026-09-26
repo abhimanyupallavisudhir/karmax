@@ -9,6 +9,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git, gitOrThrow } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 import { GithubPrApi, githubSlug } from '../src/integrations/github-pr.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
 /**
  * The pull-request integration against **real GitHub**. `github-pr.test.ts` and
@@ -18,7 +19,7 @@ import { GithubPrApi, githubSlug } from '../src/integrations/github-pr.js';
  * own that a PR is `merged` once its commits reach the base branch, its 422 on a
  * duplicate head, and whether the branch push actually authenticates.
  *
- * It self-skips without a GitHub token, and `KARMAX_SKIP_LIVE=1` force-skips it
+ * It requires `KARMAX_RUN_LIVE=1` and a GitHub token
  * (same switch as `live-agent.test.ts` / `cloud-live.test.ts`). It touches a real
  * account: one dedicated **private** repository, reused across runs and left in
  * place (deleting it would need a `delete_repo` token scope this deliberately
@@ -28,7 +29,7 @@ import { GithubPrApi, githubSlug } from '../src/integrations/github-pr.js';
 
 const pexec = promisify(execFile);
 const REPO_NAME = 'karmax-e2e-tests';
-const skipLive = process.env.KARMAX_SKIP_LIVE === '1';
+const skipLive = !liveEnabled();
 
 /** The host's GitHub token, however it is stored (env, then the `gh` login). */
 async function hostToken(): Promise<string | undefined> {
@@ -37,7 +38,7 @@ async function hostToken(): Promise<string | undefined> {
   catch { return undefined; }
 }
 
-const token = await hostToken();
+const token = skipLive ? undefined : await hostToken();
 
 describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', () => {
   let h: Harness;

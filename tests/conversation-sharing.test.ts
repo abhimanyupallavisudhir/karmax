@@ -196,13 +196,26 @@ describe('public conversation sharing over HTTP', async () => {
       const errors: string[] = [];
       page.on('pageerror', error => errors.push(error.message));
       // Deterministic loader fixture; a separate smoke run verifies real MathJax.
-      if (!process.env.KARMAX_TEST_REAL_MATHJAX) await page.route('https://cdn.jsdelivr.net/**', route => route.fulfill({ contentType: 'text/javascript', body: `
+      if (!process.env.KARMAX_TEST_REAL_MATHJAX) {
+        // This fixture has different bytes from the pinned CDN bundle, so let
+        // only its intercepted script bypass SRI in the test browser.
+        await page.addInitScript(() => {
+          const browser = globalThis as any;
+          const append = browser.Element.prototype.appendChild;
+          browser.Element.prototype.appendChild = function (this: any, node: any) {
+            if (node instanceof browser.HTMLScriptElement && node.src.startsWith('https://cdn.jsdelivr.net/npm/mathjax@3.2.2/'))
+              node.removeAttribute('integrity');
+            return append.call(this, node);
+          };
+        });
+        await page.route('https://cdn.jsdelivr.net/**', route => route.fulfill({ contentType: 'text/javascript', body: `
         Object.assign(window.MathJax, { typesetClear() {}, typesetPromise: async nodes => {
           for (const node of nodes) node.innerHTML = '<mjx-container><svg aria-label="math"></svg></mjx-container>';
         } });
         window.MathJax.startup.defaultReady = () => {};
         window.MathJax.startup.ready();
       ` }));
+      }
       await page.goto(`${base}${url}`);
       await page.locator('.md-table').waitFor();
       expect(await page.getByRole('link', { name: 'krmax home' }).getAttribute('href')).toBe('/');

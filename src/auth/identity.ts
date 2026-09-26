@@ -131,6 +131,14 @@ export class IdentityService {
   }
 
   static async create(dbFile: string, opts: IdentityOptions = {}) {
+    if (opts.oidc?.issuer) {
+      // Better Auth now verifies ID tokens against the discovered issuer, but
+      // no longer accepts an operator-specified issuer in GenericOAuthConfig.
+      const response = await fetch(opts.oidc.discoveryUrl, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) throw new Error(`OIDC discovery failed: HTTP ${response.status}`);
+      const discovered = await response.json() as { issuer?: string };
+      if (discovered.issuer !== opts.oidc.issuer) throw new Error('OIDC discovery issuer mismatch');
+    }
     const instance = new IdentityService(dbFile, opts);
     await instance.initialize(dbFile, opts);
     return instance;
@@ -307,9 +315,9 @@ export class IdentityService {
       rateLimit: { enabled: true, window: 60, max: 100 },
       plugins: [admin({ defaultRole: 'user', adminRoles: ['admin'] }),
         ...(opts.oidc ? [genericOAuth({ config: [{ providerId: opts.oidc.providerId,
-          discoveryUrl: opts.oidc.discoveryUrl, issuer: opts.oidc.issuer, clientId: opts.oidc.clientId,
+          discoveryUrl: opts.oidc.discoveryUrl, clientId: opts.oidc.clientId,
           clientSecret: opts.oidc.clientSecret, scopes: opts.oidc.scopes ?? ['openid', 'profile', 'email'],
-          pkce: true, requireIssuerValidation: true }] })] : [])],
+          pkce: true, requireIdTokenVerification: true }] })] : [])],
     });
   }
 
@@ -320,6 +328,9 @@ export class IdentityService {
     await runMigrations();
     if (opts.databaseUrl)
       service.migration = (await importSqliteDatabase(dbFile, service.db, 'identity', { sentinelTable: 'user' }));
+    // Better Auth's first request checks the schema using a separate checkout.
+    // Complete that check before bootstrap takes the SQLite transaction lock.
+    await service.auth.api.getSession({ headers: new Headers() });
     // Better Auth intentionally permits duplicate display names, but every
     // karmax user owns a same-named personal organization. This index closes the
     // concurrent-signup gap around the cross-store application check.
@@ -335,6 +346,11 @@ export class IdentityService {
   async listUsers(): Promise<IdentityUser[]> {
     return ((await this.db.prepare('SELECT id, email, name, role, createdAt FROM user ORDER BY createdAt').all()) as any[])
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
+  }
+
+  async userById(id: string): Promise<IdentityUser | undefined> {
+    const row = await this.db.prepare('SELECT id, email, name, role, createdAt FROM user WHERE id=?').get(id) as any;
+    return row ? { ...row, createdAt: new Date(row.createdAt) } : undefined;
   }
 
   /** Connect Better Auth's user lifecycle to the organization namespace. */

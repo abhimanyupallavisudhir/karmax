@@ -2,15 +2,16 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
 /**
  * Live end-to-end test with a REAL coding agent (no mock). Gated on a real key
  * so the hermetic suite stays free/fast. Proves karmax drives a real model to
  * produce real code that merges into the user's repo — the whole point.
  *
- * Run with: OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
+ * Run with: KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
  */
-const LIVE = !!process.env.OPENAI_API_KEY && process.env.KARMAX_SKIP_LIVE !== '1';
+const LIVE = liveEnabled() && !!process.env.OPENAI_API_KEY;
 
 describe.skipIf(!LIVE)('live agent (real model, real git)', () => {
   let h: Harness;

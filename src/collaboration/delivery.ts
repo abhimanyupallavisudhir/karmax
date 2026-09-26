@@ -88,7 +88,7 @@ export class DeliveryDispatcher {
       try {
         const adapter = this.adapters[claim.channel];
         if (!adapter) throw new Error(`${claim.channel} delivery is enabled but no adapter is configured`);
-        const task = (await this.store.getTask(claim.inbox.taskId));
+        const task = (await this.store.taskHeaders([claim.inbox.taskId])).get(claim.inbox.taskId);
         await adapter.deliver({ inbox: claim.inbox,
           task: task ? { id: task.id, num: task.num, title: task.title } : undefined,
           user: (await this.user?.(claim.inbox.userId)) });

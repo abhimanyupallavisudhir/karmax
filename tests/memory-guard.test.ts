@@ -84,9 +84,11 @@ describe('sandbox memory guard', () => {
       fs.writeFileSync(path.join(proc, 'meminfo'), 'MemTotal:        2030592 kB\nMemAvailable:      81920 kB\n');
       expect(await exited).toBe('SIGKILL');
       const logFile = path.join(dir, 'memory-guard.log');
-      for (let i = 0; i < 100 && !fs.existsSync(logFile); i++) await new Promise((r) => setTimeout(r, 20));
+      const loggedKill = new RegExp(`killed PID ${hog.pid} \\(sleep 30\\) using 1200 MB: the sandbox had 80 MB of 1983 MB memory left`);
+      for (let i = 0; i < 100 && (!fs.existsSync(logFile) || !loggedKill.test(fs.readFileSync(logFile, 'utf8'))); i++)
+        await new Promise((r) => setTimeout(r, 20));
       const log = fs.readFileSync(logFile, 'utf8');
-      expect(log).toMatch(new RegExp(`killed PID ${hog.pid} \\(sleep 30\\) using 1200 MB: the sandbox had 80 MB of 1983 MB memory left`));
+      expect(log).toMatch(loggedKill);
       const guards = spawnSync('pgrep', ['-f', `${dir}/memory-guard.sh run`], { encoding: 'utf8' }).stdout.trim().split('\n');
       expect(guards).toEqual([String(guardPid)]);
       // Removing the injection directory retires the guard.
