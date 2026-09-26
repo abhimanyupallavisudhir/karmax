@@ -40,8 +40,7 @@ export async function runOrThrow(target: ProvisionTarget, command: string, timeo
  * tokens use HTTPS askpass; legacy/non-GitHub sources may use SSH keys. The
  * caller deletes every karmax-auth-* file before the agent runs. */
 export async function provisionGitCredentials(target: ProvisionTarget, spec: WorldSpec, home: string): Promise<void> {
-  const values = [spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
-    .filter((value): value is string => Boolean(value));
+  const values = repositoryKeys(spec);
   const tokens = Object.values(spec.gitCredentials?.httpsTokens ?? {})
     .filter((value): value is string => Boolean(value));
   if (!values.length && !tokens.length) return;
@@ -66,6 +65,11 @@ esac
 `);
     await runOrThrow(target, `chmod 600 ${quote(tokenFile)} && chmod 700 ${quote(askpassFile)}`);
   }
+}
+
+function repositoryKeys(spec: WorldSpec): string[] {
+  return Object.entries(spec.gitCredentials?.repositories ?? {})
+    .filter(([source, key]) => key && !spec.gitCredentials?.httpsTokens?.[source]).map(([, key]) => key);
 }
 
 export function credentialFile(home: string, index: number): string {
@@ -114,8 +118,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   if (workdir) {
     await runOrThrow(target, `mkdir -p ${quote(workdir)}`);
   }
-  const uniqueKeys = [...new Set([spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
-    .filter((value): value is string => Boolean(value)))];
+  const uniqueKeys = [...new Set(repositoryKeys(spec))];
   const uniqueTokens = [...new Set(Object.values(spec.gitCredentials?.httpsTokens ?? {})
     .filter((value): value is string => Boolean(value)))];
   const repos: WorldRepo[] = [];
@@ -125,7 +128,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     let base = branchPolicy?.base ?? spec.base;
     let targetBranch = branchPolicy?.target ?? spec.target;
     const repoRoot = multi ? path.posix.join(root, names[index]!) : root;
-    const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
+    const key = spec.gitCredentials?.httpsTokens?.[source] ? undefined : spec.gitCredentials?.repositories?.[source];
     const token = spec.gitCredentials?.httpsTokens?.[source];
     const keyIndex = key ? uniqueKeys.indexOf(key) : -1;
     const tokenIndex = token ? uniqueTokens.indexOf(token) : -1;

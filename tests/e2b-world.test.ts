@@ -331,7 +331,7 @@ describe('E2B cloud world provider', () => {
       taskId: 'private',
       base: 'main',
       repo: 'git@github.com:acme/private.git',
-      gitCredentials: { sshKey: 'PRIVATE CLONE KEY' },
+      gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'PRIVATE CLONE KEY' } },
     });
 
     expect(writes.get('/home/user/.ssh/karmax-auth-0')).toContain('PRIVATE CLONE KEY');

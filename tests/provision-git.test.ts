@@ -31,6 +31,20 @@ describe('shared cloud world git provisioning', () => {
     delete process.env.KARMAX_WORLD_CLONE_RETRY_MS;
   });
 
+  it('never uploads a personal key and prefers repository tokens (WD-5)', async () => {
+    const { target, commands } = fakeTarget(command => command.includes('rev-parse') ? { stdout: 'a'.repeat(40) } : undefined);
+    const writes: string[] = [];
+    target.writeFile = async (_path, data) => { writes.push(String(data)); };
+    const spec = { taskId: 'credentials', base: 'main', repo: 'git@github.com:acme/app.git',
+      gitCredentials: { sshKey: 'personal-key', repositories: { 'git@github.com:acme/app.git': 'repo-key' },
+        httpsTokens: { 'git@github.com:acme/app.git': 'repo-token' } } };
+    await provisionGitCredentials(target, spec, OPTIONS.home);
+    await provisionGitRepos(target, spec, OPTIONS);
+    expect(writes.join('')).not.toContain('personal-key');
+    expect(writes.join('')).not.toContain('repo-key');
+    expect(commands.find(command => command.includes('git clone'))).toContain('GIT_ASKPASS');
+  });
+
   it('creates a plain directory without invoking Git when there are no repositories', async () => {
     const { target, commands } = fakeTarget(() => undefined);
     const provisioned = await provisionGitRepos(target, { taskId: 't0', base: 'main', repos: [] }, OPTIONS);

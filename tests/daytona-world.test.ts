@@ -264,7 +264,7 @@ describe('Daytona cloud world provider', () => {
     sandbox.updateNetworkSettings = vi.fn(async () => { expect(commands.at(-1)).toContain('rm -f'); });
     const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
     await new DaytonaWorldProvider({ create, get: async () => sandbox }).create({
-      taskId: 'ssh', base: 'main', repo: 'git@github.com:acme/private.git', gitCredentials: { sshKey: 'test-key' },
+      taskId: 'ssh', base: 'main', repo: 'git@github.com:acme/private.git', gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'test-key' } },
     });
     expect(create.mock.calls[0]![0]).toMatchObject({ networkBlockAll: false });
     expect(create.mock.calls[0]![0]).not.toHaveProperty('domainAllowList');
@@ -362,7 +362,7 @@ describe('Daytona cloud world provider', () => {
     sandbox.fs.uploadFile = async (value, file) => { writes.set(file, value); };
     const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
     const world = await provider.create({ taskId: 'private', base: 'main', repo: 'git@github.com:acme/private.git',
-      gitCredentials: { sshKey: 'PRIVATE KEY' } });
+      gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'PRIVATE KEY' } } });
     expect(writes.get('/home/daytona/.ssh/karmax-auth-0')?.toString()).toContain('PRIVATE KEY');
     expect(commands.some((command) => command.includes('GIT_SSH_COMMAND=') && command.includes('git clone'))).toBe(true);
     expect(commands.at(-1)).toContain('rm -f');
