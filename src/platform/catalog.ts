@@ -180,7 +180,7 @@ export const PLATFORM_API_CATALOG = {
   review: [
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
     'POST /api/tasks/:taskId/review-action/:procId/stop', 'GET /api/tasks/:taskId/artifact?path=',
-    'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
+    'POST /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
     'GET /api/tasks/:taskId/resources?summary=metadata (fast list without scanning the world; includes excluded, automaticReview, selectionFrozen)',
     'PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:boolean} (task:review:execute; reversible until confirmation; included resources are adopted/updated automatically after all review layers approve)', 'POST /api/tasks/:taskId/resources/:resourceId/promote',
     'POST /api/tasks/:taskId/resources/:resourceId/discard',
@@ -198,7 +198,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/settings/global/:workflow (shared installation; settings:read/write; God authority)', 'GET|PUT /api/settings/project/:projectId/:workflow',
     'GET|PUT /api/projects/:projectId/explanation-settings',
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
-    'POST /api/skills', 'POST /api/safe-mode',
+    'POST /api/skills',
   ],
   installation: [
     'GET|PUT /api/settings/paid-launch (installation operator: legal operator, billingProvider stripe|paddle, provider catalog and encrypted secrets, checkout gate, founder checklist)',
@@ -318,7 +318,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/inbox?since= (verified user subject; delegation accepted — the inbox is per-user)',
     'PATCH /api/inbox/:itemId (verified user subject; delegation accepted)',
     'GET|PUT /api/inbox/preferences (verified user subject; delegation accepted)',
-    'GET /api/meta (deployment flags: hosted, hostLocal, safeMode — tells you which host-local routes exist here)',
+    'GET /api/meta (deployment flags: hosted, hostLocal — tells you which host-local routes exist here)',
     'POST /api/attachments (JSON dataUrl or image bytes)', 'POST /api/files (raw prompt file bytes)',
     'GET /api/attachments/:attachmentId',
     'POST /api/logout', 'GET /api/health/live', 'GET /api/health/ready',
