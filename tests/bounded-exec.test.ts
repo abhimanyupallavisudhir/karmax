@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { boundedExec } from '../src/world/bounded-exec.js';
+import { openLocalPty } from '../src/world/local-execution.js';
 import { platformToolHandlers } from '../src/agent/tools.js';
 
 function fixture(chunks: string[], code = 0) {
@@ -12,10 +13,13 @@ function fixture(chunks: string[], code = 0) {
         onData(cb: typeof output) { output = cb; return () => {}; },
         onExit(cb: typeof exit) { exit = cb; return () => {}; },
         async write(command: string) {
-          const marker = command.match(/KARMAX_EXEC_[a-f0-9]+/)![0];
-          output(command + '\r\n'); // terminal echo must not become output
-          output('\n' + marker.slice(0, 8));
-          output(marker.slice(8) + '\r\n');
+          if (command.startsWith('stty')) {
+            const marker = command.match(/KARMAX_EXEC_[a-f0-9]+/)![0];
+            output(command + '\r\n'); // terminal echo must not become output
+            output('\n' + marker.slice(0, 8));
+            output(marker.slice(8) + '\r\n');
+            return;
+          }
           for (const chunk of chunks) output(chunk);
           exit(code);
         },
@@ -27,6 +31,27 @@ function fixture(chunks: string[], code = 0) {
 }
 
 describe('bounded world command capture', () => {
+  it('executes real local shell output with exit status and UTF-8 intact', async () => {
+    const world = { openPty: (spec: any) => openLocalPty('/tmp', spec) } as any;
+    const result = await boundedExec(world, "printf 'hello 🌍\\n'; printf 'oops\\n' >&2; exit 7", { maxBytes: 1024 });
+    expect(result).toEqual({ code: 7, stdout: 'hello 🌍\n' + 'oops\n', stderr: '' });
+  });
+
+  it('delivers commands larger than the terminal canonical line limit intact', async () => {
+    const world = { openPty: (spec: any) => openLocalPty('/tmp', spec) } as any;
+    const command = `printf '%s' '${'x'.repeat(200_000)}'; printf done`;
+    const result = await boundedExec(world, command, { maxBytes: 32, overflow: 'tail', timeoutMs: 5000 });
+    expect(result.code).toBe(0);
+    expect(result.stdout.endsWith('done')).toBe(true);
+  });
+
+  it('preserves the result if terminal cleanup throws synchronously', async () => {
+    const f = fixture(['done']);
+    const open = f.world.openPty;
+    f.world.openPty = async () => ({ ...await open(), close() { throw new Error('already closed'); } });
+    await expect(boundedExec(f.world, 'command', { maxBytes: 32 })).resolves.toMatchObject({ stdout: 'done', code: 0 });
+  });
+
   it('keeps only a bounded tail while preserving exit status', async () => {
     const f = fixture(['x'.repeat(1024), 'final'], 7);
     const result = await boundedExec(f.world, 'command', { maxBytes: 32, overflow: 'tail' });
