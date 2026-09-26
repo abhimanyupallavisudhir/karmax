@@ -949,8 +949,14 @@ export class GitHubAppService {
   }
 
   async retryWebhooks(dispatch: (result: GithubWebhookResult) => Promise<void>, now = Date.now()): Promise<void> {
-    for (const entry of (await this.store.kvEntries('github:webhook-pending:')).slice(0, 100)) {
-      try { await this.processPendingWebhook(entry.key, dispatch, now); }
+    let attempted = 0;
+    for (const entry of await this.store.kvEntries('github:webhook-pending:')) {
+      try {
+        const pending = JSON.parse(entry.value);
+        if (pending.nextAt > now || pending.leaseUntil > now) continue;
+        if (attempted++ >= 100) break;
+        await this.processPendingWebhook(entry.key, dispatch, now);
+      }
       catch { /* The durable entry carries the bounded retry deadline. */ }
     }
   }

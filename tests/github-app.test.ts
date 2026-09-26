@@ -832,9 +832,12 @@ describe('GitHub App failure and suspension handling', () => {
       const dispatch = async (result: unknown) => { results.push(result); };
       await expect(h.service.deliverWebhook('installation_repositories', 'durable', raw, signature, dispatch)).rejects.toThrow();
       failing = false;
-      await h.service.retryWebhooks(dispatch, Date.now() + 600_000);
+      const now = Date.now() + 600_000;
+      for (let index = 0; index < 100; index++) await h.store.kvSet(`github:webhook-pending:000-${index}`,
+        JSON.stringify({ nextAt: now + 60_000, leaseUntil: 0 }));
+      await h.service.retryWebhooks(dispatch, now);
       expect(results).toEqual([expect.objectContaining({ accepted: true, reconciled: 0 })]);
-      expect(await h.store.kvEntries('github:webhook-pending:')).toEqual([]);
+      expect(await h.store.kvEntries('github:webhook-pending:')).toHaveLength(100);
     } finally { await h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true }); }
   });
 
