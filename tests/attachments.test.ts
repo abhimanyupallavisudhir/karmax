@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -166,6 +166,21 @@ describe('image adapter helpers', () => {
 });
 
 describe('ordinary file attachment materialization', () => {
+  it('checks all attachment hashes in one world command', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-file-batch-'));
+    process.env.KARMAX_HOME = home;
+    const refs = ['one', 'two', 'three'].map(name => new AttachmentStore({ home }).putFile(Buffer.from(name), `${name}.txt`, 'text/plain'));
+    const world = await new MemoryWorldProvider().create({ taskId: 'batch-files', base: 'main' });
+    const exec = vi.spyOn(world, 'exec');
+    try {
+      const messages: Message[] = [{ id: 'm', role: 'user', text: '', ts: 0, files: refs }];
+      await materializeFileAttachments(world, messages);
+      exec.mockClear();
+      await materializeFileAttachments(world, messages);
+      expect(exec.mock.calls.filter(([command]) => command === 'sha256sum')).toHaveLength(1);
+      expect(exec.mock.calls.filter(([command]) => command === 'chmod')).toHaveLength(0);
+    } finally { await world.destroy(); fs.rmSync(home, { recursive: true, force: true }); }
+  });
   it('copies durable bytes into the world and annotates only the delivered copy', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fileh-'));
     process.env.KARMAX_HOME = home;
