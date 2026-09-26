@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { ensurePaths, paths } from './config/paths.js';
 import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
-import { WorkerManager } from './temporal/worker-pool.js';
+import { WorkerManager, terminateOnWorkerFailure } from './temporal/worker-pool.js';
 import { WorkerProcessManager } from './temporal/worker-process.js';
 import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
 import { TASK_QUEUE } from './temporal/config.js';
@@ -275,10 +275,7 @@ async function main() {
   const workerManager = separateWorker ? new WorkerProcessManager({
     entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
     env: workerEnvironment,
-    onFailure: error => {
-      console.error('  ! Activity worker failed:', error);
-      process.kill(process.pid, 'SIGTERM');
-    },
+    onFailure: terminateOnWorkerFailure,
   }) : new WorkerManager(conn, {
     store,
     worlds,
@@ -300,7 +297,7 @@ async function main() {
     contentDir: p.content,
     hostLocal: deployment.hostLocal,
     taskQueue: TASK_QUEUE,
-  });
+  }, terminateOnWorkerFailure);
   const workflows = new WorkflowManager(
     workerManager,
     new WorkflowRepoLoader(p.workflows),

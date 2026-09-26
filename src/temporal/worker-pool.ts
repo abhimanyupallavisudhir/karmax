@@ -3,6 +3,12 @@ import { ActivityDeps } from '../activities/index.js';
 import { makeWorker, WorkerHandle } from './worker.js';
 import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js';
 
+/** Let the supervisor restart the service instead of serving without a poller. */
+export function terminateOnWorkerFailure(error: unknown): void {
+  console.error('  ! Activity worker failed:', error);
+  process.kill(process.pid, 'SIGTERM');
+}
+
 /**
  * Keeps a worker running for the task queue and can **roll** it to pick up
  * newly-loaded workflow packages without a restart (PLAN-dynamic-repos §21e).
