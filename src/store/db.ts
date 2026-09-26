@@ -791,6 +791,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
+      CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, taskId);
       CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);

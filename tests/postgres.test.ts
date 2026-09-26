@@ -37,6 +37,14 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('creates the event-type index for approval and inbox scans', async () => {
+    const store = await Store.create(url!);
+    try {
+      const indexes = await store.db.prepare("SELECT indexname FROM pg_indexes WHERE tablename='events'").all() as Array<{ indexname: string }>;
+      expect(indexes.map((row) => row.indexname)).toContain('idx_events_type');
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);

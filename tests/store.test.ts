@@ -30,6 +30,11 @@ describe('Store', () => {
     expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k >= \? AND k < \?/.test(sql))).toBe(true);
   });
 
+  it('indexes event type with task id for inbox and approval scans', async () => {
+    const indexes = await store.db.prepare('PRAGMA index_list(events)').all() as Array<{ name: string }>;
+    expect(indexes.map((row) => row.name)).toContain('idx_events_type');
+  });
+
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
     const project = (await store.createProject('Parameter patches'));
     const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
