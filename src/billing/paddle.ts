@@ -208,6 +208,7 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     const c = await this.source();
     if (!c.apiKey) throw new BillingRequestRejected('Paddle API key is not configured');
     const base = c.environment === 'sandbox' ? 'https://sandbox-api.paddle.com' : 'https://api.paddle.com';
+    try {
     const response = await this.fetcher(`${base}${path}`, { method,
       headers: { Authorization: `Bearer ${c.apiKey}`, 'Content-Type': 'application/json', 'Paddle-Version': '1' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(20_000) });
@@ -219,6 +220,11 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     }
     if (!result.data) throw new Error('Paddle returned no data; reconcile before retrying');
     return envelope ? result : result.data;
+    } catch (error) {
+      // A failed preflight read cannot have performed a financial write.
+      if (method === 'GET') throw new BillingRequestRejected(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 }
 

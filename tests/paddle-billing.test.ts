@@ -99,6 +99,30 @@ describe('Paddle subscription billing', () => {
     } finally { await store.close(); }
   });
 
+  it.each(['network', '503', 'malformed'])('releases billing reservations after a failed preflight read: %s', async (failure) => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'Retry reads', ownerUserId: 'owner' });
+      let fail = false;
+      const fetcher = vi.fn(async (_url: any, init: any) => {
+        if (init.method === 'GET' && fail) {
+          if (failure === 'network') throw new Error('connection lost');
+          return failure === '503' ? new Response('unavailable', { status: 503 }) : Response.json({});
+        }
+        return Response.json({ data: { id: 'txn_test', status: 'draft',
+          items: [{ price: { id: 'pri_individual' }, quantity: 1 }] } });
+      });
+      const billing = new SubscriptionBillingService(store, new PaddleSubscriptionProvider(() => config, fetcher), true);
+      const urls = { success: 'https://example.test/', cancel: 'https://example.test/' };
+      await billing.checkout(org.id, 'individual', urls, 'safe-read-first');
+      fail = true;
+      await expect(billing.checkout(org.id, 'individual', urls, 'safe-read-retry')).rejects.toThrow();
+      fail = false;
+      await expect(billing.checkout(org.id, 'individual', urls, 'safe-read-retry')).resolves.toMatchObject({ checkoutSessionReference: 'txn_test' });
+      expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+    } finally { await store.close(); }
+  });
+
   it('does not automatically retry ambiguous Paddle writes under a different request key', async () => {
     const store = await Store.create(':memory:', { hosted: true });
     try {
