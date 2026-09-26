@@ -6,13 +6,29 @@ import ssl
 from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from .detect import url_format
+from . import __version__
 from .errors import AcquisitionError, FormatError
 from .model import message, new_conversation, normalize_timestamp, text_block, validate_conversation, warning
 
-USER_AGENT = "panagent/0.1 (+https://github.com/abhimanyupallavisudhir/panagent)"
+USER_AGENT = f"panagent/{__version__} (+https://github.com/abhimanyupallavisudhir/panagent)"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+def _require_share_url(url: str) -> None:
+    try:
+        if not url.startswith("https://") or not url_format(url):
+            raise AcquisitionError("only HTTPS public share URLs are supported")
+    except FormatError as exc:
+        raise AcquisitionError("only HTTPS public share URLs are supported") from exc
+
+
+class _ShareRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
+        _require_share_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class _HTMLCollector(HTMLParser):
@@ -82,6 +98,7 @@ def _clean_dom_text(text: str) -> str:
 
 
 def fetch_share(url: str, *, timeout: float = 30.0) -> str:
+    _require_share_url(url)
     request = Request(
         url,
         headers={
@@ -91,7 +108,8 @@ def fetch_share(url: str, *, timeout: float = 30.0) -> str:
         },
     )
     try:
-        with urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
+        opener = build_opener(_ShareRedirectHandler(), HTTPSHandler(context=ssl.create_default_context()))
+        with opener.open(request, timeout=timeout) as response:
             data = response.read(MAX_DOWNLOAD_BYTES + 1)
             if len(data) > MAX_DOWNLOAD_BYTES:
                 raise AcquisitionError("share response exceeded the 20 MiB safety limit")
@@ -314,7 +332,7 @@ def _chatgpt_content(value: Any, conv: dict[str, Any], index: int) -> list[dict[
 def read_claude_share(text: str, *, source_uri: str | None = None, **_: Any) -> dict[str, Any]:
     stripped = text.lstrip()
     lowered = text.lower()
-    if "challenge-platform" in lowered or "cf-chl-" in lowered or "verify you are human" in lowered:
+    if stripped.startswith("<") and ("challenge-platform" in lowered or "cf-chl-" in lowered):
         raise AcquisitionError(
             "Claude returned an anti-bot challenge, not a conversation. Open the share URL in your browser, "
             "complete the challenge, then use the browser/export fallback documented in docs/browser-export.md."
