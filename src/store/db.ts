@@ -1890,8 +1890,6 @@ export class Store {
    * their tasks and notifications, and their own authorization history. It must
    * never become a shortcut for downloading every organization they belong to. */
   async exportUserData(userId: string, email?: string): Promise<Record<string, unknown>> {
-    return this.db.transaction(async () => {
-
     const includeTiming = (await this.getSettings('global', 'timing'))?.enabled === true;
     const principalId = `user:${userId}`;
     const memberships = (await selectRows(this.db, 'organization_memberships', 'userId=?', [userId]));
@@ -2012,8 +2010,6 @@ export class Store {
         auditLog,
       },
     };
-  
-    });
   }
 
   async projectResources(projectId: string): Promise<{ worlds: WorldHandleRef[]; objectKeys: string[];

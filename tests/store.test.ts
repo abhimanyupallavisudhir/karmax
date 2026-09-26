@@ -1,5 +1,5 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -10,6 +10,14 @@ describe('Store', () => {
   let store: Store;
   beforeEach(async () => {
     store = (await Store.create(':memory:'));
+  });
+
+  it('exports personal data without holding a database write transaction', async () => {
+    vi.spyOn(store, 'getSettings').mockImplementation(async () => {
+      expect(store.db.inTransaction()).toBe(false);
+      return undefined;
+    });
+    await store.exportUserData('no-records');
   });
 
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
