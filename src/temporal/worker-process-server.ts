@@ -42,6 +42,12 @@ function watchParent(): Guardian {
  */
 export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, options: { stopTimeoutMs?: number } = {}): void {
   if (!process.send || !process.connected) throw new Error('worker entrypoint requires a supervisor IPC channel');
+  // Mirror the primary process backstop: an isolated rejected promise must not
+  // terminate every unrelated activity hosted by this worker. Synchronous
+  // uncaught exceptions still use Node's normal crash/restart behavior.
+  process.on('unhandledRejection', reason => {
+    console.error('unhandled rejection (worker kept running):', reason instanceof Error ? reason.stack ?? reason.message : reason);
+  });
   const guardian = watchParent();
   let runtime: WorkerProcessRuntime | undefined;
   let started = false;

@@ -165,3 +165,13 @@ test('kills an event-loop-stalled worker after its supervisor dies', async () =>
     if (alive()) process.kill(childPid!, 'SIGKILL');
   }
 });
+
+
+test('survives an isolated unhandled asynchronous callback rejection', async () => {
+  const worker = manager('rejected-callback');
+  await worker.start();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect(worker.isReady).toBe(true);
+  await worker.refresh([]);
+  expect(worker.failure).toBeUndefined();
+});
