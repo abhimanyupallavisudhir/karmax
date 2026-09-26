@@ -99,6 +99,36 @@ describe('turnkey update deploys an exact validated revision', () => {
   });
 });
 
+describe('turnkey restore preflight', () => {
+  it('rejects a backup without checksums before stopping the running instance', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-preflight-'));
+    try {
+      const sandbox = path.join(home, 'deploy');
+      const backup = path.join(home, 'backup');
+      const bin = path.join(home, 'bin');
+      fs.mkdirSync(sandbox);
+      fs.mkdirSync(bin);
+      fs.mkdirSync(path.join(backup, 'control-plane'), { recursive: true });
+      fs.mkdirSync(path.join(backup, 'deployment-secrets'));
+      fs.writeFileSync(path.join(backup, 'control-plane', 'manifest.json'), '{}');
+      fs.writeFileSync(path.join(backup, 'temporal.dump'), 'invalid');
+      fs.writeFileSync(path.join(backup, 'temporal-visibility.dump'), 'invalid');
+      fs.writeFileSync(path.join(sandbox, '.turnkey.env'), 'KARMAX_DOMAIN=example.test\n');
+      fs.copyFileSync(path.join(deployDir, 'karmax'), path.join(sandbox, 'karmax'));
+      fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${home}/docker.log"\nexit 0\n`, { mode: 0o755 });
+      const result = spawnSync('sh', [path.join(sandbox, 'karmax'), 'restore', backup], {
+        input: 'RESTORE\n', encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('checksum');
+      expect(fs.readFileSync(path.join(home, 'docker.log'), 'utf8')).not.toMatch(/\bdown\b|dropdb/);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
   const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
