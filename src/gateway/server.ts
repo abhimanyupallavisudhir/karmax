@@ -2648,7 +2648,6 @@ export class Gateway {
           const connections = (await store.listGitConnections(organizationId));
           if (!connections.some((connection) => connection.id === connectionId))
             return this.json(res, 404, { error: 'GitHub connection not found' });
-          if (connections.length <= 1) return this.json(res, 409, { error: 'Connect a new GitHub account first' });
           if (this.deps.githubApp) (await this.deps.githubApp.disconnectInstallation(connectionId));
           else (await store.deleteGitConnection(connectionId));
           return this.json(res, 200, { ok: true });
