@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 
 const lock = JSON.parse(fs.readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8')) as {
@@ -28,4 +29,13 @@ it('declares every directly imported package, including tooling and replay fixtu
   const root = lock.packages['']!;
   expect(root.dependencies?.dotenv ?? root.devDependencies?.dotenv).toBeDefined();
   expect(root.dependencies?.['@temporalio/proto'] ?? root.devDependencies?.['@temporalio/proto']).toBeDefined();
+});
+
+it('keeps the lockfile usable by clean CI installs', () => {
+  const result = spawnSync('npm', ['ci', '--dry-run', '--ignore-scripts', '--offline', '--no-audit', '--no-fund'], {
+    cwd: new URL('..', import.meta.url),
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  expect(result.status, result.stderr).toBe(0);
 });
