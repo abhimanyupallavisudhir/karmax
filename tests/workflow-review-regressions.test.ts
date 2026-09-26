@@ -39,6 +39,7 @@ const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work'
 beforeEach(() => {
   wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true;
   wf.activities = {
+    restoreChildTasks: vi.fn(async () => []),
     createWorld: vi.fn(async () => ({ id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' })),
     publishView: vi.fn(async () => undefined),
     accountPoolSize: vi.fn(async () => 1),
@@ -232,3 +233,18 @@ it.each([['just-do', justDoV1_7], ['software-dev', softwareDevV1_26]] as const)(
     await workflow(input);
     expect(waited).toBe(true);
   });
+
+it('WF-4: recovered conversations are not copied into every agent task input', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  let taskInput: any;
+  wf.activities.runAgentTurn.mockImplementation(async ({ task }: any) => {
+    taskInput = task;
+    wf.handlers.get('cancel')!();
+    return {};
+  });
+  await softwareDevV1_26({ ...input, recovery: { messages: [{ id: 'history', role: 'user', text: 'large history', ts: 0 }],
+    resumeStage: 'do' } });
+  expect(taskInput).toBeDefined();
+  expect(taskInput.recovery).toBeUndefined();
+});
+

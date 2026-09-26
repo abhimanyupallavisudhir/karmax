@@ -774,6 +774,7 @@ async function softwareDevImpl(
   // the next best convenience in the conversation: the next turn that role runs
   // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
+  if (patched('software-dev-omit-recovery-input-v1')) delete liveInput.recovery;
   // Params the workflow has already consumed (value now load-bearing). `target` is
   // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
   // (provider/session) once its turn runs — its model/effort stay retunable after;
