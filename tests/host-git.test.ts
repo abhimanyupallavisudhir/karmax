@@ -38,3 +38,10 @@ it('ignores inherited Git directory and execution settings (RT-5)', async () => 
   vi.stubEnv('GIT_WORK_TREE', foreign);
   expect(await gitOrThrow(root, ['rev-parse', '--show-toplevel'])).toBe(root);
 });
+it('validates the enclosing repository when Git runs in a subdirectory (RT-5)', async () => {
+  const root = await fixture(), foreign = await fixture();
+  const nested = path.join(root, 'nested'); fs.mkdirSync(nested);
+  fs.rmSync(path.join(root, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.git'), `gitdir: ${foreign}/.git\n`);
+  expect((await git(nested, ['status', '--porcelain'])).code).not.toBe(0);
+});

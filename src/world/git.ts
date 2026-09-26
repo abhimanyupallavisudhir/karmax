@@ -95,7 +95,7 @@ export async function ensureIdentity(dir: string) {
 
 function hostGitEnvironment(): Record<string, string> {
   const env: Record<string, string> = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
-  for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSH_AUTH_SOCK'])
+  for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSH_AUTH_SOCK', 'GIT_TRACE2_EVENT'])
     if (process.env[key]) env[key] = process.env[key]!;
   return env;
 }
@@ -109,7 +109,11 @@ async function validateGitDirectory(cwd: string): Promise<void> {
     if (error.code === 'ENOENT') return undefined;
     throw error;
   });
-  if (!stat) return; // init, clone, and bare repository operations
+  if (!stat) {
+    const parent = path.dirname(root);
+    if (parent !== root) await validateGitDirectory(parent);
+    return; // init, clone, bare repositories, or a validated enclosing checkout
+  }
   if (stat.isSymbolicLink()) throw new Error('refusing symlinked Git directory');
   if (stat.isDirectory()) {
     if (fs.existsSync(path.join(marker, 'commondir'))) throw new Error('unexpected common Git directory');
