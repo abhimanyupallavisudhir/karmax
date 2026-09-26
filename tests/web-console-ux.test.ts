@@ -142,7 +142,7 @@ describe('forms report their failures', () => {
     "row.querySelector('.resource-toggle').addEventListener",
     "row.querySelector('.resource-delete').addEventListener",
     "box.querySelectorAll('.service-delete')",
-    "$('#environment-save')?.addEventListener",
+    "box.querySelector('#environment-save')?.addEventListener",
     "$('#main').querySelectorAll('[data-inbox-toggle]')",
     "$('#inbox-read-all')?.addEventListener",
   ];
