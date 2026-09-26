@@ -43,6 +43,34 @@ describe('Store', () => {
     expect(queries.some((sql) => /SELECT id, config FROM projects|SELECT k, v FROM kv WHERE k LIKE 'vault:items/.test(sql))).toBe(false);
   });
 
+  it('expires old events and audit entries while retaining recent history', async () => {
+    expect(((await store.db.prepare('PRAGMA synchronous').get()) as { synchronous: number }).synchronous).toBe(1);
+    const now = Date.UTC(2026, 8, 26);
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: {} });
+    await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: { text: 'old' } });
+    await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 1 * 86400_000, payload: { text: 'new' } });
+    await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
+    await store.appendAudit({ principalId: 'user:a', action: 'new', ts: now - 1 * 86400_000 });
+    const swept = await store.retentionSweep(now);
+    expect(swept.events).toBe(1);
+    expect(swept.auditEntries).toBe(1);
+    expect((await store.eventsSince(task.id, 0)).map((event) => event.payload.text)).toEqual(['new']);
+    expect((await store.db.prepare('SELECT action FROM audit_log ORDER BY seq').all())).toEqual([{ action: 'new' }]);
+  });
+
+  it('retains old unresolved approval requests until their resolution is recorded', async () => {
+    const now = Date.UTC(2026, 8, 26);
+    const project = await store.createProject('Approvals');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: {} });
+    await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested',
+      ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
+    expect((await store.retentionSweep(now)).events).toBe(0);
+    await store.appendEvent({ taskId: task.id, type: 'permission.approval-resolved',
+      ts: now, payload: { requestId: 'ask' } });
+    expect((await store.retentionSweep(now)).events).toBe(1);
+  });
+
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
     const project = (await store.createProject('Parameter patches'));
     const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',

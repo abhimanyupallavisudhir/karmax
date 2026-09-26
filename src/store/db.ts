@@ -167,7 +167,7 @@ export class Store {
     // credential registration) must not instantly kill a long agent turn's
     // event append with "database is locked" (that error cost a merge-agent
     // turn mid-conflict-resolution — the 05f9802 postmortem).
-    (await this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;'));
+    (await this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;'));
     (await this.migrate());
     (await this.migrateData());
     (await this.migrateConversations());
@@ -790,6 +790,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
       CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, taskId);
+      CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
@@ -7219,7 +7220,8 @@ export class Store {
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
-    subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number }> {
+    subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
+    events: number; auditEntries: number }> {
     return this.db.transaction(async () => {
 
     // Keep immutable snapshots through a retry window. A late activity retry can
@@ -7251,6 +7253,20 @@ export class Store {
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
       viewSnapshots, publicationFences, turnSessions,
+      events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
+        (SELECT e.seq FROM events e WHERE e.ts<?
+          AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
+            'authorization.approval-requested', 'connection.requested')
+            OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
+              AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved',
+                'authorization.approval-resolved', 'connection.resolved',
+                'permission.approval-dismissed', 'authorization.approval-dismissed')
+              AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
+          ORDER BY e.ts, e.seq LIMIT 10000)`)
+        .run(now - 90 * 86400_000)).changes),
+      auditEntries: Number((await this.db.prepare(`DELETE FROM audit_log WHERE seq IN
+        (SELECT seq FROM audit_log WHERE ts<? ORDER BY ts, seq LIMIT 10000)`)
+        .run(now - 365 * 86400_000)).changes),
     };
   
     });

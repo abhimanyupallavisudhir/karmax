@@ -83,6 +83,22 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('expires old events and audit rows while retaining unresolved approval evidence', async () => {
+    const store = await Store.create(url!);
+    try {
+      const now = Date.UTC(2026, 8, 26);
+      const project = await store.createProject('Retention');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: {} });
+      await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: {} });
+      await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested', ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
+      await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
+      const swept = await store.retentionSweep(now);
+      expect(swept.events).toBe(1);
+      expect(swept.auditEntries).toBe(1);
+      expect((await store.eventsSince(task.id, 0)).map((event) => event.type)).toEqual(['permission.approval-requested']);
+    } finally { await store.close(); }
+  });
+
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
     const store = await Store.create(url!);
