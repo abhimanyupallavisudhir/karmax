@@ -200,8 +200,12 @@ cmd_backup() {
   destination=${1:-"$DEPLOY_DIR/backups/$stamp"}
   case "$destination" in /*) ;; *) destination="$PWD/$destination" ;; esac
   [ ! -e "$destination" ] || die "backup destination already exists: $destination"
-  mkdir -p "$destination"
-  chmod 700 "$destination"
+  staging="$destination.partial.$$"
+  [ ! -e "$staging" ] || die "backup staging path already exists: $staging"
+  mkdir -p "$(dirname "$destination")"
+  mkdir "$staging"
+  chmod 700 "$staging"
+  trap 'rm -rf "$staging"' EXIT
   temporary="/tmp/karmax-control-plane-$stamp"
   note 'Taking an online Karmax snapshot…'
   # The app is intentionally live here: SQLite uses its online backup API, and
@@ -210,15 +214,17 @@ cmd_backup() {
   # are not all taken at one instant; without this flag every automated update
   # fails before it can pull the commit that would fix the updater.
   dc exec -T app npm run backup -- --allow-running "$temporary"
-  dc cp "app:$temporary" "$destination/control-plane"
+  dc cp "app:$temporary" "$staging/control-plane"
   dc exec -T app rm -rf "$temporary"
   note 'Dumping Karmax and Temporal PostgreSQL data…'
-  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$destination/karmax.dump"
-  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$destination/temporal.dump"
-  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$destination/temporal-visibility.dump"
-  cp -R "$SECRETS_DIR" "$destination/deployment-secrets"
-  backup_checksums "$destination"
-  chmod -R go-rwx "$destination"
+  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$staging/karmax.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$staging/temporal.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$staging/temporal-visibility.dump"
+  cp -R "$SECRETS_DIR" "$staging/deployment-secrets"
+  backup_checksums "$staging"
+  chmod -R go-rwx "$staging"
+  mv "$staging" "$destination"
+  trap - EXIT
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
   compact_backups
@@ -231,7 +237,7 @@ cmd_backup() {
 # volume while the existing service remains untouched.
 cmd_backup_candidate() {
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  destination="$DEPLOY_DIR/backups/$stamp"
+  destination="$DEPLOY_DIR/backups/predeploy-$stamp"
   [ ! -e "$destination" ] || die "backup destination already exists: $destination"
   mkdir -p "$destination"
   chmod 700 "$destination"

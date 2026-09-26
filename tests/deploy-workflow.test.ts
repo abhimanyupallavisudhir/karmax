@@ -8,6 +8,7 @@ const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
 const ciSource = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
 const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'deploy.yml'), 'utf8'));
+const backupWorkflowPath = path.join(repoRoot, '.github', 'workflows', 'backup.yml');
 const deploy = workflow.jobs.deploy;
 const script: string = JSON.stringify(deploy.steps);
 const operator = fs.readFileSync(path.join(repoRoot, 'deploy', 'karmax'), 'utf8');
@@ -82,9 +83,13 @@ describe('post-push deployment to the public instance', () => {
   // Every push snapshots the vault and Temporal history before rebuilding.
   // Unpruned, that grows without bound until the disk fills and the instance
   // stops taking writes.
-  it('prunes old pre-deploy backups', () => {
-    expect(script).toContain('deploy/backups');
-    expect(script).toMatch(/-mtime \+\d+/);
+  it('retains manual backups while pruning only automatic snapshots', () => {
+    expect(script).toContain("-name 'predeploy-*'");
+    const backup = parse(fs.readFileSync(backupWorkflowPath, 'utf8'));
+    expect(backup.on.schedule).toBeDefined();
+    const steps = JSON.stringify(backup.jobs.backup.steps);
+    expect(steps).toContain('scheduled-');
+    expect(steps).toMatch(/-name.*scheduled-\*/);
   });
 
   // `cmd_backup` runs inside the live app container. The backup API rejects a

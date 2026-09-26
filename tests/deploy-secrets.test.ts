@@ -129,6 +129,28 @@ describe('turnkey restore preflight', () => {
   });
 });
 
+describe('turnkey backup publication', () => {
+  it('leaves no visible backup directory when a database dump fails', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-publish-'));
+    try {
+      const sandbox = path.join(home, 'deploy');
+      const bin = path.join(home, 'bin');
+      const backup = path.join(home, 'manual-backup');
+      fs.mkdirSync(sandbox);
+      fs.mkdirSync(bin);
+      fs.writeFileSync(path.join(sandbox, '.turnkey.env'), 'KARMAX_DOMAIN=example.test\n');
+      fs.copyFileSync(path.join(deployDir, 'karmax'), path.join(sandbox, 'karmax'));
+      fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh\ncase "$*" in *"pg_dump -U temporal -Fc temporal") exit 7;; esac\nexit 0\n`, { mode: 0o755 });
+      const result = spawnSync('sh', [path.join(sandbox, 'karmax'), 'backup', backup], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      });
+      expect(result.status).not.toBe(0);
+      expect(fs.existsSync(backup)).toBe(false);
+      expect(fs.readdirSync(home).some(name => name.startsWith('manual-backup.partial'))).toBe(false);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+});
+
 describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
   const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
