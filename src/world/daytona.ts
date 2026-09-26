@@ -1,3 +1,4 @@
+import { isMissingSandbox } from './provider-errors.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, ProviderSandboxRef, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
@@ -221,7 +222,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       if (['stopped', 'stopping', 'archived', 'archiving'].includes(state)) return 'parked';
       return 'ready';
     } catch (error) {
-      return /not\s*found|does not exist|404/i.test(String((error as Error)?.message ?? error)) ? 'missing' : undefined;
+      return isMissingSandbox(error) ? 'missing' : undefined;
     }
   }
 
@@ -237,7 +238,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       ...(sandbox.labels?.karmaxTaskId ? { taskId: sandbox.labels.karmaxTaskId } : {}),
       matches: (handle) => {
         try { return handle.kind === this.kind && this.sandboxId(handle as WorldHandle) === sandbox.id; }
-        catch { return false; }
+        catch { return undefined; }
       },
       destroy: async () => {
         await deleteSandbox(sandbox);

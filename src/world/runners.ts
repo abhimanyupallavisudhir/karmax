@@ -374,7 +374,7 @@ export class WorldLifecycleManager {
           await this.worlds.withOperation(taskId, async () => {
             const task = (await this.store.taskMetadata(taskId));
             const current = task ? (await this.store.currentWorld(taskId)) : undefined;
-            const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
+            const duplicate = Boolean(task && current && sandbox.matches && sandbox.matches(current) === false);
             if (task && !duplicate) return;
             try {
               await sandbox.destroy();

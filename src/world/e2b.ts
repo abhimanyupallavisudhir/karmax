@@ -1,3 +1,4 @@
+import { isMissingSandbox } from './provider-errors.js';
 import { timed } from '../timing/index.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -289,7 +290,7 @@ export class E2BWorldProvider implements WorldProvider {
       if (['running', 'starting', 'resuming', 'ready'].includes(state)) return 'ready';
       return 'missing';
     } catch (error) {
-      return looksLikeMissingSandbox(error) ? 'missing' : undefined;
+      return isMissingSandbox(error) ? 'missing' : undefined;
     }
   }
 
@@ -306,7 +307,7 @@ export class E2BWorldProvider implements WorldProvider {
       ...(sandbox.metadata?.karmaxTaskId ? { taskId: sandbox.metadata.karmaxTaskId } : {}),
       matches: (handle) => {
         try { return handle.kind === this.kind && this.sandboxIdOf(handle as WorldHandle) === sandbox.sandboxId; }
-        catch { return false; }
+        catch { return undefined; }
       },
       destroy: async () => {
         if (this.factory.kill) await this.factory.kill(sandbox.sandboxId, apiKey);
@@ -786,9 +787,6 @@ function provisionTarget(sandbox: E2BSandboxLike, signal?: AbortSignal): Provisi
   };
 }
 
-function looksLikeMissingSandbox(error: unknown): boolean {
-  return /not\s*found|does not exist|404/i.test(String((error as Error)?.message ?? error));
-}
 
 function defaultE2BFactory(): E2BFactory {
   const sdk = async (): Promise<any> => {

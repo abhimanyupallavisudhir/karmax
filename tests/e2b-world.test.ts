@@ -3,6 +3,27 @@ import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandbo
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it.each([
+    [Object.assign(new Error('getaddrinfo ENOTFOUND api.provider'), { code: 'ENOTFOUND' }), undefined],
+    [new Error('upstream returned 404 while resolving proxy'), undefined],
+    [Object.assign(new Error('deleted'), { status: 404 }), 'missing'],
+  ])('requires authoritative missing status (WD-8): %s', async (error, expected) => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, info: async () => { throw error; } } as any);
+    const world = await provider.create({ taskId: 'probe', base: 'main' });
+    expect(await provider.probe(world.handle)).toBe(expected);
+  });
+
+  it('preserves undecidable sealed references during orphan comparison (WD-1)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, list: async () => [sandbox] } as any);
+    const world = await provider.create({ taskId: 'sealed', base: 'main' });
+    const [listed] = await provider.listSandboxes();
+    expect(listed!.matches!({ ...world.handle, sealedProviderRef: 'unreadable' })).toBeUndefined();
+  });
+
   it('normalizes only this deployment\'s completed provider executions for billing', async () => {
     const sandbox = fakeSandbox(() => undefined);
     const factory: E2BFactory = {

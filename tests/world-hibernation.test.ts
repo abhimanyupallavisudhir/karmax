@@ -130,3 +130,14 @@ it('records a missing probe for an unchanged ready world', async () => {
   expect(await f.store.worldState(f.handle.id)).toBe('degraded');
   expect(await f.store.eventsOfType(f.handle.id, 'world.providerLost')).toHaveLength(1);
 });
+
+it('does not reap an undecidable provider reference (WD-1)', async () => {
+  const f = await fixture();
+  await f.store.setWorldState(f.handle, 'ready');
+  const destroy = vi.fn(async () => {});
+  f.worlds.register({ kind: 'memory', open: f.open, listSandboxes: async () => [{
+    sandboxId: 'unreadable', taskId: f.handle.id, matches: () => undefined, destroy,
+  }] } as any);
+  await f.lifecycle.sweep();
+  expect(destroy).not.toHaveBeenCalled();
+});
