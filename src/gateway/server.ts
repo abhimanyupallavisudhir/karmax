@@ -6613,6 +6613,11 @@ export class Gateway {
             imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
           });
           if (result.status === 'connected' && result.config) {
+            if (result.config.provider === 'agentmail') {
+              const { verifyAgentMailInbox } = await import('../autonomy/mail-pull.js');
+              await verifyAgentMailInbox(String(b.apiKey), result.config.agentmailAddress!);
+              await new AgentMail(store, undefined, undefined, result.config.agentmailAddress).address(organizationId);
+            }
             // The provider secret (AgentMail key / IMAP password) → the vault under
             // an org-scoped handle the poller resolves; never echoed or stored raw.
             const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));

@@ -128,6 +128,15 @@ function firstDeliveredTo(raw: string): string | undefined {
 // ── AgentMail (agentmail.to REST) ─────────────────────────────────────────────
 
 const AGENTMAIL_BASE = process.env.KARMAX_AGENTMAIL_BASE || 'https://api.agentmail.to/v0';
+export async function verifyAgentMailInbox(key: string, address: string, fetcher: typeof fetch = fetch): Promise<void> {
+  const response = await fetcher(`${AGENTMAIL_BASE}/inboxes/${encodeURIComponent(address)}`, {
+    headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error('AgentMail key cannot access this inbox');
+  const inbox = await response.json() as { inbox_id?: string };
+  if (cleanAddress(inbox.inbox_id ?? '') !== cleanAddress(address)) throw new Error('AgentMail returned a different inbox');
+}
+
 const amCursorKey = (address: string) => `agent-mail:am-cursor:${address}`;
 
 export class AgentMailPuller implements Puller {

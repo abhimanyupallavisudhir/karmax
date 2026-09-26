@@ -120,3 +120,13 @@ describe('MailPoller loop', () => {
     expect(createPuller({ provider: 'self-managed', domain: 'x.com' }, deps)).toBeUndefined();
   });
 });
+
+it('verifies that an AgentMail key can access the requested inbox (AU-1)', async () => {
+  const { verifyAgentMailInbox } = await import('../src/autonomy/mail-pull.js');
+  const denied = async () => new Response('{}', { status: 403 });
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', denied as typeof fetch)).rejects.toThrow();
+  const mismatch = async () => new Response(JSON.stringify({ inbox_id: 'other@example.com' }));
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', mismatch as typeof fetch)).rejects.toThrow();
+  const allowed = async () => new Response(JSON.stringify({ inbox_id: 'victim@example.com' }));
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', allowed as typeof fetch)).resolves.toBeUndefined();
+});

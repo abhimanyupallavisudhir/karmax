@@ -75,9 +75,9 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     const mail = new AgentMail(store, 'inbound.postmarkapp.com', 'ab12cd');
     const a = (await mail.address('org_a'));
     expect(a).toMatch(/^ab12cd\+agent-[0-9a-f]{12}@inbound\.postmarkapp\.com$/);
-    // routes on the exact local, and on the tag alone (provider may rewrite base)
+    // Only the exact mailbox is owned; a rewritten base is a different address.
     expect((await mail.ownerOf(a))).toBe('org_a');
-    expect((await mail.ownerOf(a.replace('ab12cd+', 'whatever+')))).toBe('org_a');
+    expect((await mail.ownerOf(a.replace('ab12cd+', 'whatever+')))).toBeUndefined();
     expect((await mail.ingest({ from: 'x@y.com', to: a, text: 'code 123456' })).delivered).toBe(true);
   });
 
@@ -89,8 +89,8 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     expect(after).toBe(`${token}@agents.myco.com`);
     const fixed = (await new AgentMail(store, 'inbound.svc.com', 'base1').address('org_a'));
     expect(fixed).toBe(`base1+${token}@inbound.svc.com`);
-    // mail addressed to ANY historical form still routes to the org
-    expect((await new AgentMail(store).ownerOf(before))).toBe('org_a');
+    // Retired addresses no longer route to the organization.
+    expect((await new AgentMail(store).ownerOf(before))).toBeUndefined();
     expect((await new AgentMail(store).ownerOf(fixed))).toBe('org_a');
   });
 
@@ -183,5 +183,29 @@ describe('webhook body parsers + secret + worker script', () => {
     expect(script).toContain('secret=abc');
     expect(script).toContain('message.raw');
     expect(script).toContain('async email(message');
+  });
+});
+
+
+describe('mail ownership boundaries (AU-1)', () => {
+  it('refuses a second tenant claiming an exact address', async () => {
+    const store = memStore();
+    const mail = new AgentMail(store, undefined, undefined, 'shared@example.com');
+    await mail.address('org_a');
+    await expect(mail.address('org_b')).rejects.toThrow(/owned/);
+    expect(await mail.ownerOf('shared@example.com')).toBe('org_a');
+  });
+  it('does not route the same local part on a foreign domain or a rewritten base', async () => {
+    const store = memStore();
+    const mail = new AgentMail(store, 'example.com', 'base');
+    const address = await mail.address('org_a');
+    expect(await mail.ownerOf(address.replace('@example.com', '@evil.com'))).toBeUndefined();
+    expect(await mail.ownerOf(address.replace('base+', 'other+'))).toBeUndefined();
+  });
+  it('retires the old route when the provider changes', async () => {
+    const store = memStore();
+    const old = await new AgentMail(store, 'old.example').address('org_a');
+    await new AgentMail(store, 'new.example').address('org_a');
+    expect(await new AgentMail(store).ownerOf(old)).toBeUndefined();
   });
 });
