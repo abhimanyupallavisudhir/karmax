@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { snapshotReplayHistories } from '../src/activities/replay-histories.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { makeCoreActivities } from '../src/activities/core.js';
@@ -49,7 +50,7 @@ function registerFakeWorld(opts: { kind: string; remote: boolean; hasBundle: boo
   return worlds;
 }
 
-async function coreFor(worlds: WorldRegistry, contentDir: string) {
+async function coreFor(worlds: WorldRegistry, contentDir: string, client: any = {}) {
   const store = (await Store.create(':memory:'));
   (await store.claimPersonalOrganization('owner'));
   return {
@@ -58,7 +59,7 @@ async function coreFor(worlds: WorldRegistry, contentDir: string) {
       store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock'),
       contentDir,
       // Only needs to be present: every assertion here returns before it is used.
-      client: {} as any,
+      client,
     } as any),
   };
 }
@@ -85,7 +86,7 @@ describe('workflow-edit merge checks', () => {
       const result = await core.runWorkflowChecks({
         taskId: 'task', worldHandle: { kind: 'pkg-world', id: 'task', root: '/workspace', branch: 'b', base: 'main' } as any,
       });
-      expect(result.passed).toBe(true);
+      expect(result.passed, result.detail).toBe(true);
       expect(result.detail).toMatch(/replay gate does not apply/);
       expect(result.detail).not.toMatch(/missing/);
     } finally {
@@ -138,4 +139,65 @@ describe('workflow-edit merge checks', () => {
       (await store.close());
     }
   });
+});
+
+
+it('replays only organization task histories from a repeatable streamed snapshot', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wfchecks-scope-'));
+  fs.mkdirSync(path.join(root, 'src/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/workflows/index.ts'), '');
+  const worlds = registerFakeWorld({ kind: 'scoped-world', remote: false, hasBundle: true, execs: [] });
+  const executions: Array<{ workflowId: string; runId: string }> = [];
+  const fetched: string[] = [];
+  const history = { events: [{ eventId: 1, eventType: 1, workflowExecutionStartedEventAttributes: { workflowType: { name: 'fixture' } } }] };
+  const client = { options: { namespace: 'fixture' }, workflow: {
+    list: async function* () { yield* executions; },
+    getHandle: (id: string) => ({ fetchHistory: async () => { fetched.push(id); return history; } }),
+  }, workflowService: { getWorkflowExecutionHistory: async ({ execution }: any) => {
+    fetched.push(execution.workflowId); return { history };
+  } } };
+  const { store, core } = await coreFor(worlds, root, client);
+  const { Worker } = await import('@temporalio/worker');
+  const seen: string[][] = [];
+  const streamed: boolean[] = [];
+  const replay = vi.spyOn(Worker, 'runReplayHistories').mockImplementation(async function* (_opts, histories) {
+    streamed.push(!Array.isArray(histories));
+    const ids: string[] = []; seen.push(ids);
+    for await (const item of histories) {
+      ids.push(item.workflowId);
+      yield { workflowId: item.workflowId, runId: 'run',
+        ...(item.workflowId.startsWith('foreign') && seen.length === 2 ? { error: new Error('foreign secret detail') } : {}) };
+    }
+  });
+  try {
+    const project = await store.createProject('Owned replay');
+    const task = await store.createTask({ projectId: project.id, title: 'Owned', workflow: 'software-dev', workflowVersion: '1', params: {} });
+    const foreign = await store.createOrganization({ name: 'Foreign replay' });
+    const foreignProject = await store.createProject('Foreign', {}, foreign.id);
+    const foreignTask = await store.createTask({ projectId: foreignProject.id, title: 'Private', workflow: 'software-dev', workflowVersion: '1', params: {} });
+    executions.push({ workflowId: task.id, runId: 'owned-run' }, { workflowId: foreignTask.id, runId: 'foreign-run' }, { workflowId: 'merge-queue:global', runId: 'shared-run' });
+    const result = await core.runWorkflowChecks({ taskId: task.id, worldHandle: { kind: 'scoped-world', id: task.id, root, branch: 'b', base: 'main' } as any });
+    expect(result.passed, result.detail).toBe(true);
+    expect(fetched).toEqual([task.id]);
+    expect(seen).toEqual([[task.id], [task.id]]);
+    expect(streamed).toEqual([true, true]);
+    expect(result.detail).not.toContain('foreign');
+  } finally { replay.mockRestore(); await store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+
+it('RT-19 fails closed at snapshot byte limits and removes the private spool', async () => {
+  const store = await Store.create(':memory:');
+  const project = await store.createProject('Replay bound');
+  const task = await store.createTask({ projectId: project.id, title: 'Bound', workflow: 'software-dev', workflowVersion: '1', params: {} });
+  const client = { options: { namespace: 'fixture' }, workflow: {
+    list: async function* () { yield { workflowId: task.id, runId: 'run' }; },
+  }, workflowService: { getWorkflowExecutionHistory: async () => ({ history: { events: [{ eventId: 1, eventType: 1, workflowExecutionStartedEventAttributes: { workflowType: { name: 'fixture' } } }] } }) } } as any;
+  const spools = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('karmax-replay-histories-')).sort();
+  const before = spools();
+  try {
+    await expect(snapshotReplayHistories(store, client, task.id, { histories: 1, historyBytes: 1, totalBytes: 1 }))
+      .rejects.toThrow('replay limit');
+    expect(spools()).toEqual(before);
+  } finally { await store.close(); }
 });

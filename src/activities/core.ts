@@ -1,3 +1,4 @@
+import { snapshotReplayHistories } from './replay-histories.js';
 import { turnPlatformRequest } from '../agent/platform-request.js';
 import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
@@ -2949,8 +2950,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       (await record(args.taskId, 'checks.done', { code: r.code }));
       if (r.code !== 0) return { passed: false, detail: r.stdout.slice(-600) };
 
-      // SPEC §4.4's replay gate is literal: fetch every currently-running history
-      // and compare the candidate bundle with the bundle serving production now.
+      // Compare this organization's running tasks against the current bundle.
+      // Shared coordinator histories belong to the installation release gate.
       // Pre-existing incompatibilities are reported but do not make unrelated edits
       // impossible; any history that regresses from baseline-pass to candidate-fail
       // blocks the merge.
@@ -2998,38 +2999,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       try {
         if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
-        const histories: Array<{ workflowId: string; history: unknown }> = [];
-        for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
-          histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
-        }
-        const { Worker } = await import('@temporalio/worker');
-        const replay = async (workflowsPath: string) => {
-          const failures = new Map<string, string>();
-          for await (const result of Worker.runReplayHistories({ workflowsPath }, histories)) {
-            if (result.error) failures.set(result.workflowId, result.error.message);
+        const snapshot = await snapshotReplayHistories(store, deps.client, args.taskId);
+        try {
+          const { Worker } = await import('@temporalio/worker');
+          const replay = async (workflowsPath: string) => {
+            const failures = new Map<string, string>();
+            for await (const result of Worker.runReplayHistories({ workflowsPath }, snapshot.histories())) {
+              if (result.error) failures.set(result.workflowId, result.error.message);
+            }
+            return failures;
+          };
+          const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
+          const baselineFailures = await replay(baselinePath);
+          const candidateFailures = await replay(candidatePath);
+          const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
+          const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
+          const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
+          (await record(args.taskId, 'checks.replay', {
+            histories: snapshot.count,
+            regressions: regressions.map(([id]) => id),
+            preExisting: existing,
+            fixed,
+          }));
+          if (regressions.length) {
+            const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
+            return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${snapshot.count} active histories:\n${detail}`.slice(-4000) };
           }
-          return failures;
-        };
-        const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
-        const baselineFailures = await replay(baselinePath);
-        const candidateFailures = await replay(candidatePath);
-        const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
-        const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
-        const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
-        (await record(args.taskId, 'checks.replay', {
-          histories: histories.length,
-          regressions: regressions.map(([id]) => id),
-          preExisting: existing,
-          fixed,
-        }));
-        if (regressions.length) {
-          const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
-          return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${histories.length} active histories:\n${detail}`.slice(-4000) };
-        }
-        return {
-          passed: true,
-          detail: `tests + replay passed (${histories.length} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
-        };
+          return {
+            passed: true,
+            detail: `tests + replay passed (${snapshot.count} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
+          };
+        } finally { snapshot.release(); }
       } catch (e) {
         return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
       } finally {
