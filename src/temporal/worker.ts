@@ -15,6 +15,7 @@ export interface WorkerOpts {
    * externally-loaded workflow packages (§21c); omit for the built-ins only.
    */
   workflowBundle?: WorkflowBundle;
+  shutdownGraceTime?: string;
 }
 
 let runtimeInstalled = false;
@@ -77,7 +78,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     // finalization, which pins the Runtime singleton and breaks every later
     // harness boot in the test suite (main.ts has its own exit backstop for a
     // truly wedged drain).
-    shutdownGraceTime: '1 second',
+    shutdownGraceTime: opts.shutdownGraceTime ?? '1 second',
   });
 
   let runPromise: Promise<void> | undefined;

@@ -73,3 +73,28 @@ it('still stops the live worker when an accepted refresh build fails', async () 
   await Promise.all([refresh, manager.stop()]);
   expect(initial.shutdown).toHaveBeenCalledTimes(1);
 });
+
+it('WF-15: refresh finishes while the retired worker drains, and stop awaits that drain', async () => {
+  const completion = deferred<void>();
+  const initial = { run: vi.fn(() => completion.promise), shutdown: vi.fn() };
+  const next = worker();
+  mocks.makeWorker.mockResolvedValueOnce(initial).mockResolvedValueOnce(next);
+  const manager = managerWithControlledBuild();
+  await manager.start();
+  let refreshed = false;
+  const refresh = manager.refresh([]).then(() => { refreshed = true; });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  try {
+    expect(refreshed).toBe(true);
+    let stopped = false;
+    const stop = manager.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(stopped).toBe(false);
+    completion.resolve();
+    await stop;
+  } finally {
+    completion.resolve();
+    await refresh;
+    await manager.stop();
+  }
+});
