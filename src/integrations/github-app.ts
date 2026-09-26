@@ -1072,22 +1072,24 @@ export class GitHubAppService {
       const prEvent = pullRequestWebhookEvent(event, payload);
       if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
         return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
-      const task = await this.store.getTask(prEvent.taskId);
-      const attached = task ? await this.store.listProjectRepositories(task.projectId) : [];
-      if (!attached.some(({ repository }) => repository.providerId === String(payload.repository?.id)))
-        return { accepted: true };
-      const view = task?.lastView;
-      if (view) {
-        const reconciled = reconcilePullRequestView(view, prEvent.payload);
-        if (reconciled !== view) (await this.store.saveView(prEvent.taskId, reconciled));
-      }
-      const observation = githubPrWebhookObservationKey(prEvent);
-      if (observation) {
-        const digest = crypto.createHash('sha256').update(observation).digest('hex');
-        if (!(await this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId)))
-          return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
-      }
-      return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
+      return this.store.transaction(async () => {
+        const task = await this.store.getTask(prEvent.taskId);
+        const attached = task ? await this.store.listProjectRepositories(task.projectId) : [];
+        if (!attached.some(({ repository }) => repository.providerId === String(payload.repository?.id)))
+          return { accepted: true };
+        const view = task?.lastView;
+        if (view) {
+          const reconciled = reconcilePullRequestView(view, prEvent.payload);
+          if (reconciled !== view) (await this.store.saveView(prEvent.taskId, reconciled));
+        }
+        const observation = githubPrWebhookObservationKey(prEvent);
+        if (observation) {
+          const digest = crypto.createHash('sha256').update(observation).digest('hex');
+          if (!(await this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId)))
+            return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
+        }
+        return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
+      });
     }
     if (['installation', 'installation_repositories', 'repository'].includes(event)) {
       const repositories = await this.reconcile({ ...connection, provider: 'github' });

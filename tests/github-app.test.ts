@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -610,6 +610,14 @@ describe('GitHub App integration', () => {
       pr: taskPr, prs: [taskPr],
       checkouts: [{ name: 'app', branch: `karmax/${task.id}`, base: 'main', pr: taskPr }] }));
 
+    const saveView = store.saveView.bind(store);
+    const claim = vi.spyOn(store, 'saveView').mockImplementationOnce(async (...args) => {
+      await saveView(...args);
+      throw new Error('observation write failed');
+    });
+    await expect(deliver('pull_request', 'pr-rollback', pull(`karmax/${task.id}`))).rejects.toThrow('observation write failed');
+    expect((await store.getTask(task.id))?.lastView?.pr).toMatchObject({ state: 'open' });
+    claim.mockRestore();
     const merged = await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`));
     expect(merged.events).toHaveLength(1);
     expect(merged.events![0]).toMatchObject({ taskId: task.id, type: 'github.pr.merged' });
