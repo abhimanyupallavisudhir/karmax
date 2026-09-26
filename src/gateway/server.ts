@@ -719,7 +719,7 @@ export class Gateway {
   }
   private sweepConnections(): void {
     if (!this.githubWebhookSweep && this.deps.githubApp?.retryWebhooks) {
-      this.githubWebhookSweep = this.deps.githubApp.retryWebhooks((result) => this.dispatchGithubWebhook(result))
+      this.githubWebhookSweep = this.deps.githubApp.retryWebhooks(async (result) => { await this.dispatchGithubWebhook(result); })
         .catch((error) => console.warn('[github] webhook retry failed', error))
         .finally(() => { this.githubWebhookSweep = undefined; });
     }
@@ -930,7 +930,7 @@ export class Gateway {
     }
   }
 
-  private async dispatchGithubWebhook(result: import('../integrations/github-app.js').GithubWebhookResult): Promise<void> {
+  private async dispatchGithubWebhook(result: import('../integrations/github-app.js').GithubWebhookResult): Promise<number> {
     for (const event of result.events ?? []) {
       await this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
       const task = await this.deps.store.getTask(event.taskId);
@@ -938,8 +938,9 @@ export class Gateway {
         && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
         await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
     }
-    await this.dispatchGithubRecoveryEvents(result.projectEvents ?? []);
+    const recoveries = await this.dispatchGithubRecoveryEvents(result.projectEvents ?? []);
     for (const event of result.vaultPushes ?? []) await this.enqueueGitPassPush(event);
+    return recoveries;
   }
 
   /** Route both terminal GitHub runs and "no run was created" incidents through
@@ -1526,14 +1527,17 @@ export class Gateway {
       try {
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
         const deliveryId = String(req.headers['x-github-delivery'] ?? '');
+        let recoveries = 0;
         const result = await this.deps.githubApp.deliverWebhook(
           String(req.headers['x-github-event'] ?? ''), deliveryId, raw,
           typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
-          (result) => this.dispatchGithubWebhook(result),
+          async (result) => { recoveries = await this.dispatchGithubWebhook(result); },
         );
         return this.json(res, 200, { accepted: result.accepted,
           ...(result.reconciled !== undefined ? { reconciled: result.reconciled } : {}),
           ...(result.events?.length ? { dispatched: result.events.length } : {}),
+          ...(recoveries ? { recoveries } : {}),
+          ...(result.vaultPushes?.length ? { vaultSyncsQueued: result.vaultPushes.length } : {}),
         });
       } catch (error) {
         // Verified failures remain in the durable inbox for local retry.
