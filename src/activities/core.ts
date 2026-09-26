@@ -1,3 +1,4 @@
+import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
@@ -118,31 +119,6 @@ const DEFAULT_GRANT = [
   'github:actions:read',
 ];
 
-// A confirmer belongs to a logical task, so sibling attempts must not review in
-// parallel against divergent copies of its conversation. The worker is the
-// single activity host in v1; this keyed FIFO serializes those turns while each
-// Temporal activity remains independently retryable.
-const confirmLocks = new Map<string, { held: boolean; waiters: Array<() => void> }>();
-async function acquireConfirmLock(key: string): Promise<() => void> {
-  let lock = confirmLocks.get(key);
-  if (!lock) {
-    lock = { held: false, waiters: [] };
-    confirmLocks.set(key, lock);
-  }
-  if (lock.held) await new Promise<void>((resolve) => lock!.waiters.push(resolve));
-  else lock.held = true;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    const next = lock!.waiters.shift();
-    if (next) next();
-    else {
-      lock!.held = false;
-      confirmLocks.delete(key);
-    }
-  };
-}
 
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
@@ -2262,7 +2238,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Confirm turns for sibling attempts share one durable transcript and run
       // serially. Fresh provider sessions replay that canonical transcript, which
       // also works across account/config-home rotation (native sessions are home-bound).
-      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId) : () => {};
+      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId, signal) : () => {};
       let confirmTranscript: Message[] | undefined;
       if (args.role === 'confirm') {
         let shared: Message[];
