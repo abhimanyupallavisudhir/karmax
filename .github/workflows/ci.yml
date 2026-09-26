@@ -64,7 +64,10 @@ jobs:
           node-version: '22'
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+      # Only these known packages need install-time work (native bindings/codegen).
+      - run: npm rebuild @swc/core esbuild node-pty protobufjs
+      - run: npm audit --audit-level=high
       - run: npm run typecheck
 
   test:
@@ -115,7 +118,8 @@ jobs:
           node-version: '22'
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild @swc/core esbuild node-pty protobufjs
 
       - name: Install Chromium for browser regressions
         run: npx playwright install --with-deps chromium

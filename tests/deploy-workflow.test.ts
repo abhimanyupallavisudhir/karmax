@@ -21,6 +21,14 @@ describe('post-push deployment to the public instance', () => {
       }
     }
   });
+
+  it('does not execute arbitrary dependency install scripts in CI', () => {
+    for (const name of ['checks', 'test']) {
+      const steps = JSON.stringify(ci.jobs[name].steps);
+      expect(steps).toContain('npm ci --ignore-scripts');
+      expect(steps).toContain('npm rebuild @swc/core esbuild node-pty protobufjs');
+    }
+  });
   it('schema-validates every workflow with a version-and-checksum-pinned actionlint', () => {
     expect(ciSource).toContain("ACTIONLINT_VERSION: '1.7.12'");
     expect(ciSource).toContain('ACTIONLINT_LINUX_AMD64_SHA256');
