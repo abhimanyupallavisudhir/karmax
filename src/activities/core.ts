@@ -1,3 +1,4 @@
+import { turnPlatformRequest } from '../agent/platform-request.js';
 import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
@@ -2615,22 +2616,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
           ...(token
             ? {
-                platformRequest: async (method: string, requestPath: string, body?: unknown) => {
-                  if (!requestPath.startsWith('/api/')) throw new Error('platform path must start with /api/');
-                  const base = process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505';
-                  const response = await fetch(`${base}${requestPath}`, {
-                    method,
-                    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-                    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-                  });
-                  const value = response.headers.get('content-type')?.includes('json') ? await response.json() : await response.text();
-                  if (!response.ok) throw new Error((value as any)?.error ?? `HTTP ${response.status}`);
-                  return value;
-                },
+                platformRequest: (method: string, requestPath: string, body?: unknown) =>
+                  turnPlatformRequest({ token, method, path: requestPath, body, signal }),
               }
             : {}),
         },
         );
+        if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
+        if (resultKey) await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
+        }
         // Defence in depth around the activity boundary. `runTurn` rejects an
         // adapter return after abort, but cancellation can race the few synchronous
         // instructions between that check and this await continuation. Never report
