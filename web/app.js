@@ -4495,7 +4495,7 @@ function tagGroupVisibleTasks(group, keep, seen = new Map()) {
 function tagChips(t) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
-    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${tag.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
     .join('');
 }
 function priorityFlag(t) {
@@ -4656,7 +4656,7 @@ function pullRequestLinks(v) {
   return prs.map((pr) => {
     const state = pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
     const label = prs.length > 1 && pr.repo ? `${pr.repo} #${pr.number}` : `PR #${pr.number}`;
-    return `<a class="pr-link ${state}" href="${esc(pr.url)}" target="_blank" rel="noopener"
+    return `<a class="pr-link ${state}" href="${esc(safeHref(pr.url))}" target="_blank" rel="noopener"
       title="${esc(pr.slug ? `${pr.slug} — ${state}` : state)}">⇱ ${esc(label)}<span class="pr-state">${state}</span></a>`;
   }).join('');
 }
@@ -5098,7 +5098,7 @@ function openTagsManager(initialEditId = null) {
     const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
       ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
-          <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
+          <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
           <span class="tagm-summary">
             <span class="pal-sub">${esc(t.kind || '—')}</span>
             ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
@@ -6916,7 +6916,7 @@ function orgEditorHtml(rec) {
     const t = tagById(id); if (!t) return '';
     const color = t.color ? `style="--tag:${esc(t.color)}"` : '';
     return `<span class="tag-assignment" ${color}>
-      <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
+      <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
       <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
     </span>`;
   }).join('');
@@ -8397,7 +8397,7 @@ function checkoutsSection(v) {
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const pr = c.pr
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
-           href="${esc(c.pr.url)}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
+           href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
     return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
       <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
@@ -8440,7 +8440,7 @@ function overviewTab(v) {
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
-         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
+         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
          ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
@@ -11257,7 +11257,7 @@ function insightTaskRow(ref, kind) {
   const meta = kind === 'shipped'
     ? `${esc(project)}${ref.at ? ` · ${esc(fmtAgo(ref.at))}` : ''}`
     : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'needs input' : stageLabel({ stage: ref.stage }))}` : ''}`;
-  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(ref.pr)}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
+  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(safeHref(ref.pr))}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
   const title = `${ref.num != null ? `<span class="ins-num">#${esc(ref.num)}</span> ` : ''}${esc(ref.title)}`;
   return `<div class="ins-task"><span class="ins-dot ${kind}" aria-hidden="true"></span>
     ${href ? `<a class="ins-task-title" data-spa href="${esc(href)}">${title}</a>` : `<span class="ins-task-title">${title}</span>`}
@@ -15863,7 +15863,7 @@ async function wireOutboundEmailCard() {
       $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
       $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
       $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-      const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+      const links = (info?.links || []).map((l) => `<a href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
       helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
     };
     if (data.provider) providerSel.value = data.provider;

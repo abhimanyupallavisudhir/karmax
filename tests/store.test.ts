@@ -216,6 +216,18 @@ describe('Store', () => {
     expect((await store.createTag({ projectId: p.id, name: 'bug' })).kind).toBe('type');
   });
 
+  it('rejects invalid tag kinds on creation and updates (UI-1)', async () => {
+    const project = await store.createProject('Tags');
+    const tag = await store.createTag({ projectId: project.id, name: 'valid', kind: 'type' });
+    for (const kind of ['\" onclick=\"alert(1)', 'unknown', '', 123, {}]) {
+      await expect(store.createTag({ projectId: project.id, name: 'parent/child', kind: kind as any })).rejects.toThrow(/tag kind/i);
+      await expect(store.updateTag(tag.id, { kind: kind as any })).rejects.toThrow(/tag kind/i);
+    }
+    expect((await store.listTags(project.id)).length).toBe(1);
+    expect((await store.getTag(tag.id))?.kind).toBe('type');
+    expect((await store.updateTag(tag.id, { kind: null }))?.kind).toBeUndefined();
+  });
+
   it('applies a path tag kind to its ancestors, not just the leaf', async () => {
     const p = (await store.createProject('Paths'));
     // A hierarchy is within-kind: kind-scoped sectioning drops a child whose

@@ -4450,6 +4450,7 @@ export class Store {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     assertTagColor(input.color);
+    assertTagKind(input.kind);
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
     // types the path. `color`/`description` apply to the leaf; `kind` applies to the
@@ -4527,6 +4528,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     assertTagColor(patch.color);
+    assertTagKind(patch.kind);
     const cur = (await this.getTag(id));
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
@@ -7829,6 +7831,11 @@ function rowToTask(r: any): TaskRecord {
 
 /** A tag colour is rendered into an inline `style` custom property; only a
  *  hex literal is accepted so it can never carry a CSS declaration. */
+function assertTagKind(kind: unknown): void {
+  if (kind == null) return;
+  if (kind !== 'type' && kind !== 'topic' && kind !== 'flag') throw new Error('tag kind must be type, topic, or flag');
+}
+
 function assertTagColor(color: string | null | undefined): void {
   if (color == null || color === '') return;
   if (!/^#[0-9a-fA-F]{3,8}$/.test(color)) throw new Error('tag color must be a hex colour like #4a90d9');
