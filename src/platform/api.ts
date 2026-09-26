@@ -4881,11 +4881,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     workflow: string,
   ): Promise<{ workflow: 'software-dev' | 'goal'; task?: TaskRecord }> {
     const task = (await this.deps.store.getTask(taskId));
-    (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
+    const caller = (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
     }
+    // Goal has no Review gate. Switching to it is the same reviewer's decision
+    // as patching `confirm.layers` to `[]` (updateParams), so a task agent,
+    // which holds task:edit on its own task, needs review:approve for it too.
+    if (workflow === 'goal' && task.workflow !== 'goal' && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
+      throw new CapabilityError('switching a task to Goal removes its Review gate and needs review:approve (a maintainer-level authorization)');
     // A draft has no Temporal execution yet, so its workflow is ordinary editable
     // task metadata. Re-pin it to the target definition in place: identity, notes,
     // tags, authorization and sparse parameters all survive the form change.

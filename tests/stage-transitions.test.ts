@@ -1031,6 +1031,11 @@ describe('task stage transitions', () => {
       .toMatchObject({ userId: `task-agent:${f.task.id}:do`, satisfied: true });
     // Re-routing who reviews follows the same rule.
     await expect(f.api.updateParams((await agent(['task:*'])), f.task.id, { confirm: { layers: [] } })).rejects.toThrow(/review:approve/);
+    // So does switching to Goal, which has no Review gate at all (WF-7).
+    await expect(f.api.changeWorkflow((await agent(['task:*'])), f.task.id, 'goal')).rejects.toThrow(/review:approve/);
+    expect((await f.store.getTask(f.task.id))?.workflow).not.toBe('goal');
+    await expect(f.api.changeWorkflow((await agent(['task:*'])), f.task.id, 'software-dev')).resolves.toBeTruthy();
+    await expect(f.api.changeWorkflow((await agent(['task:*', 'review:approve'])), f.task.id, 'goal')).resolves.toBeTruthy();
   });
 
   it('consumes a current Review-hold confirmation once instead of restoring the hold again', async () => {
