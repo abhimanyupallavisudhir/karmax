@@ -141,3 +141,29 @@ it('does not reap an undecidable provider reference (WD-1)', async () => {
   await f.lifecycle.sweep();
   expect(destroy).not.toHaveBeenCalled();
 });
+
+it('continues after one checkpoint fails (WD-2)', async () => {
+  const f = await fixture();
+  const task = await f.store.createTask({ projectId: f.project.id, title: 'Second parked task',
+    workflow: 'software-dev', workflowVersion: '1.0.0', params: {} });
+  const second = await f.store.registerWorld({ ...f.handle, id: task.id }, f.project.id);
+  await f.store.setWorldState(second, 'parked');
+  vi.spyOn(f.store, 'latestWorldCheckpoint').mockResolvedValue(undefined);
+  f.checkpointWorld.mockImplementation(async handle => {
+    if (handle.id === f.handle.id) throw new Error('checkpoint unavailable');
+    return { id: 'second-checkpoint', worldId: task.id, generation: 1, projectId: f.project.id,
+      runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() };
+  });
+  expect(await f.lifecycle.sweep(Date.now() + 100)).toBe(1);
+  expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  expect(await f.store.worldState(second.id)).toBe('hibernated');
+});
+
+it('never invokes recovery to destroy an old sandbox (WD-7)', async () => {
+  const f = await fixture();
+  f.open.mockRejectedValue(new Error('sandbox vanished'));
+  const recover = vi.fn(async () => undefined);
+  f.worlds.setRecoveryHandler(recover);
+  await f.lifecycle.sweep(Date.now() + 1);
+  expect(recover).not.toHaveBeenCalled();
+});

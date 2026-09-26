@@ -266,6 +266,16 @@ export class E2BWorldProvider implements WorldProvider {
       });
   }
 
+  async destroy(handle: WorldHandle): Promise<void> {
+    const reference = this.refOf(handle);
+    const connection = await this.connection(reference.organizationId);
+    if (!this.factory.kill) { await (await this.open(handle)).destroy(); return; }
+    await this.factory.kill(reference.sandboxId, connection?.apiKey ? { apiKey: connection.apiKey } : {});
+    this.sandboxes.delete(reference.sandboxId);
+    this.states.delete(reference.sandboxId);
+    this.destroyed.add(handle);
+  }
+
   async park(handle: WorldHandle): Promise<WorldHandle> {
     const reference = this.refOf(handle);
     const sandboxId = reference.sandboxId;

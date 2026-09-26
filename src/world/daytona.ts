@@ -200,6 +200,15 @@ export class DaytonaWorldProvider implements WorldProvider {
       });
   }
 
+  async destroy(handle: WorldHandle): Promise<void> {
+    const reference = this.reference(handle);
+    const sandbox = await this.factoryFor(await this.connection(reference.organizationId)).get(reference.sandboxId);
+    await deleteSandbox(sandbox);
+    this.sandboxes.delete(reference.sandboxId);
+    this.states.delete(reference.sandboxId);
+    this.destroyed.add(handle);
+  }
+
   async park(handle: WorldHandle): Promise<WorldHandle> {
     const reference = this.reference(handle);
     const id = reference.sandboxId;

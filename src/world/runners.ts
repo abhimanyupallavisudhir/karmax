@@ -220,6 +220,7 @@ export class WorldLifecycleManager {
     await this.reapOrphanSandboxes();
     let hibernated = 0;
     for (const candidate of (await this.store.listWorldInstances('parked'))) {
+      try {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = (await this.store.getProject(projectId));
       const after = project ? (await this.store.effectiveProjectConfig(project)).hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
@@ -227,7 +228,7 @@ export class WorldLifecycleManager {
       // Selection is only a hint: a gateway or activity can resume this world
       // while the sweep awaits another provider. Own the complete destructive
       // transition, and recheck after every potentially slow preparation step.
-      await this.worlds.withOperation(candidate.handle.id, async () => {
+      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
         const eligible = async (checkSelection = false) => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);
           return !!current && current.generation === (candidate.handle.generation ?? 1)
@@ -243,11 +244,13 @@ export class WorldLifecycleManager {
           checkpoint = await this.checkpoints.checkpoint(candidate.handle);
         if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return;
         try {
-          const world = await this.worlds.open(candidate.handle as any);
-          // Recovery may replace a missing sandbox during open. Never destroy
-          // that new generation on the authority of the old parked candidate.
-          if (!(await eligible())) return;
-          await world.destroy();
+          const provider = this.worlds.get(candidate.handle.kind);
+          if (provider.destroy) await provider.destroy(candidate.handle as any);
+          else {
+            const world = await this.worlds.open(candidate.handle as any);
+            if (!(await eligible())) return;
+            await world.destroy();
+          }
         } catch (error) {
           // A timeout/5xx is not proof of eviction. Preserve the recoverable
           // state and let the next sweep retry unless the provider proves loss.
@@ -266,7 +269,12 @@ export class WorldLifecycleManager {
         await this.store.setWorldState(candidate.handle, 'hibernated');
         await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id });
         hibernated++;
-      });
+      }));
+      } catch (error) {
+        await this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return hibernated;
   }

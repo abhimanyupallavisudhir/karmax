@@ -434,6 +434,8 @@ export interface WorldProvider {
   open(handle: WorldHandle): Promise<World>;
   /** Release metered compute while retaining the world's durable state. */
   park?(handle: WorldHandle): Promise<WorldHandle>;
+  /** Delete through the control plane without resuming the sandbox. */
+  destroy?(handle: WorldHandle): Promise<void>;
   status?(handle: WorldHandle): Promise<WorldLifecycleState>;
   /** Ask the provider's control plane for the sandbox's authoritative state
    * without resuming or otherwise mutating it. `status` reports the local
