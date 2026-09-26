@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -72,6 +72,15 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       model: { type: 'string' },
       effort: { enum: expect.arrayContaining(['low', 'high', 'xhigh']) },
     });
+  });
+
+  it('projects bare task listings from summaries', async () => {
+    const full = vi.fn(async () => { throw new Error('full conversation listing used'); });
+    const summaries = vi.fn(async () => [{ id: 'task-1', title: 'Task', workflow: 'just-do' }]);
+    const ops = apiOps({ listTasks: full, listTaskSummaries: summaries } as any, () => 'token');
+    expect(await ops.listTasks('project')).toEqual([{ id: 'task-1', title: 'Task', workflow: 'just-do' }]);
+    expect(summaries).toHaveBeenCalledWith('token', 'project');
+    expect(full).not.toHaveBeenCalled();
   });
 
   it('routes exact historical verification through the authorized API', async () => {

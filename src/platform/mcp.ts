@@ -107,7 +107,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     // error for a task that already existed.
     createTask: (a) => api.createTask(getToken(), a),
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
-    listTasks: async (pid) => (await api.listTasks(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
+    listTasks: async (pid) => (await api.listTaskSummaries(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
     searchTasks: async (pid, query) => {
       const [result, tags] = await Promise.all([api.searchTasks(getToken(), pid, query), api.listTags(getToken(), pid)]);
       return compactSearch(result, tags);
