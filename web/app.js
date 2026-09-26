@@ -2374,7 +2374,7 @@ async function uploadConversationFile(file) {
 }
 
 function attachmentUrl(id, name) {
-  const query = new URLSearchParams({ projectId: S.projectId, token: S.token || '' });
+  const query = new URLSearchParams({ projectId: S.projectId });
   if (name) query.set('name', name);
   return `/api/attachments/${encodeURIComponent(id)}?${query}`;
 }
@@ -3270,7 +3270,7 @@ function scheduleTaskListReload() {
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
   ws.onmessage = (m) => {
     let ev;
@@ -7820,7 +7820,7 @@ function openTerminal(taskId) {
   // which branch to land in. It is just a cwd — no second world, and the remote
   // case costs nothing extra for exactly that reason (SPEC §11.1).
   const checkout = document.getElementById('term-checkout')?.value;
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -8045,7 +8045,7 @@ function wireReviewActions(v) {
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
         reviewActionWs = ws;
         let exited = false;
         ws.onmessage = (m) => {

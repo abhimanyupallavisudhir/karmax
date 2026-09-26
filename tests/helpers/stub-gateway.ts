@@ -9,6 +9,8 @@ import { ContributionRegistry } from '../../src/contrib/registry.js';
 import { Overlays } from '../../src/store/overlays.js';
 import { WorldRegistry } from '../../src/world/registry.js';
 
+let nextPort = 48300;
+
 /** Real HTTP boundary, with no Temporal or paid providers. */
 export async function stubGateway(overrides: Partial<GatewayDeps> = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gateway-regression-'));
@@ -19,7 +21,7 @@ export async function stubGateway(overrides: Partial<GatewayDeps> = {}) {
     client: {} as any, api: {} as any, taskQueue: 'test', staticDir: home,
     agentInfo: { provider: 'mock', reason: 'regression test' }, worlds: new WorldRegistry(),
     ...overrides });
-  const running = await gateway.listen(48300);
+  const running = await gateway.listen(nextPort++);
   return { gateway, store, tokens, base: running.internalUrl, async close() {
     await running.close(); await store.close(); fs.rmSync(home, { recursive: true, force: true });
   } };

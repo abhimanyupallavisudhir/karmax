@@ -552,10 +552,12 @@ interface Session {
   apiToken: string;
   userId?: string;
   email?: string;
+  expiresAt?: number;
 }
 
 export class Gateway {
   private sessions = new Map<string, Session>();
+  private passwordlessSession?: Promise<{ sid: string; session: Session }>;
   private closing = false;
   private terminalStarts = new Set<Promise<void>>();
   private terminalStops = new Set<() => Promise<void>>();
@@ -890,8 +892,17 @@ export class Gateway {
     }
     const sid = `s_${crypto.randomBytes(18).toString('hex')}`;
     const apiToken = (await this.deps.tokens.mintPrincipal(`user:${user}`, USER_CAPS)).token;
-    const session: Session = { user, userId: user, apiToken };
+    const session: Session = { user, userId: user, apiToken, expiresAt: Date.now() + 12 * 60 * 60_000 };
+    for (const [key, value] of this.sessions) if ((value.expiresAt ?? Infinity) <= Date.now()) {
+      this.sessions.delete(key);
+      await this.deps.tokens.revoke(value.apiToken);
+    }
     this.sessions.set(sid, session);
+    while (this.sessions.size > 128) {
+      const [key, value] = this.sessions.entries().next().value!;
+      this.sessions.delete(key);
+      await this.deps.tokens.revoke(value.apiToken);
+    }
     return { sid, session };
   }
 
@@ -1320,6 +1331,15 @@ export class Gateway {
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
+  private secureRequest(req: http.IncomingMessage): boolean {
+    return this.deps.hosted === true || process.env.KARMAX_PUBLIC_URL?.startsWith('https://') === true
+      || (req.socket as { encrypted?: boolean })?.encrypted === true;
+  }
+
+  private sessionCookie(req: http.IncomingMessage, sid: string): string {
+    return `krmax_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sid ? 43200 : 0}${this.secureRequest(req) ? '; Secure' : ''}`;
+  }
+
   private sameOriginRequest(req: http.IncomingMessage): boolean {
     const site = req.headers['sec-fetch-site'];
     if (site && site !== 'same-origin' && site !== 'none') return false;
@@ -1433,7 +1453,14 @@ export class Gateway {
       if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       const authRequired = !!this.deps.password;
       if (!authRequired) {
-        const { sid } = (await this.newSession());
+        if (this.passwordlessSession) {
+          const previous = await this.passwordlessSession;
+          if (!this.sessions.has(previous.sid) || (previous.session.expiresAt ?? 0) <= Date.now()) this.passwordlessSession = undefined;
+        }
+        const { sid } = await (this.passwordlessSession ??= this.newSession().catch(error => {
+          this.passwordlessSession = undefined; throw error;
+        }));
+        res.setHeader('set-cookie', this.sessionCookie(req, sid));
         return this.json(res, 200, { authRequired: false, token: sid, user: 'me' });
       }
       return this.json(res, 200, { authRequired: true });
@@ -1460,7 +1487,7 @@ export class Gateway {
         if (this.pendingPolicyAcceptances.size >= 10_000)
           return this.json(res, 429, { error: 'too many pending signup attempts; try again shortly' });
         this.pendingPolicyAcceptances.set(hash, { versions, expiresAt: now + 15 * 60_000 });
-        res.setHeader('set-cookie', `krmax_policy_acceptance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=900${this.deps.hosted ? '; Secure' : ''}`);
+        res.setHeader('set-cookie', `krmax_policy_acceptance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=900${this.secureRequest(req) ? '; Secure' : ''}`);
         return this.json(res, 200, { ok: true, versions });
       } catch (error) {
         return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -1777,6 +1804,7 @@ export class Gateway {
       if (this.deps.password && timingSafeEqualStr(String(b.password ?? ''), this.deps.password)) {
         this.clearLoginFailures(throttleKeys);
         const { sid } = (await this.newSession());
+        res.setHeader('set-cookie', this.sessionCookie(req, sid));
         return this.json(res, 200, { token: sid, user: 'me' });
       }
       this.noteLoginFailure(throttleKeys);
@@ -1872,19 +1900,11 @@ export class Gateway {
       }
     }
 
-    // Serve an image attachment. Auth via `?token=` (session id) because a plain
-    // <img src> can't set an Authorization header; the token is the same session
-    // secret used everywhere else, so this is no weaker than the Bearer path.
+    // Browser attachments use HttpOnly session cookies; API clients use headers.
     const attGet = p.match(/^\/api\/attachments\/([^/]+)$/);
     if (attGet && method === 'GET') {
-      const sid = url.searchParams.get('token') ?? '';
       const projectId = url.searchParams.get('projectId') ?? undefined;
-      let attachmentSession = await this.auth(req, projectId);
-      if (!attachmentSession && sid) {
-        attachmentSession = this.sessions.get(sid);
-        const agent = (await this.deps.tokens.verify(sid));
-        if (!attachmentSession && agent) attachmentSession = { user: agent.principal, apiToken: sid };
-      }
+      const attachmentSession = await this.auth(req, projectId);
       if (!attachmentSession) return this.json(res, 401, { error: 'unauthorized' });
       if (projectId && !(await this.deps.tokens.check(attachmentSession.apiToken, 'task:read', { projectId })).ok)
         return this.json(res, 403, { error: 'missing capability task:read' });
@@ -2043,7 +2063,14 @@ export class Gateway {
       }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
-        if (bearer) this.sessions.delete(bearer);
+        const legacyId = bearer ?? req.headers.cookie?.split(';').map(value => value.trim())
+          .find(value => value.startsWith('krmax_session='))?.slice('krmax_session='.length);
+        if (legacyId) {
+          const legacy = this.sessions.get(legacyId);
+          this.sessions.delete(legacyId);
+          if (legacy) await this.deps.tokens.revoke(legacy.apiToken);
+        }
+        res.setHeader('set-cookie', this.sessionCookie(req, ''));
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
       }
@@ -8408,10 +8435,15 @@ export class Gateway {
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
     const h = req.headers['authorization'];
-    const sid = h?.startsWith('Bearer ') ? h.slice(7) : undefined;
+    const sid = h?.startsWith('Bearer ') ? h.slice(7)
+      : req.headers.cookie?.split(';').map(value => value.trim()).find(value => value.startsWith('krmax_session='))?.slice('krmax_session='.length);
     if (sid) {
       const legacy = this.sessions.get(sid);
-      if (legacy) return legacy;
+      if (legacy) {
+        if ((legacy.expiresAt ?? Infinity) > Date.now() && await this.deps.tokens.verify(legacy.apiToken)) return legacy;
+        this.sessions.delete(sid);
+        await this.deps.tokens.revoke(legacy.apiToken);
+      }
       const agent = (await this.deps.tokens.verify(sid));
       if (agent) return { user: agent.principal, apiToken: sid };
     }
@@ -8454,17 +8486,8 @@ export class Gateway {
     }
     return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
   }
-  /** Browser WebSockets carry Better Auth cookies. The legacy test/embed gateway
-   * instead has a JSON session id, which may be passed explicitly in the query
-   * just like attachment URLs; production task tokens are never synthesized. */
-  private async socketAuth(req: http.IncomingMessage, url: URL, projectId?: string): Promise<Session | undefined> {
-    const token = url.searchParams.get('token') ?? '';
-    if (token) {
-      const legacy = this.sessions.get(token);
-      if (legacy) return legacy;
-      const agent = (await this.deps.tokens.verify(token));
-      if (agent) return { user: agent.principal, apiToken: token };
-    }
+  /** Browser sockets use HttpOnly cookies; API clients use Authorization. */
+  private async socketAuth(req: http.IncomingMessage, _url: URL, projectId?: string): Promise<Session | undefined> {
     return this.auth(req, projectId);
   }
   /** Organization-scoped mailbox provider config (agent-mail §8). */
