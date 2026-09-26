@@ -555,28 +555,41 @@ export class StripeIssuingProvider implements PaymentProvider {
         ? (await this.requireStore().getProject(spec.scopeId!))?.organizationId : 'org_personal');
     if (!organizationId) throw new Error('card organization is required');
     const connection = (await this.connection(organizationId));
+    if (!spec.label.trim() || (await this.requireStore().listOrganizationCards(organizationId))
+      .some(card => card.label.trim().toLowerCase() === spec.label.trim().toLowerCase()))
+      throw new Error('Card name must be unique in the organization');
+    const balance = await this.balance(organizationId);
     const id = newId('card');
     const currency = (spec.currency ?? 'usd').toLowerCase();
     const remote = await this.request('POST', '/v1/issuing/cards', connection.accountId, {
       cardholder: spec.cardholderId,
       currency,
       type: 'virtual',
-      status: 'active',
+      status: 'inactive',
       'spending_controls[spending_limits][0][amount]': spec.cap,
       'spending_controls[spending_limits][0][interval]': 'all_time',
       'spending_controls[spending_limits_currency]': currency,
       'metadata[karmax_card_id]': id,
       'metadata[karmax_organization_id]': organizationId,
     }, `karmax-card-${id}`);
-    const balance = await this.balance(organizationId);
     const card: Card = {
       id, provider: this.name, scope: spec.scope, scopeId: spec.scopeId, label: spec.label,
       cap: spec.cap, available: balance.available, merchantLock: spec.merchantLock,
-      externalId: remote.id, currency, status: remote.status, cardholderId: spec.cardholderId,
+      externalId: remote.id, currency, status: 'inactive', cardholderId: spec.cardholderId,
       last4: remote.last4, createdAt: Date.now(),
     };
-    (await this.requireStore().createCard(card));
-    return card;
+    try {
+      await this.requireStore().createCard(card);
+      await this.request('POST', `/v1/issuing/cards/${encodeURIComponent(remote.id)}`, connection.accountId,
+        { status: 'active' }, `karmax-activate-${id}`);
+      await this.requireStore().updateCard(id, { status: 'active' });
+      return { ...card, status: 'active' };
+    } catch (error) {
+      await this.request('POST', `/v1/issuing/cards/${encodeURIComponent(remote.id)}`, connection.accountId,
+        { status: 'canceled', cancellation_reason: 'lost' }, `karmax-failed-provision-${id}`);
+      await this.requireStore().updateCard(id, { status: 'canceled', available: 0 });
+      throw error;
+    }
   }
   async getCard(cardId: string): Promise<Card | undefined> {
     const card = (await this.store?.getCard(cardId)) as Card | undefined;

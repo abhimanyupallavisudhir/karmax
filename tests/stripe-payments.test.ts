@@ -137,6 +137,21 @@ describe('Stripe Issuing organization rail', () => {
     expect([...secrets.values()]).toContain('sk_test_retained');
   });
 
+  it('validates names before issuing and cancels remote cards when persistence fails (AU-18)', async () => {
+    await connect();
+    const spec = { scope: 'organization' as const, scopeId: organizationId, organizationId, label: 'Duplicate', cap: 1000, cardholderId: 'ich_tenant_a' };
+    await stripe.provisionCard(spec);
+    fetcher.mockClear();
+    await expect(stripe.provisionCard(spec)).rejects.toThrow(/unique/);
+    expect(fetcher.mock.calls.some(([url]) => url === 'https://api.stripe.com/v1/issuing/cards')).toBe(false);
+    const save = vi.spyOn(store, 'createCard').mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(stripe.provisionCard({ ...spec, label: 'Failure' })).rejects.toThrow(/database/);
+    save.mockRestore();
+    const create = fetcher.mock.calls.find(([url]) => url === 'https://api.stripe.com/v1/issuing/cards');
+    expect(new URLSearchParams(String(create?.[1]?.body)).get('status')).toBe('inactive');
+    expect(fetcher.mock.calls.some(([url, init]) => url.endsWith('/ic_tenant_a') && new URLSearchParams(String(init?.body)).get('status') === 'canceled')).toBe(true);
+  });
+
   it('stores a separate connected account and balance for the organization', async () => {
     await connect();
     expect((await store.getPaymentConnection(organizationId, 'stripe'))).toMatchObject({
