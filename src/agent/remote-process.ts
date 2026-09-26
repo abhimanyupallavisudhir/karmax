@@ -800,7 +800,20 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
-  const baked = await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
+  try {
+    const cached = JSON.parse(await world.readFile(marker));
+    if (cached.playwright === PLAYWRIGHT_VERSION && cached.chromeMcp === CHROME_DEVTOOLS_MCP_VERSION
+      && cached.playwrightMcp === PLAYWRIGHT_MCP_VERSION && typeof cached.chromium === 'string'
+      && typeof cached.bin === 'string' && typeof cached.cache === 'string') {
+      const probe = await world.exec('bash', ['-lc', [cached.chromium,
+        path.posix.join(cached.bin, 'playwright-mcp'), path.posix.join(cached.bin, 'chrome-devtools-mcp')]
+        .map(file => `test -x ${quote(file)}`).join(' && ')]);
+      if (probe.code === 0) {
+        chromium = cached.chromium; resolvedBin = cached.bin; resolvedCache = cached.cache;
+      }
+    }
+  } catch { /* missing or stale readiness marker: probe and repair below */ }
+  const baked = chromium ? { code: 1 } : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
   if (baked.code === 0) {
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
@@ -814,7 +827,6 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       resolvedCache = bakedCache;
     }
   }
-  if (!chromium) try { chromium = JSON.parse(await world.readFile(marker)).chromium; } catch { /* install below */ }
   if (!chromium) {
     const packages = [
       `playwright@${PLAYWRIGHT_VERSION}`,
@@ -860,8 +872,9 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
         : dependencyInstall;
       if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Krmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
-    await world.writeFile(marker, JSON.stringify({ chromium, playwright: PLAYWRIGHT_VERSION }));
   }
+  await world.writeFile(marker, JSON.stringify({ chromium, bin: resolvedBin, cache: resolvedCache,
+    playwright: PLAYWRIGHT_VERSION, chromeMcp: CHROME_DEVTOOLS_MCP_VERSION, playwrightMcp: PLAYWRIGHT_MCP_VERSION }));
   const env = { PLAYWRIGHT_BROWSERS_PATH: resolvedCache, ...(pathEnv ? { PATH: pathEnv } : {}) };
   if (browser === 'playwright')
     return { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
