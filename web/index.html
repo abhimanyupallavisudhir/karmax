@@ -24,8 +24,6 @@
     <script src="/totp-qr.js"></script>
     <script src="/markdown.js"></script>
     <script type="module" src="/app.js"></script>
-    <script>
-      if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js');
-    </script>
+    <script src="/register-service-worker.js" defer></script>
   </body>
 </html>
