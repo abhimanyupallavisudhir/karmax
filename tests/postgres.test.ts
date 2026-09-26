@@ -63,6 +63,11 @@ integration('PostgreSQL cutover', () => {
       const draft = await store.db.prepare("SELECT COALESCE(json_extract(params, '$.draft'), 0) AS draft FROM tasks WHERE id=?")
         .get(task.id) as { draft: number };
       expect(Number(draft.draft)).toBe(1);
+      await store.db.prepare('UPDATE tasks SET params=? WHERE id=?')
+        .run(JSON.stringify({ prompt: 'fixture', draft: 'false' }), task.id);
+      const stringDraft = await store.db.prepare("SELECT COALESCE(json_extract(params, '$.draft'), 0) AS draft FROM tasks WHERE id=?")
+        .get(task.id) as { draft: number };
+      expect(Number(stringDraft.draft)).toBe(1);
       const removed = await store.db.prepare("SELECT json_remove(params, '$.prompt', '$.draft', '$.missing', '$.nested.value') AS value FROM tasks WHERE id=?")
         .get(task.id) as { value: string };
       expect(JSON.parse(removed.value)).toEqual({});

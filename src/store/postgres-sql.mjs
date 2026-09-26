@@ -104,8 +104,8 @@ export function translate(statement) {
     .replace(/json_set\s*\(\s*([^,]+),\s*'\$\.([^']+)'\s*,\s*json\s*\(\s*\?\s*\)\s*\)/gi,
       (_match, expression, key) => `jsonb_set((${expression})::jsonb, '{${key}}', ?::jsonb)::text`)
     .replace(/COALESCE\s*\(\s*json_extract\(([^,]+),\s*'\$\.draft'\),\s*0\s*\)/gi,
-      (_match, expression) => `(CASE WHEN (${expression}::jsonb #>> '{draft}') IS NULL
-        OR lower((${expression}::jsonb #>> '{draft}')) IN ('false', '0', '0.0') THEN 0 ELSE 1 END)`)
+      (_match, expression) => `(CASE WHEN COALESCE((${expression})::jsonb -> 'draft', 'null'::jsonb)
+        IN ('null'::jsonb, 'false'::jsonb, '0'::jsonb) THEN 0 ELSE 1 END)`)
     .replace(/json_extract\(([^,]+),\s*'\$\.([^']+)'\)/gi, (_match, expression, path) =>
       `(${expression}::jsonb #>> '{${String(path).split('.').join(',')}}')`)
     .replace(/(FROM\s+task_subscribers\b[\s\S]*?ORDER\s+BY\s+createdAt)\s*,\s*rowid/gi, '$1, principalKey')

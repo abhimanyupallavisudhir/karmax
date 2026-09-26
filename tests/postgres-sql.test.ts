@@ -6,6 +6,7 @@ describe('PostgreSQL SQL translation', () => {
     const sql = translate("SELECT id FROM tasks WHERE COALESCE(json_extract(params, '$.draft'), 0) = 0").sql;
     expect(sql).not.toContain('::integer');
     expect(sql).toContain("'false'");
+    expect(sql).toContain("-> 'draft'");
   });
 
   it('removes any number of JSON paths including nested paths', () => {
