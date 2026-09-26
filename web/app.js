@@ -3326,7 +3326,7 @@ function scheduleTaskListReload() {
 }
 
 function connectWs() {
-  clearTimeout(connectWs.retryTimer);
+  if (connectWs.retryTimer) clearTimeout(connectWs.retryTimer);
   if (S.ws) {
     S.ws.onclose = S.ws.onmessage = S.ws.onopen = null;
     S.ws.close();
