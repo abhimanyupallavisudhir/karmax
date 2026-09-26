@@ -4123,8 +4123,11 @@ export class Store {
   ): Promise<void> {
     return this.db.transaction(async () => {
 
-    const requestOffset = [...subject.requestId].reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) % 997, 0);
-    const eventSeq = createdAt * 1000 + requestOffset;
+    // Synthetic inbox events use negative, transaction-allocated sequence
+    // numbers; real event sequences are positive. Hashing request ids can
+    // collide for different simultaneous asks to the same user.
+    const eventSeq = Number(await this.kvGet('inbox:next-synthetic-seq') ?? '0') - 1;
+    await this.kvSet('inbox:next-synthetic-seq', String(eventSeq));
     for (const userId of new Set(userIds)) {
       (await this.deleteInbox("userId=? AND taskId=? AND kind='approval-requested'", [userId, `avatar:${subject.avatarId}`]));
       const item: InboxItem = {

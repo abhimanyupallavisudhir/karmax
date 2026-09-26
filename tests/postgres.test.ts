@@ -26,6 +26,18 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('allocates distinct synthetic inbox sequences for simultaneous asks', async () => {
+    const store = await Store.create(url!);
+    try {
+      const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']])
+        await store.addAuthorizationInbox(org.id, ['owner'],
+          { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
+      expect((await store.listInbox('owner', org.id)).map((row) => row.subject?.requestId).sort()).toEqual(['Aa', 'BB']);
+    } finally { await store.close(); }
+  });
+
   it('removes project admission reservations with the project', async () => {
     const store = await Store.create(url!);
     try {

@@ -4,6 +4,19 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
 describe('organization and collaboration domain', () => {
+  it('delivers simultaneous authorization asks even when request hashes collide', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']])
+        await store.addAuthorizationInbox(org.id, ['owner'],
+          { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
+      const inbox = await store.listInbox('owner', org.id);
+      expect(inbox.map((row) => row.subject?.requestId).sort()).toEqual(['Aa', 'BB']);
+    } finally { await store.close(); }
+  });
+
   it('routes email by urgency for task and resource asks, retaining legacy defaults', async () => {
     const store = (await Store.create(':memory:'));
     const org = (await store.createOrganization({ name: 'Email', ownerUserId: 'owner' }));
