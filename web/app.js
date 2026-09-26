@@ -2921,7 +2921,10 @@ async function loadInbox() {
 }
 
 function inboxEventChanges(ev) {
-  return ev.type === 'view.updated' || ev.type.includes('escalat')
+  if (ev.type === 'view.updated') return ['done', 'failed', 'cancelled'].includes(ev.payload?.status)
+    || ['human', 'confirm', 'responder'].includes(ev.payload?.waitingFor)
+    || (S.inbox || []).some(item => item.taskId === ev.taskId);
+  return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
       'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
@@ -3311,7 +3314,11 @@ function connectWs() {
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
-    const patchedList = patchTaskListFromEvent(ev);
+    const eventProject = ev.projectId || ev.payload?.projectId;
+    const currentProject = !eventProject || eventProject === S.projectId;
+    const siblingAttempt = S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
+      && S.attemptGroup.principalAttemptId !== ev.taskId;
+    const patchedList = currentProject && patchTaskListFromEvent(ev);
     if (S.selected && ev.taskId === S.selected) {
       if (ev.type !== 'agent.output') {
         S.taskEvents.push(ev);
@@ -3349,10 +3356,9 @@ function connectWs() {
       // membership, but they do not require the expensive all-tasks endpoint.
       if (S.tab === 'tasks' && !S.selected) scheduleSearch();
       if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
-      renderRail();
-    } else if (LIST_RELOAD_EVENTS.has(ev.type)
+    } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
-        && (!ev.payload?.projectId || ev.payload.projectId === S.projectId))) {
+        ))) {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
@@ -3409,7 +3415,6 @@ async function refreshTasks() {
         await loadTasks();
         if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
         if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-        renderRail();
         if (S.tab === 'queue' && !S.selected) seedQueue();
       } catch {}
     } while (taskRefreshQueued);
