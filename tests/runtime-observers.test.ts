@@ -9,6 +9,16 @@ const adapters = (run: (ctx: PlatformToolContext) => Promise<void>) => new Map([
 }]]);
 
 describe('runtime observer delivery', () => {
+  it('starts observers at the event boundary and catches synchronous failures', async () => {
+    let observed = false;
+    const failure = new Error('synchronous observer failure');
+    await expect(runTurn(input, { adapters: adapters(async ctx => {
+      ctx.emit('hello');
+      expect(observed).toBe(true);
+    }), onEmit: () => { observed = true; throw failure; },
+    })).rejects.toBe(failure);
+  });
+
   it('waits for asynchronous output/session observers even when adapters do not await them', async () => {
     const delivered: string[] = [];
     const later = async (name: string) => { await new Promise(resolve => setTimeout(resolve, 10)); delivered.push(name); };

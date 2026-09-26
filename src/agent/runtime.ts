@@ -131,7 +131,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let observerFailed = false;
   let observerError: unknown;
   const observe = (callback: () => void | Promise<void>): Promise<void> => {
-    const pending = Promise.resolve().then(callback).catch(error => {
+    const pending = (async () => { await callback(); })().catch(error => {
       if (!observerFailed) { observerFailed = true; observerError = error; }
     });
     observers.add(pending);
