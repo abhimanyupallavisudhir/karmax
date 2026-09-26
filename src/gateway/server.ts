@@ -1670,7 +1670,10 @@ export class Gateway {
       try {
         await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
         const status = (await this.deps.githubApp.status(identity.user.id));
-        if (pending.returnTo === 'profile' && status.oauthConfigured) {
+        // Sign-in that continued to installation already authorized this exact account.
+        const authorized = Boolean(pending.githubAccountId && (await this.deps.githubApp.listUserAccounts(identity.user.id))
+          .some((account) => account.id === pending.githubAccountId));
+        if (pending.returnTo === 'profile' && status.oauthConfigured && !authorized) {
           const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
             { returnTo: 'profile', selectAccount: pending.selectAccount,
               githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin }));

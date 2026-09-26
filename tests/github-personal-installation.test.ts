@@ -66,7 +66,12 @@ async function fixture(installations: Installation[]) {
     expect(response.status, await response.clone().text()).toBe(303);
     return response.headers.get('location')!;
   };
-  return { store, githubApp, team, github, callback };
+  const installed = async (state: string, installationId: number) => {
+    const response = await fetch(`${server.url}/api/github/callback?installation_id=${installationId}&setup_action=install&state=${state}`, { redirect: 'manual' });
+    expect(response.status, await response.clone().text()).toBe(303);
+    return response.headers.get('location')!;
+  };
+  return { store, githubApp, team, github, callback, installed };
 }
 
 const own: Installation = { id: 42, account: { login: 'owner', type: 'User' } };
@@ -91,9 +96,27 @@ it('continues to GitHub installation for the personal organization when the App 
   const f = await fixture([githubOrganization]);
   const location = new URL(await f.callback('org_personal', 'profile'));
   expect(`${location.origin}${location.pathname}`).toBe('https://github.com/apps/test-app/installations/new');
-  expect(await f.store.consumeGithubInstallState(location.searchParams.get('state')!, 'me'))
-    .toMatchObject({ organizationId: 'org_personal', returnTo: 'profile', githubAccountId: '1', githubLogin: 'owner' });
+  const state = location.searchParams.get('state')!;
   expect(await f.store.listGitConnections('org_personal')).toEqual([]);
+  // Returning from GitHub lands on the profile: the account is already authorized.
+  f.github.installations = [githubOrganization, own];
+  const returned = await f.installed(state, 42);
+  expect(returned).not.toContain('github.com');
+  expect(returned).toContain('github=connected');
+  expect((await f.store.listGitConnections('org_personal')).map(item => item.installationId)).toEqual(['42']);
+  expect(await f.store.consumeGithubInstallState(state, 'me')).toBeUndefined();
+});
+
+it('still authorizes after installation when the GitHub account is not yet authorized', async () => {
+  const f = await fixture([own]);
+  // App creation from the profile installs before any user authorization exists.
+  const state = await f.store.createGithubInstallState('org_personal', 'me', { returnTo: 'profile', selectAccount: true });
+  const setup = new URL(await f.installed(state, 42));
+  expect(`${setup.origin}${setup.pathname}`).toBe('https://github.com/login/oauth/authorize');
+  // So does an installation for an account whose authorization was removed.
+  await f.callback('org_personal', 'profile');
+  const other = await f.store.createGithubInstallState('org_personal', 'me', { returnTo: 'profile', githubAccountId: '2', githubLogin: 'second' });
+  expect(new URL(await f.installed(other, 42)).pathname).toBe('/login/oauth/authorize');
 });
 
 it('leaves explicit installation choice and other authorization flows unchanged', async () => {
