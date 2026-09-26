@@ -7,6 +7,7 @@ import {
   continueAsNew,
   getExternalWorkflowHandle,
   workflowInfo,
+  patched,
   log,
 } from '@temporalio/workflow';
 import type { coordinatorActivities } from '../activities/coordinator.js';
@@ -30,6 +31,7 @@ export interface MergeQueueState {
   queue: string[];
   current?: string;
   processed: number;
+  historyPolicyVersion?: 2;
 }
 
 export interface QueueView {
@@ -106,7 +108,38 @@ export async function mergeQueue(input: { domain: string; state?: MergeQueueStat
   });
   setHandler(queueQuery, (): QueueView => ({ domain, queue: [...queue], current }));
 
+  const boundedHistory = input.state?.historyPolicyVersion === 2;
+  const historyFull = () => processed >= CONTINUE_AS_NEW_AFTER
+    || workflowInfo().historyLength >= 10_000 || workflowInfo().continueAsNewSuggested;
+  async function rotateIfNeeded() {
+    if ((!boundedHistory && patched('merge-queue-history-policy-v2')) || (boundedHistory && historyFull()))
+      await continueAsNew<typeof mergeQueue>({ domain, state: { domain, queue, current, processed: 0, historyPolicyVersion: 2 } });
+  }
+  if (boundedHistory) {
+    for (;;) {
+      await rotateIfNeeded();
+      await condition(() => !!current || queue.length > 0 || historyFull());
+      await rotateIfNeeded();
+      if (!current) {
+        current = queue.shift()!;
+        processed++;
+        try { await getExternalWorkflowHandle(current).signal(MERGE_GRANTED_SIGNAL); }
+        catch (e) {
+          log.warn(`grant signal to ${current} failed; reclaiming`, { e: String(e) });
+          current = undefined;
+          continue;
+        }
+      }
+      if (!current) continue;
+      const holder = current;
+      if (await condition(() => current !== holder || historyFull(), LEASE_TIMEOUT)) continue;
+      const alive = await act.isTaskAlive(holder);
+      if (current === holder && !alive) current = undefined;
+    }
+  }
+
   for (;;) {
+    await rotateIfNeeded();
     // Park until there is something to grant, or we should recycle history.
     await condition(() => (!current && queue.length > 0) || (processed >= CONTINUE_AS_NEW_AFTER));
 
@@ -140,6 +173,7 @@ export async function mergeQueue(input: { domain: string; state?: MergeQueueStat
       // it always exits with `current === undefined`, which is what the
       // continue-as-new guards below require.
       while (current === taskId) {
+        await rotateIfNeeded();
         if (await condition(() => current === undefined, LEASE_TIMEOUT)) break;
         if (!(await act.isTaskAlive(taskId))) {
           log.warn(`lease timeout; grantee ${taskId} not alive; reclaiming`);

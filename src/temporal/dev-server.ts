@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import { Connection } from '@temporalio/client';
 import { findFreePortFrom, findFreePorts, isPortFree, waitForPort } from '../util/ports.js';
 import { withTimeout } from '../util/timeout.js';
-import { trackProcess } from '../util/processes.js';
+import { trackProcess, processStartTick } from '../util/processes.js';
 import { CUSTODY_ENV } from '../agent/custody.js';
 
 const execFileP = promisify(execFileCb);
@@ -46,13 +46,14 @@ export interface DevServerOptions {
 }
 
 /** What we persist so a later boot/reload can find and reuse the running server. */
-interface ServerRecord {
+export interface ServerRecord {
   pid: number;
   address: string;
   uiUrl: string;
   namespace: string;
   /** Transient systemd user unit hosting the server, when systemd-run was usable. */
   unit?: string;
+  startTick?: string;
 }
 
 interface EphemeralServerRecord {
@@ -154,6 +155,38 @@ async function serverHealthy(address: string, namespace: string): Promise<boolea
   } finally {
     if (conn) await conn.close().catch(() => {});
   }
+}
+
+export function matchesRecordedTemporalProcess(
+  record: Pick<ServerRecord, 'pid' | 'address' | 'startTick'>,
+  process: { startTick?: string; argv: string[] },
+  dbFilename: string,
+): boolean {
+  if (!Number.isInteger(record.pid) || record.pid <= 1) return false;
+  if (record.startTick && record.startTick !== process.startTick) return false;
+  const [binary, command, subcommand] = process.argv;
+  if (!binary || path.basename(binary) !== 'temporal' || command !== 'server' || subcommand !== 'start-dev') return false;
+  const option = (name: string) => {
+    const indexes = process.argv.flatMap((arg, index) => arg === name ? [index] : []);
+    return indexes.length === 1 ? process.argv[indexes[0]! + 1] : undefined;
+  };
+  return option('--port') === record.address.split(':').at(-1)
+    && option('--db-filename') === dbFilename;
+}
+
+/** Refuse to signal an unverifiable/recycled pid, including during reset. */
+export async function stopRecordedDevServer(record: ServerRecord, dbFilename: string): Promise<boolean> {
+  if (!Number.isInteger(record.pid) || record.pid <= 1) return false;
+  if (!pidAlive(record.pid)) return true;
+  try {
+    const argv = fs.readFileSync(`/proc/${record.pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+    if (!matchesRecordedTemporalProcess(record, { argv, startTick: processStartTick(record.pid) }, dbFilename)) return false;
+    if (record.unit && (await unitMainPid(record.unit)) !== record.pid) return false;
+    // Recheck after the asynchronous unit lookup before sending the signal.
+    if (record.startTick && processStartTick(record.pid) !== record.startTick) return false;
+    await killPid(record.pid);
+    return true;
+  } catch { return false; }
 }
 
 async function killPid(pid: number, timeoutMs = 5000): Promise<void> {
@@ -367,7 +400,8 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
         // Adopt it into a unit by replacing it at the same address — boot is the
         // safe moment (our workers aren't polling yet; other instances' pollers
         // ride through a same-address respawn).
-        await killPid(existing.pid);
+        if (!await stopRecordedDevServer(existing, opts.dbFilename!))
+          throw new Error('Cannot verify the recorded Temporal process; refusing to replace it');
         try {
           fs.rmSync(rec);
         } catch {
@@ -381,7 +415,8 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
       // the SQLite file is released before we start a replacement. When the record
       // names a unit, verify the pid still belongs to it — a dead server's pid can
       // be recycled by an unrelated process we must not SIGKILL.
-      if (!existing.unit || (await unitMainPid(existing.unit)) === existing.pid) await killPid(existing.pid);
+      if (!await stopRecordedDevServer(existing, opts.dbFilename!))
+        throw new Error('Cannot verify the recorded Temporal process; refusing to replace it');
     }
     try {
       fs.rmSync(rec);
@@ -482,7 +517,7 @@ async function spawnPersistent(
     pid = child.pid!;
   }
 
-  const record: ServerRecord = { pid, address, uiUrl, namespace, ...(unit ? { unit } : {}) };
+  const record: ServerRecord = { pid, address, uiUrl, namespace, startTick: processStartTick(pid), ...(unit ? { unit } : {}) };
   try {
     fs.writeFileSync(rec, JSON.stringify(record));
   } catch {
@@ -644,7 +679,8 @@ export function watchDevServer(
       const existing = readRecord(rec);
       if (existing && pidAlive(existing.pid)) {
         // Alive-but-wedged: release its SQLite lock (unit check as in startDevServer).
-        if (!existing.unit || (await unitMainPid(existing.unit)) === existing.pid) await killPid(existing.pid);
+        if (!await stopRecordedDevServer(existing, opts.dbFilename!))
+          throw new Error('Cannot verify the recorded Temporal process; refusing to replace it');
       }
       let lastErr: unknown;
       for (let i = 1; i <= RESPAWN_ATTEMPTS && !stopped; i++) {

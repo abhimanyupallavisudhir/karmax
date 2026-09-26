@@ -137,6 +137,7 @@ export interface AccountCoordinatorState {
   /** Granted-but-not-yet-returned leases; carried across continue-as-new. */
   granted?: GrantedAccountLease[];
   processed: number;
+  historyPolicyVersion?: 2;
 }
 
 export interface AccountView {
@@ -181,7 +182,7 @@ export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; wi
 export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export const accountLeaseQuery = defineQuery<
-  { waiting: boolean; earliestResetAt?: number; detail?: string },
+  { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true },
   [{ taskId: string; turnId?: string }]
 >(QRY_ACCOUNT_LEASE);
 export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
@@ -197,10 +198,13 @@ const LEASE_TIMEOUT_MS = 5 * 60 * 1000;
 const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({ startToCloseTimeout: '20s' });
 
 export async function accountCoordinator(input: { state?: AccountCoordinatorState }): Promise<void> {
+  const boundedHistory = input.state?.historyPolicyVersion === 2;
   let accounts = input.state?.accounts ?? [];
   let queue = input.state?.queue ?? [];
   let granted = (input.state?.granted ?? []).map((g) => ({ ...g, grantedAt: g.grantedAt ?? Date.now() }));
   let processed = input.state?.processed ?? 0;
+  // Query-only metadata: never participates in workflow command decisions.
+  let continuingAsNew = false;
   // Whether `returnAccount` gives capacity back ONLY when it can attribute the
   // return to a granted-lease record (see the handler below). Gated like
   // `account-coordinator-lease-sweep-v1`: the pre-fix handler decremented `inUse`
@@ -309,6 +313,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     accounts = accounts.filter((a) => live.has(a.id) || a.inUse > 0);
   });
   setHandler(leaseAccountSignal, (req) => {
+    if (boundedHistory && granted.some((g) => g.taskId === req.taskId && g.turnId === req.turnId)) return;
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
       queue.push({ taskId: req.taskId, turnId: req.turnId, provider: req.provider, allowed: req.allowed });
     }
@@ -435,6 +440,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     waiting: queue.length,
   }));
   setHandler(accountLeaseQuery, ({ taskId, turnId }) => {
+    if (continuingAsNew) return { waiting: false, continuingAsNew: true as const };
     const req = queue.find((r) => r.taskId === taskId && (turnId === undefined || r.turnId === turnId));
     if (!req) return { waiting: false };
     const compatible = accounts.filter((a) => req.allowed !== undefined
@@ -459,16 +465,31 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     ...granted.filter((g) => g.taskId === taskId).map((g) => g.turnId),
   ]);
 
+  const historyFull = () => processed >= CONTINUE_AFTER
+    || workflowInfo().historyLength >= 10_000 || workflowInfo().continueAsNewSuggested;
+  async function rotateIfNeeded() {
+    // Migrate at a command boundary; the new loop policy lives in the next run's input.
+    if ((!boundedHistory && patched('account-history-policy-v2')) || (boundedHistory && historyFull())) {
+      continuingAsNew = true;
+      await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, granted, processed: 0, historyPolicyVersion: 2 } });
+    }
+  }
+
   for (;;) {
+    await rotateIfNeeded();
     refreshDue();
     identifiedReturnsRelease = patched('account-coordinator-return-identity-v1');
     // Keep the legacy branch byte-for-byte for histories created before this fix.
     // `patched` is deliberately evaluated on every loop: it remains false while
     // replaying marker-less history, then flips true at the live edge. That lets a
     // coordinator already trapped in the legacy immediate-condition spin escape.
-    if (!patched('account-coordinator-rotation-v2')) {
+    if (boundedHistory) {
+      await condition(() => queue.length > 0 || historyFull());
+      await rotateIfNeeded();
+    } else if (!patched('account-coordinator-rotation-v2')) {
       await condition(() => queue.length > 0 || processed >= CONTINUE_AFTER);
       if (processed >= CONTINUE_AFTER && queue.length === 0 && !accounts.some((a) => a.status === 'exhausted')) {
+        continuingAsNew = true;
         await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, processed: 0 } });
       }
     } else {
@@ -482,11 +503,13 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       if (shouldRotate()) {
         // `granted` must survive rotation: dropping it would resurrect the leak it
         // exists to close (`inUse` would stay charged with no record of who owes it).
+        continuingAsNew = true;
         await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, granted, processed: 0 } });
       }
     }
 
     while (queue.length > 0) {
+      await rotateIfNeeded();
       refreshDue();
       // Serve the first request whose credential allow-list has capacity (avoids
       // head-of-line blocking: each request carries its own ordered list).
@@ -521,7 +544,10 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         // singleton replaying marker-less history must not emit them.
         const sweepLeases = patched('account-coordinator-lease-sweep-v1');
         const parkMs = sweepLeases && granted.length ? Math.min(sleepMs, LEASE_TIMEOUT_MS) : sleepMs;
-        const woke = await Promise.race([
+        const wake = () => queue.length === 0 || queue.some((q) => serveable(q) || deniable(q));
+        const woke = boundedHistory
+          ? await condition(() => wake() || historyFull(), parkMs)
+          : await Promise.race([
           // Cancellation of the last parked request must wake this branch too;
           // otherwise the coordinator can remain asleep until the six-hour
           // backstop despite its query already reporting an empty queue. Manual
@@ -555,8 +581,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       } catch (e) {
         log.warn(`account grant signal to ${req.taskId} failed; freeing`, { e: String(e) });
         if (free) {
-          free.inUse--;
           const i = granted.findIndex((g) => g.taskId === req.taskId && g.turnId === req.turnId);
+          if (!boundedHistory || i >= 0) free.inUse--;
           if (i >= 0) granted.splice(i, 1);
         }
       }

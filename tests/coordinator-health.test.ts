@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { WorkflowNotFoundError } from '@temporalio/client';
 import { healCoordinators } from '../src/platform/coordinator-health.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
@@ -256,4 +256,49 @@ describe('account-pool discovery', () => {
       throw new Error('query task expired during worker replay');
     }).accountPoolSize()).rejects.toThrow('query task expired');
   });
+});
+
+describe('WF-13: lease-holder liveness', () => {
+  const activities = (describe: () => Promise<unknown>) => makeCoordinatorActivities({ client: { workflow: {
+    getHandle: () => ({ describe }),
+  } } as never, taskQueue: 'queue' });
+  it('propagates transient describe failures without reclaiming a live lease', async () => {
+    const error = new Error('UNAVAILABLE');
+    await expect(activities(async () => { throw error; }).isTaskAlive('task')).rejects.toBe(error);
+  });
+  it('reclaims only missing or closed executions', async () => {
+    expect(await activities(async () => { throw new WorkflowNotFoundError('missing', 'task', undefined); }).isTaskAlive('task')).toBe(false);
+    expect(await activities(async () => ({ status: { name: 'COMPLETED' } })).isTaskAlive('task')).toBe(false);
+    expect(await activities(async () => ({ status: { name: 'RUNNING' } })).isTaskAlive('task')).toBe(true);
+  });
+});
+
+it('replays coordinator histories recorded before the history-policy and acknowledgement changes', async () => {
+  const { Worker, bundleWorkflowCode } = await import('@temporalio/worker');
+  const { temporal } = await import('@temporalio/proto');
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
+  // Policy v2 was recorded from 0cddcb35: grant, park, return, grant and return.
+  for (const name of ['review-legacy-accountCoordinator', 'review-legacy-mergeQueue', 'account-history-policy-v2']) {
+    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8')));
+    await Worker.runReplayHistory({ workflowBundle }, history);
+  }
+}, 60_000);
+
+it('WF-5: retries a lease acknowledgement from a coordinator continuing as new', async () => {
+  vi.useFakeTimers();
+  try {
+    const query = vi.fn().mockResolvedValueOnce({ waiting: false, continuingAsNew: true })
+      .mockResolvedValueOnce({ waiting: true, detail: 'Waiting for a free slot on an allowed account' });
+    const signalWithStart = vi.fn(async () => undefined);
+    const activity = makeCoordinatorActivities({ client: { workflow: {
+      signalWithStart, getHandle: () => ({ query }),
+    } } as never, taskQueue: 'queue' });
+    const pending = activity.leaseAccount('task', 'turn', 'mock');
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toEqual({ waiting: true, detail: 'Waiting for a free slot on an allowed account' });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(signalWithStart).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
 });

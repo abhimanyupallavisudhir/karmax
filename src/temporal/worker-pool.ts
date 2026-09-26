@@ -3,6 +3,12 @@ import { ActivityDeps } from '../activities/index.js';
 import { makeWorker, WorkerHandle } from './worker.js';
 import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js';
 
+/** Let the supervisor restart the service instead of serving without a poller. */
+export function terminateOnWorkerFailure(error: unknown): void {
+  console.error('  ! Activity worker failed:', error);
+  process.kill(process.pid, 'SIGTERM');
+}
+
 /**
  * Keeps a worker running for the task queue and can **roll** it to pick up
  * newly-loaded workflow packages without a restart (PLAN-dynamic-repos §21e).
@@ -24,6 +30,7 @@ export class WorkerManager {
   private refreshing?: Promise<void>;
   private starting?: Promise<void>;
   private stopping?: Promise<void>;
+  private draining = new Set<Promise<void>>();
   private stopRequested = false;
 
   /** Why the live worker stopped, if it did (see `watch`). */
@@ -67,7 +74,7 @@ export class WorkerManager {
 
   private async build(externals: ExternalWorkflowRef[]): Promise<WorkerHandle> {
     const opts = externals.length ? { workflowBundle: await buildVersionedBundle(externals) } : {};
-    return makeWorker(this.conn, this.deps, opts);
+    return makeWorker(this.conn, this.deps, { ...opts, shutdownGraceTime: '45 minutes' });
   }
 
   /**
@@ -88,7 +95,10 @@ export class WorkerManager {
       this.runPromise = nextRun;
       this.externals = externals;
       old?.shutdown(); // graceful drain: stop polling, let in-flight finish
-      await oldRun?.catch(() => {});
+      if (oldRun) {
+        this.draining.add(oldRun);
+        void oldRun.finally(() => this.draining.delete(oldRun));
+      }
     };
     this.refreshing = (this.refreshing ?? Promise.resolve()).then(run, run);
     return this.refreshing;
@@ -103,6 +113,7 @@ export class WorkerManager {
       await this.refreshing?.catch(() => {});
       this.handle?.shutdown();
       await this.runPromise?.catch(() => {});
+      await Promise.allSettled(this.draining);
     })();
     await this.stopping;
   }

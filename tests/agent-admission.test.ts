@@ -55,6 +55,9 @@ describe('agent turn admission', () => {
     } }]]) as any;
     const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
     try {
+      expect(await core.resolveCredentialOrder({ taskId: task.id, projectId: project.id, provider: 'claude', role: 'do',
+        task: { taskId: task.id, projectId: project.id, agents: { do: { provider: 'claude', model: 'test-model' } } } as any,
+      })).toEqual([]);
       await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
         agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
         messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],

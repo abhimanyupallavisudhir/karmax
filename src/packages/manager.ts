@@ -160,8 +160,6 @@ export class WorkflowManager {
       this.external = snapshot.external;
       this.shaByType = snapshot.shaByType;
       this.shaByPackage = snapshot.shaByPackage;
-      // Best-effort: put the worker back on the last bundle that did build.
-      await this.worker.refresh([...this.external.values()]).catch(() => {});
       throw e;
     }
     this.storeFor(organizationId).register(pkg.manifest);
@@ -181,7 +179,10 @@ export class WorkflowManager {
       return 0;
     }
     const records = this.readRegistry();
-    let loaded = 0;
+    const external = new Map(this.external);
+    const shaByType = new Map(this.shaByType);
+    const shaByPackage = new Map(this.shaByPackage);
+    const restored: { organizationId: string; manifest: WorkflowManifest }[] = [];
     for (const r of records) {
       try {
         // Reassert confinement before reading the manifest and selecting code.
@@ -199,7 +200,7 @@ export class WorkflowManager {
         if (!workflowEntry) throw new Error('no workflow module');
         const organizationId = r.organizationId ?? 'org_personal';
         if (isBuiltInWorkflowName(manifest.name)) throw new Error('shadows a built-in workflow');
-        this.storeFor(organizationId).register(manifest);
+        restored.push({ organizationId, manifest });
         // Legacy personal installs already have running executions pinned to the
         // old unqualified package type. Keep that export forever; new records are
         // tenant-qualified so two organizations may install the same name/version
@@ -207,16 +208,19 @@ export class WorkflowManager {
         const type = r.organizationId
           ? externalWorkflowType(organizationId, manifest.name, manifest.version)
           : qualifiedType(manifest.name, manifest.version);
-        this.external.set(type, { type, entryFile: workflowEntry, exportName: manifestExport(manifest) });
-        this.shaByType.set(type, r.sha);
-        this.shaByPackage.set(`${organizationId}:${qualifiedType(manifest.name, manifest.version)}`, r.sha);
-        loaded++;
+        external.set(type, { type, entryFile: workflowEntry, exportName: manifestExport(manifest) });
+        shaByType.set(type, r.sha);
+        shaByPackage.set(`${organizationId}:${qualifiedType(manifest.name, manifest.version)}`, r.sha);
       } catch (e) {
         onWarn(`could not restore workflow ${r.name}@${r.version}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    if (this.external.size) await this.worker.refresh([...this.external.values()]);
-    return loaded;
+    if (external.size) await this.worker.refresh([...external.values()]);
+    this.external = external;
+    this.shaByType = shaByType;
+    this.shaByPackage = shaByPackage;
+    for (const { organizationId, manifest } of restored) this.storeFor(organizationId).register(manifest);
+    return restored.length;
   }
 
   /** Remove one tenant's selectable packages after all of its task executions

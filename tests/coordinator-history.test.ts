@@ -1,0 +1,98 @@
+import { afterAll, beforeEach, expect, it, vi } from 'vitest';
+
+// Other files import these workflows with the real SDK when isolate is disabled.
+vi.hoisted(() => vi.resetModules());
+afterAll(() => { vi.doUnmock('@temporalio/workflow'); vi.resetModules(); });
+const state = vi.hoisted(() => ({ handlers: new Map<string, (...args: any[]) => any>(),
+  signal: vi.fn(async () => undefined), rotate: vi.fn(), sleep: vi.fn(), condition: vi.fn(), patches: true }));
+vi.mock('@temporalio/workflow', async (original) => ({
+  ...await original<typeof import('@temporalio/workflow')>(),
+  defineSignal: (name: string) => name, defineQuery: (name: string) => name, defineUpdate: (name: string) => name,
+  setHandler: (name: string, handler: (...args: any[]) => any) => state.handlers.set(name, handler),
+  proxyActivities: () => ({ isTaskAlive: async () => true }),
+  getExternalWorkflowHandle: () => ({ signal: state.signal }),
+  continueAsNew: (...args: any[]) => state.rotate(...args),
+  sleep: (...args: any[]) => state.sleep(...args),
+  condition: (...args: any[]) => state.condition(...args),
+  patched: () => state.patches,
+  allHandlersFinished: () => true,
+  log: { warn: vi.fn() },
+  workflowInfo: () => ({ historyLength: 1, continueAsNewSuggested: false }),
+}));
+import { accountCoordinator } from '../src/coordinators/account.js';
+import { mergeQueue } from '../src/coordinators/merge-queue.js';
+const stop = new Error('continue-as-new');
+beforeEach(() => {
+  state.handlers.clear(); state.signal.mockClear(); state.patches = true;
+  state.rotate.mockReset().mockImplementation(async () => { throw stop; });
+  state.condition.mockReset().mockImplementation(async (predicate: () => boolean) => {
+    if (state.condition.mock.calls.length > 10) throw new Error('spin');
+    if (!predicate()) throw new Error('blocked');
+    return true;
+  });
+  state.sleep.mockReset().mockImplementation(() => new Promise(() => {}));
+});
+
+it('WF-5: rotates a busy account queue with its requests and held leases intact', async () => {
+  const account = { id: 'login', provider: 'mock', configHome: '/test', status: 'available', inUse: 1, maxConcurrent: 1 };
+  const queue = [{ taskId: 'waiting', turnId: 'turn', allowed: ['login'] }];
+  const granted = [{ taskId: 'holder', turnId: 'held', accountId: 'login', grantedAt: Date.now() }];
+  await expect(accountCoordinator({ state: { accounts: [account], queue, granted, processed: 1000,
+    historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.rotate).toHaveBeenCalledWith({ state: { accounts: [account], queue, granted, processed: 0, historyPolicyVersion: 2 } });
+  expect(state.signal).not.toHaveBeenCalled();
+});
+
+it('LT-20: cancels the account park timer when a condition wakes it', async () => {
+  state.condition.mockImplementation(async (predicate: () => boolean, timeout?: number) => {
+    if (timeout !== undefined) throw stop;
+    if (!predicate()) throw new Error('unbounded park');
+    return true;
+  });
+  await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
+    status: 'available', inUse: 1, maxConcurrent: 1 }], queue: [{ taskId: 'waiting', turnId: 'turn', allowed: ['login'] }],
+    processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.sleep).not.toHaveBeenCalled();
+});
+
+it('WF-24: rotates a merge queue with a current holder and waiting tasks', async () => {
+  await expect(mergeQueue({ domain: 'repo', state: { domain: 'repo', current: 'holder', queue: ['waiting'], processed: 500,
+    historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.rotate).toHaveBeenCalledWith({ domain: 'repo', state: { domain: 'repo', current: 'holder', queue: ['waiting'], processed: 0,
+    historyPolicyVersion: 2 } });
+  expect(state.signal).not.toHaveBeenCalled();
+});
+
+it('WF-23: a repeated lease signal does not queue an already granted turn', async () => {
+  state.condition.mockImplementation(async () => {
+    state.handlers.get('leaseAccount')!({ taskId: 'holder', turnId: 'held', allowed: ['login'] });
+    throw stop;
+  });
+  await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
+    status: 'available', inUse: 1, maxConcurrent: 1 }], queue: [],
+    granted: [{ taskId: 'holder', turnId: 'held', accountId: 'login', grantedAt: Date.now() }],
+    processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.handlers.get('accountTaskLeases')!('holder')).toEqual(['held']);
+});
+
+it('WF-22: failed grant delivery does not return an already cancelled lease twice', async () => {
+  state.signal.mockImplementationOnce(async () => {
+    state.handlers.get('cancelAccountLease')!({ taskId: 'holder', turnId: 'held' });
+    throw new Error('workflow closed');
+  });
+  state.condition.mockImplementation(async (predicate: () => boolean) => {
+    if (!predicate()) throw stop;
+    return true;
+  });
+  await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
+    status: 'available', inUse: 0, maxConcurrent: 1 }],
+    queue: [{ taskId: 'holder', turnId: 'held', allowed: ['login'] }], processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.handlers.get('accounts')!().accounts[0].inUse).toBe(0);
+});
+
+it('WF-5: identifies acknowledgements served by a run continuing as new', async () => {
+  await expect(accountCoordinator({ state: { accounts: [], queue: [{ taskId: 'waiting', turnId: 'turn' }],
+    processed: 0 } })).rejects.toBe(stop);
+  expect(state.handlers.get('accountLease')!({ taskId: 'waiting', turnId: 'turn' }))
+    .toEqual({ waiting: false, continuingAsNew: true });
+});

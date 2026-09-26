@@ -1,4 +1,5 @@
 import type { Client } from '@temporalio/client';
+import { makeChildActivities } from './children.js';
 import { pingActivities } from './ping.js';
 import { makeCoreActivities, CoreActivityDeps } from './core.js';
 import { makeCoordinatorActivities } from './coordinator.js';
@@ -26,6 +27,7 @@ export function buildActivities(deps: ActivityDeps = {}) {
       ...(deps.store ? { store: deps.store } : {}),
     }));
   }
+  if (deps.store) Object.assign(activities, makeChildActivities(deps.store));
   return activities;
 }
 

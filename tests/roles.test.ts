@@ -237,3 +237,12 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
   });
 });
+
+it('WF-29: ignores unsafe or oversized declared resolve regexes', () => {
+  for (const [match, error] of [['(a+)+$', 'aaaaa'], ['(a|aa)*$', 'aaaaa'], ['a?a?a?a?a?a?a?a?a?a?b', 'aaaaab'],
+    ['a*a*a*a*b', 'aaaaab'], ['(a|a)(a|a)b', 'aab'], ['a{2}', 'aa'], ['a'.repeat(513), 'a'.repeat(513)]]) {
+    // Inputs that match quickly: the regression never runs an exponential near miss.
+    expect(autoResolve('do', error!, [{ name: 'unsafe', match: match!, action: 'retry' }])).toEqual({ resolved: false });
+  }
+  expect(autoResolve('do', 'Widget exploded', [{ name: 'simple', match: 'Widget.*exploded', action: 'retry' }])).toMatchObject({ resolved: true });
+});

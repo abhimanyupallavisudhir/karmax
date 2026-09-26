@@ -1,5 +1,6 @@
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
+import { conversationPublisher } from '../domain/view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -17,7 +18,7 @@ import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
-import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
+import { AgentTurnCancelled, CredentialUnavailable, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
@@ -164,7 +165,10 @@ async function justDoImpl(
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
-  const publish = async () => publishTaskView(core, taskId, view());
+  const publishConversation = conversationPublisher(workflowInfo().runId,
+    (snapshot, reference) => publishTaskView(core, taskId, snapshot, reference));
+  const publish = async () => patched('just-do-conversation-reference-v1')
+    ? publishConversation(view()) : publishTaskView(core, taskId, view());
   const leaser = managedTurns
     ? createAgentTurnLeaser(core, coordinator, {
         taskId,
@@ -281,6 +285,16 @@ async function justDoImpl(
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
       if (managedTurns && cancelled && (err instanceof AgentTurnCancelled || isCancellation(err))) break;
+      if (err instanceof CredentialUnavailable && patched('just-do-credential-denial-v1')) {
+        status = 'waiting';
+        waitingFor = { kind: 'human', audience: ['@creator'], detail: err.message };
+        await publish();
+        await condition(() => cancelled || msgs.length > deliveredNow);
+        if (cancelled) break;
+        status = 'active';
+        waitingFor = undefined;
+        continue;
+      }
       // Infrastructure outage that outlived the activity retries: park with
       // backoff and re-run the turn (which resumes its session) rather than
       // failing the task. Anything else propagates as before.
@@ -314,7 +328,8 @@ async function justDoImpl(
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        else await condition(() => cancelled || msgs.length > seen, '30 seconds');
       }
       if (cancelled) break;
       if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
@@ -377,6 +392,7 @@ async function justDoImpl(
         // no verdict → degrade this layer to the human gate below
       }
       // A human layer: one Confirm click passes ONE layer; a follow-up → back to Do.
+      if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
       waitingFor = { kind: 'human', audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);

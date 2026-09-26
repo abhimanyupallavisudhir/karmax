@@ -1,4 +1,5 @@
 import { concurrentMap } from '../util/concurrent-map.js';
+import { notifyChildSettlement } from './children.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
@@ -1672,6 +1673,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const keys = ordered.map((c) => c.key);
+      if (!keys.length && profile && managedModelRailAvailable(store.hosted,
+        await store.getOrganizationUsagePolicy(organizationId), profile)) return [];
       // An empty compatible set must not fall through to an ambient/profile
       // credential and bypass an explicit disable. A non-existent allow-list
       // entry makes the coordinator deny the turn with a credential action.
@@ -1939,15 +1942,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
       }
-      const installationModelProvider = canonicalModelProvider(credentialProvider(profile));
       const usagePolicy = (await store.getOrganizationUsagePolicy(organizationId));
-      const managedInstallationRail = store.hosted
-        && !!usagePolicy.managedSpendCapMicros
-        && usagePolicy.managedModelProviders.includes(installationModelProvider)
-        && !!managedModelCostCeiling(installationModelProvider, profile.model)
-        && ((profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
-          || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
-          || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(installationModelProvider)]));
+      const managedInstallationRail = managedModelRailAvailable(store.hosted, usagePolicy, profile);
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
@@ -2895,12 +2891,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runScript(args: { taskId: string; worldHandle: WorldHandle; command: string }): Promise<{ code: number; output: string }> {
-      const world = await openWorld(args.worldHandle, args.taskId);
-      (await record(args.taskId, 'script.start', { command: args.command }));
-      const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
-      const output = `${r.stdout}${r.stderr}`;
-      (await record(args.taskId, 'script.done', { code: r.code, output: output.slice(0, 4000) }));
-      return { code: r.code, output };
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct invocation */ }
+      const pulse = setInterval(() => { try { context?.heartbeat(); } catch { /* completion */ } }, 10_000);
+      try {
+        const world = await openWorld(args.worldHandle, args.taskId);
+        (await record(args.taskId, 'script.start', { command: args.command }));
+        const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
+        const output = `${r.stdout}${r.stderr}`;
+        (await record(args.taskId, 'script.done', { code: r.code, output: output.slice(0, 4000) }));
+        return { code: r.code, output };
+      } finally { clearInterval(pulse); }
     },
 
     async runWorkflowChecks(args: { taskId: string; worldHandle: WorldHandle }): Promise<{ passed: boolean; detail?: string }> {
@@ -4975,6 +4976,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       (await store.saveView(taskId, view, conversationReference));
+      await notifyChildSettlement(store, deps.client, view);
       // First Merge admission freezes whether sibling proposals remain eligible.
       // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {
@@ -5152,6 +5154,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
  * Values are worst-case micro-dollar debits per admitted request, keyed by
  * `provider/model`, `provider/*`, or `provider`. Invalid/absent configuration
  * fails managed admission closed and never affects BYOK. */
+function managedModelRailAvailable(
+  hosted: boolean,
+  policy: { managedSpendCapMicros?: number | null; managedModelProviders: string[] },
+  profile: import('../domain/types.js').AgentProfile,
+): boolean {
+  const provider = canonicalModelProvider(credentialProvider(profile));
+  return hosted && !!policy.managedSpendCapMicros && policy.managedModelProviders.includes(provider)
+    && !!managedModelCostCeiling(provider, profile.model)
+    && ((profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+      || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+      || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(provider)]));
+}
+
 function managedModelCostCeiling(provider: string, model?: string): number | undefined {
   const raw = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
   if (!raw) return undefined;

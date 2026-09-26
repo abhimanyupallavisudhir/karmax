@@ -19,6 +19,7 @@ import {
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
+import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
@@ -55,6 +56,7 @@ import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { conversationPublisher } from '../domain/view-publication.js';
 
+const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 seconds' });
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
@@ -747,6 +749,8 @@ async function softwareDevImpl(
   // The epoch wakes a human pause so an accepted edit reroutes that same question.
   let liveResponder = input.responder;
   let responderEpoch = 0;
+  let responderRounds = 0;
+  let subtaskNags = 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, {
     accountId: string;
@@ -772,6 +776,7 @@ async function softwareDevImpl(
   // the next best convenience in the conversation: the next turn that role runs
   // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
+  if (patched('software-dev-omit-recovery-input-v1')) delete liveInput.recovery;
   // Params the workflow has already consumed (value now load-bearing). `target` is
   // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
   // (provider/session) once its turn runs — its model/effort stay retunable after;
@@ -888,6 +893,7 @@ async function softwareDevImpl(
     if (mutableInputResponder && patch.responder && typeof patch.responder === 'object') {
       liveResponder = patch.responder as ResponderConfig;
       responderEpoch++;
+      responderRounds = 0;
       applied.push('responder');
     }
     for (const name of Object.keys(patch)) {
@@ -1014,6 +1020,7 @@ async function softwareDevImpl(
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
         cancelled,
+        ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
         worldReady: !!world,
         mergeGranted,
@@ -1187,6 +1194,7 @@ async function softwareDevImpl(
             return 'do';
           }
         }
+        if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = {
           kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
@@ -1265,6 +1273,8 @@ async function softwareDevImpl(
   });
   setHandler(followUpSignal, (m, role) => {
     manualPrConfirmer = undefined;
+    responderRounds = 0;
+    subtaskNags = 0;
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript). A turn currently
@@ -1343,7 +1353,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel();
       activeTurn?.cancel();
-      cancelChildren();
+      if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
   setHandler(retrySignal, () => {
@@ -1352,7 +1362,10 @@ async function softwareDevImpl(
       humanPauseWake = { kind: 'retry' };
   });
   // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
+  if (recovery && patched('software-dev-preserve-replacement-children-v1'))
+    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => { settled.push(result); });
   setHandler(raiseFromChildSignal, (r) => {
+    if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
   });
@@ -1815,6 +1828,7 @@ async function softwareDevImpl(
               await publish();
             }
           }
+          if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
           return await fn(
             home,
             key,
@@ -1844,6 +1858,7 @@ async function softwareDevImpl(
       }
     };
 
+    if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coordinator.accountPoolSize();
     // v1 took this exact zero-activity passthrough. v1.1 still exposes host-slot
     // admission even when there is no configured account pool.
     if (accountPool <= 0) {
@@ -1903,7 +1918,12 @@ async function softwareDevImpl(
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
       await publish();
     }
-    if (liveAgentStates && cancelled) throw new Cancelled();
+    if (liveAgentStates && cancelled) {
+      if (grant && grant.accountId !== '(passthrough)' && grant.accountId !== '(denied)'
+        && patched('software-dev-return-cancelled-grant-v1'))
+        await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
+      throw new Cancelled();
+    }
     // The coordinator denies a turn whose every allowed credential needs human action
     // (#5): escalate rather than run/park.
     if (grant?.accountId === '(denied)') {
@@ -1980,7 +2000,10 @@ async function softwareDevImpl(
     const scope = new CancellationScope({ cancellable: true });
     activeTurn = scope;
     try {
-      return await scope.run(fn);
+      return await scope.run(async () => {
+        if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+        return await fn();
+      });
     } finally {
       activeTurn = undefined;
     }
@@ -2428,7 +2451,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         } catch {
           /* child already gone */
         }
-        awaitingResponse.delete(cid);
+        if (awaitingResponse.delete(cid)) subtaskNags = 0;
       }
     }
   }
@@ -2473,6 +2496,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     while (settled.length) {
       const s = settled.shift()!;
+      if (recovery && patched('software-dev-preserve-replacement-children-v1') && !outstanding.has(s.childTaskId)) continue;
+      subtaskNags = 0;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
@@ -2502,6 +2527,18 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   try {
   // ── Setup ──
+  if (recovery && patched('software-dev-preserve-replacement-children-v1')) {
+    const children = await coreChild.restoreChildTasks(taskId);
+    for (const child of children) {
+      subTaskIds.push(child.taskId);
+      outstanding.add(child.taskId);
+      if (child.waiting) {
+        awaitingResponse.add(child.taskId);
+        raises.push({ childTaskId: child.taskId, childTitle: child.title, type: 'needs_info', detail: child.detail });
+      }
+
+    }
+  }
   await publish();
   if (cancellableSetup && cancelled) return await abort();
   if (!world) {
@@ -2530,7 +2567,9 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
-  accountPool = await coordinator.accountPoolSize().catch(() => 0);
+  accountPool = patched('agent-turn-account-pool-refresh-v1')
+    ? await withResolve('setup', () => coordinator.accountPoolSize())
+    : await coordinator.accountPoolSize().catch(() => 0);
 
   // A platform-requested human hold is deliberately outside the pipeline. Keep
   // the originating stage visible. An explicit Resume always wakes it; v1.7 also
@@ -2734,7 +2773,11 @@ Inspect the complete current diff and specifically compare its delta from the re
         // so the parent's own Review/Merge never races ahead of its delegated work.
         // Stay responsive: wake on a child raise/settlement or a human follow-up.
         status = 'waiting';
-        waitingFor = { kind: 'subtask' };
+        const boundedNags = patched('software-dev-bounded-input-loops-v1');
+        const needsHuman = boundedNags && awaitingResponse.size > 0 && subtaskNags >= 3;
+        waitingFor = needsHuman
+          ? { kind: 'human', audience: ['@creator'], detail: 'The managing agent has not answered its children after three reminders. Send guidance to continue.' }
+          : { kind: 'subtask' };
         await publish();
         const wake = () => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen;
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
@@ -2744,8 +2787,10 @@ Inspect the complete current diff and specifically compare its delta from the re
         // and re-prompt the agent (the unresolved raise is still in the conversation)
         // until it acts — SPEC §5.3 "keep prompting". With nothing awaiting us, wait
         // indefinitely for the next child event or human follow-up.
-        if (awaitingResponse.size > 0) await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
-        else await condition(wake);
+        if (awaitingResponse.size > 0 && !needsHuman) {
+          if (boundedNags) subtaskNags++;
+          await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+        } else await condition(wake);
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
@@ -2775,7 +2820,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        else await condition(() => cancelled || msgs.length > seen, '30 seconds');
       }
       if (cancelled) return await abort();
       if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
@@ -2952,7 +2998,9 @@ Inspect the complete current diff and specifically compare its delta from the re
             while (!prRequested && !cancelled && msgs.length <= seen) {
               const routeEpoch = responderEpoch;
               const route = liveResponder;
-              if (routedInputResponder && route?.kind === 'agent') {
+              const boundedResponses = patched('software-dev-bounded-input-loops-v1');
+              if (routedInputResponder && route?.kind === 'agent' && (!boundedResponses || responderRounds < 3)) {
+                if (boundedResponses) responderRounds++;
                 waitingFor = { kind: 'responder', detail: question };
                 await publish();
                 const answer = await responderTurn(route, question);
@@ -2980,7 +3028,8 @@ Inspect the complete current diff and specifically compare its delta from the re
                   audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
                     ? route.audience
                     : ['@creator'],
-                  detail: question,
+                  detail: boundedResponses && route?.kind === 'agent' && responderRounds >= 3
+                    ? `Three automated responses have not resolved this pause. ${question}` : question,
                 };
               }
               await publish();
@@ -4014,7 +4063,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     stage = 'cancelled';
     status = 'cancelled';
     if (retainedMergeDomains.length) await releaseRetainedLandingDomains();
-    await cancelChildren(liveAgentStates); // don't strand children when we go away
+    if (!lifecycleReplacement || !patched('software-dev-preserve-replacement-children-v1'))
+      await cancelChildren(liveAgentStates);
     // A cancelled task must not leave an open pull request proposing work that
     // will never land.
     if (!lifecycleReplacement && githubPrLifecycle && world && prs.length

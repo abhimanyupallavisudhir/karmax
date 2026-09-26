@@ -1,6 +1,7 @@
 import {
   CancellationScope,
   condition,
+  patched,
   defineSignal,
   setHandler,
   type ActivityInterfaceFor,
@@ -140,6 +141,7 @@ export function createAgentTurnLeaser(
     let queueId: string | undefined;
     try {
       return await scope.run(async () => {
+        if (patched('agent-turn-cancel-before-start-v1') && host.cancelled()) throw new AgentTurnCancelled();
         if (durableAdmission) {
           const world = host.world();
           if (!world) throw new Error('agent world is not ready');
@@ -187,6 +189,7 @@ export function createAgentTurnLeaser(
             await host.publish();
           }
         }
+        if (patched('agent-turn-cancel-before-start-v1') && host.cancelled()) throw new AgentTurnCancelled();
         return await fn({
           accountConfigHome: home,
           accountApiKeyHandle: key,
@@ -219,7 +222,8 @@ export function createAgentTurnLeaser(
 
   return {
     async init(): Promise<void> {
-      accountPool = await coord.accountPoolSize().catch(() => 0);
+      accountPool = patched('agent-turn-account-pool-refresh-v1')
+        ? await coord.accountPoolSize() : await coord.accountPoolSize().catch(() => 0);
     },
 
     cancelActive(): void {
@@ -230,6 +234,7 @@ export function createAgentTurnLeaser(
       role: AgentRole,
       fn: (ctx: AgentTurnContext) => Promise<T>,
     ): Promise<T> {
+      if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coord.accountPoolSize();
       const turnId = agentTurnId(host.taskId, turnSeq++);
       if (accountPool <= 0) return admitted(turnId, role, undefined, fn);
 

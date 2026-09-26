@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -547,4 +547,32 @@ it('forwards addCheckout through environment wrappers (WD-13)', async () => {
   expect(await wrapped.addCheckout!({ name: 'branch' })).toBe(handle);
   expect(received).toEqual({ name: 'branch' });
   expect((await service.withEnvironment({ handle } as any)).addCheckout).toBeUndefined();
+});
+
+it('LT-20: backs off publish-slot queries while preserving immediate grant and release', async () => {
+  vi.useFakeTimers();
+  let token: string | undefined;
+  let available = false;
+  const query = vi.fn(async () => ({ current: available ? { token } : undefined }));
+  const signal = vi.fn(async () => undefined);
+  const client = { workflow: {
+    signalWithStart: vi.fn(async (_name, options) => { token = options.signalArgs[0].token; }),
+    getHandle: () => ({ query, signal }),
+  } };
+  const service = new ProjectResourceService({} as any, {} as any, {} as any, {} as any,
+    { client: client as any, taskQueue: 'test' });
+  const action = vi.fn(async () => 'published');
+  const publication = (service as any).serializeDurably('resource', 'task', action);
+  try {
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(query.mock.calls.length).toBeLessThanOrEqual(20);
+    expect(action).not.toHaveBeenCalled();
+  } finally {
+    available = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await publication).toBe('published');
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(signal).toHaveBeenCalledWith('releaseResourcePublish', { token });
+    vi.useRealTimers();
+  }
 });

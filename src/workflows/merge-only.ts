@@ -8,6 +8,7 @@ import {
   setHandler,
   condition,
   workflowInfo,
+  patched,
   ApplicationFailure,
   isCancellation,
   log,
@@ -437,6 +438,7 @@ async function mergeOnlyImpl(
         }
       } else {
         // A human layer: one Approve click passes ONE layer.
+        if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = { kind: 'human', audience: layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
         await condition(() => confirmed || cancelled || confirmEpoch !== epoch);
@@ -447,13 +449,20 @@ async function mergeOnlyImpl(
       }
     }
     if (!cancelled && !leftToHuman) confirmed = true;
-    if (leftToHuman) waitingFor = { kind: 'human', audience: ['@creator'] };
+    if (leftToHuman) {
+      if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
+      waitingFor = { kind: 'human', audience: ['@creator'] };
+    }
   }
   // The gate has played (or was blocked by failing checks); the route is load-bearing
   // no longer, so it freezes here rather than at queue time (SPEC §4.5/§5.5).
   confirmConsumed = true;
   await publish();
-  await condition(() => confirmed || cancelled);
+  if (patched('merge-only-enforce-failed-checks-v1')) {
+    await condition(() => cancelled || (confirmed && mayConfirm));
+  } else {
+    await condition(() => confirmed || cancelled);
+  }
   waitingFor = undefined;
   if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) return await finishCancelled();
 
