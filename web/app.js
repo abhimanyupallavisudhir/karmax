@@ -18211,8 +18211,14 @@ async function runDeclaredAction(a) {
 }
 
 // Auto-rendered argument form for a declared action (ActionArg[] → controls).
+function createTransientOverlay() {
+  const root = document.createElement('div');
+  $('#modal-root').appendChild(root);
+  return root;
+}
+
 function openActionForm(a) {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   const control = (arg) => {
     const label = `<div class="label-row"><label>${esc(arg.label || arg.name)}${arg.required ? ' *' : ''}</label></div>`;
     if (arg.type === 'text') return `<div class="form-row">${label}<textarea data-arg="${esc(arg.name)}" rows="3">${esc(arg.default ?? '')}</textarea></div>`;
@@ -18227,7 +18233,7 @@ function openActionForm(a) {
       <button class="btn" id="act-cancel">Cancel</button>
       <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
     </div></div></div>`;
-  const close = () => (root.innerHTML = '');
+  const close = () => (root.remove());
   $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
   $('#act-cancel').addEventListener('click', close);
   root.querySelector('[data-arg]')?.focus();
@@ -18452,7 +18458,7 @@ function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
 }
 
 function openGlobalSearch() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="gs-scrim"><div class="palette global-search" role="dialog" aria-modal="true" aria-labelledby="gs-title">
     <div class="global-search-head">
       <span aria-hidden="true">⌕</span>
@@ -18471,7 +18477,7 @@ function openGlobalSearch() {
   let request = 0;
   let state = 'prompt';
   let summary = '';
-  const close = () => { clearTimeout(timer); request++; root.innerHTML = ''; };
+  const close = () => { clearTimeout(timer); request++; root.remove(); };
 
   const draw = () => {
     if (state === 'prompt') {
@@ -18566,14 +18572,14 @@ function openGlobalSearch() {
 
 // -- the ⌘K palette: fuzzy command/action invocation --------------------------
 function openPalette() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
     <input id="pal-in" placeholder="Type a command…" autocomplete="off" />
     <div id="pal-list"></div>
   </div></div>`;
   const input = $('#pal-in');
   const list = $('#pal-list');
-  const close = () => (root.innerHTML = '');
+  const close = () => (root.remove());
   let items = [];
   let active = 0;
   const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2 };
@@ -18617,7 +18623,7 @@ function openPalette() {
 
 // -- "?" help: the same registry, grouped — includes every workflow's commands -
 function openHelp() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
   const groups = [...new Set(cmds.map((c) => c.group))];
   const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
@@ -18638,8 +18644,8 @@ function openHelp() {
       ${row('↵', 'Open the full task form with what you typed')}
       ${row(esc(fmtKeys('meta+Enter')), 'Add the task directly')}
     </div></div></div>`;
-  $('#help-close').addEventListener('click', () => (root.innerHTML = ''));
-  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.innerHTML = ''; });
+  $('#help-close').addEventListener('click', () => (root.remove()));
+  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });
 }
 
 // ── login ────────────────────────────────────────────────────────────────────
