@@ -42,7 +42,7 @@ export async function createExecutionServices(input: {
   const tokens = new TokenAuthority(store);
   const providerConnections = new WorldProviderConnectionService(store, broker);
   if (bootstrap) await providerConnections.importEnvironment();
-  const referenceKeys = await WorldReferenceKeys.create(broker);
+  const referenceKeys = await WorldReferenceKeys.create(broker, bootstrap);
   worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
     async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
