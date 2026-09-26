@@ -120,9 +120,10 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
     await new ClaudeAdapter().runTurn({ ...input, extraEnv: { KARMAX_TOKEN: 'scoped' } }, ctx);
     expect(sdkState.options.strictMcpConfig).toBe(true);
+    expect(sdkState.options.env.KARMAX_TOKEN).toBe('scoped');
     expect(sdkState.options.mcpServers.karmax).toMatchObject({
       command: process.execPath,
-      env: expect.objectContaining({ KARMAX_TOKEN: 'scoped' }),
+      env: expect.not.objectContaining({ KARMAX_TOKEN: expect.anything() }),
       alwaysLoad: true,
     });
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });

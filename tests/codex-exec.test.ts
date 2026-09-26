@@ -115,6 +115,18 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     expect(r.usage).toBeUndefined();
   });
 
+  it('delivers large prompts through stdin instead of argv', async () => {
+    delete process.env.STUB_MODE;
+    const argvOut = path.join(dir, 'large-argv.json');
+    process.env.STUB_ARGV_OUT = argvOut;
+    try {
+      await adapter.runTurn({ ...makeInput(), systemPrompt: 'x'.repeat(200_000) } as any, ctx);
+      const rec = JSON.parse(fs.readFileSync(argvOut, 'utf8'));
+      expect(rec.argv.at(-1)).toBe('-');
+      expect(rec.argv.join(' ').length).toBeLessThan(20_000);
+    } finally { delete process.env.STUB_ARGV_OUT; }
+  });
+
   it('keeps project secrets outside the legacy harness process', async () => {
     const output = path.join(dir, 'env.json');
     process.env.STUB_ENV_OUT = output;

@@ -1027,13 +1027,15 @@ export class CodexAdapter implements AgentAdapter {
     const { files: imageFiles, cleanup: cleanupImages } = materializeImageFiles(toSend);
     for (const f of imageFiles) flags.push('-i', f);
     // Args go straight to execve (no shell), so a multi-line prompt needs no escaping.
-    const args = [...workArgs, ...(resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText])];
+    const args = [...workArgs, ...(resuming ? ['exec', 'resume', input.session!, ...flags, '-'] : ['exec', ...flags, '-'])];
 
     // Keep a detached root group as fallback, while the inherited custody marker
     // covers descendants that create their own groups/sessions.
     const custody = createCustodyEnv(env);
     (await (await currentTiming())?.mark('process.spawn.requested'));
-    const child = spawn(cmd, args, { cwd, env: custody.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const child = spawn(cmd, args, { cwd, env: custody.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    child.stdin.on('error', () => {}); // process failure is reported by close/error below
+    child.stdin.end(promptText);
 
     // Process-tree custody (src/agent/custody.ts): record the root pid so a
     // boot-time sweep can reap this group if karmax is SIGKILLed mid-turn

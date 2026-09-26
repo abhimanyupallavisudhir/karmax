@@ -399,10 +399,8 @@ export class ClaudeAdapter implements AgentAdapter {
     const { forwardEnv: _forwardEnv, ...platform } = platformMcpSpec(
       process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505',
     );
-    platform.env = {
-      ...(platform.env ?? {}),
-      ...(input.extraEnv?.KARMAX_TOKEN ? { KARMAX_TOKEN: input.extraEnv.KARMAX_TOKEN } : {}),
-    };
+    // The stdio server inherits KARMAX_TOKEN from the harness environment.
+    // Embedding it here exposes it in the SDK's --mcp-config command line.
 
     // Only the messages new since the resumed session last advanced (the whole
     // conversation on a fresh session) — the session already holds the rest, so
