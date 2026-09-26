@@ -355,10 +355,11 @@ function decodeRoutePart(value, component = false) {
 }
 
 function parseRoute(url) {
-  const [pathname, search = ''] = String(url).split('?');
+  let [pathname, search = ''] = String(url).split('?');
+  try { pathname = decodeURI(pathname); } catch {}
   const query = new URLSearchParams(search);
   const q = query.get('q') || '';
-  const seg = decodeRoutePart(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  const seg = pathname.replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
   if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
