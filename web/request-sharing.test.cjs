@@ -18,3 +18,31 @@ test('RQ-4: share pending identical reads, invalidate on mutations, and retry fa
   const failed = ctx.api('/fail'); pending[5].reject(new Error('offline')); await assert.rejects(failed);
   const retry = ctx.api('/fail'); assert.equal(pending.length, 7); pending[6].resolve({}); await retry;
 });
+test('RQ-4/UI-8: defaults share settled reads and invalidate on writes', async () => {
+  let reads = 0;
+  const ctx = vm.createContext({ S: { token: 'a' }, fetchApi: async () => ({ value: ++reads }) });
+  vm.runInContext(fn('api'), ctx);
+  await ctx.api('/api/defaults/p/software-dev');
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 1);
+  await ctx.api('/api/settings', { method: 'PUT' });
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 3);
+  ctx.S.token = 'b';
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 4);
+});
+test('RQ-4: a default read superseded by a mutation cannot refill the cache', async () => {
+  const pending = [];
+  const ctx = vm.createContext({ S: {}, fetchApi: path => new Promise(resolve => pending.push({ path, resolve })) });
+  vm.runInContext(fn('api'), ctx);
+  const old = ctx.api('/api/defaults/p/workflow');
+  const write = ctx.api('/api/settings', { method: 'PUT' });
+  pending[1].resolve({}); await write;
+  pending[0].resolve({ stale: true }); await old;
+  const fresh = ctx.api('/api/defaults/p/workflow');
+  assert.equal(pending.length, 3);
+  pending[2].resolve({ fresh: true }); await fresh;
+  const cached = await ctx.api('/api/defaults/p/workflow'); cached.fresh = false;
+  assert.equal((await ctx.api('/api/defaults/p/workflow')).fresh, true);
+});

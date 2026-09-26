@@ -13,4 +13,3 @@ test('UI-19: ordinary text editing is never blocked by action feedback', () => {
     assert.equal(blocked, false);
   }
 });
-

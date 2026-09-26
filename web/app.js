@@ -2309,15 +2309,25 @@ function resetResponderField(box, attr = 'data-inherit') {
 // ── api ──────────────────────────────────────────────────────────────────────
 function api(path, opts = {}) {
   const pending = api.pending ||= new Map();
+  const defaults = api.defaults ||= new Map();
   const method = String(opts.method || 'GET').toUpperCase();
   if (method !== 'GET') {
-    pending.clear();
-    return fetchApi(path, opts).finally(() => pending.clear());
+    pending.clear(); defaults.clear();
+    return fetchApi(path, opts).finally(() => { pending.clear(); defaults.clear(); });
   }
   if (opts.signal) return fetchApi(path, opts);
   const key = JSON.stringify([S.token, path, opts]);
+  const cached = defaults.get(key);
+  if (cached && Date.now() - cached.at < 10_000) return Promise.resolve(JSON.parse(cached.json));
+  defaults.delete(key);
   if (pending.has(key)) return pending.get(key);
-  const request = fetchApi(path, opts).finally(() => {
+  const request = fetchApi(path, opts).then(value => {
+    if (path.startsWith('/api/defaults/') && pending.get(key) === request) {
+      if (defaults.size >= 64) defaults.delete(defaults.keys().next().value);
+      defaults.set(key, { at: Date.now(), json: JSON.stringify(value) });
+    }
+    return value;
+  }).finally(() => {
     if (pending.get(key) === request) pending.delete(key);
   });
   pending.set(key, request);
