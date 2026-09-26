@@ -2787,7 +2787,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const changedFiles = (await world.listFiles()).map((file) => `${file} (new)`);
         const summary = changedFiles.length ? `${changedFiles.length} file(s) in the task workspace.` : 'No file changes detected.';
         (await record(handle.id, 'review.built', { files: changedFiles.length }));
-        return { summary, changedFiles };
+        return boundedReviewFiles(summary, changedFiles);
       }
       const roots = repos;
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
@@ -2820,7 +2820,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
       (await record(handle.id, 'review.built', { files: changedFiles.length }));
-      return { summary, changedFiles };
+      return boundedReviewFiles(summary, changedFiles);
     },
 
     /** Readiness check for the explicit Open PR transition. The Do agent owns
@@ -5192,3 +5192,15 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
 }
 
 export type coreActivities = ReturnType<typeof makeCoreActivities>;
+
+function boundedReviewFiles(summary: string, files: string[]): { summary: string; changedFiles: string[] } {
+  const changedFiles: string[] = [];
+  let bytes = 0;
+  for (const file of files) {
+    const size = Buffer.byteLength(JSON.stringify(file));
+    if (changedFiles.length >= 1_000 || bytes + size > 256 * 1024) break;
+    changedFiles.push(file); bytes += size;
+  }
+  return { changedFiles, summary: changedFiles.length < files.length
+    ? `${summary} Showing ${changedFiles.length} of ${files.length}; inspect the workspace for the full list.` : summary };
+}
