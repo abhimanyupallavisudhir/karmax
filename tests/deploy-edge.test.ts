@@ -175,6 +175,14 @@ describe('compose forwards optional identity providers', () => {
   }
 });
 
+it('forwards optional Stripe Issuing settings in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const app = read(file).split('\n  app:')[1]?.split('\n  caddy:')[0] ?? '';
+    for (const name of ['STRIPE_CLIENT_ID', 'STRIPE_WEBHOOK_SECRET'])
+      expect(app, `${file}: ${name}`).toMatch(new RegExp(`^\\s+${name}:`, 'm'));
+  }
+});
+
 describe('compose provisions the PostgreSQL application database', () => {
   it('turnkey creates and connects the separate karmax database', () => {
     expect(read('temporal/setup-postgres.sh')).toContain('--db karmax create');
