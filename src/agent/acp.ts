@@ -428,7 +428,7 @@ export class AcpAdapter implements AgentAdapter {
           custodyId: terminalCustody.custodyId,
           output: '',
           truncated: false,
-          limit: Math.max(1, params.outputByteLimit ?? 1024 * 1024),
+          limit: Math.min(1024 * 1024, Math.max(1, params.outputByteLimit ?? 1024 * 1024)),
           exited,
         };
         terminals.set(terminalId, terminal);
@@ -483,8 +483,9 @@ export class AcpAdapter implements AgentAdapter {
         (await (await currentTiming())?.markOnce('provider.first-event'));
         const update = params.update;
         if (update.sessionUpdate === 'agent_message_chunk') {
-          finalText += textOf(update.content);
-          ctx.emit(finalText, 'assistant');
+          const text = textOf(update.content);
+          finalText += text;
+          ctx.emit(text, 'assistant');
         }
         const activity = updateActivity(update, tools);
         if (activity) ctx.emitActivity(activity);
