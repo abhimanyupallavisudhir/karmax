@@ -695,6 +695,7 @@ async function applyRoute() {
     return renderTaskPage();
   }
   S.taskFile = null;
+  if (canPaintCachedProject && tab !== 'tasks') return;
   renderMain();
   if (tab === 'activity') seedActivity();
   if (tab === 'queue') seedQueue();
@@ -3139,14 +3140,14 @@ function syncQueryUrl() {
 }
 
 let searchDebounce = null;
-function scheduleSearch() {
+function scheduleSearch(background = false) {
   clearTimeout(searchDebounce);
   searchDebounce = setTimeout(async () => {
     syncQueryUrl();
     const search = runSearch();
-    if (S.tab === 'tasks') renderMain();
+    if (S.tab === 'tasks' && !background) renderMain();
     await search;
-    if (S.tab === 'tasks') renderMain();
+    if (S.tab === 'tasks' && !S.selected) bgRenderMain();
   }, 180);
 }
 
@@ -3354,8 +3355,8 @@ function connectWs() {
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
-      if (S.tab === 'tasks' && !S.selected) scheduleSearch();
-      if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
+      if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
+      if (S.tab === 'queue' && !S.selected) bgRenderMain();
     } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
         ))) {
