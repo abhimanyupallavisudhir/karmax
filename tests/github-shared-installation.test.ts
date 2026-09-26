@@ -134,7 +134,7 @@ describe('shared GitHub installations', () => {
         return project;
       }));
       const failed = await deliver('workflow_run', { action: 'completed', repository: { id: 7 },
-        workflow_run: { id: 123, name: 'CI', conclusion: 'failure', head_branch: 'main', head_sha: 'sha' } });
+        workflow_run: { event: 'push', head_repository: { id: 7 }, id: 123, name: 'CI', conclusion: 'failure', head_branch: 'main', head_sha: 'sha' } });
       expect(failed.projectEvents?.map(event => event.projectId)).toEqual(projects.map(project => project.id));
       const tasks = await Promise.all(projects.map(project => store.createTask({ projectId: project.id, title: 'Work',
         workflow: 'software-dev', workflowVersion: '1.8.0', params: { prompt: 'work' } })));

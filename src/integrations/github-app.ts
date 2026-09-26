@@ -1041,38 +1041,32 @@ export class GitHubAppService {
     return { accepted: true };
   }
 
-  /** A merged revision is immutable history. A default-branch workflow failure
-   * therefore fans out to the projects that actually attach this repository;
-   * the gateway turns each event into a new recovery task. check_run is a
-   * compatibility path for Apps that have not yet accepted workflow_run. */
+  /** Only same-repository pushes prove a failure on the merged default branch. */
   private async failedDefaultBranchWorkflowEvents(event: string, payload: any,
     organizationId: string): Promise<GithubProjectWebhookEvent[]> {
-    if (!['workflow_run', 'check_run'].includes(event) || payload.action !== 'completed') return [];
-    const repositoryPayload = payload.repository;
+    if (event !== 'workflow_run' || payload.action !== 'completed') return [];
+    const workflowRun = payload.workflow_run;
+    const repositoryId = payload.repository?.id;
+    if (!repositoryId || workflowRun?.event !== 'push'
+      || workflowRun.head_repository?.id !== repositoryId) return [];
     const repository = (await this.store.listRepositories(organizationId)).find((candidate) =>
-      (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
-      || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
+      candidate.providerId === String(repositoryId));
     if (!repository) return [];
     const failed = new Set(['action_required', 'failure', 'stale', 'startup_failure', 'timed_out']);
-    const workflowRun = payload.workflow_run;
-    const checkRun = payload.check_run;
-    const conclusion = String(workflowRun?.conclusion ?? checkRun?.conclusion ?? '').toLowerCase();
-    const branch = String(workflowRun?.head_branch ?? checkRun?.check_suite?.head_branch ?? '');
+    const conclusion = String(workflowRun.conclusion ?? '').toLowerCase();
+    const branch = String(workflowRun.head_branch ?? '');
     if (!failed.has(conclusion) || branch !== repository.defaultBranch) return [];
-    const url = String(workflowRun?.html_url ?? checkRun?.details_url ?? '');
-    const runId = Number(workflowRun?.id ?? githubActionsRunIdFromUrl(url)
-      ?? checkRun?.check_suite?.id ?? checkRun?.id);
+    const url = String(workflowRun.html_url ?? '');
+    const runId = Number(workflowRun.id);
     if (!Number.isSafeInteger(runId) || runId <= 0) return [];
-    const headSha = String(workflowRun?.head_sha ?? checkRun?.head_sha ?? checkRun?.check_suite?.head_sha ?? '');
-    const headRefs = [
-      ...(Array.isArray(workflowRun?.pull_requests) ? workflowRun.pull_requests : []),
-      ...(Array.isArray(checkRun?.pull_requests) ? checkRun.pull_requests : []),
-    ].map((pr: any) => String(pr?.head?.ref ?? pr?.head?.label ?? ''));
-    const originatingTaskId = headRefs.map((ref) => ref.match(/(?:^|:)karmax\/(task_[A-Za-z0-9_-]+)/)?.[1]).find(Boolean);
+    const headSha = String(workflowRun.head_sha ?? '');
+    const headRefs = (Array.isArray(workflowRun.pull_requests) ? workflowRun.pull_requests : [])
+      .map((pr: any) => String(pr?.head?.ref ?? ''));
+    const originatingTaskId = headRefs.map((ref: string) => ref.match(/(?:^|:)karmax\/(task_[A-Za-z0-9_-]+)/)?.[1]).find(Boolean);
     const base = {
       repository: `${repository.owner}/${repository.name}`,
       repositoryId: repository.id,
-      workflow: String(workflowRun?.name ?? checkRun?.name ?? 'GitHub workflow'),
+      workflow: String(workflowRun.name ?? 'GitHub workflow'),
       runId,
       attempt: Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1),
       conclusion,

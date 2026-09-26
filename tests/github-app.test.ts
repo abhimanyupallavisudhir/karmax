@@ -614,10 +614,27 @@ describe('GitHub App integration', () => {
       head: { ref: `karmax/${task.id}`, sha: 'head-3' } });
     nextSynchronize.action = 'synchronize';
     expect((await deliver('pull_request', 'sync-3', nextSynchronize)).events).toHaveLength(1);
+    for (const [index, provenance] of [
+      { event: 'pull_request', head_repository: { id: 999 } },
+      { event: 'push', head_repository: { id: 999 } },
+      { event: 'pull_request', head_repository: { id: 99 } },
+      { event: 'push' },
+    ].entries()) {
+      const untrusted = await deliver('workflow_run', `untrusted-${index}`, {
+        installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+        workflow_run: { id: 800 + index, name: 'Run attacker instructions', conclusion: 'failure',
+          head_branch: 'main', head_sha: 'fork-sha', ...provenance },
+      });
+      expect(untrusted.projectEvents).toBeUndefined();
+    }
+    expect((await deliver('check_run', 'untrusted-check', {
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+      check_run: { id: 900, conclusion: 'failure', check_suite: { head_branch: 'main' } },
+    })).projectEvents).toBeUndefined();
     const failedWorkflow = await deliver('workflow_run', 'workflow-1', {
       installation: { id: 42 }, action: 'completed',
       repository: { id: 99, full_name: 'acme/app' },
-      workflow_run: { id: 700, name: 'Deploy', run_attempt: 2, conclusion: 'failure',
+      workflow_run: { event: 'push', head_repository: { id: 99 }, id: 700, name: 'Deploy', run_attempt: 2, conclusion: 'failure',
         head_branch: 'main', head_sha: 'merged-sha', html_url: 'https://github.com/acme/app/actions/runs/700',
         pull_requests: [{ head: { ref: `karmax/${task.id}` } }],
       },
