@@ -563,7 +563,10 @@ export class ClaudeAdapter implements AgentAdapter {
     // sent has been answered. Unanswered input and tracked in-harness work both hold the
     // stream open, bounded because a backgrounded shell may be a dev server the task
     // deliberately left running.
-    const settleGraceMs = Number(process.env.KARMAX_AGENT_BG_SETTLE_MS ?? 300_000);
+    const grace = process.env.KARMAX_AGENT_BG_SETTLE_MS?.trim();
+    const parsedGrace = grace ? Number(grace) : NaN;
+    const settleGraceMs = Number.isFinite(parsedGrace) && parsedGrace >= 0 && parsedGrace <= 2_147_483_647
+      ? parsedGrace : 300_000;
     let settleDeadline: number | undefined;
     const harnessStillWorking = (): boolean => {
       if (!subagents.size && !unanswered.size) return false;

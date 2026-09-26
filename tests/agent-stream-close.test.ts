@@ -296,6 +296,18 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
       .toMatchObject({ CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' });
   });
 
+  it.each(['', '5m', '-1', 'Infinity'])('holds background work with invalid grace %j', async (value) => {
+    process.env.KARMAX_AGENT_BG_SETTLE_MS = value;
+    const h = fakeHarness(async function* () {
+      yield { type: 'system', subtype: 'task_started', task_id: 'bg' };
+      yield { type: 'result', subtype: 'success', session_id: 's' };
+      await sleep(10);
+      expect(h.current!.inputClosed).toBe(false);
+      yield { type: 'system', subtype: 'task_notification', task_id: 'bg', status: 'completed' };
+    });
+    await runTurn([]);
+  });
+
   it('bounds the wait — a deliberately long-lived background shell cannot wedge the turn', async () => {
     // A dev server the task left running never settles. After the grace we close anyway
     // (degrading to the old behaviour) rather than holding the turn open forever.
