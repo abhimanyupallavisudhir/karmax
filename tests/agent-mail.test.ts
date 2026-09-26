@@ -209,3 +209,13 @@ describe('mail ownership boundaries (AU-1)', () => {
     expect(await new AgentMail(store).ownerOf(old)).toBeUndefined();
   });
 });
+
+it('bounds stored mail bodies and total inbox bytes (AU-6)', async () => {
+  const store = memStore();
+  const mail = new AgentMail(store);
+  const to = await mail.address('org_a');
+  for (let i = 0; i < 70; i++) await mail.ingest({ to, from: 'a@example.com', text: 'x'.repeat(100_000), subject: 's'.repeat(100_000) });
+  const raw = await store.kvGet('agent-mail:messages:org_a');
+  expect(Buffer.byteLength(raw!)).toBeLessThanOrEqual(1_048_576);
+  expect((await mail.recent('org_a'))[0]!.text.length).toBeLessThanOrEqual(16_384);
+});

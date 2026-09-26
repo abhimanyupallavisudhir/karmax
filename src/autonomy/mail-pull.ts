@@ -102,8 +102,9 @@ async function defaultOpenImap(opts: ImapOpts): Promise<ImapConn> {
       const out: ImapMessage[] = [];
       const lock = await client.getMailboxLock('INBOX');
       try {
-        for await (const msg of client.fetch({ uid: `${lastUid + 1}:*` }, { uid: true, source: true })) {
+        for await (const msg of client.fetch({ uid: `${lastUid + 1}:*` }, { uid: true, source: { maxLength: 65_536 } })) {
           if (msg.uid > lastUid && msg.source) out.push({ uid: msg.uid, source: msg.source.toString('utf8') });
+          if (out.length >= 50) break;
         }
       } finally {
         lock.release();
@@ -139,6 +140,24 @@ export async function verifyAgentMailInbox(key: string, address: string, fetcher
 
 const amCursorKey = (address: string) => `agent-mail:am-cursor:${address}`;
 
+async function readMailResponse(response: Response): Promise<any> {
+  if (!response.body) return response.headers.get('content-type')?.includes('json') ? response.json() : response.text();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > 2 * 1_048_576) throw new Error('AgentMail response exceeds size limit');
+      chunks.push(chunk.value);
+    }
+  } finally { await reader.cancel(); }
+  const text = Buffer.concat(chunks).toString('utf8');
+  return response.headers.get('content-type')?.includes('json') ? JSON.parse(text) : text;
+}
+
 export class AgentMailPuller implements Puller {
   constructor(private config: MailboxConfig, private deps: PullDeps) {}
   private key(): string | undefined {
@@ -148,11 +167,11 @@ export class AgentMailPuller implements Puller {
     const key = this.key();
     const doFetch = this.deps.fetchFn ?? fetch;
     const res = await doFetch(`${AGENTMAIL_BASE}${path}`, {
-      ...init,
+      ...init, signal: AbortSignal.timeout(15_000),
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', ...(init.headers ?? {}) },
     });
     if (res.status === 404) return undefined;
-    const body = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text();
+    const body = await readMailResponse(res);
     if (!res.ok) {
       const message = typeof body === 'object'
         ? (body as any)?.message ?? (body as any)?.error?.message ?? (body as any)?.error ?? (body as any)?.detail
@@ -171,7 +190,7 @@ export class AgentMailPuller implements Puller {
     if (!list) throw new Error(`AgentMail inbox ${address} was not found`);
     const messages: any[] = list?.messages ?? list?.data ?? (Array.isArray(list) ? list : []);
     let newest = cursor;
-    for (const summary of messages) {
+    for (const summary of messages.slice(0, 50)) {
       const messageId = summary.message_id ?? summary.id;
       const m = (!summary.text && messageId)
         ? (await this.api(`/inboxes/${encodeURIComponent(address)}/messages/${encodeURIComponent(String(messageId))}`) ?? summary)

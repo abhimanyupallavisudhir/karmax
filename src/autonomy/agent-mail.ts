@@ -314,6 +314,7 @@ export class AgentMail {
 
   private async all(organizationId: string): Promise<AgentMessage[]> {
     const raw = await this.store.kvGet(kvMessages(organizationId));
+    if (raw && Buffer.byteLength(raw) > 8 * 1_048_576) throw new Error('agent inbox exceeds size limit; archive it before polling');
     try {
       return JSON.parse(raw ?? '[]');
     } catch {
@@ -337,6 +338,7 @@ export class AgentMail {
     const existing = (await this.all(organizationId));
     // Polling may replay a boundary message; keep its original arrival time.
     if (existing.some((message) => message.id === id)) return { delivered: false };
+    msg = { ...msg, from: msg.from.slice(0, 512), to: msg.to.slice(0, 512), subject: msg.subject?.slice(0, 1024), text: msg.text.slice(0, 16_384) };
     const record: AgentMessage = {
       id,
       from: msg.from,
@@ -348,6 +350,11 @@ export class AgentMail {
       receivedAt: msg.receivedAt ?? Date.now(),
     };
     const next = [...existing, record].slice(-MAX_MESSAGES);
+    let bytes = Buffer.byteLength(JSON.stringify(next));
+    while (bytes > 1_048_576 && next.length > 1) {
+      next.shift();
+      bytes = Buffer.byteLength(JSON.stringify(next));
+    }
     (await this.store.kvSet(kvMessages(organizationId), JSON.stringify(next)));
     return { delivered: true, message: record };
       });
