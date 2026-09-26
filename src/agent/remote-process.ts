@@ -122,62 +122,52 @@ export function remoteAgentHomeRelative(provider: Provider, localHome: string): 
   return `${REMOTE_ROOT}/${provider}/${identity}`;
 }
 
-/** Export only provider-owned authentication and native conversation files.
- * Remote MCP/browser rewrites, logs, caches, and process-control files remain
- * sandbox-local. Atomic 0600 writes make OAuth token rotation durable without
- * allowing a partial download to corrupt the account's control-plane home. */
+/** Export only this turn's conversation and physical Codex history dependencies.
+ * Credentials are host-owned; a task world must never replace another session. */
 export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
-  localHome: string): Promise<void> {
-  if (!localHome) return;
-  const listed = await world.exec('bash', ['-lc',
-    `if [ -d ${quote(remoteHome.absolute)} ]; then find ${quote(remoteHome.absolute)} -type f -print; fi`]);
-  if (listed.code !== 0) throw new Error(`could not export remote ${provider} state: ${listed.stderr || listed.stdout}`);
-  const root = world.handle.root.replace(/\/+$/, '');
+  localHome: string, session?: string): Promise<void> {
+  if (!localHome || !session) return;
   const homePrefix = `${remoteHome.relative}/`;
-  const files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
-    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file).filter((file) => file.startsWith(homePrefix));
-  const auth = new Set(provider === 'codex'
-    ? ['auth.json', 'karmax-oauth.json']
-    : ['.credentials.json', '.claude/.credentials.json', 'karmax-oauth.json']);
-  for (const remoteFile of files) {
-    const relative = remoteFile.slice(homePrefix.length);
-    const session = provider === 'codex'
-      ? (relative.startsWith('sessions/') || relative.startsWith('archived_sessions/')) && relative.endsWith('.jsonl')
-      : relative.startsWith('projects/') && relative.endsWith('.jsonl');
-    const recovery = provider === 'codex' && /^\.karmax-history-recovery\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.json$/.test(relative);
-    if (!auth.has(relative) && !session && !recovery) continue;
-    // Remote provider processes receive refresh-token-free projections. They are
-    // intentionally never refresh authority and must never overwrite the one
-    // canonical credential shared by every task using this login.
-    if (isControlPlaneAuth(provider, relative)) continue;
-    // The listing came from a shell inside the sandbox, which the agent controls:
-    // a `..` segment would write anywhere the control plane's user can.
-    const segments = relative.split('/');
-    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) continue;
-    const destination = path.join(localHome, ...segments);
-    if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
-    const data = await world.readFileBuffer(remoteFile);
-    if (recovery) { atomicPrivateWrite(destination, data); continue; }
-    if (provider === 'codex' && session) {
-      const id = path.posix.basename(relative).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]
-        ?? path.posix.basename(relative).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
-      publishLocalCodexHistory(localHome, { file: relative, content: data }, id);
+  const files = [...await remoteHomeFiles(world, remoteHome.absolute)].filter(file => {
+    if (!file.startsWith(homePrefix)) return false;
+    const relative = file.slice(homePrefix.length);
+    return !relative.split('/').some(segment => !segment || segment === '.' || segment === '..');
+  });
+  const pending = [session];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (seen.has(current)) throw new CodexHistoryError(`cyclic lineage for ${session}`);
+    seen.add(current);
+    const matches = files.filter(file => {
+      const relative = file.slice(homePrefix.length);
+      return provider === 'codex'
+        ? !!codexRolloutIdentity(relative) && path.posix.basename(relative).endsWith(`${current}.jsonl`)
+        : relative.startsWith('projects/') && path.posix.basename(relative) === `${current}.jsonl`;
+    });
+    const candidates = [];
+    for (const file of matches) candidates.push({ file, content: await world.readFileBuffer(file) });
+    if (!candidates.length) {
+      if (current !== session) throw new CodexHistoryError(`missing ancestor ${current}`);
       continue;
     }
-    // A task cleanup can race a human re-login on the control plane. Do not let
-    // an older persistent world restore the token the user just replaced.
-    if (auth.has(relative) && fs.existsSync(destination)) {
-      const local = fs.readFileSync(destination);
-      if (authIsNewer(provider, relative, local, data)) continue;
-    }
-    fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-    const temp = `${destination}.${crypto.randomBytes(6).toString('hex')}.karmax-tmp`;
-    try {
-      fs.writeFileSync(temp, data, { mode: 0o600 });
-      fs.renameSync(temp, destination);
-      fs.chmodSync(destination, 0o600);
-    } finally {
-      fs.rmSync(temp, { force: true });
+    if (provider === 'codex') {
+      const kept = selectCodexHistoryCopy(candidates, current);
+      publishLocalCodexHistory(localHome, { file: kept.file.slice(homePrefix.length), content: kept.content }, current);
+      const base = codexHistoryBase(kept.content);
+      if (base) pending.push(base);
+    } else {
+      for (const candidate of candidates) {
+        const destination = path.resolve(localHome, candidate.file.slice(homePrefix.length));
+        if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
+        if (fs.existsSync(destination)) {
+          const local = fs.readFileSync(destination);
+          if (local.subarray(0, candidate.content.length).equals(candidate.content)) continue;
+          if (!candidate.content.subarray(0, local.length).equals(local))
+            throw new Error(`divergent Claude history for ${current}`);
+        }
+        atomicPrivateWrite(destination, candidate.content);
+      }
     }
   }
 }
@@ -225,36 +215,13 @@ function remoteAuthProjection(provider: Provider, relative: string, content: Buf
   }
 }
 
-/** Provider-native monotonic-ish credential freshness for Claude, whose remote
- * SDK still owns refresh. Codex is deliberately excluded: one canonical host
- * owns its rotating refresh token, independent of task-local timestamps. */
-function authFreshness(provider: Provider, relative: string, content: Buffer): number | undefined {
-  const normalized = relative.split(path.sep).join('/');
-  const isClaude = provider === 'claude'
-    && (normalized === '.credentials.json' || normalized === '.claude/.credentials.json');
-  if (!isClaude) return undefined;
-  try {
-    const parsed = JSON.parse(content.toString('utf8'));
-    const expiry = Number(parsed?.claudeAiOauth?.expiresAt ?? parsed?.oauthAccount?.expiresAt);
-    return Number.isFinite(expiry) && expiry > 0 ? expiry : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function authIsNewer(provider: Provider, relative: string, candidate: Buffer, current: Buffer): boolean {
-  const next = authFreshness(provider, relative, candidate);
-  const prior = authFreshness(provider, relative, current);
-  return next !== undefined && (prior === undefined || next > prior);
-}
-
 /** Remote auth/session export is a durability enhancement, not the provider
  * turn's terminal result. Return a diagnostic instead of throwing so a control-
  * plane timeout during cleanup cannot replace a verified successful turn. */
 export async function syncRemoteAgentHomeBestEffort(world: World, provider: Provider,
-  remoteHome: RemoteAgentHome, localHome: string): Promise<Error | undefined> {
+  remoteHome: RemoteAgentHome, localHome: string, session?: string): Promise<Error | undefined> {
   try {
-    await syncRemoteAgentHome(world, provider, remoteHome, localHome);
+    await syncRemoteAgentHome(world, provider, remoteHome, localHome, session);
     return undefined;
   } catch (error) {
     if (error instanceof CodexHistoryError) throw error;

@@ -163,7 +163,7 @@ it('forks, migrates tools, transfers, checkpoints, restores, and completes a rea
   const durable = temp();
   expect(await materializeRemoteSession(first, second, 'codex', grandchild, durable)).toBe(true);
   const relative = remoteAgentHomeRelative('codex', durable);
-  await syncRemoteAgentHome(second, 'codex', { relative, absolute: path.join(second.handle.root, relative) }, durable);
+  await syncRemoteAgentHome(second, 'codex', { relative, absolute: path.join(second.handle.root, relative) }, durable, grandchild);
   const restored = diskWorld(temp());
   const restoredHome = await seedRemoteAgentHome(restored, 'codex', durable, grandchild);
   const { client, stop } = await server(restoredHome.absolute);

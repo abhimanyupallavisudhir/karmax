@@ -387,6 +387,34 @@ describe('remote subscription agents', () => {
       .toEqual(expect.arrayContaining(['@openai/codex@0.156.1', 'app-server']));
   });
 
+  it('exports only the current Claude session and never replaces newer or divergent history', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-session-export-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    const current = 'projects/world/current-session.jsonl';
+    const other = 'projects/world/other-session.jsonl';
+    world.files.set(`${home.relative}/${current}`, Buffer.from('first\n'));
+    world.files.set(`${home.relative}/${other}`, Buffer.from('foreign\n'));
+    await syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session');
+    expect(fs.existsSync(path.join(localHome, other))).toBe(false);
+    expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\n');
+    fs.writeFileSync(path.join(localHome, current), 'first\nnewer\n');
+    await syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session');
+    expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\nnewer\n');
+    world.files.set(`${home.relative}/${current}`, Buffer.from('forged\n'));
+    await expect(syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session')).rejects.toThrow('divergent');
+    expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\nnewer\n');
+  });
+
+  it('does not export native histories before the adapter has a current session', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-session-export-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    world.files.set(`${home.relative}/projects/world/other-session.jsonl`, Buffer.from('foreign\n'));
+    await syncRemoteAgentHome(world, 'claude', home, localHome);
+    expect(fs.existsSync(path.join(localHome, 'projects'))).toBe(false);
+  });
+
   it('isolates accounts and exports native sessions without importing task-local OAuth state', async () => {
     const first = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-a-'));
     const second = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-b-'));
@@ -401,7 +429,7 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${b.relative}/auth.json`)?.toString()).toContain('"b"');
     world.files.set(`${a.relative}/auth.json`, Buffer.from('{"account":"a-refreshed"}'));
     world.files.set(`${a.relative}/sessions/2026/session-a.jsonl`, Buffer.from('durable native session'));
-    await syncRemoteAgentHome(world, 'codex', a, first);
+    await syncRemoteAgentHome(world, 'codex', a, first, 'session-a');
     expect(fs.readFileSync(path.join(first, 'auth.json'), 'utf8')).toContain('a-old');
     expect(fs.readFileSync(path.join(first, 'sessions/forked/session-a.jsonl'), 'utf8')).toBe('durable native session');
     fs.rmSync(second, { recursive: true, force: true });
@@ -495,7 +523,7 @@ describe('remote subscription agents', () => {
     destination.files.set(`${home}/archived_sessions/rollout-root-session.jsonl`,
       destination.files.get(`${home}/sessions/forked/rollout-root-session.jsonl`)!);
     destination.files.delete(`${home}/sessions/forked/rollout-root-session.jsonl`);
-    await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome);
+    await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome, 'leaf-session');
     const restored = fakeWorld();
     await seedRemoteAgentHome(restored, 'codex', localHome, 'leaf-session');
     for (const [file, content] of destination.files) if (!file.includes('.karmax-history-publish.sqlite')) expect(restored.files.get(`${home}/sessions/forked/${path.basename(file)}`)).toEqual(content);

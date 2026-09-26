@@ -106,7 +106,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
         approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id;
       await turn(client, root, 'inherited-root-marker');
       // The host cache is now one completed turn behind the live source.
-      await syncRemoteAgentHome(source, 'codex', sourceHome, host);
+      await syncRemoteAgentHome(source, 'codex', sourceHome, host, root);
       await turn(client, root, 'newest-source-marker');
     });
     const stale = rollouts(host).find((file) => file.endsWith(`${root}.jsonl`))!;
@@ -177,7 +177,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
           approvalPolicy: 'never', sandbox: 'danger-full-access' });
         await turn(client, child, `resumed-${generation}-marker`);
       });
-      await syncRemoteAgentHome(destination, 'codex', home, host);
+      await syncRemoteAgentHome(destination, 'codex', home, host, child);
       from = destination;
       parent = child;
     }
