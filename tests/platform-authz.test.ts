@@ -134,6 +134,29 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
   });
 
   /**
+   * PL-2: `_`-prefixed params are platform metadata — the task's authorization,
+   * its pinned GitHub account, its Temporal run, one-shot start flags. createTask
+   * mints them itself; editing a draft or armed task must not let the caller
+   * write them either, or a task:edit token could widen a task's grant or
+   * substitute the account its PRs are opened as.
+   */
+  it('never takes platform metadata from an armed/draft params edit', async () => {
+    const draft = (await store.createTask({ projectId: mine, title: 'Draft', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x', draft: true, _githubAccountId: 'owner-account' } as any }));
+    const injected = { _authorization: { capabilities: ['*'], principal: 'user:root' }, _githubAccountId: 'attacker',
+      _workflowRunId: 'run-elsewhere', _discardProgress: true };
+    for (const replace of [false, true]) {
+      (await api.updateArmedParams(token, draft.id, { prompt: 'edited', ...injected }, { replace, keepArmed: false }));
+      const params = (await store.getTask(draft.id))!.params as Record<string, unknown>;
+      expect(params.prompt).toBe('edited');
+      expect(params._authorization).toBeUndefined();
+      expect(params._workflowRunId).toBeUndefined();
+      expect(params._discardProgress).toBeUndefined();
+      expect(params._githubAccountId).not.toBe('attacker');
+    }
+  });
+
+  /**
    * The host agent queue is a queue surface. It asked for `get_task` while the
    * gateway route (after the fix) asks for `queue:read`/`queue:write`, and
    * `setAgentCapacity` took no token and performed no check at all.

@@ -200,6 +200,15 @@ const TERMINAL_CLEANUP_TIMEOUT_MS = 10_000;
  */
 const RECOVERABLE_WORKFLOWS = new Set(['software-dev', 'goal']);
 
+/** `_`-prefixed task params are platform metadata — the task's authorization
+ * and delegation, its pinned GitHub account, fork provenance, the Temporal run
+ * id, one-shot start flags. Only the platform writes them; remove any a caller
+ * put in a params bag. Mutates and returns `params`. */
+function stripPlatformMetadata<T extends Record<string, unknown>>(params: T): T {
+  for (const key of Object.keys(params)) if (key.startsWith('_')) delete params[key];
+  return params;
+}
+
 /**
  * Reject a queue reorder aimed at a domain this task does not hold.
  *
@@ -1121,8 +1130,7 @@ export class KarmaxApi {
     // Authority-owned fields are minted below. An API caller may never inject a
     // delegated subject or substitute the task-pinned external account through
     // the otherwise-open workflow params bag.
-    delete taskOverrides._authorization;
-    delete taskOverrides._githubAccountId;
+    stripPlatformMetadata(taskOverrides);
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
@@ -2231,6 +2239,10 @@ export class KarmaxApi {
       (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', params.paymentPolicy));
     }
     this.assertBranchParams(params);
+    // Platform metadata is written by the platform only, exactly as at creation
+    // (PL-2) — a legacy task with no stored `_authorization` would otherwise
+    // adopt the caller's.
+    params = stripPlatformMetadata({ ...params });
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
     (await this.validateAndAuthorizeResumeSources(token, params));
