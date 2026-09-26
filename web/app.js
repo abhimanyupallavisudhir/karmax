@@ -2691,9 +2691,25 @@ async function checkConsoleRevision() {
   return false;
 }
 
+function resumeVisibleUpdates() {
+  if (document.hidden) return;
+  if (S.liveUpdatesStale) {
+    S.liveUpdatesStale = false;
+    resourceReviewCache.clear(); resourceInventoryCache.clear();
+    loadInbox().catch(() => {});
+    if (S.selected) { refreshTask(); refreshTaskHistory(S.selected); }
+    else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
+    else if (S.tab === 'activity') seedActivity();
+  }
+  checkConsoleRevision();
+  if (S.tab === 'installation') { refreshHostDiag(); refreshProcPanel(); }
+  if (S.onboarding?.display === 'expanded') refreshOnboarding();
+}
+
 function watchConsoleRevision() {
   if (consoleRevisionTimer) return;
   consoleRevisionTimer = setInterval(checkConsoleRevision, 60_000);
+  document.addEventListener('visibilitychange', resumeVisibleUpdates);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -3311,16 +3327,23 @@ function connectWs() {
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
-    S.activity.unshift(ev);
-    if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') bgRenderMain();
+    if (document.hidden) { S.liveUpdatesStale = true; return; }
+    if (S.tab === 'activity' && (!ev.projectId || ev.projectId === S.projectId)) {
+      S.activity.unshift(ev);
+      if (S.activity.length > 400) S.activity.pop();
+      bgRenderMain();
+    }
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
     const eventProject = ev.projectId || ev.payload?.projectId;
     const currentProject = !eventProject || eventProject === S.projectId;
     const siblingAttempt = S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
       && S.attemptGroup.principalAttemptId !== ev.taskId;
     const patchedList = currentProject && patchTaskListFromEvent(ev);
+    if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
+      resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
+    }
     if (S.selected && ev.taskId === S.selected) {
+      if (ev.type.startsWith('spend.') || ev.type.startsWith('payment.')) $('#tp-payments')?.refreshSpent?.();
       if (ev.type !== 'agent.output') {
         S.taskEvents.push(ev);
         if (S.taskEvents.length > 400) S.taskEvents.shift();
@@ -3374,7 +3397,8 @@ function connectWs() {
     wsRetryMs = 1500;
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
-    if (wsHadDropped) {
+    if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
+    else if (wsHadDropped) {
       loadInbox().catch(() => {});
       refreshTasks().catch(() => {});
       if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
@@ -3573,6 +3597,7 @@ function onboardingStep(number, key, title, detail, action) {
 
 function pollOnboarding() {
   clearTimeout(S.onboardingTimer);
+  if (document.hidden || ['minimized', 'closed'].includes(S.onboarding?.display)) return;
   S.onboardingTimer = setTimeout(() => {
     if (document.hidden) return pollOnboarding();
     return refreshOnboarding();
@@ -7420,7 +7445,7 @@ function renderTaskPage() {
     const projectId = rec?.projectId || S.projectId;
     wireLiveSection($('#tp-auth'), () => wireTaskAuthorization(v));
     const payments = $('#tp-payments');
-    if (!wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId))) payments?.refreshSpent?.();
+    wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId));
     wireLiveSection($('#cred-editor-task'), (el) => renderCredentialEditor(el, 'task', { projectId, taskId: v.taskId }));
   }
   wireCopyButtons();
@@ -8138,8 +8163,8 @@ function resourceReviewPlaceholder() {
 function loadResourceReview(v, force = false, inventory = false) {
   const cache = inventory ? resourceInventoryCache : resourceReviewCache;
   const cached = cache.get(v.taskId);
-  if (!force && cached && (cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))
-    && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  if (!force && cached && cached.view.stage === v.stage
+    && (inventory || JSON.stringify(cached.view.reviewInfo) === JSON.stringify(v.reviewInfo))) return cached.promise;
   const entry = { view: v, pending: true, at: Date.now() };
   entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : '?summary=metadata'}`)
     .then((result) => {
@@ -10998,7 +11023,7 @@ function hostDiagHtml(diag) {
 // Live-refresh just the host panel every 5s while Installation is open. Self-
 // terminates (no reschedule) once the tab changes or the element is gone.
 async function refreshHostDiag() {
-  if (S.tab !== 'installation' || !$('#host-diag')) return;
+  if (document.hidden || S.tab !== 'installation' || !$('#host-diag')) return;
   clearTimeout(S.hostDiagTimer);
   const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
@@ -11101,7 +11126,7 @@ function wireProcPanel(el) {
 // self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
 // so the very first paint shows 0% and settles from the second sample on.
 async function refreshProcPanel(now = false) {
-  if (S.tab !== 'installation' || !$('#proc-panel')) return;
+  if (document.hidden || S.tab !== 'installation' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
   const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
