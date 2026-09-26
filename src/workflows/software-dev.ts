@@ -19,6 +19,7 @@ import {
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
+import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
@@ -55,6 +56,7 @@ import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { conversationPublisher } from '../domain/view-publication.js';
 
+const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 seconds' });
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
@@ -1014,6 +1016,7 @@ async function softwareDevImpl(
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
         cancelled,
+        ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
         worldReady: !!world,
         mergeGranted,
@@ -1344,7 +1347,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel();
       activeTurn?.cancel();
-      cancelChildren();
+      if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
   setHandler(retrySignal, () => {
@@ -1353,6 +1356,8 @@ async function softwareDevImpl(
       humanPauseWake = { kind: 'retry' };
   });
   // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
+  if (recovery && patched('software-dev-preserve-replacement-children-v1'))
+    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => settled.push(result));
   setHandler(raiseFromChildSignal, (r) => {
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
@@ -2484,6 +2489,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     while (settled.length) {
       const s = settled.shift()!;
+      if (recovery && patched('software-dev-preserve-replacement-children-v1') && !outstanding.has(s.childTaskId)) continue;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
@@ -2513,6 +2519,18 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   try {
   // ── Setup ──
+  if (recovery && patched('software-dev-preserve-replacement-children-v1')) {
+    const children = await coreChild.restoreChildTasks(taskId);
+    for (const child of children) {
+      subTaskIds.push(child.taskId);
+      outstanding.add(child.taskId);
+      if (child.waiting) {
+        awaitingResponse.add(child.taskId);
+        raises.push({ childTaskId: child.taskId, childTitle: child.title, type: 'needs_info', detail: child.detail });
+      }
+
+    }
+  }
   await publish();
   if (cancellableSetup && cancelled) return await abort();
   if (!world) {
@@ -4027,7 +4045,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     stage = 'cancelled';
     status = 'cancelled';
     if (retainedMergeDomains.length) await releaseRetainedLandingDomains();
-    await cancelChildren(liveAgentStates); // don't strand children when we go away
+    if (!lifecycleReplacement || !patched('software-dev-preserve-replacement-children-v1'))
+      await cancelChildren(liveAgentStates);
     // A cancelled task must not leave an open pull request proposing work that
     // will never land.
     if (!lifecycleReplacement && githubPrLifecycle && world && prs.length

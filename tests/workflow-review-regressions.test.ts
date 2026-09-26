@@ -5,6 +5,7 @@ const wf = vi.hoisted(() => ({
   activities: {} as Record<string, any>,
   wait: undefined as undefined | (() => void),
   patches: true,
+  childSignal: vi.fn(async () => undefined),
 }));
 vi.mock('@temporalio/workflow', async (importOriginal) => ({
   ...await importOriginal<typeof import('@temporalio/workflow')>(),
@@ -22,6 +23,8 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
     if (!predicate()) throw new Error('test: unexpected wait');
     return true;
   },
+  startChild: async () => ({ result: () => new Promise(() => {}) }),
+  getExternalWorkflowHandle: () => ({ signal: wf.childSignal }),
   CancellationScope: class { async run(fn: () => any) { return fn(); } cancel() {} },
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
@@ -32,7 +35,7 @@ import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work',
   project: { repos: [] }, confirm: { layers: [] } } as any;
 beforeEach(() => {
-  wf.handlers.clear(); wf.wait = undefined; wf.patches = true;
+  wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true;
   wf.activities = {
     createWorld: vi.fn(async () => ({ id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' })),
     publishView: vi.fn(async () => undefined),
@@ -186,4 +189,29 @@ it('WF-16: refreshes a formerly empty pool before the next turn', async () => {
   await expect(leaser.run('do', turn)).rejects.toThrow('credential');
   expect(turn).not.toHaveBeenCalled();
   expect(coordinator.leaseAccount).toHaveBeenCalled();
+});
+
+it('WF-8: lifecycle replacement preserves detached children', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+  wf.activities.runAgentTurn.mockResolvedValue({ subTasks: [{ title: 'child', prompt: 'work' }] });
+  wf.activities.publishView.mockImplementation(async (_id, view) => {
+    if (view.subTasks?.length) wf.handlers.get('prepareLifecycleReplacement')!();
+  });
+  await softwareDevV1_26(input);
+  expect(wf.childSignal).not.toHaveBeenCalledWith(expect.objectContaining({ name: 'cancel' }));
+  expect(wf.childSignal).not.toHaveBeenCalledWith('cancel');
+});
+
+it('WF-8: a replacement parent restores its child barrier and pending questions', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.restoreChildTasks = vi.fn(async () => [{ taskId: 'child', title: 'Child',
+    waiting: true, detail: 'Please review' }]);
+  let restored = false;
+  wf.activities.publishView.mockImplementation(async (_id, view) => {
+    if (view.subTasks?.includes('child')) { restored = true; wf.handlers.get('prepareLifecycleReplacement')!(); }
+  });
+  await softwareDevV1_26({ ...input, recovery: { messages: [], resumeStage: 'do' } });
+  expect(restored).toBe(true);
+  expect(wf.handlers.has('childSettled')).toBe(true);
 });

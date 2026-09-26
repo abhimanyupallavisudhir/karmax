@@ -1,3 +1,4 @@
+import { notifyChildSettlement } from './children.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
@@ -4956,6 +4957,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       (await store.saveView(taskId, view, conversationReference));
+      await notifyChildSettlement(store, deps.client, view);
       // First Merge admission freezes whether sibling proposals remain eligible.
       // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {
