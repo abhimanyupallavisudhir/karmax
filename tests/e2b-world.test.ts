@@ -217,13 +217,15 @@ describe('E2B cloud world provider', () => {
     let terminalOutput = '';
     terminal.onData((chunk) => { terminalOutput += chunk; });
     ptyData?.(new TextEncoder().encode('ready'));
+    const utf8 = new TextEncoder().encode('🌍'); // AD-6: split a multibyte character across SDK chunks
+    ptyData?.(utf8.slice(0, 2)); ptyData?.({ data: utf8.slice(2) });
     await terminal.write('pwd\n');
     await terminal.resize(120, 40);
     await terminal.close();
     expect(timeoutRefreshes).toBeGreaterThanOrEqual(2); // process + PTY leases
     expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
     expect(ptyOptions.cmd).toBeUndefined();
-    expect(terminalOutput).toBe('ready');
+    expect(terminalOutput).toBe('ready🌍');
     expect(ptyInput).toBe('exec agent\npwd\n');
     expect(await world.previewSocketTarget!(3000, '/hmr?x=1')).toMatchObject({
       url: 'wss://3000-sbx_test.e2b.app/hmr?x=1', headers: { 'x-access-token': 'provider-secret' },
