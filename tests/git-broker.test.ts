@@ -10,6 +10,14 @@ describe('cloud Git broker', () => {
   const cleanups: string[] = [];
   afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
+  it.each(['../escape', '/absolute', '.', '..', 'nested/name'])('rejects unsafe enrollment names before world access (WD-24): %s', async name => {
+    const exec = vi.fn();
+    const world = { handle: { root: '/workspace', repos: [] }, exec, writeFileBuffer: vi.fn() } as any;
+    await expect(brokerEnrollRepository(world, { source: 'git@example:repo.git', name, branch: 'task', base: 'main' }, {}))
+      .rejects.toThrow('checkout name');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('publishes independent repositories concurrently with bounded fan-out (LT-10)', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-parallel-')); cleanups.push(root);
     const repos: string[] = [];

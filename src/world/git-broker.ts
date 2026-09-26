@@ -60,6 +60,8 @@ export async function brokerEnrollRepository(
   spec: GitBrokerEnrollmentSpec,
   auth: GitBrokerAuth,
 ): Promise<WorldRepo> {
+  if (spec.name !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(spec.name))
+    throw new Error('invalid checkout name');
   if (!/^(?:ssh:\/\/|git@)/.test(spec.source)) throw new Error('dynamic repository enrollment requires an SSH remote');
   if (!validGitBranch(spec.branch)) throw new Error(`invalid task branch "${spec.branch}"`);
   if (!validGitBranch(spec.base)) throw new Error(`invalid repository base branch "${spec.base}"`);
