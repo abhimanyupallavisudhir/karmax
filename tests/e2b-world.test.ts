@@ -3,6 +3,14 @@ import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandbo
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('uses one provider inventory request before a new allocation (LT-3)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const list = vi.fn(async () => []);
+    await new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox, list })
+      .create({ taskId: 'new-allocation', base: 'main' });
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
   it('stops lifecycle pagination after the overlapping cursor (WD-18, LT-19)', async () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
       const offset = Number(new URL(String(input)).searchParams.get('offset'));
@@ -297,7 +305,7 @@ describe('E2B cloud world provider', () => {
         return sandbox;
       },
       async list(options) {
-        return options.metadata.karmaxGeneration === '3'
+        return options.metadata.karmaxTaskId === 'retry-create'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
@@ -325,7 +333,7 @@ describe('E2B cloud world provider', () => {
       },
       async connect(id) { expect(id).toBe('late-create'); connects++; return sandbox; },
       async list(options) {
-        return allocated && options.metadata.karmaxGeneration === '1'
+        return allocated && options.metadata.karmaxTaskId === 'late'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },

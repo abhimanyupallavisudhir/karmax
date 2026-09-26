@@ -420,13 +420,10 @@ export class E2BWorldProvider implements WorldProvider {
       requestTimeoutMs: options.requestTimeoutMs,
       ...(options.signal ? { signal: options.signal } : {}),
     };
-    let matches = await this.factory.list({ ...api, metadata });
-    if (!matches.length) {
-      const { karmaxGeneration: _generation, ...legacy } = metadata;
-      const candidates = await this.factory.list({ ...api, metadata: legacy });
-      matches = candidates.filter((candidate) => !candidate.metadata?.karmaxGeneration
-        || candidate.metadata.karmaxGeneration === metadata.karmaxGeneration);
-    }
+    const { karmaxGeneration: generation, ...scope } = metadata;
+    const candidates = await this.factory.list({ ...api, metadata: scope });
+    let matches = candidates.filter(candidate => candidate.metadata?.karmaxGeneration === generation);
+    if (!matches.length) matches = candidates.filter(candidate => !candidate.metadata?.karmaxGeneration);
     if (!matches.length) return undefined;
     if (matches.length > 1) {
       // No candidate has been registered yet, so none contains user work. Clear
