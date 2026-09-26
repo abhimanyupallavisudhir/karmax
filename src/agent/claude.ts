@@ -783,9 +783,10 @@ export class ClaudeAdapter implements AgentAdapter {
               ...(cls.note ? { note: cls.note } : {}),
             });
           }
-          if (assistantError === 'authentication_failed' || assistantError === 'oauth_org_not_allowed') {
+          if (['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'cloud_credential_error'].includes(assistantError)) {
             throw providerFailure(text || `Claude credential rejected (${assistantError})`, {
               kind: 'credential', permanence: 'hard', provider: 'claude', source: 'structured',
+              diagnostic: { code: assistantError },
             });
           }
           if (assistantError === 'billing_error') {
@@ -802,6 +803,7 @@ export class ClaudeAdapter implements AgentAdapter {
             // rather than asking a human to diagnose a token counter.
             throw new Error(`turn interrupted before completion: Claude reached max_output_tokens${text ? ` · ${text}` : ''}`);
           }
+          if (assistantError) throw new Error(`Claude provider ${String(assistantError)}: ${text || 'request failed'}`);
           // Claude Code sometimes carries the only real failure in a text block,
           // then emits the same misleading `success` / `completed` result envelope
           // seen with structured limits. Task #240 was exactly this shape:

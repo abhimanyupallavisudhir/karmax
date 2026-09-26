@@ -231,6 +231,31 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
+  it.each(['account_on_hold', 'verification_required', 'cloud_credential_error'])(
+    'recognizes the structured %s login failure before a success result', async (code) => {
+      sdkState.messages = [
+        { type: 'assistant', error: code, message: { content: [{ type: 'text', text: 'Action required' }] } },
+        { type: 'result', subtype: 'success' },
+      ];
+      await expect(new ClaudeAdapter().runTurn(input, ctx)).rejects.toMatchObject({
+        metadata: { kind: 'credential', permanence: 'hard', diagnostic: { code } },
+      });
+    },
+  );
+
+  it.each(['model_not_found', 'invalid_request', 'unknown', 'future_error'])(
+    'fails the task without parking the login for structured %s', async (code) => {
+      sdkState.messages = [
+        { type: 'assistant', error: code, message: { content: [{ type: 'text', text: 'Bad request' }] } },
+        { type: 'result', subtype: 'success' },
+      ];
+      const failure = await new ClaudeAdapter().runTurn(input, ctx).catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+      expect(failure.message).toContain(code);
+    },
+  );
+
   it('returns only after an explicit SDK success result', async () => {
     sdkState.messages = [
       { type: 'assistant', session_id: 's1', message: { content: [{ type: 'text', text: 'done' }] } },
