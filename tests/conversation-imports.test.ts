@@ -94,6 +94,26 @@ describe('conversation import storage', () => {
 });
 
 describe('Krmax panagent bridge', () => {
+  it('does not pass host credentials to the Python converter', async () => {
+    const home = temporary('karmax-panagent-env-');
+    const executable = path.join(home, 'python');
+    const marker = path.join(home, 'marker');
+    fs.writeFileSync(executable, `#!/bin/sh\nif [ -n "$KARMAX_TEST_SECRET" ]; then echo exposed > ${marker}; else echo safe > ${marker}; fi\nexit 1\n`, { mode: 0o700 });
+    const previous = process.env.KARMAX_PANAGENT_PYTHON;
+    process.env.KARMAX_PANAGENT_PYTHON = executable;
+    process.env.KARMAX_TEST_SECRET = 'fake-credential';
+    try {
+      await expect(importWithPanagent({ source: { data: Buffer.from(CLAUDE_JSONL) }, provider: 'mock',
+        forkHome: home, worldPath: '/tmp/imported', mode: 'context', native: false })).rejects.toThrow();
+      expect(fs.readFileSync(marker, 'utf8').trim()).toBe('safe');
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_PANAGENT_PYTHON;
+      else process.env.KARMAX_PANAGENT_PYTHON = previous;
+      delete process.env.KARMAX_TEST_SECRET;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('copies an uploaded Claude history without losing native records', async () => {
     const home = temporary('karmax-native-claude-import-');
     try {

@@ -204,10 +204,11 @@ function rewriteClaudeHistory(content: Buffer, sessionId: string): { sessionId: 
 
 async function runPanagent(args: string[], reportFile: string): Promise<PanagentWarning[]> {
   const python = process.env.KARMAX_PANAGENT_PYTHON || 'python3';
-  const env = {
-    ...process.env,
-    PYTHONPATH: [VENDORED_PANAGENT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-  };
+  const env: NodeJS.ProcessEnv = { PYTHONPATH: VENDORED_PANAGENT };
+  for (const key of ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
   try {
     await pexec(python, ['-m', 'panagent', ...args, '--report', reportFile], {
       env,
