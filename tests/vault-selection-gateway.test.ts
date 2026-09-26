@@ -59,7 +59,7 @@ describe('credential selection ranking through HTTP', () => {
         expect((await fill.json() as any).error).toMatch(/login fields|domains/);
       }
 
-      const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: { prompt: '' } });
       const login = await vault.save({ type: 'login', label: 'Once', domains: ['example.com'], username: 'alice', policy: { use: 'ask', reveal: 'ask' }, secrets: { password: 'pw' } });
       const grant = await vault.request({ taskId: task.id, caps: [], itemId: login.id, mode: 'use', why: 'login' });
       await vault.resolve(grant.requestId!, { action: 'once', by: 'user:test' });
@@ -79,6 +79,20 @@ describe('credential selection ranking through HTTP', () => {
       expect((await vault.access([], task.id, login, 'use')).status).toBe('granted');
       expect((await fill('password', '#pw')).status).toBe(200);
       expect((await vault.access([], task.id, login, 'use')).status).toBe('needs_approval');
+      const reader = await tokens.mint({ taskId: task.id, projectId: project.id, organizationId: 'org_personal',
+        principal: 'task:reader', profileId: 'reader', ceiling: ['credential:read'], grantorCaps: ['credential:read'] });
+      const providers = await fetch(`${running.url}/api/organizations/org_personal/agent-mail/providers`, {
+        headers: { authorization: `Bearer ${reader.token}` },
+      });
+      expect(providers.status).toBe(200);
+      const providerMetadata = await providers.json() as any;
+      expect(providerMetadata.providers.length).toBeGreaterThan(0);
+      expect(providerMetadata).not.toHaveProperty('webhookUrl');
+      expect(providerMetadata).not.toHaveProperty('cloudflareWorker');
+      const managedProviders = await fetch(`${running.url}/api/organizations/org_personal/agent-mail/providers`, {
+        headers: { authorization: `Bearer ${agent.token}` },
+      });
+      expect(await managedProviders.json()).toHaveProperty('webhookUrl');
       (gateway as any).deps.hosted = true;
       const remotePasskey = await fetch(`${running.url}/api/vault/passkey/enroll`, {
         method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },

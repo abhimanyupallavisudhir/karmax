@@ -6629,6 +6629,8 @@ export class Gateway {
           const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
           const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
           const config = (await this.mailboxConfig(organizationId));
+          if (!(await this.deps.tokens.check(token, 'credential:write')).ok)
+            return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider });
           // The push webhook URL (secret included) + Cloudflare worker are still
           // returned for the operator who wants them; the UI hides them for now.
           const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
