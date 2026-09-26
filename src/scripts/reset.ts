@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths } from '../config/paths.js';
+import { stopRecordedDevServer, type ServerRecord } from '../temporal/dev-server.js';
 
 /**
  * Wipe Temporal's durable state + karmax local state. Use when the dev server
@@ -15,18 +16,13 @@ const p = paths();
 
 // Stop the persistent dev server first (recorded by startDevServer).
 const rec = path.join(p.temporal, 'dev-server.json');
-try {
-  const { pid } = JSON.parse(fs.readFileSync(rec, 'utf8')) as { pid?: number };
-  if (pid) {
-    try {
-      process.kill(pid, 'SIGKILL');
-      console.log('stopped Temporal dev server (pid', pid + ')');
-    } catch {
-      /* already gone */
-    }
-  }
-} catch {
-  /* no record — nothing to stop */
+let server: ServerRecord | undefined;
+try { server = JSON.parse(fs.readFileSync(rec, 'utf8')); }
+catch { /* no record — nothing to stop */ }
+if (server) {
+  if (!await stopRecordedDevServer(server, path.join(p.temporal, 'temporal.db')))
+    throw new Error('Cannot verify the recorded Temporal process; stop it before resetting');
+  console.log('stopped Temporal dev server (pid', server.pid + ')');
 }
 
 for (const dir of [p.temporal, p.state]) {
