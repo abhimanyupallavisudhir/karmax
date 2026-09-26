@@ -11,15 +11,16 @@ import { materializeFork } from '../src/agent/fork.js';
 import { probeClaudeUsage } from '../src/agent/usage.js';
 import { paths } from '../src/config/paths.js';
 import type { PlatformToolContext } from '../src/agent/types.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
 /**
  * LIVE provider smoke tests — real models, real credentials. Each rail is gated on
- * its own credential being present + KARMAX_SKIP_LIVE!=1, so the hermetic suite
+ * its own credential being present + KARMAX_RUN_LIVE=1, so the hermetic suite
  * (and CI without creds) skips them. They spend a sliver of real quota. Run with:
- *   ANTHROPIC_API_KEY=… npx vitest run tests/live-providers.test.ts
+ *   KARMAX_RUN_LIVE=1 ANTHROPIC_API_KEY=… npx vitest run tests/live-providers.test.ts
  *   (or with a Claude Code / Codex subscription login present)
  */
-const NOTLIVE = process.env.KARMAX_SKIP_LIVE === '1';
+const NOTLIVE = !liveEnabled();
 
 const ctx = (): PlatformToolContext => ({
   openPr() {},
