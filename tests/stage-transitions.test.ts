@@ -105,6 +105,18 @@ describe('task stage transitions', () => {
     } finally { await f.store.close(); }
   });
 
+  it.each(['openPr', 'confirm', 'retry', 'approveCheckout'])('journals accepted %s to supersede idle parking', async signal => {
+    const f = await fixture();
+    try {
+      await f.api.signalTask(f.token, f.task.id, signal);
+      expect(await f.store.eventsOfType(f.task.id, 'task.transition-requested'))
+        .toEqual([expect.objectContaining({ payload: { signal } })]);
+      vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({ signal: async () => { throw new Error('Temporal unavailable'); } });
+      await expect(f.api.signalTask(f.token, f.task.id, signal)).rejects.toThrow('Temporal unavailable');
+      expect(await f.store.eventsOfType(f.task.id, 'task.transition-requested')).toHaveLength(1);
+    } finally { await f.store.close(); }
+  });
+
   it('waits for cancelled cleanup to close before restoring Review', async () => {
     const f = await fixture();
     await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' });

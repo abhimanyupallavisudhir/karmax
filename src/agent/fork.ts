@@ -146,7 +146,8 @@ function findCodexRollout(session: string, home: string): string | undefined {
 /** Physical history dependency, distinct from the informational forked_from_id.
  * Keep rollout bytes intact: history_base also contains byte offsets into it. */
 export function codexHistoryBase(content: Buffer): string | undefined {
-  const first = content.toString('utf8').split('\n', 1)[0] ?? '';
+  const end = content.indexOf(10);
+  const first = content.subarray(0, end < 0 ? content.length : end).toString('utf8');
   let record: any;
   try { record = JSON.parse(first); } catch { return undefined; }
   const base = record?.type === 'session_meta' ? record.payload?.history_base : undefined;
@@ -172,7 +173,21 @@ export function codexSessionFiles(opts: { session: string; forkHome?: string; sr
       return undefined;
     }
     files.push(file);
-    session = codexHistoryBase(fs.readFileSync(file));
+    const fd = fs.openSync(file, 'r');
+    try {
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      while (true) {
+        const chunk = Buffer.alloc(16 * 1024);
+        const bytes = fs.readSync(fd, chunk, 0, chunk.length, offset);
+        const end = chunk.subarray(0, bytes).indexOf(10);
+        chunks.push(chunk.subarray(0, end < 0 ? bytes : end));
+        if (end >= 0 || bytes < chunk.length) break;
+        offset += bytes;
+        if (offset >= 2 * 1024 * 1024) throw new CodexHistoryError('leading session metadata exceeds 2 MiB');
+      }
+      session = codexHistoryBase(Buffer.concat(chunks));
+    } finally { fs.closeSync(fd); }
   }
   return files.reverse();
 }

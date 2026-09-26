@@ -214,6 +214,12 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     return json(200, pr);
   }
   const comment = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/);
+  if (comment && method === 'GET') {
+    const page = Number(u.searchParams.get('page') ?? 1);
+    const perPage = Number(u.searchParams.get('per_page') ?? 30);
+    return json(200, comments.filter(entry => entry.number === Number(comment[2]))
+      .slice((page - 1) * perPage, page * perPage));
+  }
   if (comment && method === 'POST') {
     comments.push({ number: Number(comment[2]), body: body.body });
     return json(201, {});

@@ -3136,6 +3136,8 @@ export class Store {
 
   async createTask(input: {
     projectId: string;
+    /** Stable activity identity for retry-safe child creation. */
+    idempotencyKey?: string;
     listId?: string;
     title: string;
     workflow: string;
@@ -3152,6 +3154,19 @@ export class Store {
     confirmer?: unknown;
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
+
+    const creationKey = input.idempotencyKey ? `task-create:${input.idempotencyKey}` : undefined;
+    if (creationKey) {
+      // The no-op conflict update serializes concurrent retries on PostgreSQL too.
+      await this.db.prepare("INSERT INTO kv (k, v) VALUES (?, '') ON CONFLICT(k) DO UPDATE SET v = kv.v").run(creationKey);
+      const priorId = await this.kvGet(creationKey);
+      if (priorId) {
+        const prior = await this.getTask(priorId);
+        if (!prior || prior.projectId !== input.projectId || prior.parentTaskId !== input.parentTaskId)
+          throw new Error('task creation retry no longer matches its recorded child');
+        return prior;
+      }
+    }
 
     for (const principal of [input.createdBy, input.assignee, input.delegate])
       if (principal?.kind === 'user' && await this.kvGet(`account-closed:${principal.userId}`)) throw new Error('account is closed');
@@ -3240,6 +3255,7 @@ export class Store {
       (await this.db.prepare('INSERT INTO task_intents (id, principalAttemptId, confirmer, createdAt) VALUES (?, ?, ?, ?)')
         .run(intentId, id, input.confirmer === undefined ? null : JSON.stringify(input.confirmer), t.createdAt));
     }
+    if (creationKey) await this.kvSet(creationKey, t.id);
     return t;
   
     });
@@ -3549,6 +3565,13 @@ export class Store {
   async withPendingReviewInfoAsync(taskId: string, view: TaskView): Promise<TaskView> {
     const raw = await this.kvGetAsync(`pending-review:${taskId}`);
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
+  }
+
+  /** Poll task liveness without loading its conversation or subscriber graph. */
+  async taskExecutionState(id: string): Promise<{ status?: string; agentTurn: boolean } | undefined> {
+    const row = await this.db.prepare(`SELECT json_extract(lastView, '$.status') AS status,
+      json_extract(lastView, '$.agentTurn') IS NOT NULL AS agentTurn FROM tasks WHERE id = ?`).get(id) as any;
+    return row ? { status: row.status ?? undefined, agentTurn: Boolean(row.agentTurn) } : undefined;
   }
 
   async getTask(id: string): Promise<TaskRecord | undefined> {
@@ -5068,7 +5091,7 @@ export class Store {
       (await prefix.run(sharePrefix, sharePrefix));
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
   
@@ -6377,7 +6400,7 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number }): Promise<{ reused: boolean }> {
+    reservedCostMicros?: number; now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
@@ -6407,12 +6430,25 @@ export class Store {
     }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
+      for (const priorId of input.retryOf ? [input.retryOf].flat() : []) {
+        const previous = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(priorId)) as any;
+        if (previous) {
+          if (previous.organizationId !== input.organizationId || previous.projectId !== input.projectId
+            || previous.taskId !== input.taskId || previous.provider !== input.provider)
+            throw new Error('usage admission retry key belongs to different attributed work');
+          if (previous.state === 'completed')
+            throw new Error('this model turn was already completed; refusing duplicate provider admission');
+          await this.db.prepare("UPDATE usage_admissions SET state='released', releasedAt=? WHERE id=? AND state='active'")
+            .run(now, priorId);
+        }
+      }
       const assertManagedCapacity = async () => {
         if (input.fundingSource !== 'managed') return;
         const month = monthWindow(now);
         const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
         const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
-          WHERE organizationId=? AND fundingSource='managed' AND state='active'`).get(input.organizationId)) as any).n);
+          WHERE organizationId=? AND fundingSource='managed' AND state='active'
+            AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`).get(input.organizationId)) as any).n);
         if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
           throw new Error('organization managed spend cap is exhausted');
       };
@@ -6461,14 +6497,24 @@ export class Store {
     });
   }
 
-  async finishUsageAdmission(id: string, completed: boolean, now = Date.now(),
+  /** Undefined completion checkpoints an in-flight cost estimate without releasing
+   * concurrency. Replace only estimates, so repeated finalization is idempotent. */
+  async finishUsageAdmission(id: string, completed: boolean | undefined, now = Date.now(),
     events: Array<Omit<UsageEvent, 'id'> & { id?: string }> = []): Promise<void> {
     return this.db.transaction(async () => {
 
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      for (const event of events) (await this.recordUsage(event));
-      (await this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
+      for (const event of events) {
+        await this.recordUsage(event);
+        if (event.id === `usage:cost:${id}` && event.kind === 'agent.cost') {
+          await this.db.prepare(`UPDATE usage_events SET costMicros=?, costClassification=?, metadata=?
+            WHERE id=? AND organizationId=? AND kind='agent.cost' AND costClassification='estimated'`)
+            .run(event.costMicros, event.costClassification ?? 'estimated', JSON.stringify(event.metadata ?? {}),
+              event.id, event.organizationId);
+        }
+      }
+      if (completed !== undefined) (await this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
         .run(completed ? 'completed' : 'released', now, id));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -6531,7 +6577,8 @@ export class Store {
       executions: Number(((await this.db.prepare(`SELECT COUNT(*) n FROM executions WHERE organizationId=?${scope} AND state IN ('starting','running','stop-requested')`).get(...args)) as any).n),
     };
     const activeReservationsMicros = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n
-      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'`)
+      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'
+        AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`)
       .get(...args)) as any).n);
     return { costMicros, incurredCostMicros: byCostClassification.incurred ?? 0,
       estimatedCostMicros: byCostClassification.estimated ?? 0, activeReservationsMicros,
@@ -7438,6 +7485,14 @@ export class Store {
       : await this.db.prepare('SELECT k, v FROM kv ORDER BY k').all();
     return (rows as any[]).filter((row) => String(row.k).startsWith(prefix))
       .map((row) => ({ key: String(row.k), value: String(row.v) }));
+  }
+
+  async clearTurnCheckpoints(taskId: string, runId?: string): Promise<void> {
+    await this.db.transaction(async () => {
+      const remove = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
+      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
+        ...(runId ? [`turnsession:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
+    });
   }
 
   async kvDelete(k: string): Promise<void> {

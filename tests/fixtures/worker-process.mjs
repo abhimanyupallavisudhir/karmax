@@ -4,6 +4,7 @@ const mode = process.env.WORKER_FIXTURE_MODE;
 serveWorkerProcess(async () => ({
   worker: {
     async start() {
+      if (mode === 'rejected-callback') setTimeout(() => { void Promise.reject(new Error('callback write failed')); }, 10);
       if (mode === 'frozen') while (true) { /* deliberate CPU stall */ }
       if (mode === 'frozen-idle') setTimeout(() => { while (true) { /* deliberate CPU stall */ } }, 50);
     },

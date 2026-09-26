@@ -10,6 +10,7 @@ it('replays pre-patch publications and schedules separate compact maintenance in
   const native = await NativeConnection.connect({ address: server.address });
   const { client, close } = await makeClient(conn);
   const currentPath = fileURLToPath(new URL('./fixtures/lifecycle-current.ts', import.meta.url));
+  const separatePath = fileURLToPath(new URL('./fixtures/lifecycle-separate.ts', import.meta.url));
   const legacyPath = fileURLToPath(new URL('./fixtures/lifecycle-legacy.ts', import.meta.url));
   const view = { taskId: 'fixture', title: 'Fixture', workflow: 'just-do', stage: 'do', status: 'waiting',
     world: { id: 'fixture', kind: 'memory', root: '/tmp', branch: 'task', base: 'main' }, state: {},
@@ -18,14 +19,14 @@ it('replays pre-patch publications and schedules separate compact maintenance in
   const publications: unknown[][] = [], maintenance: unknown[][] = [];
   try {
     const currentBundle = await bundleWorkflowCode({ workflowsPath: currentPath });
-    for (const version of ['legacy', 'current']) {
+    for (const version of ['legacy', 'separate', 'current']) {
       const taskQueue = `lifecycle-${version}`;
       const worker = await Worker.create({ connection: native, namespace: server.namespace, taskQueue,
-        ...(version === 'legacy' ? { workflowsPath: legacyPath } : { workflowBundle: currentBundle }),
+        ...(version !== 'current' ? { workflowsPath: version === 'legacy' ? legacyPath : separatePath } : { workflowBundle: currentBundle }),
         maxCachedWorkflows: 2, maxConcurrentWorkflowTaskExecutions: 2, maxConcurrentActivityTaskExecutions: 2,
         reuseV8Context: true,
         activities: {
-          publishView: async (...args: unknown[]) => { publications.push(args); return version === 'current' ? 'fence' : undefined; },
+          publishView: async (...args: unknown[]) => { publications.push(args); return version !== 'legacy' ? 'fence' : undefined; },
           parkWaitingWorld: async (...args: unknown[]) => { maintenance.push(args); },
           recordEvent: async () => {},
         },
@@ -34,15 +35,15 @@ it('replays pre-patch publications and schedules separate compact maintenance in
       try {
         for (const reference of [undefined, 'run:1']) {
           const handle = await client.workflow.start('lifecycleReplay', { workflowId: `${version}-${reference ?? 'full'}`,
-            taskQueue, args: [view, reference] });
+            taskQueue, args: [version === 'separate' ? { ...view, waitingFor: { kind: 'subagent' } } : view, reference] });
           await handle.result();
           const history = await handle.fetchHistory();
           await Worker.runReplayHistory({ workflowBundle: currentBundle }, history);
         }
       } finally { worker.shutdown(); await run; }
     }
-    expect(publications.map(args => args.length)).toEqual([2, 3, 4, 4]);
-    expect(maintenance).toHaveLength(2);
+    expect(publications.map(args => args.length)).toEqual([2, 3, 4, 4, 4, 4]);
+    expect(maintenance).toHaveLength(4);
     for (const args of maintenance) {
       expect(args[0]).toBe('fixture');
       expect(args[2]).toBe('fence');

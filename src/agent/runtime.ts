@@ -1,5 +1,5 @@
 import { currentTiming } from '../timing/index.js';
-import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
+import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 
@@ -8,7 +8,7 @@ const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
 export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
   /** Stream incremental output to the task's live event log. */
-  onEmit?: (text: string, source?: 'assistant' | 'tool') => void;
+  onEmit?: (text: string, source?: 'assistant' | 'tool') => void | Promise<void>;
   /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
   onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
@@ -26,13 +26,16 @@ export interface RunTurnDeps {
     }>;
   };
   spendCtx?: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] };
-  onSpend?: (req: any, outcome: any) => void;
+  onSpend?: (req: any, outcome: any) => void | Promise<void>;
   /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
   signal?: AbortSignal;
   heartbeat?: () => void;
   /** Publish the provider session id the moment it's known (mid-turn), for the live
    *  "fork this agent" command in the drawer (RESOLVE-PLAN #3). */
-  onSession?: (session: string) => void;
+  onSession?: (session: string) => void | Promise<void>;
+  /** Preserve billable provider usage before cancellation or observer delivery can fail. */
+  onProviderResult?: (turn: AdapterTurn) => void;
+  onProviderStart?: () => Promise<void>;
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
@@ -121,6 +124,24 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   if (liveSecretEnv) input = { ...input, secretEnv: liveSecretEnv };
   const secretEnvListeners = new Set<() => void | Promise<void>>();
 
+  // SDK event handlers may ignore returned promises. Catch at the boundary and
+  // drain before finishing, so persistence failures belong to this turn rather
+  // than becoming unhandled rejections in the shared worker.
+  const observers = new Set<Promise<void>>();
+  let observerFailed = false;
+  let observerError: unknown;
+  const observe = (callback: () => void | Promise<void>): Promise<void> => {
+    const pending = (async () => { await callback(); })().catch(error => {
+      if (!observerFailed) { observerFailed = true; observerError = error; }
+    });
+    observers.add(pending);
+    void pending.then(() => observers.delete(pending));
+    return pending;
+  };
+  const drainObservers = async () => {
+    while (observers.size) await Promise.all(observers);
+  };
+
   const ctx: PlatformToolContext = {
     openPr() {
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
@@ -194,7 +215,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     async requestSpend(args) {
       if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
       const outcome = await deps.budget.request(deps.spendCtx, args);
-      deps.onSpend?.(args, outcome);
+      await deps.onSpend?.(args, outcome);
       // surface a pending spend at the Review gate so the human can fund/approve
       if (outcome.status !== 'granted') {
         const note =
@@ -223,13 +244,12 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       return deps.platformRequest(method, path, body);
     },
     fillPaymentCard: deps.fillPaymentCard,
-    async emit(text, source) {
+    emit(text, source) { return observe(async () => {
       const output = text.trim() ? outputObserved() : undefined;
       const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
-      deps.onEmit?.(text, source);
-      await Promise.all([output, firstText]);
-    },
-    async emitActivity(activity) {
+      await Promise.all([deps.onEmit?.(text, source), output, firstText]);
+    }); },
+    emitActivity(activity) { return observe(async () => {
       const output = outputObserved();
       const firstText = activity.kind === 'message' && activity.title?.trim() ? trace?.markOnce('first.text') : undefined;
       await Promise.all([deps.onActivity?.(activity), output, firstText]);
@@ -241,9 +261,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
           observedTools.delete(activity.id);
         }
       }
-
-    },
-    onSession: deps.onSession,
+    }); },
+    onSession: deps.onSession ? session => observe(() => deps.onSession!(session)) : undefined,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
     ...(liveSecretEnv ? { onSecretEnvChange(listener: () => void | Promise<void>) {
@@ -271,10 +290,15 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       }, 1_000)
     : undefined;
   const secretPoll = liveSecretEnv ? pollSecretEnv(liveSecretEnv, deps.pullSecretEnv!, secretEnvListeners) : undefined;
-  let turn;
-  deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' });
+  let turn: AdapterTurn;
   try {
+    await observe(() => deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' }));
+    if (observerFailed) throw observerError;
+    await deps.onProviderStart?.();
     turn = await adapter.runTurn(input, ctx);
+    deps.onProviderResult?.(turn);
+    await drainObservers();
+    if (observerFailed) throw observerError;
     // An adapter may deliberately swallow its provider's AbortError so it can clean
     // up and return partial output (Claude SDK, Codex app-server/CLI). That partial
     // result is NOT a completed turn when the enclosing activity was cancelled. In
@@ -293,25 +317,27 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       throw new Error('agent provider ended without a verified successful terminal event');
     }
     (await trace?.mark('provider.completed', turn.usage));
-    deps.onActivity?.({
+    await observe(() => deps.onActivity?.({
       id: 'turn',
       kind: 'turn',
       phase: 'completed',
       title: 'Agent finished',
       ...(turn.termination.reason ? { detail: turn.termination.reason } : {}),
-    });
+    }));
+    if (observerFailed) throw observerError;
   } catch (error) {
-    deps.onActivity?.({
+    await observe(() => deps.onActivity?.({
       id: 'turn',
       kind: 'turn',
       phase: 'failed',
       title: 'Agent turn failed',
       detail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200),
-    });
+    }));
     throw error;
   } finally {
     if (hb) clearInterval(hb);
     secretPoll?.();
+    await drainObservers();
   }
 
   return {

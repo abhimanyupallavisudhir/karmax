@@ -233,13 +233,20 @@ function recordedBaseViolation(repo: WorldRepo): string {
  */
 export async function brokerPublishBranch(
   world: World, auth: GitBrokerAuth, expectedRemoteHeads: Record<string, string> = {},
-  onPublished?: OriginPublicationRecorder,
+  onPublished?: OriginPublicationRecorder, options: { omitUnchangedBase?: boolean } = {},
 ): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
   for (const repo of worldRepos(world.handle)) {
     try {
+      // Idle capture can restore the provisioned commit from the base without
+      // creating a task ref. Explicit publication still transports every branch.
+      if (options.omitUnchangedBase && repo.baseSha && !expectedRemoteHeads[repo.name]) {
+        const tip = await world.exec('git', ['rev-parse', '--verify', `refs/heads/${repo.branch}`], { cwd: repo.root });
+        if (tip.code !== 0) throw new Error(`could not resolve task branch ${repo.branch}: ${tip.stderr || tip.stdout}`);
+        if (tip.stdout.trim() === repo.baseSha) continue;
+      }
       // Worktree-backed worlds already share refs with their source repository.
       // Trying to bundle/fetch the live branch back into that same repository
       // either mistakes its local path for an SSH remote or hits Git's

@@ -32,3 +32,9 @@ export function lifecyclePublication(view: PublishedView): LifecyclePublication 
     waitingFor: view.waitingFor, updatedAt: view.updatedAt,
     state: { recoveryWorld: view.state?.recoveryWorld } };
 }
+
+/** These waits still own live work or are about to enter a turn. */
+export function hasLiveWorldWork(view: Pick<TaskView, 'waitingFor'>): boolean {
+  return view.waitingFor?.kind === 'agentSlot' || view.waitingFor?.kind === 'subagent'
+    || view.waitingFor?.kind === 'shell';
+}
