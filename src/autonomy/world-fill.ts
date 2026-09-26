@@ -30,6 +30,14 @@ export async function fillInWorld(world: World, args: {
   await world.writeFile(HELPER_REL, HELPER_SOURCE);
   // writeFile is root-relative but exec defaults to the workdir, which a
   // single-repo world nests below the root — run from where the helper lives.
+  const preflight = await world.exec('node', [HELPER_REL, args.selector, args.expectDomains.join(','), args.cdpUrl, '--check'], {
+    cwd: world.handle.root, input: '', timeoutMs: args.timeoutMs ?? 30_000,
+  });
+  if (preflight.code !== 0) {
+    let error = 'remote credential target validation failed';
+    try { error = JSON.parse(preflight.stdout).error || error; } catch {}
+    throw new Error(error);
+  }
   const res = await world.exec('node', [HELPER_REL, args.selector, (args.expectDomains ?? []).join(','), args.cdpUrl], {
     cwd: world.handle.root,
     input: (await args.resolveText()),

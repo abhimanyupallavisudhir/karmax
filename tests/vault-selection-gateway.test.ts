@@ -33,7 +33,8 @@ describe('credential selection ranking through HTTP', () => {
       for (let i = 0; i < 3; i++) await store.createTask({ projectId: project.id, title: 'Granted task', workflow: 'software-dev', workflowVersion: '1',
         params: { prompt: '', _authorization: { capabilities: [`use-credential:item:${frequent.id}`] } } });
       for (let i = 0; i < 5; i++) await vault.resolveField(accessed, 'password', { mode: 'use' });
-      const gateway = await Gateway.create({ store, broker, bus: new KarmaxBus(), tokens: new TokenAuthority(),
+      const tokens = new TokenAuthority();
+      const gateway = await Gateway.create({ store, broker, bus: new KarmaxBus(), tokens,
         contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any, api: {} as any,
         taskQueue: 'test', staticDir: home, agentInfo: { provider: 'mock', reason: 'selection test' }, worlds: new WorldRegistry(),
       } as any);
@@ -57,6 +58,27 @@ describe('credential selection ranking through HTTP', () => {
         expect(fill.status).toBe(400);
         expect((await fill.json() as any).error).toMatch(/login fields|domains/);
       }
+
+      const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: {} });
+      const login = await vault.save({ type: 'login', label: 'Once', domains: ['example.com'], username: 'alice', policy: { use: 'ask', reveal: 'ask' }, secrets: { password: 'pw' } });
+      const grant = await vault.request({ taskId: task.id, caps: [], itemId: login.id, mode: 'use', why: 'login' });
+      await vault.resolve(grant.requestId!, { action: 'once', by: 'user:test' });
+      const agent = await tokens.mint({ taskId: task.id, projectId: project.id, organizationId: 'org_personal', principal: 'task:test', profileId: 'test', ceiling: ['*'], grantorCaps: ['*'] });
+      (gateway as any).fillCredential = async (_taskId: string, args: any) => {
+        if (args.selector === '#missing') throw new Error('missing selector');
+        await args.resolveText();
+        return 'https://example.com';
+      };
+      const fill = (field: string, selector: string) => fetch(`${running.url}/api/vault/fill`, {
+        method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ itemId: login.id, field, selector }),
+      });
+      expect((await fill('username', '#user')).status).toBe(200);
+      expect((await vault.access([], task.id, login, 'use')).status).toBe('granted');
+      expect((await fill('password', '#missing')).status).toBe(400);
+      expect((await vault.access([], task.id, login, 'use')).status).toBe('granted');
+      expect((await fill('password', '#pw')).status).toBe(200);
+      expect((await vault.access([], task.id, login, 'use')).status).toBe('needs_approval');
 
     } finally {
       await close?.();

@@ -6353,11 +6353,11 @@ export class Gateway {
           const b = await this.body(req);
           const item = (await findItem(b));
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const field = (b.field as any) ?? defaultField(item.type);
+          if (!ITEM_FIELDS[item.type].includes(field) || !item.fields.includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           const decision = (await vault.access(caps, callerTaskId, item, 'reveal', { consume: true }));
           if (decision.status !== 'granted')
             return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'reveal', why: b.why })));
-          const field = (b.field as any) ?? defaultField(item.type);
-          if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           const value = field === 'totp'
             ? (await vault.totp(item, { taskId: callerTaskId, principal }))
             : (await vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' }));
@@ -6376,16 +6376,19 @@ export class Gateway {
           if (item.type !== 'login' || !['username', 'password', 'totp'].includes(field))
             return this.json(res, 400, { error: 'browser fill supports only login fields: username, password, totp' });
           if (!item.domains?.length) return this.json(res, 400, { error: 'browser fill requires credential domains' });
-          const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
+          const decision = (await vault.access(caps, callerTaskId, item, 'use'));
           if (decision.status !== 'granted')
             return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           if (field !== 'username' && !item.fields.includes(field as any)) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
-          const resolveText = async () => field === 'username'
-            ? item.username!
-            : field === 'totp'
-              ? (await vault.totp(item, { taskId: callerTaskId, principal }))
-              : (await vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' }));
+          const resolveText = async () => {
+            if (field === 'username') return item.username!;
+            const granted = await vault.access(caps, callerTaskId, item, 'use', { consume: true });
+            if (granted.status !== 'granted') throw new Error('credential approval is no longer available');
+            return field === 'totp'
+              ? await vault.totp(item, { taskId: callerTaskId, principal })
+              : await vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
+          };
           try {
             const origin = await this.fillCredential(callerTaskId, {
               selector: String(b.selector ?? ''), cdpUrl: b.cdpUrl, expectDomains: item.domains, resolveText,

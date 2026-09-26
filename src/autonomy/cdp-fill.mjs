@@ -156,8 +156,9 @@ const connect = wsClient;
 
 async function main() {
   if (!expectDomains.length) fail('browser fill requires credential domains');
+  const checkOnly = process.argv[5] === '--check';
   const secret = await readStdin();
-  if (!secret) fail('no secret on stdin');
+  if (!checkOnly && !secret) fail('no secret on stdin');
   const base = assertLoopback(cdpUrl);
   const list = await (await fetch(new URL('/json/list', base), { signal: AbortSignal.timeout(TIMEOUT) })).json();
   if (process.env.KARMAX_CDP_DEBUG)
@@ -181,8 +182,10 @@ async function main() {
         fail(`refusing: the page origin (${origin || 'unknown'}) does not match the expected domains (${expectDomains.join(', ')})`);
     }
     if (selector === '@tab') {
+      if (!checkOnly) {
       await session.call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab' });
       await session.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab' });
+      }
     } else if (selector !== '@focused') {
       const focus = await session.call('Runtime.evaluate', {
         expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.focus(); return true; })()`,
@@ -190,7 +193,7 @@ async function main() {
       });
       if (focus?.result?.value !== true) fail(`no element matches selector ${selector}`);
     }
-    await session.call('Input.insertText', { text: secret });
+    if (!checkOnly) await session.call('Input.insertText', { text: secret });
     process.stdout.write(JSON.stringify({ origin }));
   } finally {
     session.close();
