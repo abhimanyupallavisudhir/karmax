@@ -1,3 +1,4 @@
+import { readCheckpointFiles } from './checkpoint-read.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
@@ -139,6 +140,7 @@ export class WorldCheckpointService {
     if (files.length > 100_000) throw new Error('checkpoint file count limit exceeded');
     const paths = files.flatMap(file => file.readPath === undefined ? [] : [file.readPath]);
     let expectedBytes = 0;
+    const fileSizes = new Map<string, number>();
     for (let offset = 0; offset < paths.length; offset += 128) {
       const batch = paths.slice(offset, offset + 128);
       const stat = await world.exec('stat', ['-c', '%s', '--', ...batch], { cwd: world.handle.root });
@@ -146,18 +148,18 @@ export class WorldCheckpointService {
       if (stat.code !== 0 || sizes.length !== batch.length || sizes.some(size => !Number.isSafeInteger(size) || size < 0))
         throw new Error('could not size checkpoint files');
       if (sizes.some(size => size > MAX_CHECKPOINT_FILE_BYTES)) throw new Error('checkpoint file limit exceeded');
+      batch.forEach((file, index) => fileSizes.set(file, sizes[index]!));
       expectedBytes += sizes.reduce((sum, size) => sum + size, 0);
       if (expectedBytes > MAX_CHECKPOINT_BYTES) throw new Error('checkpoint total size limit exceeded');
     }
+    const metadataBytes = files.reduce((sum, file) => sum + Buffer.byteLength(JSON.stringify(file)), 0);
+    if (metadataBytes + Math.ceil(expectedBytes / 3) * 4 + files.length * 8 > MAX_CHECKPOINT_JSON_BYTES)
+      throw new Error('checkpoint JSON size limit exceeded');
     async function* contents(): AsyncGenerator<CheckpointFile> {
-      let total = 0;
-      for (const { readPath, ...file } of files) {
-        await options.checkContinue?.();
-        if (readPath === undefined) { yield file; continue; }
-        const data = await world.readFileBuffer(readPath);
-        if (data.length > MAX_CHECKPOINT_FILE_BYTES) throw new Error(`checkpoint file limit exceeded: ${readPath}`);
-        total += data.length;
-        if (total > MAX_CHECKPOINT_BYTES) throw new Error('checkpoint total size limit exceeded');
+      for (const { readPath, ...file } of files) if (readPath === undefined) yield file;
+      const byPath = new Map(files.flatMap(file => file.readPath === undefined ? [] : [[file.readPath, file] as const]));
+      for await (const { path, data } of readCheckpointFiles(world, fileSizes, options.checkContinue)) {
+        const { readPath, ...file } = byPath.get(path)!;
         yield { ...file, data };
       }
     }

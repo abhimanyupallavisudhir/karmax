@@ -537,3 +537,25 @@ it('retires obsolete checkpoints while keeping current recovery and fork pins (W
     }
   } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('captures small dirty files in one bounded sandbox read (WD-19, LT-11)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-batch-'));
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const project = await store.createProject('Batch');
+  const task = await store.createTask({ projectId: project.id, title: 'Batch', workflow: 'software-dev', workflowVersion: '1.0.0', params: {} });
+  const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  vi.spyOn(worlds, 'open').mockResolvedValue(world);
+  const reads = vi.spyOn(world, 'readFileBuffer');
+  const exec = vi.spyOn(world, 'exec');
+  const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    for (let i = 0; i < 20; i++) await world.writeFile(`file-${i}`, `value ${i}`);
+    const checkpoint = await service.checkpoint(world.handle);
+    expect(checkpoint.filesystemDelta?.bytes).toBeGreaterThan(0);
+    expect(reads).not.toHaveBeenCalled();
+    expect(exec.mock.calls.filter(([command]) => command === 'node')).toHaveLength(1);
+  } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
