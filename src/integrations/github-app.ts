@@ -851,7 +851,6 @@ export class GitHubAppService {
     };
   }
 
-  /** Human-readable recovery for Git's remote-rejection message. */
   private permissionSnapshot<T>(pathname: string, forceRefresh = false): Promise<T> {
     const cached = this.permissionSnapshots.get(pathname);
     if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.value as Promise<T>;
@@ -864,6 +863,7 @@ export class GitHubAppService {
     return value;
   }
 
+  /** Human-readable recovery for Git's remote-rejection message. */
   async workflowPermissionGuidance(repository: Repository): Promise<string> {
     const connection = repository.gitConnectionId
       ? (await this.store.getGitConnection(repository.gitConnectionId))
@@ -1185,15 +1185,15 @@ export class GitHubAppService {
     if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
     const inFlight = this.tokenMints.get(cacheKey);
     if (inFlight) return inFlight;
-    const mint = (async () => {
-      const created = await this.appRequest<{ token: string; expires_at: string }>(
-        `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`, { method: 'POST', ...(ids ? { body: JSON.stringify({ repository_ids: ids }) } : {}) },
-      );
+    const mint = this.appRequest<{ token: string; expires_at: string }>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`,
+      { method: 'POST', ...(ids ? { body: JSON.stringify({ repository_ids: ids }) } : {}) },
+    ).then((created) => {
       const parsed = Date.parse(created.expires_at ?? '');
       const expiresAt = Number.isFinite(parsed) ? parsed : Date.now() + 3600_000;
       if (this.tokenMints.get(cacheKey) === mint) this.tokenCache.set(cacheKey, { token: created.token, expiresAt });
       return created.token;
-    })().finally(() => { if (this.tokenMints.get(cacheKey) === mint) this.tokenMints.delete(cacheKey); });
+    }).finally(() => { if (this.tokenMints.get(cacheKey) === mint) this.tokenMints.delete(cacheKey); });
     this.tokenMints.set(cacheKey, mint);
     return mint;
   }
