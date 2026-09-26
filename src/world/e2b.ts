@@ -489,8 +489,10 @@ class E2BWorld implements World {
     const exits = new Set<(code: number | null) => void>();
     const pending: string[] = [];
     let attached = false;
-    const emit = (data: unknown) => {
-      const chunk = sdkText(data);
+    const stdoutDecoder = new TextDecoder();
+    const stderrDecoder = new TextDecoder();
+    const emit = (data: unknown, decoder: TextDecoder) => {
+      const chunk = sdkText(data, decoder);
       if (!attached) pending.push(chunk);
       for (const listener of outputs) listener(chunk);
     };
@@ -504,8 +506,8 @@ class E2BWorld implements World {
       // with a spurious exit; 0 disables that bound, as openPty already does.
       // (keepAlive() below refreshes the *sandbox* lease, not this timeout.)
       timeoutMs: 0,
-      onStdout: emit,
-      onStderr: emit,
+      onStdout: (data: unknown) => emit(data, stdoutDecoder),
+      onStderr: (data: unknown) => emit(data, stderrDecoder),
     });
     let exited = false;
     let exitCode: number | null = null;
@@ -553,8 +555,9 @@ class E2BWorld implements World {
     let exitCode: number | null = null;
     let termination: WorldPtyTermination | undefined;
     let closed = false;
+    const decoder = new TextDecoder();
     const onData = (data: unknown) => {
-      const chunk = sdkText(data);
+      const chunk = sdkText(data, decoder);
       if (!attached) pending.push(chunk);
       for (const listener of outputs) listener(chunk);
     };
@@ -873,10 +876,10 @@ function toBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
   return value instanceof Uint8Array ? value : new Uint8Array(value);
 }
 
-function sdkText(value: unknown): string {
+function sdkText(value: unknown, decoder: TextDecoder): string {
   if (typeof value === 'string') return value;
-  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
-  if (value && typeof value === 'object' && 'data' in value) return sdkText((value as { data: unknown }).data);
+  if (value instanceof Uint8Array) return decoder.decode(value, { stream: true });
+  if (value && typeof value === 'object' && 'data' in value) return sdkText((value as { data: unknown }).data, decoder);
   return String(value ?? '');
 }
 
