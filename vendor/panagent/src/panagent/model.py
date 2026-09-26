@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
+from pathlib import Path
 
 from .errors import FormatError
 
@@ -33,7 +34,7 @@ def new_conversation(
         "acquired_at": utc_now(),
     }
     if source_uri:
-        source["uri"] = source_uri
+        source["uri"] = Path(source_uri).name if source_uri.startswith(("/", "file://")) else source_uri
     if conversation_id:
         source["conversation_id"] = conversation_id
     return {
