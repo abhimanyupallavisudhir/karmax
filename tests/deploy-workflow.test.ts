@@ -79,6 +79,7 @@ describe('post-push deployment to the public instance', () => {
     expect(script).toContain('deploy/.updates/');
     expect(script).toContain('status');
     expect(script).toContain('sleep 10');
+    expect(script).toContain('after $attempt polls');
   });
 
   it('accepts only a successful push from this repository and checks ancestry before executing candidate code', () => {

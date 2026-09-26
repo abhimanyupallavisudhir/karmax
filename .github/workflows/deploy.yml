@@ -89,5 +89,5 @@ jobs:
               *) echo "invalid deployment status: $state" >&2; exit 1 ;;
             esac
           done
-          echo 'deployment is still running on the host; inspect its durable log and status' >&2
+          echo "deployment is still running after $attempt polls; inspect its durable log and status" >&2
           exit 1
