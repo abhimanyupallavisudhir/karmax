@@ -3609,6 +3609,9 @@ function renderOnboarding() {
   if (!host) return;
   const state = S.onboarding;
   const completion = S.onboardingCompletion;
+  const renderKey = JSON.stringify([state, completion, S.organizationId, S.user?.id]);
+  if (host.onboardingRenderKey === renderKey) { pollOnboarding(); return; }
+  host.onboardingRenderKey = renderKey;
   if (state?.complete && completion?.organizationId === S.organizationId
     && completion.userId === S.user?.id && S.meta?.hosted) {
     clearTimeout(S.onboardingTimer);

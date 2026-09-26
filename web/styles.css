@@ -1107,6 +1107,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 
 /* Hosted personal-workspace onboarding. Progress comes from the gateway; this
    floating surface only guides the user to the existing first-party controls. */
+body:has(#tf-page, .ck-compose) .hosted-onboarding { display: none; }
 .hosted-onboarding { position: fixed; z-index: 60; right: 22px; bottom: 20px; width: min(390px, calc(100vw - 28px)); }
 .onboarding-card {
   max-height: min(720px, calc(100vh - 82px)); overflow-y: auto;
