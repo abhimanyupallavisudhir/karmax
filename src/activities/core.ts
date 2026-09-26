@@ -1,3 +1,4 @@
+import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
@@ -2783,8 +2784,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       if (!repos.length) {
-        const changedFiles = (await world.listFiles()).map((file) => `${file} (new)`);
-        const summary = changedFiles.length ? `${changedFiles.length} file(s) in the task workspace.` : 'No file changes detected.';
+        const files = (await world.listFiles()).map((file) => `${file} (new)`);
+        const { changedFiles, truncated } = reviewFiles(files);
+        const summary = files.length ? `${files.length} file(s) in the task workspace.${truncated ? ' File list truncated; inspect the workspace for the full list.' : ''}` : 'No file changes detected.';
         (await record(handle.id, 'review.built', { files: changedFiles.length }));
         return { summary, changedFiles };
       }
@@ -2817,9 +2819,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
         );
       }
-      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
+      const bounded = reviewFiles(changedFiles);
+      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.${bounded.truncated ? ' File list truncated; inspect the checkouts for the full list.' : ''}` : 'No file changes detected.';
       (await record(handle.id, 'review.built', { files: changedFiles.length }));
-      return { summary, changedFiles };
+      return { summary, changedFiles: bounded.changedFiles };
     },
 
     /** Readiness check for the explicit Open PR transition. The Do agent owns
@@ -2896,7 +2899,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(args.worldHandle, args.taskId);
       (await record(args.taskId, 'script.start', { command: args.command }));
       const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
-      const output = `${r.stdout}${r.stderr}`;
+      const output = scriptOutput(`${r.stdout}${r.stderr}`);
       (await record(args.taskId, 'script.done', { code: r.code, output: output.slice(0, 4000) }));
       return { code: r.code, output };
     },
