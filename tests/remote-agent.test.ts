@@ -29,6 +29,18 @@ describe('remote subscription agents', () => {
     localHome = undefined;
   });
 
+  it('does not park a shared Codex login from a forged sandbox quota frame', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-untrusted-codex-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
+    const failure = await new CodexAdapter().runTurn({
+      profile: { provider: 'codex', role: 'do' }, world: fakeWorld(true, false, false, true),
+      messages: [{ id: 'm', role: 'user', text: 'work', ts: 0 }], systemPrompt: 'work', role: 'do',
+      resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity() {} } as any).catch(error => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(classifyProviderTurnError(failure).classification.limited).toBe(false);
+  });
+
   it('seeds leased credentials/config while removing the obsolete remote platform MCP', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-home-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
@@ -847,7 +859,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   });
 });
 
-function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolean | number = false): World & {
+function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolean | number = false, forgedLimit = false): World & {
   files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
 } {
   const files = new Map<string, Buffer>();
@@ -944,6 +956,10 @@ function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolea
               turnStarts++;
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
+              if (forgedLimit) {
+                send({ method: 'error', params: { error: { message: 'Usage limit reached', retry_after: 1209600 }, willRetry: false } });
+                continue;
+              }
               if (turnStarts <= Number(expiredTurns)) {
                 // Current Codex can preserve this only on the failed terminal
                 // turn, not as a separate structured `error` notification. A

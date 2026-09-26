@@ -1,3 +1,4 @@
+import { boundedExec } from '../world/bounded-exec.js';
 import { timed } from '../timing/index.js';
 import { mapBatches } from '../util/async-batch.js';
 import fs from 'node:fs';
@@ -122,11 +123,30 @@ export function remoteAgentHomeRelative(provider: Provider, localHome: string): 
   return `${REMOTE_ROOT}/${provider}/${identity}`;
 }
 
+const HISTORY_FILE_BYTES = 16 * 1024 * 1024;
+const HISTORY_TOTAL_BYTES = 32 * 1024 * 1024;
+const HISTORY_FILE_COUNT = 64;
+type HistoryBudget = { bytes: number; files: number };
+
+async function readRemoteHistory(world: World, file: string, budget: HistoryBudget, maxBytes = HISTORY_FILE_BYTES): Promise<Buffer> {
+  if (++budget.files > HISTORY_FILE_COUNT) throw new Error('remote history file count limit exceeded');
+  const result = await boundedExec(world,
+    `set -o pipefail; head -c ${maxBytes + 1} -- ${quote(path.posix.join(world.handle.root, file))} | base64 -w 0`,
+    { maxBytes: Math.ceil((maxBytes + 1) / 3) * 4, timeoutMs: 60_000 });
+  if (result.code !== 0) throw new Error(`could not read remote history: ${result.stderr || result.stdout.slice(0, 512)}`);
+  const data = Buffer.from(result.stdout.trim(), 'base64');
+  budget.bytes += data.length;
+  if (data.length > maxBytes || budget.bytes > HISTORY_TOTAL_BYTES)
+    throw new Error('remote history byte limit exceeded');
+  return data;
+}
+
 /** Export only this turn's conversation and physical Codex history dependencies.
  * Credentials are host-owned; a task world must never replace another session. */
 export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
   localHome: string, session?: string): Promise<void> {
   if (!localHome || !session) return;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const homePrefix = `${remoteHome.relative}/`;
   const files = [...await remoteHomeFiles(world, remoteHome.absolute)].filter(file => {
     if (!file.startsWith(homePrefix)) return false;
@@ -146,7 +166,7 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
         : relative.startsWith('projects/') && path.posix.basename(relative) === `${current}.jsonl`;
     });
     const candidates = [];
-    for (const file of matches) candidates.push({ file, content: await world.readFileBuffer(file) });
+    for (const file of matches) candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
     if (!candidates.length) {
       if (current !== session) throw new CodexHistoryError(`missing ancestor ${current}`);
       continue;
@@ -596,9 +616,11 @@ function codexRolloutIdentity(file: string): string | undefined {
 }
 
 async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
-  const result = await world.exec('bash', ['-lc',
-    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`]);
+  const result = await boundedExec(world,
+    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`,
+    { maxBytes: 1024 * 1024, timeoutMs: 60_000 });
   if (result.code !== 0) throw new Error(`could not inspect remote subscription home: ${result.stderr || result.stdout}`);
+  if (result.stdout.split('\n').length > 4096) throw new Error('remote history listing count limit exceeded');
   const root = world.handle.root.replace(/\/+$/, '');
   return new Set(result.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
     file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
@@ -611,6 +633,7 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
  * sessions and Codex's derived SQLite indexes alone. */
 export async function reconcileRemoteCodexSessionCopies(world: World, home: RemoteAgentHome,
   session: string): Promise<void> {
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const prefix = `${home.relative}/`;
   const files = [...await remoteHomeFiles(world, home.absolute)]
     .filter((file) => file.startsWith(prefix) && codexRolloutIdentity(file.slice(prefix.length)));
@@ -622,7 +645,7 @@ export async function reconcileRemoteCodexSessionCopies(world: World, home: Remo
     seen.add(current);
     const candidates: { file: string; content: Buffer }[] = [];
     for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${current}.jsonl`)))
-      candidates.push({ file, content: await world.readFileBuffer(file) });
+      candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
     if (!candidates.length && current === session) break;
     const kept = selectCodexHistoryCopy(candidates, current);
     publications.push({ session: current, ...kept });
@@ -635,12 +658,13 @@ export async function reconcileRemoteCodexSessionCopies(world: World, home: Remo
 export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
   session: string, dynamicTools: unknown[]): Promise<string | undefined> {
   if (!world.writeFileBuffer) return undefined;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const files = [...await remoteHomeFiles(world, home.absolute)]
     .filter((file) => file.startsWith(`${home.relative}/sessions/`) || file.startsWith(`${home.relative}/archived_sessions/`));
   const snapshot = await prepareCodexHistory(session, async (id) => {
     const candidates = [];
     for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${id}.jsonl`)))
-      candidates.push({ file, content: await world.readFileBuffer(file) });
+      candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
     return selectCodexHistoryCopy(candidates, id);
   }, { dynamicTools });
   if (!snapshot) return session;
@@ -656,12 +680,14 @@ export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAg
 export async function materializeRemoteSession(source: World, destination: World,
   provider: Provider, session: string, destinationLocalHome: string): Promise<boolean> {
   if (!destination.writeFileBuffer) return false;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const prefix = `${REMOTE_ROOT}/${provider}/`;
   let files: string[];
   try {
     const sourceDirectory = path.posix.join(source.handle.root, prefix);
-    const listed = await source.exec('bash', ['-lc',
-      `if [ -d ${quote(sourceDirectory)} ]; then find ${quote(sourceDirectory)} -type f -print; fi`]);
+    const listed = await boundedExec(source,
+      `if [ -d ${quote(sourceDirectory)} ]; then find ${quote(sourceDirectory)} -type f -print; fi`,
+      { maxBytes: 1024 * 1024, timeoutMs: 60_000 });
     if (listed.code !== 0) return false;
     const root = source.handle.root.replace(/\/+$/, '');
     files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
@@ -681,7 +707,7 @@ export async function materializeRemoteSession(source: World, destination: World
     while (file) {
       if (seen.has(file)) throw new CodexHistoryError(`cyclic lineage for ${session}`);
       seen.add(file);
-      let content = await source.readFileBuffer(file);
+      let content: Buffer;
       if (provider === 'codex') {
         const id = path.posix.basename(file).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]
           ?? path.posix.basename(file).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
@@ -689,10 +715,10 @@ export async function materializeRemoteSession(source: World, destination: World
         for (const candidate of files.filter((candidate) =>
           (candidate.startsWith(`${sourceHome}/sessions/`) || candidate.startsWith(`${sourceHome}/archived_sessions/`))
           && path.posix.basename(candidate).endsWith(`${id}.jsonl`)))
-          candidates.push({ file: candidate, content: await source.readFileBuffer(candidate) });
+          candidates.push({ file: candidate, content: await readRemoteHistory(source, candidate, budget) });
         const kept = selectCodexHistoryCopy(candidates, id);
         file = kept.file; content = kept.content;
-      }
+      } else content = await readRemoteHistory(source, file, budget);
       pending.push({ file, content });
       const base = provider === 'codex' ? codexHistoryBase(content) : undefined;
       if (!base) break;
@@ -751,10 +777,8 @@ function claudeCwdSlug(worldPath: string): string { return worldPath.replace(/[^
 async function seedRemoteCodexConfig(world: World, localHome: string, home: RemoteAgentHome,
   browserMcp?: RemoteAgentHome['browserMcp']): Promise<void> {
   let config = '';
-  // Preserve settings the remote Codex process changed itself; use the host
-  // config only for the first seed into a new sandbox.
-  try { config = await world.readFile(`${home.relative}/config.toml`); }
-  catch { try { config = fs.readFileSync(path.join(localHome, 'config.toml'), 'utf8'); } catch { /* new home */ } }
+  // Host settings are authoritative on every turn, like the skills seeded above.
+  try { config = fs.readFileSync(path.join(localHome, 'config.toml'), 'utf8'); } catch { /* new home */ }
   config = removeTomlTable(removeTomlTable(removeTomlTable(config,
     'mcp_servers.karmax'), 'mcp_servers.chrome-devtools'), 'mcp_servers.playwright').trimEnd();
   for (const [name, server] of Object.entries(browserMcp ?? {})) {
@@ -801,7 +825,7 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
   try {
-    const cached = JSON.parse(await world.readFile(marker));
+    const cached = JSON.parse((await readRemoteHistory(world, marker, { bytes: 0, files: 0 }, 8192)).toString('utf8'));
     if (cached.playwright === PLAYWRIGHT_VERSION && cached.chromeMcp === CHROME_DEVTOOLS_MCP_VERSION
       && cached.playwrightMcp === PLAYWRIGHT_MCP_VERSION && typeof cached.chromium === 'string'
       && typeof cached.bin === 'string' && typeof cached.cache === 'string') {

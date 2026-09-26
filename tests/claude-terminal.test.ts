@@ -266,6 +266,23 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(turn.output).toBe('done');
   });
 
+  it.each(['rate_limit', 'authentication_failed'])('keeps sandbox %s signals task-local', async (code) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-untrusted-claude-'));
+    const world: any = {
+      handle: { version: 2, kind: 'e2b', sealedProviderRef: 'sealed', id: 'remote', root: '/workspace' },
+      async exec() { return { stdout: '', stderr: '', code: 0 }; },
+      async writeFileBuffer() {}, async writeFile() {}, async listFiles() { return []; },
+      async readFile() { throw new Error('missing'); }, async readFileBuffer() { throw new Error('missing'); },
+    };
+    sdkState.messages = [{ type: 'assistant', error: code,
+      message: { content: [{ type: 'text', text: 'usage limit; resets in 1209600s' }] } }];
+    try {
+      const failure = await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx).catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it('selects the remote Claude spawn rail and keeps all platform tools available', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-'));
     fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({

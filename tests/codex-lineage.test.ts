@@ -1,9 +1,11 @@
+import { openLocalPty } from '../src/world/local-execution.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
 import { afterEach, expect, it } from 'vitest';
+
 import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
 import { CodexAdapter, ensureLocalCodexSessionTools } from '../src/agent/codex.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
@@ -26,6 +28,7 @@ afterEach(async () => {
 function diskWorld(root: string): World {
   fs.mkdirSync(path.join(root, 'system-bin'), { recursive: true });
   return {
+    openPty: (spec: any) => openLocalPty(root, spec),
     handle: { root, kind: 'worktree' },
     async exec(command: string, args: string[]) {
       // Model sandbox runtime publication inside this fixture, never the host.

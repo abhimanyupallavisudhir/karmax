@@ -1,4 +1,6 @@
+import { openLocalPty } from '../src/world/local-execution.js';
 import { it, expect } from 'vitest';
+
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +26,7 @@ function diskWorld(root: string): World {
     fs.writeFileSync(dest, content);
   };
   return {
+    openPty: (spec: any) => openLocalPty(root, spec),
     handle: { root },
     readFile: async (file: string) => fs.readFileSync(path.join(root, file), 'utf8'),
     readFileBuffer: async (file: string) => fs.readFileSync(path.join(root, file)),

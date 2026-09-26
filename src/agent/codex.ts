@@ -146,6 +146,17 @@ export class CodexAdapter implements AgentAdapter {
   /** The ChatGPT-subscription rail: the app-server (live, steerable) by default, or
    *  the legacy one-shot `codex exec` when forced via `KARMAX_CODEX_USE_EXEC`. */
   private async runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    try { return await this.runSubscriptionWithRecovery(input, ctx); }
+    catch (error) {
+      // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
+      // account health must come from a host-side provider request or probe.
+      if (isRemoteAgentWorld(input.world) && error instanceof ProviderFailure)
+        throw new Error(error.message, { cause: error });
+      throw error;
+    }
+  }
+
+  private async runSubscriptionWithRecovery(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world)) return this.runCodexExec(input, ctx);
     const remote = isRemoteAgentWorld(input.world);
     const configHome = input.resolvedAuth?.configHome;

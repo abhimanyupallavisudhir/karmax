@@ -249,6 +249,17 @@ export class ClaudeAdapter implements AgentAdapter {
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
   private async runAgentSdk(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    try { return await this.runAgentSdkWithRecovery(input, ctx); }
+    catch (error) {
+      // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
+      // account health must come from a host-side provider request or probe.
+      if (isRemoteAgentWorld(input.world) && error instanceof ProviderFailure)
+        throw new Error(error.message, { cause: error });
+      throw error;
+    }
+  }
+
+  private async runAgentSdkWithRecovery(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     const configHome = input.resolvedAuth?.configHome
       ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
     input = { ...input, resolvedAuth: { ...input.resolvedAuth, configHome } };
