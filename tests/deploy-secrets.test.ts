@@ -182,6 +182,13 @@ describe('turnkey deployment secrets', () => {
     const dockerfile = fs.readFileSync(path.join(deployDir, 'Dockerfile'), 'utf8');
     expect(dockerfile).toMatch(/^USER\s+(?!root)\S+/m);
   });
+
+  it('keeps application code root-owned after switching to the runtime user', () => {
+    const dockerfile = fs.readFileSync(path.join(deployDir, 'Dockerfile'), 'utf8');
+    expect(dockerfile).not.toContain('--chown=karmax:karmax');
+    expect(dockerfile).not.toMatch(/chown[^\n]*\/app/);
+    expect(dockerfile).toContain('USER karmax');
+  });
 });
 
 it('keeps migration copies and backup data out of Git and Docker build contexts', () => {
