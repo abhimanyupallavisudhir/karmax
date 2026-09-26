@@ -47,7 +47,7 @@ export class WorktreeProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     fs.mkdirSync(this.home, { recursive: true });
-    const branch = spec.branch ?? `karmax/${spec.taskId}`;
+    const branch = spec.checkouts?.[0]?.branch ?? spec.branch ?? `karmax/${spec.taskId}`;
     const root = path.join(this.home, spec.taskId);
 
     // Normalize the configured sources: `repos` (multi) wins over `repo` (legacy single).
@@ -86,8 +86,8 @@ export class WorktreeProvider implements WorldProvider {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       const source = spec.repositoryOrigins?.[resolved.source] ?? (resolved.managed ? resolved.source : undefined);
-      repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
-        this.repoSpec(spec, resolved.source), warnings, source, ephemeralPaths,
+      repos.push(await this.addWorktree(resolved.repo, root, spec.checkouts?.[0]?.name ?? repoName(resolved.source), branch,
+        { ...this.repoSpec(spec, resolved.source), ...spec.checkouts?.[0] }, warnings, source, ephemeralPaths,
         '', Boolean(spec.repositoryBranches?.[resolved.source]?.target), resolved.source));
     } else {
       // Multi-repo (or a lone repo a multi-PR task asked to nest): the world root
@@ -96,7 +96,7 @@ export class WorktreeProvider implements WorldProvider {
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });
       const names = uniqueNames([...(spec.scratch ? ['scratch'] : []),
-        ...resolvedSources.map((resolved) => repoName(resolved.source))]);
+        ...resolvedSources.map((resolved, index) => spec.checkouts?.[index]?.name ?? repoName(resolved.source))]);
       if (spec.scratch) {
         scratchWorkdir = path.join(root, names.shift()!);
         fs.mkdirSync(scratchWorkdir, { recursive: true });
@@ -105,8 +105,8 @@ export class WorktreeProvider implements WorldProvider {
         const name = names[i]!;
         const resolved = resolvedSources[i]!;
         const source = spec.repositoryOrigins?.[resolved.source] ?? (resolved.managed ? resolved.source : undefined);
-        repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, branch,
-          this.repoSpec(spec, resolved.source), warnings, source,
+        repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, spec.checkouts?.[i]?.branch ?? branch,
+          { ...this.repoSpec(spec, resolved.source), ...spec.checkouts?.[i] }, warnings, source,
           ephemeralPaths, name, Boolean(spec.repositoryBranches?.[resolved.source]?.target), resolved.source));
       }
     }

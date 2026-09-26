@@ -98,7 +98,7 @@ export class WorldCheckpointService {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
-        const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
+        const relative = repo.root === world.handle.root ? change.path : `${repo.name}/${change.path}`;
         // Legacy copyGlobs and broker materializations are inputs, never project
         // data. Do not make them portable merely because they are untracked.
         if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || ephemeralPaths.has(relative)
@@ -110,10 +110,15 @@ export class WorldCheckpointService {
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
       const source = worldRepoSource(repo);
+      const name = await world.exec('git', ['config', 'user.name'], { cwd: repo.root });
+      const email = await world.exec('git', ['config', 'user.email'], { cwd: repo.root });
       const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
         ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, source));
       repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(source)).slice(0, 24)}`, source,
-        checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
+        checkoutPath: repo.root === world.handle.root ? '.' : repo.name,
+        ...(repo.localPath ? { localPath: repo.localPath } : {}),
+        ...(repo.sourceAuthority ? { sourceAuthority: repo.sourceAuthority } : {}),
+        ...(name.code === 0 && email.code === 0 ? { gitIdentity: { name: name.stdout.trim(), email: email.stdout.trim() } } : {}), baseSha: repo.baseSha ?? handle.base,
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined,
         base: repo.base, ...(repo.target ? { target: repo.target } : {}),
         ...(repo.targetPinned !== undefined ? { targetPinned: repo.targetPinned } : {}),
@@ -273,7 +278,16 @@ export class WorldCheckpointService {
       // keeps the provider's idempotency lookup away from the vanished sandbox.
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
         generation: checkpoint.generation + 1, organizationId: project.organizationId,
-        repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
+        repos: sources as string[],
+        ...(checkpoint.repos.some(repo => repo.checkoutPath !== '.') ? { layout: 'nested' } : {}),
+        copySources: checkpoint.repos.map((repo, index) => repo.localPath ?? previousFor(repo, index)?.localPath),
+        checkouts: checkpoint.repos.map((repo, index) => ({
+          name: repo.checkoutPath === '.' ? previousFor(repo, index)?.name ?? 'repo' : repo.checkoutPath,
+          branch: repo.branch, base: repo.base ?? previousFor(repo, index)?.base ?? project.config.defaultBase ?? 'main',
+          target: repo.target ?? previousFor(repo, index)?.target,
+          sourceAuthority: repo.sourceAuthority ?? previousFor(repo, index)?.sourceAuthority,
+          gitIdentity: repo.gitIdentity,
+        })), base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
         branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
         network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
@@ -298,8 +312,12 @@ export class WorldCheckpointService {
           checkpoint.generation + 1, revisions);
       }
       for (const file of delta.files) {
-        const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
-        if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
+        const checkout = checkpoint.repos.find(repo => repo.checkoutPath === file.repo) ?? checkpoint.repos[0];
+        const relative = checkout && checkout.checkoutPath !== '.' ? `${checkout.checkoutPath}/${file.path}` : file.path;
+        if (file.deleted) {
+          const removed = await world.exec('rm', ['-f', '--', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
+          if (removed.code !== 0) throw new Error(`could not restore deletion: ${file.path}`);
+        }
         else {
           const content = Buffer.from(file.data ?? '', 'base64');
           if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);

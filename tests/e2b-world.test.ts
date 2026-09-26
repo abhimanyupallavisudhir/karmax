@@ -3,6 +3,20 @@ import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandbo
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('provisions each recorded checkout branch and directory (WD-11)', async () => {
+    const commands: string[] = [];
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async command => { commands.push(command); return { stdout: command.includes('rev-parse') ? 'a'.repeat(40) : '', stderr: '', exitCode: 0 }; };
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'restored', base: 'main',
+      repos: ['git@github.com:org/repo.git', 'git@github.com:org/repo.git'],
+      checkouts: [ { name: 'first', branch: 'saved-one', base: 'main', sourceAuthority: 'origin' },
+        { name: 'second', branch: 'saved-two', base: 'main', gitIdentity: { name: 'Saved', email: 'saved@test' } } ] });
+    expect(world.handle.repos?.map(repo => [repo.name, repo.branch])).toEqual([['first', 'saved-one'], ['second', 'saved-two']]);
+    expect(commands.join('\n')).toContain("checkout -q -B 'saved-two' 'origin/saved-two'");
+    expect(commands.join('\n')).toContain("config user.email 'saved@test'");
+  });
+
   it('evicts destroyed sandboxes and lifecycle cache entries (WD-3, PS-10)', async () => {
     const sandbox = fakeSandbox(() => undefined);
     let opens = 0;

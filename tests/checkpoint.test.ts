@@ -474,3 +474,34 @@ it('rejects oversized checkpoint files before reading them (WD-4)', async () => 
     expect(read).not.toHaveBeenCalled();
   } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('restores distinct branches of the same repository (WD-11)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-checkouts-'));
+  const store = await Store.create(':memory:');
+  const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+  await gitOrThrow(repo, ['init', '-qb', 'main']); await ensureIdentity(repo);
+  fs.writeFileSync(path.join(repo, 'file'), 'base');
+  fs.writeFileSync(path.join(repo, '-option'), 'delete me');
+  await gitOrThrow(repo, ['add', '.']); await gitOrThrow(repo, ['commit', '-qm', 'init']);
+  const project = await store.createProject('Checkout checkpoint', { repos: [repo] });
+  const task = await store.createTask({ projectId: project.id, title: 'Branches', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'test' } });
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+  const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main', layout: 'nested', gitIdentity: { name: 'Original', email: 'original@test' } });
+  await world.addCheckout!({ name: 'extra', base: 'main', branch: 'extra-branch' });
+  world.handle = await store.registerWorld(world.handle, project.id) as any;
+  await world.writeFile('extra/file', 'extra edit');
+  fs.unlinkSync(path.join(world.handle.root, 'extra', '-option'));
+  const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+    new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+  try {
+    const checkpoint = await service.checkpoint(world.handle);
+    await world.destroy();
+    const restored = await service.restore(checkpoint.id, 'worktree');
+    expect(restored.repos?.map(repo => [repo.name, repo.branch])).toEqual(world.handle.repos?.map(repo => [repo.name, repo.branch]));
+    const opened = await worlds.open(restored);
+    expect(await opened.readFile('extra/file')).toBe('extra edit');
+    expect((await opened.exec('git', ['config', 'user.email'], { cwd: restored.repos![0]!.root })).stdout.trim()).toBe('original@test');
+    await expect(opened.readFile('extra/-option')).rejects.toThrow();
+  } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});

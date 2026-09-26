@@ -112,7 +112,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   const multi = sources.length > 1 || spec.scratch || spec.layout === 'nested';
   const allNames = uniqueNames([...(spec.scratch ? ['scratch'] : []), ...sources.map(remoteName)]);
   const scratchName = spec.scratch ? allNames[0]! : undefined;
-  const names = spec.scratch ? allNames.slice(1) : allNames;
+  const names = (spec.scratch ? allNames.slice(1) : allNames)
+    .map((name, index) => spec.checkouts?.[index]?.name ?? name);
   if (multi) await runOrThrow(target, `mkdir -p ${quote(root)}`);
   const workdir = spec.scratch ? path.posix.join(root, scratchName!) : undefined;
   if (workdir) {
@@ -124,7 +125,10 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   const repos: WorldRepo[] = [];
   for (let index = 0; index < sources.length; index++) {
     const source = sources[index]!;
-    const branchPolicy = spec.repositoryBranches?.[source];
+    const recorded = spec.checkouts?.[index];
+    const repoSpec = { ...spec, ...recorded };
+    const branch = recorded?.branch ?? spec.branch ?? `karmax/${spec.taskId}`;
+    const branchPolicy = recorded ?? spec.repositoryBranches?.[source];
     let base = branchPolicy?.base ?? spec.base;
     let targetBranch = branchPolicy?.target ?? spec.target;
     const repoRoot = multi ? path.posix.join(root, names[index]!) : root;
@@ -137,16 +141,16 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
       : tokenIndex >= 0 ? githubHttpsAuthPrefix(options.home, tokenIndex) : '';
     await cloneWithRetry(target, `${auth}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
     const localPath = spec.copySources?.[index];
-    const sourceAuthority = spec.repositoryAuthorities?.[source] ?? 'project';
+    const sourceAuthority = recorded?.sourceAuthority ?? spec.repositoryAuthorities?.[source] ?? 'project';
     if (localPath && sourceAuthority !== 'origin')
-      await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
-    const requested = spec.branch ?? base;
+      await seedFromLocalCheckout(target, repoRoot, localPath, [base, repoSpec.branch], names[index]!, warnings);
+    const requested = repoSpec.branch ?? base;
     let remoteRef = `refs/remotes/origin/${requested}`;
     const refCheck = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(remoteRef)}`, 120_000);
     const remoteRefExists = refCheck.code === 0;
-    if (spec.branch && !remoteRefExists) throw new Error(`repository "${source}" has no remote branch "${spec.branch}" to review`);
+    if (repoSpec.branch && !remoteRefExists) throw new Error(`repository "${source}" has no remote branch "${repoSpec.branch}" to review`);
     let branchAdjustment;
-    if (!spec.branch && !remoteRefExists) {
+    if (!repoSpec.branch && !remoteRefExists) {
       const fallback = await runOrThrow(target, `git -C ${quote(repoRoot)} symbolic-ref refs/remotes/origin/HEAD`);
       const prefix = 'refs/remotes/origin/';
       const ref = fallback.stdout.trim();
@@ -157,14 +161,14 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
       remoteRef = ref;
       warnings.push(branchAdjustment.warning);
     }
-    if (!spec.branch && targetBranch && targetBranch !== base) {
+    if (!repoSpec.branch && targetBranch && targetBranch !== base) {
       const check = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(`refs/remotes/origin/${targetBranch}`)}`, 120_000);
       if (check.code !== 0) throw new Error(`repository "${source}": target branch "${targetBranch}" does not exist; choose an existing target before starting the task`);
     }
     const resolved = await target.run(`git -C ${quote(repoRoot)} rev-parse ${quote(remoteRef)}`, 120_000);
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
-    await configureRepo(target, repoRoot, spec, branch, true, true, base);
+    await configureRepo(target, repoRoot, repoSpec, branch, true, true, base);
     repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base,
       ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target || (branchAdjustment && index > 0)), baseSha,
       ...(branchAdjustment ? { branchAdjustment } : {}),
