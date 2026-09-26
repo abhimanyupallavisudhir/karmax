@@ -76,3 +76,15 @@ it('treats a home removed during account discovery as absent', () => {
   }) as typeof fs.readdirSync);
   expect(homes.list()).toEqual([]);
 });
+
+it('does not republish unchanged managed MCP configuration on boot (PS-15)', () => {
+  const homes = new ConfigHomeManager(fixture());
+  const files = [path.join(homes.ensure('claude', 'fixture'), '.claude.json'),
+    path.join(homes.ensure('codex', 'fixture'), 'config.toml')];
+  homes.refreshManagedMcp('http://localhost:4505');
+  for (const file of files) fs.utimesSync(file, 100, 100);
+  homes.refreshManagedMcp('http://localhost:4505');
+  for (const file of files) expect(fs.statSync(file).mtimeMs).toBe(100_000);
+  homes.refreshManagedMcp('http://localhost:4506');
+  for (const file of files) expect(fs.readFileSync(file, 'utf8')).toContain('4506');
+});

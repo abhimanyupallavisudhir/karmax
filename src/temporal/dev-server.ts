@@ -143,17 +143,40 @@ export function reapOrphanedEphemeralServers(): number {
  * A TCP probe isn't enough — we hit a persistence-backed RPC (describeNamespace)
  * so a jammed SQLite backend reads as unhealthy and gets replaced, not reused.
  */
+export function createServerHealthProbe(address: string, namespace: string) {
+  let stopped = false;
+  let connection: Connection | undefined;
+  let connecting: Promise<Connection | undefined> | undefined;
+  return {
+    async check(): Promise<boolean> {
+      if (stopped) return false;
+      try {
+        connecting ??= Connection.connect({ address, connectTimeout: HEALTH_TIMEOUT_MS }).then(async conn => {
+          if (stopped) { await conn.close().catch(() => {}); return undefined; }
+          connection = conn;
+          return conn;
+        }).catch(error => { connecting = undefined; throw error; });
+        const conn = await withTimeout(connecting, HEALTH_TIMEOUT_MS);
+        if (!conn || stopped) return false;
+        await withTimeout(conn.workflowService.describeNamespace({ namespace }), HEALTH_TIMEOUT_MS);
+        return !stopped;
+      } catch {
+        return false;
+      }
+    },
+    async close(): Promise<void> {
+      stopped = true;
+      const conn = connection;
+      connection = undefined;
+      if (conn) await conn.close().catch(() => {});
+    },
+  };
+}
+
 async function serverHealthy(address: string, namespace: string): Promise<boolean> {
-  let conn: Connection | undefined;
-  try {
-    conn = await withTimeout(Connection.connect({ address, connectTimeout: HEALTH_TIMEOUT_MS }), HEALTH_TIMEOUT_MS);
-    await withTimeout(conn.workflowService.describeNamespace({ namespace }), HEALTH_TIMEOUT_MS);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (conn) await conn.close().catch(() => {});
-  }
+  const probe = createServerHealthProbe(address, namespace);
+  try { return await probe.check(); }
+  finally { await probe.close(); }
 }
 
 async function killPid(pid: number, timeoutMs = 5000): Promise<void> {
@@ -626,6 +649,7 @@ export function watchDevServer(
   const grpcPort = Number(server.address.split(':')[1]);
   const uiPort = server.uiUrl ? Number(new URL(server.uiUrl).port) : undefined;
 
+  const health = createServerHealthProbe(server.address, server.namespace);
   let stopped = false;
   let fails = 0;
   let timer: NodeJS.Timeout | undefined;
@@ -637,7 +661,7 @@ export function watchDevServer(
     }
     try {
       // Re-check under the lock: another instance may have just fixed it.
-      if (await serverHealthy(server.address, server.namespace)) {
+      if (await health.check()) {
         fails = 0;
         return;
       }
@@ -680,7 +704,7 @@ export function watchDevServer(
   };
   const tick = async () => {
     if (stopped) return;
-    const healthy = await serverHealthy(server.address, server.namespace);
+    const healthy = await health.check();
     if (stopped) return;
     if (healthy) {
       fails = 0;
@@ -698,6 +722,7 @@ export function watchDevServer(
   return {
     stop() {
       stopped = true;
+      void health.close();
       if (timer) clearTimeout(timer);
     },
   };
