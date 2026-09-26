@@ -3987,7 +3987,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }) {
     const { task, repository, api } = (await this.githubActionsTask(token, 'dispatch_github_actions_workflow', input.repository));
     const slug = `${repository.owner}/${repository.name}`;
-    const result = await api.dispatch(slug, input.workflow, input.ref, input.inputs);
+    const ref = `refs/heads/${repository.defaultBranch}`;
+    if (input.ref !== repository.defaultBranch && input.ref !== ref)
+      throw new CapabilityError('workflow dispatch requires the repository default branch');
+    const result = await api.dispatch(slug, input.workflow, ref, input.inputs);
     (await this.githubActionsEvent(task.id, 'github.actions.workflow-dispatched', {
       repositoryId: repository.id, slug, workflow: input.workflow, ref: input.ref,
       inputNames: Object.keys(input.inputs ?? {}).sort(),

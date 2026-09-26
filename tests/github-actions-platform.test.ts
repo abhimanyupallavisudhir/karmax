@@ -52,11 +52,17 @@ describe('task-scoped GitHub Actions authority', () => {
       ceiling: ['github:actions:write'], grantorCaps: ['github:actions:write'] })).token;
     await expect(api.manageGithubActionsRun(write, { repository: 'app', runId: 42, action: 'rerun-failed' }))
       .resolves.toMatchObject({ accepted: true });
+    for (const ref of ['karmax/task_unreviewed', 'v1.0', 'refs/tags/main', 'deadbeef']) {
+      await expect(api.dispatchGithubActionsWorkflow(write, {
+        repository: 'app', workflow: 'deploy.yml', ref,
+      })).rejects.toThrow(/default branch/);
+    }
+    expect(actions.dispatch).not.toHaveBeenCalled();
     await expect(api.dispatchGithubActionsWorkflow(write, {
       repository: 'app', workflow: 'deploy.yml', ref: 'main', inputs: { environment: 'production' },
     })).resolves.toMatchObject({ accepted: true });
     expect(actions.rerun).toHaveBeenCalledWith('acme/app', 42, true);
-    expect(actions.dispatch).toHaveBeenCalledWith('acme/app', 'deploy.yml', 'main', { environment: 'production' });
+    expect(actions.dispatch).toHaveBeenCalledWith('acme/app', 'deploy.yml', 'refs/heads/main', { environment: 'production' });
     expect((await store.eventsSince(task.id, 0)).map((event) => event.type)).toEqual([
       'github.actions.runs-read', 'github.actions.run-inspected',
       'github.actions.run-operated', 'github.actions.workflow-dispatched',
