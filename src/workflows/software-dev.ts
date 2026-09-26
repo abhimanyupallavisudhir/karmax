@@ -2592,7 +2592,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (githubAuthoritativeMerge) {
         const reopened = await withResolve('pr', () => core.openPr(world as any, target, {
           title: input.title,
-          summary: reviewInfo?.summary ?? lastOutputs(msgs),
+          summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
         }));
         prs = reopened ?? [];
         pr = prs[0];
@@ -3033,7 +3033,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             try {
               return { prs: await core.openPr(world as any, target, {
                 title: input.title,
-                summary: reviewInfo?.summary ?? lastOutputs(msgs),
+                summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
               }) };
             } catch (err) {
               if (failureHasType(err, 'task-branch-conflict')
@@ -3082,7 +3082,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           branchPreparedForPr = true;
           const opened = await withResolve('pr', () => core.openPr(world as any, target, {
             title: input.title,
-            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+            summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
           }));
           prs = opened ?? [];
           pr = prs[0];
@@ -3229,7 +3229,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     const opened = await withResolve('pr', () => core.openPr(world as any, target, {
       title: input.title,
-      summary: reviewInfo?.summary ?? lastOutputs(msgs),
+      summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
     }));
     prs = opened ?? [];
     pr = prs[0];
@@ -3445,7 +3445,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           // updates the existing PR rather than creating another one.
           const refreshed = await core.openPr(world as any, target, {
             title: input.title,
-            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+            summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
           });
           prs = refreshed;
           pr = prs[0];
@@ -4044,6 +4044,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     return { stage } as { stage: Stage };
   }
+}
+
+export function pullRequestSummary(summary: string | undefined, msgs: Message[], legacy = false): string | undefined {
+  return summary ?? (legacy ? lastOutputs(msgs) : undefined);
 }
 
 function lastOutputs(msgs: Message[]): string {

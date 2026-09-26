@@ -282,7 +282,21 @@ export interface OpenPrDetails {
 function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
   const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
   const task = num != null ? `karmax task #${num} (\`${handle.id}\`)` : `karmax task \`${handle.id}\``;
-  return `${summary}\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
+  const provenance = `\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
+  const suffix = '\n… (summary truncated)';
+  const budget = Math.max(0, 65_536 - Buffer.byteLength(provenance + suffix));
+  let bounded = summary;
+  if (Buffer.byteLength(summary) > budget) {
+    let bytes = 0;
+    bounded = '';
+    for (const character of summary) {
+      bytes += Buffer.byteLength(character);
+      if (bytes > budget) break;
+      bounded += character;
+    }
+    bounded += suffix;
+  }
+  return bounded + provenance;
 }
 
 export interface CreateWorldArgs {

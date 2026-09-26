@@ -1662,6 +1662,10 @@ describe('PR stage (remote policy "pr")', () => {
     expect(again[0]!.number).toBe(1);
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Add a feature v2');
+    await core.openPr(handle, 'main', { summary: '😀'.repeat(70_000) });
+    expect(Buffer.byteLength(gh.prs[0].body, 'utf8')).toBeLessThanOrEqual(65_536);
+    expect(gh.prs[0].body).toContain('task_pr1');
+    expect(gh.prs[0].body).not.toContain('\uFFFD');
     await core.destroyWorld(handle);
   });
 
