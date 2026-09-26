@@ -14,6 +14,7 @@ dist/
 # auth_secret and vault_key at the repo root once, one `git add -A` away from
 # being committed. Matching at any depth costs nothing.
 .turnkey.env
+.turnkey.env.migration.*
 .secrets/
 deploy/backups/
 deploy/.updates/

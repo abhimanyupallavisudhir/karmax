@@ -184,6 +184,18 @@ describe('turnkey deployment secrets', () => {
   });
 });
 
+it('keeps migration copies and backup data out of Git and Docker build contexts', () => {
+  const migration = 'deploy/.turnkey.env.migration.1234';
+  const ignored = execFileSync('git', ['check-ignore', migration, 'deploy/backups/snapshot/key'], {
+    cwd: repoRoot, encoding: 'utf8',
+  });
+  expect(ignored).toContain(migration);
+  expect(ignored).toContain('deploy/backups/snapshot/key');
+  const dockerignore = fs.readFileSync(path.join(repoRoot, '.dockerignore'), 'utf8');
+  expect(dockerignore).toContain('deploy/.turnkey.env*');
+  expect(dockerignore).toContain('deploy/backups');
+});
+
 describe('hosted credential connector runtime', () => {
   const dockerfile = fs.readFileSync(path.join(deployDir, 'Dockerfile'), 'utf8');
 
