@@ -3,10 +3,32 @@ import dns from 'node:dns/promises';
 import https from 'node:https';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { spawnSync } from 'node:child_process';
 import { publicFetch } from '../src/mcp/connections/http.js';
 
 afterEach(() => vi.restoreAllMocks());
 describe('MCP public network boundary', () => {
+  it.each(['publicFetch', 'publicStreamFetch'])('%s rejects non-Fetch HTTP status codes without crashing the host', async name => {
+    const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import https from 'node:https';
+      import { EventEmitter } from 'node:events';
+      import { PassThrough } from 'node:stream';
+      import { ${name} as fetcher } from './src/mcp/connections/http.ts';
+      process.on('uncaughtException', () => process.exit(99));
+      https.request = (_url, _options, callback) => {
+        const req = new EventEmitter();
+        req.end = () => queueMicrotask(() => {
+          const res = new PassThrough(); res.statusCode = 700; res.headers = {};
+          callback(res); res.end(); req.emit('close');
+        });
+        return req;
+      };
+      try { await fetcher('https://1.1.1.1/mcp'); process.exit(98); }
+      catch (error) { console.log(error.message); }
+    `], { timeout: 3000, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toMatch(/status/i);
+  });
   it('rejects a hostname with any private DNS answer before opening a socket', async () => {
     vi.spyOn(dns, 'lookup').mockResolvedValue([{ address: '1.1.1.1', family: 4 }, { address: '10.0.0.1', family: 4 }] as any);
     const socket = vi.spyOn(https, 'request');
