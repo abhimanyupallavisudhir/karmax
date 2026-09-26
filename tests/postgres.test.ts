@@ -26,6 +26,16 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('looks up merged task events without hydrating event history', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Merge');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 1, payload: { merged: true } });
+      expect(await store.hasMergedTaskEvent(task.id)).toBe(true);
+    } finally { await store.close(); }
+  });
+
   it('expires deduplicated GitHub PR observations', async () => {
     const store = await Store.create(url!);
     try {

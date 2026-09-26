@@ -690,8 +690,7 @@ async function main() {
     if (sourceRestartScheduled || process.env.npm_lifecycle_event === 'dev'
       || event.type !== 'view.updated'
       || (event.payload as { status?: string } | undefined)?.status !== 'done') return;
-    const landed = (await store.eventsSince(event.taskId, 0)).some((candidate) => candidate.type === 'merge.result'
-      && (candidate.payload as { merged?: boolean } | undefined)?.merged === true);
+    const landed = await store.hasMergedTaskEvent(event.taskId);
     if (!landed) return; // manual Done and no-merge workflows changed no live source
     const task = (await store.getTask(event.taskId));
     const handle = ((await store.currentWorld(event.taskId)) ?? task?.lastView?.world) as WorldHandle | undefined;

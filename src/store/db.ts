@@ -5309,6 +5309,11 @@ export class Store {
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
+  async hasMergedTaskEvent(taskId: string): Promise<boolean> {
+    return !!(await this.db.prepare(`SELECT 1 FROM events WHERE taskId=? AND type='merge.result'
+      AND LOWER(CAST(json_extract(payload, '$.merged') AS TEXT)) IN ('true', '1') LIMIT 1`).get(taskId));
+  }
+
   /** Sparse durable annotations should not disappear merely because a task has
    *  more live activity rows than the UI's bounded event window. */
   async eventsOfType(taskId: string, type: string): Promise<(KarmaxEvent & { seq: number })[]> {

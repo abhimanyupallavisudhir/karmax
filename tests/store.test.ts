@@ -13,6 +13,15 @@ describe('Store', () => {
     store = (await Store.create(':memory:'));
   });
 
+  it('finds a merged result without loading the task event history', async () => {
+    const project = await store.createProject('Merge');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 1, payload: { merged: false } });
+    expect(await store.hasMergedTaskEvent(task.id)).toBe(false);
+    await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 2, payload: { merged: true } });
+    expect(await store.hasMergedTaskEvent(task.id)).toBe(true);
+  });
+
   it('deduplicates GitHub PR observations and expires them after a month', async () => {
     expect(await store.claimGithubPrObservation('digest', 1000)).toBe(true);
     expect(await store.claimGithubPrObservation('digest', 1001)).toBe(false);
