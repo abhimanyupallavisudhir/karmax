@@ -879,8 +879,18 @@ export class KarmaxApi {
    * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
    */
   private async validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): Promise<void> {
-    for (const [key, value] of Object.entries(params ?? {})) {
-      if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+    // Every agent spec can carry the pointer: the `agent:*` roles, each
+    // Confirm-agent layer (and the legacy single-gate `{mode:'agent'}`), and
+    // the Responder. Walk them by shape so a renamed field cannot slip past.
+    const specs: unknown[] = [];
+    for (const value of Object.values(params ?? {})) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      specs.push(value);
+      const layers = (value as Record<string, unknown>).layers;
+      if (Array.isArray(layers)) specs.push(...layers);
+    }
+    for (const value of specs) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
       const resumeFrom = (value as Record<string, unknown>).resumeFrom;
       if (!resumeFrom || typeof resumeFrom !== 'object' || Array.isArray(resumeFrom)) continue;
       const sessionId = (resumeFrom as Record<string, unknown>).sessionId;

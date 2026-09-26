@@ -1961,6 +1961,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // and unsupported native targets receive a guarded context message instead.
       if (!session && spec?.resumeFrom) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        // A task fork reads the source's conversation, native session and world.
+        // The API authorizes the pointer when it is set, but a pointer can
+        // outlive that check (an old template's spawned run, a task created
+        // before every agent spec was validated), so the turn re-checks it with
+        // its own authority — the same check get_conversation would apply.
+        if (spec.resumeFrom.taskId) {
+          const source = (await store.getTask(spec.resumeFrom.taskId));
+          const sourceOrganization = source ? (await store.getProject(source.projectId))?.organizationId ?? 'org_personal' : undefined;
+          const readable = !!source && sourceOrganization === organizationId
+            && (!deps.tokens || !token
+              || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
+          if (!readable) {
+            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            throw ApplicationFailure.create({
+              message: `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
+              type: 'agent-error',
+              nonRetryable: true,
+            });
+          }
+        }
         // The config home THIS turn runs under — where the source session must be
         // visible for the provider to resolve it. Shared by both resume paths below.
         const ambientHome =
