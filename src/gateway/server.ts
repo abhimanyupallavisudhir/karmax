@@ -1920,8 +1920,9 @@ export class Gateway {
         authRecord = checked.record;
         callerIdentity = resolveCallerIdentity(authRecord, session.userId);
       }
-      (await this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope,
-        { path: p, ...identityAuditDetail(auditedIdentity) }));
+      if (method !== 'GET' && method !== 'HEAD')
+        (await this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope,
+          { path: p, ...identityAuditDetail(auditedIdentity) }));
     }
 
     if (required && requestedScope.projectId && !['GET', 'HEAD'].includes(method)) {

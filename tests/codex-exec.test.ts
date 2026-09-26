@@ -46,6 +46,10 @@ if (mode === 'partial-fail') {
   process.stdout.write(JSON.stringify({ type: 'turn.failed', error: { message: 'connection reset during turn' } }) + '\\n');
   process.exit(1);
 }
+if (mode === 'stderr-flood') {
+  process.stderr.write('x'.repeat(1024 * 1024) + 'LATEST DIAGNOSTIC', () => process.exit(1));
+  return;
+}
 if (outFile) fs.writeFileSync(outFile, 'FINAL ANSWER from codex stub');
 process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
 process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'working on it' } }) + '\\n');
@@ -94,6 +98,11 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     const r = await adapter.runTurn(makeInput() as any, ctx);
     expect(r.output).toContain('FINAL ANSWER');
     expect(r.session).toBe('th_stub');
+  });
+
+  it('keeps the recent diagnostic after a large stderr stream', async () => {
+    process.env.STUB_MODE = 'stderr-flood';
+    await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow(/LATEST DIAGNOSTIC/);
   });
 
   it('reports the turn\'s provider token usage on a fresh thread', async () => {

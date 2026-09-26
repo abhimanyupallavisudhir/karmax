@@ -44,12 +44,11 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
   for (const project of (await store.listProjects())) {
     // Reconciliation operates on Temporal executions, not logical list rows:
     // every sibling attempt has its own workflow that must be settled.
-    for (const t of (await store.listTaskAttempts(project.id))) {
-      if (t.params?.draft) continue; // drafts are intentionally not started
-      if (t.params?.triggerState === 'armed') continue; // armed triggered tasks have no workflow yet
-      if (t.params?.repeatable) continue; // a series never runs its own workflow — only its runs do
+    const candidates = await store.listReconciliationCandidates(project.id);
+    for (let offset = 0; offset < candidates.length; offset += 8) {
+      await Promise.all(candidates.slice(offset, offset + 8).map(async (t) => {
       const v: TaskView | undefined = t.lastView;
-      if (v && TERMINAL.includes(v.status)) continue;
+      if (v && TERMINAL.includes(v.status)) return;
       checked++;
       const base = v ?? stubView(t);
       try {
@@ -106,7 +105,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
               settled++;
             }
           }
-          continue;
+          return;
         }
         let terminationReason: string | undefined;
         if (name === 'TERMINATED') {
@@ -129,7 +128,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         (await store.saveView(t.id, next));
         settled++;
       } catch (e) {
-        if (e instanceof Error && e.message === 'operation timed out') continue; // transient — don't fail a live task
+        if (e instanceof Error && e.message === 'operation timed out') return; // transient — don't fail a live task
         // workflow not found → lost (state reset) or never started (orphan row).
         (await store.saveView(t.id, {
           ...base,
@@ -140,6 +139,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         }));
         settled++;
       }
+      }));
     }
   }
   return { checked, settled };
