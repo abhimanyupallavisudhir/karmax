@@ -1,3 +1,4 @@
+import { concurrentMap } from '../util/concurrent-map.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
@@ -1337,7 +1338,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
-        for (const [index, source] of worldSources.entries()) {
+        await concurrentMap(worldSources, 3, async (source, index) => {
           const transportSource = transportSources[index]!;
           const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, transportSource));
           const repository = linked?.repository
@@ -1354,12 +1355,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // enrollment. Under local policy it is the authority; under PR
             // policy an un-enrolled GitHub transport can still use an explicit
             // Git profile/host credential while origin owns the base.
-            if (sourceResolutions[index]?.localPath) continue;
+            if (sourceResolutions[index]?.localPath) return;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
-            continue;
+            return;
           }
           if (deps.githubApp) httpsTokens[source] = await deps.githubApp.repositoryCloneToken(repository);
-        }
+        });
         // Repository-scoped read-only installation tokens exist only during
         // trusted provisioning and are removed before the agent starts.
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };

@@ -1,3 +1,4 @@
+import { concurrentMap } from '../util/concurrent-map.js';
 import { missingBaseAdjustment } from './branch-fallback.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -48,12 +49,12 @@ export async function provisionGitCredentials(target: ProvisionTarget, spec: Wor
   await runOrThrow(target, `mkdir -p ${quote(ssh)} && chmod 700 ${quote(ssh)}`);
   if (values.length)
     await runOrThrow(target, `ssh-keyscan github.com >> ${quote(path.posix.join(ssh, 'known_hosts'))} 2>/dev/null || true`);
-  for (const [index, key] of [...new Set(values)].entries()) {
+  await concurrentMap([...new Set(values)], 3, async (key, index) => {
     const file = credentialFile(home, index);
     await target.writeFile(file, key.endsWith('\n') ? key : `${key}\n`);
     await runOrThrow(target, `chmod 600 ${quote(file)}`);
-  }
-  for (const [index, token] of [...new Set(tokens)].entries()) {
+  });
+  await concurrentMap([...new Set(tokens)], 3, async (token, index) => {
     const tokenFile = credentialTokenFile(home, index);
     const askpassFile = credentialAskpassFile(home, index);
     await target.writeFile(tokenFile, token);
@@ -64,7 +65,7 @@ case "$1" in
 esac
 `);
     await runOrThrow(target, `chmod 600 ${quote(tokenFile)} && chmod 700 ${quote(askpassFile)}`);
-  }
+  });
 }
 
 function repositoryKeys(spec: WorldSpec): string[] {
@@ -99,7 +100,6 @@ function githubHttpsAuthPrefix(home: string, index: number): string {
 
 export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec, options: ProvisionRepoOptions):
   Promise<{ root: string; repos: WorldRepo[]; warnings: string[]; workdir?: string; ephemeralPaths: string[] }> {
-  const branch = spec.branch ?? `karmax/${spec.taskId}`;
   const sources = (spec.repos?.length ? spec.repos : spec.repo ? [spec.repo] : []).map((value) => value.trim()).filter(Boolean);
   const warnings: string[] = [];
   const ephemeralPaths: string[] = [];
@@ -122,9 +122,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   const uniqueKeys = [...new Set(repositoryKeys(spec))];
   const uniqueTokens = [...new Set(Object.values(spec.gitCredentials?.httpsTokens ?? {})
     .filter((value): value is string => Boolean(value)))];
-  const repos: WorldRepo[] = [];
-  for (let index = 0; index < sources.length; index++) {
-    const source = sources[index]!;
+  const repos = await concurrentMap(sources, 3, async (source, index): Promise<WorldRepo> => {
     const recorded = spec.checkouts?.[index];
     const repoSpec = { ...spec, ...recorded };
     const branch = recorded?.branch ?? spec.branch ?? `karmax/${spec.taskId}`;
@@ -169,11 +167,11 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
     await configureRepo(target, repoRoot, repoSpec, branch, true, true, base);
-    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base,
+    return { name: names[index]!, repo: source, root: repoRoot, branch, base,
       ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target || (branchAdjustment && index > 0)), baseSha,
       ...(branchAdjustment ? { branchAdjustment } : {}),
-      ...(localPath ? { localPath } : {}), ...(sourceAuthority === 'origin' ? { sourceAuthority } : {}) });
-  }
+      ...(localPath ? { localPath } : {}), ...(sourceAuthority === 'origin' ? { sourceAuthority } : {}) };
+  });
   if (repos[0]?.branchAdjustment) {
     for (const repo of repos.slice(1)) if (repo.target && repo.target !== repos[0].target) repo.targetPinned = true;
   }

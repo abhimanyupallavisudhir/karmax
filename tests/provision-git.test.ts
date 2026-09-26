@@ -31,6 +31,24 @@ describe('shared cloud world git provisioning', () => {
     delete process.env.KARMAX_WORLD_CLONE_RETRY_MS;
   });
 
+  it('clones independent repositories concurrently with a bounded fan-out (LT-3)', async () => {
+    let active = 0, peak = 0;
+    const { target } = fakeTarget(command => command.includes('rev-parse') ? { stdout: 'a'.repeat(40) } : undefined);
+    const run = target.run;
+    target.run = async (command, timeout) => {
+      if (!command.includes('git clone')) return run(command, timeout);
+      peak = Math.max(peak, ++active);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      active--;
+      return run(command, timeout);
+    };
+    const result = await provisionGitRepos(target, { taskId: 'parallel', base: 'main',
+      repos: Array.from({ length: 8 }, (_, i) => `git@github.com:org/repo${i}.git`) }, OPTIONS);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(result.repos.map(repo => repo.name)).toEqual(Array.from({ length: 8 }, (_, i) => `repo${i}`));
+  });
+
   it('never uploads a personal key and prefers repository tokens (WD-5)', async () => {
     const { target, commands } = fakeTarget(command => command.includes('rev-parse') ? { stdout: 'a'.repeat(40) } : undefined);
     const writes: string[] = [];
