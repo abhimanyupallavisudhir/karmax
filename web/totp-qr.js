@@ -15,11 +15,25 @@
     return value;
   }
 
+  let scannerLoad;
+  function loadScanner() {
+    if (root.QrScanner) return Promise.resolve(root.QrScanner.scanImage);
+    if (scannerLoad) return scannerLoad;
+    scannerLoad = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '/vendor/qr-scanner.legacy.min.js';
+      script.onload = () => resolve(root.QrScanner.scanImage);
+      script.onerror = () => { script.remove(); scannerLoad = null; reject(new Error(TOTP_QR_ERROR)); };
+      document.head.appendChild(script);
+    });
+    return scannerLoad;
+  }
+
   /** Decode locally in the browser. The pasted image is never uploaded or persisted. */
   async function decodeTotpQrImage(image, scanImage = root.QrScanner?.scanImage) {
     let result;
     try {
-      if (!scanImage) throw new Error('QR scanner unavailable');
+      scanImage ||= await loadScanner();
       result = await scanImage(image, { returnDetailedScanResult: true });
     } catch {
       throw new Error(TOTP_QR_ERROR);

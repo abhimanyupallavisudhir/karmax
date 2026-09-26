@@ -26,7 +26,7 @@
   --surface-2: #fbfcfd;
   --ink: #15181e;
   --ink-2: #58616f;
-  --ink-3: #8b95a5;
+  --ink-3: #626e7e;
   --line: #e5e8ed;
   --line-strong: #d4d9e1;
   --accent: #5b5bd6;
@@ -57,7 +57,7 @@ html[data-theme="dark"],
   --surface-2: #1f232c;
   --ink: #e7e9ef;
   --ink-2: #9aa4b2;
-  --ink-3: #6a7383;
+  --ink-3: #929dad;
   --line: #292e39;
   --line-strong: #353c49;
   --accent: #8b8bf0;
@@ -83,7 +83,7 @@ html[data-theme="dark"],
     --surface-2: #1f232c;
     --ink: #e7e9ef;
     --ink-2: #9aa4b2;
-    --ink-3: #6a7383;
+    --ink-3: #929dad;
     --line: #292e39;
     --line-strong: #353c49;
     --accent: #8b8bf0;
@@ -1107,6 +1107,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 
 /* Hosted personal-workspace onboarding. Progress comes from the gateway; this
    floating surface only guides the user to the existing first-party controls. */
+body:has(#tf-page, .ck-compose) .hosted-onboarding { display: none; }
 .hosted-onboarding { position: fixed; z-index: 60; right: 22px; bottom: 20px; width: min(390px, calc(100vw - 28px)); }
 .onboarding-card {
   max-height: min(720px, calc(100vh - 82px)); overflow-y: auto;
@@ -3001,3 +3002,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .resource-review-name > * { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .resource-review-controls { display:flex; align-items:center; gap:8px; flex-shrink:0; }
 @media (max-width:480px) { .resource-review-controls .resource-selection-state { display:none; } }
+
+.text-prompt { width:min(480px,92vw); padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--surface); color:var(--ink); }
+.text-prompt::backdrop { background:rgba(0,0,0,.4); }

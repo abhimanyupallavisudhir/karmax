@@ -12,3 +12,13 @@ krmax gives agents isolated cloud worlds, lets people or agents own review and i
 - [Security](https://krmax.io/legal/security)
 - [Subprocessors](https://krmax.io/legal/subprocessors)
 - [Business DPA requests](https://krmax.io/legal/dpa)
+
+## Agent entry points
+
+Task agents receive a permission-checked platform MCP server in their configured tools.
+Use `describe_platform` to discover the administrative API, then `platform_request`
+with a method, `/api/` path, and optional JSON body. These tools enforce the task's
+authorization; they do not bypass project, organization, credential, or payment grants.
+Use `list_connections` to discover connected applications and `search_connection_tools`
+to inspect their schemas before calling `execute_connection_tool`. Request missing
+access through the supplied permission and connection tools.

@@ -4121,6 +4121,15 @@ export class Store {
     return out;
   }
 
+  async markInboxMany(userId: string, organizationId: string, ids: string[]): Promise<InboxItem[]> {
+    if (!ids.length) return [];
+    if (ids.length > 500) throw new Error('Too many inbox items');
+    const rows = await this.db.prepare(`UPDATE inbox SET unread=0, readAt=?
+      WHERE userId=? AND organizationId=? AND id IN (${ids.map(() => '?').join(',')}) RETURNING *`)
+      .all(Date.now(), userId, organizationId, ...ids);
+    return rows.map(rowToInbox);
+  }
+
   async markInbox(userId: string, id: string, unread: boolean): Promise<InboxItem | undefined> {
     return this.db.transaction(async () => {
 
@@ -4520,6 +4529,7 @@ export class Store {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     assertTagColor(input.color);
+    assertTagKind(input.kind);
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
     // types the path. `color`/`description` apply to the leaf; `kind` applies to the
@@ -4597,6 +4607,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     assertTagColor(patch.color);
+    assertTagKind(patch.kind);
     const cur = (await this.getTag(id));
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
@@ -7726,7 +7737,7 @@ function parseJsonOptional<T>(value: unknown): T | undefined {
 }
 
 export function slugify(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
+  return value.trim().normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
 }
 
 async function uniqueSlug(value: string, used: (candidate: string) => boolean | Promise<boolean>): Promise<string> {
@@ -8042,6 +8053,11 @@ function rowToTask(r: any): TaskRecord {
 
 /** A tag colour is rendered into an inline `style` custom property; only a
  *  hex literal is accepted so it can never carry a CSS declaration. */
+function assertTagKind(kind: unknown): void {
+  if (kind == null) return;
+  if (kind !== 'type' && kind !== 'topic' && kind !== 'flag') throw new Error('tag kind must be type, topic, or flag');
+}
+
 function assertTagColor(color: string | null | undefined): void {
   if (color == null || color === '') return;
   if (!/^#[0-9a-fA-F]{3,8}$/.test(color)) throw new Error('tag color must be a hex colour like #4a90d9');

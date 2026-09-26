@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
+import type { EvalResult } from '../domain/search.js';
 import type { TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
 import { Store } from '../store/db.js';
@@ -274,6 +275,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
   }
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
+  if (p === '/api/search' && read) return 'none'; // each project is authorized in searchProjects
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments' || p === '/api/files') return 'task:create';
   if (p === '/api/conversation-imports') return 'task:create';
@@ -693,7 +695,7 @@ export class Gateway {
             workflowRunId: typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined,
             attempt: typeof payload.attempt === 'number' ? payload.attempt : undefined })) : undefined;
         if (ws.readyState !== WebSocketClient.OPEN) return;
-        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
+        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId, ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     }, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
     ws.on('close', off);
@@ -2993,6 +2995,14 @@ export class Gateway {
             ...(avatar ? { resource: { kind: 'avatar', id: avatar.id, name: avatar.name, projectId: avatar.projectId } } : {}) };
         })));
       }
+      if (p === '/api/inbox' && method === 'PATCH') {
+        const subject = requireHumanSubject(callerIdentity);
+        if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        const body = await this.body(req);
+        if (!Array.isArray(body.ids) || body.ids.length > 500 || body.ids.some((id: unknown) => typeof id !== 'string'))
+          return this.json(res, 400, { error: 'Pass up to 500 inbox item IDs' });
+        return this.json(res, 200, await store.markInboxMany(subject.userId, requestedScope.organizationId, body.ids));
+      }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
         const subject = requireHumanSubject(callerIdentity);
@@ -4416,6 +4426,11 @@ export class Gateway {
 
       // ── search / organization (a view is a saved query — PLAN-search-views) ──
       // The searchable-field registry the UI reads to build its filter/sort/group menus.
+      if (p === '/api/search' && method === 'GET') {
+        const query = url.searchParams.get('q')?.trim() ?? '';
+        if (query.length > 2000) return this.json(res, 400, { error: 'Search is too long' });
+        return this.json(res, 200, await this.searchProjects(req, res, query));
+      }
       if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, (await api.searchFields(token)));
 
       // Evaluate a query against a project: `?q=<query string>` (Linear-style token
@@ -8423,6 +8438,22 @@ export class Gateway {
     (await new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(userId))
       .saveGithubIdentity(identity));
     (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
+  }
+
+  private async searchProjects(req: http.IncomingMessage, res: http.ServerResponse, query: string) {
+    const results: { projectId: string; tasks: EvalResult['tasks']; total: number }[] = [];
+    if (query.length < 2) return results;
+    for (const project of await this.deps.store.listProjects()) {
+      if (res.destroyed) break;
+      const session = await this.auth(req, project.id, project.organizationId);
+      if (!session) continue;
+      const scope = { projectId: project.id };
+      if (!(await this.deps.tokens.check(session.apiToken, 'project:read', scope)).ok
+        || !(await this.deps.tokens.check(session.apiToken, 'task:read', scope)).ok) continue;
+      const result = await this.deps.api.searchTasks(session.apiToken, project.id, query);
+      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
+    }
+    return results;
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {

@@ -203,7 +203,7 @@ function constant(name) {
       window.api = async (url, options) => {
         requests.push({ url, ...options });
         const organizationId = new URL(url, location.origin).searchParams.get('organizationId');
-        if (options) return { unread: false };
+        if (options) return url.startsWith('/api/inbox?') ? JSON.parse(options.body).ids.map(id => ({ id, unread: false })) : { unread: false };
         return [{ id: organizationId, organizationId, kind: 'escalated', actionable: true,
           urgency: 'high', unread: true, createdAt: Date.now(), task: { title: organizationId } }];
       };
@@ -223,7 +223,7 @@ function constant(name) {
     await page.locator('#inbox-read-all').click();
     assert.equal(await page.locator('#bell-badge').textContent(), '0');
     assert.equal(await page.locator('#bell-badge').isHidden(), true);
-    assert.equal(await page.evaluate(() => requests.at(-1).url), '/api/inbox/personal?organizationId=personal');
+    assert.equal(await page.evaluate(() => requests.at(-1).url), '/api/inbox?organizationId=personal');
     console.log('Inbox browser checks passed (desktop, dark, mobile, read/unread, navigation).');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

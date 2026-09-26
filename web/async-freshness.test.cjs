@@ -168,9 +168,9 @@ eval(extractFn('refreshTask'));
   };
   const oldTaskRefresh = refreshTask();
   const freshTaskRefresh = refreshTask();
+  oldTaskView.resolve({ taskId: 'task-a', title: 'stale' });
   freshTaskView.resolve({ taskId: 'task-a', title: 'fresh' });
   await freshTaskRefresh;
-  oldTaskView.resolve({ taskId: 'task-a', title: 'stale' });
   await oldTaskRefresh;
   ok(S.view.title === 'fresh', 'the latest refresh of one open task wins when responses arrive out of order');
 

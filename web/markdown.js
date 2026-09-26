@@ -333,6 +333,8 @@
       };
       const script = document.createElement('script');
       script.src = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js';
+      script.integrity = 'sha384-KKWa9jJ1MZvssLeOoXG6FiOAZfAgmzsIIfw8BXwI9+kYm0lPCbC6yTQPBC00F1/L';
+      script.crossOrigin = 'anonymous';
       script.async = true;
       script.onerror = () => resolve(false);
       document.head.appendChild(script);

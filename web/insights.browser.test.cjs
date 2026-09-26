@@ -111,7 +111,7 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
     await page.addScriptTag({ content: [
       ...['beginAsyncElementRender', 'fmtAgo', 'fmtCountdown', 'usageResetLabel', 'autoRecheckUsage'].map(fn),
       'const asyncElementRenderEpoch = new WeakMap();',
-      insights,
+      fn('safeHref'), insights,
       'window.renderPage = () => { $("#main").innerHTML = insightsView(); wireInsights(); return renderInsights(); };',
     ].join('\n') });
     await page.evaluate(() => renderPage());

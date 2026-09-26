@@ -162,6 +162,7 @@ function rememberInteractionOrigin(event) {
   // Only activation keys count; ordinary typing must never be swallowed, and a
   // paste/drop into a text field is an upload, not an action on that field —
   // marking it pending would disable the field the user is typing in.
+  if (event.type === 'keydown' && (/^(?:INPUT|TEXTAREA)$/.test(control.tagName || '') || control.isContentEditable)) return;
   if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
   if ((event.type === 'paste' || event.type === 'drop') && /^(?:INPUT|TEXTAREA)$/.test(control.tagName || '')) return;
   if (control.classList?.contains('action-pending')) {
@@ -283,7 +284,7 @@ function taskRecord(id) {
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
-  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+  return String(s || '').normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
@@ -348,11 +349,17 @@ const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbo
 // page it names. The tasks list's whole search state (free text, filters, group,
 // sort) is the one query string in `?q=`, so it rides along as `q` on every
 // project route: a search is just a URL.
+function decodeRoutePart(value, component = false) {
+  try { return component ? decodeURIComponent(value) : decodeURI(value); }
+  catch { return value; }
+}
+
 function parseRoute(url) {
-  const [pathname, search = ''] = String(url).split('?');
+  let [pathname, search = ''] = String(url).split('?');
+  try { pathname = decodeURI(pathname); } catch {}
   const query = new URLSearchParams(search);
   const q = query.get('q') || '';
-  const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  const seg = pathname.replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
   if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
@@ -688,6 +695,7 @@ async function applyRoute() {
     return renderTaskPage();
   }
   S.taskFile = null;
+  if (canPaintCachedProject && tab !== 'tasks') return;
   renderMain();
   if (tab === 'activity') seedActivity();
   if (tab === 'queue') seedQueue();
@@ -1246,6 +1254,7 @@ function humanAudienceOptions() {
   ];
 }
 function cfLayerHtml(f, layer, agentDefault) {
+  const audienceOptionsId = `human-audience-${humanAudienceOptions.nextId = (humanAudienceOptions.nextId || 0) + 1}`;
   const isAgent = layer.kind === 'agent';
   const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
   const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
@@ -1260,13 +1269,13 @@ function cfLayerHtml(f, layer, agentDefault) {
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
       <label class="form-row">Who confirms
-        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
+        <input class="cf-audience" list="${audienceOptionsId}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
       </label>
-      <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
-      <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
+      <datalist id="${audienceOptionsId}">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+      ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type [[ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review prompt ${policyTip('Sent at each review. Type [[ for wiki context. Variables: {{prompt}}, {{response}}, {{reviewInfo}}, {{changedFiles}}, {{transcript}}.')}</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -1323,12 +1332,13 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
+    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
   const inh = inherited || {};
   const route = responderOf(own || inh);
+  const audienceOptionsId = `human-audience-${humanAudienceOptions.nextId = (humanAudienceOptions.nextId || 0) + 1}`;
   const isAgent = route.kind === 'agent';
   const agentDefault = inh.agentDefault || {};
   const audience = (route.audience?.length ? route.audience : ['@creator']).join(', ');
@@ -1340,9 +1350,9 @@ function renderResponderField(f, own, inherited, alt) {
         <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
       </div>
       <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
-        <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
-        <div class="task-sub">Comma-separated. Any selected person may answer this single input step.</div>
+        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="${audienceOptionsId}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
+        <datalist id="${audienceOptionsId}">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+        ${policyTip('Separate people or teams with commas. Any selected person may answer.')}
       </div>
       <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
         <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
@@ -1357,13 +1367,8 @@ function readResponder(box) {
     return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
   }
   const ab = box.querySelector('.agent-field');
-  const route = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
-  const model = ab.querySelector('.af-model').value.trim();
-  const effort = ab.querySelector('.af-effort').value;
-  if (model) route.model = model;
-  if (effort) route.effort = effort;
-  const resumeFrom = readResume(ab);
-  if (resumeFrom) route.resumeFrom = resumeFrom;
+  const route = { kind: 'agent', ...readAgentSpec(ab) };
+  if (route.avatarId) return { kind: 'human', audience: [`avatar:${route.avatarId}`] };
   const prompt = box.querySelector('.rf-prompt')?.value ?? '';
   const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
@@ -2302,7 +2307,34 @@ function resetResponderField(box, attr = 'data-inherit') {
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
-async function api(path, opts = {}) {
+function api(path, opts = {}) {
+  const pending = api.pending ||= new Map();
+  const defaults = api.defaults ||= new Map();
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET') {
+    pending.clear(); defaults.clear();
+    return fetchApi(path, opts).finally(() => { pending.clear(); defaults.clear(); });
+  }
+  if (opts.signal) return fetchApi(path, opts);
+  const key = JSON.stringify([S.token, typeof S.user === 'object' ? S.user?.id : S.user, path, opts]);
+  const cached = defaults.get(key);
+  if (cached && Date.now() - cached.at < 10_000) return Promise.resolve(JSON.parse(cached.json));
+  defaults.delete(key);
+  if (pending.has(key)) return pending.get(key);
+  const request = fetchApi(path, opts).then(value => {
+    if (path.startsWith('/api/defaults/') && pending.get(key) === request) {
+      if (defaults.size >= 64) defaults.delete(defaults.keys().next().value);
+      defaults.set(key, { at: Date.now(), json: JSON.stringify(value) });
+    }
+    return value;
+  }).finally(() => {
+    if (pending.get(key) === request) pending.delete(key);
+  });
+  pending.set(key, request);
+  return request;
+}
+
+async function fetchApi(path, opts = {}) {
   const res = await feedbackFetch(path, {
     ...opts,
     headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(opts.headers || {}) },
@@ -2556,7 +2588,15 @@ function wireMessageCopies(root = document) {
 
 // Shared with the public conversation reader; keep console callers unchanged.
 function renderMarkdown(src, opts = {}) {
-  return globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  const cache = renderMarkdown.cache ||= new Map();
+  const key = JSON.stringify([src, opts]);
+  if (cache.has(key)) return cache.get(key);
+  const html = globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  if (key.length + html.length <= 64_000) {
+    if (cache.size >= 128) cache.delete(cache.keys().next().value);
+    cache.set(key, html);
+  }
+  return html;
 }
 function ensureMathJax() {
   return globalThis.TavyaMarkdown.ensureMathJax();
@@ -2648,10 +2688,14 @@ function consoleRevisionChanged(current, next) {
 }
 
 async function checkConsoleRevision() {
+  if (document.hidden) return false;
   try {
     const meta = await api('/api/meta');
     if (consoleRevisionChanged(S.meta?.consoleRevision, meta.consoleRevision)) {
-      location.reload();
+      if (S.offeredConsoleRevision !== meta.consoleRevision) {
+        S.offeredConsoleRevision = meta.consoleRevision;
+        toast('Update available', false, { label: 'Reload', fn: () => location.reload() });
+      }
       return true;
     }
     applyTimingSetting(meta.timingEnabled);
@@ -2660,9 +2704,25 @@ async function checkConsoleRevision() {
   return false;
 }
 
+function resumeVisibleUpdates() {
+  if (document.hidden) return;
+  if (S.liveUpdatesStale) {
+    S.liveUpdatesStale = false;
+    resourceReviewCache.clear(); resourceInventoryCache.clear();
+    loadInbox().catch(() => {});
+    if (S.selected) { refreshTask(); refreshTaskHistory(S.selected); }
+    else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
+    else if (S.tab === 'activity') seedActivity();
+  }
+  checkConsoleRevision();
+  if (S.tab === 'installation') { refreshHostDiag(); refreshProcPanel(); }
+  if (S.onboarding?.display === 'expanded') refreshOnboarding();
+}
+
 function watchConsoleRevision() {
   if (consoleRevisionTimer) return;
   consoleRevisionTimer = setInterval(checkConsoleRevision, 60_000);
+  document.addEventListener('visibilitychange', resumeVisibleUpdates);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -2785,6 +2845,13 @@ async function boot() {
   connectWs();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
+  installShellListeners();
+  await applyRoute(); // honor the initial URL (deep link / bookmark)
+}
+
+function installShellListeners() {
+  if (installShellListeners.installed) return;
+  installShellListeners.installed = true;
   bindKeys();
   installLinkRouter();
   installTagRouter();
@@ -2809,7 +2876,6 @@ async function boot() {
   document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
   document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
-  await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
 async function loadProjects(request = api('/api/projects')) {
@@ -2891,7 +2957,10 @@ async function loadInbox() {
 }
 
 function inboxEventChanges(ev) {
-  return ev.type === 'view.updated' || ev.type.includes('escalat')
+  if (ev.type === 'view.updated') return ['done', 'failed', 'cancelled'].includes(ev.payload?.status)
+    || ['human', 'confirm', 'responder'].includes(ev.payload?.waitingFor)
+    || (S.inbox || []).some(item => item.taskId === ev.taskId);
+  return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
       'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
@@ -3106,14 +3175,14 @@ function syncQueryUrl() {
 }
 
 let searchDebounce = null;
-function scheduleSearch() {
+function scheduleSearch(background = false) {
   clearTimeout(searchDebounce);
   searchDebounce = setTimeout(async () => {
     syncQueryUrl();
     const search = runSearch();
-    if (S.tab === 'tasks') renderMain();
+    if (S.tab === 'tasks' && !background) renderMain();
     await search;
-    if (S.tab === 'tasks') renderMain();
+    if (S.tab === 'tasks' && !S.selected) bgRenderMain();
   }, 180);
 }
 
@@ -3269,6 +3338,11 @@ function scheduleTaskListReload() {
 }
 
 function connectWs() {
+  if (connectWs.retryTimer) clearTimeout(connectWs.retryTimer);
+  if (S.ws) {
+    S.ws.onclose = S.ws.onmessage = S.ws.onopen = null;
+    S.ws.close();
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
   S.ws = ws;
@@ -3277,14 +3351,27 @@ function connectWs() {
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
-    S.activity.unshift(ev);
-    if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') bgRenderMain();
+    if (document.hidden) { S.liveUpdatesStale = true; return; }
+    if (S.tab === 'activity' && (!ev.projectId || ev.projectId === S.projectId)) {
+      S.activity.unshift(ev);
+      if (S.activity.length > 400) S.activity.pop();
+      bgRenderMain();
+    }
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
-    const patchedList = patchTaskListFromEvent(ev);
+    const eventProject = ev.projectId || ev.payload?.projectId;
+    const currentProject = !eventProject || eventProject === S.projectId;
+    const siblingAttempt = S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
+      && S.attemptGroup.principalAttemptId !== ev.taskId;
+    const patchedList = currentProject && patchTaskListFromEvent(ev);
+    if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
+      resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
+    }
     if (S.selected && ev.taskId === S.selected) {
-      S.taskEvents.push(ev);
-      if (S.taskEvents.length > 400) S.taskEvents.shift();
+      if (ev.type.startsWith('spend.') || ev.type.startsWith('payment.')) $('#tp-payments')?.refreshSpent?.();
+      if (ev.type !== 'agent.output') {
+        S.taskEvents.push(ev);
+        if (S.taskEvents.length > 400) S.taskEvents.shift();
+      }
       if (ev.type === 'agent.output' && ev.payload?.text) {
         // Provider adapters emit the current complete block, not a token delta.
         // Replacing avoids the old "H / He / Hello" cumulative transcript.
@@ -3303,24 +3390,23 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
-        refreshTask();
+        refreshTask(ev.type);
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
-        refreshTask();
-      } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
+        refreshTask(ev.type);
+      } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
-      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask();
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask(ev.type);
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
-      if (S.tab === 'tasks' && !S.selected) scheduleSearch();
-      if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
-      renderRail();
-    } else if (LIST_RELOAD_EVENTS.has(ev.type)
+      if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
+      if (S.tab === 'queue' && !S.selected) bgRenderMain();
+    } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
-        && (!ev.payload?.projectId || ev.payload.projectId === S.projectId))) {
+        ))) {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
@@ -3335,7 +3421,8 @@ function connectWs() {
     wsRetryMs = 1500;
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
-    if (wsHadDropped) {
+    if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
+    else if (wsHadDropped) {
       loadInbox().catch(() => {});
       refreshTasks().catch(() => {});
       if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
@@ -3346,7 +3433,7 @@ function connectWs() {
     wsHadDropped = true; setWsOnline(false);
     // Back off while the gateway is down (a restart, an expired session) instead
     // of hammering it from every open tab at a fixed 1.5 s.
-    setTimeout(connectWs, wsRetryMs);
+    connectWs.retryTimer = setTimeout(connectWs, wsRetryMs);
     wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
   };
 }
@@ -3377,7 +3464,6 @@ async function refreshTasks() {
         await loadTasks();
         if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
         if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-        renderRail();
         if (S.tab === 'queue' && !S.selected) seedQueue();
       } catch {}
     } while (taskRefreshQueued);
@@ -3535,6 +3621,7 @@ function onboardingStep(number, key, title, detail, action) {
 
 function pollOnboarding() {
   clearTimeout(S.onboardingTimer);
+  if (document.hidden || ['minimized', 'closed'].includes(S.onboarding?.display)) return;
   S.onboardingTimer = setTimeout(() => {
     if (document.hidden) return pollOnboarding();
     return refreshOnboarding();
@@ -3546,6 +3633,9 @@ function renderOnboarding() {
   if (!host) return;
   const state = S.onboarding;
   const completion = S.onboardingCompletion;
+  const renderKey = JSON.stringify([state, completion, S.organizationId, S.user?.id]);
+  if (host.onboardingRenderKey === renderKey) { pollOnboarding(); return; }
+  host.onboardingRenderKey = renderKey;
   if (state?.complete && completion?.organizationId === S.organizationId
     && completion.userId === S.user?.id && S.meta?.hosted) {
     clearTimeout(S.onboardingTimer);
@@ -4495,7 +4585,7 @@ function tagGroupVisibleTasks(group, keep, seen = new Map()) {
 function tagChips(t) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
-    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${tag.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
     .join('');
 }
 function priorityFlag(t) {
@@ -4602,7 +4692,7 @@ function taskRow(t, { showTags = true } = {}) {
   // rows retain their direct editing controls.
   if (isDraft && !archived) {
     return `
-    <div class="task-row" data-draft="${t.id}" tabindex="0">
+    <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
@@ -4623,7 +4713,7 @@ function taskRow(t, { showTags = true } = {}) {
     ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
-    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
+    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
@@ -4656,7 +4746,7 @@ function pullRequestLinks(v) {
   return prs.map((pr) => {
     const state = pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
     const label = prs.length > 1 && pr.repo ? `${pr.repo} #${pr.number}` : `PR #${pr.number}`;
-    return `<a class="pr-link ${state}" href="${esc(pr.url)}" target="_blank" rel="noopener"
+    return `<a class="pr-link ${state}" href="${esc(safeHref(pr.url))}" target="_blank" rel="noopener"
       title="${esc(pr.slug ? `${pr.slug} — ${state}` : state)}">⇱ ${esc(label)}<span class="pr-state">${state}</span></a>`;
   }).join('');
 }
@@ -4793,7 +4883,7 @@ function wireOrgControls() {
 
 // Persist the current working query as a named view (Save-view button).
 async function saveCurrentView() {
-  const name = prompt('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  const name = await promptText('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
   if (!name) return;
   try {
     // The API persists a structured TaskQuery, so parse the working string into one
@@ -5095,10 +5185,15 @@ function openTagsManager(initialEditId = null) {
     if (S.tab === 'tasks') renderMain();
   };
   const draw = () => {
+    const draft = [...root.querySelectorAll('.tagm-new input, .tagm-new select, .tagm-new textarea')]
+      .map(control => ({ id: control.id, value: control.value, checked: control.checked }));
+    const editDraft = root.querySelector('.tagm-edit')?.dataset.tagId === editingId
+      ? [...root.querySelectorAll('.tagm-edit input, .tagm-edit select, .tagm-edit textarea')]
+        .map(control => ({ id: control.id, value: control.value, checked: control.checked })) : [];
     const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
       ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
-          <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
+          <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
           <span class="tagm-summary">
             <span class="pal-sub">${esc(t.kind || '—')}</span>
             ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
@@ -5124,7 +5219,7 @@ function openTagsManager(initialEditId = null) {
       .filter((tag) => !blockedParents.has(tag.id))
       .map((tag) => `<option value="${esc(tag.id)}" ${editing?.parentId === tag.id ? 'selected' : ''}>${esc(tagPathStr(tag.id))}</option>`)
       .join('');
-    const editForm = editing ? `<div class="tagm-form tagm-edit">
+    const editForm = editing ? `<div class="tagm-form tagm-edit" data-tag-id="${esc(editing.id)}">
       <div class="tagm-form-head"><div><b>Edit tag</b><span class="pal-sub">${esc(tagPathStr(editing.id))}</span></div><button class="icon-btn" id="tagm-cancel-edit" aria-label="Close editor">✕</button></div>
       <label>Name<input id="tagm-edit-name" class="title-in" value="${esc(editing.name)}" /></label>
       <label>Parent<select id="tagm-edit-parent" class="q-sel"><option value="">No parent (top level)</option>${parentOptions}</select></label>
@@ -5147,6 +5242,10 @@ function openTagsManager(initialEditId = null) {
       </div>
       <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth); <b>flag</b> = an operational marker (no-merge).</div>
     </div></div>`;
+    for (const saved of [...draft, ...editDraft]) {
+      const control = root.querySelector('#' + saved.id);
+      if (control) { control.value = saved.value; control.checked = saved.checked; }
+    }
     const close = () => (root.innerHTML = '');
     $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
     $('#tagm-close').addEventListener('click', close);
@@ -5154,12 +5253,17 @@ function openTagsManager(initialEditId = null) {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
         const kind = $('#tagm-kind').value || undefined;
+        const description = $('#tagm-description').value;
         await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
           name,
           kind,
           color: $('#tagm-use-color').checked ? $('#tagm-color').value : undefined,
-          description: $('#tagm-description').value,
+          description,
         }) });
+        if ($('#tagm-name').value.trim() === name && $('#tagm-description').value === description) {
+          $('#tagm-name').value = '';
+          $('#tagm-description').value = '';
+        }
         await refresh();
         toast(`Created tag “${name}”`);
       } catch (e) { toast(e.message, true); }
@@ -5884,7 +5988,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
-      </footer>
+      </div>
     </div>`;
   wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
@@ -6829,29 +6933,40 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (S.taskTab === 'parameters') renderTaskPage();
   });
 }
-async function refreshTask() {
+async function refreshTask(reason = 'all') {
   if (!S.selected) return;
   // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
   if (taskRecord(S.selected)?.params?.repeatable) return;
+  const id = S.selected;
+  const pending = refreshTask.pending ||= new Map();
+  const existing = pending.get(id);
+  if (existing) { existing.reasons.add(reason); return existing.promise; }
+  const entry = { reasons: new Set([reason]) };
+  pending.set(id, entry);
+  entry.promise = (async () => {
+    do {
+      const reasons = new Set(entry.reasons);
+      entry.reasons.clear();
+      const full = reasons.has('all');
+      const has = (pattern) => full || [...reasons].some(value => pattern.test(value));
   try {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
-    const id = S.selected;
     const epoch = S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
-      api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
-      api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions),
-      api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
-      api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
-      api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
-      api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests),
-      api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
-      api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []),
+      has(/review|stage|turn.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
+      has(/session|turn.result|stage/) ? api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions) : S.sessions,
+      has(/attempt|turn.result|merge.result/) ? api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup) : S.attemptGroup,
+      has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
+      has(/permission\.approval/) ? api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests) : S.permissionRequests,
+      has(/authorization\.approval/) ? api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests) : S.authorizationRequests,
+      has(/credential\.approval/) ? api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems) : S.approvalItems,
+      has(/^connection\./) ? api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []) : S.connections,
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -6873,8 +6988,22 @@ async function refreshTask() {
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
     // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
-  } catch {}
-  renderTaskPage();
+  } catch (error) {
+    if (error.status === 404 && S.selected === id) {
+      S.tasks = S.tasks.filter(task => task.id !== id);
+      toast('This task was deleted');
+      await closeTask();
+      return;
+    }
+  }
+  if (S.selected === id) {
+    renderTaskPage();
+    if (full && typeof document !== 'undefined') $('#tp-payments')?.refreshSpent?.();
+  }
+    } while (entry.reasons.size && S.selected === id);
+  })();
+  try { await entry.promise; }
+  finally { if (pending.get(id) === entry) pending.delete(id); }
 }
 // Close the task page by navigating back to the underlying list/queue; applyRoute()
 // then repaints the list. Kept as a navigation so the URL + history stay in sync
@@ -6916,7 +7045,7 @@ function orgEditorHtml(rec) {
     const t = tagById(id); if (!t) return '';
     const color = t.color ? `style="--tag:${esc(t.color)}"` : '';
     return `<span class="tag-assignment" ${color}>
-      <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
+      <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
       <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
     </span>`;
   }).join('');
@@ -7367,7 +7496,7 @@ function renderTaskPage() {
     const projectId = rec?.projectId || S.projectId;
     wireLiveSection($('#tp-auth'), () => wireTaskAuthorization(v));
     const payments = $('#tp-payments');
-    if (!wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId))) payments?.refreshSpent?.();
+    wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId));
     wireLiveSection($('#cred-editor-task'), (el) => renderCredentialEditor(el, 'task', { projectId, taskId: v.taskId }));
   }
   wireCopyButtons();
@@ -7885,6 +8014,26 @@ function reviewActionBtn(a, i) {
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
+function promptText(title, initial = '') {
+  return new Promise(resolve => {
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'text-prompt';
+    dialog.setAttribute('aria-label', title);
+    dialog.innerHTML = `<form method="dialog"><label class="form-row">${esc(title)}<input value="${esc(initial)}" autocomplete="off"></label>
+      <div class="inline-form" style="justify-content:flex-end"><button type="button" class="btn">Cancel</button><button class="btn primary" value="submit">Continue</button></div></form>`;
+    dialog.querySelector('[type="button"]').onclick = () => dialog.close();
+    dialog.addEventListener('keydown', event => event.stopPropagation());
+    dialog.addEventListener('close', () => {
+      const value = dialog.returnValue === 'submit' ? dialog.querySelector('input').value : null;
+      dialog.remove(); previousFocus?.focus(); resolve(value);
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    dialog.querySelector('input').select();
+  });
+}
+
 /** Ask for a secret in a masked field. `window.prompt` shows the value in clear
  *  and keeps it in the browser's prompt history; every other secret input in the
  *  console is `type="password"`, so this one is too. Resolves null on cancel. */
@@ -8038,7 +8187,7 @@ function wireReviewActions(v) {
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
-          await refreshTask(v.taskId);
+          await refreshTask();
           return;
         }
         // kind === 'run': stream output; open follow-up URLs; offer Stop.
@@ -8085,8 +8234,8 @@ function resourceReviewPlaceholder() {
 function loadResourceReview(v, force = false, inventory = false) {
   const cache = inventory ? resourceInventoryCache : resourceReviewCache;
   const cached = cache.get(v.taskId);
-  if (!force && cached && (cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))
-    && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  if (!force && cached && cached.view.stage === v.stage
+    && (inventory || cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))) return cached.promise;
   const entry = { view: v, pending: true, at: Date.now() };
   entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : '?summary=metadata'}`)
     .then((result) => {
@@ -8397,7 +8546,7 @@ function checkoutsSection(v) {
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const pr = c.pr
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
-           href="${esc(c.pr.url)}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
+           href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
     return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
       <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
@@ -8440,7 +8589,7 @@ function overviewTab(v) {
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
-         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
+         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
          ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
@@ -9689,8 +9838,9 @@ function conversationInputRequest(v, entries) {
 // copy that's safe to open even while the agent is running (it never mutates the live
 // session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
 function forkCommandFor(sess, worldPath) {
-  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
-  if (sess.provider === 'claude') return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  if (sess.provider === 'codex') return `cd ${quote(worldPath)} && CODEX_HOME=${quote(sess.home)} codex fork ${quote(sess.id)}`;
+  if (sess.provider === 'claude') return `cd ${quote(worldPath)} && CLAUDE_CONFIG_DIR=${quote(sess.home)} claude --resume ${quote(sess.id)} --fork-session`;
   // ACP makes forking available to karmax protocol-to-protocol. Until a harness
   // documents an equivalent safe terminal command, don't manufacture one.
   return '';
@@ -9824,7 +9974,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     const login = loginByKey[key];
     const credential = byKey[key];
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
-      const to = prompt(`Rename login ${login.account} to:`, login.account);
+      const to = await promptText(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
       try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
@@ -10945,7 +11095,7 @@ function hostDiagHtml(diag) {
 // Live-refresh just the host panel every 5s while Installation is open. Self-
 // terminates (no reschedule) once the tab changes or the element is gone.
 async function refreshHostDiag() {
-  if (S.tab !== 'installation' || !$('#host-diag')) return;
+  if (document.hidden || S.tab !== 'installation' || !$('#host-diag')) return;
   clearTimeout(S.hostDiagTimer);
   const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
@@ -11048,7 +11198,7 @@ function wireProcPanel(el) {
 // self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
 // so the very first paint shows 0% and settles from the second sample on.
 async function refreshProcPanel(now = false) {
-  if (S.tab !== 'installation' || !$('#proc-panel')) return;
+  if (document.hidden || S.tab !== 'installation' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
   const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
@@ -11144,7 +11294,7 @@ async function renderAccountStatus(organizationId = S.organizationId || 'org_per
     });
   });
   box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
-    const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
+    const ans = await promptText('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
     if (!ans) return;
     const mins = Number(ans);
     const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
@@ -11257,7 +11407,7 @@ function insightTaskRow(ref, kind) {
   const meta = kind === 'shipped'
     ? `${esc(project)}${ref.at ? ` · ${esc(fmtAgo(ref.at))}` : ''}`
     : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'needs input' : stageLabel({ stage: ref.stage }))}` : ''}`;
-  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(ref.pr)}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
+  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(safeHref(ref.pr))}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
   const title = `${ref.num != null ? `<span class="ins-num">#${esc(ref.num)}</span> ` : ''}${esc(ref.title)}`;
   return `<div class="ins-task"><span class="ins-dot ${kind}" aria-hidden="true"></span>
     ${href ? `<a class="ins-task-title" data-spa href="${esc(href)}">${title}</a>` : `<span class="ins-task-title">${title}</span>`}
@@ -12207,7 +12357,7 @@ async function wireWikiView(proj) {
   let data;
   try { data = await api(wikiUrl(info)); }
   catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
-  const sel = decodeURIComponent((location.hash || '').slice(1));
+  const sel = decodeRoutePart((location.hash || '').slice(1), true);
 
   nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
     <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
@@ -12949,9 +13099,11 @@ async function hydrateAvatarAvailability(scope, id) {
 }
 
 async function hydrateProjectSecrets(proj) {
-  const box = $('#project-secrets-box'); if (!box) return;
+  const box = $('#project-secrets-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    if (!renderIsCurrent()) return;
     box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
@@ -12963,35 +13115,36 @@ async function hydrateProjectSecrets(proj) {
       </details>
       <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      $('#project-secret-add').open = true; $('#project-secret-name').value = button.dataset.name; $('#project-secret-value').focus();
+      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name; box.querySelector('#project-secret-value').focus();
     }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Remove this secret and its vault value?')) return;
       try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    $('#project-secret-save')?.addEventListener('click', async () => {
-      const name = $('#project-secret-name').value.trim(), value = $('#project-secret-value').value;
+    box.querySelector('#project-secret-save')?.addEventListener('click', async () => {
+      const name = box.querySelector('#project-secret-name').value.trim(), value = box.querySelector('#project-secret-value').value;
       if (!name || !value) return toast('Name and value are required', true);
       try {
         await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name, value,
-          file: $('#project-secret-file').value.trim() || undefined }) });
+          file: box.querySelector('#project-secret-file').value.trim() || undefined }) });
         toast(`Saved ${name}`); await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-    $('#project-secret-import')?.addEventListener('click', async () => {
+    box.querySelector('#project-secret-import')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST',
-          body: JSON.stringify({ env: $('#project-secret-env').value }) });
+          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value }) });
         toast(`Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}`);
         await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectSecrets(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectSecrets(proj)); }
 }
 
 async function hydrateProjectData(proj) {
-  const box = $('#project-data-box'); if (!box) return;
+  const box = $('#project-data-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [all, storageLocations] = await Promise.all([
       api(`/api/projects/${encodeURIComponent(proj.id)}/resources`),
@@ -13001,6 +13154,7 @@ async function hydrateProjectData(proj) {
     const readyStorage = storageLocations.filter((location) => location.status === 'ready');
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when ${siteNameMarkup()} should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
@@ -13034,52 +13188,54 @@ async function hydrateProjectData(proj) {
         } catch (error) { toast(error.message, true); }
       });
     });
-    $('#data-discover')?.addEventListener('click', async () => {
+    box.querySelector('#data-discover')?.addEventListener('click', async () => {
       try {
-        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
+        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = box.querySelector('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
           || `<div class="project-empty">Nothing looks like project data. ${siteNameMarkup()} checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>`;
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
-          $('#data-add-panel').open = true;
-          $('#data-name').value = proposal.path.split('/').pop() || 'Data';
-          $('#data-path').value = proposal.suggested.target.path;
-          $('#data-access').value = proposal.suggested.access;
-          $('#data-publish').value = proposal.suggested.publish;
-          if ($('#data-source')) $('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          box.querySelector('#data-add-panel').open = true;
+          box.querySelector('#data-name').value = proposal.path.split('/').pop() || 'Data';
+          box.querySelector('#data-path').value = proposal.suggested.target.path;
+          box.querySelector('#data-access').value = proposal.suggested.access;
+          box.querySelector('#data-publish').value = proposal.suggested.publish;
+          if (box.querySelector('#data-source')) box.querySelector('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
+          box.querySelector('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#data-add')?.addEventListener('click', async () => {
-      const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
-      const files = [...$('#data-files').files, ...$('#data-folder').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
-      const button = $('#data-add'); button.disabled = true;
+    box.querySelector('#data-add')?.addEventListener('click', async () => {
+      const name = box.querySelector('#data-name').value.trim(); if (!name) return toast('Name is required', true);
+      const files = [...box.querySelector('#data-files').files, ...box.querySelector('#data-folder').files];
+      if (box.querySelector('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
+      const button = box.querySelector('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
-          name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
-          access: $('#data-access').value, isolation: 'fork', publish: $('#data-publish').value,
-          storageLocationId: $('#data-storage')?.value || undefined,
-          sourcePath: $('#data-source')?.value.trim() || undefined,
+          name, driver: 'volume@1', target: { kind: 'path', path: box.querySelector('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
+          access: box.querySelector('#data-access').value, isolation: 'fork', publish: box.querySelector('#data-publish').value,
+          storageLocationId: box.querySelector('#data-storage')?.value || undefined,
+          sourcePath: box.querySelector('#data-source')?.value.trim() || undefined,
         }) });
         if (files.length) await uploadResourceFiles(proj.id, created.id, files,
           (done, total) => { button.textContent = `Uploading ${Math.round(done / total * 100)}%`; });
         toast('Data resource added'); await hydrateProjectData(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add data'; }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectData(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectData(proj)); }
 }
 
 async function hydrateProjectServices(proj) {
-  const box = $('#project-services-box'); if (!box) return;
+  const box = $('#project-services-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [{ services }, resources] = await Promise.all([
       api(`/api/projects/${proj.id}/services`), api(`/api/projects/${proj.id}/resources`),
     ]);
     const secrets = resources.filter((resource) => ['secret@1', 'database@1', 'service@1'].includes(resource.driver));
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">↗</span><div><b>A service stays live.</b> Use an external service for an API, hosted database, or S3 bucket tasks call directly. Use a per-task container for an isolated development dependency such as Postgres or Redis. Credentials belong in Secrets.</div></div>
       ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
       <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
@@ -13102,9 +13258,9 @@ async function hydrateProjectServices(proj) {
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
       </details>`;
     const syncServiceFields = () => box.querySelectorAll('[data-service-kind]').forEach((fields) => {
-      fields.hidden = fields.dataset.serviceKind !== $('#service-kind').value;
+      fields.hidden = fields.dataset.serviceKind !== box.querySelector('#service-kind').value;
     });
-    $('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
+    box.querySelector('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
     box.querySelectorAll('.service-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm(`Remove ${button.dataset.name}?`)) return;
       try {
@@ -13112,9 +13268,9 @@ async function hydrateProjectServices(proj) {
         await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     }));
-    $('#service-discover')?.addEventListener('click', async () => {
+    box.querySelector('#service-discover')?.addEventListener('click', async () => {
       try {
-        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = $('#service-proposals');
+        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = box.querySelector('#service-proposals');
         target.innerHTML = proposals.map((service, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(service.name)}</b> <span class="chip">${esc(service.image)}</span>${service.urlEnv ? ` <span class="chip">${esc(service.urlEnv)}</span>` : ''}</div><button class="btn sm primary service-accept">Add</button></div>`).join('')
           || '<p class="task-sub">No importable Compose services found.</p>';
         target.querySelectorAll('.service-accept').forEach((button) => button.addEventListener('click', async () => {
@@ -13124,32 +13280,34 @@ async function hydrateProjectServices(proj) {
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#service-save')?.addEventListener('click', async () => {
-      const kind = $('#service-kind').value;
-      const name = $('#service-name').value.trim();
+    box.querySelector('#service-save')?.addEventListener('click', async () => {
+      const kind = box.querySelector('#service-kind').value;
+      const name = box.querySelector('#service-name').value.trim();
       if (!name) return toast('Service name is required', true);
-      if (kind === 'external' && !$('#service-connection').value) return toast('Choose a connection secret first', true);
+      if (kind === 'external' && !box.querySelector('#service-connection').value) return toast('Choose a connection secret first', true);
       try {
         await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify({
           name, kind,
-          ...(kind === 'external' ? { connectionResourceId: $('#service-connection').value } : {
-            image: $('#service-image').value.trim(), containerPort: Number($('#service-port').value) || undefined,
-            urlEnv: $('#service-url-env').value.trim() || undefined,
-            urlTemplate: $('#service-url-template').value.trim() || undefined,
-            seedResourceId: $('#service-seed').value || undefined,
-            seedContainerPath: $('#service-seed-path').value.trim() || undefined,
+          ...(kind === 'external' ? { connectionResourceId: box.querySelector('#service-connection').value } : {
+            image: box.querySelector('#service-image').value.trim(), containerPort: Number(box.querySelector('#service-port').value) || undefined,
+            urlEnv: box.querySelector('#service-url-env').value.trim() || undefined,
+            urlTemplate: box.querySelector('#service-url-template').value.trim() || undefined,
+            seedResourceId: box.querySelector('#service-seed').value || undefined,
+            seedContainerPath: box.querySelector('#service-seed-path').value.trim() || undefined,
           }),
         }) }); toast('Service saved'); await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectServices(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectServices(proj)); }
 }
 
 async function hydrateProjectEnvironment(proj) {
-  const box = $('#project-environment-box'); if (!box) return;
+  const box = $('#project-environment-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
@@ -13176,7 +13334,7 @@ async function hydrateProjectEnvironment(proj) {
         : `Stop the builder or build job in ${record.provider} first, and remove its image or snapshot named “${artifact}”.`
           + (record.builderId ? ` Builder: ${record.builderId}.` : ' For older builds, locate the builder in the provider dashboard or on the build host.')
           + (record.buildHost ? ` Build host: ${record.buildHost}.` : '');
-      const note = prompt(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
+      const note = await promptText(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
       if (!note?.trim()) return;
       button.disabled = true;
       try {
@@ -13187,134 +13345,36 @@ async function hydrateProjectEnvironment(proj) {
         await hydrateProjectEnvironment(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
-    $('#environment-propose')?.addEventListener('click', async () => {
+    box.querySelector('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
-        if (proposal.spec.image) $('#environment-image').value = proposal.spec.image;
-        if (proposal.spec.setup?.length) $('#environment-setup').value = proposal.spec.setup.join('\n');
-        if (proposal.spec.includeDocker) $('#environment-docker').checked = true;
-        $('#environment-evidence').innerHTML = proposal.evidence.length
+        if (proposal.spec.image) box.querySelector('#environment-image').value = proposal.spec.image;
+        if (proposal.spec.setup?.length) box.querySelector('#environment-setup').value = proposal.spec.setup.join('\n');
+        if (proposal.spec.includeDocker) box.querySelector('#environment-docker').checked = true;
+        box.querySelector('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
           : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
       } catch (error) { toast(error.message, true); }
     });
-    $('#environment-save')?.addEventListener('click', async () => {
+    box.querySelector('#environment-save')?.addEventListener('click', async () => {
       try {
         await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
-          image: $('#environment-image').value.trim() || undefined,
-          setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
-          boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
-          includeDocker: $('#environment-docker').checked,
+          image: box.querySelector('#environment-image').value.trim() || undefined,
+          setup: box.querySelector('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          boot: box.querySelector('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          includeDocker: box.querySelector('#environment-docker').checked,
         }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
       } catch (error) { toast(error.message, true); }
     });
-    $('#environment-build')?.addEventListener('click', async () => {
+    box.querySelector('#environment-build')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/environment/build`, { method: 'POST', body: '{}' });
         toast(`Building for ${result.building.provider}…`); setTimeout(() => hydrateProjectEnvironment(proj), 1500);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectEnvironment(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectEnvironment(proj)); }
 }
 
-async function hydrateProjectResources(proj) {
-  const box = $('#project-resources'); if (!box) return;
-  try {
-    const resources = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
-    const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
-    box.innerHTML = `<div class="section-h">Attached resources</div>
-      <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
-      <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
-        <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
-          <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
-        <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
-      </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
-      <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
-      <div class="settings-grid">
-        <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
-        <label class="form-row">Kind<select id="resource-driver"><option value="volume@1">Versioned files / model / SQLite</option><option value="secret@1">Secret</option><option value="database@1">Shared database URL</option><option value="service@1">External service credential</option></select></label>
-        <label class="form-row">World path or variable<input id="resource-target" placeholder="resources/training-data"></label>
-        <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
-        <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
-        <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Upload files<input id="resource-files" type="file" multiple></label>
-        <label class="form-row">Upload a folder<input id="resource-folder" type="file" multiple webkitdirectory></label>
-      </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
-    const driverInput = $('#resource-driver');
-    const syncDefaults = () => {
-      const name = $('#resource-name').value.trim() || 'resource';
-      const fileKind = driverInput.value === 'volume@1';
-      $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-      $('#resource-secret').disabled = fileKind;
-      $('#resource-files').disabled = !fileKind;
-      $('#resource-folder').disabled = !fileKind;
-      if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
-    };
-    driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
-    $('#resource-scan')?.addEventListener('click', async () => {
-      const button = $('#resource-scan'); const results = $('#resource-scan-results');
-      button.disabled = true; button.textContent = 'Scanning…';
-      try {
-        const scan = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources/scan`);
-        results.innerHTML = scan.proposals.length ? `<div class="section-h">Suggested classifications</div>${scan.proposals.map((proposal, index) =>
-          `<div class="queue-item" data-proposal="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span>
-          <div class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</div></div><button class="btn sm resource-use-proposal">Use suggestion</button></div>`).join('')}`
-          : '<p class="task-sub">No likely resources found. You can still attach one below.</p>';
-        results.querySelectorAll('[data-proposal]').forEach((row) => row.querySelector('.resource-use-proposal').addEventListener('click', () => {
-          const proposal = scan.proposals[Number(row.dataset.proposal)];
-          $('#resource-name').value = proposal.path.split('/').pop().replace(/\.[^.]+$/, '') || proposal.kind;
-          $('#resource-driver').value = proposal.suggested.driver;
-          $('#resource-target').value = proposal.suggested.target.path || proposal.suggested.target.name;
-          $('#resource-access').value = proposal.suggested.access;
-          $('#resource-publish').value = proposal.suggested.publish;
-          if ($('#resource-source-path') && proposal.suggested.driver === 'volume@1')
-            $('#resource-source-path').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#resource-driver').dispatchEvent(new Event('change'));
-          if (proposal.suggested.driver === 'secret@1') $('#resource-secret').focus();
-          else $('#resource-add').focus();
-        }));
-      } catch (error) { results.textContent = error.message; }
-      finally { button.disabled = false; button.textContent = 'Scan ignored project files'; }
-    });
-    $('#resource-add').addEventListener('click', async () => {
-      const button = $('#resource-add'); const name = $('#resource-name').value.trim();
-      if (!name) return toast('Resource name is required', true);
-      const driver = driverInput.value; const isFiles = driver === 'volume@1';
-      const enteredTarget = $('#resource-target').value.trim();
-      const target = isFiles ? { kind: 'path', path: enteredTarget || `resources/${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}` }
-        : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
-      button.disabled = true; button.textContent = 'Attaching…';
-      try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files, ...$('#resource-folder').files] : [];
-        const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
-          access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
-          publish: $('#resource-publish').value, secret: $('#resource-secret').value,
-          sourcePath: $('#resource-source-path')?.value.trim() || undefined }) });
-        if (selectedFiles.length) {
-          button.textContent = 'Uploading…';
-          await uploadResourceFiles(proj.id, created.id, selectedFiles, (sent, total) => {
-            button.textContent = `Uploading ${Math.round(sent / Math.max(total, 1) * 100)}%…`;
-          });
-        }
-        toast('Resource attached'); await hydrateProjectResources(proj);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Attach resource'; }
-    });
-    box.querySelectorAll('[data-resource]').forEach((row) => {
-      const resource = resources.find((candidate) => candidate.id === row.dataset.resource);
-      row.querySelector('.resource-toggle').addEventListener('click', async () => {
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-      row.querySelector('.resource-delete').addEventListener('click', async () => {
-        if (!confirm(`Remove resource “${resource.name}”? Existing task snapshots and audit history may be retained, but new tasks will no longer receive it.`)) return;
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-    });
-  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
-}
 
 async function uploadResourceFiles(projectId, resourceId, files, progress) {
   const upload = await api(`/api/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/uploads`, { method: 'POST' });
@@ -14620,7 +14680,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = prompt(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
+      const amt = await promptText(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
       if (amt == null) return;
       if (!Number(amt) || Number(amt) < 0) return toast('Enter an amount greater than zero.', true);
       try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
@@ -15306,11 +15366,17 @@ async function wireVaultCards(organizationId) {
       list.querySelectorAll('[data-vi]').forEach((row) => {
         const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
         const savePolicy = async () => {
+          const controls = row.querySelectorAll('select');
+          controls.forEach(control => { control.disabled = true; });
           try {
             const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
             Object.assign(item, updated.item || updated);
             toast('Policy saved');
-          } catch (e) { toast(e.message, true); }
+          } catch (e) {
+            row.querySelector('.vi-pol-use').value = item.policy?.use || 'auto';
+            row.querySelector('.vi-pol-reveal').value = item.policy?.reveal || 'ask';
+            toast(e.message, true);
+          } finally { controls.forEach(control => { control.disabled = false; }); }
         };
         row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
         row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
@@ -15863,7 +15929,7 @@ async function wireOutboundEmailCard() {
       $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
       $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
       $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-      const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+      const links = (info?.links || []).map((l) => `<a href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
       helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
     };
     if (data.provider) providerSel.value = data.provider;
@@ -15891,7 +15957,7 @@ async function wireOutboundEmailCard() {
       finally { btn.disabled = false; }
     });
     $('#oe-test').addEventListener('click', async () => {
-      const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+      const to = await promptText('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
       if (!to) return;
       const btn = $('#oe-test'); btn.disabled = true;
       try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
@@ -16267,7 +16333,7 @@ function inboxView() {
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.title || item.task?.title || 'Notification')}">
       <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
       <div class="task-main">
         <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
@@ -16309,21 +16375,22 @@ function wireInboxView() {
 
 async function markVisibleInboxRead() {
   const items = inboxItems().filter((item) => item.unread);
-  const results = await Promise.allSettled(items.map(async (item) => {
-    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, {
-      method: 'PATCH', body: JSON.stringify({ unread: false }),
+  const groups = new Map();
+  for (const item of items) {
+    if (!groups.has(item.organizationId)) groups.set(item.organizationId, []);
+    groups.get(item.organizationId).push(item.id);
+  }
+  const savedIds = new Set();
+  await Promise.allSettled([...groups].map(async ([organizationId, ids]) => {
+    const saved = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ ids }),
     });
-    if (!saved) throw new Error('Notification could not be marked read.');
+    for (const item of saved) savedIds.add(item.id);
   }));
-  items.forEach((item, index) => {
-    if (results[index].status !== 'fulfilled') return;
-    const current = S.inbox.find((candidate) => candidate.id === item.id);
-    if (current) current.unread = false;
-  });
-  // Invalidate reads started before the mutation; they may contain stale unread flags.
+  for (const item of S.inbox) if (savedIds.has(item.id)) item.unread = false;
   S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
   updateBell(); renderMain(); renderRail();
-  const failed = results.filter((result) => result.status === 'rejected');
+  const failed = items.filter(item => !savedIds.has(item.id));
   if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
 }
 
@@ -16585,7 +16652,8 @@ async function hydrateProfileGithub() {
     row.querySelector('.github-use')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}/active`, { method: 'POST', body: '{}' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
     row.querySelector('.github-custom')?.addEventListener('click', () => openGitIdentityDialog({ title: 'Custom identity', profile: account.profile,
       endpoint: `/api/user/github-accounts/${account.id}/identity`, onSaved: hydrateProfileGithub }));
-    row.querySelector('.github-remove')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
+    row.querySelector('.github-remove')?.addEventListener('click', async () => {
+      if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return; try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });
 }
 
@@ -17581,6 +17649,10 @@ function renderOrganizationRoles() {
   });
 }
 
+function setEventHandler(element, type, handler) {
+  if (element) element['on' + type] = handler;
+}
+
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -17623,10 +17695,11 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
+  let githubLoadError = null;
   const [entitlements, gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, usagePolicy, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
     api(`/api/organizations/${organizationId}/entitlements`).catch(() => null),
-    api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
-    api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${organizationId}/git-connections`).catch(error => { githubLoadError = error; return []; }),
+    api(`/api/organizations/${organizationId}/github/app`).catch(error => { githubLoadError = error; return { configured: false }; }),
     api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
     api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
     api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
@@ -17664,6 +17737,7 @@ async function hydrateOrganizationView() {
     <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
   </div>`; }).join('')}</div>
   <div class="github-org-actions">${githubSetup}</div>`;
+  if (githubLoadError) paneError($('#org-github'), githubLoadError, hydrateOrganizationView);
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   S.worldProviderConnections = providerConnections;
   // The default Agent environment moved to Task defaults (below) and can be
@@ -17741,7 +17815,7 @@ async function hydrateOrganizationView() {
     <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
     <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
   wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
-  $('#invite-member')?.addEventListener('click', async () => {
+  setEventHandler($('#invite-member'), 'click', async () => {
     try {
       const email = $('#invite-email').value;
       const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
@@ -17751,8 +17825,8 @@ async function hydrateOrganizationView() {
       $('#invite-email').value = '';
     } catch (e) { toast(e.message, true); }
   });
-  $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  $('#connect-github')?.addEventListener('click', async () => {
+  setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#connect-github'), 'click', async () => {
     try {
       await connectOrganizationGithub(organizationId, hydrateOrganizationView);
     } catch (error) { toast(error.message, true); }
@@ -17763,12 +17837,13 @@ async function hydrateOrganizationView() {
     history.replaceState(history.state, '', returned);
     connectOrganizationGithub(organizationId, hydrateOrganizationView).catch(error => toast(error.message, true));
   }
-  $('#org-github-custom')?.addEventListener('click', () => openGitIdentityDialog({
+  setEventHandler($('#org-github-custom'), 'click', () => openGitIdentityDialog({
     title: 'Custom automation identity', profile: githubIdentity.profile,
     endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: hydrateOrganizationView,
   }));
   $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
     row.querySelector('.github-remove')?.addEventListener('click', async () => {
+      if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return;
       try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
       catch (error) { toast(error.message, true); }
     });
@@ -17787,7 +17862,7 @@ async function hydrateOrganizationView() {
     row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
     row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
-  $('#storage-connect')?.addEventListener('click', async () => {
+  setEventHandler($('#storage-connect'), 'click', async () => {
     try {
       const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
         name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
@@ -17812,11 +17887,11 @@ async function hydrateOrganizationView() {
       catch (error) { toast(error.message, true); }
     });
   });
-  $('#runner-create')?.addEventListener('click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#runner-create'), 'click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
   $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-  $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
-  $('#org-execution-save')?.addEventListener('click', async () => {
+  setEventHandler($('#org-execution-network'), 'change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
+  setEventHandler($('#org-execution-save'), 'click', async () => {
     const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
     const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
     try {
@@ -17830,7 +17905,7 @@ async function hydrateOrganizationView() {
       } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
     } catch (error) { toast(error.message, true); }
   });
-  $('#usage-policy-save')?.addEventListener('click', async () => {
+  setEventHandler($('#usage-policy-save'), 'click', async () => {
     const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
     const cap = $('#usage-managed-cap').value.trim();
     const agentCap = $('#usage-agent-active').value.trim();
@@ -17847,9 +17922,9 @@ async function hydrateOrganizationView() {
     } catch (error) { toast(error.message, true); }
   });
   $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
-  $('#save-identity')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
-  $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
-  $('#create-organization')?.addEventListener('click', createOrganization);
+  setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#create-organization'), 'click', createOrganization);
   $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
     const editor = row.querySelector('.authz-editor');
     wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
@@ -17882,7 +17957,7 @@ async function hydrateOrganizationView() {
     });
     block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   });
-  $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+  setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
   const renameOrganization = async () => {
     const name = $('#organization-name')?.value.trim();
     if (!name) return toast('Organization name is required', true);
@@ -17894,15 +17969,15 @@ async function hydrateOrganizationView() {
       renderMain();
     } catch (e) { toast(e.message, true); }
   };
-  $('#rename-organization')?.addEventListener('click', renameOrganization);
-  $('#organization-name')?.addEventListener('keydown', (event) => {
+  setEventHandler($('#rename-organization'), 'click', renameOrganization);
+  setEventHandler($('#organization-name'), 'keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
   });
-  $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = await promptText(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
 }
 
 async function createOrganization() {
-  const name = prompt('Organization name');
+  const name = await promptText('Organization name');
   if (!name) { syncOrganizationSwitcher(); return; }
   try {
     const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
@@ -18194,8 +18269,14 @@ async function runDeclaredAction(a) {
 }
 
 // Auto-rendered argument form for a declared action (ActionArg[] → controls).
+function createTransientOverlay() {
+  const root = document.createElement('div');
+  $('#modal-root').appendChild(root);
+  return root;
+}
+
 function openActionForm(a) {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   const control = (arg) => {
     const label = `<div class="label-row"><label>${esc(arg.label || arg.name)}${arg.required ? ' *' : ''}</label></div>`;
     if (arg.type === 'text') return `<div class="form-row">${label}<textarea data-arg="${esc(arg.name)}" rows="3">${esc(arg.default ?? '')}</textarea></div>`;
@@ -18210,7 +18291,7 @@ function openActionForm(a) {
       <button class="btn" id="act-cancel">Cancel</button>
       <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
     </div></div></div>`;
-  const close = () => (root.innerHTML = '');
+  const close = () => (root.remove());
   $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
   $('#act-cancel').addEventListener('click', close);
   root.querySelector('[data-arg]')?.focus();
@@ -18431,11 +18512,11 @@ function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
     })),
   );
   allTasks.sort((a, b) => b.score - a.score || (b.task.createdAt || 0) - (a.task.createdAt || 0));
-  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: allTasks.length };
+  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: (responses || []).reduce((total, row) => total + (row.result?.total ?? row.result?.tasks?.length ?? 0), 0) };
 }
 
 function openGlobalSearch() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="gs-scrim"><div class="palette global-search" role="dialog" aria-modal="true" aria-labelledby="gs-title">
     <div class="global-search-head">
       <span aria-hidden="true">⌕</span>
@@ -18452,14 +18533,21 @@ function openGlobalSearch() {
   let active = 0;
   let timer = 0;
   let request = 0;
+  let controller = null;
   let state = 'prompt';
   let summary = '';
-  const close = () => { clearTimeout(timer); request++; root.innerHTML = ''; };
+  const close = () => { clearTimeout(timer); controller?.abort(); request++; root.remove(); };
 
   const draw = () => {
     if (state === 'prompt') {
       input.removeAttribute('aria-activedescendant');
       list.innerHTML = `<div class="global-search-empty"><b>Find work anywhere</b><span>Enter words, a task number, or a task filter. Results include archived work.</span></div>`;
+      return;
+    }
+    if (state === 'error') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = '<div class="global-search-empty">Search unavailable. <button class="btn sm">Retry</button></div>';
+      list.querySelector('button').onclick = search;
       return;
     }
     if (state === 'loading') {
@@ -18492,15 +18580,19 @@ function openGlobalSearch() {
   const search = async () => {
     const q = input.value.trim();
     const ownRequest = ++request;
-    if (!q) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    if (q.length < 2) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    controller?.abort();
+    controller = new AbortController();
     state = 'loading';
     draw();
-    const responses = (await Promise.all(S.projects.map(async (project) => {
-      try {
-        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`);
-        return { project, result };
-      } catch { return null; } // project discovery and task-read grants can differ
-    }))).filter(Boolean);
+    let responses;
+    try {
+      const results = await api(`/api/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
+      responses = results.map(result => ({ project: projectById(result.projectId), result })).filter(row => row.project);
+    } catch (error) {
+      if (ownRequest !== request || !root.contains(input) || error.name === 'AbortError') return;
+      state = 'error'; draw(); return;
+    }
     if (ownRequest !== request || !root.contains(input)) return;
     const found = assembleGlobalSearchResults(q, S.projects, responses);
     items = [
@@ -18524,7 +18616,7 @@ function openGlobalSearch() {
     state = 'done';
     draw();
   };
-  const schedule = () => { request++; clearTimeout(timer); timer = setTimeout(search, 160); };
+  const schedule = () => { controller?.abort(); request++; clearTimeout(timer); timer = setTimeout(search, 160); };
   const run = (i) => { const item = items[i]; if (!item) return; close(); item.run(); };
 
   input.addEventListener('input', schedule);
@@ -18549,14 +18641,14 @@ function openGlobalSearch() {
 
 // -- the ⌘K palette: fuzzy command/action invocation --------------------------
 function openPalette() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
     <input id="pal-in" placeholder="Type a command…" autocomplete="off" />
     <div id="pal-list"></div>
   </div></div>`;
   const input = $('#pal-in');
   const list = $('#pal-list');
-  const close = () => (root.innerHTML = '');
+  const close = () => (root.remove());
   let items = [];
   let active = 0;
   const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2 };
@@ -18600,7 +18692,7 @@ function openPalette() {
 
 // -- "?" help: the same registry, grouped — includes every workflow's commands -
 function openHelp() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
   const groups = [...new Set(cmds.map((c) => c.group))];
   const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
@@ -18621,8 +18713,8 @@ function openHelp() {
       ${row('↵', 'Open the full task form with what you typed')}
       ${row(esc(fmtKeys('meta+Enter')), 'Add the task directly')}
     </div></div></div>`;
-  $('#help-close').addEventListener('click', () => (root.innerHTML = ''));
-  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.innerHTML = ''; });
+  $('#help-close').addEventListener('click', () => (root.remove()));
+  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });
 }
 
 // ── login ────────────────────────────────────────────────────────────────────
@@ -19171,8 +19263,8 @@ function renderAccessPending() {
   </div></div>`;
   $('#pending-retry').addEventListener('click', () => boot());
   $('#pending-workspace').addEventListener('click', async () => {
-    const organizationName = prompt('Organization name'); if (!organizationName) return;
-    const projectName = prompt('First project name', 'My project'); if (!projectName) return;
+    const organizationName = await promptText('Organization name'); if (!organizationName) return;
+    const projectName = await promptText('First project name', 'My project'); if (!projectName) return;
     try {
       const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name: organizationName }) });
       await api(`/api/organizations/${organization.id}/projects`, { method: 'POST', body: JSON.stringify({ name: projectName, config: {} }) });
@@ -19548,7 +19640,7 @@ async function finishMcpCallback() {
   const key = `mcp-oauth:${state}`; let pending;
   try { pending = JSON.parse(sessionStorage.getItem(key) || 'null'); } catch {}
   history.replaceState({}, '', '/mcp-callback');
-  document.querySelector('#app').innerHTML = '<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to Tavya</a></main>';
+  document.querySelector('#app').innerHTML = `<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to ${siteNameMarkup()}</a></main>`;
   const status = document.querySelector('.mcp-callback p');
   try {
     if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');

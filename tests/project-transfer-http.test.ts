@@ -135,9 +135,11 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     page.on('pageerror', error => errors.push(error.message));
     await page.context().addCookies([{ name: 'test', value: 'alice', url: f.server.url }]);
     await page.goto(`${f.server.url}/source/project/settings`, { waitUntil: 'domcontentloaded' });
-    let confirmation = '';
-    page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept('The old gateway is stopped; no host artifact exists.'); });
     await page.locator('[data-environment-recover]').click();
+    const dialog = page.getByRole('dialog');
+    const confirmation = await dialog.innerText();
+    await dialog.getByRole('textbox').fill('The old gateway is stopped; no host artifact exists.');
+    await dialog.getByRole('button', { name: 'Continue', exact: true }).click();
     await expect.poll(async () => (await environments.builds(f.project.id))[0]?.status).toBe('failed');
     expect(confirmation).toContain('does not stop or delete provider resources for you');
     expect(confirmation).toContain('another gateway');

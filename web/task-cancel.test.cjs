@@ -23,7 +23,7 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
       };
       const context = vm.createContext({
         S: { selected: 'task', view: { taskId: 'task' } },
-        $: element, QUICK_TASK_WORKFLOW: 'software-dev',
+        $: element, createTransientOverlay: () => ({ ...element('#overlay-root'), remove() {} }), QUICK_TASK_WORKFLOW: 'software-dev',
         confirm: message => { prompts.push(message); return accepted; },
         api: async (url, options) => { requests.push({ url, ...options }); },
         beginActionFeedback: () => feedback.push('start'), finishActionFeedback() {},
