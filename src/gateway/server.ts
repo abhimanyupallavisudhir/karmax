@@ -8345,7 +8345,7 @@ export class Gateway {
    * gateway drives CDP directly (agent + gateway share the host). For a REMOTE
    * world the browser lives in the sandbox with no private path from the host,
    * so the fill runs INSIDE the world via `world.exec`, the secret handed over
-   * stdin (never argv/env/a file the co-resident agent could read). Either way
+   * stdin (never argv/env/a file). The agent still controls its browser. Either way
    * the live page origin is re-verified against the item's domains before typing.
    */
   private async fillCredential(callerTaskId: string | undefined, args: {

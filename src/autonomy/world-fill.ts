@@ -11,7 +11,8 @@ import type { World } from '../world/types.js';
  * private socket to the sandbox's loopback, so it runs the `cdp-fill.mjs`
  * helper INSIDE the world via `world.exec`. The secret is resolved host-side
  * (the vault never leaves the gateway) and handed to the helper over STDIN —
- * never argv/env/a file, so the co-resident agent cannot read it. The helper
+ * never argv/env/a file. The agent still controls the browser and sandbox; this
+ * avoids exposing secrets in tool results, not access by a hostile agent. The helper
  * re-verifies the live page origin against the item's domains before typing,
  * exactly like the local path.
  */
