@@ -24,7 +24,7 @@ describe('organization and collaboration domain', () => {
     try {
       const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
       const project = await store.createProject('App', {}, org.id);
-      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']])
+      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']] as const)
         await store.addAuthorizationInbox(org.id, ['owner'],
           { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
       const inbox = await store.listInbox('owner', org.id);
