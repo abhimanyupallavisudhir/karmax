@@ -116,6 +116,19 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(JSON.parse(diagnostic.detail)).toMatchObject({ version: 1, reason: 'error', remote: false });
   });
 
+  it('retains safe startup diagnostics from local harness stderr', async () => {
+    sdkState.run = async function* (options) {
+      const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ['-e', 'process.stderr.write("Cannot find module SECRET_TOKEN"); process.exitCode = 1'], env: {}, signal: new AbortController().signal });
+      await new Promise(resolve => child.once('close', resolve));
+      throw new Error('harness exited');
+    };
+    const activities: any[] = [];
+    await expect(new ClaudeAdapter().runTurn(input, { ...ctx, emitActivity: (e: any) => activities.push(e) })).rejects.toThrow('harness exited');
+    const detail = activities.find(a => a.id === 'claude-startup-diagnostics').detail;
+    expect(JSON.parse(detail).stderr.flags).toContain('package');
+    expect(detail).not.toContain('SECRET_TOKEN');
+  });
+
   it('uses one stdio platform server plus a disjoint local-control server', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
     await new ClaudeAdapter().runTurn({ ...input, extraEnv: { KARMAX_TOKEN: 'scoped' } }, ctx);

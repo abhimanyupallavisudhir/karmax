@@ -31,7 +31,7 @@ import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAge
 import { worldWorkingDirectory } from '../world/types.js';
 import { recoverClaudeToolInputs } from './claude-history.js';
 import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
-import { boundedStartupProbe } from './startup-diagnostics.js';
+import { boundedStartupProbe, startupStderrSummary } from './startup-diagnostics.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -374,6 +374,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // The SDK only sees a codeless exit when the sandbox stream drops; the
     // process knows the agent may still be running there (task 348).
     let remoteProcess: RemoteSpawnedProcess | undefined;
+    let localStderr = '';
+    let localStderrBytes = 0;
 
     // Only turn-local controls live in-process. Historically this SDK server and
     // the config-home stdio bridge were both registered as `karmax`; the SDK
@@ -685,7 +687,7 @@ export class ClaudeAdapter implements AgentAdapter {
             cwd: o.cwd,
             env: custody.env,
             signal: o.signal,
-            stdio: ['pipe', 'pipe', 'ignore'],
+            stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
             detached: true, // own process group remains the custody fallback
           });
@@ -693,6 +695,10 @@ export class ClaudeAdapter implements AgentAdapter {
           // cover the spawn→return edge so an asynchronous ENOENT never becomes an
           // unhandled EventEmitter error in the host process.
           child.on('error', () => {});
+          child.stderr?.on('data', (chunk: Buffer) => {
+            localStderrBytes += chunk.length;
+            localStderr = (localStderr + chunk.toString()).slice(-64 * 1024);
+          });
           if (child.pid) {
             const pid = child.pid;
             registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: runtimeWorld.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
@@ -717,7 +723,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (startupDiagnosticCaptured) return;
       startupDiagnosticCaptured = true;
       const at = Date.now();
-      const snapshot = remoteProcess ? await remoteProcess.startupDiagnostics() : { process: 'not-observed' };
+      const snapshot = remoteProcess ? await remoteProcess.startupDiagnostics() : { process: 'not-observed', stderr: startupStderrSummary(localStderr, localStderrBytes) };
       await ctx.emitActivity?.({ id: 'claude-startup-diagnostics', kind: 'error', phase: 'failed',
         title: reason === 'timeout' ? 'Agent startup stalled' : 'Agent startup failed',
         detail: JSON.stringify({ version: 1, at, reason, elapsedMs: at - startupAt,
