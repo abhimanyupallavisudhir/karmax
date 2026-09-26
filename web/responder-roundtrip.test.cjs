@@ -8,6 +8,9 @@ test('UI-5: responder uses the same avatar and MCP selection as other agents', (
   const spec = { provider: 'mock', avatarId: 'avatar-1', mcpConnections: ['connection-1'] };
   const ctx = vm.createContext({ readAgentSpec: () => spec }); vm.runInContext(fn('readResponder'), ctx);
   const route = ctx.readResponder({ querySelector: s => s === '.rf-kind' ? { value: 'agent' } : {}, getAttribute: () => '""' });
-  assert.equal(route.avatarId, spec.avatarId); assert.deepEqual(route.mcpConnections, spec.mcpConnections);
+  assert.equal(route.kind, 'human'); assert.deepEqual([...route.audience], ['avatar:avatar-1']);
+  delete spec.avatarId;
+  const agent = ctx.readResponder({ querySelector: s => s === '.rf-kind' ? { value: 'agent' } : {}, getAttribute: () => '\"\"' });
+  assert.deepEqual(agent.mcpConnections, spec.mcpConnections);
   assert.match(fn('normResponder'), /avatarId/);
 });

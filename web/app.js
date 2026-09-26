@@ -1366,6 +1366,7 @@ function readResponder(box) {
   }
   const ab = box.querySelector('.agent-field');
   const route = { kind: 'agent', ...readAgentSpec(ab) };
+  if (route.avatarId) return { kind: 'human', audience: [`avatar:${route.avatarId}`] };
   const prompt = box.querySelector('.rf-prompt')?.value ?? '';
   const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
