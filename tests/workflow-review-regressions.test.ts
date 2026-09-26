@@ -1,4 +1,8 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, expect, it, vi } from 'vitest';
+
+// Other files import these workflows with the real SDK when isolate is disabled.
+vi.hoisted(() => vi.resetModules());
+afterAll(() => { vi.doUnmock('@temporalio/workflow'); vi.resetModules(); });
 
 const wf = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => any>(),
