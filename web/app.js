@@ -16677,7 +16677,8 @@ async function hydrateProfileGithub() {
     row.querySelector('.github-use')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}/active`, { method: 'POST', body: '{}' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
     row.querySelector('.github-custom')?.addEventListener('click', () => openGitIdentityDialog({ title: 'Custom identity', profile: account.profile,
       endpoint: `/api/user/github-accounts/${account.id}/identity`, onSaved: hydrateProfileGithub }));
-    row.querySelector('.github-remove')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
+    row.querySelector('.github-remove')?.addEventListener('click', async () => {
+      if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return; try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });
 }
 
@@ -17865,6 +17866,7 @@ async function hydrateOrganizationView() {
   }));
   $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
     row.querySelector('.github-remove')?.addEventListener('click', async () => {
+      if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return;
       try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
       catch (error) { toast(error.message, true); }
     });
