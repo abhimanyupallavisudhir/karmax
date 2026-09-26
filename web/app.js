@@ -348,11 +348,16 @@ const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbo
 // page it names. The tasks list's whole search state (free text, filters, group,
 // sort) is the one query string in `?q=`, so it rides along as `q` on every
 // project route: a search is just a URL.
+function decodeRoutePart(value, component = false) {
+  try { return component ? decodeURIComponent(value) : decodeURI(value); }
+  catch { return value; }
+}
+
 function parseRoute(url) {
   const [pathname, search = ''] = String(url).split('?');
   const query = new URLSearchParams(search);
   const q = query.get('q') || '';
-  const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  const seg = decodeRoutePart(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
   if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
@@ -12201,7 +12206,7 @@ async function wireWikiView(proj) {
   let data;
   try { data = await api(wikiUrl(info)); }
   catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
-  const sel = decodeURIComponent((location.hash || '').slice(1));
+  const sel = decodeRoutePart((location.hash || '').slice(1), true);
 
   nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
     <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
