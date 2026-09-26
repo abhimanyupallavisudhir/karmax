@@ -16,6 +16,7 @@ dist/
 .turnkey.env
 .secrets/
 deploy/backups/
+deploy/.updates/
 
 # logs / coverage / caches
 *.log

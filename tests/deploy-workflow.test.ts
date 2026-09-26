@@ -39,7 +39,7 @@ describe('post-push deployment to the public instance', () => {
 
   it('exists, so a landed commit reaches the VPS without anyone SSHing in by hand', () => {
     expect(deploy).toBeDefined();
-    expect(script).toContain('deploy/.karmax-update update');
+    expect(script).toContain("./deploy/.karmax-runner start '$DEPLOY_SHA'");
   });
 
   it('is separate from PR CI and starts only after the master CI workflow succeeds', () => {
@@ -52,8 +52,14 @@ describe('post-push deployment to the public instance', () => {
   it('passes the exact SHA validated by CI instead of pulling an arbitrary newer master', () => {
     expect(JSON.stringify(deploy.env)).toContain('github.event.workflow_run.head_sha');
     expect(script).toContain("git show '$DEPLOY_SHA:deploy/karmax'");
-    expect(script).toContain("./deploy/.karmax-update update '$DEPLOY_SHA'");
+    expect(script).toContain("./deploy/.karmax-runner start '$DEPLOY_SHA'");
     expect(operator.split('cmd_update() {')[1]?.split('\n}')[0]).not.toContain('pull --ff-only');
+  });
+
+  it('polls a detached host update so losing the runner connection cannot interrupt deployment', () => {
+    expect(script).toContain('deploy/.updates/');
+    expect(script).toContain('status');
+    expect(script).toContain('sleep 10');
   });
 
   it('accepts only a successful push from this repository and checks ancestry before executing candidate code', () => {
