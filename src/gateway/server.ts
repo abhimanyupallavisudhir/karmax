@@ -80,7 +80,7 @@ import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
-import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
@@ -581,6 +581,7 @@ export class Gateway {
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
+  private wikiWork = new Set<Promise<void>>();
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
   private wikiRemoteRetryAfter = new Map<string, number>();
@@ -1113,10 +1114,14 @@ export class Gateway {
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
     });
 
-    // Initialize local canonical repos before binding so task starts cannot race
-    // that invariant. Remote provisioning is scheduled best-effort by
-    // ensureProjectWiki and deliberately does not gate the control plane.
-    for (const project of (await this.deps.store.listProjects())) await this.ensureProjectWiki(project);
+    // Wiki repair is best-effort; project/task mutations initialize their own
+    // canonical wiki before use, so unrelated projects never delay binding.
+    this.trackWikiWork((async () => {
+      for (const project of await this.deps.store.listProjects()) {
+        if (this.closing) break;
+        await this.ensureProjectWiki(project).catch(error => console.warn('[wiki] startup repair failed:', error));
+      }
+    })().catch(error => console.warn('[wiki] startup scan failed:', error)));
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
@@ -1145,6 +1150,7 @@ export class Gateway {
       port,
       close: async () => {
           this.closing = true;
+          while (this.wikiWork.size) await Promise.allSettled([...this.wikiWork]);
           if (this.connectionTimer) clearInterval(this.connectionTimer);
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
@@ -7577,8 +7583,15 @@ export class Gateway {
    * connected and the creating human authorized, also create its private
    * companion remote; otherwise the local repo remains ready and this is
    * retried naturally when a project is next set up. */
+  private trackWikiWork(work: Promise<void>): void {
+    this.wikiWork.add(work);
+    void work.finally(() => this.wikiWork.delete(work)).catch(() => {});
+  }
+
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
-    const root = ensureProjectWikiRepository(paths().content, project.id);
+    if (this.closing) return;
+    const root = await ensureProjectWikiRepositoryAsync(paths().content, project.id);
+    if (this.closing) return;
     if (!(await this.deps.store.projectWiki(project.id))) (await this.deps.store.setProjectWikiRepository(project.id));
     const current = (await this.deps.store.projectWiki(project.id))?.repository;
     if (current && this.wikiRemotesReady.has(project.id)) return;
@@ -7592,7 +7605,7 @@ export class Gateway {
     if (current?.private && current.gitConnectionId) {
       if (this.wikiRemotesProvisioning.has(project.id)) return;
       this.wikiRemotesProvisioning.add(project.id);
-      void (async () => {
+      this.trackWikiWork((async () => {
         try {
           await setProjectWikiRemote(root, current.sshUrl, await githubApp.brokerCredentials(current));
           this.wikiRemotesReady.add(project.id);
@@ -7603,7 +7616,7 @@ export class Gateway {
         } finally {
           this.wikiRemotesProvisioning.delete(project.id);
         }
-      })();
+      })());
       return;
     }
     const organizationId = project.organizationId ?? 'org_personal';
@@ -7626,7 +7639,7 @@ export class Gateway {
     if (!connection) return;
     if (this.wikiRemotesProvisioning.has(project.id)) return;
     this.wikiRemotesProvisioning.add(project.id);
-    void (await (async () => {
+    this.trackWikiWork((async () => {
       try {
         const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
         // Preserve the remote identity across project renames. The deterministic

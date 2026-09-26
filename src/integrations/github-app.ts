@@ -483,6 +483,7 @@ export class GitHubAppService {
   async convertManifest(code: string): Promise<ReturnType<GitHubAppService['status']>> {
     if (!code.trim()) throw new Error('GitHub App manifest code is missing');
     const response = await this.fetcher(`${this.apiBase}/app-manifests/${encodeURIComponent(code)}/conversions`, {
+      signal: AbortSignal.timeout(30_000),
       method: 'POST', headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' },
     });
     if (!response.ok) throw new Error(`GitHub manifest conversion failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
@@ -1421,7 +1422,9 @@ export class GitHubAppService {
   private async request<T = unknown>(pathname: string, token: string, init: RequestInit = {}): Promise<T> {
     const method = (init.method ?? 'GET').toUpperCase();
     for (let attempt = 0; ; attempt++) {
-      const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
+      const timeout = AbortSignal.timeout(30_000);
+      const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+      const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, signal, headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
         'x-github-api-version': '2022-11-28', 'content-type': 'application/json', ...(init.headers ?? {}),
       } });
@@ -1631,6 +1634,7 @@ export class GitHubAppService {
 
   private async oauthToken(input: Record<string, string>): Promise<any> {
     const response = await this.fetcher('https://github.com/login/oauth/access_token', {
+      signal: AbortSignal.timeout(30_000),
       method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams(input).toString(),
     });

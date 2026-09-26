@@ -942,3 +942,16 @@ describe('GitHub App failure and suspension handling', () => {
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+it('bounds GitHub provisioning requests with an abort signal (PS-7)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-timeout-'));
+  const store = await Store.create(':memory:');
+  let signal: AbortSignal | null | undefined;
+  try {
+    const app = await GitHubAppService.create(store, new CredentialBroker(new Vault(dir)), { fetch: async (_input, init) => {
+      signal = init?.signal; return Response.json({ ok: true });
+    } });
+    await (app as any).request('/repos/example/wiki', 'fixture');
+    expect(signal).toBeInstanceOf(AbortSignal);
+  } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
