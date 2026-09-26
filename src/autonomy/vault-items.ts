@@ -611,6 +611,8 @@ export class VaultItems {
     const env: Record<string, string> = {};
     for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
+      if (item.provenance.taskId && item.provenance.taskId !== taskId
+        && !caps.includes(`use-credential:item:${item.id}`)) continue;
       if ((await this.access(caps, taskId, item, 'use', { ambient: true })).status !== 'granted') continue;
       try {
         if (item.type === 'env' && item.fields.includes('env')) {

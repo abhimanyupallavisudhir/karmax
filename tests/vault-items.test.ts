@@ -523,3 +523,12 @@ it('bounds each organization independently and permits existing-item updates at 
   await expect(items.save({ type: 'note', label: 'extra' })).rejects.toThrow(/quota/);
   await expect(items.save({ id: item.id, type: 'note', label: 'updated' })).resolves.toMatchObject({ label: 'updated' });
 });
+
+it('does not ambiently inject another agent task’s environment item (AU-13)', async () => {
+  const { items } = makeService();
+  const item = await items.save({ type: 'env', label: 'Agent environment', secrets: { env: 'NODE_OPTIONS=--require=/tmp/agent.js\nAPP_TOKEN=value' },
+    provenance: { source: 'agent', taskId: 'creator' } });
+  expect(await items.envFor('other', ['use-credential:*'])).toEqual({});
+  expect(await items.envFor('creator', ['use-credential:*'])).toHaveProperty('APP_TOKEN', 'value');
+  expect(await items.envFor('other', [`use-credential:item:${item.id}`])).toHaveProperty('APP_TOKEN', 'value');
+});
