@@ -380,7 +380,7 @@ describe('portable world checkpoints', () => {
     const bin = path.join(dir, 'bin'), dockerLog = path.join(dir, 'docker.log');
     fs.mkdirSync(bin);
     fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh
-printf '%s\\n' "$*" >> "$KARMAX_TEST_DOCKER_LOG"
+printf '%s\\n' "$*" >> '${dockerLog}'
 case "$1" in
   version) echo 27.0 ;;
   inspect) echo 172.17.0.8 ;;
