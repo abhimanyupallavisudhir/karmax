@@ -884,7 +884,7 @@ export class GitHubAppService {
   }
 
   async disconnectInstallation(connectionId: string): Promise<void> {
-    this.tokenCache.delete(connectionId);
+    this.clearInstallationTokens(connectionId);
     this.tokenMints.delete(connectionId);
     (await this.store.deleteGitConnection(connectionId));
   }
@@ -973,10 +973,12 @@ export class GitHubAppService {
 
   private async dispatchConnectionWebhook(event: string, payload: any, connection: GitConnection): Promise<GithubWebhookResult> {
     const installationId = connection.installationId;
+    if (event === 'installation' && payload.action === 'new_permissions_accepted')
+      this.clearInstallationTokens(connection.id);
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {
       const saved = (await this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
         accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() }));
-      this.tokenCache.delete(saved.id);
+      this.clearInstallationTokens(saved.id);
       return { accepted: true, reconciled: 0 };
     }
     // The inverse transition. Without it `suspendedAt` was write-only: the ONLY
@@ -990,7 +992,7 @@ export class GitHubAppService {
         accountLogin: payload.installation?.account?.login ?? connection.accountLogin,
         accountType: payload.installation?.account?.type ?? connection.accountType ?? undefined,
         suspendedAt: undefined }));
-      this.tokenCache.delete(saved.id);
+      this.clearInstallationTokens(saved.id);
       const repositories = await this.reconcile(saved);
       return { accepted: true, reconciled: repositories.length };
     }
@@ -1109,23 +1111,33 @@ export class GitHubAppService {
    *    (each mint invalidates nothing, but N round trips per burst is pure waste
    *    and counts against the App's rate limit).
    */
-  async installationToken(connection: GitConnection): Promise<string> {
+  async installationToken(connection: GitConnection, repositoryIds?: string[]): Promise<string> {
     if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
-    const cached = this.tokenCache.get(connection.id);
+    if (repositoryIds && (!repositoryIds.length || repositoryIds.some((id) => !/^\d+$/.test(id)
+      || !Number.isSafeInteger(Number(id)) || Number(id) <= 0))) throw new Error('invalid GitHub repository scope');
+    const ids = repositoryIds ? [...new Set(repositoryIds.map(Number))].sort((a, b) => a - b) : undefined;
+    const cacheKey = ids ? `${connection.id}:${ids.join(',')}` : connection.id;
+    const cached = this.tokenCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
-    const inFlight = this.tokenMints.get(connection.id);
+    const inFlight = this.tokenMints.get(cacheKey);
     if (inFlight) return inFlight;
     const mint = (async () => {
       const created = await this.appRequest<{ token: string; expires_at: string }>(
-        `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`, { method: 'POST' },
+        `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`, { method: 'POST', ...(ids ? { body: JSON.stringify({ repository_ids: ids }) } : {}) },
       );
       const parsed = Date.parse(created.expires_at ?? '');
       const expiresAt = Number.isFinite(parsed) ? parsed : Date.now() + 3600_000;
-      this.tokenCache.set(connection.id, { token: created.token, expiresAt });
+      if (this.tokenMints.get(cacheKey) === mint) this.tokenCache.set(cacheKey, { token: created.token, expiresAt });
       return created.token;
-    })().finally(() => this.tokenMints.delete(connection.id));
-    this.tokenMints.set(connection.id, mint);
+    })().finally(() => { if (this.tokenMints.get(cacheKey) === mint) this.tokenMints.delete(cacheKey); });
+    this.tokenMints.set(cacheKey, mint);
     return mint;
+  }
+
+  private clearInstallationTokens(connectionId: string): void {
+    for (const cache of [this.tokenCache, this.tokenMints]) {
+      for (const key of cache.keys()) if (key === connectionId || key.startsWith(`${connectionId}:`)) cache.delete(key);
+    }
   }
 
   /** Drop a token minted before an installation-permission upgrade. Calls are
@@ -1136,15 +1148,15 @@ export class GitHubAppService {
     const last = this.tokenInvalidatedAt.get(connectionId) ?? 0;
     if (now - last < cooldownMs) return false;
     this.tokenInvalidatedAt.set(connectionId, now);
-    this.tokenCache.delete(connectionId);
+    this.clearInstallationTokens(connectionId);
     return true;
   }
 
   async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
     const connection = (await this.store.getGitConnection(repository.gitConnectionId));
-    if (!connection) throw new Error('repository GitHub App connection is missing');
-    const token = await this.installationToken(connection);
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
+    const token = await this.installationToken(connection, [repository.providerId ?? '']);
     return { httpsToken: token, env: { GH_TOKEN: token } };
   }
 
@@ -1153,13 +1165,13 @@ export class GitHubAppService {
   async actions(repository: Repository): Promise<GithubActionsApi> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
     const connection = (await this.store.getGitConnection(repository.gitConnectionId));
-    if (!connection) throw new Error('repository GitHub App connection is missing');
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
     return new GithubActionsApi(async (options) => {
       if (options?.forceRefresh) {
-        this.tokenCache.delete(connection.id);
-        this.tokenMints.delete(connection.id);
+        this.tokenCache.delete(`${connection.id}:${repository.providerId}`);
+        this.tokenMints.delete(`${connection.id}:${repository.providerId}`);
       }
-      return this.installationToken(connection);
+      return this.installationToken(connection, [repository.providerId ?? '']);
     }, { apiBase: this.apiBase, fetch: this.fetcher });
   }
 

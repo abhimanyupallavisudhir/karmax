@@ -522,9 +522,16 @@ describe('GitHub App integration', () => {
     expect((await store.repositoryDeployKeys(repository.id))).toBeUndefined();
     expect(calls.some((call) => call.path.includes('/keys'))).toBe(false);
     expect(calls.find((call) => call.path === '/app/installations/42')?.auth?.split('.')).toHaveLength(3);
+    const beforeBroker = calls.length;
     expect(await service.brokerCredentials(repository)).toMatchObject({
       httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' },
     });
+    expect(calls.slice(beforeBroker).find((call) => call.path.endsWith('/access_tokens'))?.body)
+      .toMatchObject({ repository_ids: [7] });
+    const beforeActions = calls.length;
+    await (await service.actions(repository)).listRuns('acme/app').catch(() => undefined);
+    expect(calls.slice(beforeActions).filter((call) => call.path.endsWith('/access_tokens'))
+      .every((call) => JSON.stringify(call.body?.repository_ids) === '[7]')).toBe(true);
     expect(await service.repositoryCloneToken(repository)).toBe('installation-token');
     const scopedMints = calls.filter((call) => call.path === '/app/installations/42/access_tokens')
       .map((call) => call.body).filter((body) => body?.repository_ids);
@@ -537,6 +544,13 @@ describe('GitHub App integration', () => {
     expect((await service.handleWebhook('installation_repositories', 'delivery-1', payload, signature)).accepted).toBe(false);
     await expect(service.handleWebhook('installation_repositories', 'delivery-2', payload, 'sha256=bad')).rejects.toThrow(/signature/);
 
+    const permissionsPayload = Buffer.from(JSON.stringify({ installation: { id: 42 }, action: 'new_permissions_accepted' }));
+    await service.handleWebhook('installation', 'permissions-accepted', permissionsPayload,
+      `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(permissionsPayload).digest('hex')}`);
+    const afterPermissions = calls.length;
+    await service.brokerCredentials(repository);
+    expect(calls.slice(afterPermissions).find((call) => call.path.endsWith('/access_tokens'))?.body)
+      .toMatchObject({ repository_ids: [7] });
     const project = await store.createProject('Rename', {}, organization.id);
     await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
     repositories = [{ ...repositories[0]!, name: 'renamed', ssh_url: 'git@github.com:acme/renamed.git' }];

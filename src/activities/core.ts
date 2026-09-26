@@ -719,7 +719,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (projectId && deps.githubApp) {
       const repository = authorizedRepository ?? (await enrolledGithubRepository(projectId, slug));
       const connection = repository?.gitConnectionId ? (await store.getGitConnection(repository.gitConnectionId)) : undefined;
-      if (connection) return await deps.githubApp.installationToken(connection);
+      if (connection && repository) return await deps.githubApp.installationToken(connection, [repository.providerId ?? '']);
     }
     // `isolatedGitEnvironment()` blanks GH_TOKEN: an organization without a
     // credentialed profile fails closed rather than borrowing the host's login.
@@ -3491,7 +3491,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return connection && typeof (deps.githubApp as any).installationToken === 'function'
           ? {
             api: new GithubPrApi(
-              () => deps.githubApp!.installationToken(connection),
+              () => deps.githubApp!.installationToken(connection, [repository!.providerId ?? '']),
               deps.githubPr ?? {},
             ),
             ...(repository && typeof (deps.githubApp as any).actions === 'function'
