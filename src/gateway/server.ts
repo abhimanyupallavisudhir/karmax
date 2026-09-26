@@ -1006,6 +1006,31 @@ export class Gateway {
     return recoveries;
   }
 
+  private async upgradePrincipal(req: http.IncomingMessage, url: URL): Promise<string | undefined> {
+    if (url.pathname.startsWith('/preview/')) {
+      const id = url.pathname.match(/^\/preview\/([^/]+)/)?.[1];
+      const lease = id ? await this.deps.store.previewLease(id) : undefined;
+      if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return;
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) return;
+      const current = await this.deps.store.currentWorld(lease.worldId);
+      if (!current || (current.generation ?? 1) !== lease.generation) return;
+      if (lease.tokenHash) {
+        if (!previewTokenMatches(lease.tokenHash, previewCookieValue(req.headers.cookie, lease.id))) return;
+      } else {
+        const auth = await this.auth(req, lease.projectId, lease.organizationId);
+        if (!auth || !(await this.deps.tokens.check(auth.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId })).ok) return;
+      }
+      return `preview:${lease.id}`;
+    }
+    if (!['/ws', '/ws/terminal', '/ws/review-action'].includes(url.pathname) || !this.sameOriginRequest(req)) return;
+    const ticket = url.pathname === '/ws/terminal' ? this.terminalTickets.get(url.searchParams.get('ticket') ?? '') : undefined;
+    const auth = ticket && ticket.taskId === url.searchParams.get('taskId') && ticket.expiresAt > Date.now()
+      ? ticket.session : await this.socketAuth(req, url);
+    if (!auth) return;
+    const record = await this.deps.tokens.verify(auth.apiToken);
+    return record ? record.principal : undefined;
+  }
+
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
@@ -1021,25 +1046,34 @@ export class Gateway {
     // Two WebSocket endpoints, routed by path on upgrade:
     //  /ws          — the live event stream (SPEC §3.3 transport).
     //  /ws/terminal — a PTY against the task's world (cheap check-in, SPEC §5.5).
-    const wssEvents = new WebSocketServer({ noServer: true });
-    const wssTerm = new WebSocketServer({ noServer: true });
-    const wssAction = new WebSocketServer({ noServer: true });
-    const wssPreview = new WebSocketServer({ noServer: true });
+    const wssEvents = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+    const wssTerm = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+    const wssAction = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+    const wssPreview = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+    let pendingUpgrades = 0;
+    const socketCounts = new Map<string, number>();
     server.on('upgrade', (req, socket, head) => {
-      if (this.closing || this.deps.runtimeReady?.() === false) { socket.destroy(); return; }
-      const { pathname } = new URL(req.url ?? '/', 'http://localhost');
-      const isolatedPreview = Boolean(configuredPreviewOrigin());
-      const onPreviewOrigin = isolatedPreview && this.requestIsPreviewOrigin(req);
-      if (onPreviewOrigin && pathname.startsWith('/preview/'))
-        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
-      else if (onPreviewOrigin) socket.destroy();
-      else if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
-      else if (pathname === '/ws/terminal') wssTerm.handleUpgrade(req, socket, head, (ws) => wssTerm.emit('connection', ws, req));
-      else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
-      else if ((!isolatedPreview && pathname.startsWith('/preview/')) ||
-        (!isolatedPreview && /^\/api\/tasks\/[^/]+\/preview\/\d+/.test(pathname)))
-        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
-      else socket.destroy();
+      const total = wssEvents.clients.size + wssTerm.clients.size + wssAction.clients.size + wssPreview.clients.size;
+      if (this.closing || this.deps.runtimeReady?.() === false || pendingUpgrades >= 64 || total + pendingUpgrades >= 1024) {
+        socket.destroy(); return;
+      }
+      pendingUpgrades++;
+      void (async () => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        const principal = await withTimeout(this.upgradePrincipal(req, url), 5000);
+        if (!principal || socket.destroyed || this.closing || (socketCounts.get(principal) ?? 0) >= 32) { socket.destroy(); return; }
+        const onPreviewOrigin = Boolean(configuredPreviewOrigin() && this.requestIsPreviewOrigin(req));
+        const wss = url.pathname.startsWith('/preview/') && (!configuredPreviewOrigin() || onPreviewOrigin) ? wssPreview
+          : onPreviewOrigin ? undefined : url.pathname === '/ws' ? wssEvents
+          : url.pathname === '/ws/terminal' ? wssTerm : url.pathname === '/ws/review-action' ? wssAction : undefined;
+        if (!wss) { socket.destroy(); return; }
+        socketCounts.set(principal, (socketCounts.get(principal) ?? 0) + 1);
+        socket.once('close', () => {
+          const count = (socketCounts.get(principal) ?? 1) - 1;
+          if (count) socketCounts.set(principal, count); else socketCounts.delete(principal);
+        });
+        wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+      })().catch(() => socket.destroy()).finally(() => { pendingUpgrades--; });
     });
     wssEvents.on('connection', (ws, req) => {
       ws.on('error', () => {});
