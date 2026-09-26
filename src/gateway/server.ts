@@ -3883,7 +3883,7 @@ export class Gateway {
           revision: resource.currentRevisionId ? redactResourceRevision((await store.getResourceRevision(resource.currentRevisionId))) : undefined,
         }))));
         if (method === 'POST') {
-          const b = await this.body(req, 600 * 1024 * 1024);
+          const b = await this.body(req);
           const id = newId('resource');
           const driver = String(b.driver ?? 'volume@1');
           const secret = typeof b.secret === 'string' ? b.secret : undefined;
@@ -4115,7 +4115,7 @@ export class Gateway {
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
           { error: 'staged resource candidates cannot be modified before Review' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
-        const b = await this.body(req, 600 * 1024 * 1024);
+        const b = await this.body(req);
         try {
           const revision = typeof b.sourcePath === 'string'
             // Same host-filesystem gate as the create path above: `hostLocal`,
@@ -8597,7 +8597,7 @@ export class Gateway {
     try {
       return JSON.parse(value.toString('utf8'));
     } catch {
-      return {};
+      throw Object.assign(new Error('invalid JSON body'), { status: 400 });
     }
   }
   /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`. */
