@@ -1,3 +1,4 @@
+import type { WorldReferenceKeys } from './reference-keys.js';
 import { isMissingSandbox } from './provider-errors.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -80,7 +81,8 @@ export class DaytonaWorldProvider implements WorldProvider {
     private image = process.env.KARMAX_DAYTONA_IMAGE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopSnapshot = process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
-    private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE) {
+    private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE,
+    private referenceKeys?: WorldReferenceKeys) {
     this.refKey = crypto.createHash('sha256').update(
       process.env.KARMAX_WORLD_REF_KEY ?? process.env.DAYTONA_API_KEY ?? 'karmax-development-world-ref',
     ).digest();
@@ -249,6 +251,11 @@ export class DaytonaWorldProvider implements WorldProvider {
   }
 
   private reference(handle: WorldHandle): { sandboxId: string; organizationId?: string } {
+    if (handle.sealedProviderRef?.startsWith('KWR2.') && this.referenceKeys) {
+      const value = this.referenceKeys.open(handle.sealedProviderRef);
+      if (!value.sandboxId) throw new Error('invalid Daytona world handle');
+      return { sandboxId: value.sandboxId, organizationId: value.organizationId };
+    }
     if (handle.sealedProviderRef) {
       const blob = Buffer.from(handle.sealedProviderRef, 'base64url');
       if (blob.subarray(0, 4).toString() !== 'KWR1') throw new Error('invalid sealed provider reference');
@@ -286,6 +293,7 @@ export class DaytonaWorldProvider implements WorldProvider {
   }
 
   private seal(value: Record<string, string>): string {
+    if (this.referenceKeys) return this.referenceKeys.seal(value);
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.refKey, iv);
     const body = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]);

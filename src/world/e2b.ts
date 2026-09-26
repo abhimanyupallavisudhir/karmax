@@ -1,3 +1,4 @@
+import type { WorldReferenceKeys } from './reference-keys.js';
 import { isMissingSandbox } from './provider-errors.js';
 import { timed } from '../timing/index.js';
 import path from 'node:path';
@@ -123,6 +124,7 @@ export class E2BWorldProvider implements WorldProvider {
     private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_E2B_TEMPLATE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
+    private referenceKeys?: WorldReferenceKeys,
   ) {
     // Hosted deployments must set KARMAX_WORLD_REF_KEY. E2B_API_KEY is a stable
     // compatibility seed for self-hosted installs; the development constant is
@@ -353,6 +355,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   private sealRef(value: Record<string, string>): string {
+    if (this.referenceKeys) return this.referenceKeys.seal(value);
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.refKey, iv);
     const body = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()]);
@@ -360,6 +363,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   private openRef(value: string): Record<string, string> {
+    if (value.startsWith('KWR2.') && this.referenceKeys) return this.referenceKeys.open(value);
     const blob = Buffer.from(value, 'base64url');
     if (blob.subarray(0, 4).toString() !== 'KWR1') throw new Error('invalid sealed provider reference');
     const decipher = crypto.createDecipheriv('aes-256-gcm', this.refKey, blob.subarray(4, 16));
