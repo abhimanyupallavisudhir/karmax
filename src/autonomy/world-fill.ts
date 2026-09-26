@@ -26,6 +26,7 @@ export async function fillInWorld(world: World, args: {
   resolveText: () => string | Promise<string>;
   timeoutMs?: number;
 }): Promise<{ origin: string }> {
+  if (!args.expectDomains?.length) throw new Error('browser fill requires credential domains');
   await world.writeFile(HELPER_REL, HELPER_SOURCE);
   // writeFile is root-relative but exec defaults to the workdir, which a
   // single-repo world nests below the root — run from where the helper lives.

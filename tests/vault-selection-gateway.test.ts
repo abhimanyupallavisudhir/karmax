@@ -49,6 +49,15 @@ describe('credential selection ranking through HTTP', () => {
       expect(sort(payload, new Set([accessed.id])).map((item: any) => item.id)).toEqual([accessed.id, frequent.id]);
       expect(JSON.stringify(payload)).not.toContain('test-secret');
       expect(JSON.stringify(payload)).not.toContain('another-secret');
+      for (const field of ['password', 'note', 'secret', 'env', 'privateKey']) {
+        const fill = await fetch(`${running.url}/api/vault/fill?organizationId=org_personal`, {
+          method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ itemId: frequent.id, field, selector: '#pw' }),
+        });
+        expect(fill.status).toBe(400);
+        expect((await fill.json() as any).error).toMatch(/login fields|domains/);
+      }
+
     } finally {
       await close?.();
       await store.close();

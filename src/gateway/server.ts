@@ -6370,10 +6370,13 @@ export class Gateway {
           const b = await this.body(req);
           const item = (await findItem(b));
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const field = String(b.field ?? 'password');
+          if (item.type !== 'login' || !['username', 'password', 'totp'].includes(field))
+            return this.json(res, 400, { error: 'browser fill supports only login fields: username, password, totp' });
+          if (!item.domains?.length) return this.json(res, 400, { error: 'browser fill requires credential domains' });
           const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
           if (decision.status !== 'granted')
             return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
-          const field = String(b.field ?? 'password');
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           if (field !== 'username' && !item.fields.includes(field as any)) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           const resolveText = async () => field === 'username'

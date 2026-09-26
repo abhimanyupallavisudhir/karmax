@@ -82,3 +82,12 @@ describe('fillInWorld in a single-repo world (workdir nested under root)', () =>
     }
   });
 });
+
+
+it('rejects missing origin restrictions before resolving a secret (AU-3)', async () => {
+  let resolved = false;
+  const { world } = mockWorld(() => ({ stdout: '{"origin":"https://evil.example"}', stderr: '', code: 0 }));
+  await expect(fillInWorld(world, { selector: '#pw', cdpUrl: 'http://127.0.0.1:9222',
+    resolveText: () => { resolved = true; return 'secret'; } })).rejects.toThrow(/domains/);
+  expect(resolved).toBe(false);
+});

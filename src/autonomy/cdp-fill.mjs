@@ -155,6 +155,7 @@ function wsClient(wsUrl) {
 const connect = wsClient;
 
 async function main() {
+  if (!expectDomains.length) fail('browser fill requires credential domains');
   const secret = await readStdin();
   if (!secret) fail('no secret on stdin');
   const base = assertLoopback(cdpUrl);
