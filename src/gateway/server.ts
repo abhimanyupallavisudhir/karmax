@@ -8694,7 +8694,7 @@ function scimList(Resources: unknown[]) {
 }
 
 function prometheusMetrics(snapshot: Record<string, unknown>): string {
-  const lines = ['# HELP karmax_info Krmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const lines = [`# HELP karmax_info ${BRAND} control-plane information.`, '# TYPE karmax_info gauge', 'karmax_info 1'];
   const scalar = (name: string, help: string, value: unknown) => {
     lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
   };

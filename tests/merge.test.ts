@@ -50,7 +50,7 @@ describe('finalizeMerge (work must actually land)', () => {
     expect(onMain.stdout).toContain('export const f');
     // a real merge commit exists (point of no return)
     const log = await git(repo, ['log', '--oneline', 'main']);
-    expect(log.stdout).toMatch(/merge karmax\/land1 into main/);
+    expect(log.stdout).toMatch(/merge tavya\/land1 into main/);
     await world.destroy();
   });
 

@@ -529,7 +529,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'connect_world_provider',
-    description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+    description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
     parameters: {
       type: 'object',
       properties: {
@@ -623,7 +623,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'request_agent_action',
-    description: 'Ask another task agent to publish its branch in the background. Returns a durable request id immediately; Karmax injects completion or failure into this conversation. Continue other work and do not poll.',
+    description: `Ask another task agent to publish its branch in the background. Returns a durable request id immediately; ${BRAND} injects completion or failure into this conversation. Continue other work and do not poll.`,
     parameters: {
       type: 'object',
       properties: {
@@ -673,7 +673,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_permission',
     description:
-      'Request exact Karmax capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ' +
+      `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',

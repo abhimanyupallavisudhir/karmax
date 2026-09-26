@@ -328,7 +328,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'connect_world_provider',
     {
-      description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+      description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
       inputSchema: {
         organizationId: z.string(), provider: z.enum(['e2b', 'daytona']), apiKey: z.string().optional(), name: z.string().optional(),
         template: z.string().optional(), snapshot: z.string().optional(), image: z.string().optional(),
@@ -484,7 +484,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'request_agent_action',
     {
-      description: 'Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; Karmax injects completion or failure into this agent automatically. Continue other work and do not poll.',
+      description: `Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; ${BRAND} injects completion or failure into this agent automatically. Continue other work and do not poll.`,
       inputSchema: {
         taskId: z.string(), role: z.string().default('do'),
         action: z.literal('publish_branch'), message: z.string().optional(),
@@ -536,7 +536,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       ref: z.string(), inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional() },
   }, async (a) => wrap(async () => (await ops.dispatchGithubActionsWorkflow(a))));
   server.registerTool('publish_task_branch', {
-    description: 'Publish this task’s clean, committed branch through Karmax’s trusted Git broker so another agent can import it.', inputSchema: {},
+    description: `Publish this task’s clean, committed branch through ${BRAND}’s trusted Git broker so another agent can import it.`, inputSchema: {},
   }, async () => wrap(async () => (await ops.publishTaskBranch())));
   server.registerTool('import_task_branch', {
     description: 'Fetch another task’s published branch into namespaced refs in this world. Inspect/test/cherry-pick or merge it locally afterward.',

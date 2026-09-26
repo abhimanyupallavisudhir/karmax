@@ -886,7 +886,7 @@ export class KarmaxApi {
         throw new ValidationError('use a public HTTPS ChatGPT/Claude share link or upload a conversation file');
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
-        throw new ValidationError('provider conversation IDs are available only on a host-local Karmax; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
+        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link`);
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));
@@ -4429,7 +4429,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const message: Message = {
         id: `landing-upgrade-${now}`,
         role: 'user',
-        text: `Karmax upgraded this attempt to the current fair Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the task context, inspect the current proposal, make only necessary fixes, verify it, and call open_pr again. The repaired proposal owns no landing slot and will request landing again at the back; live repository policy decides whether fresh approval is required. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
+        text: `${BRAND} upgraded this attempt to the current fair Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the task context, inspect the current proposal, make only necessary fixes, verify it, and call open_pr again. The repaired proposal owns no landing slot and will request landing again at the back; live repository policy decides whether fresh approval is required. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
         ts: now,
       };
       const nextView = this.withConversationMessage(heldView, 'do', message);

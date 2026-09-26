@@ -1411,7 +1411,7 @@ function safePassName(label: string): string {
 function gitPassGpgError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/spawn gpg ENOENT|gpg.*not found/i.test(message)) {
-    return 'Git-backed pass requires GnuPG (`gpg`) on the Karmax server';
+    return 'Git-backed pass requires GnuPG (`gpg`) on the tavya server';
   }
   if (/gpg|decrypt|secret key|passphrase|public key|decryption failed|bad key/i.test(message)) {
     return 'Git-backed pass could not use the supplied GPG key or passphrase';

@@ -158,7 +158,7 @@ describe('branding — stable technical and operator identifiers', () => {
   it('keeps Prometheus metric names stable', () => {
     const gateway = read('src/gateway/server.ts');
     expect(gateway).toContain('karmax_info 1');
-    expect(gateway).toContain('karmax_info Krmax control-plane information.');
+    expect(gateway).toContain('# HELP karmax_info ${BRAND} control-plane information.');
   });
 
   it('keeps the technical boot and process labels stable', () => {
@@ -204,6 +204,7 @@ describe('outward-facing brand', () => {
       /user\.name=karmax|'karmax@localhost'|`karmax\+/, // git author identity
       /'user-agent': 'karmax/, /clientInfo: \{ name: 'karmax/,
       /\bkrmax\b(?!-issues)/, // retired display name
+      /\b(Karmax|Krmax)\b(?![\w-]|’s? [a-z]*[A-Z])/, // the old name in prose
     ];
     const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const file = path.join(dir, entry.name);

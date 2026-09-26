@@ -203,8 +203,8 @@ const GIT_AUTHORIZATION = /authentication failed|permission denied|could not rea
 export function describeGitPushError(repo: WorldRepo, detail: string): string {
   const compact = detail.trim().replace(/\s+/g, ' ').slice(0, 500);
   if (NON_FAST_FORWARD.test(detail)) {
-    return `remote task branch non-fast-forward for "${repo.branch}": origin advanced or diverged, so Karmax did not overwrite it. `
-      + `Fetch origin/${repo.branch} and integrate the remote work, or retry a Karmax-owned rebase only after its exact prior PR head is recorded. `
+    return `remote task branch non-fast-forward for "${repo.branch}": origin advanced or diverged, so ${BRAND} did not overwrite it. `
+      + `Fetch origin/${repo.branch} and integrate the remote work, or retry a ${BRAND}-owned rebase only after its exact prior PR head is recorded. `
       + `Reconnect GitHub will not fix this remote-state conflict.${compact ? ` Git said: ${compact}` : ''}`;
   }
   if (GIT_AUTHORIZATION.test(detail)) {
@@ -217,7 +217,7 @@ export function describeGitPushError(repo: WorldRepo, detail: string): string {
 function recordedBaseViolation(repo: WorldRepo): string {
   return `local recorded-base ancestry violation for branch "${repo.branch}"`
     + `${repo.baseSha ? ` (base ${repo.baseSha.slice(0, 12)})` : ''}: the branch no longer descends from the commit provisioned for this task. `
-    + 'Karmax did not publish it; reconnecting GitHub will not help. Restore the provisioned HEAD as an ancestor and integrate the selected target normally.';
+    + `${BRAND} did not publish it; reconnecting GitHub will not help. Restore the provisioned HEAD as an ancestor and integrate the selected target normally.`;
 }
 
 /**
