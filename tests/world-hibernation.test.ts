@@ -27,7 +27,7 @@ async function fixture() {
   const open = vi.fn(async () => ({ handle, destroy }));
   const probe = vi.fn(async (): Promise<string | undefined> => undefined);
   worlds.register({ kind: 'memory', open, probe } as any);
-  const checkpointWorld = vi.fn(async () => checkpoint);
+  const checkpointWorld = vi.fn(async (_handle: WorldHandle) => checkpoint);
   const lifecycle = new WorldLifecycleManager(store, worlds, { checkpoint: checkpointWorld } as any);
   return { store, project, handle, worlds, destroy, open, probe, checkpointWorld, lifecycle };
 }
@@ -145,7 +145,7 @@ it('does not reap an undecidable provider reference (WD-1)', async () => {
 it('continues after one checkpoint fails (WD-2)', async () => {
   const f = await fixture();
   const task = await f.store.createTask({ projectId: f.project.id, title: 'Second parked task',
-    workflow: 'software-dev', workflowVersion: '1.0.0', params: {} });
+    workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
   const second = await f.store.registerWorld({ ...f.handle, id: task.id }, f.project.id);
   await f.store.setWorldState(second, 'parked');
   vi.spyOn(f.store, 'latestWorldCheckpoint').mockResolvedValue(undefined);
@@ -166,4 +166,15 @@ it('never invokes recovery to destroy an old sandbox (WD-7)', async () => {
   f.worlds.setRecoveryHandler(recover);
   await f.lifecycle.sweep(Date.now() + 1);
   expect(recover).not.toHaveBeenCalled();
+});
+
+it('retries explicitly pending teardown for terminal tasks (WD-14)', async () => {
+  const f = await fixture();
+  await f.store.saveView(f.handle.id, { taskId: f.handle.id, title: 'Done', workflow: 'software-dev',
+    stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() } as any);
+  const pending = await f.store.updateWorldMeta(f.handle, { teardownPending: true });
+  await f.store.setWorldState(pending, 'degraded');
+  await f.lifecycle.sweep();
+  expect(f.destroy).toHaveBeenCalledOnce();
+  expect(await f.store.worldState(f.handle.id)).toBe('released');
 });

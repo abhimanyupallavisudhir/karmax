@@ -137,3 +137,10 @@ it('destroys an unpublished world if cancellation arrives during resource restor
     expect((await store.eventsSince(task.id, 0)).some(e => e.type === 'world.ready')).toBe(false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('marks failed teardown for lifecycle retry (WD-14)', async () => {
+  const f = await fixture();
+  f.destroy.mockRejectedValue(new Error('provider unavailable'));
+  await f.core.destroyWorld(f.handle);
+  expect((await f.store.currentWorld(f.handle.id))?.meta?.teardownPending).toBe(true);
+});

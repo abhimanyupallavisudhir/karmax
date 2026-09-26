@@ -217,6 +217,34 @@ export class WorldLifecycleManager {
         });
       }
     }
+    for (const candidate of await this.store.listWorldInstances('degraded')) {
+      if (!candidate.handle.meta?.teardownPending) continue;
+      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
+        const eligible = async () => {
+          const current = await this.store.worldStateSnapshot(candidate.handle.id);
+          const task = await this.store.taskMetadata(candidate.handle.id);
+          return current?.state === 'degraded' && current.generation === (candidate.handle.generation ?? 1)
+            && (!task || ['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? 'active'))
+            && !(await this.worlds.hasActiveAccess(candidate.handle.id))
+            && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0;
+        };
+        if (!(await eligible())) return;
+        try {
+          const provider = this.worlds.get(candidate.handle.kind);
+          if (provider.destroy) await provider.destroy(candidate.handle as any);
+          else {
+            const world = await this.worlds.open(candidate.handle as any);
+            if (!(await eligible())) return;
+            await world.destroy();
+          }
+        } catch {
+          if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) !== 'missing') return;
+        }
+        if (!(await eligible())) return;
+        await this.store.setWorldState(candidate.handle, 'released');
+        await this.recordLifecycle(candidate.handle, 'world.destroyed', { retried: true });
+      }));
+    }
     await this.reapOrphanSandboxes();
     let hibernated = 0;
     for (const candidate of (await this.store.listWorldInstances('parked'))) {

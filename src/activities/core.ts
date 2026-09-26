@@ -3129,7 +3129,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           // A transient provider failure remains visible, without rewriting a
           // replacement generation's state or retaining this run's capacity.
-          await store.setWorldState(current, 'degraded');
+          const pending = await store.updateWorldMeta(current, { teardownPending: true });
+          await store.setWorldState(pending, 'degraded');
           await record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) });
         } finally {
           if (await owns()) {
