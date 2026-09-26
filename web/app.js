@@ -136,9 +136,11 @@ const S = {
 // Promise to the browser, so remember the control that originated the current
 // event; feedbackFetch() can then bind the request to that control without every
 // one of the console's mutation handlers reinventing a spinner/disabled state.
-// The origin deliberately expires at the next microtask: background refreshes
-// and auto-save requests must not make an unrelated, previously-clicked button
-// look busy.
+// The origin expires when the event's task ends (a zero-delay timeout), so
+// background refreshes and auto-save requests never make an unrelated,
+// previously-clicked button look busy. It must outlive microtasks: for real
+// input the browser runs a microtask checkpoint after every listener, i.e.
+// between this capture listener and the control's own handler.
 let interactionOrigin = null;
 let interactionOriginEpoch = 0;
 let actionProgressCount = 0;
@@ -169,18 +171,17 @@ function rememberInteractionOrigin(event) {
   }
   const epoch = ++interactionOriginEpoch;
   interactionOrigin = control;
-  queueMicrotask(() => {
-    if (interactionOriginEpoch === epoch) {
-      interactionOrigin = null;
-    }
-  });
+  setTimeout(() => {
+    if (interactionOriginEpoch === epoch) interactionOrigin = null;
+  }, 0);
 }
 
-if (typeof document !== 'undefined') {
+function installInteractionTracking() {
   ['pointerdown', 'click', 'change', 'submit', 'paste', 'drop'].forEach((type) =>
     document.addEventListener(type, rememberInteractionOrigin, true));
   document.addEventListener('keydown', rememberInteractionOrigin, true);
 }
+if (typeof document !== 'undefined') installInteractionTracking();
 
 function actionLabel(control) {
   return String(control?.getAttribute?.('aria-label') || control?.title || control?.textContent || 'Action')
