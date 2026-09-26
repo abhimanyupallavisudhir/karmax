@@ -17746,10 +17746,11 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
+  let githubLoadError = null;
   const [entitlements, gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, usagePolicy, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
     api(`/api/organizations/${organizationId}/entitlements`).catch(() => null),
-    api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
-    api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${organizationId}/git-connections`).catch(error => { githubLoadError = error; return []; }),
+    api(`/api/organizations/${organizationId}/github/app`).catch(error => { githubLoadError = error; return { configured: false }; }),
     api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
     api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
     api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
@@ -17787,6 +17788,7 @@ async function hydrateOrganizationView() {
     <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
   </div>`; }).join('')}</div>
   <div class="github-org-actions">${githubSetup}</div>`;
+  if (githubLoadError) paneError($('#org-github'), githubLoadError, hydrateOrganizationView);
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   S.worldProviderConnections = providerConnections;
   // The default Agent environment moved to Task defaults (below) and can be
@@ -18585,7 +18587,7 @@ function openGlobalSearch() {
   let controller = null;
   let state = 'prompt';
   let summary = '';
-  const close = () => { clearTimeout(timer); request++; root.remove(); };
+  const close = () => { clearTimeout(timer); controller?.abort(); request++; root.remove(); };
 
   const draw = () => {
     if (state === 'prompt') {
