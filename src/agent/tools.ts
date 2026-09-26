@@ -104,7 +104,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_sub_task',
     description:
-      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. You manage your children to completion before you finish.',
+      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends. You manage your children to completion before you finish.',
     parameters: {
       type: 'object',
       properties: { title: { type: 'string' }, prompt: { type: 'string' } },
@@ -114,7 +114,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve a PR already at Review), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve a PR already at Review), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
     parameters: {
       type: 'object',
       properties: {
@@ -928,7 +928,7 @@ export function platformToolHandlers(
     },
     async create_sub_task(args) {
       ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
-      return 'sub-task spawned (branches off your work; you are its confirmer)';
+      return 'sub-task queued: it starts when this turn ends (branches off your work; you are its confirmer)';
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
@@ -939,7 +939,7 @@ export function platformToolHandlers(
         action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
         text: args?.text ? String(args.text) : undefined,
       });
-      return `responded to sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: ${action}`;
+      return `${action} queued for sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: delivered when this turn ends`;
     },
     async raise_to_parent(args) {
       const type = String(args?.type ?? '');
