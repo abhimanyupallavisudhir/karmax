@@ -18,6 +18,8 @@ dist/
 .secrets/
 deploy/backups/
 deploy/.updates/
+design/*.png
+design/**/*.png
 
 # logs / coverage / caches
 *.log
