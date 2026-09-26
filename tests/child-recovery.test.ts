@@ -25,3 +25,11 @@ it('signals the durable parent only for a terminal child, excluding lifecycle re
   expect(getHandle).toHaveBeenCalledWith('parent');
   expect(signal).toHaveBeenCalledWith('childSettled', { childTaskId: 'child', stage: 'cancelled' });
 });
+
+it('retries a child settlement when the parent signal transport is unavailable', async () => {
+  const error = new Error('UNAVAILABLE');
+  const store = { taskMetadata: async () => ({ id: 'child', parentTaskId: 'parent' }) };
+  const client = { workflow: { getHandle: () => ({ signal: async () => { throw error; } }) } };
+  await expect(notifyChildSettlement(store as any, client as any,
+    { taskId: 'child', stage: 'done', status: 'done' } as any)).rejects.toBe(error);
+});
