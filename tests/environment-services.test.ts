@@ -3,7 +3,10 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ProjectEnvironment, parseDevcontainer, proposeEnvironment, stripJsonComments } from '../src/store/project-environment.js';
+import { ProjectEnvironment, localRepositoryFiles, parseDevcontainer, proposeEnvironment, stripJsonComments,
+  type RepositoryFiles } from '../src/store/project-environment.js';
+import { activateProjectRuntime } from '../src/world/project-runtime.js';
+import type { World } from '../src/world/types.js';
 import { buildEnvironment, bootCommands, environmentDockerfile, environmentArtifactName, setupCommands, type BuilderSandbox } from '../src/world/environment-build.js';
 import { ProjectServices, composeServiceProposals } from '../src/store/project-services.js';
 import { launchWorldServices } from '../src/world/services.js';
@@ -16,9 +19,13 @@ function memoryKv() {
 describe('project environment proposals and builds', () => {
   it('stores build-relevant recipes and tracks immutable provider artifacts', async () => {
     const environment = new ProjectEnvironment(memoryKv());
-    const spec = (await environment.setSpec('p', { image: 'node:22', setup: ['npm ci', ''], boot: ['echo boot'] }));
+    const spec = (await environment.setSpec('p', { image: 'node:22', setup: ['apt-get install -y jq', ''], boot: ['echo boot'],
+      install: { app: [' npm ci ', ''], empty: [''] } }));
+    expect(spec.install).toEqual({ app: ['npm ci'] });
     const digest = environment.digest(spec);
     expect(environment.digest({ ...spec, boot: ['changed'] })).toBe(digest);
+    // Repository installs run in every world after checkout, never in the snapshot.
+    expect(environment.digest({ ...spec, install: { app: ['changed'] } })).toBe(digest);
     expect(environment.digest({ ...spec, setup: ['changed'] })).not.toBe(digest);
     (await environment.recordBuild('p', { provider: 'container', digest, status: 'building' }));
     expect((await environment.readyBuild('p', 'container', digest))).toBeUndefined();
@@ -26,7 +33,7 @@ describe('project environment proposals and builds', () => {
     expect((await environment.readyBuild('p', 'container', digest))?.ref).toBe('image:tag');
   });
 
-  it('parses JSONC devcontainers and proposes setup from tracked declarations', () => {
+  it('parses JSONC devcontainers and proposes repository installs from tracked declarations', async () => {
     const parsed = parseDevcontainer(`{
       // comment-like text inside strings must survive
       "image": "example.invalid/http://node",
@@ -34,7 +41,7 @@ describe('project environment proposals and builds', () => {
       "postCreateCommand": { "db": "npm run db:setup" },
       "dockerComposeFile": "compose.yaml",
     }`);
-    expect(parsed.setup).toEqual(["npm install '--some flag'", 'npm run db:setup']);
+    expect(parsed.commands).toEqual(["npm install '--some flag'", 'npm run db:setup']);
     expect(JSON.parse(stripJsonComments('{"url":"http://x", /* c */ "ok":true,}'))).toEqual({ url: 'http://x', ok: true });
 
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-env-proposal-'));
@@ -44,10 +51,69 @@ describe('project environment proposals and builds', () => {
         '{"image":"node:22","postCreateCommand":"npm run setup","dockerComposeFile":"compose.yaml"}');
       fs.writeFileSync(path.join(dir, '.devcontainer/compose.yaml'), 'services: {}');
       fs.writeFileSync(path.join(dir, 'package-lock.json'), '{}');
-      const proposal = proposeEnvironment([dir], { hasPerWorldServices: true });
-      expect(proposal.spec).toMatchObject({ image: 'node:22', setup: ['npm run setup', 'npm ci'], includeDocker: true });
+      const proposal = await proposeEnvironment([localRepositoryFiles(dir, 'app')], { hasPerWorldServices: true });
+      // Dependency installs need the checkout, so they are never snapshot setup.
+      expect(proposal.spec).toEqual({ image: 'node:22', install: { app: ['npm run setup', 'npm ci'] }, includeDocker: true });
       expect(proposal.composeFiles).toEqual([path.join(dir, '.devcontainer/compose.yaml')]);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('adds the browser download that Playwright dependencies need, per repository', async () => {
+    const repository = (name: string, files: Record<string, string>): RepositoryFiles => ({
+      name, files: Object.keys(files), read: async (file) => files[file],
+    });
+    const proposal = await proposeEnvironment([
+      repository('web', { 'package-lock.json': '{}',
+        'package.json': JSON.stringify({ devDependencies: { '@playwright/test': '1.63.0' } }) }),
+      repository('api', { 'uv.lock': '', 'pyproject.toml': '[project]\ndependencies = [\n  "playwright>=1.50",\n]\n' }),
+      repository('worker', { 'requirements.txt': 'requests==2\npytest-playwright==0.5\n' }),
+      repository('scraper', { 'requirements.txt': 'playwright-stealth==1\n' }),
+      repository('lib', { 'package.json': JSON.stringify({ dependencies: { 'playwright-core': '1.63.0' } }), 'yarn.lock': '' }),
+      repository('docs', { 'README.md': '# docs' }),
+    ]);
+    expect(proposal.spec).toEqual({ install: {
+      web: ['npm ci', 'npx playwright install --with-deps chromium'],
+      api: ['uv sync', 'uv run playwright install --with-deps chromium'],
+      worker: ['pip install -r requirements.txt', 'python -m playwright install --with-deps chromium'],
+      scraper: ['pip install -r requirements.txt', 'python -m playwright install --with-deps chromium'],
+      // playwright-core ships no browser download of its own.
+      lib: ['corepack enable && yarn install --frozen-lockfile'],
+    } });
+    expect(proposal.evidence).toContain('web: "npx playwright install --with-deps chromium" (package.json)');
+  });
+
+  it('runs repository installs inside each checkout between setup and boot', async () => {
+    const calls: Array<{ command: string; cwd?: string }> = [];
+    const world = {
+      handle: { id: 'w', kind: 'e2b', root: '/world', branch: 'b', base: 'x', target: 'main',
+        repos: [
+          { name: 'app', repo: 'git@github.com:acme/app.git', root: '/world/app', branch: 'b', base: 'x', target: 'main', targetPinned: false },
+          { name: 'wiki', role: 'project-wiki', repo: 'git@github.com:acme/wiki.git', root: '/world/wiki', branch: 'b', base: 'x', target: 'main', targetPinned: false },
+        ] },
+      async exec(_cmd: string, args: string[], opts: { cwd?: string } = {}) {
+        calls.push({ command: args[1]!, cwd: opts.cwd });
+        return args[1] === 'broken' ? { code: 1, stdout: '', stderr: 'no such tool' } : { code: 0, stdout: '', stderr: '' };
+      },
+    } as unknown as World;
+    const store = { listResourceAttachments: async () => [] } as any;
+    const runtime = await activateProjectRuntime({ world, store, projectId: 'p', taskId: 't', services: [], runSetupIfUnbuilt: true,
+      selection: { built: false, spec: { setup: ['apt-get install -y jq'], boot: ['npm run migrate'],
+        install: { app: ['npm ci', 'broken', 'npx playwright install --with-deps chromium'], missing: ['npm ci'] } } } });
+    expect(calls).toEqual([
+      { command: 'apt-get install -y jq', cwd: undefined },
+      { command: 'npm ci', cwd: '/world/app' },
+      { command: 'broken', cwd: '/world/app' },
+      // Later installs in a repository depend on earlier ones, so they are skipped.
+      { command: 'npm run migrate', cwd: undefined },
+    ]);
+    expect(runtime.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('environment command "broken" failed in app: no such tool'),
+      'environment install for "missing" skipped: this world has no repository with that name',
+    ]));
+    expect(runtime.handle.meta?.environmentInstall).toEqual([
+      { repository: 'app', command: 'npm ci', ok: true },
+      { repository: 'app', command: 'broken', ok: false },
+    ]);
   });
 
   it('realizes host and fake-E2B builds and includes Docker when requested', async () => {

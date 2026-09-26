@@ -104,7 +104,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: describeRepos(args.world),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -117,6 +117,27 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     ...(args.bindings ?? {}),
   };
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+}
+
+/** Which project toolchain installs already ran, so agents neither redo nor
+ * misdiagnose them, and where a missing step belongs so later tasks get it. */
+function describeEnvironment(world: WorldHandle): string {
+  if (!world.meta?.projectId) return '';
+  const installs = Array.isArray(world.meta.environmentInstall)
+    ? world.meta.environmentInstall as Array<{ repository: string; command: string; ok: boolean }> : [];
+  const list = (ok: boolean) => {
+    const byRepo = new Map<string, string[]>();
+    for (const entry of installs) if (entry.ok === ok)
+      byRepo.set(entry.repository, [...(byRepo.get(entry.repository) ?? []), `\`${entry.command}\``]);
+    return [...byRepo].map(([repo, commands]) => `${repo}: ${commands.join(', ')}`).join('; ');
+  };
+  const ran = list(true);
+  const failed = list(false);
+  return [
+    ...(ran || failed ? [`Project environment installs already ran: ${ran || 'none'}.${failed ? ` Failed: ${failed}.` : ''}`] : []),
+    'If this project is missing a toolchain step that every task needs (dependencies, browsers, CLIs), work around it, '
+      + 'then suggest the exact command for Project Settings → Environment in your final response so future tasks start ready.',
+  ].join(' ');
 }
 
 /**

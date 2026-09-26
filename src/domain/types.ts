@@ -718,7 +718,11 @@ export interface ResourceChangeSummary {
  * from lockfiles/devcontainers instead of requiring hand-authored config. */
 export interface ProjectEnvironmentSpec {
   image?: string;
+  /** System setup baked into provider snapshots. No repository is checked out. */
   setup?: string[];
+  /** Dependency installs keyed by world repository name. Each runs inside that
+   *  checkout in every new or restored world, so it always matches the code. */
+  install?: Record<string, string[]>;
   boot?: string[];
   includeDocker?: boolean;
 }

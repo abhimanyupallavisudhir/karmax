@@ -33,9 +33,14 @@ export class ProjectEnvironment {
   }
 
   async setSpec(projectId: string, spec: ProjectEnvironmentSpec): Promise<ProjectEnvironmentSpec> {
+    const installs = Object.entries(spec.install ?? {})
+      .map(([name, commands]) => [name.trim(), commands.map((value) => value.trim()).filter(Boolean)] as const)
+      .filter(([name, commands]) => name && commands.length);
+    const install = installs.length ? Object.fromEntries(installs) : undefined;
     const clean: ProjectEnvironmentSpec = {
       ...(spec.image?.trim() ? { image: spec.image.trim() } : {}),
       ...(spec.setup?.length ? { setup: spec.setup.map((value) => value.trim()).filter(Boolean) } : {}),
+      ...(install ? { install } : {}),
       ...(spec.boot?.length ? { boot: spec.boot.map((value) => value.trim()).filter(Boolean) } : {}),
       ...(spec.includeDocker ? { includeDocker: true } : {}),
     };
@@ -181,31 +186,54 @@ export interface EnvironmentProposal {
   composeFiles: string[];
 }
 
-export function proposeEnvironment(dirs: string[], options: { hasPerWorldServices?: boolean } = {}): EnvironmentProposal {
+/** Tracked files of one project repository, read from wherever it lives: a
+ * local checkout or the GitHub API for hosted projects. */
+export interface RepositoryFiles {
+  /** World checkout name: the directory tasks see and the `install` key. */
+  name: string;
+  /** Top-level entries. A listing, because GitHub omits content above 1 MB. */
+  files: string[];
+  read(file: string): Promise<string | undefined>;
+  /** Local checkout, when there is one (Compose discovery needs real paths). */
+  dir?: string;
+}
+
+export function localRepositoryFiles(dir: string, name: string): RepositoryFiles {
+  let files: string[] = [];
+  try { files = fs.readdirSync(dir); } catch { /* an unreadable checkout proposes nothing */ }
+  return { name, dir, files, read: async (file) => {
+    try { return fs.readFileSync(path.join(dir, file), 'utf8'); } catch { return undefined; }
+  } };
+}
+
+export async function proposeEnvironment(repos: RepositoryFiles[], options: { hasPerWorldServices?: boolean } = {}): Promise<EnvironmentProposal> {
   const proposal: EnvironmentProposal = { spec: {}, evidence: [], composeFiles: [] };
-  const setup: string[] = [];
-  for (const dir of dirs) {
-    const devcontainer = readDevcontainer(dir);
+  const install: Record<string, string[]> = {};
+  for (const repo of repos) {
+    const commands: string[] = [];
+    const add = (command: string, source: string) => {
+      if (commands.includes(command)) return;
+      commands.push(command);
+      proposal.evidence.push(`${repo.name}: "${command}" (${source})`);
+    };
+    const devcontainer = await readDevcontainer(repo);
     if (devcontainer) {
       if (devcontainer.image && !proposal.spec.image) {
         proposal.spec.image = devcontainer.image;
-        proposal.evidence.push(`image ${devcontainer.image} (${devcontainer.source})`);
+        proposal.evidence.push(`image ${devcontainer.image} (${repo.name}/${devcontainer.source})`);
       }
-      for (const command of devcontainer.setup) if (!setup.includes(command)) {
-        setup.push(command);
-        proposal.evidence.push(`setup "${command}" (${devcontainer.source})`);
-      }
-      for (const compose of devcontainer.composeFiles) {
-        const resolved = path.join(dir, compose);
+      for (const command of devcontainer.commands) add(command, devcontainer.source);
+      if (repo.dir) for (const compose of devcontainer.composeFiles) {
+        const resolved = path.join(repo.dir, compose);
         if (fs.existsSync(resolved)) proposal.composeFiles.push(resolved);
       }
     }
-    for (const [file, command] of LOCKFILES) if (fs.existsSync(path.join(dir, file)) && !setup.includes(command)) {
-      setup.push(command);
-      proposal.evidence.push(`setup "${command}" (${file})`);
-    }
+    for (const [file, command] of LOCKFILES) if (repo.files.includes(file)) add(command, file);
+    const browsers = await playwrightBrowserInstall(repo);
+    if (browsers) add(browsers.command, browsers.source);
+    if (commands.length) install[repo.name] = commands;
   }
-  if (setup.length) proposal.spec.setup = setup;
+  if (Object.keys(install).length) proposal.spec.install = install;
   if (options.hasPerWorldServices) {
     proposal.spec.includeDocker = true;
     proposal.evidence.push('Docker baked in (per-world services discovered)');
@@ -223,19 +251,44 @@ const LOCKFILES: Array<[string, string]> = [
   ['go.sum', 'go mod download'],
 ];
 
+/** Playwright pins a browser build per release and downloads it separately from
+ * the package, so a dependency install alone leaves its tests unable to launch.
+ * The repository's own Playwright performs the download, so the browser always
+ * matches the checked-out version. Chromium only: it is what nearly every
+ * suite uses, and all three engines would triple the download. */
+async function playwrightBrowserInstall(repo: RepositoryFiles): Promise<{ command: string; source: string } | undefined> {
+  const flags = 'install --with-deps chromium';
+  if (repo.files.includes('package.json')) {
+    try {
+      const manifest = JSON.parse(await repo.read('package.json') ?? '{}');
+      const names = { ...manifest.dependencies, ...manifest.devDependencies };
+      if ('playwright' in names || '@playwright/test' in names) return { command: `npx playwright ${flags}`, source: 'package.json' };
+    } catch { /* malformed manifests propose nothing */ }
+  }
+  // pytest-playwright, playwright-stealth, … all pull in Playwright itself.
+  const python = /^\s*["']?[\w.-]*playwright/m;
+  if (repo.files.includes('uv.lock') && repo.files.includes('pyproject.toml') && python.test(await repo.read('pyproject.toml') ?? ''))
+    return { command: `uv run playwright ${flags}`, source: 'pyproject.toml' };
+  if (repo.files.includes('requirements.txt') && python.test(await repo.read('requirements.txt') ?? ''))
+    return { command: `python -m playwright ${flags}`, source: 'requirements.txt' };
+  return undefined;
+}
+
 export interface DevcontainerInfo {
   source: string;
   image?: string;
-  setup: string[];
+  /** onCreate/postCreate commands; they run in the checked-out workspace. */
+  commands: string[];
   composeFiles: string[];
 }
 
-export function readDevcontainer(dir: string): DevcontainerInfo | undefined {
+export async function readDevcontainer(repo: RepositoryFiles): Promise<DevcontainerInfo | undefined> {
   for (const candidate of ['.devcontainer/devcontainer.json', '.devcontainer.json']) {
-    const filename = path.join(dir, candidate);
-    if (!fs.existsSync(filename)) continue;
+    if (!repo.files.includes(candidate.split('/')[0]!)) continue;
+    const text = await repo.read(candidate);
+    if (text === undefined) continue;
     try {
-      const parsed = parseDevcontainer(fs.readFileSync(filename, 'utf8'));
+      const parsed = parseDevcontainer(text);
       return { ...parsed, source: candidate,
         composeFiles: parsed.composeFiles.map((value) => path.join(path.dirname(candidate), value)) };
     } catch { return undefined; }
@@ -255,7 +308,7 @@ export function parseDevcontainer(text: string): Omit<DevcontainerInfo, 'source'
     : Array.isArray(doc.dockerComposeFile) ? doc.dockerComposeFile.map(String) : [];
   return {
     ...(typeof doc.image === 'string' && doc.image ? { image: doc.image } : {}),
-    setup: [...commands(doc.onCreateCommand), ...commands(doc.postCreateCommand)],
+    commands: [...commands(doc.onCreateCommand), ...commands(doc.postCreateCommand)],
     composeFiles,
   };
 }

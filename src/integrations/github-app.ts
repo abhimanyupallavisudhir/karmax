@@ -1361,18 +1361,30 @@ export class GitHubAppService {
     return result.status === 'present' ? { status: 'present', bytes: Buffer.byteLength(result.content) } : result;
   }
 
+  /** Top-level entry names on the default branch; undefined when unreadable. */
+  async rootEntries(repository: Repository): Promise<string[] | undefined> {
+    try {
+      const value = await this.contents<Array<{ name?: string }>>(repository, '');
+      return Array.isArray(value) ? value.map((entry) => String(entry.name ?? '')).filter(Boolean) : undefined;
+    } catch { return undefined; }
+  }
+
+  private async contents<T>(repository: Repository, filePath: string): Promise<T> {
+    if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
+    if (!connection) throw new Error('repository GitHub App connection is missing');
+    const token = await this.installationToken(connection);
+    return this.request<T>(
+      `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/contents/`
+      + filePath.split('/').map(encodeURIComponent).join('/'), token);
+  }
+
   private async repositoryFile(repository: Repository, filePath: string): Promise<
     | { status: 'present'; content: string }
     | { status: 'missing' }
     | { status: 'unreadable'; error: string }> {
     try {
-      if (!repository.gitConnectionId) return { status: 'unreadable', error: 'repository has no GitHub App connection' };
-      const connection = (await this.store.getGitConnection(repository.gitConnectionId));
-      if (!connection) return { status: 'unreadable', error: 'repository GitHub App connection is missing' };
-      const token = await this.installationToken(connection);
-      const value = await this.request<{ content?: string; encoding?: string }>(
-        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/contents/`
-        + filePath.split('/').map(encodeURIComponent).join('/'), token);
+      const value = await this.contents<{ content?: string; encoding?: string }>(repository, filePath);
       if (!value.content) return { status: 'unreadable', error: 'GitHub returned the file without content' };
       return { status: 'present', content: Buffer.from(value.content,
         (value.encoding as BufferEncoding) ?? 'base64').toString('utf8') };

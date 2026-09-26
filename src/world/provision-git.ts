@@ -287,7 +287,8 @@ function isSshRemote(value: string): boolean {
   return /^(?:ssh:\/\/|git@)[^\s]+/.test(value);
 }
 
-function remoteName(remote: string): string {
+/** World checkout name for a repository source (its basename). */
+export function remoteName(remote: string): string {
   const raw = remote.replace(/\/$/, '').split(/[/:]/).pop()?.replace(/\.git$/, '') || 'repo';
   const safe = raw.replace(/[^a-zA-Z0-9._-]/g, '-');
   return !safe || /^\.+$/.test(safe) ? 'repo' : safe;

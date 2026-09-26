@@ -53,6 +53,7 @@ import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
+import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
@@ -3761,7 +3762,10 @@ export class Gateway {
         try {
           if (method === 'GET' && !sub) {
             const spec = (await environments.spec(project.id));
-            return this.json(res, 200, { spec: spec ?? null,
+            const { remoteName } = await import('../world/provision-git.js');
+            const repositories = [...new Set([...(project.config.repos ?? []).map(remoteName),
+              ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+            return this.json(res, 200, { spec: spec ?? null, repositories,
               digest: spec ? environments.digest(spec) : null, builds: (await environments.builds(project.id)).map(build => ({ ...build,
                 recoveryRevision: environmentBuildRevision(build) })) });
           }
@@ -3770,13 +3774,15 @@ export class Gateway {
             const list = (value: unknown) => Array.isArray(value) ? value.map(String)
               : typeof value === 'string' ? value.split('\n') : [];
             const spec = (await environments.setSpec(project.id, { image: body.image ? String(body.image) : undefined,
-              setup: list(body.setup), boot: list(body.boot), includeDocker: Boolean(body.includeDocker) }));
+              setup: list(body.setup), install: body.install && typeof body.install === 'object' && !Array.isArray(body.install)
+                ? Object.fromEntries(Object.entries(body.install).map(([name, commands]) => [name, list(commands)])) : undefined,
+              boot: list(body.boot), includeDocker: Boolean(body.includeDocker) }));
             return this.json(res, 200, { spec, digest: environments.digest(spec) });
           }
           if (method === 'GET' && sub === 'proposal') {
-            const dirs = projectRepositoryDirectories(project);
+            const repos = await projectRepositoryFiles(project, store, this.deps.githubApp);
             const { ProjectServices } = await import('../store/project-services.js');
-            return this.json(res, 200, proposeEnvironment(dirs, {
+            return this.json(res, 200, await proposeEnvironment(repos, {
               hasPerWorldServices: (await new ProjectServices(store).list(project.id))
                 .some((service) => service.kind === 'per-world'),
             }));
@@ -3825,10 +3831,10 @@ export class Gateway {
         const services = new ProjectServices(store);
         try {
           if (method === 'GET' && projectServices[2] === 'compose-import') {
-            const { readDevcontainer } = await import('../store/project-environment.js');
+            const { localRepositoryFiles, readDevcontainer } = await import('../store/project-environment.js');
             const proposals = [];
             for (const dir of projectRepositoryDirectories(project)) {
-              const devcontainer = readDevcontainer(dir);
+              const devcontainer = await readDevcontainer(localRepositoryFiles(dir, path.basename(dir)));
               const candidates = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
                 ...(devcontainer?.composeFiles ?? []),
                 '.devcontainer/docker-compose.yml', '.devcontainer/docker-compose.yaml'];
@@ -8804,12 +8810,33 @@ function applyExecutionOverride(config: ProjectConfig, override: Record<string, 
 }
 
 function projectRepositoryDirectories(project: Project): string[] {
-  return (project.config.repos ?? []).map((source) => {
-    const local = expandPath(source);
-    if (fs.existsSync(local)) return local;
-    const managed = managedRepoPath(source);
-    return fs.existsSync(managed) ? managed : undefined;
-  }).filter((value): value is string => Boolean(value));
+  return (project.config.repos ?? []).map(localRepositoryDirectory).filter((value): value is string => Boolean(value));
+}
+
+function localRepositoryDirectory(source: string): string | undefined {
+  const local = expandPath(source);
+  if (fs.existsSync(local)) return local;
+  const managed = managedRepoPath(source);
+  return fs.existsSync(managed) ? managed : undefined;
+}
+
+/** Every project repository's tracked files: this host's checkout when it has
+ * one, else the GitHub default branch (hosted projects keep no checkout). */
+async function projectRepositoryFiles(project: Project, store: Store,
+  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<RepositoryFiles[]> {
+  const { localRepositoryFiles } = await import('../store/project-environment.js');
+  const { remoteName } = await import('../world/provision-git.js');
+  const repos: RepositoryFiles[] = [];
+  for (const source of project.config.repos ?? []) {
+    const dir = localRepositoryDirectory(source);
+    if (dir) repos.push(localRepositoryFiles(dir, remoteName(source)));
+  }
+  if (githubApp) for (const { repository } of await store.listProjectRepositories(project.id)) {
+    if (repos.some((repo) => repo.name === repository.name)) continue;
+    const files = await githubApp.rootEntries(repository);
+    if (files) repos.push({ name: repository.name, files, read: (file) => githubApp.fileContents(repository, file) });
+  }
+  return repos;
 }
 
 async function discoverEnvironmentNames(project: Project, store: Store,

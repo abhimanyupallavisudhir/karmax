@@ -5,7 +5,7 @@ import { ProjectServices } from '../store/project-services.js';
 import { bootCommands, setupCommands } from './environment-build.js';
 import type { ProjectResourceService } from './resources.js';
 import { launchWorldServices } from './services.js';
-import type { World, WorldHandle } from './types.js';
+import { worldRepos, type World, type WorldHandle } from './types.js';
 
 export interface ProjectEnvironmentSelection {
   spec?: ProjectEnvironmentSpec;
@@ -66,11 +66,33 @@ export async function activateProjectRuntime(args: {
     const setup = args.runSetupIfUnbuilt && !selection.built ? setupCommands(selection.spec) : [];
     if (setup.length)
       warnings.push('environment build is not ready; setup ran live (build it in Project Settings → Environment for faster worlds)');
-    for (const command of [...setup, ...bootCommands(selection.spec)]) {
-      const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
+    const run = async (command: string, cwd?: string, where = '') => {
+      const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000, ...(cwd ? { cwd } : {}) });
       if (result.code !== 0)
-        warnings.push(`environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}`);
+        warnings.push(`environment command "${command}" failed${where}: ${(result.stderr || result.stdout).slice(-300)}`);
+      return result.code === 0;
+    };
+    for (const command of setup) await run(command);
+    // Snapshots cannot hold a checkout, so dependency installs run here, against
+    // exactly the code this world contains. Checkpoints exclude ignored files,
+    // so restored worlds need them again too.
+    const repos = worldRepos(world.handle);
+    const installed: Array<{ repository: string; command: string; ok: boolean }> = [];
+    for (const [name, commands] of Object.entries(selection.spec.install ?? {})) {
+      const repo = repos.find((candidate) => candidate.name === name);
+      if (!repo) {
+        warnings.push(`environment install for "${name}" skipped: this world has no repository with that name`);
+        continue;
+      }
+      // Later steps build on earlier ones (a browser download needs the packages).
+      for (const command of commands) {
+        const ok = await run(command, repo.root, ` in ${name}`);
+        installed.push({ repository: name, command, ok });
+        if (!ok) break;
+      }
     }
+    if (installed.length) world.handle.meta = { ...world.handle.meta, environmentInstall: installed };
+    for (const command of bootCommands(selection.spec)) await run(command);
   }
 
   const declarations = args.services ?? (await new ProjectServices(args.store).list(args.projectId));

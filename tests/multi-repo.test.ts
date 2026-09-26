@@ -233,4 +233,20 @@ describe('prompt assembly surfaces the multi-repo layout', () => {
     expect(out).not.toContain('spans');
     expect(out).toContain('Working directory: /w/t');
   });
+
+  it('tells a project agent which environment installs already ran and where to fix missing toolchain', () => {
+    const world = { kind: 'e2b', id: 't', root: '/w/t', branch: 'karmax/t', base: 'main', target: 'main',
+      repos: [{ name: 'only', repo: 'git@github.com:acme/only.git', root: '/w/t', branch: 'karmax/t', base: 'main' }],
+      meta: { projectId: 'p', environmentInstall: [
+        { repository: 'only', command: 'npm ci', ok: true },
+        { repository: 'only', command: 'npx playwright install --with-deps chromium', ok: true },
+        { repository: 'only', command: 'make tools', ok: false },
+      ] } } as any;
+    const out = assemblePrompt({ profile: profile(), role: 'do', task, world });
+    expect(out).toContain('Project environment installs already ran: only: `npm ci`, `npx playwright install --with-deps chromium`. Failed: only: `make tools`.');
+    expect(out).toContain('Project Settings → Environment');
+    const bare = assemblePrompt({ profile: profile(), role: 'do', task, world: { ...world, meta: { projectId: 'p' } } });
+    expect(bare).not.toContain('installs already ran');
+    expect(bare).toContain('Project Settings → Environment');
+  });
 });
