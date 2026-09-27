@@ -2,7 +2,6 @@ import { beforeAll, afterAll, describe, it, expect } from 'vitest';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
-import { temporal } from '@temporalio/proto';
 
 describe('service connection workflow wait (real Temporal)', () => {
   let h: Harness;
@@ -19,11 +18,15 @@ describe('service connection workflow wait (real Temporal)', () => {
       try {
         await expect.poll(async () => (await view()).waitingFor?.detail, { timeout: 25_000 }).toContain('Connect the requested app');
         expect((await view()).stage).toBe('do');
-        // Restart while the task is idle in its sign-in wait, as in production.
-        // Restarting mid workflow task abandons that task, and Temporal only
-        // reschedules it after its 10 s workflow-task timeout: a CI flake.
-        await expect.poll(async () => (await handle.fetchHistory()).events?.at(-1)?.eventType, { timeout: 25_000 })
-          .toBe(temporal.api.enums.v1.EventType.EVENT_TYPE_TIMER_STARTED);
+        // Restart while the task is idle in its sign-in wait, as in production:
+        // no workflow task or activity pending. Restarting mid workflow task
+        // abandons that task, and Temporal only reschedules it after its 10 s
+        // workflow-task timeout: a CI flake. (A signal-driven wait need not
+        // leave a timer as its last event, so the history's tail can't tell.)
+        await expect.poll(async () => {
+          const { raw } = await handle.describe();
+          return !raw.pendingWorkflowTask && !raw.pendingActivities?.length;
+        }, { timeout: 25_000 }).toBe(true);
         await h.restartWorker();
         expect((await view()).stage).toBe('do');
         (await h.store.kvSet(`service-connection:${taskId}`, JSON.stringify({ id: taskId, taskId, status: 'active', notifiedAt: Date.now() })));
