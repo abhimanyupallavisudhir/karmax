@@ -6968,7 +6968,9 @@ async function refreshTask(reason = 'all') {
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
-      has(/review|stage|turn.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
+      // Widgets are resolved against the view (the Overview's stage and changed
+      // files), so every lifecycle publication re-resolves them.
+      has(/view\.updated|review|stage|turn\.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
       has(/session|turn.result|stage/) ? api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions) : S.sessions,
       has(/attempt|turn.result|merge.result/) ? api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup) : S.attemptGroup,
       has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
