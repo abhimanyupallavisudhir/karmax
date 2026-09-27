@@ -3738,6 +3738,10 @@ export class Store {
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
       }
+    } else if (messages === undefined && transcripts === undefined) {
+      // A status-only view (reconcile and lifecycle repairs read `lastView`
+      // without the conversation column) must never erase the stored transcript.
+      (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
     } else {
       (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=?, conversationRef=NULL WHERE id=?')
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
