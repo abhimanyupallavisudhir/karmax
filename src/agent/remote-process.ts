@@ -128,13 +128,42 @@ const HISTORY_TOTAL_BYTES = 32 * 1024 * 1024;
 const HISTORY_FILE_COUNT = 64;
 type HistoryBudget = { bytes: number; files: number };
 
+const VERIFIED_READ_ATTEMPTS = 3;
+
+/** A terminal can lose a command's final output while still reporting success
+ * (node-pty discards unread bytes 200 ms after its child exits: AD-30), and a
+ * truncated base64 stream still decodes. History built from such a read drops
+ * the newest turns or breaks a child's recorded cutoff, so the sandbox reports
+ * the length and digest of exactly what it printed; an incomplete read is
+ * retried, never used. */
+async function verifiedRemoteOutput(world: World, command: string, maxBytes: number, action: string): Promise<Buffer> {
+  const script = [
+    'set -o pipefail',
+    'out=$(mktemp) || exit',
+    `trap 'rm -f -- "$out"' EXIT`,
+    `{ ${command}\n} > "$out" || exit`,
+    `cat -- "$out" && printf '\\n%s %s\\n' "$(wc -c < "$out")" "$(sha256sum < "$out" | cut -d ' ' -f 1)"`,
+  ].join('\n');
+  for (let attempt = 1; ; attempt++) {
+    const result = await boundedExec(world, script, { maxBytes: maxBytes + 128, timeoutMs: 60_000 });
+    if (result.code !== 0) throw new Error(`could not ${action}: ${result.stderr || result.stdout.slice(0, 512)}`);
+    const printed = Buffer.from(result.stdout);
+    const trailer = /\n *(\d+) ([0-9a-f]{64})\r?\n?$/.exec(result.stdout);
+    const length = Number(trailer?.[1]);
+    const end = trailer ? printed.length - Buffer.byteLength(trailer[0]) : -1;
+    // Anything a login shell printed before the command precedes its output.
+    const output = trailer && length <= end ? printed.subarray(end - length, end) : undefined;
+    if (output && crypto.createHash('sha256').update(output).digest('hex') === trailer![2]) return output;
+    if (attempt >= VERIFIED_READ_ATTEMPTS) throw new Error(`could not ${action}: output was incomplete after ${attempt} reads`);
+  }
+}
+
 async function readRemoteHistory(world: World, file: string, budget: HistoryBudget, maxBytes = HISTORY_FILE_BYTES): Promise<Buffer> {
   if (++budget.files > HISTORY_FILE_COUNT) throw new Error('remote history file count limit exceeded');
-  const result = await boundedExec(world,
-    `set -o pipefail; head -c ${maxBytes + 1} -- ${quote(path.posix.join(world.handle.root, file))} | base64 -w 0`,
-    { maxBytes: Math.ceil((maxBytes + 1) / 3) * 4, timeoutMs: 60_000 });
-  if (result.code !== 0) throw new Error(`could not read remote history: ${result.stderr || result.stdout.slice(0, 512)}`);
-  const data = Buffer.from(result.stdout.trim(), 'base64');
+  const encoded = await verifiedRemoteOutput(world,
+    `head -c ${maxBytes + 1} -- ${quote(path.posix.join(world.handle.root, file))} | base64 -w 0`,
+    Math.ceil((maxBytes + 1) / 3) * 4, 'read remote history');
+  const data = Buffer.from(encoded.toString('latin1'), 'base64');
   budget.bytes += data.length;
   if (data.length > maxBytes || budget.bytes > HISTORY_TOTAL_BYTES)
     throw new Error('remote history byte limit exceeded');
@@ -627,15 +656,20 @@ function codexRolloutIdentity(file: string): string | undefined {
   return name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1] ?? name;
 }
 
-async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
-  const result = await boundedExec(world,
-    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`,
-    { maxBytes: 1024 * 1024, timeoutMs: 60_000 });
-  if (result.code !== 0) throw new Error(`could not inspect remote subscription home: ${result.stderr || result.stdout}`);
-  if (result.stdout.split('\n').length > 4096) throw new Error('remote history listing count limit exceeded');
+/** Every file under a sandbox directory, relative to the world root. A lost
+ * tail would silently drop exactly the newest paths, so the listing is verified. */
+async function remoteFiles(world: World, absolute: string, action: string): Promise<string[]> {
+  const listed = (await verifiedRemoteOutput(world,
+    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`, 1024 * 1024, action)).toString('utf8');
   const root = world.handle.root.replace(/\/+$/, '');
-  return new Set(result.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
-    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
+  return listed.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
+    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file);
+}
+
+async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
+  const files = await remoteFiles(world, absolute, 'inspect remote subscription home');
+  if (files.length > 4096) throw new Error('remote history listing count limit exceeded');
+  return new Set(files);
 }
 
 /** Repair stale aliases left by earlier seeding, including on host-only retries.
@@ -697,13 +731,7 @@ export async function materializeRemoteSession(source: World, destination: World
   let files: string[];
   try {
     const sourceDirectory = path.posix.join(source.handle.root, prefix);
-    const listed = await boundedExec(source,
-      `if [ -d ${quote(sourceDirectory)} ]; then find ${quote(sourceDirectory)} -type f -print; fi`,
-      { maxBytes: 1024 * 1024, timeoutMs: 60_000 });
-    if (listed.code !== 0) return false;
-    const root = source.handle.root.replace(/\/+$/, '');
-    files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
-      file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file).filter((file) => file.startsWith(prefix));
+    files = (await remoteFiles(source, sourceDirectory, 'list remote sessions')).filter((file) => file.startsWith(prefix));
   }
   catch { return false; }
   const sourceFile = files.find((file) => provider === 'claude'
