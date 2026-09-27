@@ -43,7 +43,7 @@ eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.UR
 eval(extractConst('NOTIFY_BEHAVIOURS').replace('const NOTIFY_BEHAVIOURS =', 'global.NOTIFY_BEHAVIOURS ='));
 eval(extractConst('NOTIFY_DEFAULTS', '\n};').replace('const NOTIFY_DEFAULTS =', 'global.NOTIFY_DEFAULTS ='));
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
-  'notificationSoundPrefs', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'notificationsCard']) eval(extractFn(name));
+  'notificationSoundPrefs', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'policyTip', 'notificationsCard']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
