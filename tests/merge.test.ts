@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { finalizeMerge } from '../src/world/merge.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
@@ -21,6 +23,40 @@ describe('finalizeMerge (work must actually land)', () => {
   afterEach(() => {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it('waits for a canonical wiki mutation in another process before landing (WD-26)', async () => {
+    const world = await new WorktreeProvider(home).create({ taskId: 'wiki-lane', repo, base: 'main', target: 'main' });
+    world.handle.repos![0]!.role = 'project-wiki';
+    await world.writeFile('task-memory.md', 'task memory\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'task memory']);
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import { mutateAndPublishProjectWiki } from './src/wiki/repository.ts';
+      await mutateAndPublishProjectWiki(process.argv[1], () => {}, async () => {
+        process.send('held');
+        await new Promise(resolve => process.once('message', resolve));
+      });
+      process.disconnect();
+    `, repo], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    let stderr = '';
+    child.stderr!.on('data', chunk => { stderr += chunk; });
+    const exited = once(child, 'exit');
+    let landing: ReturnType<typeof finalizeMerge> | undefined;
+    try {
+      await Promise.race([once(child, 'message'), exited.then(() => { throw new Error(stderr || 'wiki writer exited early'); })]);
+      landing = finalizeMerge(world, 'main');
+      expect(await Promise.race([landing.then(() => 'landed'),
+        new Promise(resolve => setTimeout(() => resolve('waiting'), 1000))])).toBe('waiting');
+      child.send('release');
+      expect((await landing).merged).toBe(true);
+      expect((await git(repo, ['show', 'main:task-memory.md'])).stdout).toBe('task memory\n');
+    } finally {
+      if (child.connected) child.send('release');
+      await exited;
+      await landing;
+      await world.destroy();
+    }
   });
 
   it('rejects uncommitted work back to the merge agent instead of sweeping it', async () => {

@@ -132,7 +132,11 @@ function release(dir: string): void {
  * can claim the name in between.
  */
 export async function withWorktreeLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
-  const dir = path.join(worktreeNamespace(repo), 'karmax-worktree.lock');
+  return withDirectoryLock(path.join(worktreeNamespace(repo), 'karmax-worktree.lock'), fn);
+}
+
+/** A cross-process mutation lane, also used by the canonical wiki checkout. */
+export async function withDirectoryLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
   const run = (queues.get(dir) ?? Promise.resolve()).then(async () => {
     await acquire(dir);
     try {
