@@ -3352,7 +3352,8 @@ function connectWs() {
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     if (document.hidden) { S.liveUpdatesStale = true; return; }
-    if (S.tab === 'activity' && (!ev.projectId || ev.projectId === S.projectId)) {
+    // Streamed text chunks are the live bubble's, not activity (LT-5).
+    if (S.tab === 'activity' && ev.type !== 'agent.output' && (!ev.projectId || ev.projectId === S.projectId)) {
       S.activity.unshift(ev);
       if (S.activity.length > 400) S.activity.pop();
       bgRenderMain();
@@ -3373,11 +3374,18 @@ function connectWs() {
         if (S.taskEvents.length > 400) S.taskEvents.shift();
       }
       if (ev.type === 'agent.output' && ev.payload?.text) {
-        // Provider adapters emit the current complete block, not a token delta.
-        // Replacing avoids the old "H / He / Hello" cumulative transcript.
-        S.liveOutput = ev.payload.text;
-        updateLiveBubble();
+        // Adapters publish the whole text so far of the block being generated,
+        // not a token delta, so the bubble is replaced. Tool lines are timeline
+        // rows of their own and never replace it.
+        if (ev.payload.source === 'assistant') {
+          S.liveOutput = ev.payload.text;
+          updateLiveBubble();
+        }
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
+        // The completed message supersedes its live text; a new or failed
+        // attempt voids it, so a half message never lingers as if final.
+        if (ev.type === 'agent.activity' && (ev.payload?.kind === 'turn' || ev.payload?.kind === 'message' && ev.payload?.phase === 'completed'))
+          S.liveOutput = '';
         scheduleTaskPageRender();
       }
       if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
@@ -8746,8 +8754,7 @@ function conversationPane(v, t) {
       : '';
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
-  const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
-  const live = t.role === liveRoleFor(v) && !hasStructuredMessages
+  const live = t.role === liveRoleFor(v)
     ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
     : '';
   // Only subscription/CLI sessions carry a config home; API-key / stateless
@@ -11044,7 +11051,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true).reverse();
+    S.activity = activity.filter(e => e.type !== 'agent.output' && (e.type !== 'timing' || S.meta?.timingEnabled === true)).reverse();
     renderMain();
   } catch {}
 }
