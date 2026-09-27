@@ -4,7 +4,7 @@ import { DurationSequencer } from './tests/helpers/duration-sequencer.js';
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts', 'src/**/*.test.ts'],
-    setupFiles: ['./tests/helpers/isolated-home.ts', './tests/helpers/module-mocks.ts'],
+    setupFiles: ['./tests/helpers/isolated-home.ts', './tests/helpers/file-isolation.ts'],
     // Integration tests run mock agents inside the Vitest worker. Production
     // host pressure must not park them based on the CI runner's live RAM/load;
     // agent-slots.test.ts enables each gate explicitly when exercising it.
