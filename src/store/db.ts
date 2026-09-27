@@ -929,6 +929,10 @@ export class Store {
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN fundingSource TEXT NOT NULL DEFAULT 'customer'"));
     if (!usageCols.some((c) => c.name === 'costClassification'))
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN costClassification TEXT NOT NULL DEFAULT 'none'"));
+    // Self-healing on every boot (a rollback can write unclassified rows again),
+    // but served by a partial index that holds only the rows still to repair,
+    // so it no longer scans the whole usage ledger at each start (PS-5).
+    (await this.db.exec("CREATE INDEX IF NOT EXISTS idx_usage_unclassified ON usage_events(id) WHERE costMicros>0 AND costClassification='none'"));
     (await this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'"));
     const usageAdmissionCols = (await this.db.prepare('PRAGMA table_info(usage_admissions)').all()) as { name: string }[];
     if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
@@ -5088,29 +5092,25 @@ export class Store {
     return this.db.transaction(async () => {
 
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
-    const prefix = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
     for (const projectId of projectIds) {
-      const recoveryPrefix = `environment-build-recovery:${projectId}:`;
-      await prefix.run(recoveryPrefix, recoveryPrefix);
+      await this.kvDeletePrefix(`environment-build-recovery:${projectId}:`);
       await exact.run(`project-transfer-current:${projectId}`);
       await exact.run(`project-transfer-lock:${projectId}`);
       (await exact.run(`authz:default:project:${projectId}`));
       (await exact.run(`credpolicy:project:${projectId}`));
       (await exact.run(`avatars:project:${projectId}`));
       (await exact.run(`conversation-sharing:project:${projectId}`));
-      const workflowPrefix = `wfpin:${projectId}:`;
-      (await prefix.run(workflowPrefix, workflowPrefix));
+      await this.kvDeletePrefix(`wfpin:${projectId}:`);
     }
     for (const taskId of taskIds) {
       await exact.run(`project-transfer-history:${taskId}`);
       const sharePrefix = `conversation-share-index:${taskId}:`;
-      const shares = (await this.db.prepare('SELECT v FROM kv WHERE substr(k, 1, length(?))=?').all(sharePrefix, sharePrefix)) as Array<{ v: string }>;
-      for (const share of shares) (await exact.run(`conversation-share:${share.v}`));
-      (await prefix.run(sharePrefix, sharePrefix));
+      for (const share of (await this.kvEntries(sharePrefix))) (await exact.run(`conversation-share:${share.value}`));
+      await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
-        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
+        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) await this.kvDeletePrefix(value);
     }
   
     });
@@ -7591,16 +7591,28 @@ export class Store {
     });
   }
 
-  async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
+  /** The first key after every key that starts with `prefix`, so a prefix
+   * becomes a primary-key range (undefined when no such key exists). */
+  private kvPrefixEnd(prefix: string): string | undefined {
     const chars = Array.from(prefix);
-    let end: string | undefined;
     for (let i = chars.length - 1; i >= 0; i--) {
       const codePoint = chars[i]!.codePointAt(0)!;
-      if (codePoint < 0x10ffff) {
-        end = chars.slice(0, i).join('') + String.fromCodePoint(codePoint + 1);
-        break;
-      }
+      if (codePoint < 0x10ffff) return chars.slice(0, i).join('') + String.fromCodePoint(codePoint + 1);
     }
+    return undefined;
+  }
+
+  /** Delete every key starting with `prefix` through the primary-key range; the
+   * literal prefix check keeps exact semantics under any collation (PS-8). */
+  private async kvDeletePrefix(prefix: string): Promise<void> {
+    const key = this.kvRangeKey();
+    const end = this.kvPrefixEnd(prefix);
+    if (end) await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND ${key} < ? AND substr(k, 1, length(?))=?`).run(prefix, end, prefix, prefix);
+    else await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND substr(k, 1, length(?))=?`).run(prefix, prefix, prefix);
+  }
+
+  async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
+    const end = this.kvPrefixEnd(prefix);
     const key = this.kvRangeKey();
     const rows = prefix
       ? end
@@ -7613,9 +7625,8 @@ export class Store {
 
   async clearTurnCheckpoints(taskId: string, runId?: string): Promise<void> {
     await this.db.transaction(async () => {
-      const remove = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
       for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
-        ...(runId ? [`turnsession:legacy:${runId}:`, `turnspawns:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
+        ...(runId ? [`turnsession:legacy:${runId}:`, `turnspawns:legacy:${runId}:`] : [])]) await this.kvDeletePrefix(prefix);
     });
   }
 

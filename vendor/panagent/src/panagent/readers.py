@@ -69,6 +69,7 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
             active.add(cursor)
             cursor = graph[cursor].get("parentUuid")
     compacted = False
+    summary_title: str | None = None
     for index, record in records:
         record_type = record.get("type")
         embedded = record.get("panagent") if isinstance(record.get("panagent"), dict) else {}
@@ -78,22 +79,24 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
         session_id = record.get("sessionId")
         if isinstance(session_id, str) and session_id not in session_ids:
             session_ids.append(session_id)
-        if record.get("isSidechain") or (active is not None and record_type in {"user", "assistant", "system", "summary"}
+        if record.get("isSidechain") or (active is not None and record_type in {"user", "assistant", "system"}
                                           and isinstance(record.get("uuid"), str) and record["uuid"] not in active):
             continue
-        if record_type == "summary" and isinstance(record.get("summary"), str):
-            conv["messages"].clear()
-            pending_tools.clear()
+        # A summary record titles the conversation ending at leafUuid. Compaction is a
+        # compact_boundary with no parent, so the active chain already starts after it.
+        if record_type == "summary":
+            if isinstance(record.get("summary"), str) and record["summary"].strip() and record.get("leafUuid") in (active or graph):
+                summary_title = record["summary"].strip()
+            continue
+        if record_type == "system" and record.get("subtype") == "compact_boundary":
             compacted = True
-            conv["messages"].append(message(role="user", content=[text_block("[Claude compaction summary]\n" + record["summary"])],
-                                            source_format="claude-code-jsonl", source_id=record.get("uuid"), source_index=index))
             continue
         if record_type in {"ai-title", "custom-title"}:
             title = record.get("aiTitle") or record.get("customTitle") or record.get("title")
             if isinstance(title, str) and title.strip():
                 conv["title"] = title.strip()
         if record_type not in {"user", "assistant", "system"} or not isinstance(record.get("message"), dict):
-            if record_type in {"file-history-snapshot", "summary", "progress"}:
+            if record_type in {"file-history-snapshot", "progress"}:
                 warning(
                     conv,
                     f"claude_{str(record_type).replace('-', '_')}_not_represented",
@@ -143,7 +146,7 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
             for key in ("model", "stop_reason", "stop_sequence", "usage")
             if native.get(key) is not None
         }
-        for key in ("version", "gitBranch", "userType", "isSidechain", "parentUuid"):
+        for key in ("version", "gitBranch", "userType", "isSidechain", "parentUuid", "isCompactSummary"):
             if record.get(key) is not None:
                 metadata[f"claude_{key}"] = record[key]
         converted = message(
@@ -161,6 +164,8 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
         if not conv["created_at"]:
             conv["created_at"] = normalize_timestamp(record.get("timestamp"))
         conv["updated_at"] = normalize_timestamp(record.get("timestamp")) or conv["updated_at"]
+    if not conv["title"] and summary_title:
+        conv["title"] = summary_title
     if session_ids:
         conv["source"]["conversation_id"] = session_ids[0]
         conv["id"] = session_ids[0]

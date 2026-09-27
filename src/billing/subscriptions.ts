@@ -14,6 +14,9 @@ export const PAST_DUE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 export type SubscriptionStatus = 'none' | 'trialing' | 'active' | 'past_due' | 'unpaid'
   | 'incomplete' | 'incomplete_expired' | 'paused' | 'canceled';
 export const TERMINAL_PROVIDER_SUBSCRIPTION_STATUSES = ['canceled', 'incomplete_expired'] as const;
+/** How long after an uncertain billing write the provider's reads must still
+ * show no effect before the write counts as never applied. */
+export const ABSENT_WRITE_SETTLE_MS = 10 * 60_000;
 
 export interface SubscriptionCatalogConfig {
   individualPriceId: string;
@@ -82,7 +85,9 @@ export interface SubscriptionProvider {
     seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
   resumeCheckout?(input: Parameters<SubscriptionProvider['createCheckout']>[0] & { checkoutId: string }): Promise<{ id: string; url: string } | null>;
   cancelCheckout?(checkoutId: string): Promise<{ id: string }>;
-  reconcileRequest?(intent: BillingRequestIntent, reference: string, createdAt: number): Promise<{ id: string; url?: string } | null>;
+  /** The recovered result, `{ absent: true }` when a complete read shows the
+   * write had no effect, or null when the reads prove neither. */
+  reconcileRequest?(intent: BillingRequestIntent, reference: string, createdAt: number): Promise<{ id: string; url?: string } | { absent: true } | null>;
   createPortal(input: { customerId: string; subscriptionId?: string; returnUrl: string; idempotencyKey: string }): Promise<{ url: string }>;
   changePlan(input: { subscriptionId: string; plan: PaidHostedPlanId; seats: number;
     items: Record<string, string>; idempotencyKey: string }): Promise<{ id: string }>;
@@ -504,9 +509,23 @@ export class SubscriptionBillingService {
     const intent = JSON.parse(lock.intentJson) as BillingRequestIntent;
     const result = await provider.reconcileRequest(intent, lock.providerReference, Number(lock.createdAt));
     if (!result) return { reconciled: false, pending: true };
+    if ('absent' in result) {
+      // Proven to have had no effect. A request cannot apply long after it was
+      // sent, so once that window has passed the reservation is released and
+      // the person can simply try again; nothing is ever re-sent for them (GH-5).
+      if (Date.now() - Number(lock.createdAt) < ABSENT_WRITE_SETTLE_MS) return { reconciled: false, pending: true };
+      return this.store.transaction(async () => {
+        const current = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId) as any;
+        if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false, applied: false };
+        await this.store.db.prepare('DELETE FROM subscription_billing_requests WHERE requestKey=? AND organizationId=? AND responseJson IS NULL')
+          .run(lock.requestKey, organizationId);
+        await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, lock.requestKey);
+        return { reconciled: true, pending: false, applied: false };
+      });
+    }
     return this.store.transaction(async () => {
       const current = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId) as any;
-      if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false };
+      if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false, applied: true };
       if (intent.kind === 'checkout') {
         await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
           (provider, checkoutId, organizationId, createdAt) VALUES (?, ?, ?, ?)`)
@@ -518,7 +537,7 @@ export class SubscriptionBillingService {
       await this.store.db.prepare('UPDATE subscription_billing_requests SET responseJson=? WHERE requestKey=? AND organizationId=? AND responseJson IS NULL')
         .run(JSON.stringify(response), lock.requestKey, organizationId);
       await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, lock.requestKey);
-      return { reconciled: true, pending: false };
+      return { reconciled: true, pending: false, applied: true };
     });
   }
 

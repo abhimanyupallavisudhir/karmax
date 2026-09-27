@@ -8638,7 +8638,7 @@ function checkoutsSection(v) {
     <div class="card checkout-list">
       ${rows}
       ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
-        ? `${pending} of ${checkouts.length} still to review — approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.`
+        ? `${pending} of ${checkouts.length} still to review ${policyTip('Approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.')}`
         : 'Every branch approved. Confirm PR to pass Review.'}</div>` : ''}
     </div>`;
 }
@@ -13080,9 +13080,9 @@ function settingsView(proj) {
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
-    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
+    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
@@ -13231,8 +13231,7 @@ async function hydrateProjectData(proj) {
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     if (!renderIsCurrent()) return;
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when ${siteNameMarkup()} should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
-      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+    box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
@@ -13312,8 +13311,7 @@ async function hydrateProjectServices(proj) {
     const secrets = resources.filter((resource) => ['secret@1', 'database@1', 'service@1'].includes(resource.driver));
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
     if (!renderIsCurrent()) return;
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">↗</span><div><b>A service stays live.</b> Use an external service for an API, hosted database, or S3 bucket tasks call directly. Use a per-task container for an isolated development dependency such as Postgres or Redis. Credentials belong in Secrets.</div></div>
-      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
+    box.innerHTML = `      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
       <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
       <details class="settings-disclosure compact"><summary><b>Add a service manually</b></summary>
         <div class="project-form-grid">
@@ -15341,8 +15339,7 @@ function passwordsCard() {
 }
 function vaultRequestsCard() {
   return `<div class="card" id="vault-requests-card">
-    <div class="section-h">Credential access requests</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet. Add and bind a missing item before approving. <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto. Every decision resumes the task automatically.</p>
+    <div class="section-h">Credential access requests ${policyTip("Agents ask here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet; add and bind a missing item before approving. Once allows a single use, this task extends the task's grant, and always also sets the item's policy to auto. Every decision resumes the task.")}</div>
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
@@ -16885,9 +16882,7 @@ function notificationsCard() {
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
   return `<div class="card" id="notifications">
-    <div class="section-h">Notifications</div>
-    <p class="task-sub">Agents set an urgency when they need you — approvals arrive high by default. Higher
-      urgency always sorts to the top of your inbox; here you choose what else each level does.</p>
+    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive high by default. Higher urgency always sorts first in your inbox; here you choose what else each level does.')}</div>
     <div class="notify-grid">
       <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
     `<span>${behaviour.label}</span>`).join('')}<span></span></div>
@@ -17514,7 +17509,9 @@ async function hydrateOrganizationSubscription(organizationId) {
   box.querySelector('.billing-reconcile')?.addEventListener('click', async () => {
     try {
       const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/reconcile`, { method: 'POST' });
-      toast(result.reconciled ? 'Billing result confirmed. You can continue.' : 'Result still uncertain. Contact billing support; no payment has been retried.', !result.reconciled);
+      toast(!result.reconciled ? 'Result still uncertain. Contact billing support; no payment has been retried.'
+        : result.applied === false ? 'Nothing was changed or charged. You can try again.'
+        : 'Billing result confirmed. You can continue.', !result.reconciled);
       await hydrateOrganizationSubscription(organizationId);
     } catch (error) { toast(error.message, true); }
   });
@@ -17581,7 +17578,7 @@ function organizationView() {
     <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
-    <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
+    <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Managed storage is intentionally bounded. Connect your own bucket for large versioned datasets; for live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteName()}.`)}</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
 
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
@@ -17810,9 +17807,8 @@ async function hydrateOrganizationView() {
     <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
     <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
     <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
-    <label class="form-row">Outbound network<select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
+    <label class="form-row"><span>Outbound network ${policyTip('Coding agents normally need arbitrary package registries, documentation, web search and APIs. Restricted mode is for organizations with a maintained egress policy.')}</span><select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
   </div>
-  <p class="task-sub">Coding agents normally need arbitrary package registries, documentation, web search, and APIs. Restricted mode is for organizations with a maintained egress policy.</p>
   <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
   <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
   const providerInfo = {
@@ -17836,7 +17832,7 @@ async function hydrateOrganizationView() {
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
     <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
-  $('#org-storage').innerHTML = `<div class="project-help-callout"><span class="callout-mark">i</span><div><b>Managed storage is intentionally bounded.</b> Connect your own bucket for large versioned datasets. For live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteNameMarkup()}.</div></div>
+  $('#org-storage').innerHTML = `
     ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
     <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
       <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
@@ -17856,7 +17852,7 @@ async function hydrateOrganizationView() {
   $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
     <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
     <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
-    ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b></summary><div class="settings-grid">
+    ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b> ${policyTip(`The plan admits ${entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns} shared active agent runs; an owner can only set a tighter cap here. Managed model use stays off until an owner sets a spend cap and enables a provider. BYOK usage is attributed separately, and remote sandboxes use the organization's own provider account.`)}</summary><div class="settings-grid">
       <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
       <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
       <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
@@ -17866,7 +17862,7 @@ async function hydrateOrganizationView() {
       <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
       ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
         : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
-    </div><p class="task-sub">The plan admits ${esc(entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns)} shared active agent runs; an owner may only set a tighter cap here. Managed model use is off until an owner sets a spend cap and explicitly enables a provider. BYOK remains separately attributed. Remote sandboxes use the organization’s own provider account.</p><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
+    </div><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
   if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
     <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
