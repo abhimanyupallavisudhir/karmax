@@ -586,6 +586,8 @@ export class Gateway {
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
   private wikiWork = new Set<Promise<void>>();
+  /** Projects whose local wiki repository this gateway process has ensured. */
+  private wikiLocalReady = new Set<string>();
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
   private wikiRemoteRetryAfter = new Map<string, number>();
@@ -4530,7 +4532,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           const project = (await store.getProject(projectId));
-          if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+          if (project) await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
           const task = await api.createTask(token, { projectId, ...b }, receivedAt);
           return this.json(res, 200, task);
         }
@@ -4726,7 +4728,7 @@ export class Gateway {
       if (queueMatch && method === 'POST') {
         const queued = (await store.getTask(queueMatch[1]!));
         const project = queued ? (await store.getProject(queued.projectId)) : undefined;
-        if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+        if (project) await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const taskPayments = p.match(/^\/api\/tasks\/([^/]+)\/payments$/);
@@ -7669,11 +7671,22 @@ export class Gateway {
     void work.finally(() => this.wikiWork.delete(work)).catch(() => {});
   }
 
+  /** A task start needs its project's local wiki repository, and once this
+   * gateway has ensured it, it exists. Ensuring it again waits in the wiki's
+   * Git lane, which can sit behind a remote sync, so a start refreshes it
+   * alongside rather than before creating the task (LT-16). */
+  private async wikiForTaskStart(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
+    if (!this.wikiLocalReady.has(project.id)) return this.ensureProjectWiki(project, userId);
+    this.trackWikiWork(this.ensureProjectWiki(project, userId).catch(error =>
+      console.warn(`[karmax] could not refresh wiki for ${project.id}:`, error instanceof Error ? error.message : error)));
+  }
+
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
     if (this.closing) return;
     const root = await ensureProjectWikiRepositoryAsync(paths().content, project.id);
     if (this.closing) return;
     if (!(await this.deps.store.projectWiki(project.id))) (await this.deps.store.setProjectWikiRepository(project.id));
+    this.wikiLocalReady.add(project.id);
     const current = (await this.deps.store.projectWiki(project.id))?.repository;
     if (current && this.wikiRemotesReady.has(project.id)) return;
     if (!this.deps.githubApp) return;
