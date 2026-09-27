@@ -14,6 +14,7 @@ import type {
   WorldHttpRequest,
   WorldLifecycleState,
   ProviderUsageEvent,
+  ProviderUsagePage,
   WorldProcess,
   WorldProcessSpec,
   WorldProvider,
@@ -44,6 +45,8 @@ export const DEFAULT_E2B_TEMPLATE = 'uj125w982t7wflqad4ig';
 const DEFAULT_REQUEST_TIMEOUT_MS = 2 * 60_000;
 // Long enough to see the memory spike that froze a sandbox before a retry.
 const DIAGNOSIS_WINDOW_MS = 30 * 60_000;
+/** Lifecycle-event pages one usage sweep reads; a longer feed resumes next sweep. */
+const LIFECYCLE_PAGES_PER_READ = 100;
 // Resuming a paused sandbox takes seconds; a frozen one never answers.
 const REATTACH_REQUEST_MS = 60_000;
 // A stream reattached right after E2B resumes may drop once more (live-tested);
@@ -106,7 +109,7 @@ export interface E2BFactory {
    * handle — and, again, without resuming it first. */
   kill?(id: string, options: { apiKey?: string }): Promise<unknown>;
   /** Completed lifecycle executions from E2B's seven-day event feed. */
-  events?(options: { apiKey?: string; since?: number }): Promise<unknown[]>;
+  events?(options: { apiKey?: string; since?: number; offset?: number }): Promise<{ events: unknown[]; resumeAt?: number }>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -344,10 +347,11 @@ export class E2BWorldProvider implements WorldProvider {
   /** E2B pause/kill events carry the exact execution time and actual template
    * resources. Those are the billable intervals; a karmax runner lease is only
    * admission capacity and can outlive an auto-paused sandbox by days. */
-  async listUsageEvents(organizationId: string, since?: number): Promise<ProviderUsageEvent[]> {
-    if (!this.factory.events) return [];
+  async listUsageEvents(organizationId: string, since?: number, resumeAt?: number): Promise<ProviderUsagePage> {
+    if (!this.factory.events) return { events: [] };
     const connection = (await this.connection(organizationId));
-    const events = await this.factory.events({ ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}), since });
+    const { events, resumeAt: next } = await this.factory.events({
+      ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}), since, offset: resumeAt });
     const home = serviceHomeLabel();
     const normalized: ProviderUsageEvent[] = [];
     for (const raw of events) {
@@ -372,7 +376,7 @@ export class E2BWorldProvider implements WorldProvider {
           ? { taskId: metadata.karmaxTaskId } : {}),
         startedAt, endedAt: startedAt + activeMs, activeMs, cpu, memoryMb });
     }
-    return normalized;
+    return { events: normalized, ...(next !== undefined ? { resumeAt: next } : {}) };
   }
 
   private sealRef(value: Record<string, string>): string {
@@ -867,10 +871,12 @@ function defaultE2BFactory(): E2BFactory {
     },
     async events(options) {
       const since = options.since;
+      const start = options.offset ?? 0;
+      const end = start + LIFECYCLE_PAGES_PER_READ * 100;
       const result: unknown[] = [];
       // Cursor overlap and periodic full reconciliation are owned by the lifecycle
       // service. Keep the whole boundary page for equal timestamps/late arrivals.
-      for (let offset = 0; offset < 50_000; offset += 100) {
+      for (let offset = start; offset < end; offset += 100) {
         const query = new URLSearchParams({ limit: '100', offset: String(offset), orderAsc: 'false' });
         query.append('types', 'sandbox.lifecycle.paused');
         query.append('types', 'sandbox.lifecycle.killed');
@@ -883,9 +889,11 @@ function defaultE2BFactory(): E2BFactory {
         const page = Array.isArray(body) ? body : Array.isArray(body?.events) ? body.events : [];
         result.push(...page);
         if (page.length < 100 || (since !== undefined && page.some((event: any) =>
-          Number.isFinite(Date.parse(event.timestamp)) && Date.parse(event.timestamp) <= since))) return result;
+          Number.isFinite(Date.parse(event.timestamp)) && Date.parse(event.timestamp) <= since))) return { events: result };
       }
-      throw new Error('E2B lifecycle pagination limit exceeded; cursor was not advanced');
+      // Newest first: events arriving meanwhile only shift older ones to higher
+      // offsets, so resuming here may re-read (deduplicated), never skip.
+      return { events: result, resumeAt: end };
     },
   };
 }

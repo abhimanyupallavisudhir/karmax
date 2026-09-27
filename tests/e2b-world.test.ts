@@ -31,8 +31,30 @@ describe('E2B cloud world provider', () => {
     });
     try {
       const provider = new E2BWorldProvider();
-      await provider.listUsageEvents('org', 9850);
+      expect((await provider.listUsageEvents('org', 9850)).resumeAt).toBeUndefined();
       expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  // LT-19: a feed longer than one sweep's page bound returns what it read and
+  // where to resume, instead of throwing away the whole scan every sweep.
+  it('returns a bounded scan with the offset to resume a long lifecycle feed from', async () => {
+    const offsets: number[] = [];
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+      const offset = Number(new URL(String(input)).searchParams.get('offset'));
+      offsets.push(offset);
+      return Response.json(Array.from({ length: 100 }, (_, index) => lifecycleEvent(`execution-${offset + index}`)));
+    });
+    try {
+      const provider = new E2BWorldProvider();
+      const first = await provider.listUsageEvents('org');
+      expect(first.events.length).toBe(offsets.length * 100);
+      expect(first.events[0]?.id).toBe('execution-0');
+      expect(first.resumeAt).toBe(offsets.length * 100);
+      offsets.length = 0;
+      const second = await provider.listUsageEvents('org', undefined, first.resumeAt);
+      expect(offsets[0]).toBe(first.resumeAt);
+      expect(second.events[0]?.id).toBe(`execution-${first.resumeAt}`);
     } finally { fetcher.mockRestore(); }
   });
 
@@ -91,7 +113,7 @@ describe('E2B cloud world provider', () => {
       async create() { return sandbox; },
       async connect() { return sandbox; },
       async events() {
-        return [
+        return { events: [
           { id: 'pause-1', type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z',
             sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-1', event_data: {
               sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
@@ -108,13 +130,13 @@ describe('E2B cloud world provider', () => {
             sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-3', event_data: {
               sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
             } },
-        ];
+        ] };
       },
     };
     const provider = new E2BWorldProvider(factory, undefined, undefined,
       () => ({ organizationId: 'org-1', provider: 'e2b', apiKey: 'secret', config: {} }));
 
-    expect(await provider.listUsageEvents!('org-1')).toEqual([{
+    expect((await provider.listUsageEvents!('org-1')).events).toEqual([{
       id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1',
       startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
       activeMs: 300_000, cpu: 2, memoryMb: 512,
@@ -649,6 +671,12 @@ describe('E2B cloud world provider', () => {
     expect(await world.diagnose!({ since: at('04:50:43').getTime(), now })).toBeUndefined();
   });
 });
+
+function lifecycleEvent(execution: string) {
+  return { type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z', sandbox_id: 'sandbox', sandbox_execution_id: execution,
+    event_data: { sandbox_metadata: { karmaxHome: serviceHomeLabel() },
+      execution: { started_at: '2026-07-31T10:00:00Z', execution_time: 1000, vcpu_count: 1, memory_mb: 512 } } };
+}
 
 function fakeSandbox(onKill: () => void): E2BSandboxLike {
   return {
