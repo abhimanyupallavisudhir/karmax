@@ -66,6 +66,11 @@ function fakeGithub() {
     if (one) {
       const pr = prs.find((candidate) => candidate.number === Number(one[2]) && candidate.repo === one[1]);
       if (!pr) return json(404, { message: 'Not Found' });
+      // Real GitHub rule (task 387): a closed PR's base cannot change.
+      if (method === 'PATCH' && pr.state === 'closed' && body.state !== 'open' && 'base' in body)
+        return json(422, { message: 'Validation Failed', errors: [{ message: 'Cannot change the base branch of a closed pull request.' }] });
+      if (method === 'PATCH' && pr.state === 'closed' && body.state === 'open' && pr.unreopenable)
+        return json(422, { message: 'Validation Failed', errors: [{ message: 'state cannot be changed. The branch was force-pushed or recreated.' }] });
       if (method === 'PATCH') Object.assign(pr, body);
       return json(200, pr);
     }
@@ -463,6 +468,21 @@ describe('GitHub PR client', () => {
     await api.update(SLUG, pr.number, { state: 'closed' });
     expect((await api.openOrUpdate(SLUG, { head: 'karmax/t2', base: 'main', title: 'T', body: 'b' })).pr.state).toBe('open');
 
+    // Retargeted while closed: reopen first, then change the base (task 387).
+    await api.update(SLUG, pr.number, { state: 'closed' });
+    const retargeted = await api.openOrUpdate(SLUG, { head: 'karmax/t2', base: 'release', title: 'T', body: 'b' });
+    expect(retargeted.pr).toMatchObject({ number: pr.number, state: 'open' });
+    expect(gh.prs[0].base.ref ?? gh.prs[0].base).toBe('release');
+
+    // A closed PR GitHub will not reopen is replaced by a fresh one.
+    await api.update(SLUG, pr.number, { state: 'closed' });
+    gh.prs[0].unreopenable = true;
+    const replaced = await api.openOrUpdate(SLUG, { head: 'karmax/t2', base: 'main', title: 'T', body: 'b' });
+    expect(replaced).toMatchObject({ created: true, pr: { state: 'open' } });
+    expect(replaced.pr.number).not.toBe(pr.number);
+    gh.prs.splice(1);
+    gh.prs[0].unreopenable = false;
+
     gh.prs[0].state = 'closed';
     gh.prs[0].merged_at = '2026-01-01T00:00:00Z';
     const merged = await api.openOrUpdate(SLUG, { head: 'karmax/t2', base: 'main', title: 'T', body: 'b' });
@@ -811,6 +831,99 @@ describe('GitHub-authoritative merge activity', () => {
     readiness = { mergeStateStatus: 'BLOCKED', statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'waiting', detail: expect.stringMatching(/merge must not be attempted/i) });
     expect(methods).toContain('PUT');
+  });
+
+  // Task 389: a flaky test the PR never touched failed CI; the repair turn found
+  // nothing to change and resubmitted the same commit, and karmax then watched the
+  // same failed run until it parked for a person. Rerun the failed jobs instead.
+  it('reruns the failed jobs once when a CI repair leaves the candidate unchanged', async () => {
+    let attempt = 1;
+    let reruns = 0;
+    const readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', databaseId: 601, name: 'tests 4/5', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/36269105185/job/601`,
+      }] } } };
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/pulls/377')) return Response.json({
+        number: 377, node_id: 'PR_flaky', html_url: 'https://github.test/acme/widgets/pull/377', state: 'open',
+        merged: false, head: { ref: 'karmax/task_flaky', sha: 'pr-head' }, base: { ref: 'main' },
+      });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_flaky', url: 'https://github.test/acme/widgets/pull/377', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: 'pr-head', baseRefOid: 'base-head', viewerCanEnableAutoMerge: false,
+          viewerCanMergeAsAdmin: false, ...readiness,
+        } } } });
+      if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/check-runs/601'))
+        return Response.json({ output: { title: 'tests 4/5', summary: 'softwareDev waits in Do: timed out' } });
+      return Response.json({ message: `unexpected ${init.method ?? 'GET'} ${url.pathname}` }, { status: 500 });
+    }) as typeof fetch;
+    const failedJob = () => ({ id: 601, name: 'tests 4/5', status: 'completed', conclusion: 'failure', url: '',
+      steps: [{ number: 5, name: 'Run tests', status: 'completed', conclusion: 'failure' }],
+      log: { excerpt: 'FAIL tests/service-connections-workflow.test.ts > softwareDev waits in Do', downloadedBytes: 70, truncated: false } });
+    const actions = {
+      inspectFailure: async () => ({
+        run: { id: 36269105185, name: 'CI', workflowId: 9, runNumber: 1104, attempt,
+          event: 'pull_request', status: 'completed', conclusion: 'failure', branch: 'karmax/task_flaky',
+          headSha: 'pr-head', url: 'https://github.test/run/36269105185',
+          createdAt: '2026-09-26T20:20:00Z', updatedAt: '2026-09-26T20:28:00Z' },
+        jobs: [failedJob()], failedJobs: [failedJob()], artifacts: [], notices: [],
+      }),
+      listRuns: async () => ({ total: 1, page: 1, perPage: 100, runs: [] }),
+      rerun: async (_slug: string, runId: number, failedOnly: boolean) => {
+        expect([runId, failedOnly]).toEqual([36269105185, true]);
+        reruns++;
+        return { accepted: true as const, action: 'rerun-failed' as const };
+      },
+    };
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+      installationToken: async () => 'installation-token',
+      actions: () => actions,
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Flaky CI', { landingAuthority: 'auto' }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'flaky', accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'flaky-repo', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Flaky CI', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'owner', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 377, headSha: 'pr-head' }],
+    } }));
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_flaky', base: 'main', repo: tmp, root: tmp } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 377, nodeId: 'PR_flaky',
+      url: 'https://github.test/acme/widgets/pull/377', state: 'open', headSha: 'pr-head' }];
+    const land = () => core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    const repairs = async () => (await core.store.eventsSince(task.id, 0)).filter((event) => event.type === 'github.ci.repair-requested');
+
+    await expect(land()).resolves.toMatchObject({ status: 'needs-revision' });
+    expect(await repairs()).toHaveLength(1);
+    // The repair resubmitted the same head: rerun the failed jobs, once.
+    await expect(land()).resolves.toMatchObject({ status: 'waiting',
+      detail: 'Re-running the failed CI jobs: the repair found nothing to change in the proposal' });
+    expect(reruns).toBe(1);
+    await expect(land()).resolves.toMatchObject({ status: 'waiting' }); // rerun not visible yet
+    expect(reruns).toBe(1);
+    // The rerun failed too: back to the agent once, with that evidence.
+    attempt = 2;
+    const again = await land();
+    expect(again).toMatchObject({ status: 'needs-revision', detail: expect.stringMatching(/failed again when rerun unchanged \(attempt 2\)/) });
+    expect(await repairs()).toHaveLength(2);
+    // A second unchanged resubmission waits for a person, never reruns again.
+    await expect(land()).resolves.toMatchObject({ status: 'waiting' });
+    expect(reruns).toBe(1);
   });
 
   it('reconciles a cancelled merge-ref run before bounded retry and follows a newer successful run without reopening the PR', async () => {

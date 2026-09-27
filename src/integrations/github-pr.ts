@@ -255,13 +255,22 @@ export class GithubPrApi {
   async openOrUpdate(slug: string, input: { head: string; base: string; title: string; body: string }):
   Promise<{ pr: GithubPullRequest; created: boolean }> {
     const existing = await this.findByHead(slug, input.head);
+    let reopenRefused = false;
     if (existing) {
-      const pr = await this.update(slug, existing.number, {
-        title: input.title, body: input.body, base: input.base,
-        // A PR closed without merging is reopened: the task is live again.
-        ...(existing.state === 'closed' && !existing.merged ? { state: 'open' as const } : {}),
-      });
-      return { pr, created: false };
+      let current = existing;
+      // A PR closed without merging is reopened: the task is live again. GitHub
+      // refuses a base change on a closed PR (task 387), so reopen on its own
+      // first; if it cannot be reopened (e.g. the branch was recreated), open anew.
+      if (existing.state === 'closed' && !existing.merged) {
+        try { current = await this.update(slug, existing.number, { state: 'open' }); }
+        catch { reopenRefused = true; }
+      }
+      if (!reopenRefused) {
+        const pr = await this.update(slug, existing.number, {
+          title: input.title, body: input.body, ...(current.state === 'open' ? { base: input.base } : {}),
+        });
+        return { pr, created: false };
+      }
     }
     try {
       return { pr: normalize(await this.request(`/repos/${slug}/pulls`, {
@@ -270,7 +279,7 @@ export class GithubPrApi {
       })), created: true };
     } catch (error) {
       // Lost a race (or GitHub indexed the head late) — adopt the existing PR.
-      const raced = await this.findByHead(slug, input.head).catch(() => undefined);
+      const raced = reopenRefused ? undefined : await this.findByHead(slug, input.head).catch(() => undefined);
       if (!raced) throw error;
       return { pr: raced, created: false };
     }

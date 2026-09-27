@@ -18,6 +18,14 @@ describe('service connection workflow wait (real Temporal)', () => {
       try {
         await expect.poll(async () => (await view()).waitingFor?.detail, { timeout: 25_000 }).toContain('Connect the requested app');
         expect((await view()).stage).toBe('do');
+        // The query answers from workflow memory before the wait is durably
+        // published and the world parked. Restarting mid-way strands that work until
+        // its timeout (parkWaitingWorld heartbeats every 30 s) and stalls the task
+        // past the limit below (task 389's CI flake). Restart once nothing is in flight.
+        await expect.poll(async () => {
+          const { raw } = await handle.describe();
+          return !raw.pendingWorkflowTask && !(raw.pendingActivities?.length);
+        }, { timeout: 25_000 }).toBe(true);
         await h.restartWorker();
         expect((await view()).stage).toBe('do');
         (await h.store.kvSet(`service-connection:${taskId}`, JSON.stringify({ id: taskId, taskId, status: 'active', notifiedAt: Date.now() })));

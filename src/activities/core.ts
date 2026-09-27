@@ -3604,14 +3604,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
           recordedCurrents.add(observation);
         };
-        const externalWait = async (key: string, detail: string): Promise<GitHubMergeAuthorization> => {
+        const externalWait = async (key: string, detail: string, exhausted?: string): Promise<GitHubMergeAuthorization> => {
           const previous = events.filter((event) => event.type === 'github.ci.external-wait'
             && event.payload?.key === key).length;
           (await record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
             candidateHead: ref.headSha, poll: previous + 1 }));
           if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
-            detail: `${detail}\n\nGitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry. The task owns no admission slot while parked.`,
+            detail: `${detail}\n\n${exhausted ?? `GitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry.`} The task owns no admission slot while parked.`,
             eligibleUserIds: [actorUserId],
           };
           return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };
@@ -3807,8 +3807,47 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (revision) {
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === revision.key);
-          if (repairRequested) return (await externalWait(revision.key,
-            `${detail}\n\nThis exact terminal run was already sent for repair, but the repository, pull request, candidate head, run, and attempt are unchanged. Waiting for a substantive external change instead of reopening the proposal.`));
+          if (repairRequested) {
+            // The repair turn resubmitted the same commit: it found nothing in the
+            // proposal to fix (task 389 — a flaky test the PR never touched). The only
+            // productive step left is to rerun the failed jobs, once. A second failure
+            // goes back to the agent with that evidence, and only then to a person.
+            const run = revision.decision.inspection.run;
+            const rerunKey = `${revision.key}:unchanged-after-repair`;
+            const rerun = events.find((event) => event.type === 'github.ci.rerun-requested' && event.payload?.key === rerunKey);
+            if (!rerun && inspection.actions) {
+              try {
+                await inspection.actions.rerun(ref.slug, run.id, true);
+                (await record(handle.id, 'github.ci.rerun-requested', {
+                  ...ref, key: rerunKey, runId: run.id, observedAttempt: run.attempt, rerunNumber: 1,
+                }));
+                return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true,
+                  detail: 'Re-running the failed CI jobs: the repair found nothing to change in the proposal' };
+              } catch (error) {
+                return (await externalWait(revision.key, `${detail}\n\nGitHub rejected the automatic rerun: ${
+                  error instanceof Error ? error.message : String(error)}`,
+                'Rerun the failed jobs on GitHub, then confirm again.'));
+              }
+            }
+            const rerunAttempt = Number(rerun?.payload?.observedAttempt);
+            const repairedAgain = events.some((event) => event.type === 'github.ci.repair-requested'
+              && event.payload?.key === `${revision.key}:after-rerun`);
+            if (rerun && run.attempt > rerunAttempt && !repairedAgain) {
+              (await record(handle.id, 'github.ci.repair-requested', {
+                key: `${revision.key}:after-rerun`, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+                runId: run.id, attempt: run.attempt,
+              }));
+              return {
+                status: 'needs-revision', prs: current, actorUserId,
+                detail: `${detail}\n\nThe same check failed again when rerun unchanged (attempt ${run.attempt}), so it is not a one-off: fix the failure or the test.`,
+                ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true,
+                  fingerprint: `${revision.key}:after-rerun` } } : {}),
+              };
+            }
+            return (await externalWait(revision.key,
+              `${detail}\n\nThis exact terminal run was already sent for repair, but the repository, pull request, candidate head, run, and attempt are unchanged. Waiting for a substantive external change instead of reopening the proposal.`,
+              'The check still fails after an automatic rerun and a second repair left the proposal unchanged. Decide whether to fix it, rerun the failed jobs on GitHub, or land anyway, then confirm again.'));
+          }
           (await record(handle.id, 'github.ci.repair-requested', {
             key: revision.key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
             runId: revision.decision.inspection.run.id, attempt: revision.decision.inspection.run.attempt,
