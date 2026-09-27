@@ -1755,6 +1755,11 @@ export class Gateway {
             .setActiveGithub(activeAccountId));
         }
         if (pending.returnTo !== 'installation') {
+          const installUrl = (await this.linkPersonalGithubInstallation(identity.user.id, githubIdentity, pending.returnTo === 'profile'));
+          if (installUrl) {
+            res.writeHead(303, { location: installUrl });
+            return void res.end();
+          }
           for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === pending.organizationId))
             await this.ensureProjectWiki(project, identity.user.id);
         }
@@ -1795,7 +1800,10 @@ export class Gateway {
           await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
         }
         const status = (await this.deps.githubApp.status(identity.user.id));
-        if (pending.returnTo === 'profile' && status.oauthConfigured) {
+        // Sign-in that continued to installation already authorized this exact account.
+        const authorized = Boolean(pending.githubAccountId && (await this.deps.githubApp.listUserAccounts(identity.user.id))
+          .some((account) => account.id === pending.githubAccountId));
+        if (pending.returnTo === 'profile' && status.oauthConfigured && !authorized) {
           const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
             { returnTo: 'profile', selectAccount: pending.selectAccount,
               githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin }));
@@ -8532,6 +8540,31 @@ export class Gateway {
     const configured = process.env.KARMAX_PUBLIC_URL?.trim();
     if (configured) return new URL(configured).origin;
     return (await this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY)) ?? this.publicUrl(req);
+  }
+
+  /** Connecting GitHub must give the personal organization repository access,
+   * not only a commit identity. Link the App installation on the user's own
+   * GitHub account (the same check as connecting an existing installation);
+   * when there is none, return the GitHub installation URL if `install`. */
+  private async linkPersonalGithubInstallation(userId: string,
+    account: import('../integrations/github-app.js').GitHubUserIdentity, install: boolean): Promise<string | undefined> {
+    const githubApp = this.deps.githubApp!;
+    const personal = (await this.deps.store.listOrganizations(userId)).find((organization) => organization.kind === 'personal');
+    if (!personal || (await this.deps.store.listGitConnections(personal.id)).length) return undefined;
+    try {
+      const installationId = (await githubApp.ownInstallation(userId, account.id));
+      if (!installationId) {
+        return install ? githubApp.installationUrl((await this.deps.store.createGithubInstallState(personal.id, userId,
+          { returnTo: 'profile', githubAccountId: account.id, githubLogin: account.login }))) : undefined;
+      }
+      await githubApp.connectInstallation(personal.id, installationId);
+      for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === personal.id))
+        await this.ensureProjectWiki(project, userId);
+    } catch (error) {
+      // A convenience only: sign-in succeeded, and organization settings can still connect.
+      console.warn(`[github] personal installation link failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return undefined;
   }
 
   private async saveGithubIdentity(userId: string,

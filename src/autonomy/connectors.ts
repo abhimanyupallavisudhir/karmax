@@ -1274,7 +1274,7 @@ export class GitPassConnector implements CredentialConnector {
     const checks: NonNullable<ConnectorInfo['checks']> = [];
     for (const store of candidate.stores()) {
       try { checks.push({ ...await store.connector.verify(), store: store.prefix || 'root' }); }
-      catch { throw new Error(`Password store ${store.prefix || 'root'} failed repository/key/decryption verification`); }
+      catch (e) { throw new Error(`Password store ${store.prefix || 'root'}: ${gitPassVerificationError(e)}`); }
     }
     return { ...info, checks };
   }
@@ -1416,6 +1416,19 @@ function gitPassGpgError(error: unknown): string {
     return 'Git-backed pass could not use the supplied GPG key or passphrase';
   }
   return message;
+}
+
+/** Name the failing verification step without echoing raw Git output, which
+ *  includes server paths. Only the connector's own messages pass through. */
+function gitPassVerificationError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/^(git (clone|pull)\b|could not update password-store repository)/.test(message)) {
+    return 'cannot fetch the repository; select a Git profile that can access it';
+  }
+  if (/^(no password store was found|password-store path |password.store (repository )?contains too many|Selected verification entry|Git-backed pass |GPG private key|unknown Git profile)/.test(message)) {
+    return message;
+  }
+  return 'repository, key or decryption verification failed';
 }
 
 // ── the registry + sync service (state in the store kv) ───────────────────────

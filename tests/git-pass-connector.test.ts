@@ -9,7 +9,7 @@ const run = (cmd: string, args: string[], options: { cwd?: string; input?: strin
   execFileSync(cmd, args, { cwd: options.cwd, input: options.input, encoding: 'utf8',
     env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' } });
 
-function encryptedRemote() {
+function encryptedRemote(storePath = '.password-store') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-pass-'));
   const gpgHome = path.join(root, 'source-gpg');
   const remote = path.join(root, 'remote.git');
@@ -29,7 +29,7 @@ function encryptedRemote() {
   run('git', ['config', 'user.name', 'Karmax Test'], { cwd: seed });
   run('git', ['config', 'user.email', 'test@karmax.invalid'], { cwd: seed });
   run('git', ['checkout', '-b', 'main'], { cwd: seed });
-  const store = path.join(seed, '.password-store');
+  const store = path.join(seed, storePath);
   fs.mkdirSync(path.join(store, 'sites'), { recursive: true });
   fs.writeFileSync(path.join(store, '.gpg-id'), `${fingerprint}\n`);
   run('gpg', ['--homedir', gpgHome, '--batch', '--yes', '--trust-model', 'always', '--recipient', fingerprint,
@@ -41,13 +41,34 @@ function encryptedRemote() {
   run('git', ['push', '-u', 'origin', 'main'], { cwd: seed });
   run('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: remote });
 
-  const secret = JSON.stringify({ repositoryUrl: remote, storePath: '.password-store', gpgPrivateKey: privateKey, gpgPassphrase: passphrase });
+  const secret = JSON.stringify({ repositoryUrl: remote, ...(storePath ? { storePath } : {}), gpgPrivateKey: privateKey, gpgPassphrase: passphrase });
   const decrypt = (file: string) => run('gpg', ['--homedir', gpgHome, '--batch', '--yes', '--pinentry-mode', 'loopback',
     '--passphrase-fd', '0', '--decrypt', file], { input: `${passphrase}\n` });
-  return { root, remote, secret, decrypt };
+  return { root, remote, seed, secret, decrypt };
 }
 
 describe('Git-backed unix pass connector', () => {
+  it('verifies a store kept at the repository root and names the check that fails', async () => {
+    const fixture = encryptedRemote('');
+    const connector = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
+      path.join(fixture.root, 'connector-state'), { allowLocalRepository: true });
+    const config = JSON.parse(fixture.secret);
+    expect((await connector.validateSecret(fixture.secret)).checks).toEqual([
+      { store: 'root', entry: 'sites/example.com', read: 'verified', encryption: true, push: true },
+    ]);
+    expect((await connector.list()).map((item) => item.externalId)).toEqual(['sites/example.com']);
+
+    await expect(connector.validateSecret(JSON.stringify({ ...config, gpgPassphrase: 'wrong' })))
+      .rejects.toThrow('Password store root: Git-backed pass could not use the supplied GPG key or passphrase');
+    await expect(connector.validateSecret(JSON.stringify({ ...config, validationEntry: 'missing' })))
+      .rejects.toThrow('Password store root: Selected verification entry was not found');
+    await expect(connector.validateSecret(JSON.stringify({ ...config, storePath: 'nowhere' })))
+      .rejects.toThrow('Password store root: password-store path "nowhere" is not a directory in the repository');
+    const unreachable = connector.validateSecret(JSON.stringify({ ...config, repositoryUrl: path.join(fixture.root, 'missing.git') }));
+    await expect(unreachable).rejects.toThrow(/^Password store root: cannot fetch the repository/);
+    await expect(unreachable).rejects.not.toThrow(fixture.root);
+  });
+
   it('clones, decrypts, updates, commits and pushes a password store', async () => {
     const fixture = encryptedRemote();
     const hooks = path.join(fixture.root, 'hooks');
