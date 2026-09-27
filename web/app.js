@@ -1238,11 +1238,18 @@ function cfLayersOf(v) {
 }
 function humanAudienceOptions() {
   return [
-    ['@creator', 'Task creator'], ['@all', 'Everyone in the organization'],
-    ['@owners', 'Organization owners'], ['@project', 'Everyone with project access'],
-    ...S.organizationMembers.map((m) => [`user:${m.userId}`, `Person · ${principalLabel({ kind: 'user', userId: m.userId })}`]),
-    ...S.teams.map((t) => [`@team:${t.slug}`, `Team · ${t.name}`]),
+    { value: '@creator', label: 'Task creator' }, { value: '@all', label: 'Everyone in the organization' },
+    { value: '@owners', label: 'Organization owners' }, { value: '@project', label: 'Everyone with project access' },
+    ...S.organizationMembers.map((m) => ({ value: `user:${m.userId}`, label: `Person · ${principalLabel({ kind: 'user', userId: m.userId })}` })),
+    ...S.teams.map((t) => ({ value: `@team:${t.slug}`, label: `Team · ${t.name}` })),
   ];
+}
+// A comma-separated audience box whose suggestions follow the entry being typed.
+function audienceComboHtml(className, audience) {
+  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
+}
+function wireAudienceCombos(root) {
+  root.querySelectorAll('.audience-combo').forEach((combo) => wireCombo(combo, humanAudienceOptions, null, { multiple: true }));
 }
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
@@ -1258,10 +1265,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <button type="button" class="btn sm cf-del" title="Remove this step">✕</button>
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-      <label class="form-row">Who confirms
-        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
-      </label>
-      <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+      <label class="form-row">Who confirms${audienceComboHtml('cf-audience', audience)}</label>
       <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
@@ -1339,8 +1343,7 @@ function renderResponderField(f, own, inherited, alt) {
         <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
       </div>
       <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
-        <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+        <label class="form-row">Who responds${audienceComboHtml('cf-audience rf-audience', audience)}</label>
         <div class="task-sub">Comma-separated. Any selected person may answer this single input step.</div>
       </div>
       <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
@@ -1800,7 +1803,9 @@ function wireAuthorizationEditor(root, projects, onChange) {
   drawChips();
 }
 
-function wireCombo(combo, getOptions, onChange) {
+// `multiple`: the value is a comma-separated list — suggestions follow the entry
+// under the cursor, skip entries already listed, and choosing replaces just that entry.
+function wireCombo(combo, getOptions, onChange, { multiple = false } = {}) {
   const input = combo.querySelector('input');
   const menu = combo.querySelector('.combo-menu');
   const caret = combo.querySelector('.combo-caret');
@@ -1816,11 +1821,23 @@ function wireCombo(combo, getOptions, onChange) {
       if (on) el.scrollIntoView({ block: 'nearest' });
     });
   };
+  // The [start, end) span of the entry being edited, and the other listed entries.
+  const entry = () => {
+    const value = input.value;
+    if (!multiple) return { start: 0, end: value.length, others: [] };
+    const caret = input.selectionStart ?? value.length;
+    const start = caret ? value.lastIndexOf(',', caret - 1) + 1 : 0;
+    const next = value.indexOf(',', caret);
+    const end = next < 0 ? value.length : next;
+    const others = `${value.slice(0, start)},${value.slice(end)}`.split(',').map((v) => v.trim()).filter(Boolean);
+    return { start, end, others };
+  };
   const draw = () => {
-    const q = input.value.trim().toLowerCase();
+    const { start, end, others } = entry();
+    const q = input.value.slice(start, end).trim().toLowerCase();
     const opts = (getOptions() || [])
       .map(normalizeComboOption)
-      .filter((o) => o.value && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
+      .filter((o) => o.value && !others.includes(o.value) && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
     menu.innerHTML = opts.length
       ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o.value)}">
           <div class="combo-opt-head"><span>${esc(o.label)}</span>${o.label !== o.value ? `<code>${esc(o.value)}</code>` : ''}</div>
@@ -1832,7 +1849,17 @@ function wireCombo(combo, getOptions, onChange) {
   const show = () => { draw(); menu.hidden = false; open = true; };
   const hide = () => { menu.hidden = true; open = false; active = -1; };
   const choose = (opt) => {
-    input.value = opt.dataset.v; hide(); onChange && onChange();
+    if (multiple) {
+      // Keep the other entries; a completed last entry gets a separator so the
+      // next one can be typed straight away.
+      const { start, end } = entry();
+      const before = input.value.slice(0, start), after = input.value.slice(end);
+      const head = `${before ? before.replace(/\s*$/, ' ') : ''}${opt.dataset.v}`;
+      input.value = head + (after || ', ');
+      const caret = after ? head.length : input.value.length;
+      input.setSelectionRange?.(caret, caret);
+    } else input.value = opt.dataset.v;
+    hide(); onChange && onChange();
     input.dispatchEvent(new Event('change', { bubbles: true }));
   };
   input.addEventListener('focus', show);
@@ -1854,7 +1881,15 @@ function wireCombo(combo, getOptions, onChange) {
       if (open && active >= 0 && els[active]) { e.preventDefault(); choose(els[active]); }
     }
   });
-  input.addEventListener('blur', () => setTimeout(hide, 150)); // let a menu click land first
+  input.addEventListener('blur', () => {
+    if (multiple) input.value = input.value.replace(/[\s,]+$/, ''); // drop a dangling separator
+    setTimeout(hide, 150); // let a menu click land first
+  });
+  // Moving the cursor to another entry re-targets the suggestions.
+  if (multiple) {
+    input.addEventListener('click', () => { if (open) draw(); });
+    input.addEventListener('keyup', (e) => { if (open && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) draw(); });
+  }
   // mousedown (not click) so it fires before the input's blur closes the menu
   caret.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -2140,6 +2175,7 @@ function wireConfirmerField(box) {
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
       row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      wireAudienceCombos(row);
       wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
@@ -2154,6 +2190,7 @@ function wireConfirmerField(box) {
     const hb = row.querySelector('.cf-human');
     if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
   });
+  wireAudienceCombos(box);
   wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
@@ -2166,6 +2203,7 @@ function wireResponderField(box) {
     if (agent) agent.style.display = isAgent ? '' : 'none';
     if (human) human.style.display = isAgent ? 'none' : '';
   });
+  wireAudienceCombos(box);
   if (typeof wireWikiMention === 'function') {
     box.querySelectorAll('.rf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
   }
@@ -2279,6 +2317,7 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   // the box, so only the fresh agent sub-forms need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  wireAudienceCombos(list);
   wireConfirmerWikiPrompts(list);
   cfSync(box);
   // This composite control is rebuilt rather than assigned through an input.
