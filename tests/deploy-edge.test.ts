@@ -4,9 +4,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 const deployDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'deploy');
 const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8');
+
+it('bounds container memory and log growth in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const compose = parse(read(file)) as { services: Record<string, { mem_limit?: string; logging?: { options?: Record<string, string> } }> };
+    for (const [name, service] of Object.entries(compose.services)) {
+      expect(service.mem_limit, `${file}: ${name}`).toBeDefined();
+      expect(service.logging?.options?.['max-size'], `${file}: ${name}`).toBeDefined();
+      expect(service.logging?.options?.['max-file'], `${file}: ${name}`).toBeDefined();
+    }
+  }
+});
 
 /**
  * Run `deploy/karmax`'s `configure()` against a throwaway deployment directory.
@@ -17,14 +29,23 @@ const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8
  */
 function runConfigure(seed: string | undefined, domain = 'krmax.example.com'): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-'));
-  if (seed !== undefined) fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
-  execFileSync('sh', ['-c',
-    `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
-    + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n`
-    + `configure "${domain}"`,
-  ], { encoding: 'utf8' });
-  return fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8');
+  try {
+    if (seed !== undefined) fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
+    execFileSync('sh', ['-c',
+      `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
+      + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n`
+      + `configure "${domain}"`,
+    ], { encoding: 'utf8' });
+    return fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
+
+it('removes temporary deployment configuration fixtures', () => {
+  const fixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('karmax-deploy-')).sort();
+  const before = fixtureDirs();
+  runConfigure(undefined);
+  expect(fixtureDirs()).toEqual(before);
+});
 
 /** The `path` patterns of every rate-limit zone declared in the Caddyfile. */
 function zonePaths(caddyfile: string): string[] {
@@ -160,6 +181,14 @@ describe('compose forwards optional identity providers', () => {
         expect(line, line).not.toContain(':?');
       }
     });
+  }
+});
+
+it('forwards optional Stripe Issuing settings in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const app = read(file).split('\n  app:')[1]?.split('\n  caddy:')[0] ?? '';
+    for (const name of ['STRIPE_CLIENT_ID', 'STRIPE_WEBHOOK_SECRET'])
+      expect(app, `${file}: ${name}`).toMatch(new RegExp(`^\\s+${name}:`, 'm'));
   }
 });
 

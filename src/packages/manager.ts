@@ -43,6 +43,13 @@ export class WorkflowManager {
   private shaByType = new Map<string, string>(); // type → the commit its code came from
   private shaByPackage = new Map<string, string>(); // organization + manifest name/version → commit
   private stores = new Map<string, PackageStore>();
+  private mutation: Promise<unknown> = Promise.resolve();
+
+  private exclusive<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.mutation.then(run);
+    this.mutation = next.catch(() => {});
+    return next;
+  }
 
   constructor(
     private worker: Pick<WorkerManager, 'refresh'>,
@@ -124,6 +131,10 @@ export class WorkflowManager {
    * worker to serve it. Refuses to shadow a built-in name.
    */
   async install(spec: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
+    return this.exclusive(() => this.installExclusive(spec, organizationId));
+  }
+
+  private async installExclusive(spec: { url: string; ref?: string; name?: string }, organizationId: string): Promise<{ name: string; version: string }> {
     if (this.hosted) throw new Error('External workflow code is disabled in hosted deployments');
     // Peek at the name to reject built-in collisions before doing the fetch when possible.
     if (spec.name && isBuiltInWorkflowName(spec.name)) throw new Error(`"${spec.name}" is a built-in workflow; built-ins change only with a platform release`);
@@ -174,15 +185,18 @@ export class WorkflowManager {
    * snapshot that has gone missing is skipped (reported to `onWarn`).
    */
   async restore(onWarn: (msg: string) => void = () => {}): Promise<number> {
+    return this.exclusive(() => this.restoreExclusive(onWarn));
+  }
+
+  private async restoreExclusive(onWarn: (msg: string) => void): Promise<number> {
     if (this.hosted) {
       if (this.readRegistry().length) onWarn('External workflow restore disabled in hosted deployments; existing external executions require migration');
       return 0;
     }
     const records = this.readRegistry();
-    const external = new Map(this.external);
-    const shaByType = new Map(this.shaByType);
-    const shaByPackage = new Map(this.shaByPackage);
-    const restored: { organizationId: string; manifest: WorkflowManifest }[] = [];
+    const external = new Map(this.external), shaByType = new Map(this.shaByType), shaByPackage = new Map(this.shaByPackage);
+    const manifests: { organizationId: string; manifest: WorkflowManifest }[] = [];
+    let loaded = 0;
     for (const r of records) {
       try {
         // Reassert confinement before reading the manifest and selecting code.
@@ -200,7 +214,6 @@ export class WorkflowManager {
         if (!workflowEntry) throw new Error('no workflow module');
         const organizationId = r.organizationId ?? 'org_personal';
         if (isBuiltInWorkflowName(manifest.name)) throw new Error('shadows a built-in workflow');
-        restored.push({ organizationId, manifest });
         // Legacy personal installs already have running executions pinned to the
         // old unqualified package type. Keep that export forever; new records are
         // tenant-qualified so two organizations may install the same name/version
@@ -211,21 +224,25 @@ export class WorkflowManager {
         external.set(type, { type, entryFile: workflowEntry, exportName: manifestExport(manifest) });
         shaByType.set(type, r.sha);
         shaByPackage.set(`${organizationId}:${qualifiedType(manifest.name, manifest.version)}`, r.sha);
+        manifests.push({ organizationId, manifest });
+        loaded++;
       } catch (e) {
         onWarn(`could not restore workflow ${r.name}@${r.version}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
     if (external.size) await this.worker.refresh([...external.values()]);
-    this.external = external;
-    this.shaByType = shaByType;
-    this.shaByPackage = shaByPackage;
-    for (const { organizationId, manifest } of restored) this.storeFor(organizationId).register(manifest);
-    return restored.length;
+    this.external = external; this.shaByType = shaByType; this.shaByPackage = shaByPackage;
+    for (const { organizationId, manifest } of manifests) this.storeFor(organizationId).register(manifest);
+    return loaded;
   }
 
   /** Remove one tenant's selectable packages after all of its task executions
    * have been terminated as part of organization deletion. */
   async removeOrganization(organizationId: string): Promise<void> {
+    return this.exclusive(() => this.removeOrganizationExclusive(organizationId));
+  }
+
+  private async removeOrganizationExclusive(organizationId: string): Promise<void> {
     if (organizationId === 'org_personal') throw new Error('cannot remove personal organization workflows');
     const records = this.readRegistry();
     const removed = records.filter((record) => record.organizationId === organizationId);

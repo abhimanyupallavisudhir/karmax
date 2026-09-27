@@ -3,8 +3,8 @@
  * signature. A hit returns a vetted action (e.g. retry); a miss falls through to
  * the Resolve agent. Agents extend this list through the reviewed PR path.
  */
-import { isSafeSearchPattern } from '../wiki/wiki.js';
 import { classifyLimitError, isResourceKill, isTransportError } from '../agent/limits.js';
+import { Script } from 'node:vm';
 
 export interface ResolveOutcome {
   resolved: boolean;
@@ -54,17 +54,24 @@ const CASES: ResolveCase[] = [
   },
 ];
 
+const matchRules = new Script(`rules.findIndex(r => {
+  try { return new RegExp(r.match, r.flags ?? 'i').test(error); }
+  catch { return false; }
+})`);
+
 export function autoResolve(stage: string, error: string, rules?: ResolveRuleDecl[]): ResolveOutcome {
   // Workflow-declared rules first (more specific), then the platform defaults.
-  for (const r of (rules ?? []).slice(0, 100)) {
-    // Declared rules run on the shared worker thread. Keep a conservative
-    // grammar and bounded input; complex patterns fall through to Resolve.
-    if (r.match.length > 512 || !isSafeSearchPattern(r.match)
-      || /[(){}]/.test(r.match) || (r.match.match(/[*+?]/g)?.length ?? 0) > 1) continue;
+  if (rules?.length && rules.length <= 500) {
     try {
-      if (new RegExp(r.match, r.flags ?? 'i').test(error.slice(0, 2048))) return { resolved: true, action: r.action, note: r.note ?? r.name };
+      // A syntax check cannot detect all catastrophic backtracking. Bound the
+      // entire rule set, including regex compilation, and fall back on timeout.
+      // Long logs keep their start and their final diagnostics.
+      const text = error.length <= 64 * 1024 ? error : `${error.slice(0, 32 * 1024)}\n${error.slice(-32 * 1024)}`;
+      const index = matchRules.runInNewContext({ rules, error: text }, { timeout: 25 });
+      const r = rules[index];
+      if (r) return { resolved: true, action: r.action, note: r.note ?? r.name };
     } catch {
-      /* a bad regex in a declared rule shouldn't wedge resolve */
+      /* slow rules must not wedge the shared activity worker */
     }
   }
   for (const c of CASES) {

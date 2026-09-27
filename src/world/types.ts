@@ -140,7 +140,7 @@ export interface WorldSpec {
   /** Keep a plain working directory in addition to configured companion repos. */
   scratch?: boolean;
   /** Recorded checkout topology, indexed like repos, for portable recovery. */
-  checkouts?: Array<Pick<WorldRepo, 'name' | 'branch' | 'base' | 'target' | 'sourceAuthority'> & { gitIdentity?: WorldGitIdentity }>;
+  checkouts?: Array<Pick<WorldRepo, 'name' | 'base' | 'target' | 'sourceAuthority'> & { branch?: string; gitIdentity?: WorldGitIdentity }>;
   base: string;
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */

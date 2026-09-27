@@ -71,7 +71,7 @@ export class WorldCheckpointService {
     this.runners = runners ?? new RunnerPoolService(store);
   }
 
-  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void> } = {}): Promise<WorldCheckpoint> {
+  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void>; reuseClean?: boolean } = {}): Promise<WorldCheckpoint> {
     return this.worlds.withOperation(handleInput.id, async () => {
     await this.store.pruneWorldCheckpoints(handleInput.id);
     await options.checkContinue?.();
@@ -137,6 +137,25 @@ export class WorldCheckpointService {
         files.push({ repo: '', path: file, readPath: file });
       }
     }
+    const manifest = {
+      worldId: handle.id, generation: handle.generation ?? 1, projectId,
+      runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
+      repos, ...(resourceRefs.length ? { resources: resourceRefs } : {}),
+      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
+      ...(await snapshotProjectRuntime(this.store, projectId)),
+    };
+    // Git cleanliness alone is insufficient: resources, runtime settings and a
+    // previous dirty delta must also agree before reusing portable recovery data.
+    const cleanFingerprint = files.length === 0 ? sha256(Buffer.from(JSON.stringify(manifest))) : undefined;
+    const clean = handle.meta?.cleanCheckpoint as { id?: string; fingerprint?: string } | undefined;
+    if (options.reuseClean && cleanFingerprint && clean?.id === handle.checkpointId && clean?.fingerprint === cleanFingerprint) {
+      const previous = await this.store.getWorldCheckpoint(clean.id!);
+      if (previous?.filesystemDelta) {
+        await options.checkContinue?.();
+        if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
+        return previous;
+      }
+    }
     if (files.length > 100_000) throw new Error('checkpoint file count limit exceeded');
     const paths = files.flatMap(file => file.readPath === undefined ? [] : [file.readPath]);
     let expectedBytes = 0;
@@ -177,18 +196,16 @@ export class WorldCheckpointService {
       throw error;
     }
     const checkpoint: WorldCheckpoint = {
-      id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
-      runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
-      repos, filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
-      ...(resourceRefs.length ? { resources: resourceRefs } : {}),
-      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
-      ...(await snapshotProjectRuntime(this.store, projectId)),
+      id: checkpointId, ...manifest,
+      filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
       createdAt: Date.now(),
     };
     try { (await this.store.saveWorldCheckpoint(checkpoint)); }
     catch (error) { await this.objects.delete(objectKey).catch(() => undefined); throw error; }
     finally { if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`)); }
     (await this.store.attachWorldCheckpoint(handle, checkpoint.id));
+    await this.store.updateWorldMeta(handle, { cleanCheckpoint: cleanFingerprint
+      ? { id: checkpoint.id, fingerprint: cleanFingerprint } : null });
     (await this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
       provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte', costMicros: 0,
       fundingSource: 'managed',
@@ -250,6 +267,7 @@ export class WorldCheckpointService {
     const environment = (await selectProjectEnvironment(this.store, checkpoint.projectId, selected,
       executionConfig.environment, checkpoint.environment));
     const primary = checkpoint.repos[0];
+    const pinnedHeads = checkpoint.repos.every(repo => /^[0-9a-f]{40,64}$/i.test(repo.headSha ?? ''));
     const linked = (await this.store.listProjectRepositories(checkpoint.projectId));
     const repositoryBranches = Object.fromEntries(checkpoint.repos.map((repo, index) => {
       const source = sources[index]!;
@@ -304,12 +322,14 @@ export class WorldCheckpointService {
         copySources: checkpoint.repos.map((repo, index) => repo.localPath ?? previousFor(repo, index)?.localPath),
         checkouts: checkpoint.repos.map((repo, index) => ({
           name: repo.checkoutPath === '.' ? previousFor(repo, index)?.name ?? 'repo' : repo.checkoutPath,
-          branch: repo.branch, base: repo.base ?? previousFor(repo, index)?.base ?? project.config.defaultBase ?? 'main',
+          // An idle checkpoint may never have published its task ref: create
+          // from base, then check out the captured commit below (LT-8).
+          branch: pinnedHeads ? undefined : repo.branch, base: repo.base ?? previousFor(repo, index)?.base ?? project.config.defaultBase ?? 'main',
           target: repo.target ?? previousFor(repo, index)?.target,
           sourceAuthority: repo.sourceAuthority ?? previousFor(repo, index)?.sourceAuthority,
           gitIdentity: repo.gitIdentity,
         })), base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
-        branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
+        branch: pinnedHeads ? undefined : primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
         network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     } catch (error) {
@@ -320,11 +340,20 @@ export class WorldCheckpointService {
       for (const [index, restoredRepo] of worldRepos(world.handle).entries()) {
         const manifestRepo = checkpoint.repos[index];
         const previous = manifestRepo ? previousFor(manifestRepo, index) : undefined;
+        // An idle checkpoint at the provisioned base need not publish a task ref.
+        // Clone normally, then restore the exact captured commit before its delta.
+        if (pinnedHeads && manifestRepo) {
+          const checkout = await world.exec('git', ['checkout', '-B', manifestRepo.branch, manifestRepo.headSha!], { cwd: restoredRepo.root });
+          if (checkout.code !== 0) throw new Error(`checkpoint commit ${manifestRepo.headSha} is unavailable: ${checkout.stderr}`);
+          restoredRepo.branch = manifestRepo.branch;
+          restoredRepo.baseSha = manifestRepo.baseSha;
+        }
         const role = manifestRepo?.role ?? previous?.role;
         if (role) restoredRepo.role = role;
         const targetPinned = manifestRepo?.targetPinned ?? previous?.targetPinned;
         if (targetPinned !== undefined) restoredRepo.targetPinned = targetPinned;
       }
+      if (pinnedHeads && primary) world.handle.branch = primary.branch;
       const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
       world.handle.workdir = developmentRepos.length === 1 ? developmentRepos[0]!.root : world.handle.root;
       if (this.resources) {

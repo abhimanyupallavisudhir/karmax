@@ -1,13 +1,17 @@
 import { concurrentMap } from '../util/concurrent-map.js';
 import { notifyChildSettlement } from './children.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
+import { snapshotReplayHistories } from './replay-histories.js';
+import { turnPlatformRequest } from '../agent/platform-request.js';
+import { acquireConfirmLock } from './confirm-lock.js';
+import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import type { PublishedView, ViewConversation, LifecyclePublication } from '../domain/view-publication.js';
+import { hasLiveWorldWork, type PublishedView, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -28,7 +32,7 @@ import {
   MODEL_PROVIDERS,
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
-import { AgentAdapter } from '../agent/types.js';
+import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
@@ -120,31 +124,6 @@ const DEFAULT_GRANT = [
   'github:actions:read',
 ];
 
-// A confirmer belongs to a logical task, so sibling attempts must not review in
-// parallel against divergent copies of its conversation. The worker is the
-// single activity host in v1; this keyed FIFO serializes those turns while each
-// Temporal activity remains independently retryable.
-const confirmLocks = new Map<string, { held: boolean; waiters: Array<() => void> }>();
-async function acquireConfirmLock(key: string): Promise<() => void> {
-  let lock = confirmLocks.get(key);
-  if (!lock) {
-    lock = { held: false, waiters: [] };
-    confirmLocks.set(key, lock);
-  }
-  if (lock.held) await new Promise<void>((resolve) => lock!.waiters.push(resolve));
-  else lock.held = true;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    const next = lock!.waiters.shift();
-    if (next) next();
-    else {
-      lock!.held = false;
-      confirmLocks.delete(key);
-    }
-  };
-}
 
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
@@ -825,9 +804,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     };
   }
 
-  async function publishTaskBranch(world: World, taskId: string) {
+  async function publishTaskBranch(world: World, taskId: string, idleCheckpoint = false) {
     return brokerPublishBranch(world, (await brokerAuthFor(world.handle, taskId)),
-      (await expectedTaskRemoteHeads(store, taskId)), recordOriginPublication(taskId));
+      (await expectedTaskRemoteHeads(store, taskId)), recordOriginPublication(taskId), { omitUnchangedBase: idleCheckpoint });
   }
 
   async function pushTaskBranches(
@@ -1051,7 +1030,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
     try {
       const snapshotFiles = new Map<string, string>();
-      for (const file of await world.listFiles()) {
+      const listed = await world.exec('bash', ['-lc',
+        "set -o pipefail; find . -type d '(' -name .git -o -name node_modules ')' -prune -o -type f '(' -name SKILL.md -o -name MEMORY.md ')' -print0 | head -c 2097153"],
+        { cwd: repo.root, timeoutMs: 30_000 });
+      if (listed.code !== 0 || Buffer.byteLength(listed.stdout) > 2 * 1024 * 1024)
+        throw new Error('project wiki listing failed or exceeded its limit');
+      const files = listed.stdout.split('\0').filter(Boolean);
+      if (files.length > 2000) throw new Error('project wiki contains too many pages');
+      for (const listedFile of files) {
+        const file = path.posix.join(prefix, listedFile.replace(/^\.\//, ''));
         if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
         const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
         if (!rel || rel === '.git' || rel.startsWith('.git/')) continue;
@@ -1074,8 +1061,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
     const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
-    const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
-    if ((view.status !== 'waiting' && view.status !== 'blocked') || startingAgent
+    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view)
       || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
@@ -1088,10 +1074,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ctx?.cancellationSignal.throwIfAborted();
       const superseding = Number.isSafeInteger(publicationSeq)
         ? (await store.eventsSince(taskId, publicationSeq, undefined, true)).find(event =>
-          event.type === 'conversation.message' || event.type === 'task.cancel-requested') : undefined;
+          event.type === 'conversation.message' || event.type === 'task.cancel-requested'
+            || event.type === 'task.transition-requested') : undefined;
       if (superseding) {
         await record(taskId, 'world.park-deferred', { reason: superseding.type === 'task.cancel-requested'
-          ? 'accepted-cancellation' : 'accepted-follow-up' });
+          ? 'accepted-cancellation' : superseding.type === 'task.transition-requested' ? 'accepted-transition' : 'accepted-follow-up' });
         return false;
       }
       if (await worlds.hasActiveAccess?.(waitingWorld.id)) return false;
@@ -1128,13 +1115,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               if ((await store.listProjectRepositories(projectId)).length) {
                 await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
                 if (!(await valid())) return;
-                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId)));
+                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId, true)));
                 if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                 (await record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
               }
             }
             if (!(await valid())) return;
-            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld, { checkContinue }));
+            const checkpoint = await parkingTrace.measure('lifecycle.checkpoint', () => deps.checkpoints!.checkpoint(waitingWorld, { checkContinue, reuseClean: true }));
             (await record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
               generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
           } catch (error) {
@@ -1161,6 +1148,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     };
     try {
+      // Keep quick replies and Review decisions out of expensive checkpoint work.
+      // Do not hold the world's operation lock during this interruptible grace.
+      const idleUntil = Math.min(view.updatedAt + 15_000, Date.now() + 15_000);
+      while (Date.now() < idleUntil) {
+        if (!(await valid())) return;
+        await new Promise(resolve => setTimeout(resolve, Math.min(250, idleUntil - Date.now())));
+      }
       await parkingTrace.measure('lifecycle.waiting-publication', () => worlds.withOperation ? worlds.withOperation(waitingWorld.id, maintain) : maintain());
     } catch (error) {
       if (ctx?.cancellationSignal.aborted) throw error;
@@ -1171,6 +1165,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
+      let activitySignal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let cancellationHeartbeat: NodeJS.Timeout | undefined;
+      {
+        try {
+          const ctx = activityContext.current();
+          activitySignal = ctx.cancellationSignal;
+          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
+          // Temporal delivers activity cancellation at heartbeat boundaries.
+          // Keep that boundary live after admission while the provider allocates
+          // and provisions the sandbox.
+          cancellationHeartbeat = setInterval(() => {
+            try { ctx.heartbeat({ provisioning: args.kind }); } catch { /* cancellation is checked by provisioning */ }
+          }, 1_000);
+          cancellationHeartbeat.unref();
+        } catch {
+          // Direct activity unit tests have no ambient Temporal context.
+        }
+      }
+      const stopCancellationHeartbeat = () => {
+        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
+        cancellationHeartbeat = undefined;
+      };
+      try {
       const trace = (await installationTiming(store, { taskId: args.taskId }, async row => (await record(args.taskId, 'timing', { ...row }))));
       try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
       return (await withTiming(trace, () => trace.measure('world.prepare', async () => {
@@ -1195,8 +1213,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // Wait for an idle source, including workflow-owned Git operations.
             // A gap between two agent turns is not an idle world.
             const sourceBusy = async () => {
-              const view = (await store.getTask(forkSource.taskId))?.lastView;
-              if (view && ['done', 'cancelled', 'failed'].includes(view.status)) return false;
+              const view = await store.taskExecutionState(forkSource.taskId);
+              if (view && ['done', 'cancelled', 'failed'].includes(view.status ?? '')) return false;
               return view?.status === 'active' || Boolean(view?.agentTurn);
             };
             if ((await sourceBusy())) (await record(args.taskId, 'world.fork-waiting', { sourceTaskId: forkSource.taskId }));
@@ -1205,7 +1223,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               try { context = activityContext.current(); } catch { /* direct activity test */ }
               context?.cancellationSignal.throwIfAborted();
               context?.heartbeat({ waitingFor: 'fork-source', taskId: forkSource.taskId });
-              await new Promise((resolve) => setTimeout(resolve, 500));
+              await new Promise((resolve) => setTimeout(resolve, 2_000));
             }
             const source = (await store.currentWorld(forkSource.taskId)) as WorldHandle | undefined;
             if (!source) throw new Error('source world is unavailable; choose another starting branch to fork only the conversation');
@@ -1393,27 +1411,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const environmentSelection = projectId
         ? (await selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment))
         : { built: false, environment: executionConfig?.environment };
-      let activitySignal: AbortSignal | undefined;
-      let heartbeat: (() => void) | undefined;
-      let cancellationHeartbeat: NodeJS.Timeout | undefined;
-      if (remote) {
-        try {
-          const ctx = activityContext.current();
-          activitySignal = ctx.cancellationSignal;
-          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
-          // Temporal delivers activity cancellation at heartbeat boundaries.
-          // Keep that boundary live after admission while the provider allocates
-          // and provisions the sandbox.
-          cancellationHeartbeat = setInterval(() => ctx.heartbeat({ provisioning: args.kind }), 500);
-          cancellationHeartbeat.unref();
-        } catch {
-          // Direct activity unit tests have no ambient Temporal context.
-        }
-      }
-      const stopCancellationHeartbeat = () => {
-        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
-        cancellationHeartbeat = undefined;
-      };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         try {
@@ -1569,6 +1566,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
       } finally { stopCancellationHeartbeat(); }
       })));
+      } finally { stopCancellationHeartbeat(); }
     },
 
     /** The effective provider for a role's turn (task override → seeded profile),
@@ -1702,6 +1700,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const attemptStarted = Date.now();
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
+      let resultCheckpointed = false;
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined;
       let workflowRunId: string | undefined;
@@ -1843,7 +1842,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Requesting human input is a non-removable safety valve for every task
       // agent. The API restricts task-scoped callers to their own task, so this
       // cannot be used to interrupt peer work or widen the agent's authority.
-      const storedAuthorization = (await store.getTask(args.taskId))?.params?._authorization as {
+      const preparationTask = await store.getTask(args.taskId);
+      const storedAuthorization = preparationTask?.params?._authorization as {
         capabilities?: string[];
         principal?: string;
         scope?: 'projects' | 'organization' | 'global';
@@ -2190,7 +2190,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? `
 - Goal mode is active. Continue autonomously across turns until the entire objective is complete and verified. A normal response does not finish the task: call signal_completion only when no required work remains. If you genuinely need a human decision, raise it with the appropriate task tool instead.`
         : '';
-      const builtinInstructions = goalSuffix ? `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}` : deps.globalInstructions;
+      const builtinInstructions = deps.globalInstructions;
       // Wiki context (SPEC §5.4 "global + project instructions"): the built-in
       // working instructions (a virtual unconditional wiki entry), then per
       // scope its unconditional entries in full and the indexed TOC. Read here
@@ -2209,8 +2209,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const taggedText = [args.task.prompt, ...args.messages.filter((m) => m.role === 'user').map((m) => m.text)]
           .filter(Boolean)
           .join('\n');
-        const wikiContext = (await store.getTask(args.taskId))?.params?.wikiContext;
-        wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
+        const wikiContext = preparationTask?.params?.wikiContext;
+        try {
+          wikiSnapshot = await trace.measure('prompt.wiki-snapshot', () => projectWikiPromptSnapshot(world));
+        } catch { /* Keep organization and canonical project context available while the world is offline. */ }
         projectInstructions = buildWikiPromptContext({
           contentDir: deps.contentDir ?? paths().content,
           organizationId: (await store.getProject(args.task.projectId))?.organizationId,
@@ -2220,16 +2222,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           taggedText,
           contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
         }) || undefined;
+        if (goalSuffix) projectInstructions = `${projectInstructions ?? ''}${goalSuffix}`;
       } catch {
         globalInstructions = `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}`;
       } finally {
         wikiSnapshot?.release();
       }
-      const liveTarget = (await store.getTask(args.taskId))?.lastView?.targetBranch ?? args.task.target;
+      const liveTarget = preparationTask?.lastView?.targetBranch ?? args.task.target;
       const promptTask = liveTarget && liveTarget !== args.task.target
         ? { ...args.task, target: liveTarget }
         : args.task;
-      const forkOrigin = (await store.getTask(args.taskId))?.params._forkWorld as ForkWorldSource | undefined;
+      const forkOrigin = preparationTask?.params._forkWorld as ForkWorldSource | undefined;
       const forkContext = forkOrigin ? `\n\nThis task forks the conversation of ${forkOrigin.taskId}. Starting branch: ${args.task.base}. `
         + (forkOrigin.base !== args.task.base
           ? 'The starting branch was changed. This world uses normal project initialization; the source task’s unpublished files and private resource snapshots were not copied. Verify remembered work against the files present here.'
@@ -2284,7 +2287,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Confirm turns for sibling attempts share one durable transcript and run
       // serially. Fresh provider sessions replay that canonical transcript, which
       // also works across account/config-home rotation (native sessions are home-bound).
-      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId) : () => {};
+      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId, signal) : () => {};
       let confirmTranscript: Message[] | undefined;
       if (args.role === 'confirm') {
         let shared: Message[];
@@ -2360,8 +2363,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
-      let result;
-      let usageAdmissionId: string | undefined;
+      const resultKey = timingTurnId ? `turnresult:${args.taskId}:${args.role}:${timingTurnId}` : undefined;
+      const savedResult = resultKey ? await store.kvGet(resultKey) : undefined;
+      const checkpoint: { result: TurnResult; admissionId?: string } | undefined = savedResult ? JSON.parse(savedResult) : undefined;
+      let result = checkpoint?.result;
+      resultCheckpointed = !!checkpoint;
+      let providerInvoked = false;
+      let providerUsage: AdapterTurn['usage'];
+      let usageAdmissionId: string | undefined = checkpoint?.admissionId;
       let usageAdmissionFinished = false;
       const fundingSource: 'managed' | 'byok' | 'customer' = store.hosted
         ? ((args.accountApiKeyHandle || args.accountConfigHome || args.accountCredentialKind === 'login') ? 'byok' : 'managed')
@@ -2369,8 +2378,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
       const managedReservationMicros = fundingSource === 'managed'
         ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
+      const finishUsage = async (completed: boolean | undefined) => {
+        if (usageAdmissionId) {
+          const usage = result?.usage ?? providerUsage;
+          const completedUsageEvents: any[] = [];
+          if (usage) {
+            const quantity = usage.totalTokens ?? usage.inputTokens + usage.outputTokens;
+            completedUsageEvents.push({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource, costClassification: 'none',
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+                cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
+          }
+          if (fundingSource === 'managed') {
+            const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
+            completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
+              fundingSource, costClassification: actualized.classification,
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                ...actualized.metadata } });
+          }
+          // Completion and incurred/estimated cost actualization commit together:
+          // no concurrent admission can observe the reservation released before
+          // its durable replacement exists, and a duplicate retry sees completed.
+          (await store.finishUsageAdmission(usageAdmissionId, completed, Date.now(), completedUsageEvents));
+          usageAdmissionFinished = completed !== undefined;
+        }
+      };
       const admissionEnd = (await trace.start('admission.host'));
       try {
+        if (!result) {
         const signalTurnState = async (
           state: 'running' | 'waiting-host',
           detail?: string,
@@ -2402,9 +2442,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // before any provider process/API request. The stable turn id makes the
         // reservation retry-safe and binds every request to its org/project/task.
         if (profile.provider !== 'mock') {
-          const admissionId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}:${activityAttempt}`;
+          const turnId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}`;
+          const admissionId = activityAttempt > 1 ? `${turnId}:attempt:${activityAttempt}` : turnId;
           (await store.admitAgentUsage({ id: admissionId, organizationId, projectId: args.task.projectId,
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
+            ...(activityAttempt > 1 ? { retryOf: Array.from({ length: activityAttempt - 1 },
+              (_, index) => index === 0 ? turnId : `${turnId}:attempt:${index + 1}`) } : {}),
             reservedCostMicros: managedReservationMicros }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).
@@ -2513,9 +2556,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           })()),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
-        } },
-        {
+        } }, {
           adapters: deps.adapters,
+          onProviderStart: async () => {
+            // The estimate survives a killed worker that cannot run finally. A
+            // provider-reported result refines it; unknown usage stays estimated.
+            if (fundingSource === 'managed') await finishUsage(undefined);
+            providerInvoked = true;
+          },
+          onProviderResult: turn => { providerUsage = turn.usage; },
           signal,
           heartbeat,
           pullFollowUps,
@@ -2579,7 +2628,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   organizationId: (await store.getProject(args.task.projectId))?.organizationId,
                   capabilities: effective,
                 },
-                onSpend: async (req: any, outcome: any) => (await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason })),
+                onSpend: async (req: any, outcome: any) => { await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }); },
                 fillPaymentCard: async (fill: {
                   requestId: string;
                   cdpUrl: string;
@@ -2641,22 +2690,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
           ...(token
             ? {
-                platformRequest: async (method: string, requestPath: string, body?: unknown) => {
-                  if (!requestPath.startsWith('/api/')) throw new Error('platform path must start with /api/');
-                  const base = process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505';
-                  const response = await fetch(`${base}${requestPath}`, {
-                    method,
-                    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-                    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-                  });
-                  const value = response.headers.get('content-type')?.includes('json') ? await response.json() : await response.text();
-                  if (!response.ok) throw new Error((value as any)?.error ?? `HTTP ${response.status}`);
-                  return value;
-                },
+                platformRequest: (method: string, requestPath: string, body?: unknown) =>
+                  turnPlatformRequest({ token, method, path: requestPath, body, signal }),
               }
             : {}),
         },
         );
+        if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
+        if (resultKey) {
+          await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
+          resultCheckpointed = true;
+        }
+        }
         // Defence in depth around the activity boundary. `runTurn` rejects an
         // adapter return after abort, but cancellation can race the few synchronous
         // instructions between that check and this await continuation. Never report
@@ -2664,34 +2709,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
         }
-        if (usageAdmissionId) {
-          const usage = result.usage;
-          const completedUsageEvents: any[] = [];
-          if (usage) {
-            const quantity = usage.totalTokens ?? usage.inputTokens + usage.outputTokens;
-            completedUsageEvents.push({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
-              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
-              kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource, costClassification: 'none',
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
-                metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-                cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
-                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
-          }
-          if (fundingSource === 'managed') {
-            const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
-            completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
-              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
-              kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
-              fundingSource, costClassification: actualized.classification,
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
-                ...actualized.metadata } });
-          }
-          // Completion and incurred/estimated cost actualization commit together:
-          // no concurrent admission can observe the reservation released before
-          // its durable replacement exists, and a duplicate retry sees completed.
-          (await store.finishUsageAdmission(usageAdmissionId, true, Date.now(), completedUsageEvents));
-          usageAdmissionFinished = true;
-        }
+        await finishUsage(true);
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
@@ -2699,10 +2717,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
         }
         if (confirmTranscript) {
-          if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
+          const outputId = timingTurnId ? `${timingTurnId}:out` : `${args.taskId}:out:${confirmTranscript.length}`;
+          if (result.output?.trim() && !confirmTranscript.some(m => m.id === outputId))
+            confirmTranscript.push({ id: outputId, role: 'agent', text: result.output, ts: confirmTranscript.length });
           if (result.confirmDecision) {
             const d = result.confirmDecision;
-            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+            const decisionId = timingTurnId ? `${timingTurnId}:decision` : `${args.taskId}:decision:${confirmTranscript.length}`;
+            if (!confirmTranscript.some(m => m.id === decisionId)) confirmTranscript.push({ id: decisionId, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
           }
           (await store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript)));
         }
@@ -2724,11 +2745,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
         throw classifyTurnError(err, profile.provider, { diagnosis });
       } finally {
-        if (usageAdmissionId && !usageAdmissionFinished) (await store.finishUsageAdmission(usageAdmissionId, false));
-        await releaseSlot();
-        releaseConfirm();
-        await mcpCleanup?.();
-        (await publishLegacyAgentState(undefined));
+        try {
+          if (usageAdmissionId && !usageAdmissionFinished) {
+            if (providerInvoked || result) await finishUsage(false);
+            else await store.finishUsageAdmission(usageAdmissionId, false);
+          }
+        } finally {
+          try { await releaseSlot(); }
+          finally {
+            releaseConfirm();
+            try { await mcpCleanup?.(); }
+            finally { await publishLegacyAgentState(undefined); }
+          }
+        }
       }
       if (token) (await deps.tokens?.revoke(token));
       // Persist the session id so other tasks can resume from this one (§10.5), plus
@@ -2786,6 +2815,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }));
       return result;
       }, undefined, timingSignal));
+      } catch (error) {
+        if (timingSignal?.aborted) throw timingSignal.reason instanceof Error ? timingSignal.reason : error;
+        if (resultCheckpointed) throw ApplicationFailure.create({ type: 'agent-infra', nonRetryable: false,
+          message: error instanceof Error ? error.message : String(error), cause: error instanceof Error ? error : undefined });
+        if (error instanceof ApplicationFailure) throw error;
+        throw classifyTurnError(error);
       } finally {
         if (keepAlive) clearInterval(keepAlive);
       }
@@ -2798,10 +2833,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       if (!repos.length) {
-        const changedFiles = (await world.listFiles()).map((file) => `${file} (new)`);
-        const summary = changedFiles.length ? `${changedFiles.length} file(s) in the task workspace.` : 'No file changes detected.';
+        const files = (await world.listFiles()).map((file) => `${file} (new)`);
+        const { changedFiles, truncated } = reviewFiles(files);
+        const summary = files.length ? `${files.length} file(s) in the task workspace.${truncated ? ' File list truncated; inspect the workspace for the full list.' : ''}` : 'No file changes detected.';
         (await record(handle.id, 'review.built', { files: changedFiles.length }));
-        return boundedReviewFiles(summary, changedFiles);
+        return { summary, changedFiles };
       }
       const roots = repos;
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
@@ -2832,9 +2868,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
         );
       }
-      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
+      const bounded = reviewFiles(changedFiles);
+      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.${bounded.truncated ? ' File list truncated; inspect the checkouts for the full list.' : ''}` : 'No file changes detected.';
       (await record(handle.id, 'review.built', { files: changedFiles.length }));
-      return boundedReviewFiles(summary, changedFiles);
+      return { summary, changedFiles: bounded.changedFiles };
     },
 
     /** Readiness check for the explicit Open PR transition. The Do agent owns
@@ -2915,7 +2952,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const world = await openWorld(args.worldHandle, args.taskId);
         (await record(args.taskId, 'script.start', { command: args.command }));
         const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
-        const output = `${r.stdout}${r.stderr}`;
+        const output = scriptOutput(`${r.stdout}${r.stderr}`);
         (await record(args.taskId, 'script.done', { code: r.code, output: output.slice(0, 4000) }));
         return { code: r.code, output };
       } finally { clearInterval(pulse); }
@@ -2928,12 +2965,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         (await record(args.taskId, 'checks.skip', { reason: 'no package.json' }));
         return { passed: true, detail: 'no test suite found' };
       }
-      const r = await world.exec('bash', ['-lc', 'npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
+      const r = await world.exec('bash', ['-lc', 'set -o pipefail; npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
       (await record(args.taskId, 'checks.done', { code: r.code }));
       if (r.code !== 0) return { passed: false, detail: r.stdout.slice(-600) };
 
-      // SPEC §4.4's replay gate is literal: fetch every currently-running history
-      // and compare the candidate bundle with the bundle serving production now.
+      // Compare this organization's running tasks against the current bundle.
+      // Shared coordinator histories belong to the installation release gate.
       // Pre-existing incompatibilities are reported but do not make unrelated edits
       // impossible; any history that regresses from baseline-pass to candidate-fail
       // blocks the merge.
@@ -2981,38 +3018,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       try {
         if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
-        const histories: Array<{ workflowId: string; history: unknown }> = [];
-        for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
-          histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
-        }
-        const { Worker } = await import('@temporalio/worker');
-        const replay = async (workflowsPath: string) => {
-          const failures = new Map<string, string>();
-          for await (const result of Worker.runReplayHistories({ workflowsPath }, histories)) {
-            if (result.error) failures.set(result.workflowId, result.error.message);
+        const snapshot = await snapshotReplayHistories(store, deps.client, args.taskId);
+        try {
+          const { Worker } = await import('@temporalio/worker');
+          const replay = async (workflowsPath: string) => {
+            const failures = new Map<string, string>();
+            for await (const result of Worker.runReplayHistories({ workflowsPath }, snapshot.histories())) {
+              if (result.error) failures.set(result.workflowId, result.error.message);
+            }
+            return failures;
+          };
+          const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
+          const baselineFailures = await replay(baselinePath);
+          const candidateFailures = await replay(candidatePath);
+          const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
+          const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
+          const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
+          (await record(args.taskId, 'checks.replay', {
+            histories: snapshot.count,
+            regressions: regressions.map(([id]) => id),
+            preExisting: existing,
+            fixed,
+          }));
+          if (regressions.length) {
+            const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
+            return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${snapshot.count} active histories:\n${detail}`.slice(-4000) };
           }
-          return failures;
-        };
-        const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
-        const baselineFailures = await replay(baselinePath);
-        const candidateFailures = await replay(candidatePath);
-        const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
-        const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
-        const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
-        (await record(args.taskId, 'checks.replay', {
-          histories: histories.length,
-          regressions: regressions.map(([id]) => id),
-          preExisting: existing,
-          fixed,
-        }));
-        if (regressions.length) {
-          const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
-          return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${histories.length} active histories:\n${detail}`.slice(-4000) };
-        }
-        return {
-          passed: true,
-          detail: `tests + replay passed (${histories.length} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
-        };
+          return {
+            passed: true,
+            detail: `tests + replay passed (${snapshot.count} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
+          };
+        } finally { snapshot.release(); }
       } catch (e) {
         return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
       } finally {
@@ -4800,11 +4836,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             await api.update(ref.slug, ref.number, { state: 'closed' }).catch(() => undefined);
           }
           const after = await api.get(ref.slug, ref.number);
-          await api.comment(ref.slug, ref.number,
+          await worlds.withOperation(handle.id, () => api.commentOnce(ref.slug, ref.number,
             after.merged ? `Merged into \`${outcome.target}\` by karmax${as}.`
             : landed ? `karmax merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
             : `karmax merged this branch into \`${outcome.target}\` locally${as}, but could not push`
-              + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`);
+              + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`,
+            JSON.stringify([handle.id, 'finalize', outcome.target, outcome.sha, landed])));
           const next = { ...ref, state: after.state, merged: after.merged };
           (await record(handle.id, after.merged ? 'pr.merged' : after.state === 'closed' ? 'pr.closed' : 'pr.open', next));
           settled.push(next);
@@ -4839,7 +4876,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (live.merged) (await record(handle.id, 'pr.merged', next));
             continue;
           }
-          await api.comment(ref.slug, ref.number, reason);
+          await worlds.withOperation(handle.id, () => api.commentOnce(ref.slug, ref.number, reason,
+            JSON.stringify([handle.id, 'close', reason])));
           const closed = await api.update(ref.slug, ref.number, { state: 'closed' });
           const next = { ...ref, state: closed.state, merged: closed.merged,
             ...(closed.headSha ? { headSha: closed.headSha } : {}) };
@@ -4998,6 +5036,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       (await store.saveView(taskId, view, conversationReference));
       await notifyChildSettlement(store, deps.client, view);
+      if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
+        let runId: string | undefined;
+        try { runId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct call */ }
+        await store.clearTurnCheckpoints(taskId, runId);
+      }
       // First Merge admission freezes whether sibling proposals remain eligible.
       // Branch integration still uses the ordinary merge queue and validation.
       if (view.stage === 'merge') {
@@ -5070,8 +5113,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
         }));
       }
+      let idempotencyKey: string | undefined;
+      try {
+        const { info } = activityContext.current();
+        if (info.workflowExecution) idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
+      } catch { /* Direct calls represent distinct requests. */ }
       let child = (await store.createTask({
         projectId: args.projectId,
+        idempotencyKey,
         listId: parent?.listId,
         title: args.title,
         workflow: 'software-dev',
@@ -5249,15 +5298,3 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
 }
 
 export type coreActivities = ReturnType<typeof makeCoreActivities>;
-
-function boundedReviewFiles(summary: string, files: string[]): { summary: string; changedFiles: string[] } {
-  const changedFiles: string[] = [];
-  let bytes = 0;
-  for (const file of files) {
-    const size = Buffer.byteLength(JSON.stringify(file));
-    if (changedFiles.length >= 1_000 || bytes + size > 256 * 1024) break;
-    changedFiles.push(file); bytes += size;
-  }
-  return { changedFiles, summary: changedFiles.length < files.length
-    ? `${summary} Showing ${changedFiles.length} of ${files.length}; inspect the workspace for the full list.` : summary };
-}

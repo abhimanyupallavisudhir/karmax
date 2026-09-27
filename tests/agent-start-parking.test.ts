@@ -81,7 +81,7 @@ describe('parking during agent admission', () => {
     } finally { ctx.mockRestore(); await store.close(); }
   });
 
-  it.each(['conversation.message', 'task.cancel-requested'])('stops checkpoint work at its next safe boundary after %s', async eventType => {
+  it.each(['conversation.message', 'task.cancel-requested', 'task.transition-requested'])('stops checkpoint work at its next safe boundary after %s', async eventType => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Interrupt capture');
     const task = await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
@@ -110,7 +110,13 @@ describe('parking during agent admission', () => {
     } finally { await store.close(); }
   });
 
-  it.each([false, true])('publishes startup without checkpointing or parking (recovery handle: %s)', async recovery => {
+  it.each([false, true].flatMap(recovery => [
+    { kind: 'agentSlot', detail: 'Starting agent' },
+    { kind: 'agentSlot', detail: 'Waiting for host capacity to start agent' },
+    { kind: 'agentSlot', detail: 'Waiting for host memory' },
+    { kind: 'subagent', detail: '1 sub-agent(s) still running' },
+    { kind: 'shell', detail: '1 background job(s) still running' },
+  ].map(waitingFor => ({ recovery, waitingFor }))))('keeps live work running: $waitingFor.kind/$waitingFor.detail/recovery=$recovery', async ({ recovery, waitingFor }) => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Admission'));
     const task = (await store.createTask({ projectId: project.id, title: 'Start', workflow: 'software-dev',
@@ -124,7 +130,7 @@ describe('parking during agent admission', () => {
     const deps = { store, worlds: worlds as any, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') };
     const core = makeCoreActivities({ ...deps, checkpoints: { checkpoint } as any });
     const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
-      waitingFor: { kind: 'agentSlot', detail: 'Starting agent' }, messages: [], actions: [], updatedAt: 1,
+      waitingFor, messages: [], actions: [], updatedAt: 1,
       state: recovery ? { recoveryWorld: handle } : {}, ...(recovery ? {} : { world: handle }) } as TaskView;
     try {
       await core.publishView(task.id, view);
@@ -136,13 +142,12 @@ describe('parking during agent admission', () => {
       // Actual resource waits retain the cost-control behavior, including old
       // workflow versions that expose their world only in recovery state.
       const parking = makeCoreActivities(deps);
-      for (const waitingFor of [{ kind: 'agentSlot', detail: 'Waiting for host capacity to start agent' },
-        { kind: 'account', provider: 'codex' }, { kind: 'human', audience: ['@creator'] }]) {
+      for (const waitingFor of [{ kind: 'account', provider: 'codex' }, { kind: 'human', audience: ['@creator'] }]) {
         parked = false;
         await parking.publishView(task.id, { ...view, waitingFor } as TaskView);
         expect(parked).toBe(true);
       }
-      expect(worlds.park).toHaveBeenCalledTimes(3);
+      expect(worlds.park).toHaveBeenCalledTimes(2);
     } finally { (await store.close()); }
   });
 

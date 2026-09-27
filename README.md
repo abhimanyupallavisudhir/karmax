@@ -58,7 +58,7 @@ upgrades, remote-world cost policy, and the laptop↔cloud Git handoff.
 
 **Requirements**
 
-- Node ≥ 22 (uses the built-in `node:sqlite`).
+- Node ≥ 22.16.0 (uses the built-in `node:sqlite`).
 - On Linux, `flock` from `util-linux` (included in the Docker image) enforces one app process per data home and releases automatically after a crash or container replacement.
 - The [Temporal CLI](https://temporal.io/setup/install-temporal-cli) at
   `~/.temporalio/bin/temporal` (or set `TEMPORAL_CLI`). `npm start` runs the dev
@@ -122,7 +122,7 @@ remote target fails setup with an actionable error.
 ## Testing
 
 ```bash
-npm test          # real Temporal, real git, mock agent (hermetic)
+npm test          # local Temporal, git and fakes; paid live suites opt in separately
 npm run typecheck
 ```
 
@@ -132,17 +132,16 @@ re-enable parallelism on a memory-constrained machine. See **[TESTING.md](./TEST
 for how to run a subset cheaply, the live-agent/Docker tests, and clearing stray
 Temporal processes.
 
-The live-agent test runs only when an API key is present:
+Paid live suites require an explicit opt-in and their provider credentials:
 
 ```bash
-OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
+KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 ```
 
 ## Operating notes
 
-- `npm run reset` wipes Temporal's durable state + karmax local state. Use it if
-  the dev server wedges after you edit workflow code (running singletons replay
-  old history against new code). Worlds/worktrees are preserved.
+- `npm run reset` wipes Temporal's durable state + karmax local state. Run it
+  only on a stopped disposable development installation. Worlds/worktrees are preserved.
 - First boot asks you to create the administrator account; every later browser
   session uses Better Auth login. **Never** expose local Karmax through Funnel
   or a naked public tunnel; use the built-in private Tailscale Serve setup.

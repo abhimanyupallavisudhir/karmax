@@ -159,7 +159,8 @@ function harnessSpec(input: TurnInput): HarnessSpec {
   // shell it opens through `terminal.create`) must not inherit them.
   const env = scrubbedEnv({ provider, configHome: input.resolvedAuth?.configHome, extra: input.extraEnv });
   const credentialEnv = apiKeyEnv(credentialProvider(input.profile));
-  const ambientApiKey = input.resolvedAuth ? undefined : process.env[credentialEnv];
+  if (input.resolvedAuth?.apiKey && !credentialEnv) throw new Error('Unsupported model API-key provider');
+  const ambientApiKey = input.resolvedAuth || !credentialEnv ? undefined : process.env[credentialEnv];
   for (const key of [
     'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'KIMI_API_KEY', 'MOONSHOT_API_KEY',
     'XAI_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY',

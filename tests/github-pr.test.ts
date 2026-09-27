@@ -71,6 +71,10 @@ function fakeGithub() {
       return json(200, pr);
     }
     const comment = u.pathname.match(/^\/repos\/[^/]+\/[^/]+\/issues\/(\d+)\/comments$/);
+    if (comment && method === 'GET') {
+      const page = Number(u.searchParams.get('page') ?? 1);
+      return json(200, comments.filter(row => row.number === Number(comment[1])).slice((page - 1) * 100, page * 100));
+    }
     if (comment && method === 'POST') {
       comments.push({ number: Number(comment[1]), body: body.body });
       return json(201, { id: comments.length });
@@ -2059,6 +2063,32 @@ describe('PR lifecycle after the merge', () => {
     const prs = await core.openPr(handle, 'main', { title: 'T', summary: 'S' });
     return { gh, core, handle, prs };
   }
+
+  it('RT-20 does not repeat finalization comments when the activity retries', async () => {
+    const { gh, core, handle, prs } = await withOpenPr();
+    try {
+      const outcome = { target: 'main', sha: 'abc1234', pushed: ['svc'] };
+      await core.finalizePrs(handle, prs, outcome);
+      await core.finalizePrs(handle, prs, outcome);
+      expect(gh.comments).toHaveLength(1);
+    } finally { await core.destroyWorld(handle); }
+  });
+
+  it('RT-20 finds the accepted cancellation comment after its acknowledgement is lost', async () => {
+    const { gh, core, handle, prs } = await withOpenPr();
+    const original = GithubPrApi.prototype.comment;
+    const comment = vi.spyOn(GithubPrApi.prototype, 'comment').mockImplementationOnce(async function(this: GithubPrApi, slug, number, body) {
+      await original.call(this, slug, number, body);
+      throw new Error('connection lost after comment');
+    });
+    try {
+      await core.closePrs(handle, prs, 'cancelled');
+      expect(gh.prs[0].state).toBe('open');
+      await core.closePrs(handle, prs, 'cancelled');
+      expect(gh.prs[0].state).toBe('closed');
+      expect(gh.comments).toHaveLength(1);
+    } finally { comment.mockRestore(); await core.destroyWorld(handle); }
+  });
 
   it('records a PR GitHub already merged, and comments the karmax outcome', async () => {
     const { gh, core, handle, prs } = await withOpenPr();

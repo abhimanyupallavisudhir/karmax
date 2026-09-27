@@ -238,9 +238,16 @@ function recordedBaseViolation(repo: WorldRepo): string {
  */
 export async function brokerPublishBranch(
   world: World, auth: GitBrokerAuth, expectedRemoteHeads: Record<string, string> = {},
-  onPublished?: OriginPublicationRecorder,
+  onPublished?: OriginPublicationRecorder, options: { omitUnchangedBase?: boolean } = {},
 ): Promise<GitBrokerPublishResult> {
   return publishRepositories(worldRepos(world.handle), async repo => {
+    // Idle capture can restore the provisioned commit from the base without
+    // creating a task ref. Explicit publication still transports every branch.
+    if (options.omitUnchangedBase && repo.baseSha && !expectedRemoteHeads[repo.name]) {
+      const tip = await world.exec('git', ['rev-parse', '--verify', `refs/heads/${repo.branch}`], { cwd: repo.root });
+      if (tip.code !== 0) throw new Error(`could not resolve task branch ${repo.branch}: ${tip.stderr || tip.stdout}`);
+      if (tip.stdout.trim() === repo.baseSha) return 'omitted';
+    }
     // Worktree-backed worlds already share refs with their source repository.
     // Trying to bundle/fetch the live branch back into that same repository
     // either mistakes its local path for an SSH remote or hits Git's
@@ -688,7 +695,10 @@ export async function brokerPushBranches(
   return publishRepositories(repos, repo => pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished));
 }
 
-async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) => Promise<void>): Promise<GitBrokerPublishResult> {
+/** Publish each repository, at most three repositories at once; checkouts of
+ * one repository run in order. `run` returns 'omitted' for a checkout that had
+ * nothing to publish, which is reported as neither pushed nor skipped. */
+async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) => Promise<void | 'omitted'>): Promise<GitBrokerPublishResult> {
   const groups = new Map<string, Array<{ repo: WorldRepo; index: number }>>();
   repos.forEach((repo, index) => {
     const key = canonicalRepositoryIdentity(worldRepoSource(repo));
@@ -696,15 +706,17 @@ async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) =>
     group.push({ repo, index }); groups.set(key, group);
   });
   const failures: Array<string | undefined> = new Array(repos.length);
+  const omitted = new Set<number>();
   await concurrentMap([...groups.values()], 3, async group => {
     for (const { repo, index } of group) {
-      try { await run(repo); }
+      try { if ((await run(repo)) === 'omitted') omitted.add(index); }
       catch (error) { failures[index] = error instanceof Error ? error.message : String(error); }
     }
   });
   const pushed: string[] = [], skipped: string[] = [];
   const errors: Record<string, string> = {};
   repos.forEach((repo, index) => {
+    if (omitted.has(index)) return;
     if (failures[index] === undefined) pushed.push(repo.name);
     else { skipped.push(repo.name); errors[repo.name] = failures[index]!; }
   });

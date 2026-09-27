@@ -219,6 +219,7 @@ export class PaidLaunchSettingsService {
       throw new Error('choose Stripe or Paddle');
     const paddleInput = input.paddle && typeof input.paddle === 'object' && !Array.isArray(input.paddle)
       ? input.paddle as Record<string, unknown> : undefined;
+    const secrets: [string, string][] = [];
     let paddle = current.paddle;
     if (paddleInput) {
       const currentEnvironment = (await this.paddleConfig()).environment;
@@ -243,8 +244,8 @@ export class PaidLaunchSettingsService {
       paddle = { environment, clientToken, individualPriceId: paddleId('individualPriceId', 'pri'),
         teamBasePriceId: paddleId('teamBasePriceId', 'pri'), teamSeatPriceId: paddleId('teamSeatPriceId', 'pri'),
         individualProductId: paddleId('individualProductId', 'pro'), teamProductId: paddleId('teamProductId', 'pro') };
-      if (apiKey) await this.broker.registerHandle(`platform:paddle-subscriptions:${environment}:api-key`, apiKey);
-      if (webhookSecret) await this.broker.registerHandle(`platform:paddle-subscriptions:${environment}:webhook-secret`, webhookSecret);
+      if (apiKey) secrets.push([`platform:paddle-subscriptions:${environment}:api-key`, apiKey]);
+      if (webhookSecret) secrets.push([`platform:paddle-subscriptions:${environment}:webhook-secret`, webhookSecret]);
     }
     const stripeInput = input.stripe && typeof input.stripe === 'object' && !Array.isArray(input.stripe)
       ? input.stripe as Record<string, unknown> : {};
@@ -263,8 +264,8 @@ export class PaidLaunchSettingsService {
       throw new Error('Stripe secret key must be an sk_test_… or sk_live_… key');
     if (webhookSecret && !/^whsec_\S+$/.test(webhookSecret))
       throw new Error('Stripe webhook signing secret must start with whsec_');
-    if (secretKey) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey));
-    if (webhookSecret) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret));
+    if (secretKey) secrets.push([SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey]);
+    if (webhookSecret) secrets.push([SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret]);
     const next: StoredPaidLaunchSettings = {
       billingProvider: (input.billingProvider as 'stripe' | 'paddle' | undefined) ?? current.billingProvider,
       paddle,
@@ -289,6 +290,8 @@ export class PaidLaunchSettingsService {
         ? [...new Set(input.completedTasks.filter((value): value is string => typeof value === 'string' && taskIds.has(value)))]
         : current.completedTasks ?? [],
     };
+    // Validate the complete form before rotating any live billing credential.
+    for (const [handle, value] of secrets) await this.broker.registerHandle(handle, value);
     (await this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify(next)));
     const status = (await this.status(publicUrl));
     if (next.paidLaunch && !status.canEnable) {

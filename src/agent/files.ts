@@ -39,11 +39,19 @@ export async function materializeFileAttachments(world: World, messages: Message
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
 
   const store = new AttachmentStore();
+  const checksums = new Map<string, string>();
+  // Bound argv size while sharing one remote round trip across ordinary uploads.
+  for (let offset = 0; offset < refs.length; offset += 100) {
+    const files = refs.slice(offset, offset + 100).map(ref => path.posix.join(world.handle.root, worldAttachmentRelative(ref)));
+    const result = await world.exec('sha256sum', ['--zero', '--', ...files]);
+    for (const record of result.stdout.split('\0')) {
+      if (/^[a-f0-9]{64}  /.test(record)) checksums.set(record.slice(66), record.slice(0, 64));
+    }
+  }
   for (const ref of refs) {
     const relative = worldAttachmentRelative(ref);
     const absolute = path.posix.join(world.handle.root, relative);
-    const checksum = await world.exec('sha256sum', [absolute]);
-    if (checksum.code === 0 && checksum.stdout.trim().split(/\s+/, 1)[0] === ref.id) continue;
+    if (checksums.get(absolute) === ref.id) continue;
     const stored = store.read(ref.id);
     if (!stored) throw new Error(`attached file is no longer available: ${ref.name}`);
     // A prior turn may have changed or chmod'd its materialized copy. The durable

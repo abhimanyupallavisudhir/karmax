@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { describe, it, expect } from 'vitest';
 import { allRoles, roleDef, roleCeiling, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/profiles.js';
@@ -192,6 +193,22 @@ describe('workflow-owned agent MCP servers (SPEC §7.5)', () => {
 });
 
 describe('workflow-declared resolve rules (SPEC §5.2)', () => {
+  it('bounds catastrophic regex evaluation and still uses platform recovery', () => {
+    // Isolate the pre-fix hang so the regression cannot wedge the test worker.
+    const result = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import { autoResolve } from './src/resolve/cases.ts';
+      const rules = [{ name: 'evil', match: '(a+)+$' }];
+      console.log(JSON.stringify([
+        autoResolve('do', 'a'.repeat(100) + '!', rules),
+        autoResolve('do', 'ECONNRESET ' + 'a'.repeat(100) + '!', rules),
+      ]));
+    `], { timeout: 3000, encoding: 'utf8' });
+    expect(JSON.parse(result)).toEqual([
+      { resolved: false },
+      { resolved: true, action: 'retry', note: 'transient infrastructure error — retrying' },
+    ]);
+  });
+
   it('a declared rule matches the error and wins over the platform defaults', () => {
     const r = autoResolve('do', 'FooWidget exploded during build', [{ name: 'widget', match: 'FooWidget exploded', action: 'retry', note: 'retrying widget' }]);
     expect(r).toEqual({ resolved: true, action: 'retry', note: 'retrying widget' });

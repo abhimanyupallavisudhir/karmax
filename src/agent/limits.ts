@@ -100,10 +100,10 @@ export class ProviderOutage extends Error {
 }
 
 // A request-level safety decision says nothing about the shared login's health.
-export function isProviderPolicyRejection(value: unknown): boolean {
+export function isProviderPolicyRejection(value: unknown, options: LimitClassifierOptions = {}): boolean {
   const diagnostic = nativeProviderDiagnostic(value);
-  return /misalignmentPolicyViolation|content_policy_violation|safety_violation/i.test(diagnostic?.code ?? '')
-    || /misalignmentPolicyViolation|content_policy_violation|safety_violation|blocked by (?:our|the) safety systems/i.test(
+  return /^(?:misalignmentPolicyViolation|content_policy_violation|safety_violation)$/i.test(diagnostic?.code ?? '')
+    || !!options.providerOrigin && /misalignmentPolicyViolation|content_policy_violation|safety_violation|blocked by (?:our|the) safety systems/i.test(
       value instanceof Error ? value.message : diagnostic?.message ?? '',
     );
 }
@@ -247,7 +247,7 @@ function termsNear(tokens: string[], left: Set<string>, right: Set<string>, dist
  */
 export function isTransportError(error: unknown): boolean {
   if (error instanceof ProviderOutage) return true;
-  if (isProviderPolicyRejection(error)) return false;
+  if (error instanceof ProviderPolicyFailure || isProviderPolicyRejection(error, { providerOrigin: true })) return false;
   const seen = new Set<unknown>();
   const inspect = (value: unknown): boolean => {
     if (value && typeof value === 'object') {
@@ -325,7 +325,7 @@ export function isResourceKill(message: string): boolean {
 /** Detect + classify a usage/session-limit error from its message. Pure. */
 export function classifyLimitError(message: string, options: LimitClassifierOptions = {}): LimitClassification {
   const m = String(message ?? '');
-  if (isProviderPolicyRejection(m)) return { limited: false };
+  if (isProviderPolicyRejection(m, options)) return { limited: false };
   const lc = m.toLowerCase();
   const tokens = words(lc);
 
@@ -388,7 +388,7 @@ export function providerErrorFromMessage(
   message: string,
   source: ProviderFailureSource = 'message',
 ): Error {
-  if (isProviderPolicyRejection(message)) return new ProviderPolicyFailure(message, provider);
+  if (isProviderPolicyRejection(message, { providerOrigin: true })) return new ProviderPolicyFailure(message, provider);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
   const diagnostic = nativeProviderDiagnostic(message);

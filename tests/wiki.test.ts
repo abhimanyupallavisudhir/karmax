@@ -901,7 +901,12 @@ describe('remote task wiki views', () => {
       readFile: async (file: string) => files.get(file)!.toString('utf8'),
       writeFileBuffer: async (file: string, value: Buffer) => { files.set(file, Buffer.from(value)); },
       writeFile: async (file: string, value: string) => { files.set(file, Buffer.from(value)); },
-      exec: async (cmd: string, args: string[]) => {
+      exec: async (cmd: string, args: string[], options?: { cwd?: string }) => {
+        if (cmd === 'bash' && args.at(-1)?.includes('-print0')) {
+          expect(options?.cwd).toBe(repoRoot);
+          const pages = [...files.keys()].filter(file => /\/(SKILL|MEMORY)\.md$/.test(file));
+          return { code: 0, stdout: pages.map(file => `./${file.slice('project-wiki/'.length)}\0`).join(''), stderr: '' };
+        }
         if (cmd === 'git' && args[0] === 'commit') commits.push(args.at(-1)!);
         return { code: 0, stdout: '', stderr: '' };
       },
