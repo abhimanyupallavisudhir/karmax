@@ -3089,8 +3089,13 @@ export class KarmaxApi {
     if (target === 'done') {
       const from = task.params.draft ? 'draft' : view.state?.humanPauseOrigin ? 'human' : view.stage;
       const checkpoint = task.params.draft ? undefined : (await this.transitionCheckpoint(view, view.stage));
-      if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status))
-        await this.stopTaskActivity(task, view, 'Task marked done manually', 'cancel');
+      if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status)) {
+        // Stop the run as a replacement, not a cancellation: cancellation
+        // cleanup closes open pull requests, silently dropping work the person
+        // just declared done (task #395). No successor run follows.
+        await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
+        (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
+      }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       const done: TaskView = {
         ...view,
