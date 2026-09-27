@@ -379,7 +379,7 @@ describe('payment reservations under concurrency', () => {
       const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 1000 });
       await provider.fund(card.id, 1000);
       const task = await store.createTask({ projectId: project.id, title: 'Late approval', workflow: 'just-do',
-        workflowVersion: '1', params: { _authorization: { capabilities: ['use-card:*'] } } });
+        workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
       const request = await store.createPaymentSpendRequest({ organizationId: 'org_personal', projectId: project.id,
         taskId: task.id, cardId: card.id, amount: 100, status: 'pending_approval', expiresAt: Date.now() - 1 });
       const original = provider.authorize.bind(provider);
@@ -393,6 +393,42 @@ describe('payment reservations under concurrency', () => {
       });
       expect((await new BudgetService(store, provider).approve(request.id, 'user:approver')).status).toBe('granted');
     } finally { await store.close(); }
+  });
+
+  it('rolls back a late local authorization before admitting a replacement reservation (AU-10)', async () => {
+    const store = await Store.create(':memory:');
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const provider = new MockPaymentProvider(store);
+      const project = await store.createProject('Late settlement', {});
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 1000 });
+      await provider.fund(card.id, 1000);
+      await store.setSettings(project.id, 'payments', { budget: 100 });
+      const budget = new BudgetService(store, provider);
+      const ctx = { projectId: project.id, taskId: 'late-settlement', capabilities: ['use-card:*'] };
+      let entered!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const original = provider.authorize.bind(provider);
+      vi.spyOn(provider, 'authorize').mockImplementationOnce(async (...args) => {
+        entered();
+        await blocked;
+        return original(...args);
+      });
+      const first = budget.request(ctx, { amount: 100 });
+      await started;
+      now += 31 * 60_000;
+      const replacement = budget.request(ctx, { amount: 100 });
+      release();
+      const [late, retry] = await Promise.all([first, replacement]);
+      expect(late.status).toBe('denied');
+      expect(retry.status).toBe('granted');
+      expect(retry.requestId).not.toBe(late.requestId);
+      expect((await store.getPaymentSpendRequest(late.requestId!)).status).toBe('expired');
+      expect((await provider.getCard(card.id))!.available).toBe(900);
+      expect(await store.paymentSpent(ctx.taskId)).toBe(100);
+    } finally { clock.mockRestore(); await store.close(); }
   });
 
   it('counts in-progress charges and never charges the same approval twice', async () => {

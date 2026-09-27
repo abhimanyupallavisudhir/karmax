@@ -1066,19 +1066,39 @@ export class BudgetService {
       const fundingUrl = pending.status === 'needs_funding' ? (await provider.balance(organizationId)).fundingUrl : undefined;
       return { ...this.result(pending), fundingUrl };
     }
-    const auth = await provider.authorize(card.id, args.amount, args.merchant);
-    if (!auth.ok) {
-      return this.result((await this.store.updatePaymentSpendRequest(pending.id, {
-        status: 'needs_funding', reason: auth.reason ?? 'authorization declined', shortfall: args.amount,
-      })));
+    return this.authorizeImmediate(provider, pending);
+  }
+
+  /** Immediate rails debit local card state. Keep that debit and settlement
+   * atomic so expiry cannot release the allowance while a charge is applying. */
+  private async authorizeImmediate(provider: PaymentProvider, request: any, resolvedBy?: string): Promise<SpendResult> {
+    const expired = new Error('payment reservation expired during authorization');
+    try {
+      return await this.store.paymentTransaction(async () => {
+        await this.store.expirePaymentSpendRequests();
+        const current = await this.store.getPaymentSpendRequest(request.id);
+        if (current.status !== 'authorizing') return this.result(current);
+        const auth = await provider.authorize(current.cardId, current.amount, current.merchant ?? undefined);
+        if (current.expiresAt <= Date.now()) throw expired;
+        if (!auth.ok) return this.result(await this.store.updatePaymentSpendRequest(current.id, {
+          status: 'needs_funding', reason: auth.reason ?? 'authorization declined', shortfall: current.amount, resolvedBy,
+        }));
+        await this.store.upsertPaymentTransaction({ organizationId: current.organizationId, projectId: current.projectId,
+          taskId: current.taskId, cardId: current.cardId, spendRequestId: current.id, provider: provider.name,
+          providerId: auth.transactionId!, kind: 'transaction', status: 'settled',
+          amount: current.amount, currency: current.currency, merchant: current.merchant });
+        return this.result(await this.store.updatePaymentSpendRequest(current.id, {
+          status: 'settled', providerAuthorizationId: auth.transactionId,
+          ...(resolvedBy ? { reason: 'approved', resolvedBy } : {}),
+        }));
+      });
+    } catch (error) {
+      if (error !== expired) throw error;
+      // The failed transaction rolled back the local debit. Expire and audit
+      // the reservation separately so it stays released after the rollback.
+      await this.store.expirePaymentSpendRequests();
+      return this.result(await this.store.getPaymentSpendRequest(request.id));
     }
-    (await this.store.upsertPaymentTransaction({ organizationId, projectId: ctx.projectId, taskId: ctx.taskId,
-      cardId: card.id, spendRequestId: pending.id, provider: provider.name,
-      providerId: auth.transactionId!, kind: 'transaction', status: 'settled',
-      amount: args.amount, currency: card.currency, merchant: args.merchant }));
-    return this.result((await this.store.updatePaymentSpendRequest(pending.id, {
-      status: 'settled', providerAuthorizationId: auth.transactionId,
-    })));
   }
 
   /** Re-evaluate the oldest requests first; later requests cannot jump the queue. */
@@ -1146,15 +1166,7 @@ export class BudgetService {
       return (await this.store.updatePaymentSpendRequest(request.id, { status: 'authorizing', resolvedBy, expiresAt: Date.now() + 30 * 60_000 }));
     }));
     if (!wonClaim) return this.result(claimed);
-    const auth = await provider.authorize(card.id, request.amount, request.merchant ?? undefined);
-    if (!auth.ok) return this.result((await this.store.updatePaymentSpendRequest(request.id,
-      { status: 'needs_funding', reason: auth.reason, shortfall: request.amount, resolvedBy })));
-    (await this.store.upsertPaymentTransaction({ organizationId: request.organizationId, projectId: request.projectId,
-      taskId: request.taskId, cardId: card.id, spendRequestId: request.id, provider: provider.name,
-      providerId: auth.transactionId!, kind: 'transaction', status: 'settled',
-      amount: request.amount, currency: request.currency, merchant: request.merchant }));
-    return this.result((await this.store.updatePaymentSpendRequest(request.id,
-      { status: 'settled', providerAuthorizationId: auth.transactionId, reason: 'approved', resolvedBy, expiresAt: Date.now() + 30 * 60_000 })));
+    return this.authorizeImmediate(provider, claimed, resolvedBy);
   }
 
   async deny(requestId: string, resolvedBy: string): Promise<SpendResult> {
