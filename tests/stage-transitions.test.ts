@@ -901,6 +901,13 @@ describe('task stage transitions', () => {
     await expect(f.api.resolvePermissionRequest(approver, {
       organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
     })).rejects.toThrow(/decision is already in progress/);
+    // PL-8: another gateway replica on the same store is held off too — its
+    // denial must not land while this approval is widening the task's scope.
+    const replica = new KarmaxApi({ store: f.store, client: f.client, authorization: f.authorization,
+      taskQueue: 'test', tokens: f.tokens, runners: f.runners } as any);
+    await expect(replica.resolvePermissionRequest(approver, {
+      organizationId: 'org_personal', requestId: requested.requestId!, action: 'deny',
+    })).rejects.toThrow(/decision is already in progress/);
     await expect(approval).resolves.toMatchObject({ status: 'granted', resume: { resumed: true } });
     const expanded = (await f.store.getTask(f.task.id))!.params._authorization as any;
     expect(expanded.projectIds).toEqual([f.project.id, second.id]);

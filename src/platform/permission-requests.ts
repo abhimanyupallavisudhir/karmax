@@ -32,6 +32,11 @@ export interface PermissionRequest {
 
 const requestsKey = (organizationId: string) => `permission:requests:${organizationId}`;
 const extensionsKey = (taskId: string) => `permission:grant:${taskId}`;
+const claimKey = (requestId: string) => `permission:deciding:${requestId}`;
+/** How long a decision may hold its claim. Long enough for a scope expansion's
+ * workflow update; short enough that a replica that died mid-decision does
+ * not strand the request. */
+const CLAIM_TTL_MS = 5 * 60_000;
 const concretePrefixes = ['merge-into:', 'use-credential:', 'use-card:'];
 
 export function exactCapability(raw: string): Capability {
@@ -50,7 +55,46 @@ export function exactCapability(raw: string): Capability {
  * axes of the next turn's scoped token. Nothing mutates a human/profile grant.
  */
 export class PermissionRequests {
-  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'kvDelete' | 'appendAudit'>, private organizationId: string) {}
+
+  /**
+   * Claim the right to decide a request. Approving can widen the task's scope
+   * before the request is marked resolved, so the claim — not the status check
+   * — is what keeps a concurrent denial or second approval out. It lives in the
+   * store, which every gateway replica shares. Returns undefined while another
+   * decision holds an unexpired claim.
+   */
+  async claim(requestId: string): Promise<string | undefined> {
+    return this.store.transaction(async () => {
+      if (await this.liveClaim(requestId)) return undefined;
+      const claim = newId('pclaim');
+      (await this.store.kvSet(claimKey(requestId), JSON.stringify({ claim, at: Date.now() })));
+      return claim;
+    });
+  }
+
+  /** Give up a claim (a decision that failed). Only the holder's claim is removed. */
+  async release(requestId: string, claim: string): Promise<void> {
+    return this.store.transaction(async () => {
+      if ((await this.liveClaim(requestId)) === claim) (await this.store.kvDelete(claimKey(requestId)));
+    });
+  }
+
+  private async liveClaim(requestId: string): Promise<string | undefined> {
+    try {
+      const raw = (await this.store.kvGet(claimKey(requestId)));
+      const held = raw ? JSON.parse(raw) : undefined;
+      return held && Date.now() - Number(held.at) < CLAIM_TTL_MS ? String(held.claim) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Refuse a state change while a decision other than `claim` holds the request. */
+  private async assertUnclaimed(requestId: string, claim?: string): Promise<void> {
+    const held = (await this.liveClaim(requestId));
+    if (held && held !== claim) throw new Error(`permission request ${requestId} decision is already in progress`);
+  }
 
   async requests(filter: { taskId?: string; status?: PermissionRequest['status'] } = {}): Promise<PermissionRequest[]> {
     let all: PermissionRequest[] = [];
@@ -143,12 +187,13 @@ export class PermissionRequests {
     });
   }
 
-  async resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean }): Promise<PermissionRequest> {
+  async resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean; claim?: string }): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === requestId);
     if (!request) throw new Error(`no permission request ${requestId}`);
     if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
+    (await this.assertUnclaimed(requestId, input.claim));
     if (input.action === 'approve' && !input.alreadyAuthorized) {
       let grants: Record<string, Capability[]> = {};
       try {
@@ -162,6 +207,7 @@ export class PermissionRequests {
     request.status = input.action === 'approve' ? 'granted' : 'denied';
     request.resolution = { action: input.action, by: input.by, at: Date.now() };
     (await this.save(all));
+    (await this.store.kvDelete(claimKey(requestId)));
     (await this.store.appendAudit({
       principalId: input.by,
       action: 'permission.request.resolved',
@@ -173,12 +219,13 @@ export class PermissionRequests {
     });
   }
 
-  async dismiss(id: string, by: string): Promise<PermissionRequest> {
+  async dismiss(id: string, by: string, claim?: string): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no permission request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    (await this.assertUnclaimed(id, claim));
     request.dismissed ??= { by, at: Date.now() };
     (await this.save(all));
     (await this.store.appendAudit({ principalId: by, action: 'permission.request.dismissed',

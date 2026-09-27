@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
 
@@ -41,6 +41,53 @@ describe('agent permission approval requests', () => {
     expect((await service.request({ ...input, projectIds: ['third'] })).id).not.toBe(first.id);
     expect((await service.resolve(first.id, { action: 'deny', by: 'user:owner' })).projectIds).toEqual(['second']);
     expect((await service.extensionCaps('task'))).toEqual([]);
+  });
+
+  /** PL-8: a decision is claimed in the shared store, not in process memory, so
+   *  two gateway replicas cannot apply an approval and a denial at once. */
+  it('lets one decision at a time claim a request, across service instances', async () => {
+    const store = (await Store.create(':memory:'));
+    const replicaA = new PermissionRequests(store, 'org_personal');
+    const replicaB = new PermissionRequests(store, 'org_personal');
+    const request = (await replicaA.request({ taskId: 'task', projectId: 'home', role: 'do',
+      capabilities: ['settings:read'], audience: ['@owners'], recipients: ['owner'],
+      reason: 'Inspect settings.', requestedBy: 'task-agent:task:do' }));
+
+    const claim = (await replicaA.claim(request.id));
+    expect(claim).toEqual(expect.any(String));
+    expect((await replicaB.claim(request.id))).toBeUndefined();
+    await expect(replicaB.resolve(request.id, { action: 'deny', by: 'user:owner' })).rejects.toThrow(/in progress/);
+    await expect(replicaB.dismiss(request.id, 'user:owner')).rejects.toThrow(/in progress/);
+    // Releasing someone else's claim is a no-op.
+    (await replicaB.release(request.id, 'not-the-claim'));
+    expect((await replicaB.claim(request.id))).toBeUndefined();
+
+    expect((await replicaA.resolve(request.id, { action: 'approve', by: 'user:owner', claim }))).toMatchObject({ status: 'granted' });
+    expect((await replicaB.extensionCaps('task', 'do'))).toEqual(['settings:read']);
+    // Resolving consumed the claim; the next request is free to be decided.
+    const next = (await replicaA.request({ taskId: 'task', projectId: 'home', role: 'do',
+      capabilities: ['settings:write'], audience: ['@owners'], recipients: ['owner'],
+      reason: 'Change settings.', requestedBy: 'task-agent:task:do' }));
+    const held = (await replicaA.claim(next.id));
+    (await replicaA.release(next.id, held!));
+    expect((await replicaB.claim(next.id))).toEqual(expect.any(String));
+  });
+
+  it('lets a claim abandoned by a crashed replica expire', async () => {
+    const store = (await Store.create(':memory:'));
+    const service = new PermissionRequests(store, 'org_personal');
+    const request = (await service.request({ taskId: 'task', projectId: 'home', role: 'do',
+      capabilities: ['settings:read'], audience: ['@owners'], recipients: ['owner'],
+      reason: 'Inspect settings.', requestedBy: 'task-agent:task:do' }));
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      expect((await service.claim(request.id))).toEqual(expect.any(String));
+      clock.mockReturnValue(now + 60_000);
+      expect((await service.claim(request.id))).toBeUndefined();
+      clock.mockReturnValue(now + 10 * 60_000);
+      expect((await service.claim(request.id))).toEqual(expect.any(String));
+    } finally { clock.mockRestore(); }
   });
 
   it('rejects wildcard and unknown capability requests', async () => {

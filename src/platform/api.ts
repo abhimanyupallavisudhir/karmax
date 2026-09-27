@@ -366,7 +366,6 @@ export interface KarmaxApiDeps {
  * so authz lives in exactly one place.
  */
 export class KarmaxApi {
-  private resolvingPermissions = new Set<string>();
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
@@ -2077,11 +2076,17 @@ export class KarmaxApi {
     (await this.persistTaskCredentialPolicies(updated));
     const requests = new PermissionRequests(this.deps.store, organizationId);
     for (const request of (await requests.requests({ taskId, status: 'pending' }))) {
-      // A manual decision may itself be updating the task's scope.
-      if (this.resolvingPermissions.has(`${organizationId}:${request.id}`)) continue;
-      if ((await requests.requests()).find((candidate) => candidate.id === request.id)?.status !== 'pending') continue;
-      if ((await this.permissionRequestSatisfied((await this.deps.store.getTask(taskId))!, request)))
-        await this.finishPermissionDecision(requests, request, 'approve', caller.principal, true);
+      // A claimed request is being decided — possibly by the manual approval
+      // that is making this very update — and that decision finishes it.
+      const claim = (await requests.claim(request.id));
+      if (!claim) continue;
+      try {
+        if ((await requests.requests()).find((candidate) => candidate.id === request.id)?.status !== 'pending') continue;
+        if ((await this.permissionRequestSatisfied((await this.deps.store.getTask(taskId))!, request)))
+          await this.finishPermissionDecision(requests, request, 'approve', caller.principal, true, claim);
+      } finally {
+        (await requests.release(request.id, claim));
+      }
     }
     return updated;
   }
@@ -3675,14 +3680,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     token: string,
     input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
-    const key = `${input.organizationId}:${input.requestId}`;
-    if (this.resolvingPermissions.has(key)) throw new ValidationError('permission request decision is already in progress');
-    this.resolvingPermissions.add(key);
-    try {
-      return await this.applyPermissionDecision(token, input);
-    } finally {
-      this.resolvingPermissions.delete(key);
-    }
+    return this.applyPermissionDecision(token, input);
   }
 
   private async applyPermissionDecision(
@@ -3707,8 +3705,24 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this permission request was not routed to you');
     if (request.status !== 'pending') throw new ValidationError(`request ${request.id} is already ${request.status}`);
+    // Approval widens scope before the request is marked resolved; the durable
+    // claim keeps every other decision out meanwhile, on any gateway replica.
+    const claim = (await service.claim(request.id));
+    if (!claim) throw new ValidationError('permission request decision is already in progress');
+    try {
+      return await this.decidePermission(token, input, service, request, task, caller, claim);
+    } finally {
+      (await service.release(request.id, claim));
+    }
+  }
+
+  private async decidePermission(
+    token: string,
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' },
+    service: PermissionRequests, request: PermissionRequest, task: TaskRecord | undefined, caller: ScopedToken, claim: string,
+  ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     if (input.action === 'dismiss') {
-      const dismissed = (await service.dismiss(request.id, caller.principal));
+      const dismissed = (await service.dismiss(request.id, caller.principal, claim));
       const event = { taskId: request.taskId, type: 'permission.approval-dismissed',
         ts: Date.now(), payload: { requestId: request.id } };
       const seq = (await this.deps.store.appendEvent(event));
@@ -3757,7 +3771,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         { acceptAttenuation: false, preserveCredentialGrants: true });
     }
     return this.finishPermissionDecision(service, request, input.action, caller.principal,
-      input.action === 'approve' && !!task && (await this.permissionRequestSatisfied(task, request)));
+      input.action === 'approve' && !!task && (await this.permissionRequestSatisfied(task, request)), claim);
   }
 
   /** Only reconcile from the persisted grant, never from the requested level. */
@@ -3786,9 +3800,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   private async finishPermissionDecision(
     service: PermissionRequests, request: PermissionRequest, action: 'approve' | 'deny',
-    principal: string, alreadyAuthorized = false,
+    principal: string, alreadyAuthorized = false, claim?: string,
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
-    const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized }));
+    const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized, claim }));
     const message = action === 'approve'
       ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
       : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;

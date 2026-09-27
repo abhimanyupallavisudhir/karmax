@@ -5021,6 +5021,7 @@ export class Store {
       const requests = JSON.parse(raw);
       if (!Array.isArray(requests)) return;
       const remaining = requests.filter((request) => !removed.has(String(request?.taskId ?? '')));
+      for (const request of requests) if (removed.has(String(request?.taskId ?? ''))) (await exact.run(`permission:deciding:${request?.id}`));
       if (remaining.length) (await this.kvSet(key, JSON.stringify(remaining)));
       else (await exact.run(key));
     } catch {
