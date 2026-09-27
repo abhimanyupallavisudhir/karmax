@@ -59,8 +59,30 @@ it('WF-24: rotates a merge queue with a current holder and waiting tasks', async
   await expect(mergeQueue({ domain: 'repo', state: { domain: 'repo', current: 'holder', queue: ['waiting'], processed: 500,
     historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
   expect(state.rotate).toHaveBeenCalledWith({ domain: 'repo', state: { domain: 'repo', current: 'holder', queue: ['waiting'], processed: 0,
-    historyPolicyVersion: 2 } });
+    historyPolicyVersion: 3 } });
   expect(state.signal).not.toHaveBeenCalled();
+});
+
+// Rotation can outpace a lease window under sustained signal traffic. With a
+// relative 5-minute timer restarted by every new run, a dead holder was never
+// checked and the whole domain queued behind it.
+it('keeps a merge lease window across rotations', async () => {
+  const since = Date.now() - 4 * 60_000;
+  await expect(mergeQueue({ domain: 'repo', state: { domain: 'repo', current: 'holder', currentSince: since, queue: ['waiting'],
+    processed: 500, historyPolicyVersion: 3 } } as any)).rejects.toBe(stop);
+  expect(state.rotate).toHaveBeenCalledWith({ domain: 'repo', state: { domain: 'repo', current: 'holder', currentSince: since,
+    queue: ['waiting'], processed: 0, historyPolicyVersion: 3 } });
+  const timeouts: number[] = [];
+  state.condition.mockImplementation(async (predicate: () => boolean, timeout?: number) => {
+    if (timeout === undefined) { if (!predicate()) throw new Error('blocked'); return true; }
+    timeouts.push(timeout);
+    throw stop;
+  });
+  await expect(mergeQueue({ domain: 'repo', state: { domain: 'repo', current: 'holder', currentSince: since, queue: [],
+    processed: 0, historyPolicyVersion: 3 } } as any)).rejects.toBe(stop);
+  expect(timeouts).toHaveLength(1);
+  expect(timeouts[0]).toBeGreaterThan(50_000);
+  expect(timeouts[0]).toBeLessThanOrEqual(60_000);
 });
 
 it('WF-23: a repeated lease signal does not queue an already granted turn', async () => {
