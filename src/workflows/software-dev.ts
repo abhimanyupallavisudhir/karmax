@@ -1843,6 +1843,9 @@ async function softwareDevImpl(
           if (compactStart && liveAgentStates) {
             waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
             await publish();
+            // A cancel delivered while that view was being published must still
+            // stop the turn before it starts (WF-11).
+            if (cancelled) throw new Cancelled();
           }
           return await fn(
             home,

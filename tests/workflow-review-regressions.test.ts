@@ -1,8 +1,4 @@
-import { afterAll, beforeEach, expect, it, vi } from 'vitest';
-
-// Other files import these workflows with the real SDK when isolate is disabled.
-vi.hoisted(() => vi.resetModules());
-afterAll(() => { vi.doUnmock('@temporalio/workflow'); vi.resetModules(); });
+import { beforeEach, expect, it, vi } from 'vitest';
 
 const wf = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => any>(),
@@ -38,6 +34,7 @@ import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
 import { softwareDevV1_26 } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
+import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
 const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work',
   project: { repos: [] }, confirm: { layers: [] } } as any;
@@ -49,6 +46,9 @@ beforeEach(() => {
     publishView: vi.fn(async () => undefined),
     accountPoolSize: vi.fn(async () => 1),
     resolveProvider: vi.fn(async () => 'mock'),
+    // The real preparation over the stubbed reads, so each test's pool size and
+    // provider reach the workflow however it batches them.
+    prepareAgentTurn: (args: any) => makeTurnPreparationActivities(wf.activities as any, wf.activities as any).prepareAgentTurn(args),
     leaseAccount: vi.fn(async (_task, turnId) => {
       wf.handlers.get('accountGranted')!({ turnId, accountId: '(denied)' });
       return { waiting: false };
