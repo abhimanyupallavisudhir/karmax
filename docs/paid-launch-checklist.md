@@ -1,64 +1,64 @@
 # Paid launch checklist
 
-The bundled policies are an initial founder-reviewed launch draft, not legal
-advice. They deliberately contain no guessed entity, address, jurisdiction, tax,
-or certification claims. Have qualified counsel review the final configuration
-and text before enabling charges.
+For hosted operators turning on subscription billing. The bundled policies are a
+launch draft, not legal advice: they contain no guessed entity, address,
+jurisdiction, tax or certification claims. Have the final configuration and text
+reviewed before enabling charges.
 
-Configure this in **Installation settings → Paid launch**. That page stores the
-legal and catalog values in the installation database, stores Stripe secrets in
-the encrypted krmax vault, shows the exact subscription webhook URL, and keeps a
-durable checklist for the real-world work. No paid-launch environment variables
-are required.
+Everything is configured in **Installation → Paid-launch setup** (or
+`GET|PUT /api/settings/paid-launch` with installation authority). Legal and
+catalog values are stored in the installation database, provider secrets in the
+encrypted vault, and the page shows the exact webhook and checkout URLs plus a
+durable founder checklist. No environment variables are required.
 
-Only enable **real paid checkout** after every applicable item is complete. The
-UI refuses to enable it while a required legal/contact value, founder policy
-review, Stripe secret, webhook secret, or Price ID is absent. `/pricing`
-withholds the operator identity until the same configuration is complete, and
-the organization billing service independently validates Stripe configuration.
-A future policy-version change intentionally breaks the founder acknowledgement
-until the new text is reviewed.
+**Paddle** is the default provider; its setup steps are in
+[deploy/README.md](../deploy/README.md#hosted-subscription-billing-with-paddle).
+Stripe Billing remains supported for existing subscriptions; changing the default
+does not migrate customers.
 
-## Contracting party and contacts
+## What blocks enabling paid checkout
 
-- Enter the exact contracting name, formation/operating country,
-  counsel-approved governing-law wording, and real legal-notice address.
-- Enter monitored legal, privacy, security, incident, DPA, and billing role
-  addresses with owners and escalation coverage.
-- Do not add a tax ID or compliance certification unless it is real, required,
-  and separately verified. The current public draft claims none.
+The server refuses to enable checkout until all of these hold (`canEnable` in
+`src/launch/settings.ts`):
 
-## Canonical organization billing
+- Every legal/contact value: legal name, country of establishment, governing law
+  and courts, legal notice address, and legal, privacy, security, incident, DPA
+  and billing emails.
+- Founder approval of the **current** policy version. A policy change deliberately
+  voids the previous approval; setup never ticks it on the founder's behalf.
+- The selected provider's billing configuration. Paddle: API key, webhook signing
+  secret, client-side token, and the Individual, Team base and Team seat price IDs,
+  in the **live** environment. Stripe: secret key, webhook secret and the same
+  three price IDs.
 
-- Enter the Stripe Billing secret key and the separate subscription webhook
-  signing secret shown by Stripe for the URL on the page. Do not reuse the
-  agent-card/Issuing Stripe Connect webhook rail.
-- Enter the Individual, Team base, and Team additional-active-user Price IDs.
-  Verify in Stripe test mode that they are recurring monthly USD prices for
-  exactly $9, $19, and $5.
-- Complete owner checkout, signed webhook reconciliation, renewal,
-  failed-payment/grace expiry, seat changes, downgrade, direct online
-  cancellation, portal cancellation, refund, and terminal organization-deletion
-  exercises. Confirm the durable acceptance evidence contains the same
-  organization, plan, active-user pricing, and provider references.
+`/pricing` withholds the operator identity until the public operator details are
+configured, and the billing service validates provider configuration independently.
 
-## Operational review
+## Before you enable it
 
-- Review every `/legal/*` page, the signup checkbox, organization checkout,
-  commercial-terms acceptance, and the cancellation portal at mobile and desktop sizes.
-- Confirm BYOK, connected subscription, managed-model, E2B/Daytona, repository
-  host, object storage, email, monitoring, and support providers match the
-  deployed subprocessor list and DPA.
-- Exercise personal and organization export, account-deletion request routing,
-  privacy/security/incident inboxes, ownership transfer, backup deletion, and
-  offboarding. Complete a written retention schedule and DPA instead of adding
-  an invented number of days to the public draft.
-- Preserve policy acceptance records and billing-provider records under the approved
-  retention schedule. A policy edit requires a new version and a deliberate
-  decision about re-acceptance and customer notice.
+- **Contracting party.** Enter the exact operator (an individual sole trader or a
+  company) and monitored role addresses with owners and escalation coverage. Add a
+  tax ID or certification only if it is real and verified.
+- **Catalog.** Recurring monthly USD prices of exactly $9 (Individual), $19 (Team
+  base) and $5 (Team additional active user). Paddle's automated setup creates or
+  reuses them; verify them anyway.
+- **Billing lifecycle, in a separate sandbox installation.** Checkout, signed webhook
+  reconciliation, renewal, failed payment and grace expiry, seat changes, plan
+  change, portal and period-end cancellation, refund handling and organization
+  deletion with a pending checkout. Never send sandbox events to an installation
+  that holds live entitlements, and never switch one between sandbox and live.
+- **Live transport.** After configuring live keys, confirm a signed webhook reaches
+  the installation and that replays are deduplicated, without granting entitlements.
+- **Legal and data operations.** Review every `/legal/*` page, the signup checkbox,
+  checkout acceptance and the cancellation path on mobile and desktop. Check the
+  subprocessor list and DPA against the providers you actually use (hosting,
+  sandboxes, email, storage, model and repository providers). Exercise personal and
+  organization export, deletion-request routing, ownership transfer, offboarding and
+  backup restore, and adopt a written retention schedule instead of inventing a
+  number of days.
+- **Records.** Keep policy acceptance and billing records under that schedule. A
+  policy edit needs a new version and a decision about re-acceptance and notice.
 
-The Installation page contains the longer founder checklist, including business
-formation, banking/bookkeeping, tax review, name/IP clearance, Stripe account
-activation, portal and webhook setup, counsel and privacy review, staffed
-inboxes, incident procedures, data operations, billing lifecycle testing, and
-the final public launch review.
+The Installation page carries the longer founder checklist (business structure,
+banking and bookkeeping, tax, name clearance, provider account verification,
+inboxes, incident procedures and the final public launch review).
