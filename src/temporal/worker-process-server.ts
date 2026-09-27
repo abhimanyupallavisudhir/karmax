@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
-import type { WorkerProcessRequest, WorkerProcessReply } from './worker-process.js';
+import type { WorkerProcessRequest, WorkerProcessReply, WorkerProcessNotice } from './worker-process.js';
 
 export interface WorkerProcessRuntime {
   worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'>;
@@ -34,6 +34,20 @@ function watchParent(): Guardian {
   guardian.on('error', () => process.kill(process.pid, 'SIGKILL'));
   guardian.unref();
   return guardian;
+}
+
+let eventsAnnounced = false;
+/** Tell the supervisor that events were committed here, so its relay delivers
+ * them now instead of at its next poll (LT-15). One notice per burst. */
+export function announceEventsAppended(): void {
+  if (eventsAnnounced || !process.send || !process.connected) return;
+  eventsAnnounced = true;
+  setImmediate(() => {
+    eventsAnnounced = false;
+    if (!process.connected) return;
+    const notice: WorkerProcessNotice = { type: 'worker.events' };
+    process.send!(notice, () => { /* a lost hint is recovered by polling */ });
+  });
 }
 
 /** Trusted child entrypoints install this before constructing runtime services.

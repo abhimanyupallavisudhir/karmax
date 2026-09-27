@@ -8,6 +8,8 @@ export interface WorkerProcessRequest {
 export interface WorkerProcessReply {
   type: 'worker.reply'; id: number; ok: boolean; error?: string;
 }
+/** Unsolicited child → supervisor hint: events were committed to the shared store. */
+export interface WorkerProcessNotice { type: 'worker.events' }
 
 /** One supervised child, with bounded control requests and explicit readiness.
  * A control timeout kills the child: the caller cannot safely assume a timed-out
@@ -41,6 +43,8 @@ export class WorkerProcessManager {
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
     onFailure?: (error: Error) => void;
+    /** The child committed events; a relay can deliver them now (LT-15). */
+    onEvents?: () => void;
   }) {
     for (const value of [options.requestTimeoutMs, options.stopTimeoutMs,
       options.heartbeatIntervalMs, options.heartbeatTimeoutMs])
@@ -110,6 +114,10 @@ export class WorkerProcessManager {
       });
       child.on('message', (value: unknown) => {
         if (!value || typeof value !== 'object') return;
+        if ((value as Partial<WorkerProcessNotice>).type === 'worker.events') {
+          try { this.options.onEvents?.(); } catch { /* a hint; polling still delivers */ }
+          return;
+        }
         const reply = value as Partial<WorkerProcessReply>;
         if (reply.type !== 'worker.reply' || typeof reply.id !== 'number' || typeof reply.ok !== 'boolean') return;
         const request = this.pending.get(reply.id);

@@ -6,7 +6,7 @@ import { Store } from '../store/db.js';
 import { makeClient } from '../temporal/client.js';
 import { temporalConnectionFromEnv } from '../temporal/connection-env.js';
 import { WorkerManager } from '../temporal/worker-pool.js';
-import type { WorkerProcessRuntime } from '../temporal/worker-process-server.js';
+import { announceEventsAppended, type WorkerProcessRuntime } from '../temporal/worker-process-server.js';
 import { TASK_QUEUE } from '../temporal/config.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -50,6 +50,10 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
   };
   try {
     store = await Store.create(database);
+    // The primary relays this process's events to browsers; wake it on every
+    // commit rather than leaving delivery to its poll (LT-15).
+    const append = store.appendEvent.bind(store);
+    store.appendEvent = async (event) => { const seq = await append(event); announceEventsAppended(); return seq; };
     const connection = await makeClient(conn);
     closeClient = connection.close;
     const client = connection.client;
