@@ -1,6 +1,6 @@
 import { claudeWorkEnvironment, workEnvironment } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
-import { readAnthropicMessage } from './api-streams.js';
+import { readAnthropicMessage, readStreamOnceMore } from './api-streams.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
 import os from 'node:os';
@@ -137,7 +137,7 @@ export class ClaudeAdapter implements AgentAdapter {
     for (let i = 0; i < maxIters; i++) {
       if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
       ctx.heartbeat?.(); // let Temporal deliver a pending cancellation
-      const data = await timed('provider.roundtrip', async () => {
+      const data = await timed('provider.roundtrip', () => readStreamOnceMore('Anthropic API', async () => {
         const res = await fetch(`${baseUrl}/v1/messages`, {
           method: 'POST',
           headers: {
@@ -170,7 +170,7 @@ export class ClaudeAdapter implements AgentAdapter {
         const data = await readAnthropicMessage(res, (text) => ctx.emit(text, 'assistant'));
         (await (await currentTiming())?.markOnce('first.output'));
         return data;
-      });
+      }));
       // Usage accounting is required even when timing collection is absent.
       const roundUsage = reportedUsage.add(data.usage, 'claude');
       (await (await currentTiming())?.mark('provider.usage', roundUsage));
