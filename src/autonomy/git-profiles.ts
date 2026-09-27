@@ -7,6 +7,7 @@ import { GitProfile, ProjectConfig } from '../domain/types.js';
 import { CredentialBroker } from './broker.js';
 import { git, isolatedGitEnvironment } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
+import { shellQuote } from '../util/shell.js';
 import { paths } from '../config/paths.js';
 
 const pexec = promisify(execFile);
@@ -359,7 +360,9 @@ export class GitProfiles {
       // A fresh hosted container has no known_hosts file. `accept-new` permits
       // that first connection without weakening protection against a changed
       // host key on subsequent operations.
-      env.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes -o UserKnownHostsFile=${knownHosts} -o StrictHostKeyChecking=accept-new`;
+      // git runs this through a shell: a data home such as "Application Support"
+      // must not split the paths into separate arguments (AU-34).
+      env.GIT_SSH_COMMAND = `ssh -i ${shellQuote(key)} -o IdentitiesOnly=yes -o UserKnownHostsFile=${shellQuote(knownHosts)} -o StrictHostKeyChecking=accept-new`;
     }
     if (profile.githubToken) {
       env.GH_TOKEN = (await this.resolveSecret(profile.name, 'token', ctx));

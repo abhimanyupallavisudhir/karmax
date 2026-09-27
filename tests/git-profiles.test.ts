@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { finalizeMerge } from '../src/world/merge.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
@@ -207,8 +207,8 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     (await profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', sshKey: 'FAKE-KEY-MATERIAL', githubToken: 'tok' }));
     const env = (await profiles.env((await profiles.get('p'))!, {}));
     expect(env.GIT_SSH_COMMAND).toMatch(/^ssh -i .* -o IdentitiesOnly=yes -o UserKnownHostsFile=.* -o StrictHostKeyChecking=accept-new$/);
-    const keyPath = env.GIT_SSH_COMMAND!.match(/^ssh -i (\S+)/)![1]!;
-    const knownHostsPath = env.GIT_SSH_COMMAND!.match(/UserKnownHostsFile=(\S+)/)![1]!;
+    const keyPath = env.GIT_SSH_COMMAND!.match(/^ssh -i '([^']+)'/)![1]!;
+    const knownHostsPath = env.GIT_SSH_COMMAND!.match(/UserKnownHostsFile='([^']+)'/)![1]!;
     expect(fs.readFileSync(keyPath, 'utf8')).toBe('FAKE-KEY-MATERIAL\n');
     expect(fs.statSync(keyPath).mode & 0o777).toBe(0o600);
     expect(fs.readFileSync(knownHostsPath, 'utf8')).toBe('');
@@ -217,6 +217,25 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(fs.statSync(env.GIT_ASKPASS!).mode & 0o777).toBe(0o700);
     // the askpass script answers with the env token, holding no secret itself
     expect(fs.readFileSync(env.GIT_ASKPASS!, 'utf8')).not.toContain('tok');
+  });
+});
+
+describe('GIT_SSH_COMMAND quoting (AU-34)', () => {
+  it('hands ssh the key even when the data directory has spaces or quotes', async () => {
+    const state = path.join(tmp, "Application Support", "karmax's state");
+    const spaced = new GitProfiles(store, broker, state);
+    (await spaced.save({ name: 'q', userName: 'J', userEmail: 'j@x.com', sshKey: 'SPACED-KEY' }));
+    const env = (await spaced.env((await spaced.get('q'))!, {}));
+    // git runs the command through a shell; a stand-in ssh records the argv it received.
+    const bin = fs.mkdtempSync(path.join(tmp, 'bin-'));
+    const argvFile = path.join(bin, 'argv');
+    fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\nexit 1\n`, { mode: 0o755 });
+    spawnSync('git', ['ls-remote', 'ssh://git@example.invalid/repo.git'], {
+      env: { ...process.env, ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
+    const argv = fs.readFileSync(argvFile, 'utf8').split('\n');
+    expect(fs.readFileSync(argv[argv.indexOf('-i') + 1]!, 'utf8')).toBe('SPACED-KEY\n');
+    const knownHosts = argv.find((arg) => arg.startsWith('UserKnownHostsFile='))!.slice('UserKnownHostsFile='.length);
+    expect(fs.existsSync(knownHosts)).toBe(true);
   });
 });
 
