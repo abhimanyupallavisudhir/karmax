@@ -84,6 +84,27 @@ it('refuses executable configuration pulled in through a repository include (RT-
   expect((await git(root, ['add', '.'])).code).not.toBe(0);
   expect(fs.existsSync(marker)).toBe(false);
 });
+it('refuses a repository signing-key command before a host commit (RT-5)', async () => {
+  const root = await fixture();
+  const marker = path.join(root, 'key-command-ran');
+  // Git runs the command without a shell, so the payload is a script.
+  const command = path.join(root, 'key-command');
+  fs.writeFileSync(command, `#!/bin/sh\ntouch '${marker}'\necho key::ssh-ed25519 AAAA\n`, { mode: 0o700 });
+  for (const [key, value] of [['gpg.format', 'ssh'], ['commit.gpgSign', 'true'], ['gpg.ssh.defaultKeyCommand', command]])
+    execFileSync('git', ['config', key!, value!], { cwd: root });
+  expect((await git(root, ['commit', '--allow-empty', '-qm', 'signed'])).code).not.toBe(0);
+  expect(fs.existsSync(marker)).toBe(false);
+});
+it('refuses a repository work tree redirected outside the checkout (RT-5)', async () => {
+  const root = await fixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'host-git-outside-')); roots.push(outside);
+  fs.writeFileSync(path.join(outside, 'host-file'), 'host data');
+  execFileSync('git', ['config', 'core.worktree', outside], { cwd: root });
+  expect((await git(root, ['add', '-A'])).code).not.toBe(0);
+  expect((await git(root, ['commit', '-qm', 'stage host files'])).code).not.toBe(0);
+  execFileSync('git', ['config', '--unset', 'core.worktree'], { cwd: root });
+  expect(await gitOrThrow(root, ['ls-files'])).toBe('file');
+});
 // The operator's own Git setup is trusted: global/system files (identity, LFS
 // filters, credential helpers) and environment-supplied config chains. Only
 // what an agent can write — the repository's config — is refused.

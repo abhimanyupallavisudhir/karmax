@@ -37,8 +37,10 @@ export async function git(cwd: string, args: string[], opts: { timeoutMs?: numbe
     // Only the repository's own configuration (and what it includes) can be
     // written from an agent's checkout; operator and karmax-supplied scopes are
     // trusted, so an operator's LFS filter or credential helper keeps working.
+    // Refused: settings that run a program, and core.worktree, which points
+    // host staging and checkout at any directory.
     const config = await pexec('git', ['config', '--show-scope', '--includes', '--null', '--get-regexp',
-      '^(filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver|diff\\..*\\.(command|textconv)|diff\\.external|core\\.(sshcommand|gitproxy|alternaterefscommand|askpass)|gpg(\\..*)?\\.program|credential(\\..*)?\\.helper|remote\\..*\\.(uploadpack|receivepack)|submodule\\..*\\.update)$'],
+      '^(filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver|diff\\..*\\.(command|textconv)|diff\\.external|core\\.(sshcommand|gitproxy|alternaterefscommand|askpass|worktree)|gpg(\\..*)?\\.program|gpg\\.ssh\\.defaultkeycommand|credential(\\..*)?\\.helper|remote\\..*\\.(uploadpack|receivepack)|submodule\\..*\\.update)$'],
       { cwd, env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 1024 * 1024 }).catch(error => {
         if (error.code === 1 && !error.killed) return { stdout: '' };
         throw error;
@@ -48,7 +50,7 @@ export async function git(cwd: string, args: string[], opts: { timeoutMs?: numbe
       const scope = fields[index]!, setting = fields[index + 1]!;
       const separator = setting.indexOf('\n');
       if ((scope === 'local' || scope === 'worktree') && separator >= 0 && setting.slice(separator + 1).trim())
-        throw new Error(`refusing executable repository Git configuration: ${setting.slice(0, separator)}`);
+        throw new Error(`refusing unsafe repository Git configuration: ${setting.slice(0, separator)}`);
     }
     const { stdout, stderr } = await pexec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
       '-c', 'core.quotePath=false', '-c', 'protocol.ext.allow=never', ...args], {
