@@ -1,3 +1,5 @@
+import { credentialAliases, MODEL_PROVIDERS } from './provider-registry.js';
+
 export interface ExplanationSettings {
   endpoint: string;
   model: string;
@@ -24,6 +26,17 @@ const PROVIDER_HOSTS: Array<[RegExp, string]> = [
   [/(?:^|\.)x\.ai$/i, 'xai'],
 ];
 
+/** Namespaces that hold a known provider's key: only that provider's own domain
+ * (PROVIDER_HOSTS) may resolve to one, whatever label or alias a lookalike borrows. */
+const RESERVED_NAMESPACES = new Set([...PROVIDER_HOSTS.map(([, provider]) => provider), ...MODEL_PROVIDERS, 'gemini']
+  .flatMap((provider) => credentialAliases(provider)));
+
+/** Whether an endpoint is a known provider's own API (its key goes nowhere else). */
+export function knownProviderEndpoint(endpoint: string): boolean {
+  try { return PROVIDER_HOSTS.some(([pattern]) => pattern.test(new URL(endpoint).hostname)); }
+  catch { return false; }
+}
+
 /** A model server on this machine (a self-hosted Ollama/vLLM) may use plain HTTP. */
 function loopbackHost(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
@@ -40,8 +53,13 @@ export function explanationProvider(endpoint: string): string {
   // Use the registrable-domain side rather than the first subdomain. Otherwise
   // `openrouter.attacker.example` would be mistaken for OpenRouter and receive
   // its key merely because a malicious host borrowed the provider as a prefix.
-  if (parts.length === 1 || hostname.includes(':') || /^\d+(?:\.\d+){3}$/.test(hostname)) return hostname;
-  return parts.at(-2) || hostname;
+  const namespace = parts.length === 1 || hostname.includes(':') || /^\d+(?:\.\d+){3}$/.test(hostname)
+    ? hostname : parts.at(-2) || hostname;
+  // `openai.xyz`, `claude.example` or an intranet host named `openai` must not
+  // receive the OpenAI or Anthropic key.
+  if (credentialAliases(namespace).some((alias) => RESERVED_NAMESPACES.has(alias)))
+    throw new Error(`${hostname} is not ${namespace}'s own API, so the ${namespace} key is never sent there`);
+  return namespace;
 }
 
 export function normalizeExplanationSettings(

@@ -87,6 +87,18 @@ describe('explanation model calls', () => {
     expect(explanationProvider('https://api.x.ai/v1')).toBe('xai');
   });
 
+  it('never lets a lookalike domain claim a known provider\'s key', () => {
+    // Only the provider's own domain may resolve to its credential namespace,
+    // whatever label, alias or TLD a lookalike borrows.
+    for (const endpoint of ['https://api.openai.xyz/v1', 'https://anthropic.evil/v1', 'https://openrouter.example/api/v1',
+      'https://claude.example/v1', 'https://codex.example/v1', 'https://grok.example/v1', 'https://gemini-proxy.google.example/v1',
+      'https://openai/v1'])
+      expect(() => explanationProvider(endpoint), endpoint).toThrow(/own/);
+    // A custom OpenAI-compatible server still gets its own namespace.
+    expect(explanationProvider('https://api.together.xyz/v1')).toBe('together');
+    expect(explanationProvider('https://openai.mycompany.com/v1')).toBe('mycompany');
+  });
+
   it('sends keys only over HTTPS, except to a model server on this machine', () => {
     expect(() => normalizeExplanationSettings({ endpoint: 'http://api.example.com/v1' })).toThrow('HTTPS');
     expect(() => normalizeExplanationSettings({ endpoint: 'http://169.254.169.254/latest' })).toThrow('HTTPS');

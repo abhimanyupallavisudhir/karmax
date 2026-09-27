@@ -92,7 +92,7 @@ import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 import { actorPrincipal, identityAuditDetail, requireHumanSubject,
   resolveCallerIdentity } from '../platform/identity.js';
-import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
+import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoint, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
 import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
@@ -5599,14 +5599,22 @@ export class Gateway {
           totalContext += text.length;
           return true;
         }).reverse();
+        const defaults = (await this.explanationSettings(project.id)).effective;
         let settings: ExplanationSettings;
+        let provider: string;
         try {
-          const defaults = (await this.explanationSettings(project.id)).effective;
           settings = normalizeExplanationSettings(body.settings, defaults);
+          provider = explanationProvider(settings.endpoint);
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
-        const provider = explanationProvider(settings.endpoint);
+        // Where the organization's key goes is a settings decision (RT-2): anyone
+        // explaining a message may switch between known providers' own APIs, but
+        // any other endpoint needs the authority that could save it as the default.
+        if (settings.endpoint !== defaults.endpoint && !knownProviderEndpoint(settings.endpoint)
+          && !(await this.deps.tokens.check(token, 'project:settings:write',
+            { projectId: project.id, organizationId: project.organizationId, taskId })).ok)
+          return this.json(res, 403, { error: 'Only someone who can change this project\'s explanation settings can use another endpoint' });
         const apiKey = (await this.explanationApiKey(provider, project.organizationId ?? 'org_personal', project.id, taskId));
         if (!apiKey) return this.json(res, 400, {
           error: `API key for ${provider} not found`,
