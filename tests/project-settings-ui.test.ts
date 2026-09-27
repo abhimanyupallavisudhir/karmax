@@ -111,18 +111,19 @@ describe('Project settings browser source', () => {
     expect(organization).not.toContain('<a href="#settings-storage">Data storage</a>');
     expect(organization).toContain('id="settings-code"><div>Projects');
     expect(organization).toContain('<div class="section-h">Git &amp; GitHub</div>');
-    expect(organization).toContain('<div class="section-h" id="settings-storage">Data storage</div>');
+    expect(organization).toContain('<div class="section-h" id="settings-storage">Data storage ${policyTip(');
   });
 
   it('explains data locations and the Data/Service/S3 boundary', () => {
     const data = source.slice(source.indexOf('async function hydrateProjectData('), source.indexOf('async function hydrateProjectServices('));
     const services = source.slice(source.indexOf('async function hydrateProjectServices('), source.indexOf('async function hydrateProjectEnvironment('));
-    expect(data).toContain('Data or Service?');
-    expect(data).toContain('Storage field only decides where those encrypted revisions live');
+    // The boundary is explained once, in the Data and Services headings' tips.
+    expect(source).toContain('<h2>Data ${policyTip(`Choose Data when');
+    expect(source).toContain('Storage only decides where the encrypted revisions live');
+    expect(source).toContain("<h2>Services ${policyTip('Use an external service for an API, hosted database or S3 bucket");
     expect(data).toContain('Mount at path <small>(repo-relative)</small>');
     expect(data).toContain('Import from local path');
     expect(data).toContain('formatBytes(proposal.bytes)');
-    expect(services).toContain('S3 bucket');
     expect(services).toContain('external service');
   });
 

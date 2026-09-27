@@ -143,6 +143,43 @@ describe('Store', () => {
     } finally { await migrated.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('deletes a task\'s kv rows through the primary-key range (PS-8)', async () => {
+    const project = (await store.createProject('Prefix deletes'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Doomed', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } }));
+    const kept = (await store.createTask({ projectId: project.id, title: 'Kept', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } }));
+    for (const id of [task.id, kept.id]) {
+      await store.kvSet(`turnsession:${id}#1`, 'x');
+      await store.kvSet(`conversation-share-index:${id}:s`, `share-${id}`);
+      await store.kvSet(`conversation-share:share-${id}`, 'y');
+    }
+    const prepare = vi.spyOn(store.db, 'prepare');
+    await store.deleteTask(task.id);
+    await store.clearTurnCheckpoints(kept.id);
+    const sql = prepare.mock.calls.map(([statement]) => String(statement));
+    prepare.mockRestore();
+    expect(sql.filter((statement) => /FROM kv WHERE substr\(k/.test(statement))).toEqual([]);
+    expect(sql.some((statement) => /FROM kv WHERE k >= \? AND k < \?/.test(statement))).toBe(true);
+    expect(await store.kvGet(`turnsession:${task.id}#1`)).toBeUndefined();
+    expect(await store.kvGet(`conversation-share:share-${task.id}`)).toBeUndefined();
+    expect(await store.kvGet(`turnsession:${kept.id}#1`)).toBeUndefined();
+    expect(await store.kvGet(`conversation-share:share-${kept.id}`)).toBe('y');
+  });
+
+  it('repairs unclassified usage at each boot through an index of only those rows (PS-5)', async () => {
+    const insert = (id: string, costMicros: number) => store.db.prepare(`INSERT INTO usage_events
+      (id, organizationId, provider, kind, quantity, unit, costMicros, startedAt, endedAt, costClassification)
+      VALUES (?, 'org_personal', 'anthropic', 'model.tokens', 1, 'token', ?, 0, 1, 'none')`).run(id, costMicros);
+    for (let i = 0; i < 50; i++) await insert(`classified-${i}`, 0);
+    // A rollback to a release without the column writes unclassified rows again.
+    await insert('unclassified', 5);
+    const plan = await store.db.prepare(`EXPLAIN QUERY PLAN UPDATE usage_events SET costClassification='incurred'
+      WHERE costMicros>0 AND costClassification='none'`).all() as Array<{ detail: string }>;
+    expect(plan.map((row) => row.detail).join(' ')).toContain('idx_usage_unclassified');
+    await (store as any).migrate();
+    expect(await store.db.prepare("SELECT costClassification FROM usage_events WHERE id='unclassified'").get()).toEqual({ costClassification: 'incurred' });
+    expect(await store.db.prepare("SELECT count(*) AS n FROM usage_events WHERE costClassification='none'").get()).toEqual({ n: 50 });
+  });
+
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
     const project = (await store.createProject('Parameter patches'));
     const task = (await store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',

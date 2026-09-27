@@ -189,11 +189,57 @@ describe('Paddle subscription billing', () => {
       expect(transaction.custom_data.karmax_request).not.toContain('recover-checkout-1');
       await expect(billing.reconcilePending(org.id)).rejects.toThrow(/progress/);
       await store.db.prepare('UPDATE subscription_billing_locks SET createdAt=? WHERE organizationId=?').run(Date.now() - 120_000, org.id);
-      expect(await billing.reconcilePending(org.id)).toEqual({ reconciled: true, pending: false });
+      expect(await billing.reconcilePending(org.id)).toEqual({ reconciled: true, pending: false, applied: true });
       const recovered = await billing.checkout(org.id, 'individual', urls, 'recover-checkout-1');
       expect(recovered.checkoutSessionReference).toBe('txn_recovered');
       expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
       expect((await billing.current(org.id)).plan).toBe('free');
+    } finally { await store.close(); }
+  });
+
+  it('proves a lost write absent only from a complete read of Paddle (GH-5)', async () => {
+    const reply = (data: unknown, more = false) => vi.fn(async () => Response.json({ data, meta: { pagination: { has_more: more, next: '/transactions?after=x' } } }));
+    const reconcile = (fetcher: any, intent: any) => new PaddleSubscriptionProvider(() => config, fetcher).reconcileRequest(intent, 'reference', Date.now());
+    const unchanged = { id: 'sub_test', status: 'active', scheduled_change: null, items: [{ price: { id: 'pri_individual' }, quantity: 1 }] };
+    expect(await reconcile(reply(unchanged), { kind: 'change', subscriptionId: 'sub_test', plan: 'team', seats: 1 })).toEqual({ absent: true });
+    expect(await reconcile(reply(unchanged), { kind: 'cancel', subscriptionId: 'sub_test' })).toEqual({ absent: true });
+    expect(await reconcile(reply({ id: 'txn_open', status: 'ready' }), { kind: 'abandon', checkoutId: 'txn_open' })).toEqual({ absent: true });
+    const checkout = { kind: 'checkout', plan: 'individual', seats: 1, successUrl: 'https://example.test/' };
+    expect(await reconcile(reply([]), checkout)).toEqual({ absent: true });
+    // A partial search or an ambiguous one proves nothing.
+    expect(await reconcile(reply([], true), checkout)).toBeNull();
+    const twice = { id: 'txn_a', origin: 'api', status: 'draft', collection_mode: 'automatic', custom_data: { karmax_request: 'reference:checkout' },
+      items: [{ price: { id: 'pri_individual' }, quantity: 1 }] };
+    expect(await reconcile(reply([twice, { ...twice, id: 'txn_b' }]), checkout)).toBeNull();
+  });
+
+  it('releases a reservation Paddle never applied once the write can no longer land (GH-5)', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'Lost write', ownerUserId: 'owner' });
+      let lose = true;
+      const fetcher = vi.fn(async (_url: any, init: any) => {
+        if (init.method === 'POST') {
+          if (lose) throw new Error('connection reset');
+          const request = JSON.parse(init.body);
+          return Response.json({ data: { id: 'txn_retried', status: 'draft', collection_mode: 'automatic',
+            items: request.items.map((i: any) => ({ price: { id: i.price_id }, quantity: i.quantity })) } });
+        }
+        return Response.json({ data: [], meta: { pagination: { has_more: false } } });
+      });
+      const billing = new SubscriptionBillingService(store, new PaddleSubscriptionProvider(() => config, fetcher), true);
+      const urls = { success: 'https://example.test/', cancel: 'https://example.test/' };
+      await expect(billing.checkout(org.id, 'individual', urls, 'lost-write-1')).rejects.toThrow('connection reset');
+      const age = async (ms: number) => { await store.db.prepare('UPDATE subscription_billing_locks SET createdAt=? WHERE organizationId=?').run(Date.now() - ms, org.id); };
+      // Absent from Paddle, but young enough that the write could still land: keep it.
+      await age(2 * 60_000);
+      expect(await billing.reconcilePending(org.id)).toEqual({ reconciled: false, pending: true });
+      await expect(billing.checkout(org.id, 'individual', urls, 'lost-write-2')).rejects.toThrow(/reconcil|progress/);
+      await age(11 * 60_000);
+      expect(await billing.reconcilePending(org.id)).toEqual({ reconciled: true, pending: false, applied: false });
+      lose = false;
+      await expect(billing.checkout(org.id, 'individual', urls, 'lost-write-3')).resolves.toMatchObject({ checkoutSessionReference: 'txn_retried' });
+      expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(2);
     } finally { await store.close(); }
   });
 
