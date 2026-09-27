@@ -34,6 +34,7 @@ import {
 } from '../agent/provider-registry.js';
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
+import { SecretScrubber } from '../agent/activity.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -1918,6 +1919,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // JIT-resolve credentials via the broker (never journaled). Every current
       // turn receives its selection from the general Credentials policy.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      // The coordinator's pool spans organizations; a leased home or key is used
+      // only if it is one of THIS organization's credentials. (The mock agent
+      // reads no credential; its pool entries exist only in tests.)
+      if ((args.accountConfigHome || args.accountApiKeyHandle) && profile.provider !== 'mock') {
+        const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+        const { enumerateCredentials } = await import('../platform/credentials.js');
+        const own = enumerateCredentials(gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
+        if ((args.accountConfigHome && !own.some((c) => c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome!)))
+          || (args.accountApiKeyHandle && !own.some((c) => c.apiKeyHandle === args.accountApiKeyHandle)))
+          throw ApplicationFailure.create({
+            message: 'The credential leased for this turn is not available to this organization; reconnect the login or API key and retry.',
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+      }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
@@ -1982,6 +1998,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // and unsupported native targets receive a guarded context message instead.
       if (!session && spec?.resumeFrom) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        // A task fork reads the source's conversation, native session and world.
+        // The API authorizes the pointer when it is set, but a pointer can
+        // outlive that check (an old template's spawned run, a task created
+        // before every agent spec was validated), so the turn re-checks it with
+        // its own authority — the same check get_conversation would apply.
+        if (spec.resumeFrom.taskId) {
+          const source = (await store.getTask(spec.resumeFrom.taskId));
+          const sourceOrganization = source ? (await store.getProject(source.projectId))?.organizationId ?? 'org_personal' : undefined;
+          const readable = !!source && sourceOrganization === organizationId
+            && (!deps.tokens || !token
+              || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
+          if (!readable) {
+            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            throw ApplicationFailure.create({
+              message: `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
+              type: 'agent-error',
+              nonRetryable: true,
+            });
+          }
+        }
         // The config home THIS turn runs under — where the source session must be
         // visible for the provider to resolve it. Shared by both resume paths below.
         const ambientHome =
@@ -2509,6 +2545,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
         let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
+        // Whatever the agent prints is archived (RT-12); scrub every value this
+        // turn was handed, including secrets that arrive mid-turn.
+        const secrets = new SecretScrubber();
+        secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2543,12 +2583,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // now, at the activity boundary. Keep application secrets separate
             // from runtime env so they cannot change model auth or startup.
             const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
+            secrets.add(...Object.values(secretEnv),
+              ...Object.entries(gitEnv).filter(([key]) => /token|password|secret|credential|key/i.test(key)).map(([, value]) => value));
             // Project settings keep applying while the agent runs (a secret added
             // after it started must reach the command it runs next), not only at
             // the next world open.
             const resources = deps.resources;
-            if (resources) pullSecretEnv = async () => ({
-              ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv });
+            if (resources) pullSecretEnv = async () => {
+              const refreshed = { ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv };
+              secrets.add(...Object.values(refreshed));
+              return refreshed;
+            };
             return {
               ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
               ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
@@ -2576,7 +2621,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           onEmit: async (t, source) => {
             if (t === lastEmit) return;
             lastEmit = t;
-            (await record(args.taskId, 'agent.output', { text: t, source, role: args.role,
+            (await record(args.taskId, 'agent.output', { text: secrets.scrub(t), source, role: args.role,
               turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt }));
           },
           onReviewInfo: async (info, supplied) => {
@@ -2592,6 +2637,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
             (await record(args.taskId, 'agent.activity', {
               ...activity,
+              title: secrets.scrub(activity.title),
+              ...(activity.detail !== undefined ? { detail: secrets.scrub(activity.detail) } : {}),
               role: args.role,
               attempt: activityAttempt, workflowRunId,
               ...(turnId ? { turnId } : {}),
@@ -2696,6 +2743,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+        // The final answer becomes a conversation message in the task view.
+        if (result.output) result = { ...result, output: secrets.scrub(result.output) };
         if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));

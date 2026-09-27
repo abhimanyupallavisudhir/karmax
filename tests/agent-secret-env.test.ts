@@ -140,6 +140,69 @@ describe('agent project-secret delivery', () => {
   });
 });
 
+/**
+ * RT-12: the agent can print any value it was handed — `env`, `cat .env`,
+ * `echo $KARMAX_TOKEN` — and its live output, activity items and final answer
+ * are archived in the event log and task view. Values karmax itself delivered
+ * to the turn are scrubbed wherever they would be archived.
+ */
+describe('agent output archiving', () => {
+  it('scrubs the turn’s own secrets from output, activity and the final answer', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-agent-scrub-'));
+    const previous = { home: process.env.KARMAX_HOME, floor: process.env.KARMAX_AGENT_MIN_FREE_MB, load: process.env.KARMAX_AGENT_MAX_LOAD_FACTOR };
+    process.env.KARMAX_HOME = dir;
+    process.env.KARMAX_AGENT_MIN_FREE_MB = '0';
+    process.env.KARMAX_AGENT_MAX_LOAD_FACTOR = '0';
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Scrub'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Print env', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } }));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const worlds = new WorldRegistry();
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    (await broker.registerHandle('resource:test:db', 'postgres://admin:hunter2-db-pass@db.internal/app'));
+    (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Database', driver: 'secret@1', target: { kind: 'environment', name: 'DATABASE_URL' },
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:test:db'], publish: 'discard' }));
+    const { TokenAuthority } = await import('../src/platform/tokens.js');
+    const tokens = new TokenAuthority(store);
+    let karmaxToken = '';
+    const adapter = { provider: 'mock' as const, async runTurn(input: TurnInput, ctx: any) {
+      karmaxToken = input.extraEnv?.KARMAX_TOKEN ?? '';
+      const leaked = `DATABASE_URL=${input.secretEnv?.DATABASE_URL}\n${karmaxToken}`;
+      ctx.emit(`$ env\n${leaked}`);
+      await ctx.emitActivity({ id: 'cmd-1', kind: 'command', phase: 'completed', title: `echo ${karmaxToken}`, detail: leaked });
+      return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: `Here is the env:\n${leaked}` };
+    } };
+    const core = makeCoreActivities({ store, worlds, resources, broker, tokens,
+      adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
+    try {
+      const result = await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle,
+        messages: [{ id: 'm1', role: 'user', text: 'work', ts: 0 }],
+        task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any });
+      expect(karmaxToken).toMatch(/^kt_/);
+      const archived = JSON.stringify((await store.eventsSince(task.id, 0)).filter((event) =>
+        event.type === 'agent.output' || event.type === 'agent.activity'));
+      expect(archived).toContain('DATABASE_URL=');
+      for (const secret of ['hunter2-db-pass', karmaxToken]) {
+        expect(archived).not.toContain(secret);
+        expect(result.output).not.toContain(secret);
+      }
+      expect(result.output).toContain('[redacted]');
+    } finally {
+      await core.destroyWorld(handle);
+      await resources.deleteProject(project.id);
+      (await store.close());
+      fs.rmSync(dir, { recursive: true, force: true });
+      restoreEnv('KARMAX_HOME', previous.home);
+      restoreEnv('KARMAX_AGENT_MIN_FREE_MB', previous.floor);
+      restoreEnv('KARMAX_AGENT_MAX_LOAD_FACTOR', previous.load);
+    }
+  });
+});
+
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;

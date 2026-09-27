@@ -311,13 +311,14 @@ describe('account coordinator — quota engine', () => {
     const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     const immediate = await grantee();
 
-    await expect(activities.leaseAccount(immediate.id, 'immediate', 'claude')).resolves.toEqual({
+    // Real providers always lease through their policy allow-list (WF-6).
+    await expect(activities.leaseAccount(immediate.id, 'immediate', 'claude', ['A'])).resolves.toEqual({
       waiting: false,
     });
     await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
 
     const parked = await grantee();
-    await expect(activities.leaseAccount(parked.id, 'parked', 'claude')).resolves.toEqual({
+    await expect(activities.leaseAccount(parked.id, 'parked', 'claude', ['A'])).resolves.toEqual({
       waiting: true,
       detail: 'Waiting for a free slot on an allowed account',
     });

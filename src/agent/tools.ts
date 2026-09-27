@@ -2,6 +2,7 @@ import { boundedExec } from '../world/bounded-exec.js';
 import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
+import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
@@ -24,10 +25,7 @@ export interface ToolSchema {
 const MAX_OUTPUT = 12_000;
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
 
-/** Review captions are orientation, not a second place for the agent's final answer. */
-export const MAX_REVIEW_TEXT_LENGTH = 280;
-
-const reviewTextLength = (value: string) => [...value].length;
+export { MAX_REVIEW_TEXT_LENGTH };
 
 /** How loudly an ask asks. One shared parameter across every human-facing tool,
  * so an agent learns the vocabulary once. See `Urgency` in domain/types.ts. */
@@ -165,7 +163,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'save_skill',
-    description: 'Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: 'Save a reusable skill (markdown content) for future tasks in your organization; saving the same name overwrites it. For content that belongs to one project, or that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -906,25 +904,22 @@ export function platformToolHandlers(
       return `wrote ${args?.path}`;
     },
     async create_review_info(args) {
-      // `summary` is no longer advertised, but validate it too for old/resumed
-      // sessions which may still call the legacy shape. Both fields occupy the
-      // same textual orientation slot in Review.
-      for (const field of ['caption', 'summary'] as const) {
-        const value = args?.[field];
-        if (typeof value !== 'string') continue;
-        const length = reviewTextLength(value);
-        if (length > MAX_REVIEW_TEXT_LENGTH) {
-          return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
-        }
+      // The runtime re-checks the accumulated total; either rejection goes back
+      // to the agent as a correctable tool result, never a lost attachment.
+      try {
+        await ctx.createReviewInfo(validateReviewInfoCall({
+          caption: args?.caption,
+          actions: args?.actions,
+          summary: args?.summary,
+          links: args?.links,
+          diff: args?.diff,
+          html: args?.html,
+        }));
+      } catch (error) {
+        if (error instanceof ReviewInfoRejected || (error as Error)?.name === 'ReviewInfoRejected')
+          return `review info rejected: ${(error as Error).message}`;
+        throw error;
       }
-      await ctx.createReviewInfo({
-        caption: args?.caption,
-        actions: Array.isArray(args?.actions) ? args.actions : undefined,
-        summary: args?.summary,
-        links: args?.links,
-        diff: args?.diff,
-        html: args?.html,
-      });
       return 'review info recorded';
     },
     async create_sub_task(args) {
@@ -971,7 +966,11 @@ export function platformToolHandlers(
       }
     },
     async save_skill(args) {
-      ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
+      const skill = { name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') };
+      // The gateway writes it under the caller's organization; the turn result
+      // only records that it was saved.
+      await platformRequest('POST', '/api/skills', skill);
+      ctx.saveSkill(skill);
       return 'skill saved';
     },
     async read_wiki(args) {
@@ -1243,7 +1242,7 @@ export function platformToolHandlers(
     },
     async message_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
+      await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
     },
     async request_agent_action(args) {
