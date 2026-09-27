@@ -97,7 +97,7 @@ import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
-import { allows, attenuate, CHILD_TASK_CAPABILITIES } from '../platform/capabilities.js';
+import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
   type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskResponse } from '../domain/types.js';
 import { newId } from '../util/id.js';
@@ -5227,7 +5227,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         currentGrant = attenuate(currentGrant, avatar
           ? await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.projectId) : []);
       }
-      const delegation = attenuate([...CHILD_TASK_CAPABILITIES, 'use-card:*'], currentGrant);
+      const delegation = attenuate(CHILD_TASK_CEILING, currentGrant);
       const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
         ? [`merge-into:${args.parentBranch}`] : [];
       const grant = [...delegation, ...mergeBack];
