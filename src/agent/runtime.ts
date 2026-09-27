@@ -314,19 +314,6 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     } : undefined,
   };
 
-  // Liveness + cancellation delivery: beat every second for the turn's whole
-  // duration. Adapters also heartbeat on activity, but only this interval
-  // guarantees a long silent stretch — a big tool run, a slow first token — can't
-  // delay cancellation. The Worker caps heartbeat throttling at the same interval.
-  const hb = deps.heartbeat
-    ? setInterval(() => {
-        try {
-          deps.heartbeat!();
-        } catch {
-          /* never let a heartbeat failure kill the turn */
-        }
-      }, 1_000)
-    : undefined;
   const secretPoll = liveSecretEnv ? pollSecretEnv(liveSecretEnv, deps.pullSecretEnv!, secretEnvListeners) : undefined;
   let turn: AdapterTurn;
   try {
@@ -376,7 +363,6 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     throw error;
   } finally {
     output.discard();
-    if (hb) clearInterval(hb);
     secretPoll?.();
     await drainObservers();
   }

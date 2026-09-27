@@ -5358,8 +5358,10 @@ export class Store {
 
   /** Sparse durable annotations should not disappear merely because a task has
    *  more live activity rows than the UI's bounded event window. */
-  async eventsOfType(taskId: string, type: string): Promise<(KarmaxEvent & { seq: number })[]> {
-    return ((await this.db.prepare('SELECT * FROM events WHERE taskId = ? AND type = ? ORDER BY seq').all(taskId, type)) as any[])
+  async eventsOfType(taskId: string, type: string | readonly string[], afterSeq = 0): Promise<(KarmaxEvent & { seq: number })[]> {
+    const types = typeof type === 'string' ? [type] : [...type];
+    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND type IN (${types.map(() => '?').join(', ')}) AND seq > ? ORDER BY seq`)
+      .all(taskId, ...types, afterSeq)) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
