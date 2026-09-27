@@ -63,14 +63,16 @@ export const OWN_TASK_CAPABILITIES = new Set<Capability>([
   'task:review:write', 'task:review:execute',
 ]);
 
-/** Child tasks inherit working authority, capped by the parent. Keep legacy
- * spellings for durable workflows whose grants predate namespaced capabilities. */
-export const CHILD_TASK_CAPABILITIES: Capability[] = [
+/** What a child task may inherit from its parent's grant (SPEC §8.2): the whole
+ * catalogue and its parameterised families except merge authority, which a
+ * child receives only for its parent's own branch. Attenuating this ceiling by
+ * the parent's grant copies that grant, expanding any wildcard into explicit
+ * capabilities so `*` can never smuggle `merge-into:*` through. Legacy
+ * spellings keep grants that predate namespaced capabilities delegable. */
+export const CHILD_TASK_CEILING: Capability[] = [
+  ...CAPABILITIES.filter((cap) => !cap.startsWith('merge-into:')),
+  'use-credential:*',
   'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
-  'task:create', 'task:manage-own', 'task:review:write', 'task:signal', 'skill:write',
-  'diagnostic:read', 'process:read',
-  'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
-  'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
 ];
 
 export interface CapabilityDefinition {
