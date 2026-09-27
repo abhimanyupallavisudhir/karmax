@@ -69,7 +69,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     reuseV8Context: true,
     // Prompt shutdown: stop polling at once and, after a short grace, CANCEL
     // in-flight activities (the agent adapters kill their subprocess on abort),
-    // so the drain completes in ~1-2s instead of waiting out a 45-minute agent
+    // so the drain completes in ~1-2s instead of waiting out a long-running agent
     // turn. tsx-watch SIGKILLs the process 5s after a reload — and karmax
     // landing on its own repo triggers exactly such a reload — so an unbounded
     // drain gets force-killed mid-activity, orphaning agent subprocesses.

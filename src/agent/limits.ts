@@ -80,6 +80,18 @@ export class ProviderFailure extends Error {
   }
 }
 
+/** The agent's harness resumed work after karmax had closed its input stream —
+ * typically a background task it was waiting on (a timer, a CI poll) finished
+ * after the settle grace. With the stream closed every karmax tool fails, so the
+ * turn is retried as infrastructure: the next attempt resumes the same session
+ * with a working channel. `summary` tells the resumed agent what happened. */
+export class AgentChannelLost extends Error {
+  constructor(message: string, readonly summary: string) {
+    super(message);
+    this.name = 'AgentChannelLost';
+  }
+}
+
 /** A provider rejected requests from a login it had just proven valid. Neither
  * a person signing in again nor login rotation can fix that, so it is retried
  * as infrastructure until the provider recovers, never parked as a dead login. */

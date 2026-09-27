@@ -927,14 +927,14 @@ export function platformToolHandlers(
       return 'review info recorded';
     },
     async create_sub_task(args) {
-      ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
+      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
       return 'sub-task spawned (branches off your work; you are its confirmer)';
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
       if (!['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(action))
         return 'invalid action — use open_pr | confirm | comment | retry | cancel';
-      ctx.respondToSubTask({
+      await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
         action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
         text: args?.text ? String(args.text) : undefined,
@@ -945,11 +945,11 @@ export function platformToolHandlers(
       const type = String(args?.type ?? '');
       if (!['needs_info', 'needs_permission', 'needs_confirmation', 'blocked'].includes(type))
         return 'invalid type — use needs_info | needs_permission | needs_confirmation | blocked';
-      ctx.raiseToParent({ type: type as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: args?.detail ? String(args.detail) : undefined });
+      await ctx.raiseToParent({ type: type as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: args?.detail ? String(args.detail) : undefined });
       return `raised to parent: ${type}`;
     },
     async wait_for_subtasks() {
-      ctx.waitForSubtasks();
+      await ctx.waitForSubtasks();
       return 'waiting for sub-tasks to finish (or raise)';
     },
     async create_branch(args) {
@@ -970,7 +970,7 @@ export function platformToolHandlers(
       }
     },
     async save_skill(args) {
-      ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
+      await ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
       return 'skill saved';
     },
     async read_wiki(args) {
@@ -1334,24 +1334,24 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)));
     },
     async signal_completion(args) {
-      ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
+      await ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
       return 'completion recorded';
     },
     async open_pr() {
-      ctx.openPr();
+      await ctx.openPr();
       return 'pull request requested; finish this turn now';
     },
     async resolve_decision(args) {
       const t = parseTransition(args);
       if (!t) return 'invalid resolve decision — use action: resume | retryStage | gotoStage | parkUntil | escalate';
-      ctx.resolveDecision(t);
+      await ctx.resolveDecision(t);
       return `resolution recorded: ${t.do}`;
     },
     async confirm_decision(args) {
       const action = String(args?.action ?? '');
       if (!['confirm', 'revise', 'reject'].includes(action)) return 'invalid confirm decision — use action: confirm | revise | reject';
       if (args?.otherAttempts !== undefined && !['keep', 'cancel'].includes(args.otherAttempts)) return 'otherAttempts must be keep or cancel';
-      ctx.confirmDecision({ otherAttempts: args?.otherAttempts, action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
+      await ctx.confirmDecision({ otherAttempts: args?.otherAttempts, action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
       return `confirm decision recorded: ${action}`;
     },
   };

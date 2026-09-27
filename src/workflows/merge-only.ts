@@ -26,14 +26,19 @@ import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
+// An agent turn has no wall-clock limit: long investigations and builds are
+// normal work. The 2-minute heartbeat timeout is what detects a dead worker or
+// a slept host. Temporal requires some start-to-close bound, so this one is
+// deliberately beyond any real turn.
+const AGENT_TURN_START_TO_CLOSE = '30 days';
 // Agent turns heartbeat (~1s); a 2-minute gap = dead worker → Temporal retries.
 const turns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
 });
 const cancellationAwareTurns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
