@@ -221,12 +221,13 @@ cmd_backup() {
   dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$staging/temporal.dump"
   dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$staging/temporal-visibility.dump"
   cp -R "$SECRETS_DIR" "$staging/deployment-secrets"
+  rm -f "$staging/deployment-secrets/vault_key"
   backup_checksums "$staging"
   chmod -R go-rwx "$staging"
   mv "$staging" "$destination"
   trap - EXIT
   note "Backup complete: $destination"
-  note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+  note 'Retain the vault key separately; this sensitive backup contains other credentials but omits its authentication key.'
   compact_backups
 }
 
@@ -270,10 +271,11 @@ cmd_backup_candidate() {
     rm -rf "$destination"; return 1
   fi
   if ! cp -R "$SECRETS_DIR" "$destination/deployment-secrets"; then rm -rf "$destination"; return 1; fi
+  if ! rm -f "$destination/deployment-secrets/vault_key"; then rm -rf "$destination"; return 1; fi
   if ! backup_checksums "$destination"; then rm -rf "$destination"; return 1; fi
   if ! chmod -R go-rwx "$destination"; then rm -rf "$destination"; return 1; fi
   note "Backup complete: $destination"
-  note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+  note 'Retain the vault key separately; this sensitive backup contains other credentials but omits its authentication key.'
   compact_backups
 }
 
@@ -286,6 +288,7 @@ cmd_restore() {
   [ -f "$source/temporal.dump" ] || die 'backup is missing temporal.dump'
   [ -f "$source/temporal-visibility.dump" ] || die 'backup is missing temporal-visibility.dump'
   [ -d "$source/deployment-secrets" ] || die 'backup is missing deployment-secrets'
+  [ ! -e "$source/deployment-secrets/vault_key" ] || die 'backup carries its authentication key; use a signed backup with the original vault key supplied separately'
   [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
   [ -f "$source/SHA256SUMS" ] || die 'backup is missing checksums; cannot verify before restore'
   (cd "$source" && sha256sum -c SHA256SUMS) || die 'backup checksum verification failed'
@@ -305,8 +308,11 @@ cmd_restore() {
   [ "$answer" = RESTORE ] || die 'restore cancelled'
 
   dc down
-  rm -rf "$SECRETS_DIR"
-  cp -R "$source/deployment-secrets" "$SECRETS_DIR"
+  # Retain the independently trusted key used by preflight verification.
+  for secret in "$SECRETS_DIR"/*; do
+    [ "$(basename "$secret")" = vault_key ] || rm -f "$secret"
+  done
+  cp -R "$source/deployment-secrets/." "$SECRETS_DIR/"
   chmod 700 "$SECRETS_DIR"
   secret_mode "$SECRETS_DIR"/*
   dc up -d postgresql

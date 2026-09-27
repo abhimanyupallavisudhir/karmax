@@ -31,6 +31,7 @@ if (allowRunning) {
   console.log('taken while karmax was running: components are snapshotted at different instants, '
     + 'so this backup is not point-in-time consistent');
 }
+console.log('vault key excluded: retain the original key separately for authenticated restore');
 if (!result.manifest.secretsIncluded) {
   console.log('secrets excluded: restoring this onto a different host will need its vault key supplied separately');
 }

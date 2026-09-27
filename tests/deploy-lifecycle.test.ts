@@ -129,3 +129,12 @@ it('rejects changed dump bytes and cancelled confirmation before stopping servic
   expect(h.run(['restore', destination], '', 'RESTORE\n').status).not.toBe(0);
   expect(h.calls().some(args => args.includes('build') || args.includes('down'))).toBe(false);
 });
+
+it('keeps the authentication key outside snapshots and preserves it on restore (DB-10)', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  expect(fs.existsSync(path.join(destination, 'deployment-secrets', 'vault_key'))).toBe(false);
+  expect(h.run(['restore', destination], '', 'RESTORE\n').status).toBe(0);
+  expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+});
