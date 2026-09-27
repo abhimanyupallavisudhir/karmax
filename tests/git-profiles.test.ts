@@ -13,7 +13,7 @@ import { GitProfiles, gitHandle, inheritPersonalGithubProfile, userGitScope } fr
 import { remotePolicyOf } from '../src/domain/types.js';
 import { Store } from '../src/store/db.js';
 
-/** Git & GitHub configuration (PLAN-git-config.md): the GitProfile registry,
+/** Git & GitHub configuration (wiki plans/PLAN-git-config): the GitProfile registry,
  *  worktree-scoped identity materialization, JIT credential env, remote policy. */
 
 let tmp: string;

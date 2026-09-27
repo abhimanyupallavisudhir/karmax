@@ -1,5 +1,5 @@
 /**
- * Organization-scoped mailbox providers (PLAN-passwords.md §8). AgentMail is
+ * Organization-scoped mailbox providers (wiki plans/PLAN-passwords §8). AgentMail is
  * the intentionally small product surface; the IMAP and push implementations
  * remain available behind the registry/API for future use.
  */

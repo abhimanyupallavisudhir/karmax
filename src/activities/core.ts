@@ -296,7 +296,7 @@ export interface CreateWorldArgs {
    *  to live inside the world boundary (SPEC §11.1). */
   multiPr?: boolean;
   kind: WorldKind;
-  /** The project's git profile selection (PLAN-git-config.md §3); the activity
+  /** The project's git profile selection (wiki plans/PLAN-git-config §3); the activity
    *  resolves it (project → global default) and materializes identity/signing. */
   gitProfile?: string;
 }
@@ -513,7 +513,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return seq;
   }
 
-  /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
+  /** JIT env for remote git/gh operations in this world (wiki plans/PLAN-git-config §4B):
    *  the world's user-owned git profile (stamped on the handle at creation) →
    *  GIT_SSH_COMMAND / GH_TOKEN, per subprocess. Only legacy worlds without a
    *  human owner retain host fallback. */
@@ -1835,7 +1835,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Workflow duty is enforced by stage/decision handlers, not a hidden lower
       // permission level for Confirm, Resolve, or legacy Merge turns.
       // Approved credential escalations recorded after creation
-      // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
+      // (wiki plans/PLAN-passwords §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
       const approvedPermissions = (await new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role));
@@ -2520,7 +2520,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
-          // Git-profile credentials for the agent subprocess (PLAN-git-config.md
+          // Git-profile credentials for the agent subprocess (wiki plans/PLAN-git-config
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(await (async () => {
             // Remote provider tools receive repository credentials through the
@@ -2530,7 +2530,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               ? {}
               : (await gitEnvFor(args.worldHandle, args.taskId));
             // Granted `auto` vault items materialize into the work-command env
-            // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
+            // (wiki plans/PLAN-passwords §5A): .env bags, API keys under their envVar,
             // SSH keys as 0600 files inside the receiving world.
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
@@ -2925,7 +2925,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
       const world = await openWorld(handle);
-      // Merge commits carry the world's profile identity too (PLAN-git-config.md
+      // Merge commits carry the world's profile identity too (wiki plans/PLAN-git-config
       // §4A) — they land on the target, where worktree-scoped config doesn't reach.
       let identity;
       const profileName = handle.meta?.gitProfile;
@@ -3059,8 +3059,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     /**
      * Head commit of every checkout in the world, keyed by checkout name.
      *
-     * Review approval for a multi-PR task is bound to `(checkout, head sha)`
-     * (PLAN-multi-pr.md §3), so the gate needs the heads to tell an approval that
+     * Review approval for a multi-PR task is bound to `(checkout, head sha)`,
+     * so the gate needs the heads to tell an approval that
      * still stands from one the Do agent has since invalidated. A branch whose
      * head cannot be read is simply absent, which the domain helpers treat as
      * unapproved — the gate fails closed rather than passing by omission.
@@ -3293,7 +3293,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     /**
-     * The PR stage under remote policy 'pr' (SPEC §5.2, PLAN-git-config.md §5):
+     * The PR stage under remote policy 'pr' (SPEC §5.2, wiki plans/PLAN-git-config §5):
      * push every repo's task branch and open — or update — its pull request.
      *
      * Idempotent by construction: the PR is keyed on the task branch, so a
@@ -3342,7 +3342,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const stacked = repos.some((other) => other !== repo && other.branch === repo.base);
         const base = stacked ? repo.base : worldRepoTarget(repo, target);
         // karmax's own model lets a worktree stay dirty until the merge stage
-        // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
+        // (wiki plans/PLAN-git-config §6 loops that back to the merge agent), so arriving
         // here with nothing committed is a state the design produces. GitHub
         // answers it with an opaque 422 — diagnose it ourselves instead.
         const ahead = await commitsAheadOfPrBase(world, repo, base);
@@ -4893,7 +4893,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /**
      * Push the landed target branch to each repo's origin (remote policy
-     * 'push'/'pr', PLAN-git-config.md §5). Best-effort by contract: the local
+     * 'push'/'pr', wiki plans/PLAN-git-config §5). Best-effort by contract: the local
      * merge is the deliverable; every skip/failure is recorded, never thrown.
      */
     async pushTarget(handle: WorldHandle, target: string): Promise<{ pushed: string[]; skipped: string[] }> {

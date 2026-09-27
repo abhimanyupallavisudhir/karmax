@@ -624,7 +624,7 @@ async function softwareDevImpl(
   let escalationAction: 'openPr' | 'confirm' | undefined;
   let manualEscalationRequested = false;
   let prRequested = recoveryStage === 'pr';
-  // checkout name -> head sha it was approved at (multi-PR Review, PLAN-multi-pr.md §3).
+  // checkout name -> head sha it was approved at (multi-PR Review).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
   let checkoutHeads: Record<string, string> = {};
   let cancelled = false;
@@ -3911,7 +3911,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (result.merged) {
       sha = result.sha;
       pointOfNoReturnPassed = true;
-      // Remote policy 'push'/'pr' (PLAN-git-config.md §5): the landed target leaves
+      // Remote policy 'push'/'pr' (wiki plans/PLAN-git-config §5): the landed target leaves
       // the machine — push it (and under 'pr', GitHub marks the PR merged).
       // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
       if (remotePolicyOf(input.project) !== 'none') {
@@ -3981,7 +3981,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       continue proposalCycle;
     }
     // Merge rejected. Conflicts (including leftover markers) and dirty worktrees
-    // (commit-vs-gitignore is a judgment call — PLAN-git-config.md §6) are the
+    // (commit-vs-gitignore is a judgment call — wiki plans/PLAN-git-config §6) are the
     // merge agent's job: loop straight back to it with the details, bounded,
     // before bothering a human/parent (SPEC §5.2).
     error = `merge failed: ${result.conflict ?? result.dirty ?? result.note ?? 'unknown'}`;

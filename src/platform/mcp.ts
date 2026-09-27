@@ -573,7 +573,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           : { kind: 'environment', name: a.targetEnvironment! },
     }));
   }));
-  // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's
+  // Vault credentials (wiki plans/PLAN-passwords) — thin wrappers over the gateway's
   // /api/vault surface so the pull model is first-class, not buried behind
   // platform_request. Available on the gateway-backed bridge; the in-process
   // apiOps embedding reports the same platform_request limitation.

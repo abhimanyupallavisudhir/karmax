@@ -147,7 +147,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
         taskId,
         projectId: 'p1',
         title: `karmax live: ${taskId}`,
-        // A competent Do agent commits its own work (PLAN-git-config.md §2.2), which
+        // A competent Do agent commits its own work (wiki plans/PLAN-git-config §2.2), which
         // is what gives the PR stage something to propose.
         prompt: `Implement it.\n@write ${file} :: export const live = true;\n`
           + `@run git add -A && git commit -q -m "karmax live: add ${file}"\n`

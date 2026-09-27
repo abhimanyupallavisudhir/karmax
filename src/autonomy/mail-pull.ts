@@ -9,7 +9,7 @@ import { extractMimeText, cleanAddress, htmlToText } from './agent-mail.js';
 export interface PulledMessage { to: string; from: string; subject?: string; text: string; sourceId?: string }
 
 /**
- * Pull-based mail intake (PLAN-passwords.md §8). Unlike the webhook (push) path,
+ * Pull-based mail intake (wiki plans/PLAN-passwords §8). Unlike the webhook (push) path,
  * karmax reaches OUT to the mail service and fetches — so it works on a
  * locally-hosted karmax behind NAT, with no public URL. Two backends:
  *

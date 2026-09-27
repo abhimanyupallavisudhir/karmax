@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * In-world credential fill (PLAN-passwords.md §5B, cloud path).
+ * In-world credential fill (wiki plans/PLAN-passwords §5B, cloud path).
  *
  * For a LOCAL world the gateway types the secret over CDP itself (fill.ts). For
  * a REMOTE world the browser lives inside the sandbox and the gateway cannot

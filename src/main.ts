@@ -542,7 +542,7 @@ async function main() {
   worldLifecycle.start();
   delivery.start();
 
-  // Agent-mail poll loop (PLAN-passwords.md §8): when a PULL provider (IMAP /
+  // Agent-mail poll loop (wiki plans/PLAN-passwords §8): when a PULL provider (IMAP /
   // AgentMail) is connected, karmax reaches OUT to fetch mail — so it works on a
   // locally-hosted install with no public URL. Inert until a pull provider is set.
   const { MailPoller } = await import('./autonomy/mail-pull.js');
