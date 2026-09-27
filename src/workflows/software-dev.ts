@@ -1,3 +1,4 @@
+import type { TurnPreparationActivities } from '../activities/turn-preparation.js';
 import { githubLandingWatch } from './github-landing-watch.js';
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
@@ -110,6 +111,11 @@ const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s
 // recorded command, so an in-flight execution must keep scheduling with the proxy
 // its history was written against.
 const boundedCoord = proxyActivities<coordinatorActivities>({
+  startToCloseTimeout: '30s',
+  retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
+});
+
+const turnPreparation = proxyActivities<TurnPreparationActivities>({
   startToCloseTimeout: '30s',
   retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
 });
@@ -1759,6 +1765,7 @@ async function softwareDevImpl(
       admission?: { agentAdmissionManaged: true; agentSlotGranted?: true },
     ) => Promise<T>,
   ): Promise<T> {
+    const compactStart = patched('software-dev-compact-turn-start-v1');
     /** v1.1 publishes the host-admission state before scheduling the turn. The
      * activity changes it to `running` only after it actually acquires a slot. */
     const admittedTurn = async (
@@ -1779,7 +1786,7 @@ async function softwareDevImpl(
           provider,
           detail: durableAgentAdmission ? 'Starting agent' : 'Waiting for host capacity to run the agent',
         };
-        await publish();
+        if (!compactStart) await publish();
       }
       let slotHeld = false;
       let slotRequested = false;
@@ -1829,10 +1836,14 @@ async function softwareDevImpl(
               }
               if (cancelled && !slotHeld) throw new Cancelled();
               waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
-              await publish();
+              if (!compactStart) await publish();
             }
           }
           if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+          if (compactStart && liveAgentStates) {
+            waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
+            await publish();
+          }
           return await fn(
             home,
             key,
@@ -1862,14 +1873,18 @@ async function softwareDevImpl(
       }
     };
 
-    if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coordinator.accountPoolSize();
+    const prepared = compactStart
+      ? await turnPreparation.prepareAgentTurn({ taskId, role, task: liveInput }) : undefined;
+    if (prepared) accountPool = prepared.accountPool;
+    else if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coordinator.accountPoolSize();
     // v1 took this exact zero-activity passthrough. v1.1 still exposes host-slot
     // admission even when there is no configured account pool.
     if (accountPool <= 0) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
       return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
-    const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
+    const prov = compactStart ? prepared?.provider
+      : await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
     const credentialProvider = typeof prov === 'string' && prov ? prov : undefined;
     if (!credentialProvider) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
@@ -1877,7 +1892,7 @@ async function softwareDevImpl(
     }
     // Credential-policy allow-list for real providers (precedence + enable/disable,
     // resolved global→project→task); mock uses the coordinator's provider fallback.
-    const allowed =
+    const allowed = compactStart ? prepared?.allowed :
       credentialProvider !== 'mock'
         ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider: credentialProvider, role, task: liveInput }).catch(() => undefined)
         : undefined;
@@ -1898,7 +1913,7 @@ async function softwareDevImpl(
       : { kind: 'account', provider: credentialProvider,
           ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
           ...(lease?.detail ? { detail: lease.detail } : {}) };
-    await publish();
+    if (!compactStart || lease?.waiting !== false) await publish();
     if (liveAgentStates) {
       // The coordinator owns refresh timers and signals every grant. An arbitrary
       // workflow-side timeout used to fall through with no grant and accidentally
@@ -2571,9 +2586,10 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
-  accountPool = patched('agent-turn-account-pool-refresh-v1')
-    ? await withResolve('setup', () => coordinator.accountPoolSize())
-    : await coordinator.accountPoolSize().catch(() => 0);
+  if (!patched('software-dev-compact-turn-start-v1'))
+    accountPool = patched('agent-turn-account-pool-refresh-v1')
+      ? await withResolve('setup', () => coordinator.accountPoolSize())
+      : await coordinator.accountPoolSize().catch(() => 0);
 
   // A platform-requested human hold is deliberately outside the pipeline. Keep
   // the originating stage visible. An explicit Resume always wakes it; v1.7 also
