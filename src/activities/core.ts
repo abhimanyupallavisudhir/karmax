@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
 import { concurrentMap } from '../util/concurrent-map.js';
@@ -3462,7 +3463,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const submitExact = workflowMinor >= 17 && options?.mode === 'submit-exact';
       const frontHeldExact = inspectExact || submitExact;
       const creator = (await store.taskCreatorUserId(handle.id));
-      const events = (await store.eventsSince(handle.id, 0));
+      const events = await store.eventsOfTypes(handle.id, [
+        'task.confirmation-voted', 'github.merge.authorization-revoked', 'github.merge.review-stale',
+        'github.ci.external-wait', 'github.ci.cancelled-reconciled', 'github.ci.repair-requested',
+        'github.ci.rerun-requested', 'github.ci.superseded', 'github.ci.terminal-observed',
+        'github.ci.validation-current', 'github.pr.branch-update-requested', 'github.pr.queued',
+        'github.pr.review-approved', 'github.pr.review-skipped',
+      ]);
       const eventAuthorizesCurrentHeads = (event: { payload?: any }) => {
         const heads = event.payload?.githubPrHeads;
         return Array.isArray(heads) && prs.filter((ref) => !ref.merged).every((ref) =>
@@ -3574,6 +3581,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       };
       const settled: TaskPullRequest[] = [];
       const participants: GithubLandingParticipant[] = [];
+      const observations: string[] = [];
       let lastSha: string | undefined;
       let queued = false;
       let queuedOwner: GitHubMergeAuthorization['landingOwner'];
@@ -4178,7 +4186,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             landingOwner: readiness.mergeQueueEntryId ? 'provider' : landingAuthority === 'external' ? 'external' : 'provider',
           };
         }
-        const reviewEvents = (await store.eventsSince(handle.id, 0));
+        const reviewEvents = events;
         const mirroredReviews = reviewEvents.filter((event) =>
           event.type === 'github.pr.review-approved'
           && event.payload?.slug === ref.slug && event.payload?.number === ref.number
@@ -4256,6 +4264,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             status: 'retryable-error', prs: current, actorUserId, participants,
             detail: `GitHub did not report the target branch for pull request ${ref.slug}#${ref.number}; multi-repository landing cannot identify its scheduler domain.`,
           };
+          observations.push(createHash('sha256').update(JSON.stringify([ref.slug, ref.number, readiness])).digest('hex'));
           const planned = participant(
             landingAuthority === 'external' ? 'external'
               : landingAuthority === 'karmax' ? 'karmax' : 'unowned',
@@ -4722,7 +4731,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
       }
       if (participantPreflight) return {
-        status: 'planned', prs: settled, actorUserId, participants,
+        status: 'planned', prs: settled, actorUserId, participants, observationKey: observations.join(':'),
         detail: 'Every pull request passed the read-only multi-repository landing preflight.',
       };
       if (claimProviderOnly) {

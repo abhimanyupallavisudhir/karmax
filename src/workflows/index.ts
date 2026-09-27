@@ -1,3 +1,4 @@
+export { githubLandingWatch } from './github-landing-watch.js';
 /**
  * Workflow bundle entry. The Temporal worker bundles this module into the
  * deterministic sandbox and registers the exported workflow functions. Only the

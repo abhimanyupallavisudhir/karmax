@@ -1455,6 +1455,7 @@ describe('GitHub-authoritative merge activity', () => {
   it('v1.21 preflights every PR before claiming any provider and assigns canonical owners per target', async () => {
     const mutations: string[] = [];
     let secondFails = true;
+    let checksPending = false;
     const headFor = (number: number) => number === 51 ? 'head-a' : 'head-b';
     const slugFor = (number: number) => number === 51 ? 'acme/service-a' : 'acme/service-b';
     const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -1473,7 +1474,7 @@ describe('GitHub-authoritative merge activity', () => {
         return Response.json({ data: { repository: { pullRequest: {
           id: `PR_${number}`, url: `https://github.test/${slugFor(number)}/pull/${number}`, state: 'OPEN', isDraft: false,
           merged: false, headRefOid: headFor(number), mergeable: 'MERGEABLE', mergeStateStatus: failing ? 'UNSTABLE' : 'CLEAN',
-          statusCheckRollup: { state: failing ? 'FAILURE' : 'SUCCESS', contexts: { nodes: [] } },
+          statusCheckRollup: { state: failing ? 'FAILURE' : checksPending ? 'PENDING' : 'SUCCESS', contexts: { nodes: [] } },
           viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
         } } } });
       }
@@ -1530,6 +1531,12 @@ describe('GitHub-authoritative merge activity', () => {
         { key: 'acme/service-b#52', owner: 'unowned', domain: 'github:acme/service-b:main' },
       ],
     });
+    expect(planned.observationKey).toEqual(expect.any(String));
+    checksPending = true;
+    const waiting = await core.mergeGithubPrs({ id: task.id } as any, refs, { mode: 'preflight', authority: 'auto' });
+    expect(waiting.status).toBe('planned');
+    expect(waiting.observationKey).not.toBe(planned.observationKey);
+    checksPending = false;
     const claimedA = await core.mergeGithubPrs({ id: task.id } as any, [refs[0]!], { mode: 'claim-provider', authority: 'auto' });
     const claimedB = await core.mergeGithubPrs({ id: task.id } as any, [refs[1]!], { mode: 'claim-provider', authority: 'auto' });
     expect(claimedA).toMatchObject({ status: 'queued', landingOwner: 'provider', participants: [{ owner: 'provider' }] });

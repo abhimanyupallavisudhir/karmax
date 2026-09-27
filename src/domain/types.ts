@@ -869,6 +869,8 @@ export interface GithubLandingParticipant {
 }
 
 export interface GitHubMergeAuthorization {
+  /** Readiness identity for idle polling, including checks and target movement. */
+  observationKey?: string;
   status: 'planned' | 'candidate-ready' | 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */

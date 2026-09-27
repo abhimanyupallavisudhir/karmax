@@ -1,3 +1,4 @@
+import { githubLandingWatch } from './github-landing-watch.js';
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import {
@@ -632,6 +633,8 @@ async function softwareDevImpl(
   let retryRequested = false;
   let resourceResolutionEpoch = 0;
   let providerChangeEpoch = 0;
+  let landingWatcher: ChildWorkflowHandle<typeof githubLandingWatch> | undefined;
+  let landingWatchSequence = 0;
   let awaitingResourceDecision = false;
   let resourceReviewSequence = 0;
   let applyingResources = false;
@@ -1304,8 +1307,9 @@ async function softwareDevImpl(
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
   });
-  if (fairLanding) setHandler(providerChangedSignal, () => {
+  if (fairLanding) setHandler(providerChangedSignal, async () => {
     providerChangeEpoch++;
+    await landingWatcher?.signal('providerChanged').catch(() => undefined);
   });
   setHandler(confirmSignal, () => {
     if (awaitingResourceDecision) return;
@@ -3310,6 +3314,34 @@ Inspect the complete current diff and specifically compare its delta from the re
   let mergeConflict: string | undefined;
   let mergeDirty: string | undefined;
   let githubErrorPolls = 0;
+  let observedPreflight: GitHubMergeAuthorization | undefined;
+  let priorPreflight: GitHubMergeAuthorization | undefined;
+  async function waitForGithubChange(pollMs: number) {
+    // Keep leases and landing mutations in the parent. The watcher returns on
+    // any readiness change, including checks or target movement under fallback.
+    if (participantLanding && githubAuthoritativeMerge && priorPreflight
+      && (priorPreflight.status === 'waiting' || priorPreflight.status === 'queued'
+        || (priorPreflight.status === 'planned' && priorPreflight.observationKey !== undefined))
+      && patched('software-dev-cheap-github-wait-v1')) {
+      const previous = priorPreflight;
+      const providerSeen = providerChangeEpoch;
+      await runCancellable(async () => {
+        landingWatcher = await startChild(githubLandingWatch, {
+          workflowId: `${workflowInfo().workflowId}/landing-watch/${landingWatchSequence++}`,
+          args: [{ world: world!, previous, authority: configuredLandingAuthority, pollMs }],
+          parentClosePolicy: ParentClosePolicy.TERMINATE,
+        });
+        try {
+          if (providerChangeEpoch > providerSeen) await landingWatcher.signal('providerChanged');
+          observedPreflight = await landingWatcher.result();
+        }
+        finally { landingWatcher = undefined; }
+      });
+    } else {
+      const providerSeen = providerChangeEpoch;
+      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), pollMs);
+    }
+  }
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -3351,9 +3383,11 @@ Inspect the complete current diff and specifically compare its delta from the re
     let plannedParticipants: GithubLandingParticipant[] = [];
     let fallbackPrs: TaskPullRequest[] = [];
     if (participantLanding && githubAuthoritativeMerge) {
-      const preflight = await core.mergeGithubPrs(world as any, prs, {
+      const preflight = observedPreflight ?? await core.mergeGithubPrs(world as any, prs, {
         mode: 'preflight', authority: configuredLandingAuthority,
       });
+      observedPreflight = undefined;
+      priorPreflight = preflight;
       prs = mergePrSnapshots(prs, preflight.prs);
       pr = prs[0];
       if (preflight.status !== 'planned') {
@@ -3808,8 +3842,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'github', detail: landing.detail };
         await publish();
-        const providerSeen = providerChangeEpoch;
-        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
+        await waitForGithubChange(input.githubPollMs ?? 30_000);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3898,9 +3931,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       status = 'waiting';
       waitingFor = { kind: 'github', detail: decision.detail ?? 'Waiting for GitHub checks or merge queue.' };
       await publish();
-      const providerSeen = providerChangeEpoch;
-      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen),
-        classifiedGithubStates ? (input.githubPollMs ?? MERGE_POLL) : '30s');
+      await waitForGithubChange(classifiedGithubStates ? (input.githubPollMs ?? 30_000) : 30_000);
       waitingFor = undefined;
       if (cancelled) return await abort();
       continue;
