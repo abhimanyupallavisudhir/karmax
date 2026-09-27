@@ -1143,7 +1143,7 @@ export class BudgetService {
           { status: 'authorized', reason: 'approved', shortfall: 0, resolvedBy, expiresAt: Date.now() + 30 * 60_000 }));
       }
       wonClaim = true;
-      return (await this.store.updatePaymentSpendRequest(request.id, { status: 'authorizing', resolvedBy }));
+      return (await this.store.updatePaymentSpendRequest(request.id, { status: 'authorizing', resolvedBy, expiresAt: Date.now() + 30 * 60_000 }));
     }));
     if (!wonClaim) return this.result(claimed);
     const auth = await provider.authorize(card.id, request.amount, request.merchant ?? undefined);

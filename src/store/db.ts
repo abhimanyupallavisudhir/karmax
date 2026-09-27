@@ -7172,10 +7172,20 @@ export class Store {
   async expirePaymentSpendRequests(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
 
-    return Number((await this.db.prepare(`UPDATE payment_spend_requests
-      SET status='expired', reason='request expired', updatedAt=?
-      WHERE expiresAt<=? AND status='authorized'`)
-      .run(now, now)).changes);
+    const expired = await this.db.prepare(`SELECT id, projectId, taskId, cardId, amount, status
+      FROM payment_spend_requests WHERE expiresAt<=? AND status IN ('authorized', 'authorizing')`).all(now) as any[];
+    let released = 0;
+    for (const request of expired) {
+      const result = await this.db.prepare(`UPDATE payment_spend_requests
+        SET status='expired', reason='request expired', updatedAt=?
+        WHERE id=? AND expiresAt<=? AND status=?`).run(now, request.id, now, request.status);
+      if (!Number(result.changes)) continue;
+      released++;
+      await this.appendAudit({ ts: now, principalId: 'system:payments', action: 'payment.reservation.expired',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId: request.taskId,
+          cardId: request.cardId, amount: request.amount, previousStatus: request.status } });
+    }
+    return released;
   
     });
   }
