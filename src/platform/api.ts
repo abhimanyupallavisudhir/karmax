@@ -4082,6 +4082,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    */
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     const caller = (await this.require(token, 'search_tasks', { projectId }));
+    return this.searchAuthorizedTasks(projectId, query, caller.principal, now);
+  }
+
+  /** Evaluate a search for a principal already authorized for `task:read` in
+   *  `projectId`. Global console search authorizes a browser session's projects
+   *  directly rather than minting a token for each (UI-18/RQ-14). */
+  async searchAuthorizedTasks(projectId: string, query: string | TaskQuery, principalId: string, now = Date.now()): Promise<EvalResult> {
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
     // Conversation search is intentionally explicit. Every other query uses the
     // compact projection so routine list filtering never parses all transcripts.
@@ -4098,7 +4105,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       includeArchived: !activeOnly, includeConversation: needsConversation,
     })) tasks.push(...page);
     const tags = await this.deps.store.listTagsAsync(projectId);
-    const principal = principalRefOf(caller.principal);
+    const principal = principalRefOf(principalId);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
   }
 

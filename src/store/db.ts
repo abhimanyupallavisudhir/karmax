@@ -1138,6 +1138,24 @@ export class Store {
     );
   }
 
+  /** Projects a user's grants or memberships reach, directly or through a team
+   *  or organization. Candidates only: authorization still decides each one. */
+  async listProjectsReachableBy(userId: string): Promise<Project[]> {
+    return (await this.readRows<any>(`SELECT p.* FROM projects p WHERE EXISTS (SELECT 1 FROM principal_grants g
+        WHERE g.principalId=? AND (g.scopeKey='global' OR g.scopeKey='project:' || p.id
+          OR g.scopeKey='organization:' || COALESCE(p.organizationId, 'org_personal')))
+      OR EXISTS (SELECT 1 FROM project_memberships m WHERE m.projectId=p.id AND (m.principalKey=?
+        OR m.principalKey IN (SELECT 'team:' || teamId FROM team_memberships WHERE userId=?)
+        OR m.principalKey IN (SELECT 'organization:' || organizationId FROM organization_memberships WHERE userId=?)))
+      ORDER BY p.ord, p.createdAt`, [`user:${userId}`, `user:${userId}`, userId, userId])).map(rowToProject);
+  }
+
+  /** One organization's projects, without reading any other tenant's rows. */
+  async listOrganizationProjects(organizationId: string): Promise<Project[]> {
+    return (await this.readRows<any>(`SELECT * FROM projects WHERE COALESCE(organizationId, 'org_personal')=?
+      ORDER BY ord, createdAt`, [organizationId])).map(rowToProject);
+  }
+
   async renameProject(id: string, name: string): Promise<Project> {
     return this.projectNameTransaction(async () => {
 
