@@ -860,13 +860,13 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(series.params.triggerState).toBe('armed');
     expect((await store.runsOf(series.id))).toHaveLength(0); // waits for the first fire
 
+    // A fire spawns its run through several awaited store writes; wait for it
+    // rather than for one macrotask, which a loaded CI runner can outpace.
     (await clock.advance(60_000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect((await store.runsOf(series.id))).toHaveLength(1);
+    await expect.poll(async () => (await store.runsOf(series.id)).length).toBe(1);
     expect(scheduler.size).toBe(1); // series stays armed for the next occurrence
     (await clock.advance(60_000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect((await store.runsOf(series.id))).toHaveLength(2);
+    await expect.poll(async () => (await store.runsOf(series.id)).length).toBe(2);
   });
 
   it('does not double-fire a cron occurrence when the clock steps backwards', async () => {
