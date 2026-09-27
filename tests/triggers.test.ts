@@ -686,8 +686,8 @@ describe('TriggerScheduler (dispatcher)', () => {
 
     // Simulate the dep completing on the bus → dispatcher fires b.
     (await bus.emit({ type: 'view.updated', taskId: dep.id, ts: 0, payload: { status: 'done' } } as KarmaxEvent));
-    await new Promise((r) => setTimeout(r, 0)); // let the async fire settle
-    expect(started).toContain(b.id);
+    // The fire is asynchronous (it resolves and validates the start first).
+    await vi.waitFor(() => expect(started).toContain(b.id));
     expect(scheduler.size).toBe(0);
   });
 
