@@ -9,7 +9,7 @@ import type { WorldCheckpoint, WorldHandleRef } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
-import { worldRepos, worldRepoSource } from './types.js';
+import { sharesHostRefDatabase, worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
@@ -267,7 +267,12 @@ export class WorldCheckpointService {
     const environment = (await selectProjectEnvironment(this.store, checkpoint.projectId, selected,
       executionConfig.environment, checkpoint.environment));
     const primary = checkpoint.repos[0];
-    const pinnedHeads = checkpoint.repos.every(repo => /^[0-9a-f]{40,64}$/i.test(repo.headSha ?? ''));
+    // An idle checkpoint may never have published its task refs, which a fresh
+    // remote clone cannot fetch: provision it from base, then check out each
+    // captured commit (LT-8). Host checkouts already share the task's refs, and
+    // two checkouts of one repository need their distinct branches (WD-11).
+    const pinnedHeads = !sharesHostRefDatabase(selected)
+      && checkpoint.repos.every(repo => /^[0-9a-f]{40,64}$/i.test(repo.headSha ?? ''));
     const linked = (await this.store.listProjectRepositories(checkpoint.projectId));
     const repositoryBranches = Object.fromEntries(checkpoint.repos.map((repo, index) => {
       const source = sources[index]!;
@@ -322,8 +327,6 @@ export class WorldCheckpointService {
         copySources: checkpoint.repos.map((repo, index) => repo.localPath ?? previousFor(repo, index)?.localPath),
         checkouts: checkpoint.repos.map((repo, index) => ({
           name: repo.checkoutPath === '.' ? previousFor(repo, index)?.name ?? 'repo' : repo.checkoutPath,
-          // An idle checkpoint may never have published its task ref: create
-          // from base, then check out the captured commit below (LT-8).
           branch: pinnedHeads ? undefined : repo.branch, base: repo.base ?? previousFor(repo, index)?.base ?? project.config.defaultBase ?? 'main',
           target: repo.target ?? previousFor(repo, index)?.target,
           sourceAuthority: repo.sourceAuthority ?? previousFor(repo, index)?.sourceAuthority,
