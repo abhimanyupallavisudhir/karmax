@@ -1,3 +1,4 @@
+import { buildVersionedBundle } from './packages/bundle.js';
 import { authHosts } from './auth/origins.js';
 import { temporalConnectionFromEnv } from './temporal/connection-env.js';
 import { createExecutionServices } from './runtime/execution-services.js';
@@ -111,6 +112,23 @@ async function main() {
   // primary may have exited while its child is still being terminated; acquiring
   // only app.lock would allow overlapping pollers during that transition.
   const releaseWorker = !separateWorker && process.platform === 'linux' ? await claimWorkerOwnership(p.home) : () => {};
+  const workflows = new WorkflowManager(
+    { refresh: (packages) => workerManager.refresh(packages) },
+    new WorkflowRepoLoader(p.workflows),
+    undefined,
+    p.workflows,
+    async (organizationId) => {
+      const profiles = new GitProfiles(store, broker, p.state, organizationId);
+      const profile = (await profiles.resolve(undefined));
+      return profile ? (await profiles.env(profile, {})) : {};
+    },
+    deployment.hosted,
+  );
+  // Restore the exact external set before compiling, while Temporal/database
+  // boot proceeds independently. The child process uses the same disk cache.
+  const bootBundle = workflows.restore((m) => console.warn('  •', m), false)
+    .then(() => buildVersionedBundle(workflows.workflowRefs));
+  void bootBundle.catch(() => {}); // observed below even if another boot step fails
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
   // One long-lived server, reused across restarts/reloads (see dev-server.ts):
   // spawning a fresh one per reload against the same SQLite file is what wedges
@@ -280,18 +298,6 @@ async function main() {
     hostLocal: deployment.hostLocal,
     taskQueue: TASK_QUEUE,
   }, terminateOnWorkerFailure);
-  const workflows = new WorkflowManager(
-    workerManager,
-    new WorkflowRepoLoader(p.workflows),
-    undefined,
-    p.workflows,
-    async (organizationId) => {
-      const profiles = new GitProfiles(store, broker, p.state, organizationId);
-      const profile = (await profiles.resolve(undefined));
-      return profile ? (await profiles.env(profile, {})) : {};
-    },
-    deployment.hosted,
-  );
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
     providerConnections, worlds,
@@ -371,7 +377,9 @@ async function main() {
   // user-defined MCP servers.
   configHomes.refreshManagedMcp(internalUrl);
 
-  await workerManager.start();
+  const workflowBundle = await bootBundle;
+  if (workerManager instanceof WorkerManager) await workerManager.start(workflows.workflowRefs, workflowBundle);
+  else await workerManager.start(workflows.workflowRefs);
   console.log('  • Worker started');
 
   // Process-tree custody (src/agent/custody.ts): reap any agent process scopes
@@ -535,8 +543,6 @@ async function main() {
   });
   api.setTriggerArmer(triggerScheduler);
   startupJobs.push(async () => {
-    const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
-    if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
     if (!shuttingDown) await triggerScheduler.start();
   });
   worldLifecycle.start();

@@ -1,3 +1,5 @@
+import { buildVersionedBundle } from '../packages/bundle.js';
+import type { WorkflowBundle } from '@temporalio/worker';
 import { concurrentMap } from '../util/concurrent-map.js';
 import { notifyChildSettlement } from './children.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
@@ -225,6 +227,7 @@ function signalKillMessage(raw: string): string {
 }
 
 export interface CoreActivityDeps {
+  workflowBundle?: () => WorkflowBundle;
   store: Store;
   worlds: WorldRegistry;
   adapters: Map<Provider, AgentAdapter>;
@@ -3021,16 +3024,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const snapshot = await snapshotReplayHistories(store, deps.client, args.taskId);
         try {
           const { Worker } = await import('@temporalio/worker');
-          const replay = async (workflowsPath: string) => {
+          const replay = async (workflowBundle: WorkflowBundle) => {
             const failures = new Map<string, string>();
-            for await (const result of Worker.runReplayHistories({ workflowsPath }, snapshot.histories())) {
+            for await (const result of Worker.runReplayHistories({ workflowBundle }, snapshot.histories())) {
               if (result.error) failures.set(result.workflowId, result.error.message);
             }
             return failures;
           };
-          const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
-          const baselineFailures = await replay(baselinePath);
-          const candidateFailures = await replay(candidatePath);
+          const baselineBundle = deps.workflowBundle?.() ?? await buildVersionedBundle([]);
+          const baselineFailures = await replay(baselineBundle);
+          const candidateFailures = await replay(await buildVersionedBundle([], { workflowsPath: candidatePath }));
           const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
           const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
           const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));

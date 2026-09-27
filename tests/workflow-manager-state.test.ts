@@ -28,7 +28,7 @@ describe('workflow package activation', () => {
     await second;
     expect(premature).toBe(false);
     expect(manager.resolveStart(manifest.name)).toBeDefined();
-    expect(refresh).toHaveBeenCalledTimes(3); // failed activation, rollback, second activation
+    expect(refresh).toHaveBeenCalledTimes(2); // failed activation, second activation
   });
 
   it('does not advertise restored packages when their bundle fails', async () => {

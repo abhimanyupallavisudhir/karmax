@@ -1,3 +1,4 @@
+import type { WorkflowBundle } from '@temporalio/worker';
 import { TemporalConn } from './config.js';
 import { ActivityDeps } from '../activities/index.js';
 import { makeWorker, WorkerHandle } from './worker.js';
@@ -25,6 +26,7 @@ export function terminateOnWorkerFailure(error: unknown): void {
  */
 export class WorkerManager {
   private handle?: WorkerHandle;
+  private bundle?: WorkflowBundle;
   private runPromise?: Promise<void>;
   private externals: ExternalWorkflowRef[] = [];
   private refreshing?: Promise<void>;
@@ -60,21 +62,23 @@ export class WorkerManager {
   }
 
   /** Start the initial worker (built-ins, plus any externals given). */
-  async start(externals: ExternalWorkflowRef[] = []): Promise<void> {
+  async start(externals: ExternalWorkflowRef[] = [], bundle?: WorkflowBundle): Promise<void> {
     if (this.stopRequested) throw new Error('worker manager is stopping');
     if (this.starting || this.handle) throw new Error('worker manager already started');
     this.starting = (async () => {
       this.externals = externals;
-      this.handle = await this.build(externals);
+      this.handle = await this.build(externals, bundle);
       this.runPromise = this.watch(this.handle, this.handle.run());
     })();
     try { await this.starting; }
     finally { this.starting = undefined; }
   }
 
-  private async build(externals: ExternalWorkflowRef[]): Promise<WorkerHandle> {
-    const opts = externals.length ? { workflowBundle: await buildVersionedBundle(externals) } : {};
-    return makeWorker(this.conn, this.deps, { ...opts, shutdownGraceTime: '45 minutes' });
+  private async build(externals: ExternalWorkflowRef[], prepared?: WorkflowBundle): Promise<WorkerHandle> {
+    const workflowBundle = prepared ?? await buildVersionedBundle(externals);
+    const handle = await makeWorker(this.conn, { ...this.deps, workflowBundle: () => this.bundle ?? workflowBundle }, { workflowBundle, shutdownGraceTime: '45 minutes' });
+    this.bundle = workflowBundle;
+    return handle;
   }
 
   /**
