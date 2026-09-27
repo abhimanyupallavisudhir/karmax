@@ -104,11 +104,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const results: Record<string, any> = {};
   try {
     for (const [name, make, id] of [['anthropic-messages', () => new ClaudeAdapter(), 'claude'], ['openai-responses', () => new CodexAdapter(), 'codex']] as const) {
-      const samples = [];
+      const samples: Awaited<ReturnType<typeof turn>>[] = [];
       for (let i = 0; i < repeats; i++) samples.push(await turn(make(), id));
       results[name] = Object.fromEntries(Object.keys(samples[0]!).map((key) => [key, median(samples.map((s: any) => s[key]))]));
     }
-    const creates = [];
+    const creates: Awaited<ReturnType<typeof createToStart>>[] = [];
     for (let i = 0; i < repeats; i++) creates.push(await createToStart());
     results['create-with-slow-github-preflight'] = Object.fromEntries(Object.keys(creates[0]!).map((key) => [key, median(creates.map((s: any) => s[key]))]));
   } finally { server.close(); }
