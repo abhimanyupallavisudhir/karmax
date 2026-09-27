@@ -546,6 +546,7 @@ const SOCKET_DECISION_TTL_MS = 60_000;
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 const MAX_PREVIEW_REQUEST_BYTES = 16 * 1024 * 1024;
+const MAX_TERMINAL_TICKETS_PER_SESSION = 8;
 const PREVIEW_REQUEST_HEADERS = new Set([
   'accept', 'accept-language', 'content-type', 'if-match', 'if-modified-since',
   'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
@@ -4929,9 +4930,15 @@ export class Gateway {
         const taskId = terminalTicketMatch[1]!;
         if (!(await store.getTask(taskId))) return this.json(res, 404, { error: 'task not found' });
         const ticket = crypto.randomBytes(24).toString('base64url');
-        const expiresAt = Date.now() + 5 * 60_000;
-        for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
+        const ttlMs = 5 * 60_000;
+        const expiresAt = Date.now() + ttlMs;
+        // Each ticket holds its session until it is used or expires: bound what one
+        // session can keep outstanding, oldest first, and drop each at expiry (PS-14c).
+        const own = [...this.terminalTickets].filter(([, record]) => record.session.apiToken === session.apiToken);
+        for (const [candidate] of own.slice(0, Math.max(0, own.length - (MAX_TERMINAL_TICKETS_PER_SESSION - 1))))
+          this.terminalTickets.delete(candidate);
         this.terminalTickets.set(ticket, { taskId, session, expiresAt });
+        setTimeout(() => this.terminalTickets.delete(ticket), ttlMs).unref();
         // A path into this install's checkout only means something to the machine it lives on.
         const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))] : ['karmax'];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
