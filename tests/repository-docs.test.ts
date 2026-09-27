@@ -34,4 +34,14 @@ describe('repository guidance', () => {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
     }).trim()).toBe('design/gold-logo-options/gold-check.png');
   });
+
+  it('links every tracked benchmark result from a repository doc', () => {
+    const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
+      cwd: new URL('..', import.meta.url), encoding: 'utf8',
+    }).trim().split('\n').filter(Boolean);
+    const docs = ls('*.md').map(read).join('\n');
+    const orphans = ls('benchmarks/results').filter(file => !file.endsWith('.md'))
+      .filter(file => !docs.includes(file.split('/').pop()!));
+    expect(orphans).toEqual([]);
+  });
 });
