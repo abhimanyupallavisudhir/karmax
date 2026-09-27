@@ -3560,11 +3560,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       return dismissed;
     }
     let queued = false;
+    let claimId: string | undefined;
     if (input.action === 'approve') {
       const grantorCaps = (await this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId));
       const authorization = (await this.deps.authorization?.taskGrant(caller.principal, request.projectId, request.authorization, grantorCaps));
       if (!authorization || authorization.attenuated)
         throw new CapabilityError('you can no longer grant the complete requested authorization');
+      claimId = await service.claim(request.id, input.action, caller.principal);
       if (request.target.kind === 'task') {
         const group = (await this.deps.store.attemptGroup(request.target.taskId));
         const attempts = group?.attempts?.length ? group.attempts : [(await this.deps.store.getTask(request.target.taskId))!];
@@ -3587,7 +3589,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           authorization: { ...authorization, principal: caller.principal }, updatedAt: Date.now() }));
       }
     }
-    const resolved = (await service.resolve(request.id, input.action, caller.principal));
+    const resolved = (await service.resolve(request.id, input.action, caller.principal, claimId));
     if (request.target.kind === 'task') {
       const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
         requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,

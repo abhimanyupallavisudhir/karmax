@@ -24,6 +24,7 @@ export interface AuthorizationRequest {
   reason: string;
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied';
+  claim?: { id: string; action: 'approve' | 'deny'; by: string; at: number };
   dismissed?: { by: string; at: number };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
@@ -48,7 +49,7 @@ export class AuthorizationRequests {
       && (!filter.avatarId || request.target.kind === 'avatar' && request.target.avatarId === filter.avatarId));
   }
 
-  async request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt'>): Promise<AuthorizationRequest> {
+  async request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt' | 'claim'>): Promise<AuthorizationRequest> {
     return this.store.transaction(async () => {
     const audience = [...new Set(input.audience.map(String).map((value) => value.trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
@@ -79,12 +80,31 @@ export class AuthorizationRequests {
     });
   }
 
-  async resolve(id: string, action: 'approve' | 'deny', by: string): Promise<AuthorizationRequest> {
+  /** Keep the claim until completion: applying a grant can cross service
+   * boundaries, so expiring it could admit a conflicting decision mid-apply. */
+  async claim(id: string, action: 'approve' | 'deny', by: string): Promise<string> {
+    return this.store.transaction(async () => {
+      const all = await this.requests();
+      const request = all.find((candidate) => candidate.id === id);
+      if (!request) throw new Error(`no authorization request ${id}`);
+      if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+      if (request.claim) throw new Error('authorization request decision is already in progress');
+      request.claim = { id: newId('claim'), action, by, at: Date.now() };
+      await this.save(all);
+      return request.claim.id;
+    });
+  }
+
+  async resolve(id: string, action: 'approve' | 'deny', by: string, claimId?: string): Promise<AuthorizationRequest> {
     return this.store.transaction(async () => {
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    if (request.claim && (request.claim.id !== claimId || request.claim.action !== action || request.claim.by !== by))
+      throw new Error('authorization request decision is already in progress');
+    if (claimId && !request.claim) throw new Error('authorization request decision claim is no longer active');
+    delete request.claim;
     request.status = action === 'approve' ? 'granted' : 'denied';
     request.resolution = { action, by, at: Date.now() };
     (await this.save(all));
@@ -105,6 +125,7 @@ export class AuthorizationRequests {
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
+    if (request.claim) throw new Error('authorization request decision is already in progress');
     request.dismissed ??= { by, at: Date.now() };
     (await this.save(all));
     (await this.store.appendAudit({ principalId: by, action: 'authorization.request.dismissed',
