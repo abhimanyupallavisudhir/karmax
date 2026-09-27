@@ -397,10 +397,6 @@ export class E2BWorldProvider implements WorldProvider {
       const value = this.openRef(handle.sealedProviderRef);
       if (value.sandboxId) return { sandboxId: value.sandboxId, organizationId: value.organizationId };
     }
-    // V1 replay compatibility only. Newly created handles never take this path.
-    const legacy = handle.meta?.sandboxId;
-    if (typeof legacy === 'string' && legacy) return { sandboxId: legacy,
-      organizationId: typeof handle.meta?.organizationId === 'string' ? handle.meta.organizationId : undefined };
     throw new Error('invalid E2B world handle');
   }
 

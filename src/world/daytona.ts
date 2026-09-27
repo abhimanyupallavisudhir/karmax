@@ -284,9 +284,6 @@ export class DaytonaWorldProvider implements WorldProvider {
       if (typeof value.sandboxId === 'string') return { sandboxId: value.sandboxId,
         organizationId: typeof value.organizationId === 'string' ? value.organizationId : undefined };
     }
-    const legacy = handle.meta?.sandboxId;
-    if (typeof legacy === 'string') return { sandboxId: legacy,
-      organizationId: typeof handle.meta?.organizationId === 'string' ? handle.meta.organizationId : undefined };
     throw new Error('invalid Daytona world handle');
   }
 

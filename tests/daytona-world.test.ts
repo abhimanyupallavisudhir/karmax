@@ -2,6 +2,19 @@ import { describe, expect, it, vi } from 'vitest';
 import { DaytonaWorldProvider, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
 
 describe('Daytona cloud world provider', () => {
+  it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
+    const sandbox = fakeSandbox();
+    const connect = vi.fn(async () => sandbox);
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, connect, get: connect } as any);
+    const world = await provider.create({ taskId: 'legacy', base: 'main' });
+    const forged = { ...world.handle, sealedProviderRef: undefined,
+      meta: { ...world.handle.meta, sandboxId: 'another-tenant-sandbox', organizationId: 'victim' } };
+    await expect(provider.open(forged)).rejects.toThrow('invalid Daytona world handle');
+    await expect(provider.destroy(forged)).rejects.toThrow('invalid Daytona world handle');
+    expect(connect).not.toHaveBeenCalled();
+    await expect(provider.open(world.handle)).resolves.toBeDefined();
+  });
+
   it('propagates exec transport failures instead of reporting command exit 1 (WD-16)', async () => {
     const sandbox = fakeSandbox();
     const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
