@@ -310,7 +310,7 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
     const failure = await runTurn([]).then(() => undefined, (error: unknown) => error);
     expect(h.current!.inputClosed).toBe(true);
     expect(failure).toBeInstanceOf(AgentChannelLost);
-    expect((failure as AgentChannelLost).summary).toMatch(/background task/);
+    expect((failure as InstanceType<typeof AgentChannelLost>).summary).toMatch(/background task/);
   });
 
   it('bounds the wait — a deliberately long-lived background shell cannot wedge the turn', async () => {
