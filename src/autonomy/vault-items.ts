@@ -10,7 +10,7 @@ import { newId } from '../util/id.js';
 import { paths } from '../config/paths.js';
 
 /**
- * Vault items (PLAN-passwords.md §4): the typed product layer over the raw
+ * Vault items (wiki plans/PLAN-passwords §4): the typed product layer over the raw
  * handle→secret vault. An item bundles what a human thinks of as "one
  * credential" — a site login (password + TOTP seed + domains), an API key, an
  * SSH key, a .env bag — so it can be granted to tasks as a unit.

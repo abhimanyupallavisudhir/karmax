@@ -29,7 +29,7 @@ describe('finalizeMerge (work must actually land)', () => {
     // agent writes a file but does NOT commit (mirrors the real failure mode)
     await world.writeFile('factorial.js', 'export const f = (n) => (n <= 1 ? 1 : n * f(n - 1));\n');
 
-    // Commit-vs-gitignore is the merge agent's call (PLAN-git-config.md §6):
+    // Commit-vs-gitignore is the merge agent's call (wiki plans/PLAN-git-config §6):
     // the dirty tree is rejected with the file list, and nothing lands.
     const res = await finalizeMerge(world, 'main');
     expect(res.merged).toBe(false);

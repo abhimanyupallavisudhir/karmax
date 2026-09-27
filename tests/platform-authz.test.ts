@@ -134,6 +134,59 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
   });
 
   /**
+   * PL-2: `_`-prefixed params are platform metadata — the task's authorization,
+   * its pinned GitHub account, its Temporal run, one-shot start flags. createTask
+   * mints them itself; editing a draft or armed task must not let the caller
+   * write them either, or a task:edit token could widen a task's grant or
+   * substitute the account its PRs are opened as.
+   */
+  it('never takes platform metadata from an armed/draft params edit', async () => {
+    const draft = (await store.createTask({ projectId: mine, title: 'Draft', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x', draft: true, _githubAccountId: 'owner-account' } as any }));
+    const injected = { _authorization: { capabilities: ['*'], principal: 'user:root' }, _githubAccountId: 'attacker',
+      _workflowRunId: 'run-elsewhere', _discardProgress: true };
+    for (const replace of [false, true]) {
+      (await api.updateArmedParams(token, draft.id, { prompt: 'edited', ...injected }, { replace, keepArmed: false }));
+      const params = (await store.getTask(draft.id))!.params as Record<string, unknown>;
+      expect(params.prompt).toBe('edited');
+      expect(params._authorization).toBeUndefined();
+      expect(params._workflowRunId).toBeUndefined();
+      expect(params._discardProgress).toBeUndefined();
+      // …and a full-form replace keeps the account the task was pinned to.
+      expect(params._githubAccountId).toBe('owner-account');
+    }
+  });
+
+  /**
+   * RT-28: a task names its role profiles by id, and profile ids are scoped by
+   * prefix — `organization:<org>::…`, `<project>::…`, or installation-wide.
+   * Another tenant's profile (its prompt template, model, tool connections)
+   * must be neither accepted by the API nor loaded by the resolver.
+   */
+  it('keeps task role profiles inside the task’s project and organization', async () => {
+    const { ProfileResolver, organizationProfileId, projectProfileId } = await import('../src/agent/profiles.js');
+    const acme = (await store.getProject(mine))!.organizationId!;
+    const other = (await store.getProject(theirs))!.organizationId!;
+    const profile = (id: string, promptTemplate: string) => store.upsertProfile({ id, name: 'Agent', role: 'do', provider: 'mock', promptTemplate });
+    (await profile('do-default', 'installation default'));
+    (await profile(organizationProfileId(other, 'do'), 'their confidential instructions'));
+    (await profile(projectProfileId(theirs, 'do'), 'their project instructions'));
+    (await profile(organizationProfileId(acme, 'do'), 'our instructions'));
+    for (const foreign of [organizationProfileId(other, 'do'), projectProfileId(theirs, 'do')]) {
+      await expect(api.createTask(token, { projectId: mine, title: 'Borrow', prompt: 'go', draft: true,
+        profiles: { do: foreign } })).rejects.toThrow(/profile/i);
+      const resolved = await new ProfileResolver(store, 'mock').resolve('do', { do: foreign }, undefined, mine);
+      expect(resolved.promptTemplate).toBe('our instructions');
+    }
+    const draft = await api.createTask(token, { projectId: mine, title: 'Own', prompt: 'go', draft: true,
+      profiles: { do: organizationProfileId(acme, 'do') } });
+    await expect(api.updateArmedParams(token, draft.id, { profiles: { do: organizationProfileId(other, 'do') } }))
+      .rejects.toThrow(/profile/i);
+    expect((await new ProfileResolver(store, 'mock').resolve('do', { do: 'do-default' }, undefined, mine)).promptTemplate)
+      .toBe('installation default');
+  });
+
+  /**
    * The host agent queue is a queue surface. It asked for `get_task` while the
    * gateway route (after the fix) asks for `queue:read`/`queue:write`, and
    * `setAgentCapacity` took no token and performed no check at all.
@@ -189,6 +242,30 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     await expect(scoped.queueView(token, 'domain')).resolves.toEqual({ queue: [ours.id] });
   });
 
+  /** PL-3: a token scoped to several projects, or to a whole organization, has
+   *  no single `projectId`; it used to receive the unfiltered queue. */
+  it('filters the merge queue to what a multi-project or organization token may read', async () => {
+    const acme = (await store.getProject(mine))!.organizationId!;
+    const sibling = (await store.createProject('Sibling', {}, acme)).id;
+    const excluded = (await store.createProject('Excluded', {}, acme)).id;
+    const task = async (projectId: string) => (await store.createTask({ projectId, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any })).id;
+    const [ours, siblings, excludedTask, foreign] = [await task(mine), await task(sibling), await task(excluded), await task(theirs)];
+    const scoped = new KarmaxApi({
+      store, tokens, taskQueue: 'karmax', contentDir, worlds: new WorldRegistry(),
+      client: { workflow: { getHandle: () => ({ query: async () => ({
+        queue: [ours, siblings, excludedTask, foreign, 'task_deleted'], current: foreign }) }) } } as any,
+    });
+    const multi = (await tokens.mint({ taskId: '*', profileId: 'user', principal: 'user:a', projectIds: [mine, sibling],
+      organizationId: acme, ceiling: ['queue:read'], grantorCaps: ['queue:read'] })).token;
+    await expect(scoped.queueView(multi, 'domain')).resolves.toEqual({ queue: [ours, siblings] });
+    const organization = (await tokens.mintPrincipal('user:a', ['queue:read'], undefined, 60_000, acme)).token;
+    await expect(scoped.queueView(organization, 'domain')).resolves.toEqual({ queue: [ours, siblings, excludedTask] });
+    // Naming a project still narrows to it, and never widens past the token.
+    await expect(scoped.queueView(multi, 'domain', sibling)).resolves.toEqual({ queue: [siblings] });
+    await expect(scoped.queueView(multi, 'domain', excluded)).rejects.toBeInstanceOf(CapabilityError);
+  });
+
   /**
    * A multi-repo task takes ONE merge slot PER REPO. The guard used to compare
    * the requested domain against `state.mergeDomain`, which is only the FIRST of
@@ -216,6 +293,22 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
 
     await expect(queued.reorderQueue(queueToken, 'unrelated:main', task.id))
       .rejects.toThrow(/not in that merge queue domain/);
+
+    // PL-5: without the complete list the guard used to pass everything, so any
+    // task could start and signal a merge-queue coordinator for any domain.
+    const legacy = (await store.createTask({ projectId: mine, title: 'Legacy', workflow: 'software-dev', workflowVersion: '1.8.0', params: { prompt: 'x' } as any }));
+    (await store.saveView(legacy.id, {
+      taskId: legacy.id, title: legacy.title, workflow: 'software-dev', stage: 'merge', status: 'waiting',
+      messages: [], transcripts: [], actions: [], updatedAt: 1, targetBranch: 'main',
+      world: { id: 'w', kind: 'worktree', root: '/w', branch: 'b', base: 'main', repos: [
+        { name: 'app', repo: 'app', localPath: 'app' }, { name: 'wiki', repo: 'wiki', localPath: 'wiki' }] },
+      state: { mergeDomain: 'app:main' },
+    } as any));
+    await queued.reorderQueue(queueToken, 'wiki:main', legacy.id); // derived from its world
+    await expect(queued.moveQueueItem(queueToken, 'unrelated:main', legacy.id)).rejects.toThrow(/not in that merge queue domain/);
+    const fresh = (await store.createTask({ projectId: mine, title: 'Never queued', workflow: 'software-dev', workflowVersion: '1.9.0', params: { prompt: 'x' } as any }));
+    await expect(queued.reorderQueue(queueToken, 'app:main', fresh.id)).rejects.toThrow(/not in that merge queue domain/);
+    expect(signals).toEqual(['app:main', 'wiki:main', 'wiki:main']);
   });
 
   /**

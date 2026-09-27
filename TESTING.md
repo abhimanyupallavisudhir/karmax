@@ -148,25 +148,6 @@ and native tool discovery does not establish successful live model tool use.
 These checks reduce risk; they do not certify arbitrary third-party servers or
 prove the absence of vulnerabilities.
 
-### Verification recorded 2026-09-16
-
-- MCP checks: **123 passed**, including a real browser, native Codex startup,
-  live Registry → Microsoft Learn tool call, and a real Temporal task. The one
-  deployment smoke test was skipped: Docker/E2B/Daytona were unavailable.
-- Repository regression: the initial single-worker run reached 1,536 passing
-  tests before an unexpected worker exit. The remaining files and affected
-  tests were run in sequential batches of 20, with targeted reruns afterward.
-  The batches recorded 964 passes; final targeted verification recorded 25
-  passes. These counts overlap and must not be added as unique coverage.
-- Every observed assertion failure was resolved and passed on rerun: missing
-  local native dependencies, an existing lineage fixture that modified host
-  Node symlinks, and omitted MCP routes in the API discovery catalog.
-- No live cloud sandbox, real-account OAuth consent, or paid model invocation
-  was verified. OAuth and model API interaction tests use protocol fixtures.
-
-The broad run was not one uninterrupted green suite. Use the commands above to
-reproduce the relevant checks; preserve per-run results and explicit skips.
-
 ## Daytona
 
 Unit and SDK-contract regressions (no account or cloud credit required):

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Worker } from '@temporalio/worker';
 import type { Project } from '../src/domain/types.js';
@@ -93,8 +94,11 @@ describe('just-do durable finalization', () => {
 
   it('fails and retains a configured repository when its commit is rejected', async () => {
     const repo = await h.makeRepo('rejected-commit');
-    fs.writeFileSync(path.join(repo, '.git/hooks/pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     const { handle, world } = await start([repo]);
+    // Host Git never runs repository hooks (RT-5), so reject the commit the way
+    // a concurrent Git process would: by holding the checkout's index lock.
+    const gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], { cwd: world.workdir ?? world.root, encoding: 'utf8' }).trim();
+    fs.writeFileSync(path.join(gitDir, 'index.lock'), '');
     await handle.signal('confirm');
     await expect(handle.result()).rejects.toThrow();
     expect(fs.existsSync(path.join(world.workdir ?? world.root, 'reports/result.md'))).toBe(true);

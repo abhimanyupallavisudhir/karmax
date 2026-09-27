@@ -150,6 +150,8 @@ it.each(['trusted', 'unreviewed'])('checks ancestry before executing a %s deploy
     git('config', 'user.email', 'deploy@example.test');
     fs.mkdirSync(path.join(root, 'deploy'));
     fs.writeFileSync(path.join(root, 'deploy/karmax'), '#!/bin/sh\necho trusted > executed\n');
+    // The real detached runner, as the deploy step loads it from the candidate.
+    fs.copyFileSync(path.join(import.meta.dirname, '../deploy/update-runner.sh'), path.join(root, 'deploy/update-runner.sh'));
     git('add', '.'); git('commit', '-qm', 'trusted');
     const trusted = git('rev-parse', 'HEAD');
     git('update-ref', 'refs/remotes/origin/master', trusted);
@@ -159,12 +161,13 @@ it.each(['trusted', 'unreviewed'])('checks ancestry before executing a %s deploy
     const unreviewed = git('rev-parse', 'HEAD');
     git('checkout', '-q', 'master');
     const run = deploy.steps.find((step: any) => step.run?.includes('ssh -o')).run as string;
-    const result = spawnSync('bash', ['-c', `
+    // GitHub runs `run:` steps with bash -e -o pipefail; the host is `root`.
+    const result = spawnSync('bash', ['-eo', 'pipefail', '-c', `
 git() { if [ "$1" = fetch ]; then return 0; fi; command git "$@"; }
 ssh() { bash -c "\${@: -1}"; }
 export -f git
-` + run.replace('cd /opt/karmax', `cd '${root}'`).replaceAll('~/.ssh', `'${root}/ssh'`)], { cwd: root, encoding: 'utf8', env: {
-      ...process.env, DEPLOY_SHA: candidate === 'trusted' ? trusted : unreviewed,
+` + run.replaceAll('/opt/karmax', root).replaceAll('~/.ssh', `'${root}/ssh'`).replaceAll('sleep 10', 'sleep 0.2')], { cwd: root, encoding: 'utf8', env: {
+      ...process.env, DEPLOY_SHA: candidate === 'trusted' ? trusted : unreviewed, RUN_KEY: '1-1',
       SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target',
     } });
     if (candidate === 'trusted') {

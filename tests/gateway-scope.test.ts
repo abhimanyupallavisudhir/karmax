@@ -385,6 +385,27 @@ describe('gateway request scope for bare-id routes', () => {
    * `no such task <id>` reached an agent looking like a server fault ("back
    * off") rather than a bad identifier ("retry with another id").
    */
+  /** PL-6: POST /api/tasks/:id/messages is message_agent's route, authorized as
+   *  task:conversation:message — and it stays inside the token's tenant. */
+  it('delivers message_agent under task:conversation:message, within the tenant', async () => {
+    const acmeTask = (await store.createTask({ projectId: mine, title: 'Fork', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const otherTask = (await store.createTask({ projectId: theirs, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    for (const t of [acmeTask, otherTask]) (await store.saveView(t.id, {
+      taskId: t.id, title: t.title, workflow: t.workflow, stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 1,
+    }));
+    const messenger = (await tokens.mintPrincipal('user:a', ['task:read', 'task:conversation:message'], mine, 60_000, acmeId)).token;
+    const send = (taskId: string, bearer: string) => fetch(`${base}/api/tasks/${taskId}/messages`, {
+      method: 'POST', headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'do', text: 'rebase please' }),
+    });
+    const ok = await send(acmeTask.id, messenger);
+    expect(ok.status).toBe(200);
+    expect((await ok.json() as any).message).toMatchObject({ role: 'user', text: 'rebase please' });
+    expect((await send(otherTask.id, messenger)).status).toBe(403);
+    const signaller = (await tokens.mintPrincipal('user:a', ['task:read', 'task:signal'], mine, 60_000, acmeId)).token;
+    expect((await send(acmeTask.id, signaller)).status).toBe(403);
+  });
+
   it('answers a missing identifier with 404 rather than 500', async () => {
     const missing = await fetch(`${base}/api/tasks/task_missing/tag`, {
       method: 'POST', headers: auth(), body: JSON.stringify({ add: ['bug'] }),

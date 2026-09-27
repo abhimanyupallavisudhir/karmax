@@ -11,7 +11,7 @@ import { GithubActionsApiError } from '../src/integrations/github-actions.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 
-/** The GitHub pull-request integration (SPEC §5.2, PLAN-git-config.md §5):
+/** The GitHub pull-request integration (SPEC §5.2, wiki plans/PLAN-git-config §5):
  *  the REST client, the PR stage activity, merge/cancel reconciliation, and the
  *  webhook → karmax event feed. */
 

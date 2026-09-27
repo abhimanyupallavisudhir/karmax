@@ -56,6 +56,38 @@ function redactString(text: string): string {
 }
 
 /**
+ * The exact values karmax delivered to one turn — its platform token, model
+ * credential, project and vault secrets. Key-based redaction above cannot see
+ * `echo $DATABASE_URL` or a `.env` printed in full, so wherever the turn's
+ * text is archived (live output, activity items, the final answer) these
+ * values are replaced outright. Short values are skipped: scrubbing "1" or
+ * "true" would mangle ordinary text and protect nothing.
+ */
+export class SecretScrubber {
+  private values: string[] = [];
+
+  add(...values: Array<string | undefined>): void {
+    const next = new Set(this.values);
+    for (const value of values) {
+      if (!value || value.length < 8) continue;
+      next.add(value);
+      // The same value inside JSON (a tool result, an activity payload).
+      const escaped = JSON.stringify(value).slice(1, -1);
+      if (escaped !== value) next.add(escaped);
+    }
+    this.values = [...next].sort((a, b) => b.length - a.length);
+  }
+
+  scrub(text: string): string;
+  scrub(text: string | undefined): string | undefined;
+  scrub(text: string | undefined): string | undefined {
+    if (!text) return text;
+    for (const value of this.values) if (text.includes(value)) text = text.split(value).join('[redacted]');
+    return text;
+  }
+}
+
+/**
  * Tools whose arguments OR results carry plaintext secrets end-to-end. Their
  * `detail` is suppressed outright rather than trusted to key-based redaction:
  * a *correctly approved* reveal must not be durably archived where the item's

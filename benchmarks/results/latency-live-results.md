@@ -90,4 +90,4 @@ Pricing checked September 18, 2026: [OpenAI GPT-5.5](https://developers.openai.c
 
 Limits announced before execution: $20 estimated total, 2,000 requests, six model calls per turn, 512 output tokens per request, 32,000 request bytes, and a 60-second request timeout. The first harness start stopped on a normal waiting state before any API call; after correcting that benchmark-only guard, collection restarted. It incurred no model usage.
 
-Raw content-free observations, cohort membership, environment and per-request usage are in [the compressed export](../benchmarks/results/latency-live-2026-09-18.json.gz). Recompute this table with `npx tsx benchmarks/summarize-live.ts benchmarks/results/latency-live-2026-09-18.json.gz`. See [response timing](response-timing.md) for scope and measurement semantics.
+Raw content-free observations, cohort membership, environment and per-request usage are in [the compressed export](latency-live-2026-09-18.json.gz). Recompute this table with `npx tsx benchmarks/summarize-live.ts benchmarks/results/latency-live-2026-09-18.json.gz`. See [response timing](../../docs/response-timing.md) for scope and measurement semantics.

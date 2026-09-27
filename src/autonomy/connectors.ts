@@ -27,7 +27,7 @@ function encryptedRevision(file: string): string {
 }
 
 /**
- * External password-store connectors (PLAN-passwords.md §9). The karmax vault
+ * External password-store connectors (wiki plans/PLAN-passwords §9). The karmax vault
  * is the runtime source of truth; a connector is a **selective mirror**, not a
  * live proxy: the user connects a store, picks items/folders to pull in, and
  * (opt-in) lets agent-created items push back. Runtime credential resolution

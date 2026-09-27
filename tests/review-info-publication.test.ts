@@ -4,6 +4,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { platformToolHandlers } from '../src/agent/tools.js';
+import { runTurn } from '../src/agent/runtime.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import type { TaskView } from '../src/domain/types.js';
 
@@ -72,5 +73,72 @@ describe('review info before turn completion', () => {
     expect(acknowledged).toBe(true);
     const failing = platformToolHandlers({} as any, { createReviewInfo: async () => { throw new Error('storage unavailable'); } } as any);
     await expect(failing.create_review_info!(attachment)).rejects.toThrow('storage unavailable');
+  });
+});
+
+/**
+ * PL-4 / UI-2: review info is agent-authored, rendered as clickable links and
+ * buttons in the console, and carried in every TurnResult into workflow
+ * history. The tool boundary bounds its size, accepts only the run/open
+ * affordances it advertises, and only http(s) links.
+ */
+describe('create_review_info validation', () => {
+  async function attempt(...calls: Record<string, unknown>[]) {
+    const results: string[] = [];
+    const published: any[] = [];
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn(input: any, ctx: any) {
+      const handlers = platformToolHandlers(input.world, ctx);
+      for (const call of calls) results.push(await handlers.create_review_info!(call));
+      return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'done' };
+    } }]]) as any;
+    const turn = await runTurn({ profile: { id: 'mock', provider: 'mock' }, world: {} as any,
+      messages: [{ id: 'm', role: 'user', text: 'x', ts: 0 }], systemPrompt: '', role: 'do' } as any,
+    { adapters, onReviewInfo: (info) => { published.push(info); } });
+    return { results, published, reviewInfo: turn.reviewInfo };
+  }
+
+  it('rejects non-http(s) link, URL and open-target schemes', async () => {
+    for (const call of [
+      { links: [{ label: 'Docs', url: 'javascript:alert(document.cookie)' }] },
+      { links: [{ label: 'Docs', url: 'data:text/html,<script>alert(1)</script>' }] },
+      { actions: [{ kind: 'open', label: 'Report', target: 'javascript:alert(1)' }] },
+      { actions: [{ kind: 'run', label: 'Serve', command: 'npm start', server: true, openUrls: ['vbscript:x'] }] },
+    ]) {
+      const { results, reviewInfo } = await attempt(call);
+      expect(results[0]).toMatch(/^review info rejected: /);
+      expect(reviewInfo).toBeUndefined();
+    }
+    const { results, reviewInfo } = await attempt({
+      links: [{ label: 'Docs', url: 'https://example.com/docs' }],
+      actions: [{ kind: 'open', label: 'Report', target: 'reports/out.html' },
+        { kind: 'run', label: 'Serve', command: 'npm start', server: true, openUrls: ['http://localhost:3000/'] }],
+    });
+    expect(results).toEqual(['review info recorded']);
+    expect(reviewInfo?.links).toHaveLength(1);
+    expect(reviewInfo?.actions).toHaveLength(2);
+  });
+
+  it('accepts only the run/open affordances the tool advertises, with their own fields', async () => {
+    const { results } = await attempt({ actions: [{ kind: 'payment', label: 'View report', requestId: 'spend_1', operation: 'approve' }] });
+    expect(results[0]).toMatch(/^review info rejected: /);
+    const { reviewInfo } = await attempt({ actions: [{ kind: 'open', label: 'Report', target: 'r.pdf', requestId: 'spend_1', operation: 'approve' }] });
+    expect(reviewInfo?.actions).toEqual([{ kind: 'open', label: 'Report', target: 'r.pdf' }]);
+  });
+
+  it('bounds html, diff, links and the accumulated action list', async () => {
+    const big = 'x'.repeat(200 * 1024);
+    for (const call of [{ html: big }, { diff: big },
+      { links: Array.from({ length: 50 }, (_, i) => ({ label: `L${i}`, url: `https://e.com/${i}` })) },
+      { actions: [{ kind: 'run', label: 'Huge', command: big }] }]) {
+      const { results, reviewInfo } = await attempt(call);
+      expect(results[0]).toMatch(/^review info rejected: /);
+      expect(reviewInfo).toBeUndefined();
+    }
+    // Actions accumulate across calls; the cap applies to the total.
+    const many = Array.from({ length: 12 }, (_, i) => ({ kind: 'open', label: `Open ${i}`, target: `f${i}.pdf` }));
+    const { results, reviewInfo, published } = await attempt({ actions: many }, { actions: many });
+    expect(results).toEqual(['review info recorded', expect.stringMatching(/^review info rejected: .*actions/)]);
+    expect(reviewInfo?.actions).toHaveLength(12);
+    expect(published).toHaveLength(1);
   });
 });

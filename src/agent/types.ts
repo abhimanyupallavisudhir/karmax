@@ -20,10 +20,10 @@ export interface PlatformToolContext {
   createReviewInfo(info: ReviewInfo): void | Promise<void>;
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
-  createSubTask(t: { title: string; prompt: string }): void;
+  createSubTask(t: { title: string; prompt: string }): void | Promise<void>;
   /** Parent-agent ONLY: answer a child that raised to you (open_pr/comment/retry/
    *  cancel; `confirm` is a replay-compatible alias). */
-  respondToSubTask(r: SubTaskResponse): void;
+  respondToSubTask(r: SubTaskResponse): void | Promise<void>;
   /** Child-agent ONLY: raise a typed request UP to your parent (needs_info /
    *  needs_permission / needs_confirmation / blocked) and pause for its reply. */
   raiseToParent(r: RaiseToParent): void;
@@ -118,7 +118,7 @@ export interface TurnInput {
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
   resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
   /** Extra env for the agent subprocess, resolved JIT (never journaled) — e.g. the
-   *  git profile's GIT_SSH_COMMAND / GH_TOKEN (PLAN-git-config.md §4B), so an agent
+   *  git profile's GIT_SSH_COMMAND / GH_TOKEN (wiki plans/PLAN-git-config §4B), so an agent
    *  that pushes or runs `gh` does so as the project's git account. */
   extraEnv?: Record<string, string>;
   /** Environment-shaped project secrets and per-world service endpoints, resolved

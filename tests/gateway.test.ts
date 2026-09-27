@@ -1748,7 +1748,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(views.find((v: any) => v.id === view.id).query.filters[0].field).toBe('tag');
   });
 
-  // ── vault items + the credential pull model over HTTP (PLAN-passwords.md) ──
+  // ── vault items + the credential pull model over HTTP (wiki plans/PLAN-passwords) ──
   it('persists task credential policies and applies edits to agent access', async () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, {
       method: 'POST', headers: auth(), body: JSON.stringify({

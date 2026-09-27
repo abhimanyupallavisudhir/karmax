@@ -33,7 +33,8 @@ import {
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
-import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
+import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn, type QueuedDelegation } from '../agent/runtime.js';
+import { SecretScrubber } from '../agent/activity.js';
 import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
@@ -297,7 +298,7 @@ export interface CreateWorldArgs {
    *  to live inside the world boundary (SPEC §11.1). */
   multiPr?: boolean;
   kind: WorldKind;
-  /** The project's git profile selection (PLAN-git-config.md §3); the activity
+  /** The project's git profile selection (wiki plans/PLAN-git-config §3); the activity
    *  resolves it (project → global default) and materializes identity/signing. */
   gitProfile?: string;
 }
@@ -514,7 +515,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return seq;
   }
 
-  /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
+  /** JIT env for remote git/gh operations in this world (wiki plans/PLAN-git-config §4B):
    *  the world's user-owned git profile (stamped on the handle at creation) →
    *  GIT_SSH_COMMAND / GH_TOKEN, per subprocess. Only legacy worlds without a
    *  human owner retain host fallback. */
@@ -1774,6 +1775,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
+      let delegationKey: string | undefined;
       let resumedActivityAttempt = false;
       let activityAttempt = 1;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
@@ -1795,6 +1797,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        // Queued sub-task spawns/answers survive a retry of the same turn.
+        delegationKey = stableTurnId ? `turnspawns:${stableTurnId}` : undefined;
         // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
         // SQLite key closes the small hard-kill window before a heartbeat reaches the
         // service; unlike session:<task>:<role>, it cannot accidentally pick up a
@@ -1837,7 +1841,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Workflow duty is enforced by stage/decision handlers, not a hidden lower
       // permission level for Confirm, Resolve, or legacy Merge turns.
       // Approved credential escalations recorded after creation
-      // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
+      // (wiki plans/PLAN-passwords §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
       const approvedPermissions = (await new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role));
@@ -1920,6 +1924,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // JIT-resolve credentials via the broker (never journaled). Every current
       // turn receives its selection from the general Credentials policy.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      // The coordinator's pool spans organizations; a leased home or key is used
+      // only if it is one of THIS organization's credentials. (The mock agent
+      // reads no credential; its pool entries exist only in tests.)
+      if ((args.accountConfigHome || args.accountApiKeyHandle) && profile.provider !== 'mock') {
+        const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+        const { enumerateCredentials } = await import('../platform/credentials.js');
+        const own = enumerateCredentials(gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
+        if ((args.accountConfigHome && !own.some((c) => c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome!)))
+          || (args.accountApiKeyHandle && !own.some((c) => c.apiKeyHandle === args.accountApiKeyHandle)))
+          throw ApplicationFailure.create({
+            message: 'The credential leased for this turn is not available to this organization; reconnect the login or API key and retry.',
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+      }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
@@ -1984,6 +2003,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // and unsupported native targets receive a guarded context message instead.
       if (!session && spec?.resumeFrom) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        // A task fork reads the source's conversation, native session and world.
+        // The API authorizes the pointer when it is set, but a pointer can
+        // outlive that check (an old template's spawned run, a task created
+        // before every agent spec was validated), so the turn re-checks it with
+        // its own authority — the same check get_conversation would apply.
+        if (spec.resumeFrom.taskId) {
+          const source = (await store.getTask(spec.resumeFrom.taskId));
+          const sourceOrganization = source ? (await store.getProject(source.projectId))?.organizationId ?? 'org_personal' : undefined;
+          const readable = !!source && sourceOrganization === organizationId
+            && (!deps.tokens || !token
+              || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
+          if (!readable) {
+            (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            throw ApplicationFailure.create({
+              message: `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
+              type: 'agent-error',
+              nonRetryable: true,
+            });
+          }
+        }
         // The config home THIS turn runs under — where the source session must be
         // visible for the provider to resolve it. Shared by both resume paths below.
         const ambientHome =
@@ -2518,6 +2557,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; }));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
         let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
+        // Whatever the agent prints is archived (RT-12); scrub every value this
+        // turn was handed, including secrets that arrive mid-turn.
+        const secrets = new SecretScrubber();
+        secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2529,7 +2572,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
-          // Git-profile credentials for the agent subprocess (PLAN-git-config.md
+          // Git-profile credentials for the agent subprocess (wiki plans/PLAN-git-config
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(await (async () => {
             // Remote provider tools receive repository credentials through the
@@ -2539,7 +2582,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               ? {}
               : (await gitEnvFor(args.worldHandle, args.taskId));
             // Granted `auto` vault items materialize into the work-command env
-            // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
+            // (wiki plans/PLAN-passwords §5A): .env bags, API keys under their envVar,
             // SSH keys as 0600 files inside the receiving world.
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
@@ -2552,12 +2595,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // now, at the activity boundary. Keep application secrets separate
             // from runtime env so they cannot change model auth or startup.
             const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
+            secrets.add(...Object.values(secretEnv),
+              ...Object.entries(gitEnv).filter(([key]) => /token|password|secret|credential|key/i.test(key)).map(([, value]) => value));
             // Project settings keep applying while the agent runs (a secret added
             // after it started must reach the command it runs next), not only at
             // the next world open.
             const resources = deps.resources;
-            if (resources) pullSecretEnv = async () => ({
-              ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv });
+            if (resources) pullSecretEnv = async () => {
+              const refreshed = { ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv };
+              secrets.add(...Object.values(refreshed));
+              return refreshed;
+            };
             return {
               ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
               ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
@@ -2585,9 +2633,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           onEmit: async (t, source) => {
             if (t === lastEmit) return;
             lastEmit = t;
-            (await record(args.taskId, 'agent.output', { text: t, source, role: args.role,
+            (await record(args.taskId, 'agent.output', { text: secrets.scrub(t), source, role: args.role,
               turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt }));
           },
+          ...(delegationKey ? {
+            queuedDelegation: await store.kvGet(delegationKey).then(raw => raw ? JSON.parse(raw) : undefined),
+            onDelegation: async (queued: QueuedDelegation) => { (await store.kvSet(delegationKey!, JSON.stringify(queued))); },
+          } : {}),
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
             if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);
@@ -2601,6 +2653,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
             (await record(args.taskId, 'agent.activity', {
               ...activity,
+              title: secrets.scrub(activity.title),
+              ...(activity.detail !== undefined ? { detail: secrets.scrub(activity.detail) } : {}),
               role: args.role,
               attempt: activityAttempt, workflowRunId,
               ...(turnId ? { turnId } : {}),
@@ -2705,10 +2759,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+        // The final answer becomes a conversation message in the task view.
+        if (result.output) result = { ...result, output: secrets.scrub(result.output) };
         if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
           resultCheckpointed = true;
+          // The checkpointed result now carries every queued spawn and answer.
+          if (delegationKey) (await store.kvDelete(delegationKey));
         }
         }
         // Defence in depth around the activity boundary. `runTurn` rejects an
@@ -2934,7 +2992,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
       const world = await openWorld(handle);
-      // Merge commits carry the world's profile identity too (PLAN-git-config.md
+      // Merge commits carry the world's profile identity too (wiki plans/PLAN-git-config
       // §4A) — they land on the target, where worktree-scoped config doesn't reach.
       let identity;
       const profileName = handle.meta?.gitProfile;
@@ -3068,8 +3126,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     /**
      * Head commit of every checkout in the world, keyed by checkout name.
      *
-     * Review approval for a multi-PR task is bound to `(checkout, head sha)`
-     * (PLAN-multi-pr.md §3), so the gate needs the heads to tell an approval that
+     * Review approval for a multi-PR task is bound to `(checkout, head sha)`,
+     * so the gate needs the heads to tell an approval that
      * still stands from one the Do agent has since invalidated. A branch whose
      * head cannot be read is simply absent, which the domain helpers treat as
      * unapproved — the gate fails closed rather than passing by omission.
@@ -3302,7 +3360,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     /**
-     * The PR stage under remote policy 'pr' (SPEC §5.2, PLAN-git-config.md §5):
+     * The PR stage under remote policy 'pr' (SPEC §5.2, wiki plans/PLAN-git-config §5):
      * push every repo's task branch and open — or update — its pull request.
      *
      * Idempotent by construction: the PR is keyed on the task branch, so a
@@ -3351,7 +3409,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const stacked = repos.some((other) => other !== repo && other.branch === repo.base);
         const base = stacked ? repo.base : worldRepoTarget(repo, target);
         // karmax's own model lets a worktree stay dirty until the merge stage
-        // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
+        // (wiki plans/PLAN-git-config §6 loops that back to the merge agent), so arriving
         // here with nothing committed is a state the design produces. GitHub
         // answers it with an opaque 422 — diagnose it ourselves instead.
         const ahead = await commitsAheadOfPrBase(world, repo, base);
@@ -4902,7 +4960,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /**
      * Push the landed target branch to each repo's origin (remote policy
-     * 'push'/'pr', PLAN-git-config.md §5). Best-effort by contract: the local
+     * 'push'/'pr', wiki plans/PLAN-git-config §5). Best-effort by contract: the local
      * merge is the deliverable; every skip/failure is recorded, never thrown.
      */
     async pushTarget(handle: WorldHandle, target: string): Promise<{ pushed: string[]; skipped: string[] }> {

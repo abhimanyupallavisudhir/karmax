@@ -532,10 +532,10 @@ export interface ProjectConfig {
   /** @deprecated Self-hosted compatibility/import path. Project resources and
    * credential injection are the durable/hosted model (SPEC §11.4). */
   copyGlobs?: string[];
-  /** @deprecated Superseded by `remote: 'pr'` (PLAN-git-config.md §5); still honored. */
+  /** @deprecated Superseded by `remote: 'pr'` (wiki plans/PLAN-git-config §5); still honored. */
   openGithubPr?: boolean;
   /**
-   * Remote policy (PLAN-git-config.md §5): what leaves the machine, and when.
+   * Remote policy (wiki plans/PLAN-git-config §5): what leaves the machine, and when.
    * 'none' (self-hosted/local default) — merges are local. 'push' — the target
    * branch is pushed after a merge lands. 'pr' — the task branch is pushed and a
    * GitHub PR opened at the PR stage, and the target pushed after merge. Hosted
@@ -797,7 +797,7 @@ export interface OrganizationUsagePolicy {
   maxActiveWorlds: number;
 }
 
-// ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
+// ─── Git & GitHub configuration (wiki plans/PLAN-git-config) ────────────────
 
 export type RemotePolicy = 'none' | 'push' | 'pr';
 export type LandingAuthority = 'auto' | 'external' | 'karmax';
@@ -1095,7 +1095,7 @@ export interface TaskParams {
   [k: string]: unknown;
 }
 
-// ─── Task organization: tags, search queries, saved views (PLAN-search-views) ─
+// ─── Task organization: tags, search queries, saved views ─────────────────────
 // A view IS a saved query (the Linear/Jira model): every list surface is the result
 // of evaluating a `TaskQuery` (filter + full-text + sort + group). The searchable-field
 // registry in `src/domain/search.ts` is the single source of truth that the query
@@ -1204,7 +1204,7 @@ export interface StageTransition {
 
 /**
  * A reference to a user-attached image, stored content-addressed on disk under
- * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; PLAN_IMAGE_PROMPTS.md).
+ * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; wiki plans/PLAN_IMAGE_PROMPTS).
  * Deliberately carries NO bytes: only this lightweight handle flows through
  * Temporal workflow input/signals/history. Bytes are resolved back to base64
  * (Claude/OpenAI APIs) or temp files (Codex CLI) at the activity boundary.

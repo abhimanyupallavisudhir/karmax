@@ -1,6 +1,7 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
+import { untrustedBlock } from '../domain/untrusted.js';
 
 /**
  * Prompt assembly (SPEC §5.4). Fills the role template (owned by the profile)
@@ -80,6 +81,8 @@ export interface AssembleArgs {
   bindings?: Record<string, string>;
 }
 
+const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
+
 export function assemblePrompt(args: AssembleArgs): string {
   // Prompt template precedence (SPEC §5.4/§7.1): an explicit profile template wins;
   // else the workflow-declared role template; else the `do` role; else a floor.
@@ -116,6 +119,9 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     skills: '',
     ...(args.bindings ?? {}),
   };
+  // Bindings another agent authored — the Do agent's transcript, its review
+  // summary and file names, a failing stage's output — are quoted as data.
+  for (const key of AGENT_AUTHORED_BINDINGS) if (values[key]) values[key] = untrustedBlock(key, values[key]);
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }
 

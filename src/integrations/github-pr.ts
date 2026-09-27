@@ -1,6 +1,6 @@
 /**
  * GitHub pull requests — the optional integration output of the PR stage
- * (SPEC §5.2, PLAN-git-config.md §5 `remote: 'pr'`).
+ * (SPEC §5.2, wiki plans/PLAN-git-config §5 `remote: 'pr'`).
  *
  * Everything here speaks the REST API with a bearer token, deliberately *not*
  * the `gh` CLI: the token is already resolvable (user App authorization for

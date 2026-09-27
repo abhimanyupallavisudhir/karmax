@@ -30,7 +30,7 @@ describe.skipIf(skipLive || !process.env.E2B_API_KEY)('E2B live smoke', () => {
     }
   }, 180_000);
 
-  // The cloud credential-fill path (PLAN-passwords.md §5B): the gateway hands the
+  // The cloud credential-fill path (wiki plans/PLAN-passwords §5B): the gateway hands the
   // secret to an in-sandbox helper over STDIN — never argv/env/a file the
   // co-resident agent could read. These are the pieces the offline fakes cannot
   // exercise: E2B's sendStdin/closeStdin/wait, and cdp-fill.mjs running under the

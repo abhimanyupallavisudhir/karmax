@@ -2,7 +2,7 @@
  * Pure helpers for turning a unix `pass` entry path into credential metadata.
  * Kept dependency-free (no store, no broker) so both the `pass` connector and
  * the boot-time metadata backfill migration can share it without an import
- * cycle (PLAN-passwords.md §9).
+ * cycle (wiki plans/PLAN-passwords §9).
  */
 
 export function hostOf(value?: string): string {

@@ -2,7 +2,7 @@ import type { TaskCheckout, TaskPullRequest } from './types.js';
 import type { WorldRepo } from '../world/types.js';
 
 /**
- * Review bookkeeping for a multi-PR task (SPEC §11.1, PLAN-multi-pr.md §3).
+ * Review bookkeeping for a multi-PR task (SPEC §11.1).
  *
  * A multi-PR task keeps ONE Review gate; what it gains is the ability to approve
  * its branches one at a time, so a human can confirm the finished ones and send a

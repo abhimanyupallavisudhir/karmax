@@ -915,7 +915,7 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   if (browser === 'playwright')
     return { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
   // Run chrome-devtools-mcp through karmax's launcher so the sandbox browser
-  // exposes a loopback DevTools port (PLAN-passwords.md §5B, cloud path): the
+  // exposes a loopback DevTools port (wiki plans/PLAN-passwords §5B, cloud path): the
   // launcher opens Chromium with --remote-debugging-port and attaches the baked
   // chrome-devtools-mcp bin via --browserUrl. That in-world port is what the
   // gateway's remote fill (world-fill.ts, over world.exec) types into. The

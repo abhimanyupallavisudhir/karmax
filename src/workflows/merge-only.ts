@@ -575,7 +575,7 @@ async function mergeOnlyImpl(
     return { stage };
   }
   pointOfNoReturnPassed = true;
-  // Remote policy 'push'/'pr' (PLAN-git-config.md §5): best-effort push of the
+  // Remote policy 'push'/'pr' (wiki plans/PLAN-git-config §5): best-effort push of the
   // landed target — the merge is the deliverable, a failed push is not fatal.
   if (remotePolicyOf(input.project) !== 'none') {
     const pushed = await core.pushTarget(world as any, target).catch(() => undefined);
