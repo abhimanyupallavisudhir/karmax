@@ -42,6 +42,17 @@ function diskWorld(root: string): World {
   } as unknown as World;
 }
 
+/** Codex appends its rollout asynchronously after turn/completed; production
+ * exports only after the process has exited, so wait for the text here. */
+async function flushedRollout(home: string, thread: string, marker: string): Promise<void> {
+  for (const deadline = Date.now() + 15_000; Date.now() < deadline; await new Promise(r => setTimeout(r, 50))) {
+    const sessions = path.join(home, 'sessions');
+    const file = fs.existsSync(sessions) ? rollouts(home).find((candidate) => candidate.endsWith(`${thread}.jsonl`)) : undefined;
+    if (file && fs.readFileSync(file, 'utf8').includes(marker)) return;
+  }
+  throw new Error(`Codex never flushed ${marker} to thread ${thread}`);
+}
+
 function rollouts(home: string): string[] {
   return fs.readdirSync(path.join(home, 'sessions'), { recursive: true })
     .map(String).filter((file) => file.endsWith('.jsonl')).map((file) => path.join(home, 'sessions', file));
@@ -108,6 +119,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
       root = (await client.request('thread/start', { cwd: source.handle.root, dynamicTools: codexDynamicTools(true),
         approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id;
       await turn(client, root, 'inherited-root-marker');
+      await flushedRollout(sourceHome.absolute, root, 'inherited-root-marker');
       // The host cache is now one completed turn behind the live source.
       await syncRemoteAgentHome(source, 'codex', sourceHome, host, root);
       await turn(client, root, 'newest-source-marker');
