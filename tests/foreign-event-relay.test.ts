@@ -107,3 +107,22 @@ it('retries a failed database read without advancing the cursor', async () => {
   expect(failed).toHaveBeenCalledTimes(1);
   expect(read.mock.calls).toEqual([[4, 128], [4, 128]]);
 });
+
+it('drains again at once for a wake-up that arrives during a drain', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const store = {
+    latestEventSeq: async () => 0,
+    nextForeignEventPage: vi.fn(async (cursor: number) => {
+      if (store.nextForeignEventPage.mock.calls.length === 1) await gate;
+      return { cursor, scanned: 0, events: [] };
+    }),
+  };
+  const relay = await ForeignEventRelay.create(store as any, new KarmaxBus(), { intervalMs: 60_000 });
+  cleanup.push(() => relay.stop());
+  void relay.wake();
+  const late = relay.wake();
+  release();
+  await late;
+  expect(store.nextForeignEventPage).toHaveBeenCalledTimes(2);
+});

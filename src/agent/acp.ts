@@ -293,10 +293,6 @@ function updateActivity(update: SessionUpdate, prior: Map<string, ToolCall>) {
       ...(detail ? { detail } : {}),
     } as const;
   }
-  if (update.sessionUpdate === 'agent_thought_chunk') {
-    const text = update.content.type === 'text' ? update.content.text : '';
-    return { id: update.messageId ?? 'acp-reasoning', kind: 'reasoning', phase: 'updated', title: 'Reasoning', ...(text ? { detail: text } : {}) } as const;
-  }
   if (update.sessionUpdate === 'plan' || update.sessionUpdate === 'plan_update') {
     return { id: (update as any).planId ?? 'acp-plan', kind: 'status', phase: 'updated', title: 'Updated plan', detail: activityDetail(update) } as const;
   }
@@ -381,7 +377,25 @@ export class AcpAdapter implements AgentAdapter {
     }
 
     let sessionId: string | undefined;
-    let finalText = '';
+    // One turn streams many messages. The live text is the current message's
+    // own: a tool call or a new message id ends it as a timeline item, and a
+    // thought is recorded once, whole, not per chunk (#396 review item 6).
+    const messages: string[] = [];
+    let message: { id?: string; text: string } | undefined;
+    let thought: { id: string; text: string } | undefined;
+    let items = 0;
+    const endMessage = () => {
+      if (message?.text) {
+        messages.push(message.text);
+        ctx.emitActivity({ id: message.id ?? `acp-message-${++items}`, kind: 'message', phase: 'completed', title: message.text });
+      }
+      message = undefined;
+    };
+    const endThought = () => {
+      if (thought?.text) ctx.emitActivity({ id: thought.id, kind: 'reasoning', phase: 'completed', title: 'Reasoning', detail: thought.text });
+      thought = undefined;
+    };
+    const finalText = () => { endThought(); endMessage(); return messages.join('\n\n'); };
     let delivered = input.messages.length;
     let steered = false; // a mid-turn follow-up cancelled this prompt to hand it to the next turn
     let clientContext: any;
@@ -483,11 +497,23 @@ export class AcpAdapter implements AgentAdapter {
         if (sessionId && params.sessionId !== sessionId) return;
         (await (await currentTiming())?.markOnce('provider.first-event'));
         const update = params.update;
+        if (update.sessionUpdate === 'agent_thought_chunk') {
+          const id = update.messageId ?? thought?.id ?? `acp-reasoning-${++items}`;
+          if (thought && thought.id !== id) endThought();
+          thought ??= { id, text: '' };
+          thought.text += textOf(update.content);
+          return;
+        }
+        endThought();
+        if (update.sessionUpdate === 'tool_call') endMessage();
         if (update.sessionUpdate === 'agent_message_chunk') {
+          if (message && update.messageId && message.id !== update.messageId) endMessage();
+          message ??= { text: '' };
+          message.id ??= update.messageId ?? undefined;
           // Chunks are deltas; the task renders each emit as the whole live
           // message, so publish the growing text (LT-5).
-          finalText += textOf(update.content);
-          ctx.emit(finalText, 'assistant');
+          message.text += textOf(update.content);
+          ctx.emit(message.text, 'assistant');
         }
         const activity = updateActivity(update, tools);
         if (activity) ctx.emitActivity(activity);
@@ -635,7 +661,7 @@ export class AcpAdapter implements AgentAdapter {
           // Cancelled to hand a mid-turn follow-up to the next turn — a clean
           // boundary, not a failure. `delivered` is unchanged, so the workflow
           // loops back to Do and delivers the follow-up (software-dev §5.6).
-          return { termination: { kind: 'success', status: 'end_turn' }, session: sessionId, output: finalText, delivered };
+          return { termination: { kind: 'success', status: 'end_turn' }, session: sessionId, output: finalText(), delivered };
         }
         throw new Error(`${this.provider} ACP turn cancelled`);
       }
@@ -652,7 +678,7 @@ export class AcpAdapter implements AgentAdapter {
       return {
         termination: { kind: 'success', status: response.stopReason },
         session: sessionId,
-        output: finalText,
+        output: finalText(),
         delivered,
       };
     } catch (error) {

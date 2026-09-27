@@ -181,6 +181,8 @@ const QUERY_TIMEOUT_MS = 3000;
  * "clicked queue, nothing happened, pile of tasks stuck at setup" failure mode).
  */
 const START_TIMEOUT_MS = 12_000;
+/** How long a create waits for the advisory GitHub merge preflight's warning. */
+const PREFLIGHT_WAIT_MS = 2_000;
 const TERMINAL_CLEANUP_TIMEOUT_MS = 10_000;
 
 /**
@@ -1305,9 +1307,9 @@ export class KarmaxApi {
           }
           if (!routedEligible) {
             const warning = 'The task creator cannot merge every GitHub repository and no selected human Review step currently routes to a connected person who can. The task may proceed, but it will stop at Merge for an eligible human.';
-            if (!(await this.deps.store.getTask(task.id))) return; // creation was undone meanwhile
-            (await this.deps.store.appendEvent({ taskId: task.id, type: 'github.merge.preflight-warning', ts: Date.now(),
-              payload: { warning, repositories: slugs } }));
+            // Nothing is journaled for a creation undone meanwhile.
+            if ((await this.deps.store.appendEventIfTaskExists({ taskId: task.id, type: 'github.merge.preflight-warning', ts: Date.now(),
+              payload: { warning, repositories: slugs } })) === undefined) return;
             (task as TaskRecord & { warnings?: string[] }).warnings = [warning];
           }
         }
@@ -1453,7 +1455,12 @@ export class KarmaxApi {
     }
     (await dispatchEnd());
     (await this.saveAgentSnapshot(task.id, manifest, input));
-    await preflight;
+    // Waited for only briefly (#396 review item 10): a hung GitHub must not hold
+    // the create until the client times out and retries it into a duplicate.
+    // A later answer is still journaled; only `warnings` misses it.
+    let preflightWait: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([preflight, new Promise<void>((resolve) => { preflightWait = setTimeout(resolve, PREFLIGHT_WAIT_MS); })]);
+    clearTimeout(preflightWait);
     // These attempts were explicitly requested as part of creation, so start all
     // of them. addAttempt() remains intentionally different: it creates one draft
     // for inspection/editing and never queues it implicitly.

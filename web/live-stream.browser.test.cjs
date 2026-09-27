@@ -57,7 +57,14 @@ const { chromium } = require('playwright');
     await page.waitForTimeout(300); // let the task page settle before measuring reads
 
     let seq = 10;
-    const send = (type, payload) => sockets[0].send(JSON.stringify({ seq: seq++, type, taskId: 't', projectId: 'p', ts: Date.now(), payload }));
+    // The newest socket: the console reconnects after a drop.
+    const send = (type, payload) => { const event = { seq: seq++, type, taskId: 't', projectId: 'p', ts: Date.now(), payload }; sockets.at(-1).send(JSON.stringify(event)); return event; };
+    const hidden = (value) => page.evaluate((value) => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => value });
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => value ? 'hidden' : 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }, value);
+    const bubbleGone = () => page.waitForFunction(() => !document.getElementById('live-bubble') || document.getElementById('live-bubble').classList.contains('hidden'));
     const bubble = () => page.evaluate(() => {
       const b = document.getElementById('live-bubble');
       return b && !b.classList.contains('hidden') && b.getClientRects().length ? b.textContent.replace(/^agent · live/, '') : null;
@@ -98,12 +105,16 @@ const { chromium } = require('playwright');
     await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Running'));
     assert.equal(await bubble(), 'Running');
 
-    // 5. Another agent's stream (the Review gate's confirmer) stays out of this
-    // conversation; after a repaint, this agent's next chunk brings its bubble back.
+    // 5. Another agent streaming at the same time (the Review gate's confirmer)
+    // keeps its own text: it never lands in this conversation, and neither its
+    // chunks nor its finished message clear or flicker this agent's text.
     send('agent.output', { role: 'confirm', turnId: 'confirm-1', attempt: 1, text: 'Reviewing the diff', source: 'assistant' });
-    await page.waitForFunction(() => document.getElementById('live-bubble')?.classList.contains('hidden') !== false);
+    await page.waitForTimeout(100);
+    assert.equal(await bubble(), 'Running', "another agent's chunk leaves this agent's text in place");
+    send('agent.activity', { role: 'confirm', turnId: 'confirm-1', attempt: 1, id: 'confirm-msg', kind: 'message', phase: 'completed', title: 'Reviewing the diff now' });
     send('agent.activity', { ...turn, id: 'cmd-1', kind: 'command', phase: 'started', title: 'npm test' });
     await page.locator('#ck-thread').getByText('npm test').first().waitFor();
+    assert.equal(await bubble(), 'Running', "another agent's finished message does not clear this agent's text");
     assert.equal(await occurrences('Reviewing the diff'), 0, "the confirmer's text never lands in the Do conversation");
     send('agent.output', { ...turn, text: 'Running the suite', source: 'assistant' });
     await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Running the suite'));
@@ -112,14 +123,41 @@ const { chromium } = require('playwright');
     send('agent.activity', { ...turn, id: 'turn', kind: 'turn', phase: 'failed', title: 'Agent turn failed' });
     await page.waitForFunction(() => document.getElementById('live-bubble')?.classList.contains('hidden') !== false);
     assert.equal(await occurrences('Running the suite'), 0, 'a failed attempt leaves no half message behind');
-    send('agent.output', { ...turn, attempt: 2, text: 'Retrying the fix', source: 'assistant' });
+    const retry = { ...turn, attempt: 2 };
+    const retrying = send('agent.output', { ...retry, text: 'Retrying the fix', source: 'assistant' });
     await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Retrying the fix'));
 
-    // 7. Cancelling the task clears the half message; it never renders as final.
+    // #396 review item 5. A message that completes while the tab is hidden (its
+    // events are dropped) is gone from the bubble once the tab is shown again.
+    await hidden(true);
+    const done = send('agent.activity', { ...retry, id: 'msg-2', kind: 'message', phase: 'completed', title: 'Retrying the fix worked.' });
+    events.push(retrying, done);
+    await hidden(false);
+    await page.locator('#ck-thread [data-conversation-key]').getByText('Retrying the fix worked.').waitFor();
+    await bubbleGone();
+    assert.equal(await occurrences('Retrying the fix worked.'), 1, 'the completed message is shown once, with no half message beside it');
+
+    // A message that completes while the socket is down is gone once it reconnects.
+    const checking = send('agent.output', { ...retry, text: 'Checking the tests', source: 'assistant' });
+    await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Checking the tests'));
+    const socketsBefore = sockets.length;
+    await sockets.at(-1).close();
+    events.push(checking, { seq: seq++, type: 'agent.activity', taskId: 't', ts: Date.now(), payload: { ...retry, id: 'msg-3', kind: 'message', phase: 'completed', title: 'Checking the tests passed.' } });
+    while (sockets.length === socketsBefore) await page.waitForTimeout(50); // the console reconnects by itself
+    await page.locator('#ck-thread [data-conversation-key]').getByText('Checking the tests passed.').waitFor();
+    await bubbleGone();
+
+    // A page opened mid-stream shows the text so far, from history alone.
+    events.push({ seq: seq++, type: 'agent.output', taskId: 't', ts: Date.now(), payload: { ...retry, text: 'Now updating the docs', source: 'assistant' } });
+    await page.reload();
+    await page.locator('#ck-thread').getByText('Checking the tests passed.').waitFor();
+    await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Now updating the docs'));
+
+    // 8. Cancelling the task clears the half message; it never renders as final.
     view = { ...view, status: 'cancelled', stage: 'cancelled', agentTurn: undefined };
     send('view.updated', { stage: 'cancelled', status: 'cancelled' });
     await page.waitForFunction(() => !document.getElementById('live-bubble') || document.getElementById('live-bubble').classList.contains('hidden'));
-    assert.equal(await occurrences('Retrying the fix'), 0, 'a cancelled turn leaves no half message looking final');
+    assert.equal(await occurrences('Now updating the docs'), 0, 'a cancelled turn leaves no half message looking final');
 
     assert.deepEqual(errors, []);
     delays.sort((a, b) => a - b);

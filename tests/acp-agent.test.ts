@@ -30,11 +30,27 @@ record({ env: {
 } });
 let pendingPrompt;
 let terminalId;
+const update = (value) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'session-new', update: value } });
+const text = (sessionUpdate, value, messageId) => update({ sessionUpdate, content: { type: 'text', text: value }, ...(messageId ? { messageId } : {}) });
 const finish = () => {
   send({ jsonrpc: '2.0', method: 'session/update', params: {
     sessionId: 'session-new',
     update: { sessionUpdate: 'tool_call_update', toolCallId: 'tool-1', status: 'completed' },
   } });
+  if (process.env.STUB_MESSAGES) {
+    text('agent_thought_chunk', 'Reading ', 'thought-1');
+    text('agent_thought_chunk', 'the ', 'thought-1');
+    text('agent_thought_chunk', 'parser.', 'thought-1');
+    text('agent_message_chunk', 'Found ', 'msg-1');
+    text('agent_message_chunk', 'the bug.', 'msg-1');
+    update({ sessionUpdate: 'tool_call', toolCallId: 'tool-2', title: 'Run tests', kind: 'execute', status: 'in_progress' });
+    text('agent_message_chunk', 'Tests pass.');
+    text('agent_thought_chunk', 'Summarize.');
+    text('agent_message_chunk', 'All ', 'msg-3');
+    text('agent_message_chunk', 'done.', 'msg-3');
+    send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'end_turn' } });
+    return;
+  }
   send({ jsonrpc: '2.0', method: 'session/update', params: {
     sessionId: 'session-new',
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'do' } },
@@ -130,6 +146,7 @@ describe('generic ACP agent adapter', () => {
     delete process.env.STUB_REQUESTS_OUT;
     delete process.env.STUB_STOP_REASON;
     delete process.env.STUB_AWAIT_CANCEL;
+    delete process.env.STUB_MESSAGES;
     delete process.env.KARMAX_HOME;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
     dir = undefined;
@@ -187,6 +204,19 @@ describe('generic ACP agent adapter', () => {
     const records = fs.readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     return { turn, output, activities, records };
   }
+
+  // #396 review item 6: ACP streams one turn as many messages. The live text is
+  // each message's own, a finished message is a timeline item of its own, and a
+  // thought is one reasoning item, not one per chunk.
+  it('streams each message on its own and records one reasoning item per thought', async () => {
+    process.env.STUB_MESSAGES = '1';
+    const { turn, output, activities } = await run();
+    expect(output).toEqual(['Found ', 'Found the bug.', 'Tests pass.', 'All ', 'All done.']);
+    expect(activities.filter((a) => a.kind === 'message').map((a) => a.title)).toEqual(['Found the bug.', 'Tests pass.', 'All done.']);
+    expect(activities.filter((a) => a.kind === 'reasoning').map((a) => a.detail)).toEqual(['Reading the parser.', 'Summarize.']);
+    expect(new Set(activities.filter((a) => a.kind === 'reasoning').map((a) => a.id)).size).toBe(2);
+    expect(turn.output).toBe('Found the bug.\n\nTests pass.\n\nAll done.');
+  });
 
   it('caps provider-requested terminal output retention', async () => {
     const { records } = await run({ hugeOutput: true });

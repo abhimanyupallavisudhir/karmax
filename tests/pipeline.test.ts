@@ -1439,6 +1439,34 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('from child');
   }, 90_000);
 
+  // #396 review item 8: a running child's follow-up gate asks its workflow only
+  // after a journal entry. The parent's answer is pushed by the parent workflow,
+  // so without one it waited for the 30 s backstop instead of the next poll.
+  it('a parent comment reaches its running child mid-turn within the follow-up latency', async () => {
+    const repo = await h.makeRepo('app-sub-comment');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Long child :: @sleep 60000' })],
+    });
+    try {
+      await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+      const childId = (await view(handle)).subTasks![0];
+      const child = h.client.workflow.getHandle(childId);
+      await expect.poll(async () => ((await child.query('view')) as any).agentTurn?.state, { timeout: 30_000 }).toBe('running');
+      await new Promise((resolve) => setTimeout(resolve, 1_500)); // past the turn's first, unconditional query
+      const sent = Date.now();
+      await handle.signal('followUp', { id: 'c1', role: 'user', text: `@respond comment ${childId} :: @run echo parent-says-hello`, ts: 0 });
+      await expect.poll(async () => (await h.store.eventsOfType(childId, 'agent.output'))
+        .some((event) => String(event.payload.text).includes('parent-says-hello')), { timeout: 40_000, interval: 200 }).toBe(true);
+      expect(Date.now() - sent).toBeLessThan(12_000);
+    } finally {
+      await handle.signal('cancel');
+      await handle.result();
+    }
+  }, 120_000);
+
   it('spawns more than 50 children without per-parent concurrent or lifetime caps', async () => {
     const repo = await h.makeRepo('app-sub-unlimited');
     const taskId = newId('task');

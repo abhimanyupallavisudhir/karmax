@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
+import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
@@ -161,7 +162,7 @@ export class Store {
 
     this.hosted = options.hosted === true;
     if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = openSqlDatabase(dbPath);
+    this.db = watchAuthorityWrites(openSqlDatabase(dbPath));
     // busy_timeout first: waiting (up to 5s) on a locked database beats failing
     // the caller outright. tsx-watch restarts overlap the outgoing and incoming
     // app for a few seconds, and the newcomer's boot writes (migrations,
@@ -5364,16 +5365,43 @@ export class Store {
     });
   }
 
+  /** Streamed text is the whole text so far of the block being generated, so an
+   *  agent's publication supersedes its previous one. Keeping only the latest
+   *  makes a streamed message O(its length) in one row per agent (#396 review
+   *  item 2); the new row still gets a fresh seq for incremental readers. */
+  async appendLiveOutput(ev: KarmaxEvent): Promise<number> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare(`DELETE FROM events WHERE type = 'agent.output' AND taskId = ?
+        AND json_extract(payload, '$.source') = 'assistant' AND json_extract(payload, '$.role') = ?`)
+        .run(ev.taskId, String((ev.payload as { role?: unknown }).role ?? '')));
+      return this.appendEvent(ev);
+    });
+  }
+
+  /** Append only while the task exists, atomically with that check, so work
+   *  that outlives an undone creation leaves no orphan event. */
+  async appendEventIfTaskExists(ev: KarmaxEvent): Promise<number | undefined> {
+    return this.db.transaction(async () => {
+      if (!(await this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(ev.taskId))) return undefined;
+      return this.appendEvent(ev);
+    });
+  }
+
   async eventsSince(taskId: string, seq: number, limit?: number, excludeTiming = false): Promise<(KarmaxEvent & { seq: number })[]> {
     // Initial task-page loads ask for the newest bounded window. Do the bound in
     // SQLite: materializing every historical event and slicing in JS is precisely
     // the allocation spike this API is meant to avoid. Incremental consumers omit
     // `limit` and retain the original "everything after cursor" contract.
     if (limit && limit > 0) {
+      // Streamed text never counts against the bound; each agent's latest
+      // partial rides along so a page opened mid-stream still shows it.
       const rows = (await this.db
-        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
+        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
         .all(taskId, seq, limit)) as any[];
-      rows.reverse();
+      rows.push(...(await this.db.prepare(`SELECT * FROM events WHERE seq IN (SELECT MAX(seq) FROM events
+        WHERE type = 'agent.output' AND taskId = ? AND seq > ? AND json_extract(payload, '$.source') = 'assistant'
+        GROUP BY json_extract(payload, '$.role'))`).all(taskId, seq)) as any[]);
+      rows.sort((a, b) => Number(a.seq) - Number(b.seq));
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
     }
     return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(taskId, seq)) as any[])
@@ -5417,9 +5445,10 @@ export class Store {
     // materialize the ENTIRE append-only table before slicing — the events table
     // is the largest in the DB, so that is the dominant read-path allocation.
     // Grab the newest N (DESC + LIMIT), then return ascending as before.
+    // The bounded window is the Activity feed's, which never shows streamed text.
     if (limit && limit > 0) {
       const rows = (await this.db
-        .prepare(`SELECT * FROM events WHERE seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
+        .prepare(`SELECT * FROM events WHERE seq > ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
         .all(seq, limit)) as any[];
       rows.reverse();
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));

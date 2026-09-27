@@ -4,6 +4,7 @@ import os from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { isTransportError } from '../src/agent/limits.js';
 import { runTurn, OUTPUT_PUBLISH_INTERVAL_MS } from '../src/agent/runtime.js';
+import { serverSentEvents } from '../src/agent/api-streams.js';
 import type { AgentAdapter, PlatformToolContext, TurnInput } from '../src/agent/types.js';
 
 /**
@@ -46,6 +47,19 @@ const adapter = (run: (ctx: PlatformToolContext) => Promise<string>): AgentAdapt
 });
 
 describe('runtime output publication (LT-5)', () => {
+  // #396 review item 7: a late SDK or notification callback must not publish
+  // into a turn that has already ended.
+  it('ignores output emitted after the turn has ended', async () => {
+    const { log, deps } = recorder();
+    await runTurn(input(), { adapters: new Map([['claude', adapter(async (ctx) => {
+      ctx.emit('Done', 'assistant');
+      setTimeout(() => { ctx.emit('Done, and late', 'assistant'); ctx.emit('$ late tool'); }, 20);
+      return 'Done';
+    })]]), ...deps });
+    await sleep(OUTPUT_PUBLISH_INTERVAL_MS * 2);
+    expect(log.map((e) => e.text)).toEqual(['Done']);
+  });
+
   it('publishes the first chunk at once and coalesces the rest of a burst', async () => {
     const { log, deps } = recorder();
     let publishedBeforeYield = 0;
@@ -193,7 +207,7 @@ describe('Claude Agent SDK text deltas (LT-5)', () => {
 /** A stub provider endpoint: each request takes the next scripted reply. */
 function stubProvider() {
   const seen: any[] = [];
-  let replies: Array<{ sse?: any[]; json?: any; status?: number; truncate?: boolean }> = [];
+  let replies: Array<{ sse?: any[]; json?: any; status?: number; truncate?: boolean; contentType?: string; done?: boolean }> = [];
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => { body += c; });
@@ -205,11 +219,12 @@ function stubProvider() {
         res.end(JSON.stringify(reply.json));
         return;
       }
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.writeHead(200, { 'content-type': reply.contentType ?? 'text/event-stream' });
       for (const event of reply.sse) {
         res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
         await sleep(2);
       }
+      if (reply.done) res.write('data: [DONE]\n\n');
       if (reply.truncate) res.destroy(); else res.end();
     });
   });
@@ -367,5 +382,101 @@ describe('metered API rails stream their responses (LT-5)', () => {
     const { diagnostic: _streamed, ...streamed } = viaStream.metadata;
     const { diagnostic: _returned, ...returned } = viaHttp.metadata;
     expect(streamed).toEqual(returned);
+  });
+
+  // #396 review item 4: without streaming, a response that fails mid-generation
+  // came back as the HTTP status of its error code, so a transient outage retried.
+  it.each([
+    ['server_error', 500, 'The server had an error while processing your request.'],
+    ['rate_limit_exceeded', 429, 'Rate limit reached for gpt-5.5'],
+    ['insufficient_quota', 429, 'You exceeded your current quota, please check your plan and billing details.'],
+    ['invalid_prompt', 400, 'Invalid prompt: the prompt was flagged.'],
+  ])('Responses API: a response.failed with %s is classified like HTTP %i', async (code, status, message) => {
+    const classify = (error: any) => ({ constructor: error.constructor, message: error.message,
+      transport: isTransportError(error), metadata: error.metadata && (({ diagnostic: _d, ...rest }) => rest)(error.metadata) });
+    provider.script([{ status, json: { error: { message, type: code === 'server_error' ? 'server_error' : 'requests', code, param: null } } }]);
+    const viaHttp = classify(await new CodexAdapter().runTurn(codexInput(), toolContext([])).catch((e) => e));
+    provider.script([{ sse: [{ type: 'response.created', response: { id: 'r', status: 'in_progress', output: [] } },
+      { type: 'response.failed', response: { id: 'r', status: 'failed', output: [], error: { code, message } } }] }]);
+    const viaStream = classify(await new CodexAdapter().runTurn(codexInput(), toolContext([])).catch((e) => e));
+    expect(viaStream.constructor).toBe(viaHttp.constructor);
+    expect(viaStream.transport).toBe(viaHttp.transport);
+    expect(viaStream.metadata).toEqual(viaHttp.metadata);
+    expect(viaStream.message).toMatch(new RegExp(`^OpenAI Responses API ${status}: `));
+    if (code === 'server_error') expect(viaStream.transport).toBe(true);
+  });
+});
+
+// #396 review item 11: the fallbacks around a stream that is not what it says.
+describe('stream framing and fallbacks', () => {
+  const chunked = (chunks: Array<string | Uint8Array>) => new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk);
+      controller.close();
+    },
+  });
+  const read = async (chunks: Array<string | Uint8Array>) => {
+    const out: Array<{ event?: string; data: string }> = [];
+    for await (const event of serverSentEvents(chunked(chunks))) out.push(event);
+    return out;
+  };
+
+  it('reassembles events split across chunks, lines, CRLF and multi-byte characters', async () => {
+    const bytes = new TextEncoder().encode('data: {"text":"héllo ✓"}\n\n');
+    const cut = bytes.indexOf(0xc3) + 1; // inside "é"
+    expect(await read([bytes.slice(0, cut), bytes.slice(cut, -3), bytes.slice(-3)])).toEqual([{ data: '{"text":"héllo ✓"}' }]);
+    expect(await read(['event: ping\r', '\ndata: 1\r\n', '\r\nda', 'ta: 2\n\n'])).toEqual([{ event: 'ping', data: '1' }, { data: '2' }]);
+    expect(await read(['data: first\ndata: second\n', '\n'])).toEqual([{ data: 'first\nsecond' }]);
+    expect(await read([': keep-alive\n\n', 'data: x\n\n', 'data: dangling'])).toEqual([{ data: 'x' }]);
+  });
+
+  describe('against a provider endpoint', () => {
+    const provider = stubProvider();
+    beforeAll(async () => {
+      const base = await provider.listen();
+      process.env.KARMAX_ANTHROPIC_BASE_URL = base;
+      process.env.KARMAX_OPENAI_BASE_URL = `${base}/v1`;
+    });
+    afterAll(async () => {
+      delete process.env.KARMAX_ANTHROPIC_BASE_URL;
+      delete process.env.KARMAX_OPENAI_BASE_URL;
+      await provider.close();
+    });
+    const claudeInput = (): TurnInput => ({ ...input(), world: { handle: { id: 'w', root: os.tmpdir() } } as any, resolvedAuth: { apiKey: 'sk-ant-test' } });
+    const codexInput = (): TurnInput => ({ ...input(), profile: { id: 'p', name: 'c', provider: 'codex', model: 'gpt-5.5', role: 'do', capabilities: [] },
+      world: { handle: { id: 'w', root: os.tmpdir() } } as any, resolvedAuth: { apiKey: 'sk-test' } });
+    const message = { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude', stop_reason: 'end_turn',
+      usage: { input_tokens: 10, output_tokens: 3 }, content: [{ type: 'text', text: 'Proxied reply.' }] };
+    const response = { id: 'resp_1', status: 'completed', usage: { input_tokens: 10, output_tokens: 3 },
+      output: [{ type: 'message', id: 'msg_a', content: [{ type: 'output_text', text: 'Proxied reply.' }] }] };
+    const responseEvents = [{ type: 'response.created', response: { ...response, status: 'in_progress', output: [] } },
+      { type: 'response.output_text.delta', item_id: 'msg_a', output_index: 0, content_index: 0, delta: 'Proxied reply.' },
+      { type: 'response.completed', response }];
+
+    it('reads an event stream served under another content type', async () => {
+      provider.script([{ sse: anthropicEvents(message), contentType: 'application/json' }]);
+      expect((await new ClaudeAdapter().runTurn(claudeInput(), toolContext([]))).output).toBe('Proxied reply.');
+      provider.script([{ sse: responseEvents, contentType: 'text/plain' }]);
+      expect((await new CodexAdapter().runTurn(codexInput(), toolContext([]))).output).toBe('Proxied reply.');
+    });
+
+    it('asks once more when a stream ends cleanly without its terminal event', async () => {
+      provider.script([{ sse: anthropicEvents(message).slice(0, -1) }, { sse: anthropicEvents(message) }]);
+      expect((await new ClaudeAdapter().runTurn(claudeInput(), toolContext([]))).output).toBe('Proxied reply.');
+      expect(provider.seen).toHaveLength(2);
+    });
+
+    it('fails as a protocol error, not a retryable interruption, when it happens again', async () => {
+      provider.script([{ sse: anthropicEvents(message).slice(0, -1) }, { sse: anthropicEvents(message).slice(0, -1) }]);
+      const claude = await new ClaudeAdapter().runTurn(claudeInput(), toolContext([])).catch((e) => e);
+      expect(provider.seen).toHaveLength(2);
+      expect(claude.message).toMatch(/protocol/i);
+      expect(isTransportError(claude)).toBe(false);
+      provider.script([{ sse: responseEvents.slice(0, -1), done: true }, { sse: responseEvents.slice(0, -1), done: true }]);
+      const codex = await new CodexAdapter().runTurn(codexInput(), toolContext([])).catch((e) => e);
+      expect(provider.seen).toHaveLength(2);
+      expect(codex.message).toMatch(/protocol/i);
+      expect(isTransportError(codex)).toBe(false);
+    });
   });
 });

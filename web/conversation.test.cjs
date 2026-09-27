@@ -218,6 +218,7 @@ eval(extractFn('reviewActionBtn'));
 eval(extractFn('conversationReviewInfo'));
 eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
+eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';

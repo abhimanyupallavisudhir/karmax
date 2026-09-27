@@ -26,8 +26,9 @@ export class ForeignEventRelay {
     return new ForeignEventRelay(store, bus, cursor, options.intervalMs ?? 500, options.onError);
   }
 
-  /** Coalesced wake-up; polling remains the recovery path for a lost wake-up. */
-  wake(): Promise<void> { return this.interval.run(); }
+  /** Coalesced wake-up; a wake during a drain drains again right after it.
+   * Polling remains the recovery path for a lost wake-up. */
+  wake(): Promise<void> { return this.interval.wake(); }
 
   private async drain(): Promise<void> {
     do {

@@ -12,6 +12,54 @@ type TextListener = (text: string) => void;
 
 const isEventStream = (res: Response) => /\btext\/event-stream\b/i.test(res.headers.get('content-type') ?? '');
 
+/** The response as an event stream, or its JSON body. A proxy may stream SSE
+ * under another content type, so a body that is not declared a stream is
+ * sniffed rather than handed to `res.json()` (#396 review item 11). */
+async function eventStreamOrJson(res: Response): Promise<{ events: ReadableStream<Uint8Array> } | { json: any }> {
+  if (!res.body) return { json: await res.json() };
+  if (isEventStream(res)) return { events: res.body };
+  const reader = res.body.getReader();
+  const head: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let start = '';
+  while (start.trimStart().length < 6) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    head.push(value);
+    start += decoder.decode(value, { stream: true });
+  }
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { for (const chunk of head) controller.enqueue(chunk); },
+    async pull(controller) {
+      const { value, done } = await reader.read();
+      if (done) controller.close(); else controller.enqueue(value);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+  if (/^(?::|(?:data|event|id|retry):)/.test(start.trimStart())) return { events: body };
+  return { json: JSON.parse(await new Response(body).text()) };
+}
+
+/** A stream that ended cleanly without its terminal event. Unlike a cut
+ * connection this is the endpoint (usually a proxy) not speaking the protocol. */
+class StreamEndedEarly extends Error {}
+
+/** Send a streaming request and read it, asking once more if the stream ends
+ * without its terminal event. Retried as an interruption it would be repeated,
+ * and paid for, on every attempt, so a second such end is a protocol error the
+ * retry policy does not repeat (#396 review item 11). */
+export async function readStreamOnceMore<T>(provider: string, attempt: () => Promise<T>): Promise<T> {
+  try { return await attempt(); }
+  catch (error) {
+    if (!(error instanceof StreamEndedEarly)) throw error;
+  }
+  try { return await attempt(); }
+  catch (error) {
+    if (error instanceof StreamEndedEarly) throw new Error(`${provider} protocol error: the stream ended twice without its terminal event`);
+    throw error;
+  }
+}
+
 /** Server-sent events (the subset providers use: `event`/`data` fields, LF or CRLF). */
 export async function* serverSentEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<{ event?: string; data: string }> {
   const reader = body.getReader();
@@ -64,12 +112,13 @@ const ANTHROPIC_ERROR_STATUS: Record<string, number> = {
 
 /** Anthropic Messages API: `stream: true` → the same message object as `res.json()`. */
 export async function readAnthropicMessage(res: Response, onText: TextListener): Promise<any> {
-  if (!isEventStream(res) || !res.body) return res.json();
+  const body = await eventStreamOrJson(res);
+  if ('json' in body) return body.json;
   let message: any = {};
   const content: any[] = [];
   const inputJson = new Map<number, string>();
   const text = () => content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n');
-  for await (const { data } of serverSentEvents(res.body)) {
+  for await (const { data } of serverSentEvents(body.events)) {
     const event = JSON.parse(data);
     switch (event.type) {
       case 'message_start':
@@ -117,20 +166,27 @@ export async function readAnthropicMessage(res: Response, onText: TextListener):
         break; // ping and future event types
     }
   }
-  throw new Error('turn interrupted before completion: the Anthropic stream ended before message_stop');
+  throw new StreamEndedEarly('turn interrupted before completion: the Anthropic stream ended before message_stop');
 }
 
 /** HTTP status OpenAI returns for the error codes a Responses stream can carry. */
 const OPENAI_ERROR_STATUS: Record<string, number> = {
-  invalid_api_key: 401, rate_limit_exceeded: 429, insufficient_quota: 429, server_error: 500,
+  invalid_api_key: 401, rate_limit_exceeded: 429, insufficient_quota: 429, server_error: 500, invalid_prompt: 400,
 };
+
+/** A stream `error` event, or a response that failed mid-generation, reads
+ * exactly like the same error returned as an HTTP status before the stream
+ * began, so a transient outage is still retried (#396 review item 4). */
+const openAiStreamFailure = (error: Record<string, unknown>) => providerErrorFromMessage('codex',
+  `OpenAI Responses API ${OPENAI_ERROR_STATUS[String(error.code)] ?? 'stream error'}: ${JSON.stringify({ error }).slice(0, 500)}`, 'structured');
 
 /** OpenAI Responses API: `stream: true` → its terminal event's response object,
  * which is the same object `res.json()` returns (status, output, usage). */
 export async function readOpenAiResponse(res: Response, onText: TextListener): Promise<any> {
-  if (!isEventStream(res) || !res.body) return res.json();
+  const body = await eventStreamOrJson(res);
+  if ('json' in body) return body.json;
   const parts = new Map<string, string>();
-  for await (const { data } of serverSentEvents(res.body)) {
+  for await (const { data } of serverSentEvents(body.events)) {
     if (data === '[DONE]') continue;
     const event = JSON.parse(data);
     switch (event.type) {
@@ -142,16 +198,16 @@ export async function readOpenAiResponse(res: Response, onText: TextListener): P
       }
       case 'response.completed':
       case 'response.incomplete':
-      case 'response.failed':
         return event.response;
+      case 'response.failed':
+        throw openAiStreamFailure(event.response?.error ?? {});
       case 'error': {
         const { type: _type, sequence_number: _sequence, ...error } = event;
-        const status = OPENAI_ERROR_STATUS[String(error.code)] ?? 'stream error';
-        throw providerErrorFromMessage('codex', `OpenAI Responses API ${status}: ${JSON.stringify({ error }).slice(0, 500)}`, 'structured');
+        throw openAiStreamFailure(error);
       }
       default:
         break;
     }
   }
-  throw new Error('turn interrupted before completion: the OpenAI Responses stream ended before its terminal event');
+  throw new StreamEndedEarly('turn interrupted before completion: the OpenAI Responses stream ended before its terminal event');
 }

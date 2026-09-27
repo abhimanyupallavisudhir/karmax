@@ -26,7 +26,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { EvalResult } from '../domain/search.js';
-import type { TaskView } from '../domain/types.js';
+import type { KarmaxEvent, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -72,6 +72,7 @@ import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault
 import { defaultCdpUrl } from '../autonomy/cdp-endpoint.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
+import { authorizationChanged, authorizationEpoch } from '../store/authorization-epoch.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
@@ -540,8 +541,12 @@ export const DEFAULT_GATEWAY_PORT = 4505;
 const LOGIN_MAX_FAILURES = 10;
 const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
-/** How long a live event socket reuses a task visibility decision (LT-15). */
-const SOCKET_DECISION_TTL_MS = 60_000;
+/** How long a live event socket reuses a task visibility decision (LT-15)
+ * when nothing in this process has changed authorization: the bound for
+ * revocations made by another replica. */
+const SOCKET_DECISION_TTL_MS = 5_000;
+/** Past this much unsent data a socket gets only the latest streamed text. */
+const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -616,6 +621,7 @@ export class Gateway {
     if (deps.identity) {
       deps.tokens.connectIdentitySessions((sessionId, userId) => deps.identity!.sessionActive(sessionId, userId));
       deps.identity.connectSessionRevocation?.(async userId => {
+        authorizationChanged(); // sessions live in the identity database, outside the Store's watch
         for (const [key, cached] of this.identityTokens) if (cached.userId === userId) {
           this.identityTokens.delete(key);
           await deps.tokens.revoke(cached.apiToken);
@@ -701,15 +707,18 @@ export class Gateway {
     });
     // Decide each task's visibility once and reuse it (LT-15): re-verifying the
     // token cost several store reads per event per socket, and a streaming agent
-    // publishes several events a second. A decision lasts until the token
-    // expires and at most SOCKET_DECISION_TTL_MS, so revocation and membership
-    // changes still reach sockets that stay open.
-    const decisions = new Map<string, { allowed: Promise<boolean>; until: number }>();
+    // publishes several events a second. A decision lasts until this process
+    // commits anything that can withdraw access (revocation, member removal,
+    // project transfer), until the token expires, and at most
+    // SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
+    const decisions = new Map<string, { allowed: Promise<boolean>; until: number; epoch: number }>();
     const mayRead = (projectId: string | undefined, taskId: string): Promise<boolean> => {
       const key = `${projectId ?? ''}\0${taskId}`;
       const cached = decisions.get(key);
-      if (cached && cached.until > Date.now()) return cached.allowed;
+      if (cached && cached.until > Date.now() && cached.epoch === authorizationEpoch()) return cached.allowed;
       if (decisions.size >= 4096) decisions.clear();
+      // Read before deciding: a change committed while the check runs moves it again.
+      const epoch = authorizationEpoch();
       const allowed = (async () => {
         if ((await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok) return true;
         const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
@@ -717,13 +726,35 @@ export class Gateway {
       })();
       // A failed lookup is not a decision: the next event asks again.
       allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
-      decisions.set(key, { allowed, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS, scoped?.expiresAt ?? Infinity) });
+      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS, scoped?.expiresAt ?? Infinity) });
       return allowed;
     };
-    const off = this.fanout.on(async (ev, projectId) => {
+    // Streamed text supersedes itself, so a client that has fallen behind gets
+    // only each agent's latest text once its buffer drains, never every window
+    // (#396 review item 2). Everything else keeps its order and the hard bound.
+    const heldOutput = new Map<string, { ev: KarmaxEvent & { seq?: number }; projectId?: string }>();
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const releaseHeld = () => {
+      drainTimer ??= setTimeout(() => {
+        drainTimer = undefined;
+        if (ws.readyState !== WebSocketClient.OPEN) return;
+        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { releaseHeld(); return; }
+        const held = [...heldOutput.values()];
+        heldOutput.clear();
+        for (const { ev, projectId } of held) void deliver(ev, projectId);
+      }, 100);
+      drainTimer.unref?.();
+    };
+    lifetime.add(() => { if (drainTimer) clearTimeout(drainTimer); });
+    const deliver = async (ev: KarmaxEvent & { seq?: number }, projectId?: string) => {
       // Reconnect/backfill from durable state rather than allowing a slow
       // browser's send queue to grow without bound.
       if (ws.readyState !== WebSocketClient.OPEN) return;
+      if (ev.type === 'agent.output' && (ev.payload as { source?: unknown }).source === 'assistant') {
+        const key = `${ev.taskId}\0${String((ev.payload as { role?: unknown }).role ?? '')}`;
+        heldOutput.delete(key);
+        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { heldOutput.set(key, { ev, projectId }); releaseHeld(); return; }
+      }
       if (ws.bufferedAmount > 2 * 1024 * 1024) {
         ws.close(1013, 'Client fell behind; reconnect to refresh');
         return;
@@ -741,7 +772,8 @@ export class Gateway {
         if (ws.readyState !== WebSocketClient.OPEN) return;
         ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId, ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
-    }, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
+    };
+    const off = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
     lifetime.add(off);
   }
 

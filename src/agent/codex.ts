@@ -1,6 +1,6 @@
 import { workEnvironment, codexWorkProfile } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
-import { readOpenAiResponse } from './api-streams.js';
+import { readOpenAiResponse, readStreamOnceMore } from './api-streams.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
 import { selectedCodexMcpFlags } from '../mcp/connections/codex-selection.js';
@@ -312,7 +312,7 @@ export class CodexAdapter implements AgentAdapter {
       const reasoningEffort = codexReasoningEffort(model, input.profile.effort);
       if (reasoningEffort) body.reasoning = { effort: reasoningEffort };
 
-      const data = await timed('provider.roundtrip', async () => {
+      const data = await timed('provider.roundtrip', () => readStreamOnceMore('OpenAI Responses API', async () => {
         const res = await fetch(`${baseUrl}/responses`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
@@ -326,7 +326,7 @@ export class CodexAdapter implements AgentAdapter {
       const data = await readOpenAiResponse(res, (text) => ctx.emit(text, 'assistant'));
       (await (await currentTiming())?.markOnce('first.output'));
       return data;
-      });
+      }));
       // Usage accounting is required even when timing collection is absent.
       const roundUsage = reportedUsage.add(data.usage, 'codex');
       (await (await currentTiming())?.mark('provider.usage', roundUsage));
