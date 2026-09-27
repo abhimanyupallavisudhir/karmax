@@ -17491,7 +17491,9 @@ async function hydrateOrganizationSubscription(organizationId) {
   box.querySelector('.billing-reconcile')?.addEventListener('click', async () => {
     try {
       const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/reconcile`, { method: 'POST' });
-      toast(result.reconciled ? 'Billing result confirmed. You can continue.' : 'Result still uncertain. Contact billing support; no payment has been retried.', !result.reconciled);
+      toast(!result.reconciled ? 'Result still uncertain. Contact billing support; no payment has been retried.'
+        : result.applied === false ? 'Nothing was changed or charged. You can try again.'
+        : 'Billing result confirmed. You can continue.', !result.reconciled);
       await hydrateOrganizationSubscription(organizationId);
     } catch (error) { toast(error.message, true); }
   });

@@ -147,19 +147,22 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
         items: { data: s.items.map((item: any) => ({ id: item.price?.id,
           price: { id: item.price?.id, product: item.price?.product_id }, quantity: item.quantity })) } } } };
   }
+  /** Absence is claimed only from a successful, complete read showing that the
+   * write had no effect; anything ambiguous stays null for an operator. */
   async reconcileRequest(intent: BillingRequestIntent, reference: string, createdAt: number) {
+    const absent = { absent: true } as const;
     if (intent.kind === 'abandon') {
       if (!intent.checkoutId) return null;
       const transaction = await this.request(`/transactions/${encodeURIComponent(intent.checkoutId)}`, 'GET');
-      return transaction.status === 'canceled' ? { id: intent.checkoutId } : null;
+      return transaction.status === 'canceled' ? { id: intent.checkoutId } : absent;
     }
     if (intent.kind !== 'checkout') {
       if (!intent.subscriptionId) return null;
       const subscription = await this.request(`/subscriptions/${encodeURIComponent(intent.subscriptionId)}`, 'GET');
       if (intent.kind === 'cancel') return subscription.status === 'canceled' || subscription.scheduled_change?.action === 'cancel'
-        ? { id: intent.subscriptionId } : null;
-      return intent.plan && intent.seats && sameItems(subscription.items, await this.items(intent.plan, intent.seats))
-        ? { id: intent.subscriptionId } : null;
+        ? { id: intent.subscriptionId } : absent;
+      if (!intent.plan || !intent.seats) return null;
+      return sameItems(subscription.items, await this.items(intent.plan, intent.seats)) ? { id: intent.subscriptionId } : absent;
     }
     if (!intent.plan || !intent.seats || !intent.successUrl) return null;
     let found: any;
@@ -173,10 +176,13 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       // or caller-chosen idempotency keys as a tenant association.
       let next: string | null = `/transactions?per_page=200&origin=api&created_at[GTE]=${encodeURIComponent(new Date(createdAt - 60_000).toISOString())}`;
       const matches: any[] = [];
+      let foreign = false;
       for (let page = 0; next && page < 20; page++) {
         const result = await this.request(next, 'GET', undefined, true);
         if (!Array.isArray(result.data)) throw new Error('Paddle transaction reconciliation returned invalid data');
-        matches.push(...result.data.filter((t: any) => t.origin === 'api' && t.custom_data?.karmax_request === `${reference}:checkout`));
+        const carrying = result.data.filter((t: any) => t.custom_data?.karmax_request === `${reference}:checkout`);
+        matches.push(...carrying.filter((t: any) => t.origin === 'api'));
+        foreign ||= carrying.some((t: any) => t.origin !== 'api');
         next = result.meta?.pagination?.has_more ? result.meta.pagination.next : null;
         if (next) {
           const config = await this.source();
@@ -186,7 +192,10 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
           next = url.pathname + url.search;
         }
       }
-      if (next || matches.length !== 1) return null;
+      if (next || matches.length > 1) return null;
+      // A non-API transaction carrying the server reference is an anomaly for
+      // an operator, never evidence either way.
+      if (!matches.length) return foreign ? null : absent;
       found = matches[0];
     }
     if (found.collection_mode !== 'automatic' || !/^txn_[a-z0-9]+$/.test(found.id)
