@@ -4,7 +4,8 @@ Living reference docs for karmax. Build, test and architecture rules are in
 [CLAUDE.md](../CLAUDE.md) and [TESTING.md](../TESTING.md); hosting in
 [HOSTING.md](../HOSTING.md) and [deploy/README.md](../deploy/README.md). Design
 contracts (SPEC), production operations, incident lessons, historical PLAN-* designs
-and past reviews live in the project wiki (`krmax-wiki-8362c77d`).
+and code reviews with their open-item trackers (`reviews/`) live in the project wiki
+(`krmax-wiki-8362c77d`).
 
 | Doc | Read when |
 | --- | --- |
@@ -16,4 +17,3 @@ and past reviews live in the project wiki (`krmax-wiki-8362c77d`).
 | [paid-launch-checklist.md](paid-launch-checklist.md) | Preparing a hosted installation to take payments |
 | [resource-revision-verification.md](resource-revision-verification.md) | Verifying the bytes of a historical project-resource revision |
 | [response-timing.md](response-timing.md) | Measuring task-start or reply latency; generated results are in [benchmarks/results/](../benchmarks/results/) |
-| [review-2026-09-26.md](review-2026-09-26.md) | Working on a finding from the current codebase review (the 2026-09-08 review moved to the wiki's `reviews/`) |
