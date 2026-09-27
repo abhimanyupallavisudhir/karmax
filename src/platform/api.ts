@@ -3089,8 +3089,13 @@ export class KarmaxApi {
     if (target === 'done') {
       const from = task.params.draft ? 'draft' : view.state?.humanPauseOrigin ? 'human' : view.stage;
       const checkpoint = task.params.draft ? undefined : (await this.transitionCheckpoint(view, view.stage));
-      if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status))
-        await this.stopTaskActivity(task, view, 'Task marked done manually', 'cancel');
+      if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status)) {
+        // Stop the run as a replacement, not a cancellation: cancellation
+        // cleanup closes open pull requests, silently dropping work the person
+        // just declared done (task #395). No successor run follows.
+        await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
+        (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
+      }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       const done: TaskView = {
         ...view,
@@ -4082,6 +4087,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    */
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     const caller = (await this.require(token, 'search_tasks', { projectId }));
+    return this.searchAuthorizedTasks(projectId, query, caller.principal, now);
+  }
+
+  /** Evaluate a search for a principal already authorized for `task:read` in
+   *  `projectId`. Global console search authorizes a browser session's projects
+   *  directly rather than minting a token for each (UI-18/RQ-14). */
+  async searchAuthorizedTasks(projectId: string, query: string | TaskQuery, principalId: string, now = Date.now()): Promise<EvalResult> {
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
     // Conversation search is intentionally explicit. Every other query uses the
     // compact projection so routine list filtering never parses all transcripts.
@@ -4098,7 +4110,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       includeArchived: !activeOnly, includeConversation: needsConversation,
     })) tasks.push(...page);
     const tags = await this.deps.store.listTagsAsync(projectId);
-    const principal = principalRefOf(caller.principal);
+    const principal = principalRefOf(principalId);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
   }
 

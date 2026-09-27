@@ -51,9 +51,14 @@ export interface Puller {
 export interface ImapOpts { servername?: string; host: string; port: number; secure: boolean; user: string; pass: string }
 export interface ImapMessage { uid: number; source: string }
 export interface ImapConn {
-  fetchSince(lastUid: number): Promise<ImapMessage[]>;
+  /** INBOX UIDs in `from..to` (to the newest when `to` is omitted), ascending. */
+  uids(from: number, to?: number): Promise<number[]>;
+  fetch(uids: number[]): Promise<ImapMessage[]>;
   close(): Promise<void>;
 }
+
+/** Messages one poll fetches; new mail always takes the batch first. */
+const IMAP_BATCH = 50;
 
 export class ImapPuller implements Puller {
   constructor(private config: MailboxConfig, private deps: PullDeps) {}
@@ -80,10 +85,28 @@ export class ImapPuller implements Puller {
     const conn = await open({ host, servername: imap.host, port: imap.port, secure: imap.secure, user: imap.user, pass });
     let delivered = 0;
     const uidKey = `agent-mail:imap-uid:${this.deps.organizationId ?? 'legacy'}`;
-    let maxUid = Number((await this.deps.store.kvGet(uidKey)) ?? 0);
+    const gapKey = `agent-mail:imap-gaps:${this.deps.organizationId ?? 'legacy'}`;
+    const stored = await this.deps.store.kvGet(uidKey);
+    let maxUid = Number(stored ?? 0);
+    const gaps: Array<[number, number]> = JSON.parse((await this.deps.store.kvGet(gapKey)) ?? '[]');
     try {
-      const messages = await conn.fetchSince(maxUid);
-      for (const m of messages.sort((a, b) => a.uid - b.uid)) {
+      // Newest first, so a verification code never waits behind a backlog.
+      // History from before the first poll is not agent mail and is skipped;
+      // mail skipped since then (a burst larger than a batch) is backfilled.
+      const fresh = (await conn.uids(maxUid + 1)).filter(uid => uid > maxUid);
+      const wanted = fresh.slice(-IMAP_BATCH);
+      if (stored !== undefined && fresh.length > wanted.length) gaps.push([maxUid + 1, wanted[0]! - 1]);
+      if (wanted.length) maxUid = wanted.at(-1)!;
+      while (wanted.length < IMAP_BATCH && gaps.length) {
+        const [from, to] = gaps.at(-1)!;
+        const missed = await conn.uids(from, to);
+        const backfill = missed.slice(-(IMAP_BATCH - wanted.length));
+        if (backfill.length < missed.length) gaps[gaps.length - 1] = [from, backfill[0]! - 1];
+        else gaps.pop();
+        wanted.push(...backfill);
+      }
+      const messages = new Map((wanted.length ? await conn.fetch(wanted) : []).map(m => [m.uid, m]));
+      for (const m of wanted.map(uid => messages.get(uid)).filter((m): m is ImapMessage => !!m)) {
         const to = firstDeliveredTo(m.source) ?? firstHeader(m.source, 'to');
         const from = firstHeader(m.source, 'from');
         if (to) {
@@ -93,12 +116,12 @@ export class ImapPuller implements Puller {
           }));
           if (ok) delivered++;
         }
-        if (m.uid > maxUid) maxUid = m.uid;
       }
     } finally {
       await conn.close().catch(() => undefined);
     }
     (await this.deps.store.kvSet(uidKey, String(maxUid)));
+    (await this.deps.store.kvSet(gapKey, JSON.stringify(gaps)));
     return delivered;
   }
 }
@@ -117,13 +140,23 @@ async function defaultOpenImap(opts: ImapOpts): Promise<ImapConn> {
   deadline.unref();
   try { await client.connect(); } catch (error) { clearTimeout(deadline); client.close(); throw error; }
   return {
-    async fetchSince(lastUid: number): Promise<ImapMessage[]> {
+    async uids(from: number, to?: number): Promise<number[]> {
+      const lock = await client.getMailboxLock('INBOX');
+      try {
+        // `n:*` always matches the newest message, even below n.
+        const found: number[] = (await client.search({ uid: `${from}:${to ?? '*'}` }, { uid: true })) || [];
+        return found.filter(uid => uid >= from && uid <= (to ?? Infinity)).sort((a, b) => a - b);
+      } finally {
+        lock.release();
+      }
+    },
+    async fetch(uids: number[]): Promise<ImapMessage[]> {
       const out: ImapMessage[] = [];
       const lock = await client.getMailboxLock('INBOX');
       try {
-        for await (const msg of client.fetch({ uid: `${lastUid + 1}:*` }, { uid: true, source: { maxLength: 65_536 } })) {
-          if (msg.uid > lastUid && msg.source) out.push({ uid: msg.uid, source: msg.source.toString('utf8') });
-          if (out.length >= 50) break;
+        for await (const msg of client.fetch(uids.join(','), { uid: true, source: { maxLength: 65_536 } }, { uid: true })) {
+          if (msg.source) out.push({ uid: msg.uid, source: msg.source.toString('utf8') });
+          if (out.length >= IMAP_BATCH) break;
         }
       } finally {
         lock.release();

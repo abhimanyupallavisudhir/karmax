@@ -220,9 +220,9 @@ describe('runner capacity and world lifecycle', () => {
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', parkable: true,
       async listUsageEvents() {
-        return [{ id: 'execution-1', sandboxId: 'sandbox-1', taskId: task.id,
+        return { events: [{ id: 'execution-1', sandboxId: 'sandbox-1', taskId: task.id,
           startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
-          activeMs: 300_000, cpu: 2, memoryMb: 512 }];
+          activeMs: 300_000, cpu: 2, memoryMb: 512 }] };
       } } as any);
     const usage = vi.spyOn(worlds.get('e2b'), 'listUsageEvents');
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
@@ -234,9 +234,9 @@ describe('runner capacity and world lifecycle', () => {
     // attribution, hydrating conversations, or issuing duplicate writes.
     await new WorldLifecycleManager(store, worlds, {} as any).sweep(Date.UTC(2026, 6, 31, 10, 7));
     expect(record).toHaveBeenCalledTimes(1);
-    expect(usage).toHaveBeenLastCalledWith(organization.id, Date.UTC(2026, 6, 31, 9, 6));
+    expect(usage).toHaveBeenLastCalledWith(organization.id, Date.UTC(2026, 6, 31, 9, 6), undefined);
     await lifecycle.sweep(Date.UTC(2026, 7, 1, 10, 7));
-    expect(usage).toHaveBeenLastCalledWith(organization.id, undefined);
+    expect(usage).toHaveBeenLastCalledWith(organization.id, undefined, undefined);
     expect(hydrate).not.toHaveBeenCalled();
 
     // 5 minutes × (2 × $0.000014/vCPU/s + 0.5 × $0.0000045/GiB/s)
@@ -263,7 +263,7 @@ describe('runner capacity and world lifecycle', () => {
     (await store.upsertWorldProviderConnection({ organizationId: organization.id, provider: 'e2b', credentialHandle: 'test:e2b', enabled: true }));
     const events = Array.from({ length: 550 }, (_, index) => ({ id: `execution-${index}`, sandboxId: `sandbox-${index}`,
       taskId: index === 0 ? foreignTask.id : task.id, startedAt: 1000, endedAt: 2000, activeMs: 1000, cpu: 1, memoryMb: 512 }));
-    const listUsageEvents = vi.fn(async () => events);
+    const listUsageEvents = vi.fn(async () => ({ events }));
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', parkable: true, listUsageEvents } as any);
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any);
@@ -284,6 +284,38 @@ describe('runner capacity and world lifecycle', () => {
     await lifecycle.sweep();
     expect(record).toHaveBeenCalledTimes(551);
     expect((await store.usageSummary(organization.id)).events).toBe(551);
+    (await store.close());
+  });
+
+  // LT-19: a feed too long for one sweep records what each sweep read and
+  // resumes from the provider's offset, so usage always makes progress.
+  it('records a long usage feed across sweeps, resuming where each one stopped', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Busy', ownerUserId: 'owner' }));
+    (await store.upsertWorldProviderConnection({ organizationId: organization.id, provider: 'e2b', credentialHandle: 'test:e2b', enabled: true }));
+    const event = (id: string) => ({ id, sandboxId: id, startedAt: 1000, endedAt: 2000, activeMs: 1000, cpu: 1, memoryMb: 512 });
+    const listUsageEvents = vi.fn(async (_organizationId: string, _since?: number, resumeAt?: number) =>
+      resumeAt === undefined ? { events: [event('newest')], resumeAt: 100 }
+        : resumeAt === 100 ? { events: [event('middle')], resumeAt: 200 } : { events: [event('oldest')] });
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true, listUsageEvents } as any);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any);
+    const started = Date.UTC(2026, 6, 31, 10);
+    const sync = async () => JSON.parse((await store.kvGet(`usage-sync:${organization.id}:e2b`))!);
+    await lifecycle.sweep(started);
+    expect((await store.usageSummary(organization.id)).events).toBe(1);
+    expect(await sync()).toMatchObject({ status: 'catching-up', scan: { resumeAt: 100, startedAt: started } });
+    await lifecycle.sweep(started + 60_000);
+    expect(listUsageEvents).toHaveBeenLastCalledWith(organization.id, undefined, 100);
+    await lifecycle.sweep(started + 120_000);
+    expect(listUsageEvents).toHaveBeenLastCalledWith(organization.id, undefined, 200);
+    expect((await store.usageSummary(organization.id)).events).toBe(3);
+    // Coverage runs to when the scan began: later events are read next.
+    const done = await sync();
+    expect(done).toMatchObject({ status: 'ready', lastSuccessfulAt: started, lastFullScanAt: started });
+    expect(done.scan).toBeUndefined();
+    await lifecycle.sweep(started + 180_000);
+    expect(listUsageEvents).toHaveBeenLastCalledWith(organization.id, started - 60 * 60_000, undefined);
     (await store.close());
   });
 

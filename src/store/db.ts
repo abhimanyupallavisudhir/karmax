@@ -1142,6 +1142,24 @@ export class Store {
     );
   }
 
+  /** Projects a user's grants or memberships reach, directly or through a team
+   *  or organization. Candidates only: authorization still decides each one. */
+  async listProjectsReachableBy(userId: string): Promise<Project[]> {
+    return (await this.readRows<any>(`SELECT p.* FROM projects p WHERE EXISTS (SELECT 1 FROM principal_grants g
+        WHERE g.principalId=? AND (g.scopeKey='global' OR g.scopeKey='project:' || p.id
+          OR g.scopeKey='organization:' || COALESCE(p.organizationId, 'org_personal')))
+      OR EXISTS (SELECT 1 FROM project_memberships m WHERE m.projectId=p.id AND (m.principalKey=?
+        OR m.principalKey IN (SELECT 'team:' || teamId FROM team_memberships WHERE userId=?)
+        OR m.principalKey IN (SELECT 'organization:' || organizationId FROM organization_memberships WHERE userId=?)))
+      ORDER BY p.ord, p.createdAt`, [`user:${userId}`, `user:${userId}`, userId, userId])).map(rowToProject);
+  }
+
+  /** One organization's projects, without reading any other tenant's rows. */
+  async listOrganizationProjects(organizationId: string): Promise<Project[]> {
+    return (await this.readRows<any>(`SELECT * FROM projects WHERE COALESCE(organizationId, 'org_personal')=?
+      ORDER BY ord, createdAt`, [organizationId])).map(rowToProject);
+  }
+
   async renameProject(id: string, name: string): Promise<Project> {
     return this.projectNameTransaction(async () => {
 
@@ -3742,6 +3760,10 @@ export class Store {
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
       }
+    } else if (messages === undefined && transcripts === undefined) {
+      // A status-only view (reconcile and lifecycle repairs read `lastView`
+      // without the conversation column) must never erase the stored transcript.
+      (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
     } else {
       (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=?, conversationRef=NULL WHERE id=?')
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
@@ -3767,7 +3789,12 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
-  
+    // `retentionSweep` measures its window from here: a workflow's `updatedAt`
+    // is its history length, not a time. Resuming the task restarts the clock.
+    if (['done', 'cancelled', 'failed'].includes(view.status))
+      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:settled:${taskId}`, String(Date.now())));
+    else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:settled:${taskId}`));
+
     });
   }
 
@@ -5107,7 +5134,8 @@ export class Store {
       for (const share of (await this.kvEntries(sharePrefix))) (await exact.run(`conversation-share:${share.value}`));
       await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
+        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
+        `retention:settled:${taskId}`, `retention:view:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) await this.kvDeletePrefix(value);
     }
@@ -7458,9 +7486,14 @@ export class Store {
     // still refer to an older revision while the workflow is live; settled tasks
     // older than a week no longer need those superseded copies.
     let viewSnapshots = 0, publicationFences = 0, turnSessions = 0;
-    const settled = await this.db.prepare(`SELECT id, conversationRef FROM tasks
-      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled')
-        AND CAST(json_extract(lastView, '$.updatedAt') AS BIGINT) < ?
+    // Tasks that settled before settle times were recorded start their window now.
+    (await this.db.prepare(`INSERT OR IGNORE INTO kv(k,v) SELECT 'retention:settled:' || id, ? FROM tasks
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`).run(String(now)));
+    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef FROM tasks
+      JOIN kv settle ON settle.k='retention:settled:' || tasks.id
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
+        AND CAST(settle.v AS BIGINT) < ?
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`)
       .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
     for (const task of settled) {

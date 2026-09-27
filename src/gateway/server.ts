@@ -4554,7 +4554,7 @@ export class Gateway {
       if (p === '/api/search' && method === 'GET') {
         const query = url.searchParams.get('q')?.trim() ?? '';
         if (query.length > 2000) return this.json(res, 400, { error: 'Search is too long' });
-        return this.json(res, 200, await this.searchProjects(req, res, query));
+        return this.json(res, 200, await this.searchProjects(req, res, session, query));
       }
       if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, (await api.searchFields(token)));
 
@@ -8591,17 +8591,52 @@ export class Gateway {
     (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
   }
 
-  private async searchProjects(req: http.IncomingMessage, res: http.ServerResponse, query: string) {
+  /** An organization that enforces SSO admits only its provider's sessions. */
+  private async ssoAdmits(userId: string, email: string | undefined, organizationId: string): Promise<boolean> {
+    const policy = await this.deps.store.getOrganizationIdentityPolicyAsync(organizationId);
+    if (!policy.enforceSso) return true;
+    if (!policy.oidcProviderId || !(await this.deps.identity!.providersForUserAsync(userId)).includes(policy.oidcProviderId)) return false;
+    if (policy.verifiedDomains.length && await this.deps.store.hasOrganizationMembershipAsync(organizationId, userId)) {
+      const domain = email?.split('@')[1]?.toLowerCase();
+      if (!domain || !policy.verifiedDomains.includes(domain)) return false;
+    }
+    return true;
+  }
+
+  /** Global search visits only the projects the caller can read, resolved once:
+   *  a browser session's from its grants and memberships, authorized directly
+   *  (minting a token per project wrote tokens on every keystroke); a bearer's
+   *  from its own scope (UI-18/RQ-14). */
+  private async searchProjects(_req: http.IncomingMessage, res: http.ServerResponse, session: Session, query: string) {
     const results: { projectId: string; tasks: EvalResult['tasks']; total: number }[] = [];
     if (query.length < 2) return results;
-    for (const project of await this.deps.store.listProjects()) {
+    const { authorization, identity, store, tokens, api } = this.deps;
+    const member = session.userId && identity && authorization ? session.userId : undefined;
+    let projects: Project[];
+    if (member) projects = await store.listProjectsReachableBy(member);
+    else {
+      const record = await tokens.verify(session.apiToken);
+      if (!record || !allows(record.caps, 'project:read') || !allows(record.caps, 'task:read')) return results;
+      const ids = record.projectId ? [record.projectId] : record.projectIds;
+      projects = ids?.length ? (await Promise.all(ids.map(id => store.getProject(id)))).filter((p): p is Project => !!p)
+        : record.organizationId ? await store.listOrganizationProjects(record.organizationId)
+        : await store.listProjects(); // installation-wide authority
+    }
+    for (const project of projects) {
       if (res.destroyed) break;
-      const session = await this.auth(req, project.id, project.organizationId);
-      if (!session) continue;
-      const scope = { projectId: project.id };
-      if (!(await this.deps.tokens.check(session.apiToken, 'project:read', scope)).ok
-        || !(await this.deps.tokens.check(session.apiToken, 'task:read', scope)).ok) continue;
-      const result = await this.deps.api.searchTasks(session.apiToken, project.id, query);
+      let result: EvalResult;
+      if (member) {
+        const organizationId = project.organizationId ?? 'org_personal';
+        const caps = await authorization!.capabilitiesAsync(`user:${member}`, project.id, organizationId);
+        if (!allows(caps, 'project:read') || !allows(caps, 'task:read')
+          || !(await this.ssoAdmits(member, session.email, organizationId))) continue;
+        result = await api.searchAuthorizedTasks(project.id, query, `user:${member}`);
+      } else {
+        const scope = { projectId: project.id };
+        if (!(await tokens.check(session.apiToken, 'project:read', scope)).ok
+          || !(await tokens.check(session.apiToken, 'task:read', scope)).ok) continue;
+        result = await api.searchTasks(session.apiToken, project.id, query);
+      }
       results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
     }
     return results;
@@ -8628,15 +8663,8 @@ export class Gateway {
     if (((await this.deps.paidLaunchSettings?.publicLaunchInfo()) ?? publicLaunchInfo()).paidLaunch && !await this.deps.store.hasSignupAcceptanceAsync(identity.user.id)) return undefined;
     const principal = `user:${identity.user.id}`;
     const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
-    if (resolvedOrganizationId) {
-      const policy = await this.deps.store.getOrganizationIdentityPolicyAsync(resolvedOrganizationId);
-      if (policy.enforceSso && (!policy.oidcProviderId
-        || !(await this.deps.identity.providersForUserAsync(identity.user.id)).includes(policy.oidcProviderId))) return undefined;
-      if (policy.enforceSso && policy.verifiedDomains.length && await this.deps.store.hasOrganizationMembershipAsync(resolvedOrganizationId, identity.user.id)) {
-        const domain = identity.user.email.split('@')[1]?.toLowerCase();
-        if (!domain || !policy.verifiedDomains.includes(domain)) return undefined;
-      }
-    }
+    if (resolvedOrganizationId && !(await this.ssoAdmits(identity.user.id, identity.user.email, resolvedOrganizationId)))
+      return undefined;
     const caps = await this.deps.authorization?.capabilitiesAsync(principal, projectId, resolvedOrganizationId) ?? [];
     const fingerprint = JSON.stringify(caps.slice().sort());
     const cacheKey = `${identity.session.id}:${resolvedOrganizationId ?? 'global'}:${projectId ?? '*'}`;

@@ -179,3 +179,65 @@ export -f git
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// CI-3: the detached runner executes a copy of the updater from
+// deploy/.updates/<key>/, which must still find the instance it updates. This
+// runs the real deploy step, runner and updater against a configured checkout;
+// only Docker (and the SSH hop) are fakes.
+it('updates a configured instance through the detached copy of the updater', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-e2e-'));
+  const origin = path.join(root, 'origin.git');
+  const host = path.join(root, 'opt-karmax');
+  const bin = path.join(root, 'bin');
+  const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  try {
+    fs.mkdirSync(bin);
+    execFileSync('git', ['init', '-q', '--bare', '-b', 'master', origin]);
+    execFileSync('git', ['clone', '-q', origin, host]);
+    git(host, 'config', 'user.name', 'Deployment Test');
+    git(host, 'config', 'user.email', 'deploy@example.test');
+    fs.mkdirSync(path.join(host, 'deploy'));
+    for (const file of ['karmax', 'update-runner.sh', 'compact-backups.sh', 'compose.turnkey.yml'])
+      fs.copyFileSync(path.join(repoRoot, 'deploy', file), path.join(host, 'deploy', file));
+    git(host, 'add', '.'); git(host, 'commit', '-qm', 'live'); git(host, 'push', '-q', 'origin', 'master');
+    const live = git(host, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(host, 'feature.txt'), 'candidate\n');
+    git(host, 'add', '.'); git(host, 'commit', '-qm', 'candidate'); git(host, 'push', '-q', 'origin', 'master');
+    const candidate = git(host, 'rev-parse', 'HEAD');
+    git(host, 'checkout', '-q', '--detach', live);
+    // The instance configuration lives beside the operator, outside Git.
+    fs.writeFileSync(path.join(host, 'deploy/.turnkey.env'), 'KARMAX_DOMAIN=example.com\nPOSTGRES_PASSWORD=fixture\n');
+    fs.mkdirSync(path.join(host, 'deploy/.secrets'));
+    for (const secret of ['auth_secret', 'vault_key', 'world_ref_key'])
+      fs.writeFileSync(path.join(host, 'deploy/.secrets', secret), secret);
+    const log = path.join(root, 'docker.jsonl');
+    fs.writeFileSync(path.join(bin, 'docker'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
+if (args.includes('cp')) {
+  fs.mkdirSync(args.at(-1), { recursive: true });
+  fs.writeFileSync(path.join(args.at(-1), 'manifest.json'), '{}');
+}
+if (args.includes('pg_dump')) process.stdout.write('dump');
+`, { mode: 0o755 });
+    const run = deploy.steps.find((step: any) => step.run?.includes('ssh -o')).run as string;
+    const result = spawnSync('bash', ['-eo', 'pipefail', '-c', `
+ssh() { (cd ${JSON.stringify(root)} && bash -c "\${@: -1}"); }
+` + run.replaceAll('/opt/karmax', host).replaceAll('~/.ssh', `'${root}/ssh'`).replaceAll('sleep 10', 'sleep 0.2')], {
+      cwd: root, encoding: 'utf8', timeout: 60_000, env: {
+        ...process.env, PATH: `${bin}:${process.env.PATH}`, DEPLOY_SHA: candidate, RUN_KEY: '7-1',
+        SSH_KEY: 'fake-key', KNOWN_HOSTS: 'fake-host', TARGET: 'fake-target',
+      } });
+    const status = path.join(host, 'deploy/.updates/7-1');
+    expect(result.status, `${result.stdout}\n${result.stderr}\n${fs.existsSync(path.join(status, 'log')) ? fs.readFileSync(path.join(status, 'log'), 'utf8') : ''}`).toBe(0);
+    expect(fs.readFileSync(path.join(status, 'status'), 'utf8').trim()).toBe('success');
+    expect(fs.readFileSync(path.join(status, 'log'), 'utf8')).toContain(`Update complete at ${candidate}.`);
+    expect(git(host, 'rev-parse', 'HEAD')).toBe(candidate);
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
+    // The copy drove the instance's own Compose project and environment.
+    expect(calls.some(args => args.includes('up') && args.includes(path.join(host, 'deploy/.turnkey.env')))).toBe(true);
+    expect(fs.readdirSync(path.join(host, 'deploy/backups')).some(name => name.startsWith('predeploy-'))).toBe(true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

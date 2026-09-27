@@ -29,7 +29,7 @@ case "$command" in
     ;;
   run)
     code=0
-    ( flock -n 9 || exit 73; "$run/karmax" update "$sha" ) 9>"$UPDATES/host.lock" || code=$?
+    ( flock -n 9 || exit 73; KARMAX_DEPLOY_DIR="$DEPLOY_DIR" "$run/karmax" update "$sha" ) 9>"$UPDATES/host.lock" || code=$?
     if [ "$code" -eq 0 ]; then printf 'success\n' > "$run/status.next"
     else printf 'failed:%s\n' "$code" > "$run/status.next"; fi
     mv "$run/status.next" "$run/status"

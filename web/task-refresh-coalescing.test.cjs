@@ -34,3 +34,33 @@ test('a lifecycle refresh re-resolves the widgets bound to the view', async () =
   await ctx.refreshTask('session.started');
   assert.deepEqual(reads.filter(url => url.endsWith('/widgets')), []);
 });
+test('LT-17: a sibling attempt\'s lifecycle refreshes the attempt cards, coalesced', async () => {
+  const reads = [], releases = [];
+  const src2 = (name) => { const at = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm')); return src.slice(at, src.indexOf('\n}', at) + 2); };
+  const ctx = vm.createContext({ S: { projectId: 'p', selected: 'a', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {},
+      attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
+    location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
+    patchTaskListFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false, scheduleTaskListReload: () => {},
+    taskRecord: () => ({}), projectById: () => ({}), pendingCancellationView: v => v, renderTaskPage: () => {},
+    api: url => {
+      reads.push(url);
+      if (url === '/api/tasks/a/attempts') return new Promise(r => releases.push(r));
+      return Promise.resolve(url === '/api/tasks/a' ? { taskId: 'a' } : []);
+    } });
+  vm.runInContext(fn, ctx);
+  vm.runInContext(src2('connectWs'), ctx); ctx.connectWs();
+  for (let i = 0; i < 20; i++) ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 'b', projectId: 'p', type: 'view.updated' }) });
+  const attempts = () => reads.filter(url => url === '/api/tasks/a/attempts');
+  assert.deepEqual(attempts(), ['/api/tasks/a/attempts']);
+  // Only the sibling's cards changed: the open attempt's own details are not re-read.
+  assert.deepEqual(reads.filter(url => /widgets|sessions/.test(url)), []);
+  releases.shift()({ principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b', stage: 'review' }] });
+  for (let i = 0; i < 10 && !releases.length; i++) await new Promise(r => setImmediate(r));
+  assert.deepEqual(attempts(), ['/api/tasks/a/attempts', '/api/tasks/a/attempts']);
+  releases.shift()({ principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b', stage: 'done' }] });
+  await refreshSettled(ctx);
+  assert.equal(ctx.S.attemptGroup.attempts[1].stage, 'done');
+});
+async function refreshSettled(ctx) {
+  for (let i = 0; i < 20 && ctx.refreshTask.pending?.size; i++) await new Promise(r => setImmediate(r));
+}

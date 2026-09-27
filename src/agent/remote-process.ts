@@ -1,4 +1,4 @@
-import { boundedExec } from '../world/bounded-exec.js';
+import { boundedExec, IncompleteOutputError } from '../world/bounded-exec.js';
 import { timed } from '../timing/index.js';
 import { mapBatches } from '../util/async-batch.js';
 import fs from 'node:fs';
@@ -145,7 +145,14 @@ async function verifiedRemoteOutput(world: World, command: string, maxBytes: num
     `cat -- "$out" && printf '\\n%s %s\\n' "$(wc -c < "$out")" "$(sha256sum < "$out" | cut -d ' ' -f 1)"`,
   ].join('\n');
   for (let attempt = 1; ; attempt++) {
-    const result = await boundedExec(world, script, { maxBytes: maxBytes + 128, timeoutMs: 60_000 });
+    let result;
+    try { result = await boundedExec(world, script, { maxBytes: maxBytes + 128, timeoutMs: 60_000 }); }
+    catch (error) {
+      // The terminal ended before the end-of-output marker: an incomplete read.
+      if (!(error instanceof IncompleteOutputError)) throw error;
+      if (attempt >= VERIFIED_READ_ATTEMPTS) throw new Error(`could not ${action}: output was incomplete after ${attempt} reads`);
+      continue;
+    }
     if (result.code !== 0) throw new Error(`could not ${action}: ${result.stderr || result.stdout.slice(0, 512)}`);
     const printed = Buffer.from(result.stdout);
     const trailer = /\n *(\d+) ([0-9a-f]{64})\r?\n?$/.exec(result.stdout);

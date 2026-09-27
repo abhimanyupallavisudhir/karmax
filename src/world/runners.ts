@@ -323,10 +323,13 @@ export class WorldLifecycleManager {
         try { previous = JSON.parse((await this.store.kvGet(syncKey)) ?? '{}'); } catch {}
         try {
           const lastFullScanAt = Number(previous.lastFullScanAt ?? 0);
-          const fullScan = !lastFullScanAt || now - lastFullScanAt >= 24 * 60 * 60_000;
+          // A read that stopped at the provider's per-sweep bound continues
+          // where it stopped, so a huge feed still makes progress every sweep.
+          const pending = previous.scan as { since?: number; resumeAt: number; startedAt: number } | undefined;
+          const fullScan = pending ? pending.since === undefined : !lastFullScanAt || now - lastFullScanAt >= 24 * 60 * 60_000;
           const cursor = Number(previous.lastSuccessfulAt);
-          const events = await provider.listUsageEvents!(organization.id,
-            !fullScan && Number.isFinite(cursor) ? cursor - 60 * 60_000 : undefined);
+          const since = pending ? pending.since : !fullScan && Number.isFinite(cursor) ? cursor - 60 * 60_000 : undefined;
+          const { events, resumeAt } = await provider.listUsageEvents!(organization.id, since, pending?.resumeAt);
           // Providers return a rolling history. Check immutable execution IDs
           // in batches before doing attribution or writes, including after a
           // restart. A timestamp cursor would lose late-arriving executions.
@@ -359,12 +362,20 @@ export class WorldLifecycleManager {
             // must let HTTP requests and activity heartbeats make progress.
             await yieldToEventLoop();
           }
+          // The events read are recorded; the cursor moves only once the scan
+          // completes, to when it began (anything newer is read next time).
+          const startedAt = pending?.startedAt ?? now;
+          if (resumeAt !== undefined) {
+            (await this.store.kvSet(syncKey, JSON.stringify({ ...previous, status: 'catching-up', at: now, error: undefined,
+              scan: { ...(since !== undefined ? { since } : {}), resumeAt, startedAt } })));
+            continue;
+          }
           const retentionMs = 7 * 24 * 60 * 60_000;
           const lastSuccessfulAt = Number(previous.lastSuccessfulAt ?? previous.at);
           const coverageFrom = Number(previous.coverageFrom);
-          (await this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: now,
-            coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : now - retentionMs,
-            retentionDays: 7, lastFullScanAt: fullScan ? now : lastFullScanAt,
+          (await this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: startedAt,
+            coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : startedAt - retentionMs,
+            retentionDays: 7, lastFullScanAt: fullScan ? startedAt : lastFullScanAt,
             ...(previous.gap === true || (Number.isFinite(lastSuccessfulAt) && now - lastSuccessfulAt > retentionMs)
               ? { gap: true } : {}) })));
         } catch (error) {

@@ -45,6 +45,10 @@ async function fixture(options: { fullApp?: boolean } = {}) {
     agentInfo: { provider: 'mock', reason: 'test' } });
   const server = await gateway.listen(await findFreePortFrom(nextPort += 10));
   cleanups.push(async () => { await server.close(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
+  // listen() repairs every project's wiki in the background, and the move plan
+  // fingerprints the wiki record. Let that settle, or a preview taken first is
+  // (correctly) refused as stale when its record lands before the confirmation.
+  await vi.waitFor(async () => { if (!(await store.projectWiki(project.id))) throw new Error('wiki not ready'); }, { timeout: 30_000 });
   const request = (route: string, body?: unknown, bearer?: string) => fetch(server.url + route, {
     method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', ...(bearer ? { authorization: `Bearer ${bearer}` } : { cookie: 'test=alice' }) },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -54,6 +58,13 @@ async function fixture(options: { fullApp?: boolean } = {}) {
 }
 
 describe('project transfer HTTP authorization', () => {
+  it('confirms a preview taken as soon as the gateway is up', async () => {
+    const f = await fixture();
+    const preview = await (await f.request(f.route + `?destinationOrganizationId=${f.destination.id}`)).json() as any;
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect((await f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: preview.id })).status).toBe(200);
+  });
+
   it('lets a cookie session authorized in both organizations preview and move', async () => {
     const f = await fixture();
     const access = await f.request(`/api/settings/access?projectId=${f.project.id}`);

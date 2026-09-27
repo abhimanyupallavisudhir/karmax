@@ -154,7 +154,7 @@ integration('PostgreSQL cutover', () => {
       await store.kvSet(`view-conversation:${task.id}:run:1`, '{"messages":[]}');
       await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
         stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }, 'run:1');
-      expect((await store.retentionSweep(30 * 24 * 60 * 60 * 1000)).viewSnapshots).toBe(1);
+      expect((await store.retentionSweep(Date.now() + 30 * 24 * 60 * 60 * 1000)).viewSnapshots).toBe(1);
       expect(await store.kvGet(`view-conversation:${task.id}:run:0`)).toBeUndefined();
       expect(await store.kvGet(`view-conversation:${task.id}:run:1`)).toBeDefined();
     } finally { await store.close(); }

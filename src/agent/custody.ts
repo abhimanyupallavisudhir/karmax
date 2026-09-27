@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { paths } from '../config/paths.js';
+import { processStartTick } from '../util/processes.js';
 
 /**
  * Process-tree custody for spawned agent subprocesses (the other half of the
@@ -62,9 +63,10 @@ export interface AgentRecord {
   /** Unique inherited marker used to find descendants across process groups. */
   custodyId?: string;
   startedAt: number;
-  /** Linux `/proc/<pid>/stat` field 22 (process start tick) for `pid`, stamped by
-   *  `registerAgent`. Wall-clock `startedAt` cannot disambiguate pid reuse; this
-   *  can. Absent on non-Linux hosts and on records written before this existed. */
+  /** The process start time for `pid` (`/proc/<pid>/stat` field 22 on Linux,
+   *  `ps` lstart elsewhere), stamped by `registerAgent`. Wall-clock `startedAt`
+   *  cannot disambiguate pid reuse; this can. Absent on records written before
+   *  this existed. */
   pidStart?: string;
   /** The same start tick for `owner`, so a recycled owner pid cannot make a
    *  genuine orphan permanently unreapable. */
@@ -170,26 +172,15 @@ function cmdlineMatches(pid: number, cmd: string): boolean {
   }
 }
 
-/** Linux `/proc/<pid>/stat` field 22: the tick at which the process started. Two
+/** The process's start time: `/proc` field 22 on Linux, `ps` elsewhere. Two
  *  processes with the same pid at different times cannot share it, so it is the
- *  only reliable identity check available after the parent has died. Mirrors
- *  `processStart()` in src/activities/agent-slots.ts. */
-function processStart(pid: number | undefined): string | undefined {
-  if (!pid || pid <= 0 || process.platform !== 'linux') return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    // The comm field may itself contain spaces/parens; split after the LAST ')'.
-    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-    return afterComm[19]; // the array begins at field 3, so index 19 is field 22
-  } catch {
-    return undefined;
-  }
-}
+ *  only reliable identity check available after the parent has died. */
+const processStart = processStartTick;
 
 /**
  * Is `pid` still the very process the record was written for?
  *
- * `recorded === undefined` (a pre-start-tick record, or a non-Linux host) is
+ * `recorded === undefined` (a pre-start-tick record, or no procfs or `ps`) is
  * treated as NOT verified. That is the conservative direction on purpose: an
  * unverifiable record can only cost us a leaked, already-dead pidfile for one
  * boot, whereas guessing "yes" reintroduces exactly the incident this guards —

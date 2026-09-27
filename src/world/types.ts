@@ -457,7 +457,15 @@ export interface WorldProvider {
   listSandboxes?(organizationId?: string): Promise<ProviderSandboxRef[]>;
   /** Completed provider-authoritative billable executions. Lease wall time is
    * not usage: providers can auto-pause while a local capacity lease is stale. */
-  listUsageEvents?(organizationId: string, since?: number): Promise<ProviderUsageEvent[]>;
+  listUsageEvents?(organizationId: string, since?: number, resumeAt?: number): Promise<ProviderUsagePage>;
+}
+
+/** One bounded read of a provider's usage feed, newest first. `resumeAt` is
+ * set when the read stopped at its per-sweep bound before reaching `since` or
+ * the end of the feed; passing it back continues from there. */
+export interface ProviderUsagePage {
+  events: ProviderUsageEvent[];
+  resumeAt?: number;
 }
 
 /** Provider-independent confinement for every file/process cwd crossing the

@@ -45,13 +45,75 @@ describe('durable conversation publication', () => {
     await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
       stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }, 'run:1');
     try {
-      const result = await store.retentionSweep(30 * 24 * 60 * 60 * 1000);
+      const result = await store.retentionSweep(Date.now() + 30 * 24 * 60 * 60 * 1000);
       expect(result.viewSnapshots).toBe(1);
       expect(await store.kvGet(old)).toBeUndefined();
       expect(await store.kvGet(current)).toBeDefined();
       expect(await store.kvEntries(`view-publication-fence:${task.id}:`)).toEqual([]);
       expect(await store.kvEntries(`turnsession:${task.id}#`)).toEqual([]);
       expect((await store.getTask(task.id))?.lastView?.messages[0]?.text).toBe('new');
+    } finally { await store.close(); }
+  });
+
+  // PS-3: a software-dev view's `updatedAt` is its history length, so the
+  // window must run from when the task settled, and failed tasks settle too.
+  it.each(['done', 'cancelled', 'failed'] as const)('keeps a %s task\'s superseded snapshots for a week after it settles', async status => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'Settled', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
+    const old = `view-conversation:${task.id}:run:0`;
+    const fence = `view-publication-fence:${task.id}:run:activity`;
+    const day = 24 * 60 * 60 * 1000;
+    try {
+      await store.kvSet(old, '{"messages":[]}');
+      await store.kvSet(`view-conversation:${task.id}:run:1`, '{"messages":[]}');
+      await store.kvSet(fence, '1');
+      const settledAt = Date.now();
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: status, status, messages: [], actions: [], state: {}, updatedAt: 412 }, 'run:1');
+      expect((await store.retentionSweep(settledAt + 6 * day)).viewSnapshots).toBe(0);
+      expect(await store.kvGet(old)).toBeDefined();
+      expect(await store.kvGet(fence)).toBe('1');
+      const swept = await store.retentionSweep(settledAt + 8 * day);
+      expect(swept).toMatchObject({ viewSnapshots: 1, publicationFences: 1 });
+      expect(await store.kvGet(old)).toBeUndefined();
+      expect(await store.kvGet(`view-conversation:${task.id}:run:1`)).toBeDefined();
+    } finally { await store.close(); }
+  });
+
+  it('restarts the retention window when a settled task is resumed', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'Retried', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'failed', status: 'failed',
+      messages: [], actions: [], state: {}, updatedAt: 3 } as TaskView;
+    const day = 24 * 60 * 60 * 1000;
+    try {
+      await store.kvSet(`view-conversation:${task.id}:run:0`, '{"messages":[]}');
+      await store.saveView(task.id, view);
+      await store.saveView(task.id, { ...view, stage: 'do', status: 'active' });
+      expect((await store.retentionSweep(Date.now() + 30 * day)).viewSnapshots).toBe(0);
+      await store.saveView(task.id, view);
+      expect((await store.retentionSweep(Date.now() + 6 * day)).viewSnapshots).toBe(0);
+      expect((await store.retentionSweep(Date.now() + 8 * day)).viewSnapshots).toBe(1);
+    } finally { await store.close(); }
+  });
+
+  it('starts the window at the first sweep for tasks that settled before settle times were recorded', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const day = 24 * 60 * 60 * 1000;
+    try {
+      await store.kvSet(`view-conversation:${task.id}:run:0`, '{"messages":[]}');
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      await store.kvDelete(`retention:settled:${task.id}`);
+      const firstSweep = Date.now() + 30 * day;
+      expect((await store.retentionSweep(firstSweep)).viewSnapshots).toBe(0);
+      expect((await store.retentionSweep(firstSweep + 8 * day)).viewSnapshots).toBe(1);
     } finally { await store.close(); }
   });
 

@@ -3444,7 +3444,7 @@ function connectWs() {
     }
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
-      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask(ev.type);
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask('attempt.sibling'); // its card, not our details
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.

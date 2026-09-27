@@ -16,11 +16,12 @@ function temp(): string {
 }
 
 /** node-pty destroys its terminal socket 200 ms after the child exits and
- * discards the bytes not yet read, so on a loaded host a large command output
- * loses its tail while the exit status still reports success (AD-30; how the
- * Codex lineage tests failed on CI). Replay that deterministically: after the
- * command script is sent, withhold each chunk until the next one arrives and
- * deliver the exit without the last. */
+ * discards the bytes not yet read, so on a loaded host a command's final
+ * output is lost (AD-30; how the Codex lineage tests failed on CI). Replay
+ * that deterministically: after the command script is sent, withhold each
+ * chunk until the next one arrives, and when the command's output is complete
+ * (its end-of-output marker is withheld) end the transport, discarding the
+ * withheld tail. */
 function lossyWorld(root: string, loses: (terminal: number) => boolean): World {
   let terminals = 0;
   return {
@@ -30,15 +31,23 @@ function lossyWorld(root: string, loses: (terminal: number) => boolean): World {
       if (!loses(++terminals)) return pty;
       let writes = 0;
       let held: string | undefined;
+      let ended = false;
       const outputs = new Set<(chunk: string) => void>();
+      const exits = new Set<(code: number | null) => void>();
       pty.onData((chunk) => {
+        if (ended) return;
         if (writes < 2) { for (const listener of outputs) listener(chunk); return; }
         if (held !== undefined) for (const listener of outputs) listener(held);
         held = chunk;
+        if (/KARMAX_EXEC_[0-9a-f]+_EXIT:/.test(held)) {
+          ended = true; // the transport ends with the tail unread
+          for (const listener of exits) listener(0);
+        }
       });
+      pty.onExit((code) => { if (!ended) { ended = true; for (const listener of exits) listener(code); } });
       const lossy: WorldPty = {
         onData(listener) { outputs.add(listener); return () => outputs.delete(listener); },
-        onExit: (listener) => pty.onExit(listener),
+        onExit(listener) { exits.add(listener); return () => exits.delete(listener); },
         write: (data) => { writes++; return pty.write(data); },
         resize: (cols, rows) => pty.resize(cols, rows),
         close: () => pty.close(),

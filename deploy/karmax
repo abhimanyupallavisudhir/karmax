@@ -2,7 +2,9 @@
 # Turnkey Karmax control-plane operator. Requires only Docker with Compose.
 set -eu
 
-DEPLOY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The detached update runner executes a copy of this file from
+# deploy/.updates/<key>/ and names the instance it belongs to.
+DEPLOY_DIR=${KARMAX_DEPLOY_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 ROOT_DIR=$(dirname "$DEPLOY_DIR")
 ENV_FILE="$DEPLOY_DIR/.turnkey.env"
 SECRETS_DIR="$DEPLOY_DIR/.secrets"
