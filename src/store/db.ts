@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
+import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
@@ -161,7 +162,7 @@ export class Store {
 
     this.hosted = options.hosted === true;
     if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = openSqlDatabase(dbPath);
+    this.db = watchAuthorityWrites(openSqlDatabase(dbPath));
     // busy_timeout first: waiting (up to 5s) on a locked database beats failing
     // the caller outright. tsx-watch restarts overlap the outgoing and incoming
     // app for a few seconds, and the newcomer's boot writes (migrations,
