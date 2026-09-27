@@ -65,7 +65,9 @@ it('persists a real webpack bundle and invalidates transitive external sources',
     await buildVersionedBundle(refs, { cacheDir: ephemeralCache, cache: false });
     await expect(fs.access(ephemeralCache)).rejects.toThrow();
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
-}, 60_000);
+// Six real webpack builds: ~10 s here, but a loaded CI runner took 10 s for
+// one cold build and 7 s for a warm one (run 36316793983) and ran out of time.
+}, 180_000);
 
 it('frames each input so moving delimiter-like bytes between files cannot reuse a stale bundle', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bundle-framing-test-'));
