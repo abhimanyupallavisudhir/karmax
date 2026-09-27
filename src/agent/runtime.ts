@@ -99,6 +99,7 @@ function coalescedOutput(publish: (text: string, source?: 'assistant' | 'tool') 
   let lastAt = -Infinity;
   let pending: { text: string; source?: 'assistant' | 'tool' } | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
   const send = (next: { text: string; source?: 'assistant' | 'tool' }) => {
     pending = undefined;
     lastAt = Date.now();
@@ -110,6 +111,8 @@ function coalescedOutput(publish: (text: string, source?: 'assistant' | 'tool') 
   };
   return {
     emit(text: string, source?: 'assistant' | 'tool') {
+      // A late SDK or notification callback must not publish into an ended turn.
+      if (closed) return;
       if (source !== 'assistant') { flush(); send({ text, source }); return; }
       pending = { text, source };
       const wait = lastAt + OUTPUT_PUBLISH_INTERVAL_MS - Date.now();
@@ -118,8 +121,9 @@ function coalescedOutput(publish: (text: string, source?: 'assistant' | 'tool') 
     },
     /** Before anything that must follow the text (the item completing it, the turn's end). */
     flush,
-    /** A failed or cancelled turn publishes nothing more. */
+    /** A failed, cancelled or ended turn publishes nothing more. */
     discard() {
+      closed = true;
       if (timer) { clearTimeout(timer); timer = undefined; }
       pending = undefined;
     },

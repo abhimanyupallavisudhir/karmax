@@ -46,6 +46,19 @@ const adapter = (run: (ctx: PlatformToolContext) => Promise<string>): AgentAdapt
 });
 
 describe('runtime output publication (LT-5)', () => {
+  // #396 review item 7: a late SDK or notification callback must not publish
+  // into a turn that has already ended.
+  it('ignores output emitted after the turn has ended', async () => {
+    const { log, deps } = recorder();
+    await runTurn(input(), { adapters: new Map([['claude', adapter(async (ctx) => {
+      ctx.emit('Done', 'assistant');
+      setTimeout(() => { ctx.emit('Done, and late', 'assistant'); ctx.emit('$ late tool'); }, 20);
+      return 'Done';
+    })]]), ...deps });
+    await sleep(OUTPUT_PUBLISH_INTERVAL_MS * 2);
+    expect(log.map((e) => e.text)).toEqual(['Done']);
+  });
+
   it('publishes the first chunk at once and coalesces the rest of a burst', async () => {
     const { log, deps } = recorder();
     let publishedBeforeYield = 0;
