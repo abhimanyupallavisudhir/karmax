@@ -3767,7 +3767,12 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
-  
+    // `retentionSweep` measures its window from here: a workflow's `updatedAt`
+    // is its history length, not a time. Resuming the task restarts the clock.
+    if (['done', 'cancelled', 'failed'].includes(view.status))
+      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:settled:${taskId}`, String(Date.now())));
+    else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:settled:${taskId}`));
+
     });
   }
 
@@ -5111,7 +5116,8 @@ export class Store {
       for (const share of shares) (await exact.run(`conversation-share:${share.v}`));
       (await prefix.run(sharePrefix, sharePrefix));
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
+        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
+        `retention:settled:${taskId}`, `retention:view:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
@@ -7462,9 +7468,14 @@ export class Store {
     // still refer to an older revision while the workflow is live; settled tasks
     // older than a week no longer need those superseded copies.
     let viewSnapshots = 0, publicationFences = 0, turnSessions = 0;
-    const settled = await this.db.prepare(`SELECT id, conversationRef FROM tasks
-      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled')
-        AND CAST(json_extract(lastView, '$.updatedAt') AS BIGINT) < ?
+    // Tasks that settled before settle times were recorded start their window now.
+    (await this.db.prepare(`INSERT OR IGNORE INTO kv(k,v) SELECT 'retention:settled:' || id, ? FROM tasks
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`).run(String(now)));
+    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef FROM tasks
+      JOIN kv settle ON settle.k='retention:settled:' || tasks.id
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
+        AND CAST(settle.v AS BIGINT) < ?
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`)
       .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
     for (const task of settled) {
