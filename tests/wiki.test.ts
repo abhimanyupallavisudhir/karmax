@@ -317,6 +317,24 @@ describe('parseFrontmatter', () => {
     expect(parseFrontmatter('---\nlabels: [a, b]\n---\nx').labels).toEqual(['a', 'b']);
     expect(parseFrontmatter('---\ndelivery: unconditional\nlabels: x\n---\nx').labels).toEqual(['default', 'x']);
   });
+
+  it('reads a YAML block-list `labels` and normalises a worded `importance` (WK-1)', () => {
+    const fm = parseFrontmatter('---\nname: X\nlabels:\n  - default\n  - "security"\n  -  vault\nimportance: 900\n---\nbody\n');
+    expect(fm.labels).toEqual(['default', 'security', 'vault']);
+    expect(fm.importance).toBe(900);
+    expect(fm.body).toBe('body\n');
+    // The list ends at the next key; a later scalar is still read.
+    const next = parseFrontmatter('---\nlabels:\n- a\n- b\ndescription: after\n---\nx');
+    expect(next.labels).toEqual(['a', 'b']);
+    expect(next.description).toBe('after');
+    // Worded importance keeps its intent instead of dropping to the default.
+    expect(parseFrontmatter('---\nimportance: high\n---\nx').importance).toBeGreaterThan(0);
+    expect(parseFrontmatter('---\nimportance: Low\n---\nx').importance).toBeLessThan(0);
+    expect(parseFrontmatter('---\nimportance: medium\n---\nx').importance).toBe(0);
+    // Unknown words and a blank value are absent, not 0 (so a builtin's own order survives).
+    expect(parseFrontmatter('---\nimportance: urgent-ish\n---\nx').importance).toBeUndefined();
+    expect(parseFrontmatter('---\nimportance:\n---\nx').importance).toBeUndefined();
+  });
 });
 
 describe('renderWikiToc', () => {

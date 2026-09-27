@@ -17,8 +17,8 @@ import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
  * directories) ride along inside the folder and do NOT count as more entries.
  * A folder WITHOUT a SKILL/MEMORY.md is a section and is recursed into.
  *
- * Frontmatter fields: `name`, `description`, `importance` (a number, default 0)
- * and `labels` (a free-form list). Delivery is no longer a fixed per-page
+ * Frontmatter fields: `name`, `description`, `importance` (a number or
+ * low/medium/high, default 0) and `labels` (a free-form list). Delivery is no longer a fixed per-page
  * choice — **every** entry is always listed in the table of contents agents
  * receive each turn. What varies is which entries' *full bodies* are inlined
  * into a given task's prompt:
@@ -250,8 +250,13 @@ export function parseLabels(raw?: string): string[] {
   return out;
 }
 
+/** Worded `importance` values, so `importance: high` keeps its intent rather
+ *  than dropping to the default; the scale matches the numbers pages use. */
+const IMPORTANCE_WORDS = new Map(Object.entries({ lowest: -200, low: -100, medium: 0, normal: 0, high: 100, highest: 200, critical: 200 }));
+
 /** Minimal YAML-frontmatter reader — the flat `key: value` scalars the Agent
- *  Skills format uses (`name`, `description`, `labels`, `importance`); anything
+ *  Skills format uses (`name`, `description`, `labels`, `importance`), plus a
+ *  `- item` block list under an empty key (read as a comma list); anything
  *  richer is ignored rather than mis-parsed. A legacy `delivery: unconditional`
  *  is read forward as the `default` label. */
 export function parseFrontmatter(content: string): {
@@ -264,12 +269,22 @@ export function parseFrontmatter(content: string): {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(content);
   if (!m) return { body: content, labels: [] };
   const fields: Record<string, string> = {};
-  for (const line of m[1]!.split('\n')) {
+  let listKey: string | undefined;
+  for (const line of m[1]!.split(/\r?\n/)) {
+    const item = listKey && /^\s*-\s+(.*)$/.exec(line);
+    if (item) {
+      fields[listKey!] = [fields[listKey!], item[1]!.trim()].filter(Boolean).join(', ');
+      continue;
+    }
     const kv = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(line);
+    listKey = undefined;
     if (!kv) continue;
-    fields[kv[1]!.toLowerCase()] = kv[2]!.trim().replace(/^["']|["']$/g, '');
+    const key = kv[1]!.toLowerCase();
+    fields[key] = kv[2]!.trim().replace(/^["']|["']$/g, '');
+    if (!fields[key]) listKey = key;
   }
-  const importance = Number(fields.importance);
+  const worded = IMPORTANCE_WORDS.get((fields.importance ?? '').toLowerCase());
+  const importance = worded ?? (fields.importance ? Number(fields.importance) : NaN);
   const labels = parseLabels(fields.labels);
   // Back-compat: an older `delivery: unconditional` is the `default` label now.
   if (fields.delivery === 'unconditional' && !labels.includes(DEFAULT_LABEL)) labels.unshift(DEFAULT_LABEL);
