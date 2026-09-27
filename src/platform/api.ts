@@ -5,6 +5,7 @@ import { timingEnabled, installationTiming, timingReport } from '../timing/index
 import { requireHumanSubject } from './identity.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
+import { notifyChildSettlement } from './child-settlement.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client, type WorkflowExecutionDescription } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
@@ -3121,6 +3122,10 @@ export class KarmaxApi {
         updatedAt: Date.now(),
       };
       (await this.deps.store.saveView(taskId, done));
+      // The stopped run's last view was a lifecycle replacement, which never
+      // settles a child, so its parent hears about this Done from here.
+      await notifyChildSettlement(this.deps.store, this.deps.client, done)
+        .catch((error) => console.warn(`[karmax] could not tell the parent that ${taskId} is done:`, error));
       return { ...done, stageTransitions: (await this.availableStageTransitions((await this.deps.store.getTask(taskId))!, done)) };
     }
 

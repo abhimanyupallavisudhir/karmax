@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
 import { concurrentMap } from '../util/concurrent-map.js';
-import { notifyChildSettlement } from './children.js';
+import { notifyChildSettlement } from '../platform/child-settlement.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { snapshotReplayHistories } from './replay-histories.js';
 import { turnPlatformRequest } from '../agent/platform-request.js';

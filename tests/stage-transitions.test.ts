@@ -586,6 +586,20 @@ describe('task stage transitions', () => {
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
   });
 
+  it('tells the parent when a person marks its sub-task done', async () => {
+    const f = (await fixture());
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: f.task.workflowVersion, params: { prompt: 'part' }, parentTaskId: f.task.id }));
+    const childView = { ...f.view, taskId: child.id, title: 'Child' };
+    (await f.store.saveView(child.id, childView));
+    f.setLiveView(childView);
+    await f.api.moveTaskStage(f.token, child.id, 'done');
+    // The stopped run's last view is a lifecycle replacement, which never
+    // settles a child; without this the parent would wait for it forever.
+    expect(f.signalled).toContainEqual(expect.objectContaining({ id: f.task.id, signal: 'childSettled',
+      args: [{ childTaskId: child.id, stage: 'done' }] }));
+  });
+
   it('restores cancellation to its remembered stage and supports a cross-cutting human hold', async () => {
     const f = (await fixture());
     (await f.store.saveView(f.task.id, {

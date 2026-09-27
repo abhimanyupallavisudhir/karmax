@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest';
-import { makeChildActivities, notifyChildSettlement } from '../src/activities/children.js';
+import { makeChildActivities } from '../src/activities/children.js';
+import { notifyChildSettlement } from '../src/platform/child-settlement.js';
 
 it('restores only unfinished children and carries their pending question', async () => {
   const store = { childTasks: vi.fn(async () => [
