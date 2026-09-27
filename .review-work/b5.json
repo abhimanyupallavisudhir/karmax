@@ -1,0 +1,737 @@
+[
+ {
+  "id": "UI-1",
+  "section": "UI",
+  "finding": "UI-1 CRIT security stored XSS tag.kind unescaped in class attr (app.js:4479,:5082,:6900); server never validates kind (db.ts:4440,4474,4552; PATCH /api/tags passes body). Fix esc + allowlist {type,topic,flag}.",
+  "commits": [
+   {
+    "sha": "ccbb4706",
+    "subject": "Validate tag kinds and filter review link schemes",
+    "body": "Reject invalid tag kinds before persistence and escape legacy values. Apply the existing safeHref policy to every review and PR link. Covers UI-1, UI-2 (client), and UI-26."
+   }
+  ]
+ },
+ {
+  "id": "UI-2",
+  "section": "UI",
+  "finding": "UI-2 HIGH security Overview review links href=esc(l.url) no safeHref (:8424); create_review_info links unvalidated (tools.ts:919 \u2192 core.ts:2495). Fix safeHref + server scheme validation.",
+  "commits": [
+   {
+    "sha": "9f31d9cb",
+    "subject": "Bound and validate agent-authored review info",
+    "body": "PL-4: create_review_info accepted html, diff, links and actions of any size\nand shape and appended actions across calls without limit; every TurnResult\ncarries the accumulated review info into workflow history, so one agent could\nbloat its execution toward Temporal's payload and history limits.\n\nUI-2 (server half): links, `open` targets and `openUrls` are rendered as\nclickable URLs in the console, and nothing refused `javascript:`/`data:`.\nThe handler also passed actions through verbatim, so an agent could mint a\nplatform-only `payment` approve button under an innocent label.\n\nA new review-info module normalizes each call (run/open actions with only\ntheir own fields, http(s)-only URLs, bounded labels, commands, html and\ndiff) and the runtime bounds the accumulated total (20 actions, 192 KiB).\nRejections return to the agent as a correctable tool result, as the caption\nlimit already did.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "ccbb4706",
+    "subject": "Validate tag kinds and filter review link schemes",
+    "body": "Reject invalid tag kinds before persistence and escape legacy values. Apply the existing safeHref policy to every review and PR link. Covers UI-1, UI-2 (client), and UI-26."
+   }
+  ]
+ },
+ {
+  "id": "UI-3",
+  "section": "UI",
+  "finding": "UI-3 HIGH correctness hydrateOrganizationView re-adds listeners on static buttons (#invite-member, #create-team, #create-organization, export/rename/delete org) after every action (:17724-17735,:17833,:17866,:17878) \u2192 duplicate invitations/orgs.",
+  "commits": [
+   {
+    "sha": "0df30b4c",
+    "subject": "Replace organization handlers on repeated hydration",
+    "body": "Keep one handler on persistent controls after team and settings mutations, preventing duplicate invitations and organizations (UI-3, RQ-6)."
+   }
+  ]
+ },
+ {
+  "id": "UI-4",
+  "section": "UI",
+  "finding": "UI-4 MED security/correctness project-settings hydrators (hydrateProjectSecrets/Data/Services/Environment :12954,:13018,:13036,:13108,:13182) use document-global $() after await with stale proj \u2192 cross-project writes.",
+  "commits": [
+   {
+    "sha": "983096b2",
+    "subject": "Update settings regressions for scoped controls and dialogs",
+    "body": "UI-4 scopes the environment save handler to its captured panel and UI-31 collects recovery text through an in-page dialog. Exercise those controls while preserving failure-toast and durable build-recovery assertions."
+   },
+   {
+    "sha": "8d25db1b",
+    "subject": "Scope project settings controls to their captured panel",
+    "body": "Discard detached or superseded hydration and bind controls only inside their original panel. Delayed responses and post-save refreshes cannot wire another project to stale writes (UI-4)."
+   }
+  ]
+ },
+ {
+  "id": "UI-5",
+  "section": "UI",
+  "finding": "UI-5 MED readResponder drops avatar + MCP (:1353-1370); avatar responder routes as avatar:<id> audience.",
+  "commits": [
+   {
+    "sha": "b402adff",
+    "subject": "Route responder avatars through the audience dispatcher",
+    "body": "The workflow responder spec drops avatarId; selected Avatars must use the supported avatar audience route. Ordinary agent responders retain MCP selection (UI-5)."
+   },
+   {
+    "sha": "41171e33",
+    "subject": "Preserve avatar and MCP selections in responder forms",
+    "body": "Read responders through the shared agent serializer and compare inherited avatar identity (UI-5)."
+   }
+  ]
+ },
+ {
+  "id": "UI-6",
+  "section": "UI",
+  "finding": "UI-6 MED perf refreshTask fires 9 GETs (incl. vault items) per event, not coalesced (:6813-6859); openTask 12 req; j/k 12 per key.",
+  "commits": [
+   {
+    "sha": "04fedf55",
+    "subject": "Coalesce task refreshes and fetch event-specific details",
+    "body": "Share each task refresh with one trailing pass for events received during the read. Ordinary view updates no longer reload vault, sessions, widgets, connections, and attempts (RQ-2, UI-6)."
+   }
+  ]
+ },
+ {
+  "id": "UI-7",
+  "section": "UI",
+  "finding": "UI-7 MED perf WS events lack projectId (server.ts:698-723 toPublicPayload) \u2192 any foreign view.updated reloads task list + search; inbox reload per org per event.",
+  "commits": [
+   {
+    "sha": "8caca636",
+    "subject": "Scope event-driven list and inbox refreshes",
+    "body": "Include the authorized project in websocket events. Ignore foreign list events and known sibling attempts, refresh inbox only for relevant transitions, and avoid rebuilding the rail (RQ-3, UI-7, RQ-8, RQ-15)."
+   }
+  ]
+ },
+ {
+  "id": "UI-8",
+  "section": "UI",
+  "finding": "UI-8 MED perf settings ~50 requests: defaults \u00d74 (may spawn git), mcp/connections per picker, vault items \u00d73, loadCollaboration twice on org switch.",
+  "commits": [
+   {
+    "sha": "78e340f9",
+    "subject": "Reuse defaults across sequential settings hydration",
+    "body": "Cache scoped defaults for ten seconds, clear on mutations, and prevent old reads from repopulating the cache. Bound entries and clone cached values so forms cannot mutate shared defaults (RQ-4, UI-8). Update regression fixtures for compact tips, removed legacy controls, and the configured callback brand."
+   },
+   {
+    "sha": "80a2e2e5",
+    "subject": "Share identical in-flight console reads",
+    "body": "Deduplicate concurrent GETs by session and options, retire settled reads, and invalidate on mutations. Requests with cancellation signals retain independent ownership (RQ-4, UI-8)."
+   }
+  ]
+ },
+ {
+  "id": "UI-9",
+  "section": "UI",
+  "finding": "UI-9 MED a11y/perf onboarding card re-renders innerHTML every 4s in aria-live container, even minimized (:3523-3594,:3629).",
+  "commits": [
+   {
+    "sha": "20ddaceb",
+    "subject": "Preserve onboarding focus and keep task controls clear",
+    "body": "Do not replace unchanged guide markup on polls, and hide the floating guide while a task form or conversation composer is present (UI-9, UI-10)."
+   },
+   {
+    "sha": "7d27ea4a",
+    "subject": "Suspend hidden-tab work and invalidate expensive panels by events",
+    "body": "Backfill once on visibility, stop minimized onboarding polling, retain general history only in Activity, and avoid repeated payment reads and inventory scans (RQ-10, RQ-11, RQ-12, RQ-13, RQ-16; UI-9 polling)."
+   }
+  ]
+ },
+ {
+  "id": "UI-10",
+  "section": "UI",
+  "finding": "UI-10 MED ux onboarding card z-index 60 fixed bottom-right covers task form footer / composer (styles.css:1110).",
+  "commits": [
+   {
+    "sha": "20ddaceb",
+    "subject": "Preserve onboarding focus and keep task controls clear",
+    "body": "Do not replace unchanged guide markup on polls, and hide the floating guide while a task form or conversation composer is present (UI-9, UI-10)."
+   }
+  ]
+ },
+ {
+  "id": "UI-11",
+  "section": "UI",
+  "finding": "UI-11 MED correctness console revision check location.reload() within 60s of deploy, even hidden tabs / dirty drafts (:2649-2665,:3324).",
+  "commits": [
+   {
+    "sha": "0473894a",
+    "subject": "Offer deployment reloads without discarding drafts",
+    "body": "Notify once per revision and skip checks in hidden tabs; reloading is an explicit user action (UI-11)."
+   }
+  ]
+ },
+ {
+  "id": "UI-12",
+  "section": "UI",
+  "finding": "UI-12 MED ux failed loads read as empty (.catch(()=>[])) \u2192 \"Connect GitHub\" etc. (:2850,:17609).",
+  "commits": [
+   {
+    "sha": "457c5804",
+    "subject": "Aggregate global search behind per-project authorization",
+    "body": "Use one cancellable browser request and reauthorize discovery and task reads for every project with the original caller. Bound results to 100 tasks per project, preserve totals, stop between projects after cancellation, and show retry for server failures (RQ-14, UI-18 search, UI-12)."
+   },
+   {
+    "sha": "c5bed76e",
+    "subject": "Show retry when GitHub connection status cannot load",
+    "body": "Do not present disconnected or unconfigured GitHub guidance after a transport or permission failure. Also abort searches when their overlay closes (UI-12, RQ-14)."
+   }
+  ]
+ },
+ {
+  "id": "UI-13",
+  "section": "UI",
+  "finding": "UI-13 MED security no CSP (lead added frame-ancestors); MathJax CDN no SRI (markdown.js:335); inline SW script (index.html:27).",
+  "commits": [
+   {
+    "sha": "bd0b3c5f",
+    "subject": "Match the MathJax browser fixture integrity hash",
+    "body": "UI-13 pins the MathJax entrypoint with SRI. Give the deterministic browser fixture its own matching digest and CORS header so Chromium tests the loader without disabling integrity enforcement."
+   },
+   {
+    "sha": "2b023505",
+    "subject": "Pin MathJax integrity and externalize service-worker setup",
+    "body": "Protect the pinned CDN entrypoint and remove inline execution from the console shell. A complete console CSP still needs artifact, preview, and payment compatibility verification (UI-13 partial)."
+   }
+  ]
+ },
+ {
+  "id": "UI-14",
+  "section": "UI",
+  "finding": "UI-14 MED modal plumbing: palette/search/help overwrite #overlay-root hosting task form \u2192 form destroyed, autosave throws (:18418,:18532,:18583,:18187,:10361); topbar clickable while form open.",
+  "commits": [
+   {
+    "sha": "6b99b18f",
+    "subject": "Preserve explicit refresh semantics in retained panels",
+    "body": "Keep resource response ownership and refresh spending on explicit task refreshes. Update isolated harnesses for visibility, safe links, and stacked overlays; minimized onboarding intentionally no longer retries in the background (RQ-10, RQ-12, RQ-13, UI-14)."
+   },
+   {
+    "sha": "eaa436b2",
+    "subject": "Stack utility dialogs above task forms",
+    "body": "Palette, search, help, and action forms receive disposable modal roots so opening them cannot destroy task drafts (UI-14)."
+   }
+  ]
+ },
+ {
+  "id": "UI-15",
+  "section": "UI",
+  "finding": "UI-15 MED ux non-ASCII project names slug collapse ('workspace'), second rejected (app.js:284; db.ts:7508,:1116).",
+  "commits": [
+   {
+    "sha": "9aab1cc9",
+    "subject": "Keep Unicode project names distinct in routes",
+    "body": "Preserve normalized letters, numbers, and combining marks in client and store slugs without changing ASCII routes (UI-15)."
+   }
+  ]
+ },
+ {
+  "id": "UI-16",
+  "section": "UI",
+  "finding": "UI-16 MED ux one-click GitHub disconnect no confirm (:17752,:16569).",
+  "commits": [
+   {
+    "sha": "f7d9aa77",
+    "subject": "Confirm GitHub account disconnections",
+    "body": "Both profile and organization removal controls explain the repository access effect before deleting (UI-16)."
+   }
+  ]
+ },
+ {
+  "id": "UI-17",
+  "section": "UI",
+  "finding": "UI-17 MED a11y --ink-3 contrast 2.8:1 (styles.css:29,:60).",
+  "commits": [
+   {
+    "sha": "668f4794",
+    "subject": "Increase secondary label contrast in both themes",
+    "body": "Keep muted text above 4.5:1 against all neutral surfaces (UI-17)."
+   }
+  ]
+ },
+ {
+  "id": "UI-18",
+  "section": "UI",
+  "finding": "UI-18 MED perf global search one /search per project per keystroke (:18479); mark-all-read one PATCH per item (:16291).",
+  "commits": [
+   {
+    "sha": "6c386aeb",
+    "subject": "Expose aggregate console operations to agents",
+    "body": "Document cross-project search and bounded bulk inbox updates in describe_platform, assert their authorization bindings, and exercise notification races with batched response fixtures (RQ-14, UI-18)."
+   },
+   {
+    "sha": "bb64d677",
+    "subject": "Batch visible inbox reads within each authorized organization",
+    "body": "Mark requested inbox rows in one bounded update per organization, filtered by the verified account owner. Preserve failed groups in the browser and return only rows actually updated (UI-18)."
+   },
+   {
+    "sha": "457c5804",
+    "subject": "Aggregate global search behind per-project authorization",
+    "body": "Use one cancellable browser request and reauthorize discovery and task reads for every project with the original caller. Bound results to 100 tasks per project, preserve totals, stop between projects after cancellation, and show retry for server failures (RQ-14, UI-18 search, UI-12)."
+   },
+   {
+    "sha": "17b7b72c",
+    "subject": "Cancel superseded global searches and require two characters",
+    "body": "Stop abandoned fetches immediately when the query changes and avoid single-character fan-out (RQ-14/UI-18 partial: server aggregation and bulk inbox reads remain). Keep the socket-gap assertion targeted to the installed handler."
+   }
+  ]
+ },
+ {
+  "id": "UI-19",
+  "section": "UI",
+  "finding": "UI-19 LOW-MED Space/Enter swallowed in textarea after Ctrl+Enter send (rememberInteractionOrigin makes textarea the origin) (:163).",
+  "commits": [
+   {
+    "sha": "34987d88",
+    "subject": "Keep text editing keys out of action feedback",
+    "body": "A keyboard send must not mark its textarea as a pending button and swallow subsequent spaces or newlines (UI-19)."
+   }
+  ]
+ },
+ {
+  "id": "UI-22",
+  "section": "UI",
+  "finding": "UI-22 LOW re-login after 401 re-runs boot \u2192 duplicate connectWs/listeners.",
+  "commits": [
+   {
+    "sha": "69378e51",
+    "subject": "Isolate shared console reads by authenticated user",
+    "body": "Cookie-authenticated sessions have no bearer token, so cache identity must also include the signed-in user. Prevent a subsequent login from reusing the prior user\u2019s in-flight reads or cached defaults (RQ-4, UI-22)."
+   },
+   {
+    "sha": "591484ad",
+    "subject": "Cancel socket retry timers only when scheduled",
+    "body": "Keep initial socket setup independent of timer cleanup and preserve isolated event-routing harnesses (UI-22)."
+   },
+   {
+    "sha": "73aaddc6",
+    "subject": "Retire sockets and reuse document listeners on login",
+    "body": "A repeated boot after an expired session must not multiply keyboard handlers, navigation listeners, sockets, or reconnect timers (UI-22)."
+   }
+  ]
+ },
+ {
+  "id": "UI-23",
+  "section": "UI",
+  "finding": "UI-23 LOW vault policy selects not reverted on failed save (:15289,:12893).",
+  "commits": [
+   {
+    "sha": "d38176a7",
+    "subject": "Restore persisted vault policies after failed saves",
+    "body": "Keep both policy controls disabled during a save and restore their durable values on rejection so the UI cannot claim broader or narrower access than the vault enforces (UI-23)."
+   }
+  ]
+ },
+ {
+  "id": "UI-24",
+  "section": "UI",
+  "finding": "UI-24 LOW tags manager redraws modal, loses input (:5078).",
+  "commits": [
+   {
+    "sha": "fd19d6e5",
+    "subject": "Retain active tag edits during unrelated catalogue updates",
+    "body": "Capture fields only for the currently edited tag and restore them after redraws. Do not clear a new-tag description changed while its save was pending. The full-browser journey reproduces the lost edit before the fix (UI-24)."
+   },
+   {
+    "sha": "3bffa273",
+    "subject": "Preserve tag drafts when redrawing the catalogue",
+    "body": "Retain new-tag field values while switching editors or refreshing rows; clear the submitted name only after successful creation (UI-24)."
+   }
+  ]
+ },
+ {
+  "id": "UI-25",
+  "section": "UI",
+  "finding": "UI-25 LOW decodeURI(pathname) throws on malformed URL \u2192 boot fails (:354,:12191).",
+  "commits": [
+   {
+    "sha": "c7bcc89c",
+    "subject": "Keep route parsing independently testable",
+    "body": "Exercise malformed project routes with the route constants present (UI-25)."
+   },
+   {
+    "sha": "0b1a02c8",
+    "subject": "Tolerate malformed percent escapes in routes",
+    "body": "Keep invalid URL fragments literal instead of aborting boot or wiki navigation (UI-25)."
+   }
+  ]
+ },
+ {
+  "id": "UI-26",
+  "section": "UI",
+  "finding": "UI-26 LOW PR hrefs not scheme-checked (:4640,:8381,:11241).",
+  "commits": [
+   {
+    "sha": "ccbb4706",
+    "subject": "Validate tag kinds and filter review link schemes",
+    "body": "Reject invalid tag kinds before persistence and escape legacy values. Apply the existing safeHref policy to every review and PR link. Covers UI-1, UI-2 (client), and UI-26."
+   }
+  ]
+ },
+ {
+  "id": "UI-27",
+  "section": "UI",
+  "finding": "UI-27 LOW forkCommandFor double-quote shell quoting (:9673).",
+  "commits": [
+   {
+    "sha": "c66eef03",
+    "subject": "Quote copied fork commands as literal shell arguments",
+    "body": "Protect paths, configuration homes, and session IDs from shell expansion and command separators (UI-27)."
+   }
+  ]
+ },
+ {
+  "id": "UI-28",
+  "section": "UI",
+  "finding": "UI-28 LOW deleted task 404 leaves stale page (:6857).",
+  "commits": [
+   {
+    "sha": "c1847261",
+    "subject": "Leave deleted tasks instead of displaying stale state",
+    "body": "Remove a missing task from the local list and navigate back when the selected task refresh returns 404 (UI-28)."
+   }
+  ]
+ },
+ {
+  "id": "UI-29",
+  "section": "UI",
+  "finding": "UI-29 LOW qr-scanner 70KB sync on every page (index.html:24).",
+  "commits": [
+   {
+    "sha": "e66fe716",
+    "subject": "Load the QR decoder only when an image is pasted",
+    "body": "Remove the synchronous scanner from normal console startup and share a retryable lazy load for QR decoding (RQ-9, UI-29)."
+   }
+  ]
+ },
+ {
+  "id": "UI-30",
+  "section": "UI",
+  "finding": "UI-30 LOW wordy inline explanations (:1265,:1268,:8399,:12985,:13064,:15190,:16742-16759,:17664,:17718).",
+  "commits": [
+   {
+    "sha": "20e4dea0",
+    "subject": "Keep review help compact and audience lists distinct",
+    "body": "Give every review/responder input its own datalist, move detailed guidance to accessible tips, and preserve full refresh semantics after resource review actions (UI-30, UI-33)."
+   }
+  ]
+ },
+ {
+  "id": "UI-31",
+  "section": "UI",
+  "finding": "UI-31 LOW native prompt()/confirm() for data entry (many).",
+  "commits": [
+   {
+    "sha": "983096b2",
+    "subject": "Update settings regressions for scoped controls and dialogs",
+    "body": "UI-4 scopes the environment save handler to its captured panel and UI-31 collects recovery text through an in-page dialog. Exercise those controls while preserving failure-toast and durable build-recovery assertions."
+   },
+   {
+    "sha": "9f3249db",
+    "subject": "Collect text in accessible in-page dialogs",
+    "body": "Replace native text prompts with escaped, keyboard-accessible modal forms that preserve underlying drafts and restore focus. Keep native yes/no confirmations for destructive actions (UI-31)."
+   }
+  ]
+ },
+ {
+  "id": "UI-32",
+  "section": "UI",
+  "finding": "UI-32 LOW llms.txt lacks agent entry points (MCP, describe_platform).",
+  "commits": [
+   {
+    "sha": "3a9598b2",
+    "subject": "Remove obsolete console markup and document agent entry points",
+    "body": "Document MCP discovery, remove the unused resource editor and invalid footer close, and use the configured brand in the OAuth callback (UI-32, UI-33 partial, UI-34)."
+   }
+  ]
+ },
+ {
+  "id": "UI-33",
+  "section": "UI",
+  "finding": "UI-33 LOW dead code/dup (hydrateProjectResources, </footer>, Work-locally \u00d73, refreshTask(v.taskId), duplicate #human-audience-options ids, parseRoute tab list dup).",
+  "commits": [
+   {
+    "sha": "20e4dea0",
+    "subject": "Keep review help compact and audience lists distinct",
+    "body": "Give every review/responder input its own datalist, move detailed guidance to accessible tips, and preserve full refresh semantics after resource review actions (UI-30, UI-33)."
+   },
+   {
+    "sha": "3a9598b2",
+    "subject": "Remove obsolete console markup and document agent entry points",
+    "body": "Document MCP discovery, remove the unused resource editor and invalid footer close, and use the configured brand in the OAuth callback (UI-32, UI-33 partial, UI-34)."
+   }
+  ]
+ },
+ {
+  "id": "UI-34",
+  "section": "UI",
+  "finding": "UI-34 LOW brand drift \"Return to Tavya\" hard-coded (:19532), krmax/Krmax/TavyaMarkdown.",
+  "commits": [
+   {
+    "sha": "3a9598b2",
+    "subject": "Remove obsolete console markup and document agent entry points",
+    "body": "Document MCP discovery, remove the unused resource editor and invalid footer close, and use the configured brand in the OAuth callback (UI-32, UI-33 partial, UI-34)."
+   }
+  ]
+ },
+ {
+  "id": "UI-35",
+  "section": "UI",
+  "finding": "UI-35 LOW a11y task rows div[tabindex] no role/name.",
+  "commits": [
+   {
+    "sha": "72166433",
+    "subject": "Name focusable task and inbox groups",
+    "body": "Expose the row title to assistive technology while retaining the separate child links and action buttons (UI-35)."
+   }
+  ]
+ },
+ {
+  "id": "UI-36",
+  "section": "UI",
+  "finding": "UI-36 MED test-gap web tests mostly source-text; no e2e harness serving web/ with fake /api.",
+  "commits": [
+   {
+    "sha": "dc57a285",
+    "subject": "Exercise complete console journeys in Chromium",
+    "body": "Serve the complete web shell against isolated API and WebSocket fixtures. Drive trusted input through tags, failed and repeated saves, navigation, search failures, two tabs, streaming, and long Unicode/HTML task drafts under stacked dialogs. No paid services or live accounts are used (UI-36)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-1",
+  "section": "RQ",
+  "finding": "RQ-1 HIGH web/app.js connectWs \u2014 every agent.output event also schedules a full renderTaskPage (\u226460/s while streaming) and re-renders markdown for every message; output chunks evict agent.activity rows from S.taskEvents (cap 400). Fix: no full render for agent.output; don't store output events; memoize markdown.",
+  "commits": [
+   {
+    "sha": "b6a5c81c",
+    "subject": "Update streaming bubbles without repainting task pages",
+    "body": "Keep output chunks out of activity history and bound markdown memoization to avoid repeated parsing of unchanged messages (RQ-1)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-2",
+  "section": "RQ",
+  "finding": "RQ-2 HIGH refreshTask \u2014 9 GETs per lifecycle event, no coalescing (\u224836\u201354 GETs per agent turn). Fix: single-flight + trailing; fetch only what the event affects.",
+  "commits": [
+   {
+    "sha": "1ac4264a",
+    "subject": "Re-resolve task widgets on every lifecycle publication",
+    "body": "The Overview's Progress section (stage, changed files) is resolved from the\ntask view on the server, but since RQ-2 a refresh fetched the widgets only\nfor events whose names mention review/stage/turn.result. A stage change\narrives as `view.updated`, so a task that moved from Working to Review kept\nshowing \"Stage: do\" and \"No changes yet\" until the page was reloaded.\nFound in a console smoke test of the integrated branch.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "04fedf55",
+    "subject": "Coalesce task refreshes and fetch event-specific details",
+    "body": "Share each task refresh with one trailing pass for events received during the read. Ordinary view updates no longer reload vault, sessions, widgets, connections, and attempts (RQ-2, UI-6)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-3",
+  "section": "RQ",
+  "finding": "RQ-3 HIGH view.updated from another project/attempt reloads the whole task list (WS payload lacks projectId, server.ts:695). Fix: add projectId; skip non-principal attempts.",
+  "commits": [
+   {
+    "sha": "e2b09ceb",
+    "subject": "Give the websocket test fake the once() the lifetime helper needs",
+    "body": "#373 registers disconnect cleanup with socket.once; #376's RQ-3 test fake\nonly had on().\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "8caca636",
+    "subject": "Scope event-driven list and inbox refreshes",
+    "body": "Include the authorized project in websocket events. Ignore foreign list events and known sibling attempts, refresh inbox only for relevant transitions, and avoid rebuilding the rail (RQ-3, UI-7, RQ-8, RQ-15)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-4",
+  "section": "RQ",
+  "finding": "RQ-4 HIGH settings pages repeat GETs (org settings 53 requests: defaults \u00d74, mcp/connections \u00d74, vault items \u00d73); api() doesn't share identical in-flight GETs. Fix: in-flight GET dedupe; memoize defaults; parallel sections.",
+  "commits": [
+   {
+    "sha": "69378e51",
+    "subject": "Isolate shared console reads by authenticated user",
+    "body": "Cookie-authenticated sessions have no bearer token, so cache identity must also include the signed-in user. Prevent a subsequent login from reusing the prior user\u2019s in-flight reads or cached defaults (RQ-4, UI-22)."
+   },
+   {
+    "sha": "78e340f9",
+    "subject": "Reuse defaults across sequential settings hydration",
+    "body": "Cache scoped defaults for ten seconds, clear on mutations, and prevent old reads from repopulating the cache. Bound entries and clone cached values so forms cannot mutate shared defaults (RQ-4, UI-8). Update regression fixtures for compact tips, removed legacy controls, and the configured callback brand."
+   },
+   {
+    "sha": "80a2e2e5",
+    "subject": "Share identical in-flight console reads",
+    "body": "Deduplicate concurrent GETs by session and options, retire settled reads, and invalidate on mutations. Requests with cancellation signals retain independent ownership (RQ-4, UI-8)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-5",
+  "section": "RQ",
+  "finding": "RQ-5 HIGH-MED same-project tab switch renders twice (Tasks \u2192 Project settings \u224878 requests).",
+  "commits": [
+   {
+    "sha": "a44cc725",
+    "subject": "Avoid redundant list and settings repaints",
+    "body": "Background query refreshes render only the final result; cached project settings do not hydrate a second time after metadata refresh (RQ-7, RQ-5)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-6",
+  "section": "RQ",
+  "finding": "RQ-6 MED-HIGH = UI-3 (hydrateOrganizationView re-runs fully per action, ~21 GETs, stacked listeners).",
+  "commits": [
+   {
+    "sha": "0df30b4c",
+    "subject": "Replace organization handlers on repeated hydration",
+    "body": "Keep one handler on persistent controls after team and settings mutations, preventing duplicate invitations and organizations (UI-3, RQ-6)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-7",
+  "section": "RQ",
+  "finding": "RQ-7 MED each visible view.updated costs 3 list renders + a search; the first two show stale rows (search rows not patched).",
+  "commits": [
+   {
+    "sha": "a44cc725",
+    "subject": "Avoid redundant list and settings repaints",
+    "body": "Background query refreshes render only the final result; cached project settings do not hydrate a second time after metadata refresh (RQ-7, RQ-5)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-8",
+  "section": "RQ",
+  "finding": "RQ-8 MED every view.updated triggers an inbox reload (one GET per org). Fix: only finished / waiting-for-human / tasks already in the inbox.",
+  "commits": [
+   {
+    "sha": "8caca636",
+    "subject": "Scope event-driven list and inbox refreshes",
+    "body": "Include the authorized project in websocket events. Ignore foreign list events and known sibling attempts, refresh inbox only for relevant transitions, and avoid rebuilding the rail (RQ-3, UI-7, RQ-8, RQ-15)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-9",
+  "section": "RQ",
+  "finding": "RQ-9 MED boot \u22489 sequential round trips before first paint (partly fixed in d5190e7e); qr-scanner (70 KB) loaded synchronously on every page.",
+  "commits": [
+   {
+    "sha": "e66fe716",
+    "subject": "Load the QR decoder only when an image is pasted",
+    "body": "Remove the synchronous scanner from normal console startup and share a retryable lazy load for QR decoding (RQ-9, UI-29)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-10",
+  "section": "RQ",
+  "finding": "RQ-10 MED Parameters tab fetches /api/tasks/:id/payments on every task-page render.",
+  "commits": [
+   {
+    "sha": "6b99b18f",
+    "subject": "Preserve explicit refresh semantics in retained panels",
+    "body": "Keep resource response ownership and refresh spending on explicit task refreshes. Update isolated harnesses for visibility, safe links, and stacked overlays; minimized onboarding intentionally no longer retries in the background (RQ-10, RQ-12, RQ-13, UI-14)."
+   },
+   {
+    "sha": "7d27ea4a",
+    "subject": "Suspend hidden-tab work and invalidate expensive panels by events",
+    "body": "Backfill once on visibility, stop minimized onboarding polling, retain general history only in Activity, and avoid repeated payment reads and inventory scans (RQ-10, RQ-11, RQ-12, RQ-13, RQ-16; UI-9 polling)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-11",
+  "section": "RQ",
+  "finding": "RQ-11 MED hidden tabs never slow down (WS-driven refreshes, 60 s revision check, 5 s diagnostics polling). Fix: visibilitychange \u2192 mark stale, refresh once when shown.",
+  "commits": [
+   {
+    "sha": "7d27ea4a",
+    "subject": "Suspend hidden-tab work and invalidate expensive panels by events",
+    "body": "Backfill once on visibility, stop minimized onboarding polling, retain general history only in Activity, and avoid repeated payment reads and inventory scans (RQ-10, RQ-11, RQ-12, RQ-13, RQ-16; UI-9 polling)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-12",
+  "section": "RQ",
+  "finding": "RQ-12 LOW-MED onboarding card polls every 4 s even when minimized.",
+  "commits": [
+   {
+    "sha": "6b99b18f",
+    "subject": "Preserve explicit refresh semantics in retained panels",
+    "body": "Keep resource response ownership and refresh spending on explicit task refreshes. Update isolated harnesses for visibility, safe links, and stacked overlays; minimized onboarding intentionally no longer retries in the background (RQ-10, RQ-12, RQ-13, UI-14)."
+   },
+   {
+    "sha": "7d27ea4a",
+    "subject": "Suspend hidden-tab work and invalidate expensive panels by events",
+    "body": "Backfill once on visibility, stop minimized onboarding polling, retain general history only in Activity, and avoid repeated payment reads and inventory scans (RQ-10, RQ-11, RQ-12, RQ-13, RQ-16; UI-9 polling)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-13",
+  "section": "RQ",
+  "finding": "RQ-13 LOW-MED task Resources panel cached only 15 s; inventory scan refetched on each refreshTask.",
+  "commits": [
+   {
+    "sha": "6b99b18f",
+    "subject": "Preserve explicit refresh semantics in retained panels",
+    "body": "Keep resource response ownership and refresh spending on explicit task refreshes. Update isolated harnesses for visibility, safe links, and stacked overlays; minimized onboarding intentionally no longer retries in the background (RQ-10, RQ-12, RQ-13, UI-14)."
+   },
+   {
+    "sha": "7d27ea4a",
+    "subject": "Suspend hidden-tab work and invalidate expensive panels by events",
+    "body": "Backfill once on visibility, stop minimized onboarding polling, retain general history only in Activity, and avoid repeated payment reads and inventory scans (RQ-10, RQ-11, RQ-12, RQ-13, RQ-16; UI-9 polling)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-14",
+  "section": "RQ",
+  "finding": "RQ-14 LOW-MED global search: one request per project across all organizations per query, no cancellation. Fix: server-side cross-project search; cancel superseded; \u22652 chars.",
+  "commits": [
+   {
+    "sha": "6c386aeb",
+    "subject": "Expose aggregate console operations to agents",
+    "body": "Document cross-project search and bounded bulk inbox updates in describe_platform, assert their authorization bindings, and exercise notification races with batched response fixtures (RQ-14, UI-18)."
+   },
+   {
+    "sha": "457c5804",
+    "subject": "Aggregate global search behind per-project authorization",
+    "body": "Use one cancellable browser request and reauthorize discovery and task reads for every project with the original caller. Bound results to 100 tasks per project, preserve totals, stop between projects after cancellation, and show retry for server failures (RQ-14, UI-18 search, UI-12)."
+   },
+   {
+    "sha": "c5bed76e",
+    "subject": "Show retry when GitHub connection status cannot load",
+    "body": "Do not present disconnected or unconfigured GitHub guidance after a transport or permission failure. Also abort searches when their overlay closes (UI-12, RQ-14)."
+   },
+   {
+    "sha": "17b7b72c",
+    "subject": "Cancel superseded global searches and require two characters",
+    "body": "Stop abandoned fetches immediately when the query changes and avoid single-character fan-out (RQ-14/UI-18 partial: server aggregation and bulk inbox reads remain). Keep the socket-gap assertion targeted to the installed handler."
+   }
+  ]
+ },
+ {
+  "id": "RQ-15",
+  "section": "RQ",
+  "finding": "RQ-15 LOW sidebar rebuilt on every visible task event/list refresh though nothing in it is task-derived. Fix: drop both calls.",
+  "commits": [
+   {
+    "sha": "8caca636",
+    "subject": "Scope event-driven list and inbox refreshes",
+    "body": "Include the authorized project in websocket events. Ignore foreign list events and known sibling attempts, refresh inbox only for relevant transitions, and avoid rebuilding the rail (RQ-3, UI-7, RQ-8, RQ-15)."
+   }
+  ]
+ },
+ {
+  "id": "RQ-16",
+  "section": "RQ",
+  "finding": "RQ-16 LOW every WS event kept in S.activity (only the debug Activity page reads it); every project's events pushed to every tab.",
+  "commits": [
+   {
+    "sha": "7d27ea4a",
+    "subject": "Suspend hidden-tab work and invalidate expensive panels by events",
+    "body": "Backfill once on visibility, stop minimized onboarding polling, retain general history only in Activity, and avoid repeated payment reads and inventory scans (RQ-10, RQ-11, RQ-12, RQ-13, RQ-16; UI-9 polling)."
+   }
+  ]
+ }
+]

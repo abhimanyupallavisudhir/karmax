@@ -1,0 +1,102 @@
+CI-1	partial	719f971b,34a8e0d8	Dispatch pinned to default branch; deploy SHA ancestry-checked (tests: github-actions-platform, deploy-workflow). Remaining: no review:approve gate on .github/workflows pushes; environment restriction unverified.
+CI-2	fixed	39b78437,3d8de07c	SHA256SUMS over dumps+secrets; checksums, control-plane and pg dumps verified before down/drop; README updated. Tests: tests/deploy-secrets.test.ts, tests/deploy-lifecycle.test.ts.
+CI-3	partial	ac0def2d	REGRESSION? update-runner.sh:32 runs copied updater from .updates/<key>/; deploy/karmax:5 derives DEPLOY_DIR there, so every update dies 'instance is not configured' (simulated).
+CI-4	open	-	No scheduled live-test workflow: .github/workflows has only ci, deploy, backup (cron backup only); live suites run solely on manual KARMAX_RUN_LIVE=1.
+CI-5	fixed	799acff7,c1d08480	ci.yml has permissions: contents: read, persist-credentials: false on every checkout, npm ci --ignore-scripts plus targeted rebuild. Test: tests/deploy-workflow.test.ts.
+CI-6	fixed	f79b9988,13a918c7,54ca9c0c	All named direct and transitive packages raised in lockfile; dependabot.yml added; npm audit --audit-level=high in CI. Test: tests/dependency-policy.test.ts.
+CI-7	partial	afbb4360	Stripe client ID/webhook secret forwarded (tests/deploy-edge.test.ts). Commit defers the rest: app still connects as temporal superuser; DB password, OAuth, Stripe secrets remain plain env.
+CI-8	deferred	397cf0fb,a2b795c3	Fix a2b795c3 reverted by 397cf0fb: needs Caddy host networking plus a re-pinned Compose subnet, an owner-scheduled production network rollout. IPv6 clients still share buckets.
+CI-9	fixed	e03d961e	Every service in both compose profiles has mem_limit and rotating json-file logs (10m x3). Test: tests/deploy-edge.test.ts.
+CI-10	fixed	6fdfe639	Nightly backup.yml (scheduled-*, 14-day prune); deploy prunes only predeploy-*; manual backups staged then renamed atomically. Tests: tests/deploy-secrets.test.ts, tests/deploy-workflow.test.ts.
+CI-11	fixed	64036540,b5d87f8b,21f714ce	All paid suites need KARMAX_RUN_LIVE=1 (or suite flags); README no longer claims hermetic. Test: tests/live-gate.test.ts. Nit: TESTING.md:160-163 Daytona commands omit KARMAX_RUN_LIVE.
+CI-12	fixed	c292165f,42a54cee	container/services-docker suites fail via requireDocker unless KARMAX_SKIP_DOCKER=1; CI shards no longer skip Docker. Tests: tests/docker-gate.test.ts, tests/deploy-workflow.test.ts.
+CI-13	partial	a0a2832d,3cc2d4ab	deploy-artifacts now required and image started to load native modules (tests/deploy-workflow.test.ts). Hosted boot with Temporal+PostgreSQL still untested; commit leaves it open.
+CI-14	fixed	21f714ce	AGENTS.md is now a one-line pointer to CLAUDE.md; stale workflow-edit/package claims corrected in CLAUDE.md. Test: tests/repository-docs.test.ts.
+CI-15	open	-	No commit; source-text assertions grew (heuristic: 33 test files at base, 35 at HEAD read src/web and assert toContain/toMatch).
+CI-16	partial	60cdab1d,efbabd5d	MathJax entry bundle SRI-pinned (web/markdown.test.cjs). Open: runtime-loaded ui/safe and autoload extensions lack SRI; console and edge still lack CSP beyond frame-ancestors.
+CI-17	fixed	db531ea4	vitest setupFiles pins a disposable KARMAX_HOME per file and restores/removes it afterAll; paths() reads env per call. Test: tests/test-home-isolation.test.ts.
+CI-18	open	-	No commit addresses it; sleep-then-assert-nothing tests remain and the five 2s wall-clock bounds (toBeLessThan(2000)) are unchanged since base.
+CI-19	partial	57b696d0	Only deploy-edge turnkey fixtures cleaned (tests/deploy-edge.test.ts). tests/helpers/harness.ts unchanged: karmax-homes-* (line 175) and makeRepo karmax-repo-* (275) still never removed.
+CI-20	fixed	21f714ce,efe62e23	TESTING.md: singleFork replaced by current Vitest settings, coverage via npm ci devDependency, dated 2026-09-16 section removed. Test: tests/repository-docs.test.ts.
+CI-21	partial	21f714ce,wiki@dcc0171	Safe-mode and fast-forward text fixed. README:103 still ticks inert 'overlay resolution + per-workflow fallback' (Overlays never read); naming explained only in wiki general.
+CI-22	fixed	41efbd57,wiki@06ce266	No .md PLAN citations remain; all cited plans exist under wiki plans/; never-existing multi-pr/search-views cites dropped. Test: tests/repository-docs.test.ts.
+CI-23	partial	09a8a0c0,d0d7cda1,618c5245	design/ cut to 151 KB; e2b.Dockerfile and dated docs removed. benchmarks/results still 2.8 MB: raw exports deliberately kept and indexed (618c5245), not removed.
+CI-24	fixed	21472b1f	reset.ts registers as an app instance and claims worker ownership before wiping; refuses when others are live; locks in state/instances preserved. Test: tests/reset.test.ts.
+CI-25	partial	d5190e7e	Serving fixed: *.test.cjs return 404 (tests/static-serving.test.ts). Still in image: deploy/Dockerfile:29 COPY web copies all 108 test suites; .dockerignore omits them.
+CI-26	fixed	d5190e7e	Static assets carry per-encoding strong ETags and answer If-None-Match with 304. Test: tests/static-serving.test.ts.
+CI-27	partial	82f409eb	/app and node_modules now root-owned (read-only to karmax). Commit leaves open: base images use tags, not digests; --legacy-peer-deps still image-only (Dockerfile:7).
+CI-28	fixed	56671fb8,34a8e0d8,611da57a	deploy.yml requires workflow_run push from same repo's default branch; ancestry check on origin/master precedes extracting the updater. Test: tests/deploy-workflow.test.ts.
+CI-29	open	-	No commit; ci.yml unchanged here: each shard still runs npm ci (npm cache only), no paths filter; tests/durations.json still lists pipeline.test.ts at 391 s.
+CI-30	fixed	d8f02048,611da57a	Temporal CLI archive checked against pinned SHA-256 before extraction; every action pinned to a full commit SHA. Test: tests/deploy-workflow.test.ts.
+CI-31	fixed	7b1e4250	package.json engines >=22.16.0, .nvmrc 22.16.0, CLAUDE.md/README updated. Test: tests/repository-docs.test.ts.
+CI-32	open	-	No linter config or lint script (actionlint covers workflows only); 'as any' in src grew from 577 at base to 592 at HEAD.
+CI-33	partial	f79b9988,13a918c7	dotenv and @temporalio/proto now declared (tests/dependency-policy.test.ts). Still unpinned: chrome-cdp-launcher.mjs:38 defaults to npx -y chrome-devtools-mcp@latest.
+CI-34	fixed	2d88cbef	.gitignore covers .turnkey.env.migration.*, deploy/backups/, deploy/.updates/; .dockerignore excludes deploy/.turnkey.env*, deploy/backups, deploy/.updates (verified with git check-ignore).
+CI-35	fixed	db59b6c2	Each web/*.test.cjs child runs with a 20 s timeout and 1 MiB maxBuffer (whole file normally 21.7 s). Test: tests/web-regressions.test.ts hang case.
+CI-36	open	-	No commit; repository root still has no LICENSE, SECURITY.md, CONTRIBUTING or CODEOWNERS (package.json private, no license field).
+CI-37	fixed	3d8de07c	up, backup and restore now executed against fake Docker with injected failures (update path still only string-checked). Test: tests/deploy-lifecycle.test.ts.
+CI-38a	fixed	21472b1f,b818381e	reset.ts now covered: tests/reset.test.ts (live-instance refusal) and tests/reset-process.test.ts (Temporal process verification).
+CI-38b	open	-	src/domain/account-names.ts still untested: no test references canonicalAccountName.
+CI-38c	open	-	src/domain/resource-drivers.ts still untested: no test references resourceDriver, resourceDriverCatalog, snapshotResource or credentialResource.
+CI-38d	open	-	src/autonomy/cdp.ts and cdp-endpoint.ts still have no direct tests (assertLoopback, listPages, pickPage, openPage unreferenced); only cdp-fill.mjs is tested.
+CI-38e	partial	7bfddd6c	card-fill gained one AU-11 routing test (tests/agent-card-fill.test.ts); tests/card-fill.test.ts unchanged, so coverage stays thin.
+CI-38f	partial	-	remote/access gained one incidental port-prefix regression test in tests/autonomy.test.ts; otherwise unchanged and still thin.
+CI-38g	partial	-	e2b.ts gained seven WD/LT regression tests in tests/e2b-world.test.ts; incidental to other fixes, no systematic coverage.
+CI-38h	partial	-	github-pr gained seven regression tests (RT-20, forks, stale target) in tests/github-pr.test.ts; incidental, still no broad coverage.
+CI-38i	open	-	tests/account-erasure.test.ts unchanged since base; no new erasure tests (new postgres.test.ts cases are unrelated).
+CI-38j	open	-	src/config/deployment.ts coverage unchanged: tests/deployment.test.ts and launch-legal.test.ts not modified since base.
+CI-38k	partial	-	paddle gained one test (reservation release after failed preflight, tests/paddle-billing.test.ts); otherwise unchanged and thin.
+CI-38l	open	-	src/ops/backup.ts: tests/backup.test.ts unchanged; new deploy-lifecycle tests cover only the shell wrapper with fake Docker.
+CI-38m	open	-	No test references resourcePublishCoordinator; promote() tests (resources, world) build ProjectResourceService without a Temporal coordinator, same as base.
+CI-38n	fixed	776ae63c	Prior #1 fixed as WF-10 with regression 'a confirm signal cannot bypass failed workflow checks' in tests/workflow-review-regressions.test.ts.
+CI-38o	open	-	No test boots src/main.ts with KARMAX_DEPLOYMENT=hosted; new boot-readiness and split-main tests boot self-host mode only; CI-13 commit leaves it open.
+CI-38p	open	-	Still only the same 5 test files use KARMAX_TEST_POSTGRES_URL; new postgres-sql.test.ts checks SQL translation only, no database.
+CI-38q	open	-	No every-route x foreign-org matrix; gateway-scope and platform-authz gained a few per-route tenant checks (message_agent, audit), still hand-picked routes.
+CI-38r	open	-	POST /api/invitations/accept still has no HTTP test; only deploy-edge.test.ts lists the path for Caddy rate limiting.
+CI-38s	open	-	No browser e2e for quick-add to agent to Review to merge; new console-journeys suite (dc57a285) covers tags/search/streaming against fakes only.
+CI-38t	open	-	No browser e2e for hosted signup to onboarding; only a vm-based UI-9 unit test was added to web/onboarding-stability.test.cjs.
+CI-38u	open	-	No browser e2e for the invite journey; no test drives invitation creation or acceptance in a browser or over HTTP.
+CI-38v	open	-	No paid-plan journey e2e; paddle-checkout.browser.test.ts only gained checkout-page CSP and success-redirect origin checks.
+CI-38w	open	-	No browser e2e for credential request to approval to fill; no new browser suite covers this path.
+CI-38x	open	-	No browser e2e for restore; restore is exercised only by the fake-Docker shell test (tests/deploy-lifecycle.test.ts).
+WK-1	fixed	0061f5b7	parseFrontmatter reads '- item' block lists under an empty key and worded importance. Test: tests/wiki.test.ts (WK-1 case).
+WK-2a	fixed	wiki@c3e9ce0	A1 size: 114 KB SPEC split into 18 pages, largest 18 KB (~4.5k tokens); read_wiki returns one page; overview indexes sections. Wiki tests/spec.test.mjs.
+WK-2b	fixed	wiki@c3e9ce0	A2-21: 230-line §3.5 changelog moved intact to SPEC/hosted-scaling-notes; §3.5 is now a 2-line summary with link. Wiki tests/spec.test.mjs (hash check).
+WK-2c	fixed	wiki@c3e9ce0	A2-2: §4.2/4.3 now describe data-only manifest.json plus workflow.{mjs,js,ts}, manifest roles/resolveRules/agentMcp; matches repo.ts:28-29,203 and schema.ts.
+WK-2d	fixed	wiki@c3e9ce0	A2-3: §4.4, §8.3 and §0 say merge never activates code; separate global workflow:install, self-host only; hosted refuses edits, install and restore.
+WK-2e	partial	wiki@c3e9ce0	A2-4 items corrected (labels/default, 20k budget, [[…]]/wikiContext, organization:edit), but §4.4 says block-list labels unsupported; parser reads them since karmax 0061f5b7.
+WK-2f	fixed	wiki@c3e9ce0	A2-5: prep task described as draft software-dev 'tavya init' migrating AGENTS.md/CLAUDE.md, port scan self-host only; matches manifests.ts:463-470, server.ts:7674-7682.
+WK-2g	fixed	wiki@c3e9ce0	A2-6: §5 says the same Do agent does final verification, Merge templates kept privately for replay; §8.3 notes default grant includes merge-into:* (core.ts:128).
+WK-2h	fixed	wiki@c3e9ce0	A2-7: §0 and §5 state RESOLVE_AGENT_ENABLED = false; auto-resolve miss escalates directly; matches config/features.ts:8.
+WK-2i	fixed	wiki@c3e9ce0	A2-8: new §7.7 specifies Responder routing/fallback and project Avatars (avatar:<id> audiences, attenuated authority, console tab, enablement/override).
+WK-2j	partial	wiki@c3e9ce0	A2-9: SPEC §6.1a now per-org agent-queue:<orgId>, plan capacity, Installation → Host capacity (names.ts:73). CLAUDE.md:73 still says Global settings.
+WK-2k	partial	wiki@c3e9ce0	A2-10: SPEC §6.3 documents resource-publish:<attachmentId>, database payment reservations, budgetCoordinator unused. CLAUDE.md:55 still lists a budget coordinator.
+WK-2l	fixed	wiki@c3e9ce0	A2-11: §8.2 documents implemented request_permission elevation (exact capabilities, selected approver); §13 no longer lists it deferred; §14 ticks it.
+WK-2m	partial	wiki@c3e9ce0	A2-12: §9 marks safe mode unimplemented, §14 unticked; but §9 still cites KARMAX_SAFE_MODE and /api/safe-mode, and §8.3 a safe-mode route, removed in karmax 1c290b36.
+WK-2n	fixed	wiki@c3e9ce0	A2-13: §10.3 org and project rails match app.js:17540 and :13047 exactly; Dashboard renamed Insights with legacy redirect.
+WK-2o	fixed	wiki@c3e9ce0	A2-14: §10.6 route table (profile, installation, invite, insights, inbox/:kind, avatars, file viewer, full-page permalink, ?q=) and reserved words match app.js parseRoute/ORG_VIEWS.
+WK-2p	partial	wiki@c3e9ce0	A2-15: SPEC §1 now names the local AES-256-GCM file vault and KARMAX_VAULT_KEY; vault.ts:7-9 comment still says production would use HashiCorp Vault/1Password.
+WK-2q	fixed	wiki@c3e9ce0	A2-16: §3.4 no longer calls the gateway thin/stateless; lists its billing, SCIM, erasure, preview TLS and session services.
+WK-2r	fixed	wiki@c3e9ce0	A2-17: §11 marks customer runner pools deferred, describes runners.ts as DB admission, hosted E2B/Daytona as organization BYOK, adds diagnose/probe/desktopSession.
+WK-2s	fixed	wiki@c3e9ce0	A2-18: §12 now consistent: private Tailscale or public HTTPS behind Caddy/managed TLS with karmax auth; Cloudflare Access optional defense in depth.
+WK-2t	partial	wiki@c3e9ce0	A2-19: §15 drops Substitute, adds Attempt/Responder/Avatar; §14 marks just-do/script-exec legacy. But §14/§15 still call safe mode a flag, removed in 1c290b36.
+WK-2u	fixed	wiki@c3e9ce0	A2-20: new §16 Hosted SaaS covers deployment modes, isolation, BYOK, HOSTED_PLANS (matches entitlements.ts), Paddle/Stripe, 7-day grace, retention, closure/erasure limits.
+WK-2v	fixed	wiki@c3e9ce0	A1: SPEC description no longer history ('moved in ccee275'); overview and all 17 subpages say when to read them. Wiki tests/spec.test.mjs (A1 metadata).
+WK-3a	fixed	41efbd57,21f714ce,wiki@06ce266	CLAUDE.md:7 now names the wiki plans/ pages, which exist (14 restored verbatim as historical); AGENTS.md just points to CLAUDE.md.
+WK-3b	fixed	wiki@c3e9ce0,wiki@06ce266	SPEC's PLAN-collaboration/cloud/project-resources citations removed (wiki tests/spec.test.mjs A2-1); plans restored under plans/. Overview still loosely calls plan pages 'missing'.
+WK-3c	fixed	41efbd57,wiki@06ce266	No .md PLAN citations remain; every cited plan (git-config, passwords, dynamic-repos, authorization, IMAGE_PROMPTS, RESOLVE) exists under wiki plans/; search-views/multi-pr dropped. tests/repository-docs.test.ts.
+WK-4a	fixed	wiki@dcc0171	general has name/description, flow labels, principles verbatim, naming, section map and memory conventions; ~2.2 KB (~550 tokens), under the 1k-token target.
+WK-4b	fixed	wiki@5b6c240	fill-credential memory is an incidents/lessons row (542d2c81); vault-key hydration and world-provider:<org>:e2b:api-key recipe kept in ops/secrets-and-accounts and e2b-sandbox-failures.
+WK-4c	fixed	wiki@5b6c240	git-bundle-limit condensed to a lessons row: 64df2696 incremental 4 MiB bundles, KARMAX_MAX_GIT_BUNDLE_MB opt-in; stale memory deleted.
+WK-4d	fixed	wiki@5b6c240	ci-speed moved to ops/ci: five shards balanced by durations.json, browser-waits rule, clone-deletion trap, build-caddy retry.
+WK-4e	fixed	wiki@5b6c240	Daytona truncation is a lessons row (f4beda4e) plus startup-stall recipe; live verification traps in ops/providers, including required KARMAX_LIVE_TASK_ID.
+WK-4f	fixed	wiki@5b6c240	E2B freeze memory replaced: control-plane confirm recipe in incidents/e2b-sandbox-failures; unselected 4 GiB template 46tapo1ghjt2u6orvtve and Hobby-vs-Pro decisions in ops/providers.
+WK-4g	fixed	wiki@5b6c240	just-do finalization condensed to a lessons row citing landed 3b7ef11d/5e79195e (justDo@1.7.0) and just-do's legacy status; stale 'proposes' text gone.
+WK-4h	fixed	wiki@5b6c240	LegiBench-10 delay condensed to a lessons row: 7108ddf8 landed; lesson 'inspect pending activities and retries' kept; stale 'not deployed' gone.
+WK-4i	fixed	wiki@5b6c240	LegiBench3 path mismatch condensed to a lessons row (0b16fce0); 'never recreate the ledger' kept with ledger ids in test-fixtures.
+WK-4j	fixed	wiki@5b6c240	pass-gopass moved to features/vault-connectors with a when-to-read description; notes the importer ignores Username: body lines (also an open lessons row).
+WK-4k	fixed	wiki@dcc0171	Bitwarden proposal moved to planned/ with flow labels, importance 100; current state now cites stdin bw edit (connectors.ts:186) and the JSON-export importer.
+WK-4l	fixed	wiki@5b6c240	production-ssh merged into ops/production-tavya (85.190.100.189, administrator, sudo -n docker; vault id in ops/secrets-and-accounts); task-189 history note is a lessons row.
+WK-4m	fixed	wiki@5b6c240	restore-review cleanup condensed to a lessons row: 5542d8b9 waitForTerminalCleanup landed; stale 'proposed fix' gone.
+WK-4n	fixed	wiki@5b6c240	review-info-before-escalation condensed to a lessons row: 25d46feb landed; stale 'not deployed' gone; recovery hint kept.
+WK-4o	fixed	wiki@5b6c240	s3-integration-201 moved to test-fixtures (front matter, do-not-mutate rule, bucket/storage/project/resource/revision ids); stale 'not in master' text gone.

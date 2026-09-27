@@ -1,0 +1,555 @@
+[
+ {
+  "id": "CI-1",
+  "section": "CI",
+  "finding": "CI-1 HIGH security deploy.yml:11-16,27,39-41; github-actions.ts:350; api.ts:3980; authorization.ts:58 \u2014 agents (maintainer) have github:actions:write; dispatch any workflow any ref any inputs; broker token has workflows:write; workflow_dispatch runs file from dispatched ref \u2192 agent-written deploy.yml on task branch runs as environment production unless GitHub env restricted to master + reviewer. Fix settings + refuse non-default refs / protected envs; require review:approve for .github/workflows/** pushes.",
+  "commits": [
+   {
+    "sha": "34a8e0d8",
+    "subject": "Validate deployment ancestry before loading candidate code",
+    "body": "Fix CI-1 input bypass: even a default-branch dispatch may name an unreviewed SHA. Fetch the authoritative master ref and reject non-ancestors before extracting or executing their updater. A local Git and shell regression exercises both trusted and unreviewed candidates without SSH or deployment effects."
+   },
+   {
+    "sha": "719f971b",
+    "subject": "Restrict workflow dispatch to the default branch",
+    "body": "Fix the CI-1 arbitrary-ref dispatch path. Use a fully qualified branch ref so a same-named tag cannot select unreviewed workflow code."
+   }
+  ]
+ },
+ {
+  "id": "CI-2",
+  "section": "CI",
+  "finding": "CI-2 MED deploy/karmax:282-302 restore drops DBs + deletes .secrets before verifying checksums; dumps/secrets never checksummed; deploy/README claims opposite.",
+  "commits": [
+   {
+    "sha": "39b78437",
+    "subject": "Verify complete turnkey backups before restore",
+    "body": "CI-2: Check deployment-secret and PostgreSQL dump hashes, parse the dump archives, and verify the control-plane payload before stopping services or replacing state."
+   }
+  ]
+ },
+ {
+  "id": "CI-3",
+  "section": "CI",
+  "finding": "CI-3 MED deploy.yml:26 update foreground over SSH 30min; SIGHUP mid-step; \"previous\" read from moved HEAD.",
+  "commits": [
+   {
+    "sha": "ac0def2d",
+    "subject": "Detach deployment updates from SSH sessions",
+    "body": "CI-3: Launch the validated updater in a durable host-side session with a deployment lock, status file, and log. CI polls the result; a runner disconnect no longer sends SIGHUP to the update. The updater already captures previous HEAD before candidate checkout."
+   }
+  ]
+ },
+ {
+  "id": "CI-4",
+  "section": "CI",
+  "finding": "CI-4 MED no scheduled live tests (providers drift only found in prod).",
+  "commits": []
+ },
+ {
+  "id": "CI-5",
+  "section": "CI",
+  "finding": "CI-5 MED ci.yml no permissions: block; checkout persists token; npm ci runs install scripts.",
+  "commits": [
+   {
+    "sha": "c1d08480",
+    "subject": "Constrain dependency install scripts in CI",
+    "body": "CI-5: Install the lockfile without arbitrary dependency scripts, then rebuild only packages known to need native or generated artifacts. Audit high-severity advisories in the validation job."
+   },
+   {
+    "sha": "799acff7",
+    "subject": "Restrict validation workflow credentials",
+    "body": "CI-5: Give CI read-only repository access and prevent checkout credentials from persisting in the workspace. Tests assert both controls on every checkout step."
+   }
+  ]
+ },
+ {
+  "id": "CI-6",
+  "section": "CI",
+  "finding": "CI-6 MED deps: npm audit 21 vulns (11 high): nodemailer 9.0.3\u21929.1.1, @daytona/sdk 0.196\u21920.218, vitest 4.1.10\u21924.1.11; undici/tar via e2b; fast-uri/ip-address/hono via MCP SDK; @temporalio 1.20.2\u21921.24, better-auth \u21921.7.6, e2b \u21922.51 (drops glob@11). No dependabot, no audit in CI.",
+  "commits": [
+   {
+    "sha": "54ca9c0c",
+    "subject": "Warm identity schema validation before bootstrap",
+    "body": "Better Auth 1.7.6 validates the schema on its first request using a second SQLite checkout. Perform the check after migrations and before bootstrap holds the database transaction, preventing the CI identity fixtures from deadlocking. CI-6 follow-up."
+   },
+   {
+    "sha": "13a918c7",
+    "subject": "Restore clean npm installs",
+    "body": "Regenerate the lockfile after dependency changes so npm ci can resolve the Anthropic SDK peer tree and optional native packages. Add a dry-run clean-install regression check. CI-6, CI-33 follow-up."
+   },
+   {
+    "sha": "f79b9988",
+    "subject": "Update vulnerable dependencies and declare direct imports",
+    "body": "CI-6, CI-33: Raise compatible security floors, audit the lockfile, and schedule dependency updates. Adapt OIDC verification to Better Auth's current API while preserving an optional configured-issuer check. Declare the tooling and replay-fixture imports directly."
+   }
+  ]
+ },
+ {
+  "id": "CI-7",
+  "section": "CI",
+  "finding": "CI-7 MED compose: app connects as `temporal` superuser; secrets plain env though _FILE supported; STRIPE_CLIENT_ID/WEBHOOK_SECRET documented but not forwarded.",
+  "commits": [
+   {
+    "sha": "afbb4360",
+    "subject": "Forward documented Stripe Issuing settings",
+    "body": "CI-7: Both Compose profiles now pass the optional Stripe client ID and webhook signing secret to the app. The separate turnkey database-role and secret-file migration remains to be handled without risking existing data."
+   }
+  ]
+ },
+ {
+  "id": "CI-8",
+  "section": "CI",
+  "finding": "CI-8 MED Caddy/IPv6 via docker userland proxy \u2192 all IPv6 share rate-limit bucket & login lockout.",
+  "commits": [
+   {
+    "sha": "397cf0fb",
+    "subject": "Defer the public-edge topology change (CI-8) to a planned rollout",
+    "body": "Reverts a2b795c3 from this integration; the commit stays ready to apply.\nIt fixes a real problem \u2014 behind Docker's userland proxy every IPv6 client\nreaches Caddy from one bridge address and shares one login-lockout and\nrequest budget \u2014 but only by moving Caddy to host networking, publishing\nthe app on host loopback and re-pinning the Compose network to\n172.30.0.0/24, with the gateway trusting forwarded addresses only from that\ngateway. The app half is inert without the topology half, and the next\ndeploy would have to recreate the production network (and reserve the\nsubnet on the host) inside an automatic update with no maintenance window.\nThat is the owner's rollout to schedule, not a side effect of merging a\nlarge review branch.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "a2b795c3",
+    "subject": "Preserve client addresses through the public edge",
+    "body": "CI-8: receive IPv6 directly at Caddy, bind app ingress to host loopback and trust only the pinned bridge gateway. Overwrite forwarded addresses and group IPv6 login and hosted request budgets by /64. Keep bounded per-replica counters and document the host-network/subnet requirement."
+   }
+  ]
+ },
+ {
+  "id": "CI-9",
+  "section": "CI",
+  "finding": "CI-9 MED compose no logging limits/memory limits.",
+  "commits": [
+   {
+    "sha": "e03d961e",
+    "subject": "Bound hosted container memory and logs",
+    "body": "CI-9: Apply per-service memory ceilings and rotating JSON logs in both deployment profiles so one process or log stream cannot consume the host indefinitely."
+   }
+  ]
+ },
+ {
+  "id": "CI-10",
+  "section": "CI",
+  "finding": "CI-10 MED no scheduled backups; prune deletes manual backups; partial dir on failure.",
+  "commits": [
+   {
+    "sha": "6fdfe639",
+    "subject": "Schedule complete backups and retain manual snapshots",
+    "body": "CI-10: Publish manual backups atomically so a failed dump leaves no partial restore point. Run daily production snapshots, retain 14 days of scheduled and predeploy snapshots, and never prune unlabelled manual backups."
+   }
+  ]
+ },
+ {
+  "id": "CI-11",
+  "section": "CI",
+  "finding": "CI-11 MED live suites opt-out (KARMAX_SKIP_LIVE) \u2192 npm test spends money/creates GitHub repo on machines with creds; README says hermetic.",
+  "commits": [
+   {
+    "sha": "b5d87f8b",
+    "subject": "Require opt-in for every paid live suite",
+    "body": "CI-11: Credential presence alone still enabled four provider suites. Route them through the shared explicit opt-in gate so ordinary test runs cannot spend provider credit."
+   },
+   {
+    "sha": "21f714ce",
+    "subject": "Unify repository guidance and correct test documentation",
+    "body": "CI-14, CI-20, CI-21, CI-11: Point AGENTS.md at the maintained guide, preserve its accurate self-hosted package guidance, document explicit live-suite opt-in and current Vitest settings, and remove stale safe-mode and deploy claims."
+   },
+   {
+    "sha": "64036540",
+    "subject": "Require explicit opt-in for paid live tests",
+    "body": "CI-11: Provider and GitHub integration suites run only with KARMAX_RUN_LIVE=1, even when host credentials are available; the GitHub suite no longer probes gh auth during default runs."
+   }
+  ]
+ },
+ {
+  "id": "CI-12",
+  "section": "CI",
+  "finding": "CI-12 MED Docker suites pass silently without docker (if(!docker) return inside it); \"covered by deploy-artifacts\" false.",
+  "commits": [
+   {
+    "sha": "42a54cee",
+    "subject": "Run Docker integration suites in CI",
+    "body": "CI-12: Docker-backed world and service suites now execute on the CI test runners instead of being silently counted as coverage from image-build checks. Local machines without Docker must opt out explicitly."
+   },
+   {
+    "sha": "c292165f",
+    "subject": "Fail enabled Docker suites without Docker",
+    "body": "CI-12: Returning early from integration tests made absent Docker look like passing coverage. Require a daemon unless the suite is explicitly skipped."
+   }
+  ]
+ },
+ {
+  "id": "CI-13",
+  "section": "CI",
+  "finding": "CI-13 MED deploy-artifacts not required; image never started; no hosted boot test.",
+  "commits": [
+   {
+    "sha": "3cc2d4ab",
+    "subject": "Cover deploy artifacts in required CI check",
+    "body": "CI-13 made deploy-artifacts a prerequisite of the required check, but the older workflow test still expected two jobs. Assert all three dependencies and verify that a failure in any one fails the check."
+   },
+   {
+    "sha": "a0a2832d",
+    "subject": "Require deployment artifact validation in CI",
+    "body": "CI-13: Gate the required check on image and Compose validation, and start the built control-plane image to load its native runtime modules. A full hosted boot with Temporal and PostgreSQL remains open."
+   }
+  ]
+ },
+ {
+  "id": "CI-14",
+  "section": "CI",
+  "finding": "CI-14 MED AGENTS.md vs CLAUDE.md \u2192 pointer.",
+  "commits": [
+   {
+    "sha": "21f714ce",
+    "subject": "Unify repository guidance and correct test documentation",
+    "body": "CI-14, CI-20, CI-21, CI-11: Point AGENTS.md at the maintained guide, preserve its accurate self-hosted package guidance, document explicit live-suite opt-in and current Vitest settings, and remove stale safe-mode and deploy claims."
+   }
+  ]
+ },
+ {
+  "id": "CI-15",
+  "section": "CI",
+  "finding": "CI-15 MED ~40 test files assert raw source text (toContain) \u2014 brittle.",
+  "commits": []
+ },
+ {
+  "id": "CI-16",
+  "section": "CI",
+  "finding": "CI-16 MED/LOW no CSP/frame-ancestors at app or edge (lead fixed frame-ancestors in app); MathJax no SRI.",
+  "commits": [
+   {
+    "sha": "efbabd5d",
+    "subject": "Keep MathJax browser fixture compatible with SRI",
+    "body": "The deterministic CDN stub has different bytes from the pinned MathJax bundle. Remove integrity only from that stubbed script in the test browser; production continues to enforce the verified hash. CI-16 follow-up."
+   },
+   {
+    "sha": "60cdab1d",
+    "subject": "Verify the lazy MathJax CDN script",
+    "body": "CI-16: Pin the exact MathJax 3.2.2 entry bundle with SRI and anonymous CORS. The console's broader CSP remains to be designed around its inline bootstrap and dynamic behavior."
+   }
+  ]
+ },
+ {
+  "id": "CI-17",
+  "section": "CI",
+  "finding": "CI-17 LOW/MED vitest isolate:false, KARMAX_HOME not pinned per file; custody/attachments tests set & don't restore \u2192 can touch real ~/.karmax.",
+  "commits": [
+   {
+    "sha": "db531ea4",
+    "subject": "Isolate the implicit Karmax home in every test file",
+    "body": "CI-17: A suite that forgets to restore KARMAX_HOME can no longer read or mutate a developer's real ~/.karmax. Vitest assigns and cleans a disposable home before each file imports production modules."
+   }
+  ]
+ },
+ {
+  "id": "CI-18",
+  "section": "CI",
+  "finding": "CI-18 LOW sleep-then-assert-nothing tests vacuous on slow runners; 2s wall clock bounds.",
+  "commits": []
+ },
+ {
+  "id": "CI-19",
+  "section": "CI",
+  "finding": "CI-19 LOW harness temp dirs not removed.",
+  "commits": [
+   {
+    "sha": "57b696d0",
+    "subject": "Clean deployment test fixtures after use",
+    "body": "CI-19: Remove each temporary turnkey configuration directory even when the shell fixture fails, and verify the helper leaves no new directories behind. Other test fixtures still need an inventory."
+   }
+  ]
+ },
+ {
+  "id": "CI-20",
+  "section": "CI",
+  "finding": "CI-20 LOW TESTING.md drift (singleFork, coverage npm i, dated section).",
+  "commits": [
+   {
+    "sha": "21f714ce",
+    "subject": "Unify repository guidance and correct test documentation",
+    "body": "CI-14, CI-20, CI-21, CI-11: Point AGENTS.md at the maintained guide, preserve its accurate self-hosted package guidance, document explicit live-suite opt-in and current Vitest settings, and remove stale safe-mode and deploy claims."
+   }
+  ]
+ },
+ {
+  "id": "CI-21",
+  "section": "CI",
+  "finding": "CI-21 LOW README safe mode \u2705 false; deploy/README \"fast-forward\"; naming karmax/krmax/tavya.",
+  "commits": [
+   {
+    "sha": "21f714ce",
+    "subject": "Unify repository guidance and correct test documentation",
+    "body": "CI-14, CI-20, CI-21, CI-11: Point AGENTS.md at the maintained guide, preserve its accurate self-hosted package guidance, document explicit live-suite opt-in and current Vitest settings, and remove stale safe-mode and deploy claims."
+   }
+  ]
+ },
+ {
+  "id": "CI-22",
+  "section": "CI",
+  "finding": "CI-22 LOW ~60 comments cite PLAN-*.md that don't exist.",
+  "commits": [
+   {
+    "sha": "41efbd57",
+    "subject": "Point design-plan citations at the restored wiki plans pages",
+    "body": "CI-22/WK-3: ~60 comments and CLAUDE.md cited PLAN-git-config.md,\nPLAN-passwords.md and PLAN_IMAGE_PROMPTS.md as if they were repository\nfiles; the plans now live in the project wiki under plans/, so cite them\nas `wiki plans/PLAN-\u2026`. PLAN-multi-pr and PLAN-search-views never\nexisted anywhere, so drop those citations instead of pointing at\nnothing. Comment text only; a repository-docs test keeps new `.md`\nplan citations out.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "CI-23",
+  "section": "CI",
+  "finding": "CI-23 LOW dead weight: benchmarks/results 2.8MB (12 unreferenced), design/ 1.2MB, deploy/e2b.Dockerfile unreferenced; dated docs.",
+  "commits": [
+   {
+    "sha": "09a8a0c0",
+    "subject": "Remove unreferenced benchmark and design artifacts",
+    "body": "CI-23: Drop unused benchmark notes, duplicate design PNGs, and the unused E2B Dockerfile. Retain every result referenced by docs, the SVG sources asserted by brand tests, and dated docs owned by the wiki migration."
+   }
+  ]
+ },
+ {
+  "id": "CI-24",
+  "section": "CI",
+  "finding": "CI-24 LOW reset.ts wipes state w/o live app check.",
+  "commits": [
+   {
+    "sha": "21472b1f",
+    "subject": "Refuse reset while an app or worker is live",
+    "body": "CI-24: Acquire the same instance and worker locks used by the runtime before deleting durable state. Preserve lock inodes through the wipe so a concurrent app start cannot race reset."
+   }
+  ]
+ },
+ {
+  "id": "CI-25",
+  "section": "CI",
+  "finding": "CI-25 **[fixed d5190e7e]** LOW web/*.test.cjs served publicly + in image (lead fixed serving).",
+  "commits": []
+ },
+ {
+  "id": "CI-26",
+  "section": "CI",
+  "finding": "CI-26 **[fixed d5190e7e]** LOW/MED no ETag (lead fixed).",
+  "commits": []
+ },
+ {
+  "id": "CI-27",
+  "section": "CI",
+  "finding": "CI-27 LOW Dockerfile code owned by runtime user; tags not digests; --legacy-peer-deps only in image.",
+  "commits": [
+   {
+    "sha": "82f409eb",
+    "subject": "Keep container application code read-only to runtime user",
+    "body": "CI-27: Copy /app and node_modules with root ownership while retaining a writable data volume for the karmax user. Image digest pinning and the image-only legacy peer flag remain open."
+   }
+  ]
+ },
+ {
+  "id": "CI-28",
+  "section": "CI",
+  "finding": "CI-28 LOW deploy.yml executes extracted deploy/karmax before ancestry check; workflow_run event/repo not checked.",
+  "commits": [
+   {
+    "sha": "611da57a",
+    "subject": "Use deployment poll count in timeout",
+    "body": "Report the bounded polling count when a detached deployment does not complete, making the loop variable useful and satisfying actionlint ShellCheck. CI-28, CI-30 follow-up."
+   },
+   {
+    "sha": "56671fb8",
+    "subject": "Validate deployment event and revision before candidate execution",
+    "body": "CI-28: workflow_run must represent a successful push from this repository's default branch. Confirm the requested commit is on origin/master before extracting and running its updater."
+   }
+  ]
+ },
+ {
+  "id": "CI-29",
+  "section": "CI",
+  "finding": "CI-29 LOW CI cost: per-shard installs uncached; no paths filter; pipeline.test.ts 391s floor.",
+  "commits": []
+ },
+ {
+  "id": "CI-30",
+  "section": "CI",
+  "finding": "CI-30 LOW Temporal CLI curl|tar no checksum; actions pinned by major.",
+  "commits": [
+   {
+    "sha": "611da57a",
+    "subject": "Use deployment poll count in timeout",
+    "body": "Report the bounded polling count when a detached deployment does not complete, making the loop variable useful and satisfying actionlint ShellCheck. CI-28, CI-30 follow-up."
+   },
+   {
+    "sha": "d8f02048",
+    "subject": "Pin CI actions and Temporal CLI archive",
+    "body": "CI-30: Use exact action commits and verify the Temporal CLI archive against the checksum published for v1.7.2 before extraction."
+   }
+  ]
+ },
+ {
+  "id": "CI-31",
+  "section": "CI",
+  "finding": "CI-31 LOW engines >=22 but needs >=22.16; no .nvmrc.",
+  "commits": [
+   {
+    "sha": "7b1e4250",
+    "subject": "Require Node 22.16 for SQLite support",
+    "body": "CI-31: Match the actual runtime floor in package metadata, repository guidance, and a version-manager file so unsupported 22.x releases are rejected early."
+   }
+  ]
+ },
+ {
+  "id": "CI-32",
+  "section": "CI",
+  "finding": "CI-32 LOW no linter; 552 `as any`.",
+  "commits": []
+ },
+ {
+  "id": "CI-33",
+  "section": "CI",
+  "finding": "CI-33 LOW undeclared deps dotenv, @temporalio/proto; npx -y MCP installs unpinned.",
+  "commits": [
+   {
+    "sha": "13a918c7",
+    "subject": "Restore clean npm installs",
+    "body": "Regenerate the lockfile after dependency changes so npm ci can resolve the Anthropic SDK peer tree and optional native packages. Add a dry-run clean-install regression check. CI-6, CI-33 follow-up."
+   },
+   {
+    "sha": "f79b9988",
+    "subject": "Update vulnerable dependencies and declare direct imports",
+    "body": "CI-6, CI-33: Raise compatible security floors, audit the lockfile, and schedule dependency updates. Adapt OIDC verification to Better Auth's current API while preserving an optional configured-issuer check. Declare the tooling and replay-fixture imports directly."
+   }
+  ]
+ },
+ {
+  "id": "CI-34",
+  "section": "CI",
+  "finding": "CI-34 LOW .gitignore misses deploy/.turnkey.env.migration.<pid>; .dockerignore misses deploy/backups, .turnkey.env*.",
+  "commits": [
+   {
+    "sha": "2d88cbef",
+    "subject": "Ignore deployment migration copies and backups",
+    "body": "CI-34: Generated migration environment files, backup snapshots, and detached deployment logs must stay outside Git and Docker build contexts."
+   }
+  ]
+ },
+ {
+  "id": "CI-35",
+  "section": "CI",
+  "finding": "CI-35 LOW web-regressions execFileSync no timeout.",
+  "commits": [
+   {
+    "sha": "db59b6c2",
+    "subject": "Bound browser regression child processes",
+    "body": "CI-35: Give every web regression subprocess a 20-second wall clock limit and bounded output so a hung child cannot wedge its Vitest file indefinitely."
+   }
+  ]
+ },
+ {
+  "id": "CI-36",
+  "section": "CI",
+  "finding": "CI-36 LOW no LICENSE, SECURITY.md, CONTRIBUTING, CODEOWNERS.",
+  "commits": []
+ },
+ {
+  "id": "CI-37",
+  "section": "CI",
+  "finding": "CI-37 LOW deploy script backup/restore/up tested by string matching only.",
+  "commits": [
+   {
+    "sha": "3d8de07c",
+    "subject": "Exercise deployment lifecycle paths against fake Docker",
+    "body": "CI-37: execute up, backup and restore with success and injected failures, verifying staging cleanup, readiness, confirmation and validation before destructive operations. The backup test exposed a shell variable leak from backup_checksums that overwrote the destination; isolate that helper in a subshell."
+   }
+  ]
+ },
+ {
+  "id": "CI-38",
+  "section": "CI",
+  "finding": "CI-38 Coverage gaps: no tests reset.ts, account-names, resource-drivers, autonomy/cdp; thin card-fill, remote/access, e2b.ts, github-pr, account-erasure, deployment, paddle, backup; resourcePublishCoordinator never started; merge-only prior #1 no test; hosted main.ts never booted; Postgres only 5 files; no every-route \u00d7 foreign-org tenancy matrix; /api/invitations/accept HTTP untested; no browser e2e for core journeys (quick-add\u2192agent\u2192Review\u2192merge; hosted signup\u2192onboarding; invite; paid plan; credential request\u2192approval\u2192fill; restore).",
+  "commits": [
+   {
+    "sha": "c483ead2",
+    "subject": "Wait for complete memory guard log line",
+    "body": "A log file can exist before the detached guard has written its first line. Wait for the expected event instead of file creation to avoid a false CI failure. CI-38 follow-up."
+   }
+  ]
+ },
+ {
+  "id": "WK-1",
+  "section": "WK",
+  "finding": "WK-1 MED src/wiki/wiki.ts:264-270 \u2014 parseFrontmatter ignores YAML block-list `labels:` (SPEC declares its labels that way, so it has none).",
+  "commits": [
+   {
+    "sha": "0061f5b7",
+    "subject": "Read block-list labels and worded importance in wiki front matter",
+    "body": "WK-1: parseFrontmatter only read flat `key: value` lines, so a page\ndeclaring `labels:` as a YAML block list (`- a` items) silently had no\nlabels, and `importance: high` was dropped to the default order. Read a\n`- item` list under an empty key as a comma list, map low/medium/high\n(and neighbours) onto the numeric scale pages already use, and treat an\nunknown word or blank value as absent rather than 0 so a builtin's own\norder still applies.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "WK-2",
+  "section": "WK",
+  "finding": "WK-2 MED SPEC is ~114 KB: likely beyond an MCP tool result budget; \u00a73.5 is a changelog; many sections contradict the code (package format \u00a74.2/4.3, merge publishes version \u00a74.4, wiki delivery, prep task \u00a74.6, Merge agent retired and Resolve disabled \u00a75, Responder/Avatars absent, per-org queue \u00a76.1a, budget coordinator dead, elevation \u00a78.2 implemented, safe mode inert \u00a79, \u00a710.3 rail, \u00a710.6 URLs, secrets backend \u00a71, thin gateway \u00a73.4, runner pools \u00a711.2, CF Access \u00a712, stale glossary/checklist, no hosted-SaaS section).",
+  "commits": [
+   {
+    "sha": "wiki@c3e9ce0",
+    "subject": "Align and split the SPEC around implemented contracts",
+    "body": "Resolve WK-2: A1 first bullet and A2-1 through A2-21. Reconfirm the audit against karmax 3a0bda09, preserve numbered design rationale, and document the hosted deployment, entitlement, Paddle/Stripe and retention boundaries.\n\nMove the unchanged section 3.5 implementation notes behind a short link. Keep safe-mode intent with Known gap GW-11 and record the older #9 prompt-journaling gap instead of declaring either implemented. Remove dangling historical PLAN citations rather than restoring obsolete plans. The requested A3-20 does not exist; the hosted-model finding is A2-20.\n\nAll 23 editorial regressions fail against the committed monolith and pass here. Validate YAML and full-page reads with the actual wiki reader, pass 47 existing wiki tests, and pass the single-threaded native typecheck after tsc exhausts its heap. No runtime changes or paid providers."
+   }
+  ]
+ },
+ {
+  "id": "WK-3",
+  "section": "WK",
+  "finding": "WK-3 MED the PLAN* pages cited by CLAUDE.md, SPEC and ~60 code comments exist nowhere (deleted in 8a0ab947 \"reconciled into the wiki\", never landed).",
+  "commits": [
+   {
+    "sha": "41efbd57",
+    "subject": "Point design-plan citations at the restored wiki plans pages",
+    "body": "CI-22/WK-3: ~60 comments and CLAUDE.md cited PLAN-git-config.md,\nPLAN-passwords.md and PLAN_IMAGE_PROMPTS.md as if they were repository\nfiles; the plans now live in the project wiki under plans/, so cite them\nas `wiki plans/PLAN-\u2026`. PLAN-multi-pr and PLAN-search-views never\nexisted anywhere, so drop those citations instead of pointing at\nnothing. Comment text only; a repository-docs test keeps new `.md`\nplan citations out.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "wiki@06ce266",
+    "subject": "Restore historical design plans in the project wiki",
+    "body": "WK-3: restore all fourteen design documents deleted by karmax commit 8a0ab947, including the image plan still cited by code. Preserve repository text under a historical provenance and SPEC/code precedence note so existing citations regain their rationale without claiming stale designs are current."
+   }
+  ]
+ },
+ {
+  "id": "WK-4",
+  "section": "WK",
+  "finding": "WK-4 LOW `general` has no name/description; `panagent-existing` is a pasted chat answer; `planned/s3-onboarding-automation` and continuation-evidence pages are dead; several memories say \"not deployed\" for work that landed; paddle-billing / hosted-launch-provider-evidence have glued numbers (\"is30days\").",
+  "commits": [
+   {
+    "sha": "wiki@5b6c240",
+    "subject": "Replace incident memories with ops, features, incidents and fixtures pages",
+    "body": "WK-4/WK-5: the TOC injected into every prompt listed ~25 dated incident\nlogs, several claiming \"not deployed\" for fixes that landed (each checked\nwith git merge-base against master; Deploy #273 put master 04d0b0c8 live\non 2026-09-26). Condense them into one incidents/lessons table\n(symptom, cause, fix commit, diagnosis) plus four reusable diagnostic\nrecipes, and add the missing operational knowledge as ops/ pages:\nproduction host, release/proof-of-deploy/rollback, secrets and vault item\nregistry with the expiry calendar (Paddle keys 2026-12-23), CI, billing,\ncompliance register, privacy/recovery runbook, providers with the live\ncloud testing traps, and a diagnostics runbook. Shipped features move to\nfeatures/, production fixtures to test-fixtures/. Glued numbers\n(\"is30days\") are gone with the rewrite. No secret values are recorded.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "wiki@dcc0171",
+    "subject": "Apply the wiki page verdicts for dead and misfiled pages",
+    "body": "WK-4: give `general` (the only default page, inlined into every task)\nfront matter plus naming, a map of where knowledge lives and the memory\nconventions, keeping the owner's principles verbatim. Delete the pasted\n`panagent-existing` chat answer, the null-id `s3-onboarding-automation`\nindex and the raw continuation log of a finished release; move the\nBitwarden proposal to planned/ with parseable labels, sane importance and\nits current-state section corrected against connectors.ts and the\nJSON-export importer; strip the finished #219 continuation from the\nscoped-release proposal, which is still unimplemented.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "wiki@b10ad12",
+    "subject": "Recover and reconcile stranded integration proposals",
+    "body": "WK-4/WK-5: selectively preserve the durable external ingress and candidate-bound test Review designs against current native MCP, Composio and authorization code. Recheck DeepSeek primary protocol documentation and replace obsolete preview claims with current admission gates. Keep proposal status explicit and omit historical task narration; do not merge obsolete branches or enable live integrations."
+   }
+  ]
+ },
+ {
+  "id": "WK-5",
+  "section": "WK",
+  "finding": "WK-5 MED missing: production operations page (host, containers, volumes, env, secrets locations, release/deploy/restore), key-expiry calendar (Paddle keys 2026-12-23), architecture overview + naming (tavya product / karmax repo / krmax UI), wiki conventions, incident-lessons index, provider register, test-fixture register, open-findings tracker.",
+  "commits": [
+   {
+    "sha": "wiki@5b6c240",
+    "subject": "Replace incident memories with ops, features, incidents and fixtures pages",
+    "body": "WK-4/WK-5: the TOC injected into every prompt listed ~25 dated incident\nlogs, several claiming \"not deployed\" for fixes that landed (each checked\nwith git merge-base against master; Deploy #273 put master 04d0b0c8 live\non 2026-09-26). Condense them into one incidents/lessons table\n(symptom, cause, fix commit, diagnosis) plus four reusable diagnostic\nrecipes, and add the missing operational knowledge as ops/ pages:\nproduction host, release/proof-of-deploy/rollback, secrets and vault item\nregistry with the expiry calendar (Paddle keys 2026-12-23), CI, billing,\ncompliance register, privacy/recovery runbook, providers with the live\ncloud testing traps, and a diagnostics runbook. Shipped features move to\nfeatures/, production fixtures to test-fixtures/. Glued numbers\n(\"is30days\") are gone with the rewrite. No secret values are recorded.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "wiki@b10ad12",
+    "subject": "Recover and reconcile stranded integration proposals",
+    "body": "WK-4/WK-5: selectively preserve the durable external ingress and candidate-bound test Review designs against current native MCP, Composio and authorization code. Recheck DeepSeek primary protocol documentation and replace obsolete preview claims with current admission gates. Keep proposal status explicit and omit historical task narration; do not merge obsolete branches or enable live integrations."
+   }
+  ]
+ }
+]

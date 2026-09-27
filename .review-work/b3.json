@@ -1,0 +1,803 @@
+[
+ {
+  "id": "WD-1",
+  "section": "WD",
+  "finding": "WD-1 CRIT data-loss e2b.ts:307-310, daytona.ts:238-241, runners.ts:377-378 \u2014 sealed-ref key change \u2192 matches() decrypt error \u2192 false \u2192 reaper destroys every live sandbox as duplicate within 60s; handles unopenable. Fix three-state match, skip undecidable; random ref key in vault w/ key id; warn at boot.",
+  "commits": [
+   {
+    "sha": "3241b44b",
+    "subject": "Initialize world reference keys only during primary bootstrap",
+    "body": "WD-1: Preserve the secondary-worker read-only attachment contract. Secondary services lazily load the primary vault key and cannot fall back to a new reference key. The execution-services regression and restart/key-integrity tests pass."
+   },
+   {
+    "sha": "993579b5",
+    "subject": "Persist independent keys for new sandbox references",
+    "body": "WD-1: store a random installation reference key in the vault using atomic initialization and a versioned key-id envelope. Preserve KWR1 decoding for existing handles and warn at boot if legacy keys are unavailable."
+   },
+   {
+    "sha": "d654ec2a",
+    "subject": "Preserve sandboxes when provider identity or liveness is uncertain",
+    "body": "WD-1, WD-8: keep undecidable sealed references out of duplicate reaping and require typed missing errors or HTTP status. DNS and proxy messages cannot authorize destructive recovery. Regression tests fail on the previous implementations."
+   }
+  ]
+ },
+ {
+  "id": "WD-2",
+  "section": "WD",
+  "finding": "WD-2 HIGH runners.ts:222-275 hibernation loop no per-candidate try/catch; oldest failing world blocks everyone forever; each attempt resumes E2B (bills).",
+  "commits": [
+   {
+    "sha": "2231e66c",
+    "subject": "Isolate hibernation failures and suppress teardown recovery",
+    "body": "WD-2, WD-7: catch each candidate failure, disable recovery throughout checkpoint and teardown, and delete cloud sandboxes through control-plane operations without resuming them merely to destroy them."
+   }
+  ]
+ },
+ {
+  "id": "WD-3",
+  "section": "WD",
+  "finding": "WD-3 HIGH e2b.ts:241-255,622-624 destroy() doesn't evict provider cache; open() returns dead cached sandbox \u2192 agent-infra loop until restart.",
+  "commits": [
+   {
+    "sha": "7022d0a8",
+    "subject": "Evict provider caches after sandbox destruction",
+    "body": "WD-3, PS-10: all successful teardown paths remove SDK objects and lifecycle map entries. Weak handle tombstones preserve status without retaining every historical sandbox."
+   }
+  ]
+ },
+ {
+  "id": "WD-4",
+  "section": "WD",
+  "finding": "WD-4 HIGH checkpoint.ts:75-170 checkpoints never deleted (count against 5GiB quota); untracked files read whole into control-plane memory (+postMessage copy); restore JSON.parse full gunzipped string >512MiB fails.",
+  "commits": [
+   {
+    "sha": "f6ff0217",
+    "subject": "Read checkpoint files in bounded sandbox batches",
+    "body": "WD-4, WD-19 and LT-11: Replace per-file unbounded SDK reads with size-checked batches executed inside the sandbox. Bound raw bytes, path arguments and decoded JSON so changed files cannot grow the host allocation after stat. Preserve checkpoint wire compatibility and cancellation checks; checkpoint and fork round trips pass."
+   },
+   {
+    "sha": "87c5c0a6",
+    "subject": "Retain recovery checkpoints and collect obsolete objects durably",
+    "body": "WD-4: Keep the two newest checkpoints plus durable world and fork references. Queue object deletion and retain quota accounting until deletion succeeds; retry failures from the lifecycle sweep. Serialize capture and restore with world operations, and reject new fork pins after retirement. Verified checkpoint, fork, hibernation and runner lifecycle suites."
+   },
+   {
+    "sha": "fa96163f",
+    "subject": "Bound portable checkpoint file and decoding memory",
+    "body": "WD-4 partial: size dirty files in bounded batches before reading, cap individual files at 32 MiB and deltas at 128 MiB, and bound gzip expansion on restore/fork. Keep oversized worlds intact rather than risking shared-worker OOM. Historical checkpoint garbage collection still requires durable reference pinning."
+   }
+  ]
+ },
+ {
+  "id": "WD-5",
+  "section": "WD",
+  "finding": "WD-5 HIGH security provision-git.ts:42-56,128-135; e2b.ts:189,198; daytona.ts:146,152 \u2014 creator's personal git-profile SSH private key written into untrusted sandbox (rm -f only) and preferred over repo-scoped token.",
+  "commits": [
+   {
+    "sha": "506c0ca7",
+    "subject": "Keep personal SSH keys out of cloud provisioning",
+    "body": "WD-5: provision only repository-specific keys without a token alternative. Prefer short-lived repository tokens and never upload the creator personal profile key."
+   }
+  ]
+ },
+ {
+  "id": "WD-6",
+  "section": "WD",
+  "finding": "WD-6 HIGH container.ts \u2014 git via world.exec can't work (/work/.git points to unmounted host gitdir; node:22-slim no git) \u2192 buildReview \"No file changes\", commitWork false; agent harness runs on host with bypassPermissions despite \"isolated\" doc.",
+  "commits": [
+   {
+    "sha": "edd3f10a",
+    "subject": "Expect container MCP runners on the managed in-world Node (WD-6)",
+    "body": "#369 runs container agents inside their container on karmax's managed Node,\ninstalled under the worktree and mounted at its host path as well as /work.\nThe MCP test still asserted the image's /usr/local/bin/node and that no\ncommand named the host path, so it failed on #369's own branch.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "23232983",
+    "subject": "Fill the browser the agent's MCP drives, including container worlds",
+    "body": "#369 (WD-6) moved container agents and their browser MCP inside the\ncontainer, while #368 (AU-11) routed container card fills to the host\nbrowser on the old layout. Merged, a container fill typed card details into\na host browser the agent never sees. Route card fills with the same\npredicate MCP setup uses (isRemoteAgentWorld), and make the test build real\nworld shapes instead of a copied memory world that lost its methods.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "84ab60ac",
+    "subject": "Align regression fixtures with provider contracts and native types",
+    "body": "WD-6, WD-18, WD-19: Use the Git-equipped container fixture image, narrow the event cursor across callbacks, and correct test input and PTY argument types exposed by the native typecheck."
+   },
+   {
+    "sha": "0d550383",
+    "subject": "Run container agents inside their mounted execution boundary",
+    "body": "WD-6: Route native agents through container PTYs, honor their launcher command, and mount the worktree and common Git directory at their recorded paths. Use a Git-equipped default image and reject custom images without Git. ACP remains unavailable for isolated worlds rather than falling back to host execution.\n\nWD-21: Pass Docker environment names in argv and values through the child environment. Fake Docker/PTY and remote-agent tests pass; real Docker is unavailable in this sandbox."
+   }
+  ]
+ },
+ {
+  "id": "WD-7",
+  "section": "WD",
+  "finding": "WD-7 HIGH runners.ts:243-248 \u2192 registry recovery \u2192 restore creates new billable sandbox + lease from sweep; acquire() polls forever at capacity \u2192 sweep stalls.",
+  "commits": [
+   {
+    "sha": "2231e66c",
+    "subject": "Isolate hibernation failures and suppress teardown recovery",
+    "body": "WD-2, WD-7: catch each candidate failure, disable recovery throughout checkpoint and teardown, and delete cloud sandboxes through control-plane operations without resuming them merely to destroy them."
+   }
+  ]
+ },
+ {
+  "id": "WD-8",
+  "section": "WD",
+  "finding": "WD-8 HIGH e2b.ts:789-791, daytona.ts:224 /not\\s*found|404/ matches getaddrinfo ENOTFOUND \u2192 DNS blip = missing \u2192 restore older checkpoint + reaper destroys live sandbox.",
+  "commits": [
+   {
+    "sha": "d654ec2a",
+    "subject": "Preserve sandboxes when provider identity or liveness is uncertain",
+    "body": "WD-1, WD-8: keep undecidable sealed references out of duplicate reaping and require typed missing errors or HTTP status. DNS and proxy messages cannot authorize destructive recovery. Regression tests fail on the previous implementations."
+   }
+  ]
+ },
+ {
+  "id": "WD-9",
+  "section": "WD",
+  "finding": "WD-9 HIGH security/DoS git-transfer.ts:61-90 bundle transfer no size cap/disk check/cancel on hosted.",
+  "commits": [
+   {
+    "sha": "9f26778c",
+    "subject": "Bound and cancel hosted Git bundle downloads",
+    "body": "WD-9: enforce a configurable hosted 1 GiB ceiling before reading, reserve host disk headroom, honor activity cancellation between chunks, and remove partial downloads on failure. Self-hosted size policy remains explicit."
+   }
+  ]
+ },
+ {
+  "id": "WD-10",
+  "section": "WD",
+  "finding": "WD-10 MED merge.ts:150-157,266-278; git-broker.ts:643,799 conflict marker guard bypass: E2BIG, timeout code 1, C-quoted non-ASCII paths.",
+  "commits": [
+   {
+    "sha": "c4691933",
+    "subject": "Fail closed when conflict-marker scans cannot complete",
+    "body": "WD-10: share bounded literal-path grep batches across host and broker merges, preserve NUL-delimited filenames, and reject failed changed-file or grep commands."
+   },
+   {
+    "sha": "ca711eec",
+    "subject": "Disable hooks and fsmonitor in host Git operations",
+    "body": "RT-5: use a minimal host environment, ignore global/system Git config, and validate reciprocal linked-worktree gitdirs. Route local world Git through the same helper. Also normalize transport errors to failure status for WD-10."
+   }
+  ]
+ },
+ {
+  "id": "WD-11",
+  "section": "WD",
+  "finding": "WD-11 MED checkpoint.ts:245-250,318-329 restore/fork rebuild from project defaults not recorded checkouts (branch, localPath, authority, identity).",
+  "commits": [
+   {
+    "sha": "71f3a133",
+    "subject": "Provision pinned checkpoint restores from base only for remote clones",
+    "body": "#377's LT-8 restore provisions every checkout from base and then checks out\nits captured commit, because a fresh remote clone cannot fetch a task ref an\nidle checkpoint never published. Applied to host checkouts too, it put two\ncheckouts of one repository on the same default branch and `git worktree\nadd` refused the second (#369's WD-11 test). Host checkouts already share\nthe task's refs, so keep their recorded branches.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "87faf08b",
+    "subject": "Recreate sibling checkouts when applying fork checkpoints",
+    "body": "WD-11: Materialize saved sibling branches from the pinned source commits under independent fork branches, retaining recorded target and authority. Prefer manifest repository identities to mutable catalog URLs. Covered by checkpoint and fork-world tests."
+   },
+   {
+    "sha": "e666a456",
+    "subject": "Restore recorded checkout topology and commit identities",
+    "body": "WD-11: Preserve per-checkout branch, directory, source authority, local provenance and public commit identity during checkpoint restoration instead of collapsing duplicate sources into one branch. Fork setup still requires separate topology reconstruction.\n\nWD-25: Restore option-shaped deleted filenames with an option terminator and surface deletion failures. Verified with checkpoint, E2B, Daytona and worktree provider tests."
+   }
+  ]
+ },
+ {
+  "id": "WD-12",
+  "section": "WD",
+  "finding": "WD-12 MED checkpoint.ts:233-238 restore acquires second runner lease.",
+  "commits": [
+   {
+    "sha": "e27cd55f",
+    "subject": "Release the replaced world lease before restore admission",
+    "body": "WD-12: recovery must retire the vanished generation reservation before acquiring replacement capacity. Validate lease world/task ownership and preserve budget admission for the new sandbox."
+   }
+  ]
+ },
+ {
+  "id": "WD-13",
+  "section": "WD",
+  "finding": "WD-13 MED resources.ts:1074-1102 EnvironmentWorld doesn't forward addCheckout \u2192 create_branch fails with env/service secrets.",
+  "commits": [
+   {
+    "sha": "eaab8645",
+    "subject": "Preserve checkout creation through environment wrappers",
+    "body": "WD-13: forward addCheckout only when supported by the inner world, preserving branch creation for tasks with environment and service secrets."
+   }
+  ]
+ },
+ {
+  "id": "WD-14",
+  "section": "WD",
+  "finding": "WD-14 MED core.ts:3106 destroy error \u2192 degraded, nothing sweeps degraded/terminal-task worlds; Daytona archived bills forever.",
+  "commits": [
+   {
+    "sha": "340ac6bc",
+    "subject": "Retry failed terminal-world teardown from the lifecycle sweep",
+    "body": "WD-14: durably mark failed deletion and retry only the same degraded generation after its task terminates and all access/leases end. Never run recovery while retrying cleanup."
+   }
+  ]
+ },
+ {
+  "id": "WD-15",
+  "section": "WD",
+  "finding": "WD-15 MED security connections.ts:130-138 hosted Daytona apiUrl can be localhost/private \u2192 control plane requests + reflected errors.",
+  "commits": [
+   {
+    "sha": "4b08df80",
+    "subject": "Restrict hosted Daytona connections to the official API",
+    "body": "WD-15: validate the endpoint before saving credentials and again when resolving legacy connections. Hosted custom origins are refused; self-hosted control planes retain custom endpoint support."
+   }
+  ]
+ },
+ {
+  "id": "WD-16",
+  "section": "WD",
+  "finding": "WD-16 MED daytona.ts:323 exec converts transport errors to exit 1.",
+  "commits": [
+   {
+    "sha": "51deb83d",
+    "subject": "Propagate Daytona command transport failures",
+    "body": "WD-16: only SDK exceptions with a concrete command exit code become ExecResult. Preserve transport errors for recovery and infrastructure classification."
+   }
+  ]
+ },
+ {
+  "id": "WD-17",
+  "section": "WD",
+  "finding": "WD-17 MED perf git-broker.ts:90,596,766 full clone per publish/merge/refresh.",
+  "commits": [
+   {
+    "sha": "560118b9",
+    "subject": "Retain task branch negotiation in scoped broker clones",
+    "body": "WD-17, LT-10: Fetch only the existing task branch alongside the selected base so repeated publication can reuse its remote tip without retransferring a bundle. The existing large-history regression failed before this repair and passes afterward."
+   },
+   {
+    "sha": "6135ce3f",
+    "subject": "Bound repository publication concurrency and clone scope",
+    "body": "WD-17 and LT-10: Publish independent repositories concurrently (maximum three) while serializing branches of the same source and preserving result order. Fetch only the default or merge-target branch into broker scratch clones; retain full ancestry checks and sequential merge failure semantics. Persistent mirror caching remains deferred to avoid introducing credential-sharing and unbounded disk retention."
+   }
+  ]
+ },
+ {
+  "id": "WD-18",
+  "section": "WD",
+  "finding": "WD-18 MED perf runners.ts:175,354; e2b.ts:849 sweep drains 500 pages per org per 60s.",
+  "commits": [
+   {
+    "sha": "84ab60ac",
+    "subject": "Align regression fixtures with provider contracts and native types",
+    "body": "WD-6, WD-18, WD-19: Use the Git-equipped container fixture image, narrow the event cursor across callbacks, and correct test input and PTY argument types exposed by the native typecheck."
+   },
+   {
+    "sha": "f8d43035",
+    "subject": "Bound repeated E2B lifecycle event reconciliation",
+    "body": "WD-18 and LT-19: Resume provider event scans with a durable one-hour overlapping cursor. Reconcile the full retained feed daily to catch older delayed events, and never advance the cursor on pagination or transport failures. Provider inventory remains current for orphan cleanup."
+   }
+  ]
+ },
+ {
+  "id": "WD-19",
+  "section": "WD",
+  "finding": "WD-19 MED perf checkpoint one remote read per untracked file; resources rewrite all secret files each open.",
+  "commits": [
+   {
+    "sha": "84ab60ac",
+    "subject": "Align regression fixtures with provider contracts and native types",
+    "body": "WD-6, WD-18, WD-19: Use the Git-equipped container fixture image, narrow the event cursor across callbacks, and correct test input and PTY argument types exposed by the native typecheck."
+   },
+   {
+    "sha": "f6ff0217",
+    "subject": "Read checkpoint files in bounded sandbox batches",
+    "body": "WD-4, WD-19 and LT-11: Replace per-file unbounded SDK reads with size-checked batches executed inside the sandbox. Bound raw bytes, path arguments and decoded JSON so changed files cannot grow the host allocation after stat. Preserve checkpoint wire compatibility and cancellation checks; checkpoint and fork round trips pass."
+   },
+   {
+    "sha": "b2eeb6b2",
+    "subject": "Avoid rewriting unchanged file secrets on world reopen",
+    "body": "WD-19: Reuse the existing secret digest cache during prepare as well as refresh. Scrubbing invalidates the cache so resume still restores files; rotations update immediately. The per-file checkpoint transport optimization remains separate."
+   }
+  ]
+ },
+ {
+  "id": "WD-20",
+  "section": "WD",
+  "finding": "WD-20 MED core.ts:2762 changedFiles/listFiles unbounded \u2192 Temporal blob limit.",
+  "commits": [
+   {
+    "sha": "48099edf",
+    "subject": "Say how many files a truncated review packet shows",
+    "body": "The merged review bounds (one helper for both review builders) dropped\n#369's \"Showing N of M\" wording for a generic truncation note, which\nfailed #369's WD-20 test and told the reviewer less.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "3a6046ed",
+    "subject": "Bound changed-file metadata returned to workflow history",
+    "body": "WD-20: cap review file lists at 1000 entries and 256 KiB, preserving total count and explicit truncation in the summary for both repository and plain-directory worlds."
+   },
+   {
+    "sha": "2fd0219e",
+    "subject": "Bound script and changed-file activity results",
+    "body": "RT-9 and WD-20: cap script diagnostics and both repository and listFiles-backed review payloads before they enter Temporal history; report truncation explicitly and retain final command diagnostics."
+   }
+  ]
+ },
+ {
+  "id": "WD-21",
+  "section": "WD",
+  "finding": "WD-21 LOW container.ts:138 secrets as docker exec -e argv.",
+  "commits": [
+   {
+    "sha": "0d550383",
+    "subject": "Run container agents inside their mounted execution boundary",
+    "body": "WD-6: Route native agents through container PTYs, honor their launcher command, and mount the worktree and common Git directory at their recorded paths. Use a Git-equipped default image and reject custom images without Git. ACP remains unavailable for isolated worlds rather than falling back to host execution.\n\nWD-21: Pass Docker environment names in argv and values through the child environment. Fake Docker/PTY and remote-agent tests pass; real Docker is unavailable in this sandbox."
+   }
+  ]
+ },
+ {
+  "id": "WD-22",
+  "section": "WD",
+  "finding": "WD-22 LOW git-credential.ts:30 etc. host global git config not isolated (credential.helper=store).",
+  "commits": [
+   {
+    "sha": "99bdd78c",
+    "subject": "Stop operator credential helpers answering tenant Git operations",
+    "body": "WD-22: a tenant-scoped host Git operation receives its per-operation\ncredential through GIT_ASKPASS, but Git asks configured credential helpers\nfirst. An operator-level helper (`store`, a keychain) therefore answered\nwith the operator's own credential \u2014 reaching whatever the operator can \u2014\nand `store` would save the tenant's installation token into the\noperator's ~/.git-credentials. A materialized credential now resets the\ninherited helper list unless the caller configured its own helpers\n(verified with `git credential fill`).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "WD-23",
+  "section": "WD",
+  "finding": "WD-23 LOW git-broker.ts:732 landLocalBranch outside withWorktreeLock.",
+  "commits": [
+   {
+    "sha": "af276530",
+    "subject": "Lock local broker landing worktree mutations",
+    "body": "WD-23: Serialize scratch worktree creation and removal with the shared worktree namespace lock, while leaving finalizeMergeRepo outside the lock to avoid nested acquisition. Regression observes the real lock during each Git mutation; broker and worktree-lock suites pass."
+   }
+  ]
+ },
+ {
+  "id": "WD-24",
+  "section": "WD",
+  "finding": "WD-24 LOW git-broker.ts:74 spec.name unsanitized.",
+  "commits": [
+   {
+    "sha": "58db54ab",
+    "subject": "Validate dynamic checkout names before world access",
+    "body": "WD-24: Reject absolute paths, traversal and nested names at the broker boundary. Five regression inputs fail before any world command executes."
+   }
+  ]
+ },
+ {
+  "id": "WD-25",
+  "section": "WD",
+  "finding": "WD-25 LOW checkpoint.ts:273 rm -f without --.",
+  "commits": [
+   {
+    "sha": "e666a456",
+    "subject": "Restore recorded checkout topology and commit identities",
+    "body": "WD-11: Preserve per-checkout branch, directory, source authority, local provenance and public commit identity during checkpoint restoration instead of collapsing duplicate sources into one branch. Fork setup still requires separate topology reconstruction.\n\nWD-25: Restore option-shaped deleted filenames with an option terminator and surface deletion failures. Verified with checkpoint, E2B, Daytona and worktree provider tests."
+   }
+  ]
+ },
+ {
+  "id": "WD-26",
+  "section": "WD",
+  "finding": "WD-26 LOW wiki landings bypass wiki mutation lane.",
+  "commits": [
+   {
+    "sha": "4cea557a",
+    "subject": "Serialize wiki task landings with canonical mutations",
+    "body": "WD-26: Route local and broker-imported wiki landings through the canonical wiki mutation lane. Back the lane with the existing cross-process directory lock so gateway saves and activity-worker merges cannot overlap; retain a distinct worktree-admin lock to avoid recursive acquisition. Reproduce the race with a separate process holding a wiki publication open."
+   }
+  ]
+ },
+ {
+  "id": "WD-27",
+  "section": "WD",
+  "finding": "WD-27 LOW C-quoted paths in UI; use -c core.quotePath=false.",
+  "commits": []
+ },
+ {
+  "id": "WD-28",
+  "section": "WD",
+  "finding": "WD-28 LOW local-execution.ts world processes inherit unscrubbed env.",
+  "commits": [
+   {
+    "sha": "be0a7d5a",
+    "subject": "Keep checkpoint Docker fixture independent of inherited secrets",
+    "body": "WD-28: Local world execution deliberately removes inherited KARMAX environment variables. Embed the fake Docker log path in the fixture instead; the checkpoint restoration regression now passes under the hardened environment."
+   },
+   {
+    "sha": "af88a11f",
+    "subject": "Scrub inherited secrets from local world execution",
+    "body": "WD-28: Apply the existing agent environment policy to local commands, background processes and terminals, retaining explicitly supplied task values. Verified real command/process output and PTY environment contracts, plus worktree and container tests."
+   }
+  ]
+ },
+ {
+  "id": "WD-29",
+  "section": "WD",
+  "finding": "WD-29 LOW secret-exclude core.excludesFile drops global gitignore.",
+  "commits": [
+   {
+    "sha": "6010910f",
+    "subject": "Preserve inherited Git ignores when excluding world secrets",
+    "body": "WD-29: Compose effective global exclusions with private worktree secret rules instead of replacing them. Refresh inherited contents during materialization and migrate the previous exclusion layout without changing sibling or canonical checkout settings. Test configured and default global ignores plus legacy worktrees."
+   }
+  ]
+ },
+ {
+  "id": "WD-30",
+  "section": "WD",
+  "finding": "WD-30 LOW stale docs/comments; legacy handles accept unauthenticated meta.sandboxId.",
+  "commits": [
+   {
+    "sha": "9800d825",
+    "subject": "Reject unauthenticated legacy cloud world references",
+    "body": "WD-30: Require an authenticated provider reference before opening or destroying E2B and Daytona worlds. Retain sealed KWR1/KWR2 compatibility; bare legacy sandbox IDs cannot establish provider authority. Cover both providers using fakes."
+   }
+  ]
+ },
+ {
+  "id": "AU-1",
+  "section": "AU",
+  "finding": "AU-1 CRIT security main.ts:571-575; agent-mail.ts:283-288,311-318; GET /api/organizations/:org/agent-mail + /connect \u2014 pull providers (AgentMail/IMAP) ingest without onlyFor; ownerOf keyed by local part, rewritten to caller org on every GET (credential:read) and connect (no check address belongs to key) \u2192 tenant B claims A's inbox \u2192 A's verification codes/magic links go to B; reverse injection. Fix: onlyFor=polling org; owner map by full address first-owner-wins; verify key lists inbox; delete owner keys on disconnect/org delete.",
+  "commits": [
+   {
+    "sha": "6075fd2f",
+    "subject": "Validate AgentMail connection failures without replacing the inbox",
+    "body": "AU-1 CI repair: test the provider ownership lookup with a scoped HTTP fake instead of a real invalid API key. Return 400 for rejected verification and preserve the previous connection. All 63 real gateway integration tests pass."
+   },
+   {
+    "sha": "b18fb1cf",
+    "subject": "Preserve mailbox ownership while migrating legacy routes",
+    "body": "AU-1: first-owner protection must consult the legacy route and existing base-address ownership before registering the full-address index. Cover an untouched legacy inbox and an attempted subaddress takeover."
+   },
+   {
+    "sha": "155f19ae",
+    "subject": "Destroy organization autonomy secrets before deleting their metadata",
+    "body": "AU-15 and AU-1 cleanup: remove vault items and key files, registered card secrets, connector credentials and caches, mailbox provider secrets, inbox contents and both routing indexes. Add mailbox disconnect and keep deletion retryable."
+   },
+   {
+    "sha": "0ddcb34c",
+    "subject": "Bind agent inbox routes and polling to their owning organization",
+    "body": "AU-1: refuse address takeover, route full addresses, retire stale routes, verify AgentMail inbox access before connection, and scope polling ingestion to its organization."
+   }
+  ]
+ },
+ {
+  "id": "AU-2",
+  "section": "AU",
+  "finding": "AU-2 HIGH security payments.ts:492-517; /api/payments/stripe/callback; db.ts:6843 \u2014 Stripe Connect callback unauthenticated, state not bound to session user; no unique (provider, accountId) \u2192 victim's Issuing account connected to attacker org.",
+  "commits": [
+   {
+    "sha": "dc85e56a",
+    "subject": "Bind Stripe Connect callbacks to the initiating user",
+    "body": "AU-2: check the authenticated callback user before consuming OAuth state. The provider/account uniqueness constraint is already present; add regression coverage for it."
+   }
+  ]
+ },
+ {
+  "id": "AU-3",
+  "section": "AU",
+  "finding": "AU-3 HIGH security cdp.ts:118-128,184; cdp-fill.mjs:208-224; /api/vault/fill \u2014 items with no domains fill first tab with no origin check; route accepts any field (secret/env/privateKey/note) via platform_request \u2192 type API key into attacker page.",
+  "commits": [
+   {
+    "sha": "e39c8a47",
+    "subject": "Require login fields and explicit domains for credential fill",
+    "body": "AU-3: fail closed before resolving secrets when a browser fill lacks an origin restriction or requests a non-login secret field."
+   }
+  ]
+ },
+ {
+  "id": "AU-4",
+  "section": "AU",
+  "finding": "AU-4 HIGH security core.ts:2545-2612 fillPaymentCard; payments.ts:308 \u2014 settled request fillable forever (no TTL/count); merchant = agent-supplied domain; public suffixes pass.",
+  "commits": [
+   {
+    "sha": "28328aed",
+    "subject": "Bound payment card fills to expiring reservations and limited attempts",
+    "body": "AU-4: atomically count at most three fill attempts, reject expired reservations including settled local spends, and validate checkout domains against the public suffix list."
+   }
+  ]
+ },
+ {
+  "id": "AU-5",
+  "section": "AU",
+  "finding": "AU-5 HIGH perf/security vault.ts \u2014 single secrets.json for all tenants, full parse per resolve, full rewrite per put; no per-secret size cap / per-org quota \u2192 agent loop store_credential 2MB \u2192 270MB file \u2192 cell stall/OOM.",
+  "commits": [
+   {
+    "sha": "9f77c3d5",
+    "subject": "Store vault ciphertext per handle and cap organization writes",
+    "body": "AU-5: migrate the legacy map under the existing writer lock, read and rewrite only individual encrypted entries, cap secret/item writes at 64 KiB, and limit organizations to 1000 items. Preserve atomic publication, backup compatibility and concurrent writer safety."
+   }
+  ]
+ },
+ {
+  "id": "AU-6",
+  "section": "AU",
+  "finding": "AU-6 HIGH perf agent-mail.ts:48,335-359; mail-pull.ts:170 \u2014 per-org inbox one kv blob of 200 untruncated bodies \u2192 RangeError/OOM, poller retries every 30s.",
+  "commits": [
+   {
+    "sha": "4a9e2008",
+    "subject": "Bound stored inboxes and pull-provider responses",
+    "body": "AU-6: cap message bodies, total inbox bytes, IMAP batch sizes and source downloads, and AgentMail response bytes. Reject oversized legacy inboxes explicitly rather than parsing them into an OOM loop."
+   }
+  ]
+ },
+ {
+  "id": "AU-7",
+  "section": "AU",
+  "finding": "AU-7 MED security payments.ts:925 no use-card cap = all cards; request_spend/fill not capability-gated.",
+  "commits": [
+   {
+    "sha": "04a346c5",
+    "subject": "Grant the PostgreSQL accounting fixture its selected card",
+    "body": "AU-7 CI repair: card selection does not grant authority. Give the transaction fixture an explicit task and caller card grant, and assert an empty caller grant still has no card access. All 18 PostgreSQL integration tests pass against a real local server."
+   },
+   {
+    "sha": "be3e5cee",
+    "subject": "Include approved card extensions in live child and payment grants",
+    "body": "RT-16, WF-17, AU-7 and AU-9: current authority includes approved per-role permission extensions as well as stored task grants. Preserve those approvals while intersecting spending with the active caller and ancestor grants."
+   },
+   {
+    "sha": "32b989c4",
+    "subject": "Provide required prompts in autonomy regression task fixtures",
+    "body": "RT-16, WF-17, AU-7, AU-9 and AU-11: use complete TaskParams in the new regression fixtures so both TypeScript and the runtime tests validate the same inputs."
+   },
+   {
+    "sha": "0f34ecc6",
+    "subject": "Keep descendant card grants and spending within live parent authority",
+    "body": "RT-16, WF-17, AU-7, AU-9: delegate the current stored parent grant including explicit card authority; deny empty card grants; intersect live ancestor grants and card selections; charge descendants and agent-created tasks against a shared ancestor budget. Keep workflow histories unchanged."
+   }
+  ]
+ },
+ {
+  "id": "AU-8",
+  "section": "AU",
+  "finding": "AU-8 MED core.ts:1886 leased API-key account resolved with task caps lacking use-credential:* \u2192 developer tasks fail.",
+  "commits": [
+   {
+    "sha": "7d8afb67",
+    "subject": "Resolve coordinator-leased model keys with handle-specific authority",
+    "body": "AU-8: the trusted activity resolves only its leased handle without requiring broad vault access in the developer task grant. Verify the key reaches the adapter through resolvedAuth."
+   }
+  ]
+ },
+ {
+  "id": "AU-9",
+  "section": "AU",
+  "finding": "AU-9 MED api.ts:1127; payments.ts:957 per-task budget; sub-tasks each get fresh budget.",
+  "commits": [
+   {
+    "sha": "be3e5cee",
+    "subject": "Include approved card extensions in live child and payment grants",
+    "body": "RT-16, WF-17, AU-7 and AU-9: current authority includes approved per-role permission extensions as well as stored task grants. Preserve those approvals while intersecting spending with the active caller and ancestor grants."
+   },
+   {
+    "sha": "32b989c4",
+    "subject": "Provide required prompts in autonomy regression task fixtures",
+    "body": "RT-16, WF-17, AU-7, AU-9 and AU-11: use complete TaskParams in the new regression fixtures so both TypeScript and the runtime tests validate the same inputs."
+   },
+   {
+    "sha": "0f34ecc6",
+    "subject": "Keep descendant card grants and spending within live parent authority",
+    "body": "RT-16, WF-17, AU-7, AU-9: delegate the current stored parent grant including explicit card authority; deny empty card grants; intersect live ancestor grants and card selections; charge descendants and agent-created tasks against a shared ancestor budget. Keep workflow histories unchanged."
+   }
+  ]
+ },
+ {
+  "id": "AU-10",
+  "section": "AU",
+  "finding": "AU-10 MED authorizing reservations never expire.",
+  "commits": [
+   {
+    "sha": "ae56c326",
+    "subject": "Fence local payment settlement against reservation expiry",
+    "body": "Complete AU-10 by making the immediate local debit and settlement one transaction. Check the reservation before debit and after authorization; if its deadline elapses, roll back the debit and durably expire/audit the reservation before retry admission. Reproduce delayed authorization racing a replacement reservation using the mock provider. Also supply the required prompt in the late-approval test fixture."
+   },
+   {
+    "sha": "841e09d7",
+    "subject": "Expire abandoned payment authorization reservations",
+    "body": "Fix AU-10 by releasing authorizing reservations at their bounded expiry along with authorized reservations, with an atomic audit record for each release. Refresh the thirty-minute reservation window when an older pending request is approved. Verify deadline boundaries, single audit emission, task/card budget release, retry admission and preservation of settled charges using the mock rail."
+   }
+  ]
+ },
+ {
+  "id": "AU-11",
+  "section": "AU",
+  "finding": "AU-11 MED core.ts:2579 container worlds card fill routed into container but Chrome on host.",
+  "commits": [
+   {
+    "sha": "23232983",
+    "subject": "Fill the browser the agent's MCP drives, including container worlds",
+    "body": "#369 (WD-6) moved container agents and their browser MCP inside the\ncontainer, while #368 (AU-11) routed container card fills to the host\nbrowser on the old layout. Merged, a container fill typed card details into\na host browser the agent never sees. Route card fills with the same\npredicate MCP setup uses (isRemoteAgentWorld), and make the test build real\nworld shapes instead of a copied memory world that lost its methods.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "c8d2c5b2",
+    "subject": "Isolate card fill spies across the sequential test suite",
+    "body": "AU-11: spy on the live imported module bindings so the regression also exercises the routing when earlier files have already loaded core activities."
+   },
+   {
+    "sha": "32b989c4",
+    "subject": "Provide required prompts in autonomy regression task fixtures",
+    "body": "RT-16, WF-17, AU-7, AU-9 and AU-11: use complete TaskParams in the new regression fixtures so both TypeScript and the runtime tests validate the same inputs."
+   },
+   {
+    "sha": "7bfddd6c",
+    "subject": "Route container card fills to the host browser",
+    "body": "AU-11: container agent browser MCPs run on the host, so their fills must follow the host CDP path. Keep in-world fills for cloud browsers and cover both paths through runAgentTurn."
+   }
+  ]
+ },
+ {
+  "id": "AU-12",
+  "section": "AU",
+  "finding": "AU-12 MED passkeys use gateway loopback CDP (broken hosted); signCount not persisted; sessions not bound.",
+  "commits": [
+   {
+    "sha": "5ecbf344",
+    "subject": "Handle a removed passkey secret during counter persistence",
+    "body": "AU-12: a credential may be deleted while the login session is open; ignore that missing secret instead of parsing undefined."
+   },
+   {
+    "sha": "c56ccbce",
+    "subject": "Bind passkey sessions to callers and retain signature counters",
+    "body": "AU-12 (partial): use opaque owner-bound session handles, restrict harvesting to enrollment, and persist counters on login release or expiry. Refuse hosted and remote requests instead of connecting to the control-plane browser; a remote passkey transport remains to be implemented."
+   }
+  ]
+ },
+ {
+  "id": "AU-13",
+  "section": "AU",
+  "finding": "AU-13 MED security vault-items.ts:608 envFor injects agent-created env items (NODE_OPTIONS, GIT_CONFIG_*) into other tasks.",
+  "commits": [
+   {
+    "sha": "405d8408",
+    "subject": "Require explicit grants for other tasks to inherit agent-created environments",
+    "body": "AU-13: wildcard vault access no longer ambiently injects another task\u2019s agent-authored environment. The creator can use its own item; deliberate item-specific grants preserve sharing."
+   }
+  ]
+ },
+ {
+  "id": "AU-14",
+  "section": "AU",
+  "finding": "AU-14 MED docs blind-use tooltip overstates; agent-supplied cdpUrl trusted.",
+  "commits": [
+   {
+    "sha": "fab585f9",
+    "subject": "Describe the actual blind-use trust boundary",
+    "body": "AU-14: browser and environment use avoids putting secret text in model tool results but cannot hide it from an agent controlling that browser or environment. Correct the tooltip and helper comments instead of promising isolation the protocol does not provide."
+   }
+  ]
+ },
+ {
+  "id": "AU-15",
+  "section": "AU",
+  "finding": "AU-15 MED org delete leaves vault secrets/cards PAN+CVC/connector auth/mail kv/key files.",
+  "commits": [
+   {
+    "sha": "40baa240",
+    "subject": "Allow empty organization cleanup without a credential broker",
+    "body": "AU-15 CI repair: require the broker only when organization metadata names autonomy resources that may hold secrets. Empty installations can delete empty organizations; unavailable secret cleanup still preserves resource metadata for retry. Verified subscription-billing and autonomy-cleanup tests."
+   },
+   {
+    "sha": "155f19ae",
+    "subject": "Destroy organization autonomy secrets before deleting their metadata",
+    "body": "AU-15 and AU-1 cleanup: remove vault items and key files, registered card secrets, connector credentials and caches, mailbox provider secrets, inbox contents and both routing indexes. Add mailbox disconnect and keep deletion retryable."
+   }
+  ]
+ },
+ {
+  "id": "AU-16",
+  "section": "AU",
+  "finding": "AU-16 MED security hosted IMAP host/pass-git URL private addresses; sequential sweep no timeout; first poll loads whole mailbox.",
+  "commits": [
+   {
+    "sha": "af2398f6",
+    "subject": "Verify private Git remotes against deployment policy",
+    "body": "AU-16 rejects private remotes on the hosted control plane. Exercise that refusal before network contact in the real browser fixture, then retain authenticated HTTPS import and write-back coverage on a self-hosted gateway."
+   },
+   {
+    "sha": "3d85d220",
+    "subject": "Constrain hosted mailbox and password-store network access",
+    "body": "AU-16: pin hosted IMAP to validated public DNS addresses with TLS and bounded connection/download lifetimes. Limit hosted Git password stores to HTTPS on public GitHub, GitLab and Bitbucket with redirects disabled; custom hosts remain available self-hosted."
+   }
+  ]
+ },
+ {
+  "id": "AU-17",
+  "section": "AU",
+  "finding": "AU-17 MED one-shot pass consumed before validation; username fill burns pass.",
+  "commits": [
+   {
+    "sha": "c261f382",
+    "subject": "Consume one-shot credential approvals only when delivering secret fields",
+    "body": "AU-17: validate fields and browser targets before consuming approvals, leave username metadata fills non-consuming, and preflight remote targets before resolving vault values. Recheck the origin during actual remote typing."
+   }
+  ]
+ },
+ {
+  "id": "AU-18",
+  "section": "AU",
+  "finding": "AU-18 MED payments.ts:546 live Stripe card created before uniqueness/balance \u2192 orphan card on failure.",
+  "commits": [
+   {
+    "sha": "4b77fb64",
+    "subject": "Persist Stripe cards before activating them and cancel failed provisions",
+    "body": "AU-18: reject duplicate names and fetch balance before creating external cards, create inactive, activate after metadata persistence, and cancel on later failure."
+   }
+  ]
+ },
+ {
+  "id": "AU-19",
+  "section": "AU",
+  "finding": "AU-19 MED activity.ts platform_request to vault/agent-mail detail archived (codes/links).",
+  "commits": [
+   {
+    "sha": "3b0b8a5b",
+    "subject": "Suppress generic platform request details in archived agent activity",
+    "body": "AU-19: platform_request can return verification codes, login links and connector secret material with arbitrary field names. Suppress its arguments and results while retaining the tool activity itself."
+   }
+  ]
+ },
+ {
+  "id": "AU-20",
+  "section": "AU",
+  "finding": "AU-20 MED chrome-cdp-launcher shared port 9222 across tasks/orgs; profile never deleted; allow-origins *.",
+  "commits": [
+   {
+    "sha": "c5e4449c",
+    "subject": "Refuse shared browser attachment and clean ephemeral profiles",
+    "body": "AU-20: serialize local launchers on the configured port, refuse unowned CDP endpoints, and allow retained-browser reuse only with the isolated world profile owner record. Remove wildcard Origin acceptance and delete launcher-created ephemeral profiles. Linux kernel locks release on process death; other local platforms require stale-lock cleanup after an ungraceful kill."
+   }
+  ]
+ },
+ {
+  "id": "AU-21",
+  "section": "AU",
+  "finding": "AU-21 MED core.ts:2456 vault env items never injected into remote worlds.",
+  "commits": [
+   {
+    "sha": "2c952a8c",
+    "subject": "Deliver granted vault environments inside remote task worlds",
+    "body": "AU-21: inject granted environments on remote turns and materialize SSH keys in the receiving world rather than handing it a control-plane path. Regression tests fail without both paths and pass with them."
+   }
+  ]
+ },
+ {
+  "id": "AU-22",
+  "section": "AU",
+  "finding": "AU-22 MED vault rotation overwrites w/o history; note \"\" accepted.",
+  "commits": [
+   {
+    "sha": "25995ba0",
+    "subject": "Preserve explicit empty notes in connector snapshots",
+    "body": "AU-22 CI repair: connector mirrors use replaceSecrets to represent the authoritative source, including an empty or removed note. Keep rejecting blank manual standalone notes without breaking snapshot synchronization. Verified connectors and vault-items tests."
+   },
+   {
+    "sha": "c442be32",
+    "subject": "Retain bounded encrypted vault rotation history",
+    "body": "AU-22: preserve the five preceding distinct values per handle for host-side recovery, keep them encrypted, and remove history on deletion. Reject explicit blank standalone notes while retaining connector note clearing semantics."
+   }
+  ]
+ },
+ {
+  "id": "AU-23",
+  "section": "AU",
+  "finding": "AU-23 LOW-MED agent-mail webhook secret shown to credential:read.",
+  "commits": [
+   {
+    "sha": "adcb1871",
+    "subject": "Limit mailbox webhook configuration to credential managers",
+    "body": "AU-23: credential readers can discover providers without receiving the ingest bearer secret or a worker script embedding it. Preserve the configuration surface for credential writers and verify both over HTTP."
+   }
+  ]
+ },
+ {
+  "id": "AU-24",
+  "section": "AU",
+  "finding": "AU-24..37 LOW: broker audit; per-access blob rewrites; merchant matching substring; no vault key canary/AAD; unparseable kv \u2192 []; 1Password argv; requireTLS; CVC; CDP pin; key files; GIT_SSH_COMMAND unquoted; pending spend of cancelled tasks actionable; currency-less budgets; test gaps.",
+  "commits": []
+ }
+]

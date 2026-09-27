@@ -1,0 +1,535 @@
+[
+ {
+  "id": "LT-1",
+  "section": "LT",
+  "finding": "LT-1 HIGH remote-process.ts:60-124, codex.ts:451,767,776-803 \u2014 every remote turn rebuilds the native agent serially (~20 s first turn, ~5 s resumed): node check twice, separate quiesce/exclude/list/chmod commands, Chromium smoke test every turn, a `codex mcp list` subprocess to read karmax's own config, serial account-health + MCP readiness. Fix: cache readiness per world generation; derive MCP flags from the seeded TOML; one script; overlap with prompt prep.",
+  "commits": [
+   {
+    "sha": "ca3e29e9",
+    "subject": "Reuse verified remote browser readiness between turns",
+    "body": "Persist versioned browser readiness and probe executable presence before reuse, avoiding repeated Chromium smoke launches while repairing removed binaries. Addresses the browser bootstrap portion of AD-12 and LT-1."
+   }
+  ]
+ },
+ {
+  "id": "LT-2",
+  "section": "LT",
+  "finding": "LT-2 HIGH view-publication.ts:23-27, core.ts:1045 \u2014 the Needs-input/Review publish waits for the full park (5.7\u201315.8 s); Open PR/Confirm don't interrupt it, so a quick reviewer waits for the park and then pays a resume. Fix: journal transition events that supersede parking; idle grace before parking.",
+  "commits": [
+   {
+    "sha": "0d9f865f",
+    "subject": "Verify historical parking commands across both patch generations",
+    "body": "LT-7/LT-9/LT-2: replay histories recorded after lifecycle separation but before non-idle guards. Reset workflow mocks under the sequential shared-process test configuration so preceding suites cannot bypass them."
+   },
+   {
+    "sha": "f214ec87",
+    "subject": "Defer idle parking for quick replies and accepted transitions",
+    "body": "Fix LT-2 by giving waiting worlds a 15-second interruptible grace before acquiring their operation lock. Journal accepted Open PR, Confirm, Retry and checkout approvals so they supersede checkpoint work at its next safe boundary. Retain awaited maintenance to avoid racing the next turn against filesystem capture."
+   }
+  ]
+ },
+ {
+  "id": "LT-3",
+  "section": "LT",
+  "finding": "LT-3 HIGH core.ts:1324-1346, e2b.ts:151,397, provision-git.ts \u2014 world setup serial (tokens one by one, two E2B list calls, credential writes, repos cloned one after another): 12\u201314 s while E2B create is 0.6 s. Fix: parallelize.",
+  "commits": [
+   {
+    "sha": "57a71b8c",
+    "subject": "Reconcile E2B provisioning generations in one inventory query",
+    "body": "LT-3: Fetch the task-scoped inventory once and select the exact generation locally, falling back to legacy unversioned sandboxes only when needed. Preserve allocation-timeout adoption and duplicate detection."
+   },
+   {
+    "sha": "f6a3de5a",
+    "subject": "Parallelize independent repository provisioning work",
+    "body": "LT-3: Resolve repository tokens and provision independent checkouts and credential files with a maximum fan-out of three. Drain active operations on failure before provider teardown. Keep provider idempotency lookups intact to avoid duplicate billable allocations."
+   }
+  ]
+ },
+ {
+  "id": "LT-4",
+  "section": "LT",
+  "finding": "LT-4 HIGH core.ts:1012 \u2192 e2b.ts:480 \u2014 wiki snapshot runs `find .` over the whole workspace (.git, node_modules) every turn (0.9\u20134.4 s). Fix: list only the wiki dir / git ls-files; skip when clean. = RT-13.",
+  "commits": [
+   {
+    "sha": "ad19c9e0",
+    "subject": "Model scoped wiki enumeration in the remote fixture",
+    "body": "RT-13 / LT-4: the remote wiki integration fake returned an empty successful response for every command, hiding its pages from the bounded snapshot. Return NUL-delimited wiki paths and assert enumeration stays in the wiki checkout."
+   },
+   {
+    "sha": "06b9a770",
+    "subject": "Prepare bounded wiki context without repeated conversation reads",
+    "body": "RT-13/LT-4: scope remote page enumeration to the wiki checkout and retain organization context on snapshot failure. RT-18: append goal instructions after resolving organization builtin overrides. RT-14: share the task preparation read and poll fork liveness without loading conversations at a lower frequency."
+   }
+  ]
+ },
+ {
+  "id": "LT-5",
+  "section": "LT",
+  "finding": "LT-5 HIGH no token streaming in any adapter (Codex emits on item/completed, Claude SDK without partial messages, API rails res.json()). Fix: handle deltas; throttle output events (~150 ms).",
+  "commits": [
+   {
+    "sha": "5e919444",
+    "subject": "Keep each agent's streamed text in its own conversation",
+    "body": "The live bubble follows the stage's conversation, so during Review a\nconfirmer's streamed text would have appeared in the Do agent's pane. The\nbubble now belongs to the conversation of the agent that is streaming:\nanother agent's chunks hide it rather than overwrite it, and a pane that\nhas no bubble yet gains one on its agent's next chunk (LT-5).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "87eb8578",
+    "subject": "Add an offline first-visible-text benchmark",
+    "body": "A loopback provider generates a reply at a fixed token rate, streamed when\nasked and whole otherwise, as the real APIs behave; the benchmark reports\nwhen the runtime would publish the first and last agent.output and how\nmany per turn, plus how long task creation takes to reach workflow.start\nwhile the advisory GitHub preflight is slow. No network or spend; run it\non two commits to compare (LT-5, LT-16).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "b8269bd1",
+    "subject": "Show streamed agent text in every open conversation",
+    "body": "The live bubble was dropped as soon as a conversation held any structured\nmessage, so after an agent's first reply nothing streamed at all. It now\nalways follows the stage's conversation: assistant text replaces it as it\ngrows, its completed message supersedes it (shown once, never next to a\nstale bubble), and a new or failed attempt clears it so a half message\nnever lingers as if final. Tool lines are timeline rows of their own and\nno longer overwrite the text, and output chunks stay out of the raw\nActivity feed, which would otherwise repaint per chunk.\n\nA browser test drives the full console over a fake socket: chunks patch\nthe bubble in place (no row repaint, no API reads), then the completion,\na failed attempt and a cancellation (LT-5).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "00003a84",
+    "subject": "Stream agent text from every adapter as it is generated",
+    "body": "A turn's text used to reach the task only when a whole message completed:\nthe Claude Agent SDK ran without partial messages, the Codex app-server\npath waited for item/completed, and both metered API rails read\nres.json(). ACP did stream, but emitted bare deltas that the console\nrenders as the whole live message, so it showed only the last chunk.\n\n- Claude Agent SDK: request partial messages and emit the main agent's\n  growing text block; sub-agent streams stay out of the main bubble.\n- Codex app-server: emit item/agentMessage/delta as the growing text.\n- ACP: publish the accumulated text instead of each chunk.\n- Messages and Responses API rails: request streaming responses and\n  rebuild the exact object the non-streaming call returns, so usage,\n  tool calls, stop reasons and error classification are unchanged. A\n  mid-stream error event is reported with the HTTP status the same\n  error carries before a stream starts; a body cut mid-stream is a\n  retryable interruption, never a completed turn. Non-SSE responses\n  (proxies, stubs) are read as JSON as before.\n\nThe completing item still records the message exactly once; an adapter\nno longer re-emits text identical to what it just streamed (LT-5).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "60fc1224",
+    "subject": "Coalesce live agent output in the turn runtime",
+    "body": "Streaming adapters re-emit the growing text of the block being generated.\nPublishing every token as an agent.output event would flood the event log\nand every open console, so the provider-neutral runtime now publishes the\nfirst chunk at once and then at most one update per 150 ms carrying the\nlatest text. Pending text is flushed before any activity that must follow\nit (the completed message) and at a successful turn end; a failed or\ncancelled turn publishes nothing more, so a half message never lands after\nthe turn stopped. Groundwork for token streaming in every adapter (LT-5).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "LT-6",
+  "section": "LT",
+  "finding": "LT-6 MED software-dev.ts:1765-1887,2505-2533 \u2014 8\u201312 sequential activities + a coordinator hop per turn; \"Starting agent\" published 3\u00d7. Fix: merge activities (needs patched()).",
+  "commits": [
+   {
+    "sha": "b6709dd0",
+    "subject": "Consolidate turn preparation and publish agent startup once",
+    "body": "LT-6: combine pool, provider and credential-policy reads in one retryable activity while retaining coordinator authority. Gate the command sequence with patched(), omit the redundant setup pool probe, and publish Starting agent only after admission. A recorded pre-change leased turn replays; the measured pre-turn path drops from nine activities to five."
+   }
+  ]
+ },
+ {
+  "id": "LT-7",
+  "section": "LT",
+  "finding": "LT-7 MED claude.ts:560, software-dev.ts:2798,2835 \u2014 a turn with a background shell/sub-agent holds up to 300 s, then each nudge publishes \"waiting\" \u2192 parks the world, waits 10 s, resumes and re-bootstraps (up to 5\u00d7). Fix: sub-agent/shell waits non-parkable.",
+  "commits": [
+   {
+    "sha": "0d9f865f",
+    "subject": "Verify historical parking commands across both patch generations",
+    "body": "LT-7/LT-9/LT-2: replay histories recorded after lifecycle separation but before non-idle guards. Reset workflow mocks under the sequential shared-process test configuration so preceding suites cannot bypass them."
+   },
+   {
+    "sha": "36ff7929",
+    "subject": "Keep live agent and background waits out of idle parking",
+    "body": "Fix LT-9 and LT-7: host admission, sub-agent, and shell waits retain their live world. Gate workflow command suppression with a patch while also guarding legacy lifecycle activities. Regression tests cover both handles and historical commands."
+   }
+  ]
+ },
+ {
+  "id": "LT-8",
+  "section": "LT",
+  "finding": "LT-8 MED software-dev.ts:1806,1876, core.ts:1085 \u2014 any short wait before the first turn triggers a full park, incl. first publication of a branch still equal to base (12 s / 3 repos). Fix: skip publish when tip == base; skip checkpoint when clean.",
+  "commits": [
+   {
+    "sha": "71f3a133",
+    "subject": "Provision pinned checkpoint restores from base only for remote clones",
+    "body": "#377's LT-8 restore provisions every checkout from base and then checks out\nits captured commit, because a fresh remote clone cannot fetch a task ref an\nidle checkpoint never published. Applied to host checkouts too, it put two\ncheckouts of one repository on the same default branch and `git worktree\nadd` refused the second (#369's WD-11 test). Host checkouts already share\nthe task's refs, so keep their recorded branches.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "41efb04a",
+    "subject": "Tighten runtime callbacks and regression fixture types",
+    "body": "Complete type validation for RT-7, RT-14, RT-15, RT-19, RT-20, RT-30 and LT-8: preserve void observer contracts, guard absent workflow metadata and provide typed fixture inputs."
+   },
+   {
+    "sha": "91e3e4de",
+    "subject": "Restore idle checkpoints from their recorded commits",
+    "body": "LT-8: checkpoints that omit an untouched task ref must restore without requiring that ref on origin. Initialize normally, then check out each captured commit and branch before applying its delta. Exercise a missing task ref and an advanced base using local fake-cloud provisioning."
+   },
+   {
+    "sha": "2946a78f",
+    "subject": "Reuse clean idle checkpoints and avoid publishing untouched bases",
+    "body": "Fix LT-8: idle capture omits unpublished task refs still at their provisioned base, while explicit publication keeps its existing contract. Reuse a clean checkpoint only when generation, repository tips, resource revisions and runtime manifest match; retain initial recovery capture and refresh after dirty data. Test with local Git and fake resources, without paid providers."
+   }
+  ]
+ },
+ {
+  "id": "LT-9",
+  "section": "LT",
+  "finding": "LT-9 MED core.ts:2352 \u2192 agent-turn-lease.ts:101 \u2014 \"Waiting for host\" publishes a parkable state while the turn is live. Fix: never park for host-capacity waits.",
+  "commits": [
+   {
+    "sha": "0d9f865f",
+    "subject": "Verify historical parking commands across both patch generations",
+    "body": "LT-7/LT-9/LT-2: replay histories recorded after lifecycle separation but before non-idle guards. Reset workflow mocks under the sequential shared-process test configuration so preceding suites cannot bypass them."
+   },
+   {
+    "sha": "36ff7929",
+    "subject": "Keep live agent and background waits out of idle parking",
+    "body": "Fix LT-9 and LT-7: host admission, sub-agent, and shell waits retain their live world. Gate workflow command suppression with a patch while also guarding legacy lifecycle activities. Regression tests cover both handles and historical commands."
+   }
+  ]
+ },
+ {
+  "id": "LT-10",
+  "section": "LT",
+  "finding": "LT-10 MED git-broker.ts:241-259,640,695,766 \u2014 publish/push/merge loop repos serially; ls-remote ~0.8 s each; changed branches full-clone per operation. Fix: parallel repos; mirror cache later.",
+  "commits": [
+   {
+    "sha": "560118b9",
+    "subject": "Retain task branch negotiation in scoped broker clones",
+    "body": "WD-17, LT-10: Fetch only the existing task branch alongside the selected base so repeated publication can reuse its remote tip without retransferring a bundle. The existing large-history regression failed before this repair and passes afterward."
+   },
+   {
+    "sha": "6135ce3f",
+    "subject": "Bound repository publication concurrency and clone scope",
+    "body": "WD-17 and LT-10: Publish independent repositories concurrently (maximum three) while serializing branches of the same source and preserving result order. Fetch only the default or merge-target branch into broker scratch clones; retain full ancestry checks and sequential merge failure semantics. Persistent mirror caching remains deferred to avoid introducing credential-sharing and unbounded disk retention."
+   }
+  ]
+ },
+ {
+  "id": "LT-11",
+  "section": "LT",
+  "finding": "LT-11 MED checkpoint.ts:93-134, resource-transfer.ts:41 \u2014 checkpoint reads dirty files one at a time with valid() (\u22488 queries) per file; write-access resources fully re-read and re-uploaded at every park. Fix: size/mtime diff; skip existing chunks; tar.",
+  "commits": [
+   {
+    "sha": "f6ff0217",
+    "subject": "Read checkpoint files in bounded sandbox batches",
+    "body": "WD-4, WD-19 and LT-11: Replace per-file unbounded SDK reads with size-checked batches executed inside the sandbox. Bound raw bytes, path arguments and decoded JSON so changed files cannot grow the host allocation after stat. Preserve checkpoint wire compatibility and cancellation checks; checkpoint and fork round trips pass."
+   }
+  ]
+ },
+ {
+  "id": "LT-12",
+  "section": "LT",
+  "finding": "LT-12 MED software-dev.ts:3264-3854 \u2014 GitHub landing wait: every 30 s 3 publishes + preflight + park + timer; mergeGithubPrs loads the full event log twice; re-parks parked worlds; no continue-as-new \u2192 ~4.2k events/h. See WF-3.",
+  "commits": [
+   {
+    "sha": "b86d6b41",
+    "subject": "Verify quiet landing polls across worker restarts",
+    "body": "LT-12: update the large-conversation pipeline regression to count actual GitHub observations rather than require redundant view publications. Verify the preserved proposal lands after replay. Rotate the watcher earlier for large histories or Temporal's continue-as-new recommendation, and propagate cancellation."
+   },
+   {
+    "sha": "73f76850",
+    "subject": "Bound GitHub landing wait history and narrow evidence reads",
+    "body": "LT-12, RT-21: keep unchanged preflight and fallback readiness polling in a child workflow that continues as new every 100 observations. Preserve parent leases and mutations, wake on provider changes, and reuse changed preflight results. Gate the command change with patched() and replay a recorded pre-change task history. Read only authorization and PR evidence once per poll instead of materializing every task event per PR."
+   }
+  ]
+ },
+ {
+  "id": "LT-13",
+  "section": "LT",
+  "finding": "LT-13 MED claude.ts:524, codex.ts:757 \u2192 core.ts:2233 \u2014 every running turn queries the workflow every 1.2 s for follow-ups (forces replays with a 20-entry cache) + two 1 s heartbeat timers. Fix: query only when a conversation.message event exists; one heartbeat; size cache for hosted.",
+  "commits": [
+   {
+    "sha": "fac28b94",
+    "subject": "Ask the workflow for follow-ups only when one can exist",
+    "body": "Every running turn queried the workflow's pendingMessages every 1.2 s. A\nquery on an execution that has left the worker's small cache replays its\nwhole history, so a long turn cost ~50 replays a minute for nothing. The\nAPI journals each accepted follow-up as a conversation.message event, and\na workflow that appends a message itself mid-turn (a mode switch)\npublishes its view, so the activity now reads those journal entries (an\nindexed read) and queries only when one appeared: the first pull always\nasks (a message may predate the turn), a journaled follow-up keeps asking\nfor up to 10 s until it comes back (the query can race the workflow task\napplying the signal), and a 30 s backstop still delivers writers that\njournal nothing (a raw Temporal signal). Adapter polling cadence, and so\ndelivery latency, is unchanged.\n\nThe runtime's own 1 s heartbeat duplicated the activity's keep-alive,\nwhich already spans the provider call; the turn now has one (LT-13).\n\nThe two end-to-end tests that signal Temporal directly mid-turn now\njournal the message as the API does.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "LT-14",
+  "section": "LT",
+  "finding": "LT-14 MED just-do.ts:159-167 \u2014 every publish sends the full conversation (quadratic history); software-dev fixed this with conversationPublisher. Needs patched().",
+  "commits": [
+   {
+    "sha": "ce7cd1a7",
+    "subject": "Isolate Temporal mocks from previously imported workflow modules",
+    "body": "WF-3, WF-4, WF-5, WF-8, WF-9, WF-10, WF-11, WF-12, WF-14, WF-16, WF-22, WF-23, WF-24, LT-14, LT-20: reset the module cache before mocked workflow imports and clean it after each suite. With isolate disabled, stage-transitions previously cached real SDK imports and caused 17 regression failures in CI. The combined 92-test run now passes."
+   },
+   {
+    "sha": "2b1a870e",
+    "subject": "Reuse just-do conversation snapshots in status publications",
+    "body": "LT-14: use the existing immutable conversation publisher behind a replay patch. Repeated status changes no longer append the full transcript to history."
+   }
+  ]
+ },
+ {
+  "id": "LT-15",
+  "section": "LT",
+  "finding": "LT-15 LOW-MED process-worker mode: gateway relay polls every 500 ms and wake() is never called; per-socket permission reads per event.",
+  "commits": [
+   {
+    "sha": "15eb3229",
+    "subject": "Push worker events to browsers at once and authorize sockets per task",
+    "body": "In process-worker mode the activity child commits events to the shared\ndatabase, and the primary's relay only found them on its 500 ms poll:\nwake() existed but nothing called it. The child now sends a coalesced\nworker.events notice over its supervisor channel after each commit, and\nthe primary wakes the relay, which feeds the bus and the fanout; polling\nremains the recovery path for a lost notice.\n\nEach live event also re-verified the socket's token (scoped-token,\nsession, account-closure and org reads) and, on refusal, re-derived the\nhuman's capabilities, per event per socket. With streamed output that is\nseveral times a second. A socket now decides each task's visibility once\nand reuses it until its token expires, capped at 60 s so a revocation or\nmembership change still reaches a socket that stays open; a failed lookup\nis retried rather than cached (LT-15).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "LT-16",
+  "section": "LT",
+  "finding": "LT-16 LOW-MED api.ts:1240-1270, server.ts:4382 \u2014 advisory GitHub permission check and sync wiki git run before workflow.start (0.2\u20130.8 s).",
+  "commits": [
+   {
+    "sha": "87eb8578",
+    "subject": "Add an offline first-visible-text benchmark",
+    "body": "A loopback provider generates a reply at a fixed token rate, streamed when\nasked and whole otherwise, as the real APIs behave; the benchmark reports\nwhen the runtime would publish the first and last agent.output and how\nmany per turn, plus how long task creation takes to reach workflow.start\nwhile the advisory GitHub preflight is slow. No network or spend; run it\non two commits to compare (LT-5, LT-16).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "ae6cb147",
+    "subject": "Start tasks without waiting for advisory GitHub and wiki work",
+    "body": "Two pieces of work sat between a create request and workflow.start\nwithout being able to change whether or how the task starts:\n\n- The GitHub merge preflight only warns, yet its live permission calls\n  (per repository, then per routed reviewer, one after another) ran\n  before the start. It now runs alongside the rest of creation and the\n  start; the created task still carries its warnings and the warning is\n  still journaled, and it journals nothing for a creation that was undone.\n  The human-route check that can reject a task still runs first.\n- Every create and queue re-ensured the project's local wiki repository:\n  three or more git processes in the wiki's per-repository lane, which\n  can sit behind a remote fetch/publish. Once this gateway has ensured a\n  project's wiki (boot does it for every project), a start refreshes it in\n  the background; a project not yet ensured still waits for it (LT-16).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   }
+  ]
+ },
+ {
+  "id": "LT-17",
+  "section": "LT",
+  "finding": "LT-17 LOW = RQ-2.",
+  "commits": []
+ },
+ {
+  "id": "LT-18",
+  "section": "LT",
+  "finding": "LT-18 LOW remote-process.ts:136-167 \u2014 after every remote turn every session file is downloaded in full, serially, before Review. Fix: current session + auth only; size check; parallel.",
+  "commits": [
+   {
+    "sha": "dafdd7c3",
+    "subject": "Bound remote native history and protocol output buffers",
+    "body": "Cap file bodies, aggregate history bytes, file counts and listing transport before sandbox-controlled output enters host buffers. Read through the bounded PTY transport rather than SDK file downloads, and stop native processes when their SDK consumer leaves more than 8 MiB queued. Cap stderr recovery too. The history implementation is partly in 6d918b0a; this commit adds the regression coverage and protocol backlog guard. Fixes AD-1 and completes size checks for AD-12/LT-18."
+   },
+   {
+    "sha": "b4baf3c4",
+    "subject": "Scope native history export to the completed agent session",
+    "body": "Pass the actual Claude/Codex session to bounded remote-home synchronization. Export no unrelated fork source history. Complete adapter integration for AD-5 and LT-18."
+   },
+   {
+    "sha": "d95e344f",
+    "subject": "Restrict remote history export to the active conversation",
+    "body": "Require the adapter session identity, leave unrelated fork sources and credentials untouched, and reject divergent Claude history while retaining newer host copies. Export only Codex physical lineage needed to restore the selected session. Fixes AD-5 and the redundant session-download portion of AD-12/LT-18."
+   }
+  ]
+ },
+ {
+  "id": "LT-19",
+  "section": "LT",
+  "finding": "LT-19 LOW runners.ts:274, e2b.ts:844 \u2014 each 60 s sweep drains E2B's 7-day event feed (\u2264500 pages) per org. Fix: cursor.",
+  "commits": [
+   {
+    "sha": "f8d43035",
+    "subject": "Bound repeated E2B lifecycle event reconciliation",
+    "body": "WD-18 and LT-19: Resume provider event scans with a durable one-hour overlapping cursor. Reconcile the full retained feed daily to catch older delayed events, and never advance the cursor on pagination or transport failures. Provider inventory remains current for orphan cleanup."
+   }
+  ]
+ },
+ {
+  "id": "LT-20",
+  "section": "LT",
+  "finding": "LT-20 LOW resources.ts:1058 \u2014 100 ms query poll for the publish slot; account.ts:524 Promise.race timer leak per park iteration (coordinator: needs patched()).",
+  "commits": [
+   {
+    "sha": "ce7cd1a7",
+    "subject": "Isolate Temporal mocks from previously imported workflow modules",
+    "body": "WF-3, WF-4, WF-5, WF-8, WF-9, WF-10, WF-11, WF-12, WF-14, WF-16, WF-22, WF-23, WF-24, LT-14, LT-20: reset the module cache before mocked workflow imports and clean it after each suite. With isolate disabled, stage-transitions previously cached real SDK imports and caused 17 regression failures in CI. The combined 92-test run now passes."
+   },
+   {
+    "sha": "14d3d7d5",
+    "subject": "Back off resource publication queue queries under contention",
+    "body": "LT-20: retain an immediate grant check, then back off from 100 ms to 5 s while queued. The test measures a minute of contention and verifies exactly one action and lease release. This trades up to five seconds of wake latency for bounded query load."
+   },
+   {
+    "sha": "45a30502",
+    "subject": "Rotate busy coordinators without losing outstanding leases",
+    "body": "WF-5, WF-24, LT-20: migrate coordinator loop policy through continue-as-new state, rotate at safe boundaries even with queued work or a live merge holder, and cancel obsolete account park timers. Add recorded pre-change replay histories and real Temporal rotation coverage."
+   }
+  ]
+ },
+ {
+  "id": "PA-1",
+  "section": "PA",
+  "finding": "PA-1 MED images exported as base64 text instead of image parts.",
+  "commits": [
+   {
+    "sha": "44a9dc37",
+    "subject": "Sync tested panagent runtime from upstream",
+    "body": "PA-1 through PA-5 and PA-8 through PA-12: Vendor the byte-identical Python runtime from upstream commit 3d80d74861026390c56b129df86369ada1a801f6."
+   },
+   {
+    "sha": "panagent@9bc4ebc",
+    "subject": "Preserve embedded images in native conversions",
+    "body": "PA-1: Emit Claude image blocks and Codex input_image parts for embedded data, while keeping binary payloads out of readable text."
+   }
+  ]
+ },
+ {
+  "id": "PA-2",
+  "section": "PA",
+  "finding": "PA-2 MED no tool-call/result pairing: \"unknown\" ids; readers.py:285 attaches results to the last pending call.",
+  "commits": [
+   {
+    "sha": "panagent@24f60f3",
+    "subject": "Pair native tool results with pending calls",
+    "body": "PA-2: Use call order only when native result IDs are absent, consume matched calls, and warn about orphan results."
+   }
+  ]
+ },
+ {
+  "id": "PA-3",
+  "section": "PA",
+  "finding": "PA-3 MED lone surrogates crash writers (ensure_ascii=False, writers.py:220,453).",
+  "commits": [
+   {
+    "sha": "panagent@c2710c9",
+    "subject": "Preserve lone surrogates in rendered output",
+    "body": "PA-3: Escape invalid Unicode before writing native or readable output so malformed exports remain serializable."
+   }
+  ]
+ },
+ {
+  "id": "PA-4",
+  "section": "PA",
+  "finding": "PA-4 MED CLI error handling incomplete (cli.py:235): tracebacks instead of messages.",
+  "commits": [
+   {
+    "sha": "panagent@a16fad0",
+    "subject": "Report malformed input errors without tracebacks",
+    "body": "PA-4: Treat decode and malformed-value errors at the CLI boundary as actionable conversion failures."
+   }
+  ]
+ },
+ {
+  "id": "PA-5",
+  "section": "PA",
+  "finding": "PA-5 MED Claude reader ignores parentUuid/isSidechain/compaction boundaries.",
+  "commits": [
+   {
+    "sha": "44a9dc37",
+    "subject": "Sync tested panagent runtime from upstream",
+    "body": "PA-1 through PA-5 and PA-8 through PA-12: Vendor the byte-identical Python runtime from upstream commit 3d80d74861026390c56b129df86369ada1a801f6."
+   },
+   {
+    "sha": "panagent@3d80d74",
+    "subject": "Honor Claude compaction summaries without UUIDs",
+    "body": "PA-5: Real summary records may lack graph identifiers; apply their boundary while following the active message chain."
+   },
+   {
+    "sha": "panagent@f06e17e",
+    "subject": "Select Claude active branch and compaction summary",
+    "body": "PA-5: Follow parentUuid from the latest mainline message, omit sidechains and stale siblings, and retain the compaction summary as context."
+   }
+  ]
+ },
+ {
+  "id": "PA-6",
+  "section": "PA",
+  "finding": "PA-6 MED karmax passes --quiet and never --report (src/.../panagent.ts:81,145,151) so conversion warnings are invisible.",
+  "commits": [
+   {
+    "sha": "278a69e2",
+    "subject": "Record panagent conversion warnings on session imports",
+    "body": "PA-6: Request a machine-readable report and persist conversion-loss warnings as task events so imports do not silently discard them."
+   }
+  ]
+ },
+ {
+  "id": "PA-7",
+  "section": "PA",
+  "finding": "PA-7 MED same-provider Claude uploads round-trip through the IR (lossy) instead of passing the native file.",
+  "commits": [
+   {
+    "sha": "fa01badc",
+    "subject": "Preserve Claude native records before a truncated tail",
+    "body": "PA-7 and PA-11: Keep valid same-provider history and surface a warning when the final append-only record is incomplete."
+   },
+   {
+    "sha": "34e033bb",
+    "subject": "Preserve native Claude uploads during same-provider import",
+    "body": "PA-7: Copy all native records with a fresh session and parent-linked UUIDs instead of losing provider state through IR conversion."
+   }
+  ]
+ },
+ {
+  "id": "PA-8",
+  "section": "PA",
+  "finding": "PA-8 LOW share fetch accepts any scheme/redirect (web.py:84-103; prior #33).",
+  "commits": [
+   {
+    "sha": "44896c37",
+    "subject": "Guard conversation share acquisition before conversion",
+    "body": "NC-2 / PA-8: validate share URLs again at acquisition and download through the DNS-pinned bounded HTTPS transport. Convert local HTML with an explicit provider format so Python cannot follow redirects or perform a second unguarded fetch."
+   },
+   {
+    "sha": "44a9dc37",
+    "subject": "Sync tested panagent runtime from upstream",
+    "body": "PA-1 through PA-5 and PA-8 through PA-12: Vendor the byte-identical Python runtime from upstream commit 3d80d74861026390c56b129df86369ada1a801f6."
+   },
+   {
+    "sha": "panagent@38beeeb",
+    "subject": "Restrict share downloads and redirects to HTTPS shares",
+    "body": "PA-8: Validate both the requested URL and every redirect target before opening a connection."
+   }
+  ]
+ },
+ {
+  "id": "PA-9",
+  "section": "PA",
+  "finding": "PA-9 LOW challenge-page detection false positives; browser fallback on any error.",
+  "commits": [
+   {
+    "sha": "panagent@2a8617d",
+    "subject": "Limit browser fallback to share challenges",
+    "body": "PA-9: Avoid launching a browser for network failures and treat challenge markers as HTML acquisition state, not conversation text."
+   }
+  ]
+ },
+ {
+  "id": "PA-10",
+  "section": "PA",
+  "finding": "PA-10 LOW `<imported_conversation>` delimiter not escaped (writers.py:92, panagent.ts:165).",
+  "commits": [
+   {
+    "sha": "43da7383",
+    "subject": "Escape delimiters in Karmax imported context",
+    "body": "PA-10: Prevent an uploaded conversation from closing the untrusted transcript wrapper in the Karmax handoff."
+   },
+   {
+    "sha": "panagent@24d691f",
+    "subject": "Escape imported conversation delimiters in handoffs",
+    "body": "PA-10: Keep untrusted source text inside the context wrapper even when it contains closing or opening delimiters."
+   }
+  ]
+ },
+ {
+  "id": "PA-11",
+  "section": "PA",
+  "finding": "PA-11 LOW strict JSONL fails on a truncated last line; host paths leak into exports; --fail-on-warning counts info.",
+  "commits": [
+   {
+    "sha": "fa01badc",
+    "subject": "Preserve Claude native records before a truncated tail",
+    "body": "PA-7 and PA-11: Keep valid same-provider history and surface a warning when the final append-only record is incomplete."
+   },
+   {
+    "sha": "panagent@07597e3",
+    "subject": "Keep warning exit test on a warning-producing source",
+    "body": "PA-11: The prior public-share fixture emits informational notes only; use native lost-state warnings for the strict exit test."
+   },
+   {
+    "sha": "panagent@9e2f805",
+    "subject": "Recover truncated JSONL and keep source paths private",
+    "body": "PA-11: Skip an incomplete final record with a warning, omit source machine paths from exports, and make fail-on-warning ignore informational notes."
+   }
+  ]
+ },
+ {
+  "id": "PA-12",
+  "section": "PA",
+  "finding": "PA-12 LOW packaging: version duplicated, docs/browser-export.md missing, stale codex cli_version; karmax passes the full environment to python (src/agent/panagent.ts:180).",
+  "commits": [
+   {
+    "sha": "44a9dc37",
+    "subject": "Sync tested panagent runtime from upstream",
+    "body": "PA-1 through PA-5 and PA-8 through PA-12: Vendor the byte-identical Python runtime from upstream commit 3d80d74861026390c56b129df86369ada1a801f6."
+   },
+   {
+    "sha": "ef47019f",
+    "subject": "Limit environment passed to panagent subprocess",
+    "body": "PA-12: Prevent task and vault credentials in the Karmax worker environment from being inherited by the converter."
+   },
+   {
+    "sha": "panagent@c3af188",
+    "subject": "Derive package version and avoid stale Codex metadata",
+    "body": "PA-12: Use runtime version as packaging source of truth and omit a fabricated Codex CLI version; browser-export documentation already exists."
+   }
+  ]
+ }
+]

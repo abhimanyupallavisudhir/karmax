@@ -1,0 +1,55 @@
+UI-1	fixed	ccbb4706	Store createTag/updateTag enforce {type,topic,flag} allowlist; all three chip sites esc(kind). Tests: tests/store.test.ts, web/review-security.test.cjs.
+UI-2	fixed	9f31d9cb,ccbb4706	Client safeHref on overview/review links, openUrls http(s)-filtered; server review-info.ts rejects non-http(s). Tests: tests/review-info-publication.test.ts, web/review-security.test.cjs.
+UI-3	fixed	0df30b4c	Static org buttons use replacing on-handlers; row listeners re-rendered per pass. Test: web/organization-handlers.test.cjs (source-text). Invite scope-editor listeners still stack (harmless).
+RQ-6	partial	0df30b4c	Stacked listeners fixed. Each org action still awaits full hydrateOrganizationView (~21 GETs; 22 call sites, unchanged); api() caches only /api/defaults.
+RQ-1	fixed	b6a5c81c	agent.output only patches live bubble; excluded from taskEvents/activity; renderMarkdown memoized (128 entries, FIFO). Test: web/stream-refresh.test.cjs.
+RQ-2	fixed	04fedf55,1ac4264a	refreshTask single-flight per task with trailing pass; view.updated now fetches view+widgets only (was 9). Test: web/task-refresh-coalescing.test.cjs.
+UI-6	partial	04fedf55,1ac4264a	refreshTask coalesced and event-scoped (2 GETs). openTask still issues ~12 requests, unchanged, and j/k calls it per key without debounce.
+RQ-3	partial	8caca636,e2b09ceb	projectId added; foreign-project events ignored. Only sibling attempts in S.attemptGroup skipped: on list page, non-principal attempt view.updated still reloads list. Test: web/event-routing.test.cjs.
+UI-7	fixed	8caca636	Server stamps projectId on socket events; client ignores foreign-project list/search reloads; inbox reloads filtered by inboxEventChanges. Tests: tests/gateway-public.test.ts, web/event-routing.test.cjs.
+RQ-8	fixed	8caca636	inboxEventChanges reloads only for done/failed/cancelled, human waits, or tasks already in inbox. Test: web/event-routing.test.cjs.
+RQ-15	fixed	8caca636	renderRail() removed from connectWs and refreshTasks; remaining callers are navigation/user actions. Test: web/event-routing.test.cjs (source-text).
+RQ-4	fixed	80a2e2e5,78e340f9,69378e51	api() shares identical in-flight GETs; defaults cached 10s, user-scoped, cleared on writes. Test: web/request-sharing.test.cjs. No page-level request-count test.
+UI-8	partial	78e340f9,80a2e2e5	Defaults cached and concurrent reads shared. loadCollaboration still runs twice on org switch (applyRoute app.js:548, then hydrateOrganizationView :17666, sequential).
+RQ-5	fixed	a44cc725	applyRoute skips the second renderMain for cached same-project non-task tabs, so settings hydrate once. Test: web/list-repaint.test.cjs (source-text).
+RQ-7	fixed	a44cc725	Patched view.updated now runs a background search and paints once after the result; no stale pre-search renders. Test: web/list-repaint.test.cjs.
+UI-4	fixed	8d25db1b,983096b2	All four project hydrators guard with renderIsCurrent and query only their captured box after await. Test: web/project-settings-scope.test.cjs (source-text).
+UI-5	fixed	41171e33,b402adff	readResponder uses readAgentSpec (MCP kept); selected Avatar saved as avatar:<id> audience route. Test: web/responder-roundtrip.test.cjs.
+UI-9	fixed	20ddaceb,7d27ea4a	renderOnboarding skips unchanged markup via render key; polling stops when minimized, closed or hidden. Tests: web/onboarding-stability.test.cjs, web/background-work.test.cjs.
+UI-10	fixed	20ddaceb	CSS hides .hosted-onboarding while #tf-page (task form) or .ck-compose (composer) is present. Test: web/onboarding-stability.test.cjs (CSS text).
+RQ-12	fixed	7d27ea4a,6b99b18f	pollOnboarding returns early when minimized/closed/hidden; expanding re-renders and resumes polling. Test: web/background-work.test.cjs.
+RQ-11	fixed	7d27ea4a,0473894a	Hidden tabs mark socket events stale and backfill once on visibilitychange; revision check, host-diag/proc polling and onboarding skip hidden tabs. Test: web/background-work.test.cjs.
+UI-11	fixed	0473894a	Revision change shows a once-per-revision Reload toast; no automatic reload; hidden tabs skip checks. Test: web/revision-drafts.test.cjs.
+UI-12	partial	c5bed76e,457c5804	Org GitHub pane and global search now show retry. Project Access still maps failed git-connections/github-app to setup guidance (app.js:13505); loadCollaboration still empties failures (:2929).
+UI-13	partial	2b023505,bd0b3c5f	MathJax entry SRI and external SW script done. Console CSP still only frame-ancestors (static-assets.ts:42), deferred per 2b023505; MathJax ui/safe loads unpinned.
+UI-14	fixed	eaa436b2,6b99b18f	Palette/search/help/action forms use transient #modal-root roots, preserving the task form. Attempt dialog (app.js:10541) still uses #overlay-root, unreachable with form open. Test: web/overlay-preservation.test.cjs.
+UI-15	fixed	9aab1cc9	Client and store slugify keep NFC-normalized Unicode letters/numbers/marks, so distinct non-ASCII names stay distinct. Tests: tests/store.test.ts, web/unicode-slugs.test.cjs.
+UI-16	fixed	f7d9aa77	Profile and organization GitHub removal both confirm with a repository-access warning before DELETE. Test: web/github-disconnect.test.cjs.
+UI-17	fixed	668f4794	--ink-3 now #626e7e light / #929dad dark: 4.84-6.77:1 on paper/surface/surface-2 (recomputed). Test: web/contrast.test.cjs.
+UI-18	fixed	457c5804,bb64d677,17b7b72c,6c386aeb	REGRESSION? /api/search loops every installation project, minting per-project session tokens (server.ts:8582-8584,:8642). Mark-read batched per org. Tests: tests/gateway-search.test.ts, tests/inbox.test.ts.
+RQ-14	fixed	457c5804,17b7b72c,c5bed76e,6c386aeb	REGRESSION? Server search walks all tenants' projects, each auth() minting a stored token for cookie users (server.ts:8582-8584,:8642). Client: one aborted, debounced, 2-char request.
+UI-19	fixed	34987d88	rememberInteractionOrigin ignores keydown from inputs/textareas/contenteditable, so keyboard sends no longer mark the textarea pending. Test: web/text-action-feedback.test.cjs.
+UI-22	fixed	73aaddc6,591484ad,69378e51	Shell listeners installed once; connectWs retires prior socket and retry timer; shared read cache keyed by user. Test: web/relogin.test.cjs.
+UI-23	partial	d38176a7	Vault item policy selects now revert and lock during save. Cited conversation-sharing policy select (HEAD app.js:13078) still keeps rejected value after failed save; unchanged.
+UI-24	fixed	3bffa273,fd19d6e5	Tags manager captures new-tag and active edit-tag fields before redraw and restores them; clears only after matching save. Tests: web/tag-draft.test.cjs, web/console-journeys.browser.test.cjs.
+UI-25	fixed	0b1a02c8,c7bcc89c	parseRoute and wiki hash use decodeRoutePart (literal on malformed escapes); remaining decodeURI calls wrapped in try. Test: web/malformed-route.test.cjs.
+UI-26	fixed	ccbb4706	All three PR link sites (pullRequestLinks, checkoutsSection, insightTaskRow) now pass URLs through safeHref. Test: web/review-security.test.cjs.
+UI-27	fixed	c66eef03	forkCommandFor single-quotes path, config home and session id with POSIX escaping for both providers. Test: web/fork-shell-quoting.test.cjs.
+UI-28	fixed	c1847261	refreshTask on 404 drops the task from S.tasks, toasts 'This task was deleted' and closes the page. Test: web/deleted-task.test.cjs.
+UI-29	fixed	e66fe716	qr-scanner script removed from index.html; totp-qr.js loads it lazily on first pasted image, retryable on error. Test: tests/vault-totp-ui.test.ts.
+RQ-9	partial	e66fe716	qr-scanner now lazy. Boot unchanged since d5190e7e: meta, launch, session, orgs/projects, collaboration/schema/onboarding still sequential before renderShell (app.js:2730-2846).
+RQ-10	fixed	7d27ea4a,6b99b18f	Payments section wired once per live key; spend refreshed only on spend./payment. events or full refresh. Test: web/background-work.test.cjs.
+RQ-13	fixed	7d27ea4a,6b99b18f	Inventory cached per stage, invalidated by review.updated/resource.* events; no 15s TTL refetch on refreshTask. Test: web/background-work.test.cjs.
+RQ-16	partial	7d27ea4a	S.activity now kept only on Activity tab for current project. Server still pushes every readable project's events, including agent.output, to every tab (no /ws subscription).
+UI-30	partial	20e4dea0	Only confirmer/responder help (:1265,:1268) moved to tips. Seven cited paragraphs unchanged inline: checkouts, project Data/Services, vault requests, notifications x2, org network, usage policy.
+UI-33a	fixed	3a9598b2	Dead hydrateProjectResources resource editor removed (0 references at HEAD). Test: web/console-cleanup.test.cjs.
+UI-33b	fixed	3a9598b2	Stray task-form </footer> replaced with </div>; footer tags now balanced (2 open, 2 close). Test: web/console-cleanup.test.cjs.
+UI-33c	open	-	Three Work-locally modals (openLocalCheckout, openProjectCheckout, materializeLocalCheckout, app.js:9472,:9521,:9549) byte-identical to base; 3a9598b2 says UI-33 partial.
+UI-33d	fixed	20e4dea0	refreshTask(v.taskId) replaced by refreshTask(); no argument-passing calls remain besides ev.type reasons. Test: web/console-cleanup.test.cjs.
+UI-33e	fixed	20e4dea0	Each confirmer/responder audience input gets a unique generated datalist id; no literal #human-audience-options remains. Test: web/console-cleanup.test.cjs.
+UI-33f	open	-	parseRoute still repeats the project tab list ['tasks','queue','activity','wiki','avatars','settings'] twice (app.js:372,:389).
+UI-32	fixed	3a9598b2	llms.txt gains 'Agent entry points': platform MCP, describe_platform, platform_request, connection tools. Test: web/console-cleanup.test.cjs.
+UI-34	partial	3a9598b2	'Return to Tavya' now uses siteNameMarkup(). Still drifting: globalThis.TavyaMarkdown (markdown.js:344), 'Krmax' in index.html:10/app.webmanifest vs 'krmax' title.
+UI-31	fixed	9f3249db,983096b2	All 10 native prompt() calls now use escaped in-page promptText dialog with focus restore; remaining confirm() are yes/no only. web/text-prompt.browser.test.cjs.
+UI-35	partial	72166433	List, draft and inbox task rows get role=group + escaped aria-label (web/task-row-accessibility.test.cjs, source-text). Queue-view task rows (.queue-item, app.js:10891,10912,10931) still unnamed.
+UI-36	partial	dc57a285	Full-shell Chromium journey on fake /api+WS added (web/console-journeys.browser.test.cjs), fixtures inline, not reusable. Web tests still mostly non-browser (91/109); pure source-text 7 to 20.

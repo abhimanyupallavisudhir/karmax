@@ -1,0 +1,61 @@
+AD-1	partial	dafdd7c3,bf38c240,7cae3b29,d251d6b6	Named sites bounded (history caps, 64MiB line cap, 16KB bash tail; bounded-exec/remote-agent tests); API read_file still reads whole sandbox file (tools.ts:894).
+AD-2	fixed	c20494a5,09f7ae68,b9c1d352,d4c7e73c	Only ProviderFailure/ProviderStreamError classify as limits; adapter catch-all reclassification removed. Tests: limits, agent-stream-close, codex-app-server, agent-admission, claude-terminal.
+AD-3	deferred	e6cedcbd,a2afe96f,54949a40	Retry-After/'try again in'/60s default added in a2afe96f then reverted by e6cedcbd for task #385; API-key 429 still parks login 5h.
+AD-4	fixed	b9c1d352	Claude and Codex API rails catch tool exceptions and return is_error tool results; failed signal_completion not success. Test: agent-api-errors.
+AD-5	fixed	d95e344f,b4baf3c4	Export limited to the turn's session (plus Codex lineage); divergent Claude history rejected, newer host copy kept. Test: remote-agent.
+AD-6	fixed	6c877ec8,71959260,30a7f744,397c261d	Persistent streaming TextDecoders per stdout/stderr/PTY in e2b.ts (sdkText stream:true). Test: e2b-world.
+AD-7	fixed	6d918b0a,09f7ae68,d4c7e73c	Remote-world provider failures unwrapped to plain errors; cannot park shared logins (trade-off: genuine sandbox limits stay task-local). Tests: claude-terminal, remote-agent.
+AD-8	fixed	43fd7da8	Boot migration no longer strips maxTurns; SDK receives input/profile maxTurns (backstop 1000). Tests: claude-terminal, store.
+AD-9	fixed	7bb61443	account_on_hold/verification_required/cloud_credential_error map to hard credential; other assistant errors fail the turn without parking. Test: claude-terminal.
+AD-10	fixed	a2afe96f,54949a40	'credit balance is too low' now a hard quota failure (legacy replays unchanged). Tests: limits, workflow-failures.
+AD-11	fixed	b9c1d352,5f4538a3,82c10837,7cae3b29	Codex killAgent/stop, MCP close and Claude work cleanup no longer replace outcomes; history export best-effort. Tests: agent-native-cleanup, agent-api-errors, claude-terminal.
+AD-12	partial	ca3e29e9,d95e344f,dafdd7c3	Browser readiness cached, export limited to current session (remote-agent test). Remain: node install-check+expose, serial bootstrap, per-turn work-env dir, full transcript re-read.
+AD-13	open	-	No commit (listed in task #394, untouched). codex-history*.ts and ensure*CodexSessionTools unchanged: every resumed turn re-reads, re-parses and republishes the whole lineage.
+AD-14	partial	ad0fb41c,00003a84	REGRESSION? 00003a84 (LT-5) restored cumulative emit (acp.ts:490); 150ms coalescing (runtime.ts:96) bounds row rate, but each agent.output row holds full text.
+AD-28	fixed	ad0fb41c	ACP terminal output retention clamped to 1 MiB regardless of provider outputByteLimit (acp.ts:432). Test: acp-agent.
+AD-15	fixed	25e695e6	findClaudeSession now picks the largest copy across homes (mtime tie-break) instead of first readdir match. Test: fork.
+AD-16	fixed	fb9011a3	KARMAX_CUSTODY_CHAIN added to the agent-visible env allowlist (config-homes.ts:466). Test: custody.
+AD-18	fixed	fb9011a3	REGRESSION? Root signalled only if /proc start tick matches; on non-Linux hosts startMatches/custodyProcesses are empty, so killAgent signals nothing (custody.ts:201,305). Test: custody.
+AD-17	fixed	19f024b6,43833be3	KARMAX_TOKEN no longer in --mcp-config (MCP inherits harness env); codex exec prompt sent on stdin ('-'). Tests: codex-exec, claude-terminal, conversation-history.
+AD-19	fixed	77dcf198	Interval steering tracked as one promise; completed-turn drain awaits it before pulling follow-ups, preventing double delivery. Test: codex-app-server.
+AD-20	fixed	5f4538a3	OAuth refresh-resume carries acknowledged deliveredMessages boundary and merged follow-ups instead of resending the whole delta. Test: claude-oauth-delivery.
+AD-21	fixed	a8b80f38	Codex app-server and exec stderr kept to a 64 KiB tail; exec stdout decoded with setEncoding('utf8'). Test: codex-exec.
+AD-22	fixed	83a54042	Stopping an agent root now cancels its owning task through the authorized signal API, not a raw retried signal. Tests: processes, gateway-processes.
+AD-23	fixed	92a827ff	configFiles excludes karmax-oauth.json and karmax-work-*.config.toml from remote seeding. Test: remote-agent.
+AD-24	fixed	92a827ff	Every seeded config file (skills, settings) is rewritten each turn instead of only when absent. Test: remote-agent.
+AD-25	fixed	216dfa84	Blank, malformed, negative or overflowing KARMAX_AGENT_BG_SETTLE_MS falls back to 5 min; explicit 0 still opts out. Test: agent-stream-close.
+AD-26	fixed	b4b8aa81	Local Claude spawn pipes stderr into a 64 KiB tail; startup diagnostics publish allowlisted error signatures. Test: claude-terminal.
+AD-27	fixed	5b9f0bb3	Transport 408/50x/529 match now needs HTTP/status/API context; bare counts like '500-iteration' no longer retry. Test: limits.
+AD-29a	n/a	-	Checked OK in review (memory guard victim choice); not a finding.
+AD-29b	n/a	-	Checked OK in review (shell quoting); not a finding.
+AD-29c	n/a	-	Checked OK in review (reapOrphans pid reuse); not a finding.
+AD-29d	n/a	-	Checked OK in review (Claude idle/result logic); not a finding.
+WF-1	fixed	39f54457	runAgentTurn keeps only replies to the task's own children (store parentTaskId) before the workflow signals; sole path. Test: subtask-response-scope.
+WF-2	fixed	39f54457	Signal route 404s non-tasks; only public signals (followUp/confirm/openPr/approveCheckout/cancel/retry) or declared actions allowed. Test: platform-authz.
+WF-3	partial	38ebbb85,0cddcb35,ce7cd1a7	App-connection waits now signal-driven (workflow-review-regressions test). Hosted admission (software-dev.ts:1823, agent-turn-lease.ts:173) and GitHub waits (:3762,:3875) still poll; no continue-as-new.
+WF-4	partial	765ab02a,0cddcb35,ce7cd1a7	Recovery checkpoint dropped from liveInput (workflow-review-regressions test). Full transcript still passed per turn into history; no continue-as-new, so 50MB limit remains.
+WF-5	fixed	45a30502,ccf631b3,ce7cd1a7	Coordinator continues-as-new at safe boundaries even with queued work (history>=10k/suggested), carrying accounts, queue, granted. Tests: coordinator-history, coordinator-health, workflows, quota-coordinator.
+WF-6	fixed	a2c7f1c3	leaseAccount fails closed (missing:policy-unavailable) without a policy; runAgentTurn rejects leased homes/keys outside the task's org. Tests: model-credential-routing, quota-coordinator.
+WF-7	fixed	835e1d30	changeWorkflow requires review:approve for an agent switching its task to Goal (no Review gate). Test: stage-transitions.
+WF-8	fixed	476c27e9,ea9589a6,0cddcb35,f6fd53fb	Replacement no longer cancels children or closes their PRs; new run restores child barrier, childSettled signal reports results. Tests: child-recovery, child-recovery-workflow, workflow-review-regressions.
+WF-9	fixed	f7f83955,ce7cd1a7	just-do catches CredentialUnavailable (patched) and parks in a cancellable human wait instead of failing the workflow task forever. Test: workflow-review-regressions.
+WF-10	fixed	776ae63c,ce7cd1a7	merge-only final gate (patched) waits for confirmed && mayConfirm, so Confirm cannot merge a workflow edit with failed checks. Test: workflow-review-regressions.
+WF-11	fixed	7e6c38e2,0cddcb35,ce7cd1a7	Cancellation rechecked (patched) after publish/admission awaits before invoking the turn, in software-dev and agent-turn-lease. Test: workflow-review-regressions.
+WF-12	fixed	b59326b9,0cddcb35,ce7cd1a7	Human confirm layers republish status 'waiting' (patched) in software-dev, just-do and merge-only, so the confirmation cycle resets stale votes. Test: workflow-review-regressions.
+WF-13	fixed	a0ce3e3d,f6fd53fb	isTaskAlive treats only WorkflowNotFoundError or a non-RUNNING execution as dead; transport errors rethrow and retry. Test: coordinator-health.
+WF-14	fixed	28e64c0b,0cddcb35,ce7cd1a7	Child nags and Do/Responder rounds capped at three (patched), then park for human guidance; human or child progress resets. Test: workflow-review-regressions.
+WF-15	fixed	523cf570,18982c4f,ed0ad74f	Managed workers get a 45-minute shutdown grace, retired runs drain in background; failed install no longer triggers a rollback roll. Tests: worker-refresh, worker-manager-shutdown.
+WF-16	fixed	bd7e080e,0cddcb35,ce7cd1a7	accountPoolSize no longer caught to 0 (patched) and is re-read before each agent turn. Test: workflow-review-regressions.
+WF-17	fixed	0f34ecc6,be3e5cee,cc4c1a51,32b989c4	Child delegation attenuated against the parent's current stored grant (plus approved extensions, live Avatar), not start-time grant. Tests: role-defaults, payments.
+WF-18	fixed	6042a486	Credential order returns passthrough [] when the org has no keys but the funded managed rail is eligible (shared check). Test: agent-admission.
+WF-19	fixed	30dbc6b3	In-process WorkerManager now gets terminateOnWorkerFailure (SIGTERM for supervisor restart), same as process mode. Test: worker-failure.
+WF-20	fixed	18982c4f	restore() stages manifests/bundle maps and registers only after worker refresh succeeds; boot awaits the bundle instead of swallowing. Test: workflow-manager-restore.
+WF-21	fixed	756226aa,73f7fd32	REGRESSION? Identity checked via /proc before SIGKILL; on non-Linux a live recorded server is unverifiable, so wedged-server replacement and reset throw (dev-server.ts:201-205). Tests: temporal-server-identity, reset-process.
+WF-22	fixed	7e6c38e2,775220e3	Grant racing cancellation is returned (software-dev, patched); lease path returns via finally; no double inUse decrement. Tests: workflow-review-regressions, coordinator-history.
+WF-23	fixed	775220e3	Account coordinator (policy v2) ignores retried lease requests already in the grant ledger. Test: coordinator-history.
+WF-24	fixed	45a30502	Merge queue continues-as-new at safe boundaries even with a live holder or queued work, carrying current and queue. Tests: coordinator-history, coordinator-health.
+WF-25	open	-	budget.ts unchanged and still registered though unused. #372 report says skipped to preserve historical balances; no commit explains it.
+WF-26	fixed	dce64c20	runScript heartbeats every 10s through world open and command; script-exec (patched) sets a 1-minute heartbeat timeout. Test: script-heartbeat.
+WF-27	open	-	saveView still has no ordering/sequence guard (db.ts:3710). #372 report defers it pending a run-distinguishing fence; no commit.
+WF-28	open	-	No change: hosted activity cap was already 1000 at base; WFT 8 and workflow cache 20 unchanged (env-configurable). #372 skipped it; no commit.
+WF-29	fixed	6955460b,9a6e7bdf,22ce3c1e,f3b441bf	Declared resolve rules run in a vm Script with 25 ms timeout, input capped at 64 KiB head+tail, max 500 rules. Test: roles.

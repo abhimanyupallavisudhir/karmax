@@ -1,0 +1,68 @@
+WD-1	fixed	d654ec2a,993579b5,3241b44b	Three-state matches(); reaper destroys only on ===false; KWR2 vault-stored random key with key id; boot warning. Tests: world-reference, world-hibernation, e2b-world, daytona-world.
+WD-2	partial	2231e66c	Per-candidate catch and control-plane destroy fixed (world-hibernation test). A parked world whose checkpoint keeps failing is still reopened (E2B resume) every sweep, no backoff.
+WD-7	fixed	2231e66c	Hibernation and teardown run under registry withoutRecovery(), so sweep open failures never restore or acquire leases. Test: world-hibernation 'never invokes recovery (WD-7)'.
+WD-3	fixed	7022d0a8	E2B/Daytona world destroy() and provider destroy evict sandbox and state caches; tombstone makes status missing. Tests: e2b-world, daytona-world (WD-3, PS-10).
+WD-4	fixed	87c5c0a6,fa96163f,f6ff0217	Keeps two newest plus pinned checkpoints, durable object GC from sweep; reads batched in-sandbox, 32/128 MiB caps; bounded gunzip on restore. Test: checkpoint (WD-4).
+WD-5	fixed	506c0ca7	Cloud provisioning ignores gitCredentials.sshKey; writes only repository keys lacking a token, and prefers repo-scoped tokens. Test: provision-git (WD-5).
+WD-6	fixed	0d550383,edd3f10a,84ab60ac,23232983	Git image, git-common-dir and worktree mounted at real paths; native agents run inside container via isRemoteAgentWorld. Tests: container-unit, mcp-connections (fake Docker; real-Docker test skipped).
+WD-8	fixed	d654ec2a	Message regexes replaced by isMissingSandbox (HTTP 404 status or typed SDK error); ENOTFOUND/proxy text no longer means missing. Tests: e2b-world, daytona-world (WD-8).
+WD-9	fixed	9f26778c	Hosted default 1 GiB bundle cap before reading, statfs disk headroom check, activity cancellation per chunk, partial file removed. Test: git-transfer (WD-9).
+WD-10	fixed	c4691933,ca711eec	Shared scan: 128-path batches, -z NUL paths, literal pathspecs, non-0/1 grep exit throws; killed git maps to 128. Test: conflict-markers (WD-10).
+WD-11	partial	e666a456,87faf08b,71f3a133	Restore now uses recorded branch, directory, localPath, authority, identity (checkpoint, e2b-world tests). Fork world repos/authority/identity still come from fork args/project defaults; only siblings recreated.
+WD-12	fixed	e27cd55f	Restore releases the vanished generation's owned lease before acquiring replacement capacity. Test: checkpoint (asserts one active lease after restore).
+WD-13	fixed	eaab8645	EnvironmentWorld forwards addCheckout when the inner world supports it. Test: resources 'forwards addCheckout through environment wrappers (WD-13)'.
+WD-14	fixed	340ac6bc	Failed teardown marks teardownPending; lifecycle sweep retries control-plane destroy after task terminates and leases/access end, without recovery. Tests: world-teardown, world-hibernation (WD-14).
+WD-15	fixed	4b08df80	Hosted Daytona apiUrl must be https://app.daytona.io/api, checked on save and on resolve of stored connections. Test: provider-connections (WD-15).
+WD-16	fixed	51deb83d	Daytona exec rethrows SDK errors lacking an integer exitCode instead of returning exit 1. Test: daytona-world (WD-16).
+WD-17	partial	6135ce3f,560118b9	Broker clones now single-branch and publishes run 3-way concurrent (git-broker test), but every publish/merge/refresh still does a fresh clone; mirror cache deferred.
+WD-18	fixed	f8d43035,84ab60ac	Event scan resumes from durable cursor minus one hour, stops at cursor page, full feed only daily; cursor not advanced on failure. Tests: e2b-world, runner-pools (WD-18).
+WD-19	fixed	f6ff0217,b2eeb6b2,84ab60ac	Checkpoint reads batch up to 128 files/4 MiB per sandbox exec; prepare reuses secret digest cache so unchanged files aren't rewritten. Tests: checkpoint, resource-secret-refresh (WD-19).
+WD-20	fixed	3a6046ed,2fd0219e,48099edf	buildReview caps changedFiles (1000 entries/64 KiB) for repo and listFiles worlds, reporting total and truncation. Tests: world, activity-review-bounds (WD-20).
+WD-21	fixed	0d550383	Container exec/process/PTY pass only env names as -e; values travel in the docker child environment. Test: container-unit (fake Docker).
+WD-22	fixed	99bdd78c,ca711eec	Materialized tenant credentials reset inherited credential.helper (isolated env already did), so operator store/keychain helpers neither answer nor save. Test: git-credential (WD-22).
+WD-23	fixed	af276530	landLocalBranch worktree add/remove now run under withWorktreeLock (finalizeMergeRepo stays outside to avoid nesting). Test: git-broker 'locks local landing (WD-23)'.
+WD-24	fixed	58db54ab	brokerEnrollRepository rejects names outside ^[A-Za-z0-9][A-Za-z0-9._-]*$ before any world command. Test: git-broker (WD-24, five unsafe names).
+WD-25	fixed	e666a456	Restore deletions use rm -f -- and fail on nonzero exit (fork path already did). Covered by checkpoint tests.
+WD-26	fixed	4cea557a	Wiki-role finalizeMergeRepo (local and broker landings) runs in the canonical wiki lane, now a cross-process directory lock. Test: merge (WD-26, separate-process race).
+WD-27	partial	ca711eec	Host git helper (worktree worlds, merges) adds core.quotePath=false. buildReview in container/E2B/Daytona worlds still runs in-world git diff/ls-files without it (core.ts:2926-2927).
+WD-28	fixed	af88a11f,be0a7d5a	Local commands, processes, PTYs and memory/worktree exec use scrubbedEnv plus explicit task values instead of process.env. Test: local-execution-env (WD-28).
+WD-29	fixed	6010910f	Worktree core.excludesFile now points to a combined file: inherited global/XDG ignore plus secret rules, with legacy layout migration. Test: resources (WD-29, three sources).
+WD-30a	open	-	No commit addresses the unnamed stale docs/comments; e.g. e2b.ts:131 still says hosted must set KARMAX_WORLD_REF_KEY, though new refs use the vault key.
+WD-30b	fixed	9800d825	E2B/Daytona reference resolution no longer falls back to handle.meta.sandboxId; only sealed KWR1/KWR2 refs. Tests: e2b-world, daytona-world (WD-30).
+AU-1	fixed	0ddcb34c,b18fb1cf,6075fd2f,155f19ae	Pull ingest passes onlyFor=polling org; full-address owner index, first-owner-wins; AgentMail key must list inbox; routes deleted on disconnect/org delete. Tests: agent-mail, mail-pull, autonomy-cleanup, gateway.
+AU-2	fixed	dc85e56a	Callback requires a signed-in session and consumes OAuth state only for its initiating userId; UNIQUE(provider, accountId) already existed at base. Test: stripe-payments.
+AU-3	fixed	e39c8a47	/api/vault/fill accepts only login items with explicit domains and username/password/totp fields; fillViaCdp, fillInWorld and cdp-fill require domains. Tests: vault-selection-gateway, world-fill.
+AU-4	fixed	28328aed	claimFill: authorized/settled request must be unexpired and under 30 min old, at most three attempts; merchant must be https registrable domain (tldts, private suffixes rejected). Test: payments.
+AU-5	fixed	9f77c3d5	Vault migrates to per-handle encrypted entry files (no full parse/rewrite); secrets and items capped at 64 KiB, 1000 items per org. Tests: shared-vault, vault-items.
+AU-6	fixed	4a9e2008	Bodies truncated to 16 KiB, stored inbox trimmed to 1 MiB, IMAP batches 50 msgs/64 KiB, AgentMail responses 2 MiB; >8 MiB legacy inbox errors instead of OOM. Test: agent-mail (AU-6).
+AU-7	fixed	0f34ecc6,be3e5cee,04a346c5,32b989c4	Cards require allows(scoped, use-card:<id>) (no capability = no cards), intersected with live and ancestor grants; spend/fill route through cards(). Tests: payments, role-defaults (AU-7).
+AU-9	fixed	0f34ecc6,be3e5cee,32b989c4	Spend counts the whole task family (parentTaskId and agent-created) against min of ancestor budgets and card selections. Test: payments 'shares a parent budget (AU-9)'.
+AU-8	fixed	7d8afb67	Leased key (already checked to be this org's credential) resolves with use-credential:<handle> instead of task caps. Test: agent-secret-env.
+AU-10	fixed	841e09d7,ae56c326	expirePaymentSpendRequests now expires authorizing as well as authorized rows, audited once; immediate-rail debit+settle is one transaction rolled back past deadline. Test: payments (AU-10).
+AU-11	fixed	23232983,7bfddd6c,c8d2c5b2,32b989c4	Card fill routing now uses isRemoteAgentWorld, the same predicate as agent/MCP placement, so container fills hit the in-container browser. Test: agent-card-fill (both paths).
+AU-12	partial	c56ccbce,5ecbf344	Sessions owner-bound, signCount persisted (passkey, vault-selection-gateway tests). Hosted/remote passkeys now refused (fail closed); no remote passkey transport, so still unusable hosted.
+AU-13	fixed	405d8408	envFor skips env/api-key/ssh-key items created by another task unless the caller holds use-credential:item:<id>; wildcard grants no longer suffice. Test: vault-items (AU-13).
+AU-14	partial	fab585f9	Blind-use tooltip and comments corrected (vault-use-policy-ui test). Gateway still uses the agent-supplied cdpUrl for local fills/passkeys (server.ts:8489, 6666), only loopback-checked, not task-bound.
+AU-15	fixed	155f19ae,40baa240	Org delete runs deleteOrganizationAutonomy first: vault items and key dirs, card PAN/CVC handles, connector secrets/caches, mailbox secrets, inbox kv and routes. Tests: autonomy-cleanup, subscription-billing.
+AU-16	fixed	3d85d220,af2398f6,4a9e2008	REGRESSION? mail-pull.ts:124 first poll fetches oldest 50 UIDs per 30s poll, so new mail waits until big mailboxes' history drains. Hosted IMAP/pass-git private hosts blocked; timeouts added.
+AU-17	fixed	c261f382	Reveal validates field before consuming; fill checks access without consuming, consumes only inside resolveText for secret fields after target preflight; username fills never consume. Tests: world-fill, vault-selection-gateway.
+AU-18	fixed	4b77fb64	Name uniqueness and balance checked before Stripe create; card created inactive, activated after persistence, canceled on later failure. Test: stripe-payments.
+AU-19	fixed	3b0b8a5b	platform_request added to SECRET_TOOL_NAMES, so archived activity keeps the tool entry but drops its arguments and results. Test: agent-activity.
+AU-20	fixed	c5e4449c	Local launchers take an exclusive per-port lock and refuse unowned CDP endpoints; --remote-allow-origins=* removed; launcher-created profiles deleted on exit. Test: chrome-cdp-launcher.
+AU-21	fixed	2c952a8c	envFor now runs for remote worlds; ssh-key items are written 0600 under .karmax-injection inside the receiving world. Tests: agent-secret-env, vault-items.
+AU-22	fixed	c442be32,25995ba0	Vault keeps five prior encrypted values per handle (deleted with it); blank manual standalone notes rejected, connector snapshots may still clear notes. Tests: shared-vault, vault-items, connectors.
+AU-23	fixed	adcb1871	providers GET returns webhook URL/secret and worker script only when the token holds credential:write; readers see providers only. Test: vault-selection-gateway.
+AU-24	fixed	04b20bcb	Fixed under PS-11: broker audit log is now a 1000-entry ring instead of an unbounded array (still in-memory only). Test: credential-broker-retention.
+AU-25	deferred	-	Skipped as optional LOW (#368 report). resolveField still rewrites the whole vault:items:<org> kv blob on every access to bump usage (vault-items.ts:594).
+AU-26	deferred	-	Skipped as optional LOW (#368). findPaymentAuthorization still matches merchants by two-way substring includes (db.ts:7178).
+AU-27	deferred	-	Skipped as optional LOW (#368). Vault AES-GCM still has no AAD binding ciphertext to handle and no key canary (vault.ts:90-105).
+AU-28	deferred	-	Skipped as optional LOW (#368). VaultItems.list and AgentMail.all still return [] on unparseable kv, so the next write overwrites it (vault-items.ts:238).
+AU-29	deferred	-	Skipped as optional LOW (#368). 1Password write-back still passes the secret in argv (op item edit ... password=<value>, connectors.ts:310).
+AU-30	deferred	-	Skipped as optional LOW (#368). SMTP transport on port 587 still sets no requireTLS, so STARTTLS stripping can downgrade to plaintext (email.ts:193).
+AU-31	deferred	-	Skipped as optional LOW (#368). VaultCardProvider still stores the CVC with the PAN in the vault card secret (payments.ts:267, 281).
+AU-32	deferred	-	Skipped as optional LOW (#368). fill_payment_card still takes agent-supplied cdp_url (loopback-checked only), not pinned to the task's own browser (core.ts:2730).
+AU-33	deferred	-	Skipped as optional LOW (#368). Materialized vault/git-profile key files still persist on host until item or org deletion (vault-items.ts:764, git-profiles.ts:477).
+AU-34	deferred	-	Skipped as optional LOW (#368). GIT_SSH_COMMAND still interpolates key/known_hosts paths unquoted (git-profiles.ts:362, git-credential.ts:36).
+AU-35	deferred	-	Skipped as optional LOW (#368). BudgetService.approve never checks task status, and cancellation doesn't retire pending spend requests (payments.ts:1120).
+AU-36	deferred	-	Skipped as optional LOW (#368). PaymentPolicy.budget is still a bare number; spend across cards of different currencies is summed without currency (payments.ts:1200).
+AU-37	deferred	-	Skipped as optional LOW (#368); gaps unnamed. AU-1..23 fixes added regression tests, but no commit targets AU-37 itself.

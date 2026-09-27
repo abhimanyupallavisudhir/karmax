@@ -1,0 +1,62 @@
+GH-1	fixed	fc728108	States carry purpose; manifest callback requires purpose=manifest and !configured(); creation route needs settings:write. Test tests/github-callback-authority.test.ts.
+GH-2	fixed	fc728108	Callback links via connectExistingInstallation (admin check); unverified POST git-connections deleted; self-hosted no-OAuth keeps old path. Test github-callback-authority.test.ts.
+GH-3	fixed	ee607068	Recovery requires workflow_run event=push and head_repository.id==repository.id, matched by providerId; check_run fallback removed. Test tests/github-app.test.ts.
+GH-4	fixed	0fa281b2	upsertRepository matches providerId first; archived known repos kept. Edge: rename plus same-name recreate in one reconcile can still merge rows. Test github-app.test.ts.
+GH-5	partial	4d60ce05	Failed GET preflights now release lock (paddle-billing.test.ts). Transient 5xx/network failure on POST/PATCH still locks forever: reconcilePending returns pending when write absent.
+GH-6	fixed	c02b0a31	Requires head.repo.id==repository.id, OWNER/MEMBER/COLLABORATOR reviewers, and repo attached to task project. Tests github-pr.test.ts, github-app.test.ts.
+GH-7	fixed	a9b1ba4e	Events for other customer subscriptions ignored; checkout.completed must match recorded checkout; checkouts serialized, open Stripe sessions resumed or expired. Test subscription-billing.test.ts.
+GH-8	fixed	d844a165,bb74c48d,9db5cc1a	Signed deliveries persisted in kv inbox with leases and backoff (max 1h), swept periodically. No attempt cap: poison deliveries retry forever. Test github-app.test.ts.
+GH-9	fixed	c1a6a193	Monitoring opt-in per repository via github-deployment-monitor settings; fork runs ignored; unreadable file/API errors defer instead of reporting. Test github-deployment-monitor.test.ts.
+GH-10	fixed	f9934df4	Merged PR reused only when compare ahead_by==0; closed-PR reopen 422 creates replacement; merged PR with different reviewed head needs revision. Test github-pr.test.ts.
+GH-11	fixed	50133de9,dfc85451	Task-facing tokens (broker credentials, PR API, Actions, githubTokenFor) minted with repository_ids; internal reconcile/file reads stay installation-wide. Test github-app.test.ts.
+GH-12	fixed	e7dfd71b,f02262a7	Observations moved to github_pr_observations table with createdAt index, 30-day bounded purge, legacy kv keys removed; kv prefix scans use ranges (PS-8). Tests store/postgres.test.ts.
+GH-13	fixed	2bfc1051,6bd9da2e	Catalogue history kept in kv (snapshotted on use and before settings replacement); mapSubscription matches retired price ids. Test subscription-billing.test.ts.
+GH-14	fixed	131310c0	prBody truncated to 65536 bytes keeping provenance; missing summary no longer falls back to raw messages (patch-gated). Tests github-pr.test.ts, stage-transitions.test.ts.
+GH-15	fixed	efeec264	isReviewRequestEvent excludes github.* event types. Test inbox.test.ts.
+GH-16	fixed	f230b664	Humans pass explicit taskId; same project/task capability checks via require(); agents still bound to own task. Test github-actions-platform.test.ts.
+GH-17	fixed	94180f6f	Errors include scrubbed, bounded GitHub message; 403/429 retried up to 3 times honoring retry-after/ratelimit-reset. Test github-actions.test.ts.
+GH-18	fixed	b4dcecb5	repositorySlug() validates owner/name (rejects path/query syntax, dot segments) before every REST/GraphQL use. Test github-pr.test.ts.
+GH-19	fixed	d662947f	Success URL carried in checkout link; same-origin redirect after completion; dedicated strict CSP for paddle-checkout.html. Tests paddle-checkout.browser.test.ts, paddle-billing.test.ts.
+GH-20	fixed	6e06a714	Omitted legal, contact, launch, founder-review and Stripe catalogue fields keep current values; explicit clearing still works. Test paid-launch-settings.test.ts.
+GH-21	fixed	5aebcbb0	409 guard on deleting the last connection removed; ownership check kept. Test github-shared-installation.test.ts.
+GH-22	fixed	50133de9,dfc85451	installation.new_permissions_accepted clears all cached and in-flight scoped tokens for the connection. Test github-app.test.ts.
+GH-23	fixed	45dec845	Task read, PR view reconcile/saveView and observation claim now run in one store transaction. Test github-app.test.ts.
+GH-24	fixed	6564c6ab	/app and installation reads cached 60s and shared in flight; cleared on configure and installation events; explicit refresh bypasses. Test github-app.test.ts.
+GH-25	fixed	a1f09fb9	reconcileEntitlements catches per-account errors, continues, then throws AggregateError. Test subscription-billing.test.ts.
+DB-1	fixed	bfab6185	Outer transaction removed from exportUserData; its reads run without the global advisory lock. Test tests/store.test.ts.
+DB-2	partial	bd266353,0b9912fd	retentionSweep prunes superseded snapshots of done/cancelled tasks only; failed tasks never pruned, live tasks still grow until settled. Test view-publication.test.ts.
+DB-3	fixed	20f60695,0b9912fd	retentionSweep deletes events >90 days (keeps unresolved approval requests) and audit_log >365 days, 10k-row indexed batches. Tests store.test.ts, postgres.test.ts.
+DB-4	fixed	6facfdc2	tasks.completedAt set on first done view event, indexed; Insights queries it. Backfill fallback uses lastView.updatedAt (historyLength). Tests insights.test.ts, postgres.test.ts.
+DB-5	fixed	ddb2ddba,b16ad5c7	idx_events_type(type,taskId) added on SQLite and PostgreSQL; boot-time pruneStaleInbox moved to post-readiness hourly job. Tests store.test.ts, postgres.test.ts.
+DB-6	fixed	00ba6094,0b9912fd	principal/organizationId columns plus scoped_token_projects table, indexed and backfilled; revocation and deprovision use indexed UPDATEs. Tests store.test.ts, postgres.test.ts.
+DB-7	fixed	7cec0b53,00ba6094	attachTags reuses one per-batch audienceReader for reviewer audiences instead of per-task reviewAudience reads. Tests store.test.ts, task-read-model.test.ts.
+DB-8	fixed	4012eb4d	deleteProject now deletes usage_admissions rows for the project. Tests store.test.ts, postgres.test.ts.
+DB-9	fixed	b818381e,756226aa,73f7fd32	reset.ts stops Temporal via stopRecordedDevServer: verifies /proc cmdline, start tick and unit before SIGKILL, else refuses. Tests reset-process, temporal-server-identity.
+DB-10	deferred	f646acbe,c7bbd52b	Signing c7bbd52b reverted by f646acbe: it made all existing unsigned v1 backups unrestorable. Manifest still unsigned; needs audited v1-restore path first.
+DB-11	fixed	e0d8cc06	Synthetic inbox eventSeq now a negative counter allocated in kv inside the transaction, no hash collisions. Tests collaboration.test.ts, postgres.test.ts.
+DB-12	fixed	658435d7	deleteTeam walks parsed settings/params/lastView JSON for exact selector strings; substring fallback only for malformed JSON. Tests collaboration.test.ts, postgres.test.ts.
+DB-13	fixed	6e0a9763,7651615a	Draft COALESCE translated to jsonb scalar comparison (null/false/0 -> 0) without integer cast. Tests postgres-sql.test.ts, postgres.test.ts.
+DB-14	fixed	6e0a9763	json_remove translation handles any number of paths, including nested keys, via chained #- operators. Tests postgres-sql.test.ts, postgres.test.ts.
+DB-15	open	-	Every Store transaction still takes global pg_advisory_xact_lock(1262572115) at sql.ts:130; per-organization lock key not implemented (long-term item).
+PS-1	fixed	8ee01438,a3fda167	REGRESSION? reconcile.ts:128,133 save conversation-less candidate views; saveView (db.ts:3742) then writes conversation='{}', erasing settled tasks' transcripts. Tests phase-e, mcp.
+PS-2	fixed	1d1d71c5,149db93a,4ad95aaa,aa0c458c	Externals restored before first worker; one boot build overlapped with DB/Temporal start; content-validated disk cache; replay reuses worker bundle. Test workflow-bundle-cache.test.ts.
+PS-3	partial	bd266353,0b9912fd,ae29e50e	REGRESSION? db.ts:7463 compares lastView.updatedAt (historyLength, software-dev.ts:1070) to ms cutoff: 7-day window void. Failed tasks' snapshots/fences never pruned.
+PS-4	fixed	20f60695,0b9912fd	Successful GET/HEAD no longer audited; events 90-day and audit_log 365-day batched retention; SQLite synchronous=NORMAL. Tests gateway-scope.test.ts, store.test.ts, postgres.test.ts.
+PS-5	partial	b16ad5c7,f6c09019,ddb2ddba,0b9912fd	migrateData gated by kv marker, inbox pruning after readiness, events(type,taskId) index. migrate() still runs ungated full scans each boot (db.ts:931 usage_events, 966-975 task intents).
+PS-6	fixed	808dbd05	Docker sweep, retention, coordinator heal, reconcile, trigger start and remote probes run as bounded post-readiness jobs, drained on shutdown. Tests boot-readiness.test.ts, coordinator-health.test.ts.
+PS-7	fixed	d3769634,eb5a33b4	Startup wiki repair detached from listen() and drained on close; async git init; 30s AbortSignal timeouts on GitHub fetches. Tests gateway-wiki-startup.test.ts, github-app.test.ts.
+PS-8	partial	f02262a7,0b9912fd	kvEntries now indexed range scans (C collation on PostgreSQL). Task-delete prefix deletes still use unindexable substr(k,1,length(?)) (db.ts:5090,5106), as does clearTurnCheckpoints (7587).
+PS-9	fixed	f6476543,76397541	TokenAuthority map used only without a store; identity token cache evicts by expiry and size cap, revoking evicted tokens. Tests durable-tokens, gateway-identity-tokens.
+PS-10	fixed	7022d0a8	E2B and Daytona worlds delete sandbox/state map entries on destroy; WeakSet tombstones keep missing status. Tests e2b-world.test.ts, daytona-world.test.ts.
+PS-11	fixed	04b20bcb	CredentialBroker.auditLog is a 1000-entry ring buffer; readers get chronological order. Test credential-broker-retention.test.ts.
+PS-12	fixed	b89b133a	socketLifetime registers close/error cleanup before awaits for event, review and preview sockets; late acquisitions released immediately. Test gateway-socket-lifecycle.test.ts.
+PS-13a	fixed	fcc45f77	Collaboration routing uses complete view.updated payloads; getTask only for incomplete historical payloads. Test collaboration-requests.test.ts.
+PS-13b	fixed	fcc45f77	Restart check uses indexed hasMergedTaskEvent EXISTS query instead of loading all task events. Tests store.test.ts, postgres.test.ts.
+PS-13c	fixed	0317b03c	Delivery reads compact taskHeaders and identity.userById instead of getTask plus listUsers. Tests collaboration.test.ts, identity-lookup.test.ts.
+PS-13d	fixed	15eb3229	Fixed under LT-15: per-socket per-task visibility decisions cached up to 60s/token expiry instead of re-verifying token per event.
+PS-14a	fixed	130787db,a8b80f38	Codex app-server and exec stderr kept as bounded UTF-8 tail (64 KiB at HEAD); failures include recent tail. Test codex-exec.test.ts.
+PS-14b	fixed	0bbef93a	Runner probedAt entries pruned after two reconcile windows (min 60s). Test runner-pools.test.ts.
+PS-14c	open	-	terminalTickets still swept only when a new ticket is minted (server.ts:4933); expired unused tickets linger until next mint. No commit addressed it.
+PS-14d	fixed	807ede96	Fixed under GW-10: legacy sessions map expires entries and caps at 128, revoking evicted tokens. Test gateway-legacy-sessions.test.ts.
+PS-15a	fixed	b400f5ba	Health watcher keeps one gRPC connection per probe; connections completing after stop are closed. Test dev-server-health.test.ts.
+PS-15b	fixed	b400f5ba	refreshManagedMcp rewrites managed config files only when contents differ. Test config-home-publication.test.ts.

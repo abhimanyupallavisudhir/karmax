@@ -1,0 +1,769 @@
+[
+ {
+  "id": "GH-1",
+  "section": "GH",
+  "finding": "GH-1 **[fixed fc728108]** CRIT security server.ts ~L1580-1597 /api/github/manifest/callback/:state \u2014 any tenant can replace installation-wide GitHub App: states have no purpose; callback converts manifest and configure() without settings:write or !configured(). Fix purpose column + require !configured() + settings:write. Test like tests/github-shared-installation.test.ts.",
+  "commits": []
+ },
+ {
+  "id": "GH-2",
+  "section": "GH",
+  "finding": "GH-2 **[fixed fc728108]** CRIT security server.ts ~L1633 /api/github/callback + ~L2620 POST /api/organizations/:org/git-connections \u2014 installation_id trusted; connectInstallation (github-app.ts:878) links any installation of the public App into caller org (repos, broker pushes w/ workflows write \u2192 Actions secrets). Fix route via connectExistingInstallation (connectableInstallations check); delete POST route; tests/github-shared-installation.test.ts:94-110 asserts insecure behavior.",
+  "commits": []
+ },
+ {
+  "id": "GH-3",
+  "section": "GH",
+  "finding": "GH-3 HIGH security/cost github-app.ts:1048-1088 failedDefaultBranchWorkflowEvents; server.ts ~923 dispatchGithubRecoveryEvents \u2014 recovery agent tasks created for fork PR runs (head_branch==default), check_run fallback; prompt embeds attacker workflow name. Fix event==='push' && head_repository.id===repo id; drop check_run fallback.",
+  "commits": [
+   {
+    "sha": "ee607068",
+    "subject": "Require trusted push provenance for recovery tasks",
+    "body": "Fix GH-3: reject fork and PR workflow runs and remove the ambiguous check_run recovery fallback before creating billable work."
+   }
+  ]
+ },
+ {
+  "id": "GH-4",
+  "section": "GH",
+  "finding": "GH-4 HIGH correctness github-app.ts:892-923 reconcile; db.ts:2712 upsertRepository \u2014 repo rename/archive deletes repository + project links (keyed by owner/name not providerId).",
+  "commits": [
+   {
+    "sha": "0fa281b2",
+    "subject": "Preserve repository identity during reconciliation",
+    "body": "Fix GH-4: match provider IDs before mutable slugs and retain existing archived repositories so task and project links survive renames and archival."
+   }
+  ]
+ },
+ {
+  "id": "GH-5",
+  "section": "GH",
+  "finding": "GH-5 HIGH correctness subscriptions.ts:735 idempotent, :477-487 reconcilePending; paddle.ts:207 \u2014 transient Paddle failure permanently locks org billing.",
+  "commits": [
+   {
+    "sha": "4d60ce05",
+    "subject": "Release billing locks after failed Paddle preflight reads",
+    "body": "Fix GH-5 for transient read failures: no financial mutation occurred, so the same request can safely retry. Preserve reconciliation for ambiguous writes to avoid duplicate charges."
+   }
+  ]
+ },
+ {
+  "id": "GH-6",
+  "section": "GH",
+  "finding": "GH-6 MED security github-pr.ts:702-745; github-app.ts:1015 \u2014 PR/check/review events routed by karmax/<taskId> branch name from forks; fake approvals. Fix head.repo.id===repo id; author_association.",
+  "commits": [
+   {
+    "sha": "c02b0a31",
+    "subject": "Verify repository provenance before routing GitHub task events",
+    "body": "Fix GH-6: reject fork heads and untrusted reviewers and require an attachment in the named task project. Branch names alone do not authorize task events."
+   }
+  ]
+ },
+ {
+  "id": "GH-7",
+  "section": "GH",
+  "finding": "GH-7 MED subscriptions.ts:547-586, 365-412 \u2014 Stripe: events for any subscription of customer overwrite account; double checkout.",
+  "commits": [
+   {
+    "sha": "a9b1ba4e",
+    "subject": "Keep Stripe events and checkouts bound to one subscription",
+    "body": "Fix GH-7: ignore unrelated customer subscriptions, verify checkout association, serialize checkout creation and resume or expire pending Stripe sessions before making replacements."
+   }
+  ]
+ },
+ {
+  "id": "GH-8",
+  "section": "GH",
+  "finding": "GH-8 MED github-app.ts:284-303 \u2014 assumes GitHub redelivers failed webhooks (it doesn't).",
+  "commits": [
+   {
+    "sha": "9db5cc1a",
+    "subject": "Preserve webhook recovery counts through durable delivery",
+    "body": "Fix GH-8 CI regression: keep recovery and vault-sync counts in the HTTP response while retaining inbox retries. Update the gateway fake to the typed deliverWebhook callback contract so signature errors and recovery idempotency exercise the current entry point."
+   },
+   {
+    "sha": "bb74c48d",
+    "subject": "Retry ready webhooks past deferred inbox entries",
+    "body": "Fix GH-8 backlog handling: bound attempted deliveries instead of the first sorted rows, so delayed or leased entries cannot starve ready retries."
+   },
+   {
+    "sha": "d844a165",
+    "subject": "Persist failed webhooks for local retry",
+    "body": "Fix GH-8: retain signed deliveries and downstream results in a durable inbox with leases and bounded backoff. Sweep it on gateway startup and periodically rather than assuming GitHub redelivers failures."
+   }
+  ]
+ },
+ {
+  "id": "GH-9",
+  "section": "GH",
+  "finding": "GH-9 MED github-deployment-monitor.ts \u2014 hard-coded CI\u2192Deploy convention for every tenant; errors reported as incidents.",
+  "commits": [
+   {
+    "sha": "c1a6a193",
+    "subject": "Require explicit deployment monitoring and defer uncertain incidents",
+    "body": "Fix GH-9: configure source workflow, deployment workflow and file per repository through organization github-deployment-monitor settings. Ignore fork observations and retain expectations during API outages instead of creating recovery work."
+   }
+  ]
+ },
+ {
+  "id": "GH-10",
+  "section": "GH",
+  "finding": "GH-10 MED github-pr.ts:255-279; core.ts:3844 \u2014 reuses merged PR even when branch has new commits; reopen after force-push 422.",
+  "commits": [
+   {
+    "sha": "f9934df4",
+    "subject": "Open new pull requests for work after a prior merge",
+    "body": "Fix GH-10: compare merged heads with the target, replace closed PRs GitHub cannot reopen, and refuse to settle a merged PR with a different reviewed head."
+   }
+  ]
+ },
+ {
+  "id": "GH-11",
+  "section": "GH",
+  "finding": "GH-11 MED #13 blast radius full installation token.",
+  "commits": [
+   {
+    "sha": "dfc85451",
+    "subject": "Initialize scoped token promises before observing completion",
+    "body": "Fix GH-11 and GH-22 typechecking while preserving invalidation-safe cache writes and shared in-flight mints."
+   },
+   {
+    "sha": "50133de9",
+    "subject": "Scope task GitHub tokens to individual repositories",
+    "body": "Fix GH-11 and GH-22: include repository_ids for Git, PR and Actions operations, isolate cached scopes, and discard all scoped tokens when installation permissions change."
+   }
+  ]
+ },
+ {
+  "id": "GH-12",
+  "section": "GH",
+  "finding": "GH-12 MED perf kv github:pr-observation:* unbounded; kvEntries LIKE can't use index.",
+  "commits": [
+   {
+    "sha": "e7dfd71b",
+    "subject": "Expire GitHub PR observation deduplication rows",
+    "body": "GH-12: Store observation digests with an indexed creation time instead of unbounded kv keys. Retention deletes 10k expired observations per sweep after 30 days; one-time migration removes legacy v1 keys. A 30-day window exceeds webhook delivery deduplication and bounds steady-state storage. Cover SQLite and PostgreSQL."
+   }
+  ]
+ },
+ {
+  "id": "GH-13",
+  "section": "GH",
+  "finding": "GH-13 MED subscriptions.ts:658 mapSubscription \u2014 only current price ids recognized; price change drops webhooks.",
+  "commits": [
+   {
+    "sha": "6bd9da2e",
+    "subject": "Accept the billing catalogue store interface",
+    "body": "Fix GH-13 typechecking with the settings service store abstraction while retaining the database transaction boundary."
+   },
+   {
+    "sha": "2bfc1051",
+    "subject": "Retain historical subscription price mappings",
+    "body": "Fix GH-13: snapshot configured catalogues before replacement and retain verified price-to-plan mappings for delayed and grandfathered subscription events."
+   }
+  ]
+ },
+ {
+  "id": "GH-14",
+  "section": "GH",
+  "finding": "GH-14 MED core.ts:282 prBody no length limit (>65536 \u2192 422); fallback publishes raw user prompts.",
+  "commits": [
+   {
+    "sha": "131310c0",
+    "subject": "Bound public PR descriptions and omit conversation fallback",
+    "body": "Fix GH-14: retain provenance within GitHub\u2019s body limit and stop publishing raw messages when no summary exists. Gate workflow argument changes with a patch marker for replay compatibility."
+   }
+  ]
+ },
+ {
+  "id": "GH-15",
+  "section": "GH",
+  "finding": "GH-15 LOW db.ts:132 isReviewRequestEvent matches github review_requested \u2192 inbox noise.",
+  "commits": [
+   {
+    "sha": "efeec264",
+    "subject": "Exclude GitHub review requests from the approval inbox",
+    "body": "Fix GH-15: repository reviewer notifications are timeline events, not Karmax Review gates."
+   }
+  ]
+ },
+ {
+  "id": "GH-16",
+  "section": "GH",
+  "finding": "GH-16 LOW principle api.ts:3905 GitHub Actions API task-agent tokens only; humans can't.",
+  "commits": [
+   {
+    "sha": "f230b664",
+    "subject": "Allow authorized humans to use task-scoped Actions APIs",
+    "body": "Fix GH-16: accept an explicit taskId for human requests and apply the same project, repository and capability checks as task agents. Agents remain bound to their own task."
+   }
+  ]
+ },
+ {
+  "id": "GH-17",
+  "section": "GH",
+  "finding": "GH-17 LOW github-actions.ts:416 errors drop GitHub message; no rate-limit backoff.",
+  "commits": [
+   {
+    "sha": "94180f6f",
+    "subject": "Preserve safe Actions errors and back off rate limits",
+    "body": "Fix GH-17: retain bounded, scrubbed provider messages and retry explicitly rate-limited requests with bounded delays."
+   }
+  ]
+ },
+ {
+  "id": "GH-18",
+  "section": "GH",
+  "finding": "GH-18 LOW slug encoding.",
+  "commits": [
+   {
+    "sha": "b4dcecb5",
+    "subject": "Validate repository slugs before GitHub PR requests",
+    "body": "Fix GH-18: reject path, query and fragment syntax before interpolating repository identifiers into REST paths or GraphQL queries."
+   }
+  ]
+ },
+ {
+  "id": "GH-19",
+  "section": "GH",
+  "finding": "GH-19 LOW web/paddle-checkout.js success URL ignored; no CSP.",
+  "commits": [
+   {
+    "sha": "d662947f",
+    "subject": "Return Paddle checkout to the requested application page",
+    "body": "Fix GH-19: carry the success URL through new, resumed and reconciled checkouts, allow only same-origin browser redirects, and apply a dedicated checkout CSP."
+   }
+  ]
+ },
+ {
+  "id": "GH-20",
+  "section": "GH",
+  "finding": "GH-20 LOW launch/settings.ts:268 paid-launch PUT resets omitted fields.",
+  "commits": [
+   {
+    "sha": "6e06a714",
+    "subject": "Preserve omitted paid launch settings",
+    "body": "Fix GH-20: partial configuration updates retain legal, contact, launch and Stripe catalogue fields; explicit clearing still works."
+   }
+  ]
+ },
+ {
+  "id": "GH-21",
+  "section": "GH",
+  "finding": "GH-21 LOW can't delete last GitHub connection (409).",
+  "commits": [
+   {
+    "sha": "5aebcbb0",
+    "subject": "Allow disconnecting the last GitHub connection",
+    "body": "Fix GH-21: retain the repository-write check and tenant ownership check while allowing an organization to stop using GitHub entirely."
+   }
+  ]
+ },
+ {
+  "id": "GH-22",
+  "section": "GH",
+  "finding": "GH-22 LOW github-app.ts:972 new_permissions_accepted doesn't clear token cache.",
+  "commits": [
+   {
+    "sha": "dfc85451",
+    "subject": "Initialize scoped token promises before observing completion",
+    "body": "Fix GH-11 and GH-22 typechecking while preserving invalidation-safe cache writes and shared in-flight mints."
+   },
+   {
+    "sha": "50133de9",
+    "subject": "Scope task GitHub tokens to individual repositories",
+    "body": "Fix GH-11 and GH-22: include repository_ids for Git, PR and Actions operations, isolate cached scopes, and discard all scoped tokens when installation permissions change."
+   }
+  ]
+ },
+ {
+  "id": "GH-23",
+  "section": "GH",
+  "finding": "GH-23 LOW github-app.ts:1023 webhook view update not transactional.",
+  "commits": [
+   {
+    "sha": "45dec845",
+    "subject": "Reconcile webhook task views in one transaction",
+    "body": "Fix GH-23: serialize the task read, PR projection update and observation claim so concurrent task updates cannot interleave and failed writes roll back."
+   }
+  ]
+ },
+ {
+  "id": "GH-24",
+  "section": "GH",
+  "finding": "GH-24 LOW perf settings render signs JWTs + GitHub calls per connection.",
+  "commits": [
+   {
+    "sha": "6564c6ab",
+    "subject": "Cache short-lived GitHub permission observations",
+    "body": "Fix GH-24: share in-flight App and installation reads across settings renders for sixty seconds. Explicit refreshes and installation events invalidate observations; authorization and permission recovery retain live checks."
+   }
+  ]
+ },
+ {
+  "id": "GH-25",
+  "section": "GH",
+  "finding": "GH-25 LOW subscriptions.ts:359 reconcileEntitlements no per-row try/catch.",
+  "commits": [
+   {
+    "sha": "a1f09fb9",
+    "subject": "Continue entitlement reconciliation after individual failures",
+    "body": "Fix GH-25: attempt every organization and report aggregate failures afterwards so one invalid row does not stall all later tenants."
+   }
+  ]
+ },
+ {
+  "id": "DB-1",
+  "section": "DB",
+  "finding": "DB-1 HIGH perf/security db.ts:1890 exportUserData wraps whole export in transaction \u2192 on Postgres takes global advisory lock pg_advisory_xact_lock(1262572115) (sql.ts:130) \u2192 any user's GET /api/user/export stalls all tenants' writes. Fix: drop outer transaction (read-only). Quick.",
+  "commits": [
+   {
+    "sha": "bfab6185",
+    "subject": "Remove write transaction from personal data export",
+    "body": "DB-1: Personal export is read-only and can span many tasks; wrapping it in Store transaction takes the global Postgres advisory write lock and stalls unrelated tenants. Keep the individual reads and omit the outer transaction. Regression asserts the first export read is outside a transaction."
+   }
+  ]
+ },
+ {
+  "id": "DB-2",
+  "section": "DB",
+  "finding": "DB-2 MED perf db.ts:3609 saveView + core.ts:4873 publishView \u2014 superseded view-conversation:<task>:<run>:<n> kv snapshots never pruned \u2192 O(turns^2) growth. Fix delete older on supersede. Test tests/view-publication.test.ts.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "bd266353",
+    "subject": "Prune settled conversation publication history",
+    "body": "DB-2/PS-3: Keep immutable snapshots during live retries, then prune superseded view snapshots, publication fences, and turn-session keys after a seven-day terminal retry window. Preserve the current referenced snapshot and task conversation; mark swept tasks to avoid repeated deletes. SQLite and PostgreSQL regressions cover the retained reference."
+   }
+  ]
+ },
+ {
+  "id": "DB-3",
+  "section": "DB",
+  "finding": "DB-3 MED perf db.ts:7203 \u2014 no time-based retention for events (agent.activity etc.) / audit_log.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "6facfdc2",
+    "subject": "Persist first task completion for indexed Insights queries",
+    "body": "DB-4: Record the first done view event in tasks.completedAt, backfill existing tasks once from event history (or terminal view when history is absent), and query that indexed column for Insights. Completion dates survive DB-3 event retention. On 100k synthetic SQLite events, 100 Insights completion queries took 387.5 ms before versus 0.3 ms after."
+   },
+   {
+    "sha": "20f60695",
+    "subject": "Retain bounded event and audit history without auditing reads",
+    "body": "DB-3/PS-4: Retain events for 90 days and audit rows for 365 days in indexed, 10k-row sweep batches; keep unresolved approval-request evidence until resolution. Successful GET/HEAD no longer write an audit row (one row per read before, zero after), while denied reads remain audited. Use SQLite WAL synchronous=NORMAL; PostgreSQL skips that pragma. The retained task view and separate policy evidence remain durable."
+   }
+  ]
+ },
+ {
+  "id": "DB-4",
+  "section": "DB",
+  "finding": "DB-4 MED perf db.ts:6462 insightRows \u2014 completions via events LIKE '%\"status\":\"done\"%' full scan per Insights load. Fix completedAt column.",
+  "commits": [
+   {
+    "sha": "6facfdc2",
+    "subject": "Persist first task completion for indexed Insights queries",
+    "body": "DB-4: Record the first done view event in tasks.completedAt, backfill existing tasks once from event history (or terminal view when history is absent), and query that indexed column for Insights. Completion dates survive DB-3 event retention. On 100k synthetic SQLite events, 100 Insights completion queries took 387.5 ms before versus 0.3 ms after."
+   }
+  ]
+ },
+ {
+  "id": "DB-5",
+  "section": "DB",
+  "finding": "DB-5 MED perf db.ts:4319/4194 \u2014 no events(type) index; boot pruneStaleInbox + hasPendingApprovals scan. Fix idx_events_type(type,taskId).",
+  "commits": [
+   {
+    "sha": "b16ad5c7",
+    "subject": "Gate completed data migrations and defer inbox pruning",
+    "body": "PS-5: Legacy row backfills no longer parse projects, profiles, vault items and usage rows on every boot; imported legacy databases explicitly force the migration. Notification backlog reconciliation now starts after readiness and repeats hourly. Replaying the migration over 200 SQLite projects took 0.9 ms before and 0.1 ms after; the benefit grows with real vault and usage data. DB-5 supplies the event-type index used by approval pruning."
+   },
+   {
+    "sha": "ddb2ddba",
+    "subject": "Index events by type and task",
+    "body": "DB-5: Approval and inbox cleanup scan events by type; the existing task/sequence index cannot serve that predicate. Add an idempotent type/task index on both SQLite and PostgreSQL, with schema regressions in each store suite."
+   }
+  ]
+ },
+ {
+  "id": "DB-6",
+  "section": "DB",
+  "finding": "DB-6 MED perf db.ts:7138/2364 \u2014 revokeScopedTokens/deprovision parse every live token JSON under global lock. Fix indexed columns.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "00ba6094",
+    "subject": "Index durable token principals and project scopes",
+    "body": "DB-6: Persist token principal/organization columns and project membership rows, including task-derived and multi-project scope, so revocation and deprovision use indexed updates rather than parsing every live token. Backfill legacy token rows and clear scope rows during purge. In a 50k-token SQLite fixture, revoking one project token took 98.2 ms and 50k JSON hydrations before versus 0.1 ms and no hydration after."
+   }
+  ]
+ },
+ {
+  "id": "DB-7",
+  "section": "DB",
+  "finding": "DB-7 MED perf db.ts:3570 attachTags reviewAudience per-task uncached.",
+  "commits": [
+   {
+    "sha": "7cec0b53",
+    "subject": "Cache reviewer audience reads within task batches",
+    "body": "DB-7: The legacy listTaskAttempts path resolved the same team membership once per task. Reuse the existing per-page audience reader for its batch. Thirty tasks with one shared team now issue one membership query instead of thirty; cache lifetime remains one read to avoid stale authorization."
+   }
+  ]
+ },
+ {
+  "id": "DB-8",
+  "section": "DB",
+  "finding": "DB-8 LOW correctness db.ts:1433 deleteProject leaves usage_admissions rows (deleteOrganization deletes them).",
+  "commits": [
+   {
+    "sha": "4012eb4d",
+    "subject": "Remove usage reservations when deleting a project",
+    "body": "DB-8: Admission rows describe temporary capacity reservations, unlike retained usage events. Delete them with the project so deleted projects cannot leave active reservations or orphan task references. Cover SQLite and PostgreSQL."
+   }
+  ]
+ },
+ {
+  "id": "DB-9",
+  "section": "DB",
+  "finding": "DB-9 LOW security scripts/reset.ts:20 SIGKILL recorded pid without cmdline identity check.",
+  "commits": [
+   {
+    "sha": "b818381e",
+    "subject": "Verify Temporal process before reset signals it",
+    "body": "DB-9: A stale dev-server PID can belong to another process. Require the live command line to identify the recorded Temporal dev server and port before SIGKILL, and abort the reset when identity cannot be verified. The identity predicate has a regression test."
+   }
+  ]
+ },
+ {
+  "id": "DB-10",
+  "section": "DB",
+  "finding": "DB-10 LOW security ops/backup.ts:166 unsigned manifest.",
+  "commits": [
+   {
+    "sha": "f646acbe",
+    "subject": "Defer signed backup manifests (DB-10) until old backups stay restorable",
+    "body": "Reverts c7bbd52b from this integration; the commit stays ready to apply.\nAs written it refuses every unsigned (v1) backup, so the day it deployed\nevery existing nightly and pre-deploy snapshot on the host would become\nunrestorable by `deploy/karmax restore`, and recovery onto a fresh host\nwould newly require supplying the vault key separately. DB-10 is a LOW\nfinding (tampering needs write access to the backup directory). Signing\nnew manifests should ship with an explicit, audited path for restoring a\nv1 backup and an updated recovery runbook.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+   },
+   {
+    "sha": "c7bbd52b",
+    "subject": "Authenticate backup manifests with the retained vault key",
+    "body": "DB-10: MAC the versioned manifest before restoring any component and reject unsigned, altered or rehashed metadata. Exclude the signing key from filesystem and deployment snapshots, preserve the independently trusted key on restore, and support a separately supplied binary key for recovery onto a fresh host. This intentionally refuses unsigned legacy snapshots rather than admitting a downgrade bypass."
+   }
+  ]
+ },
+ {
+  "id": "DB-11",
+  "section": "DB",
+  "finding": "DB-11 LOW correctness db.ts:4064 inbox eventSeq hash%997 collision drops notification.",
+  "commits": [
+   {
+    "sha": "e0d8cc06",
+    "subject": "Allocate collision-free synthetic inbox sequences",
+    "body": "DB-11: The request-id hash modulo 997 dropped distinct approval notifications created in the same millisecond. Allocate negative synthetic event sequences transactionally through kv, separate from positive event-log sequences. Cover SQLite and PostgreSQL."
+   }
+  ]
+ },
+ {
+  "id": "DB-12",
+  "section": "DB",
+  "finding": "DB-12 LOW debt db.ts:2527 deleteTeam substring false positive (dev vs developers).",
+  "commits": [
+   {
+    "sha": "658435d7",
+    "subject": "Match team routes as complete JSON values",
+    "body": "DB-12: A substring search treated @team:developers as use of @team:dev and blocked deletion. Walk structured settings and unfinished task values for exact selectors, retaining conservative behavior for malformed legacy JSON. Cover SQLite and PostgreSQL."
+   }
+  ]
+ },
+ {
+  "id": "DB-13",
+  "section": "DB",
+  "finding": "DB-13 LOW correctness postgres-sql.mjs:104 COALESCE json_extract draft \u2192 ::integer cast of 'true' errors on PG (latent).",
+  "commits": [
+   {
+    "sha": "7651615a",
+    "subject": "Preserve JSON scalar types in draft translation",
+    "body": "DB-13 follow-up: PostgreSQL text extraction erased the distinction between JSON false and the string \"false\". Compare JSONB scalars directly, preserving SQLite draft predicate behavior for booleans, zero, null, and strings without integer casts. Add regression expectations."
+   },
+   {
+    "sha": "6e0a9763",
+    "subject": "Translate JSON draft and removal expressions for PostgreSQL",
+    "body": "DB-13/DB-14: SQLite JSON booleans appear as numeric 0/1, while PostgreSQL text cannot cast true to integer. Preserve the draft predicate without that cast, and translate json_remove with any number of paths, including nested keys. Add translator and PostgreSQL parity regressions."
+   }
+  ]
+ },
+ {
+  "id": "DB-14",
+  "section": "DB",
+  "finding": "DB-14 LOW debt postgres-sql.mjs:100 json_remove translation hard-codes exactly 3 paths.",
+  "commits": [
+   {
+    "sha": "6e0a9763",
+    "subject": "Translate JSON draft and removal expressions for PostgreSQL",
+    "body": "DB-13/DB-14: SQLite JSON booleans appear as numeric 0/1, while PostgreSQL text cannot cast true to integer. Preserve the draft predicate without that cast, and translate json_remove with any number of paths, including nested keys. Add translator and PostgreSQL parity regressions."
+   }
+  ]
+ },
+ {
+  "id": "DB-15",
+  "section": "DB",
+  "finding": "DB-15 LOW perf/scale sql.ts:130 global advisory lock serializes all tenants' writes (long-term: per-org key).",
+  "commits": []
+ },
+ {
+  "id": "PS-1",
+  "section": "PS",
+  "finding": "PS-1 HIGH perf main.ts:488,497-504 \u2192 reconcile.ts:45 \u2192 db.ts listTaskAttempts `SELECT *` \u2014 every reconcile (boot + every 60 s) loads every task incl. terminal/archived and parses lastView + full conversation, then filters in JS; one sequential 4 s describe per live task. ~150\u2013300 MB churn/min on large installs. MCP list_tasks does the same (includeConversation=true). Fix: select non-terminal candidates in SQL without conversation; bounded-parallel describes.",
+  "commits": [
+   {
+    "sha": "a3fda167",
+    "subject": "Use task summaries for bare MCP listings",
+    "body": "PS-1 follow-up: list_tasks returns only id, title and workflow, yet the MCP adapter loaded every full task conversation. Route it through the existing summary projection and cover the adapter call."
+   },
+   {
+    "sha": "8ee01438",
+    "subject": "Reconcile only live task metadata with bounded describes",
+    "body": "PS-1: Query non-terminal, non-draft attempts in SQL without conversations or tags and describe at most eight concurrently. A synthetic 1000-task SQLite project with 100 KB conversations returned 100,121,673 serialized bytes in 300.3 ms before versus 65 bytes in 0.9 ms after. Includes SQLite behavior and PostgreSQL parity regressions."
+   }
+  ]
+ },
+ {
+  "id": "PS-2",
+  "section": "PS",
+  "finding": "PS-2 HIGH latency main.ts:395 \u2192 worker-pool.ts \u2192 worker.ts \u2014 workflow bundle rebuilt with webpack on every boot (3\u20138 s, 200\u2013400 MB), twice when a package is installed; the replay check bundles twice more. Fix: start once with externals; overlap bundling with DB boot; cache keyed by source hash.",
+  "commits": [
+   {
+    "sha": "149db93a",
+    "subject": "Frame bundle cache inputs unambiguously",
+    "body": "PS-2: hash structured file identities and fixed-size content digests so delimiter-like source bytes cannot move between files while retaining a cache key. A failing regression demonstrated the ambiguity before this fix. Bound context traversal across symlink cycles as well."
+   },
+   {
+    "sha": "4ad95aaa",
+    "subject": "Verify workflow bundle reuse and invalidation",
+    "body": "PS-2: require the exact running-worker bundle for baseline replay and a compiled candidate. Exercise content changes with preserved mtimes and newly created higher-priority .ts imports against the real webpack cache, guarding against unsafe metadata-only cache hits."
+   },
+   {
+    "sha": "aa0c458c",
+    "subject": "Avoid persisting ephemeral replay bundle paths",
+    "body": "PS-2: remote replay mirrors disappear after verification, so their dependency manifests can never produce a cache hit. Compile those candidates without retaining unusable cache entries; continue reusing the worker baseline and caching durable source trees. Cover the opt-out with the real webpack regression test."
+   },
+   {
+    "sha": "1d1d71c5",
+    "subject": "Cache and share validated workflow bundles at startup",
+    "body": "PS-2: restore external packages before the first worker and overlap the single build with Temporal/database startup. Reuse its bundle for baseline replay; validate disk cache entries against source, resolver, compiler and installed dependency content. Cache failures rebuild safely. Remove the obsolete rollback count in the existing package activation test."
+   }
+  ]
+ },
+ {
+  "id": "PS-3",
+  "section": "PS",
+  "finding": "PS-3 HIGH scalability core.ts:4879, view-publication.ts:13 \u2014 `view-conversation:<task>:<run>:<rev>` full snapshots, `view-publication-fence:` and `turnsession:` kv rows are never pruned (O(revisions\u00b2)). Fix: retentionSweep deletes superseded rows of terminal tasks (keep tasks.conversationRef). = DB-2.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "bd266353",
+    "subject": "Prune settled conversation publication history",
+    "body": "DB-2/PS-3: Keep immutable snapshots during live retries, then prune superseded view snapshots, publication fences, and turn-session keys after a seven-day terminal retry window. Preserve the current referenced snapshot and task conversation; mark swept tasks to avoid repeated deletes. SQLite and PostgreSQL regressions cover the retained reference."
+   }
+  ]
+ },
+ {
+  "id": "PS-4",
+  "section": "PS",
+  "finding": "PS-4 MED scalability server.ts:1891 \u2192 authorization.ts:649 \u2014 every authorized request writes an audit_log row in its own fsync'd transaction on the single queue; audit_log never purged; events prune only agent.output. Fix: time-based retention; don't audit successful GET/HEAD; synchronous=NORMAL.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "20f60695",
+    "subject": "Retain bounded event and audit history without auditing reads",
+    "body": "DB-3/PS-4: Retain events for 90 days and audit rows for 365 days in indexed, 10k-row sweep batches; keep unresolved approval-request evidence until resolution. Successful GET/HEAD no longer write an audit row (one row per read before, zero after), while denied reads remain audited. Use SQLite WAL synchronous=NORMAL; PostgreSQL skips that pragma. The retained task view and separate policy evidence remain durable."
+   }
+  ]
+ },
+ {
+  "id": "PS-5",
+  "section": "PS",
+  "finding": "PS-5 MED latency db.ts:159-190 \u2014 every boot re-runs ~150 migration statements, full-scan backfills and pruneStaleInbox full scans inside write transactions. Fix: gate backfills by kv marker / user_version; idx_events(type,taskId); prune after readiness.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "f6c09019",
+    "subject": "Preserve hosted migration on deployment change",
+    "body": "PS-5: Use a separate migration marker when an existing local installation switches to hosted mode. The one-time migration fixtures now clear the marker before injecting legacy rows, matching a database created before that migration shipped. The full store suite passes again."
+   },
+   {
+    "sha": "b16ad5c7",
+    "subject": "Gate completed data migrations and defer inbox pruning",
+    "body": "PS-5: Legacy row backfills no longer parse projects, profiles, vault items and usage rows on every boot; imported legacy databases explicitly force the migration. Notification backlog reconciliation now starts after readiness and repeats hourly. Replaying the migration over 200 SQLite projects took 0.9 ms before and 0.1 ms after; the benefit grows with real vault and usage data. DB-5 supplies the event-type index used by approval pruning."
+   }
+  ]
+ },
+ {
+  "id": "PS-6",
+  "section": "PS",
+  "finding": "PS-6 MED latency main.ts:708 \u2014 /api answers 503 until startupReady, which waits on sequential non-essential work (docker sweep, retention, coordinator heal, reconcile, package restore, trigger arming, tailscale probe). Fix: ready after worker start; background the rest; bounded-parallel probes; timeouts on visibility list.",
+  "commits": [
+   {
+    "sha": "808dbd05",
+    "subject": "Keep startup maintenance out of the readiness gate",
+    "body": "PS-6: defer Docker cleanup, retention, coordinator repair and task reconciliation, workflow restoration and trigger recovery, and remote-access probes until the API is ready. Keep credential registration and subscribers on the startup path. Bound maintenance concurrency and coordinator visibility/probes; drain admitted maintenance during shutdown."
+   }
+  ]
+ },
+ {
+  "id": "PS-7",
+  "section": "PS",
+  "finding": "PS-7 MED latency server.ts:1051 \u2192 7502-7583 \u2014 listen() awaits ensureProjectWiki for every project before binding (sync execFileSync git; first GitHub wiki provisioning blocks the bind). Regression from 76e8cd0d (`void (await (async()=>\u2026)())`). Fix: drop the inner await; async git; AbortSignal.timeout on GitHub fetches.",
+  "commits": [
+   {
+    "sha": "eb5a33b4",
+    "subject": "Await background wiki repair and always close its gateway",
+    "body": "PS-7 intentionally moves remote backfill past gateway readiness. Wait for the asynchronous owner lookup in the existing integration test, and drain the gateway in finally so an assertion failure cannot leave fanout reading a closed store. Repairs the wiki failure and leaked timer reported by CI #1090."
+   },
+   {
+    "sha": "d3769634",
+    "subject": "Serve the console before repairing project wikis",
+    "body": "PS-7: use asynchronous Git initialization, detach and drain background wiki repair, and bound GitHub requests. Pending remote provisioning no longer blocks the gateway bind."
+   }
+  ]
+ },
+ {
+  "id": "PS-8",
+  "section": "PS",
+  "finding": "PS-8 MED perf db.ts kvEntries \u2014 `WHERE k LIKE ?` cannot use the PK index (LIKE is case-insensitive) \u2192 full kv scan every 5 s (sweepConnections), every 60 s (deployment monitor), at boot and per task delete. Fix: range `k>=? AND k<?` + startsWith post-filter.",
+  "commits": [
+   {
+    "sha": "0b9912fd",
+    "subject": "Repair PostgreSQL retention and team query regressions",
+    "body": "Use an indexed C-collation key range for DB-2/PS-3 and PS-8 so literal KV prefixes and terminal snapshot retention work under hosted PostgreSQL locales. Give nullable team selectors an explicit parameter type for DB-6. Align PS-5 inbox migration test with readiness-time reconciliation and use a routable DB-3/PS-4 insight fixture. CI #1092 exposed all five failures; PostgreSQL integration: 34 passed with en_US.utf8."
+   },
+   {
+    "sha": "f02262a7",
+    "subject": "Use indexed key ranges for kv prefix scans",
+    "body": "PS-8: SQLite LIKE over the kv primary key scanned all rows and was case-insensitive. Range-bound literal prefixes and post-filter for exact prefix semantics on SQLite and Postgres. On 100k SQLite keys, 300 lookups took 2059.3 ms before and 204.2 ms after; EXPLAIN changed from SCAN to SEARCH on the primary-key index."
+   }
+  ]
+ },
+ {
+  "id": "PS-9",
+  "section": "PS",
+  "finding": "PS-9 MED perf tokens.ts:116-130 \u2014 TokenAuthority keeps every minted token in a Map that is never read when a store exists; identityTokens sweep does O(n) DB verifies per mint at \u22652000 entries; evicted entries not revoked. Fix: Map only without store; time-evict + revoke.",
+  "commits": [
+   {
+    "sha": "76397541",
+    "subject": "Update gateway fixtures to validate identity sessions",
+    "body": "Supply the live-session validator in identity fakes and direct gateway fixtures. GW-8 / PS-9 now bind browser tokens to a live identity session; preserve that fail-closed production check while restoring the HTTP authorization tests exposed by CI #1090."
+   },
+   {
+    "sha": "f6476543",
+    "subject": "Bind browser platform tokens to live identity sessions",
+    "body": "GW-8 and PS-9: invalidate browser-derived tokens on session revocation across replicas, revoke sessions after credential changes, and evict gateway cache entries with revocation. Keep persistent tokens only in the database and prune the bounded identity cache by time rather than repeated database sweeps."
+   }
+  ]
+ },
+ {
+  "id": "PS-10",
+  "section": "PS",
+  "finding": "PS-10 MED hosted e2b.ts:115, daytona.ts:70 \u2014 provider sandboxes/states maps never evicted on destroy (memory growth; see WD-3).",
+  "commits": [
+   {
+    "sha": "7022d0a8",
+    "subject": "Evict provider caches after sandbox destruction",
+    "body": "WD-3, PS-10: all successful teardown paths remove SDK objects and lifecycle map entries. Weak handle tombstones preserve status without retaining every historical sandbox."
+   }
+  ]
+ },
+ {
+  "id": "PS-11",
+  "section": "PS",
+  "finding": "PS-11 MED/LOW broker.ts:27,82 \u2014 CredentialBroker.auditLog unbounded (~0.3 MB/day/org from mail polling). Fix: ring buffer.",
+  "commits": [
+   {
+    "sha": "04b20bcb",
+    "subject": "Bound credential broker audit memory",
+    "body": "PS-11: Keep the newest 1000 credential resolution attempts in a ring so polling and long-lived broker processes cannot grow this diagnostic array without bound. Preserve chronological audit_log output."
+   }
+  ]
+ },
+ {
+  "id": "PS-12",
+  "section": "PS",
+  "finding": "PS-12 LOW/MED server.ts:653-699, 8046-8065 \u2014 WebSocket close handlers registered after awaits \u2192 leaked fanout subscribers, timing polls, preview world pins + runner leases (world never parks, keeps billing). Fix: register once('close') before awaiting / re-check readyState.",
+  "commits": [
+   {
+    "sha": "b89b133a",
+    "subject": "Release socket resources acquired after disconnect",
+    "body": "PS-12: register lifecycle cleanup before asynchronous initialization. Timing subscribers, review streams and preview access leases are disposed even when their acquisition finishes after the browser has closed."
+   }
+  ]
+ },
+ {
+  "id": "PS-13",
+  "section": "PS",
+  "finding": "PS-13 LOW per-event full hydration: collaboration routing getTask per view.updated (api.ts:4635), restart check loads all events (main.ts:693), delivery getTask + listUsers, fanout re-verifies the token per event per socket.",
+  "commits": [
+   {
+    "sha": "0317b03c",
+    "subject": "Project delivery envelopes from indexed task and user rows",
+    "body": "PS-13: Delivery polling needed only a task title/number and one recipient, yet hydrated the full task conversation and listed every identity user for each claim. Read the compact task header and primary-key user row instead. Cover SQLite delivery, identity lookup, and PostgreSQL lookup."
+   },
+   {
+    "sha": "fcc45f77",
+    "subject": "Avoid task hydration on routine collaboration and restart events",
+    "body": "PS-13: Route complete view.updated lifecycle payloads directly, falling back to the stored view only for incomplete historical payloads. Check for a merged result with an indexed EXISTS query rather than parsing every task event on each done update. Cover the hot paths and PostgreSQL parity."
+   }
+  ]
+ },
+ {
+  "id": "PS-14",
+  "section": "PS",
+  "finding": "PS-14 LOW small unbounded structures: codex stderr kept whole, runners probedAt map, terminal tickets swept only on mint, legacy sessions map.",
+  "commits": [
+   {
+    "sha": "0bbef93a",
+    "subject": "Evict stale world probe timestamps",
+    "body": "PS-14: Lifecycle probes retain one timestamp per world generation; prune entries after two reconciliation windows so destroyed or replaced worlds do not accumulate in a long-lived gateway. Cover sweep eviction without a paid provider."
+   },
+   {
+    "sha": "130787db",
+    "subject": "Bound Codex stderr while retaining recent failures",
+    "body": "PS-14: Keep only the latest 4 KiB from app-server and legacy exec stderr streams, and include the recent diagnostic on failure. This prevents a long-lived turn from retaining unbounded provider stderr. Also correct fixture tuple types found by native typecheck."
+   }
+  ]
+ },
+ {
+  "id": "PS-15",
+  "section": "PS",
+  "finding": "PS-15 LOW dev-server.ts:146-157,677 \u2014 health watcher opens a new gRPC connection every 15 s (late connects never closed); refreshManagedMcp rewrites every config home on each boot.",
+  "commits": [
+   {
+    "sha": "b400f5ba",
+    "subject": "Reuse Temporal health connections and unchanged MCP files",
+    "body": "PS-15: retain one gRPC connection per watcher, close late connections after stop, and publish managed config only when its contents change."
+   }
+  ]
+ }
+]

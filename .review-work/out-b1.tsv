@@ -1,0 +1,59 @@
+GW-1	fixed	d4753123	Hosted uses publicModelFetch (public 443, pinned DNS, no redirects) and checks on save; self-host still reaches private HTTPS by design. tests/explanation.test.ts
+RT-2	partial	d4753123	Anchoring/HTTPS/no-redirect done, but body settings.endpoint still honoured for any reader; fallback maps openai.xyz to 'openai' (explanation.ts:39-44), key still exfiltrable.
+GW-2	fixed	fa63fb8a	Resource create/import now use default 2 MiB body(); files go through resumable upload routes (UI already did). tests/resources.test.ts (413).
+GW-5	fixed	fa63fb8a	body() throws status-400 'invalid JSON body' instead of returning {}. tests/gateway-json.test.ts.
+GW-3	fixed	14a1d96d,c76f0bfd,bef0c431	Sec-Fetch-Site/Origin gate on all /api mutations plus desktop/preview; desktop is POST, legacy preview GET returns 405. tests/gateway-hardening.test.ts.
+GW-4	fixed	f048165d,8c10b701	Hosted cap of 10 owned orgs checked inside the store transaction before storage/onboarding; returns 429. tests/gateway-organization-limit.test.ts.
+GW-6	fixed	8f1ad7b7,8c10b701	/api/activity resolves projects with one batched taskProjectIds query plus per-project cache. tests/gateway-hot-path.test.ts.
+GW-12	fixed	8f1ad7b7	Gateway request/socket/activity paths use a shared 1s cachedTimingEnabled; activities/api.ts still read uncached, outside the gateway hot path. tests/gateway-hot-path.test.ts.
+GW-7	fixed	b967fb8e	Default auth hosts now loopback only; a tailnet host must come from KARMAX_PUBLIC_URL/KARMAX_AUTH_HOSTS. tests/auth-origins.test.ts.
+GW-8	fixed	f6476543,76397541	Browser tokens bound to identity session (checked on verify, cross-replica); password change/session delete revoke cached tokens. tests/gateway-identity-tokens.test.ts, identity-hardening.
+GW-9	fixed	a2a57fc4	Upgrades authenticated and Origin-checked before handleUpgrade; pending/total/per-principal caps, 5s handshake timeout, maxPayload. tests/gateway-websocket-admission.test.ts.
+GW-10	fixed	807ede96	Policy and session cookies Secure when hosted, https KARMAX_PUBLIC_URL or TLS socket; TLS-terminating proxy without PUBLIC_URL still unmarked. tests/gateway-legacy-sessions.test.ts.
+GW-11	fixed	1c290b36,c4035ace,bef0c431,wiki@c3e9ce0	Resolved by removal: inert /api/safe-mode route, UI card/link, capability and grants withdrawn; overlay library kept. tests/gateway-safe-mode.test.ts.
+PL-1	fixed	7bcc0aa2	Undelegated review:approve agent now passes only if its task's creator human would (humanMayAct); unresolvable human refused. tests/stage-transitions.test.ts.
+PL-2	fixed	e8a718ad,1eb4f67e	createTask and updateArmedParams drop every caller-sent _-prefixed key; stored _authorization/_githubAccountId retained on replace edits. tests/platform-authz.test.ts.
+PL-3	fixed	1ec00fa4	queueView shows each queued id only if the token passes queue:read on that task's project/org (and named projectId). tests/platform-authz.test.ts.
+PL-4	fixed	9f31d9cb	review-info.ts validates each call (http(s) URLs, run/open only, 128 KiB html/diff) and runtime caps total (20 actions, 192 KiB). tests/review-info-publication.test.ts.
+PL-5	fixed	52bfef39	Without mergeDomains, held set derived via mergeQueueDomains(world,target) plus singular; a task holding none is refused. Error text generic (cosmetic). tests/platform-authz.test.ts.
+PL-6	fixed	0ff84d2e	New POST /api/tasks/:id/messages requires task:conversation:message; stdio tool, HTTP ops and in-turn handler use it. tests/conversation-message.test.ts, agent-sdk-tools, gateway-scope.
+PL-7	fixed	174bc7ac	Both save_skill descriptions now say organization-scoped; in-turn handler also persists content via POST /api/skills. tests/agent-sdk-tools.test.ts, mcp.test.ts.
+PL-8	partial	e24eacde,5ec19805	Multi-replica race fixed with store-held decision claims (tests/permission-requests.test.ts); per-org single kv blob remains, rewritten each request, pruned only on task deletion.
+RT-1	fixed	431677a6	API validator walks every agent spec (roles, confirm layers, legacy gate, responder); runAgentTurn refuses cross-org or unreadable source before any read. tests/fork-reauthorize.test.ts.
+RT-3	fixed	6b42b670,b8acc9ed	Managed cost estimate checkpointed at provider start, refined by usage; failure/cancel/timeout/worker loss keep the charge, retries charged separately. tests/agent-admission.test.ts.
+RT-10	fixed	6b42b670,b8acc9ed	Result checkpointed (turnresult kv) before billing completion; retry resumes it without provider call, post-turn errors retryable agent-infra. tests/agent-admission.test.ts (post-turn case).
+RT-4	fixed	c20494a5,43fd7da8,09f7ae68	Store throws typed AdmissionBackpressureError (retryable agent-infra); only provider-tagged errors can classify as agent-limit and park logins. tests/limits.test.ts, agent-admission.test.ts.
+RT-17	fixed	c20494a5	'organization active model turn limit reached' now AdmissionBackpressureError, classified retryable agent-infra. tests/agent-admission.test.ts ('active' case).
+RT-5	partial	ca711eec,5e4e0b67,ffc6ed3e,223dc722,d4c7e73c	Hooks/fsmonitor off, env allowlist, gitfile check, config scan (tests/host-git.test.ts); scan misses gpg.ssh.defaultKeyCommand (verified runs on host commit) and core.worktree redirection (git.ts:40).
+RT-6	fixed	e74c1d48	createWorld now heartbeats every 1s for all world kinds from preparation through registration, cleared on every exit. tests/world-provision-transition.test.ts.
+RT-7	fixed	7c24f066,e6736c4a,fb46daa5,41efb04a	Runtime wraps emit/activity/session observers in caught, drained promises, awaits onSpend; worker process has unhandledRejection backstop. tests/runtime-observers.test.ts, worker-process.test.ts.
+RT-8	fixed	b8fd068f	Workflow-edit test gate runs 'set -o pipefail; npm test | tail -40', so npm's failure propagates. tests/workflow-check-exit.test.ts.
+RT-9	fixed	2fd0219e	runScript output capped to final 64 KiB; buildReview changedFiles capped (1000 files/64 KiB) with truncation note. tests/activity-review-bounds.test.ts.
+RT-11	fixed	fb13394c,88d592ae	transcript/reviewInfo/changedFiles/error bindings wrapped in labelled, unclosable <untrusted-data> blocks (mitigation, not elimination of injection). tests/roles.test.ts.
+RT-12	fixed	73934d57	SecretScrubber replaces the turn's token, model key, project/vault/git secrets in agent.output, activity title/detail and final answer; review-info/error text not scrubbed. tests/agent-secret-env.test.ts.
+RT-13	fixed	06b9a770,ad19c9e0	Remote wiki snapshot runs a bounded find in the wiki checkout (prunes .git/node_modules); snapshot failure keeps org/canonical context. tests/activity-prompt-preparation.test.ts, wiki.test.ts.
+RT-14	partial	06b9a770,2d5cf948,41efb04a	Fork-wait now a light 2s execution-state query; turn start still fully hydrates getTask up to 4x (ceiling test allows 4), remote lease path more. tests/activity-prompt-preparation.test.ts.
+RT-15	fixed	4eeaca83,e8343d8e,41efb04a	Child creation keyed by parent+runId+activityId, recorded atomically and serialized; retries reuse the child; receipts pruned after parent settles. tests/child-preparation-retry.test.ts.
+RT-16	fixed	0f34ecc6,be3e5cee,cc4c1a51,32b989c4	Child grant attenuates use-card from parent's live stored grant (Avatar rechecked); no use-card means no cards; shared ancestor budget and card intersection. tests/payments.test.ts, role-defaults.
+RT-18	fixed	06b9a770	Goal mode no longer replaces built-ins; org @builtin override resolved and goal suffix appended to project instructions. tests/activity-prompt-preparation.test.ts (RT-18 case).
+RT-19	fixed	16720493,c5c99242,c829a1ae,41efb04a	Replay gate snapshots only the owning organization's running task histories, spooled to disk with count/byte caps; coordinators left to release gate. tests/workflow-checks.test.ts.
+RT-20	fixed	92d6fa3b,7bb8216b,41efb04a	finalizePrs/closePrs use commentOnce with a stable hashed marker looked up before posting, serialized per world. tests/github-pr.test.ts.
+RT-21	fixed	73f76850	mergeGithubPrs reads only the needed evidence event types once per poll (eventsOfTypes) and reuses them per PR. tests/github-landing-events.test.ts, github-pr.test.ts.
+RT-22	fixed	fe57ffd2	Errors thrown before the provider try block now pass through classifyTurnError (cancellation and checkpointed results preserved). tests/agent-admission.test.ts.
+RT-23	fixed	5ef310c2	acquireConfirmLock takes the turn's abort signal, removes cancelled waiters and releases a lock handed over during cancellation. tests/confirm-lock.test.ts.
+RT-24	fixed	c2d45dcf	turnPlatformRequest streams with a 2 MiB cap, 30s deadline and turn cancellation signal. tests/turn-platform-request.test.ts.
+RT-25	fixed	0f489489,516b27c4	codexSessionFiles reads 16 KiB blocks only up to the first newline (2 MiB cap) instead of the whole rollout. tests/fork.test.ts.
+RT-26	fixed	b080d5e7	Attachment checksums batched: one NUL-delimited sha256sum per 100 files instead of one exec per attachment. tests/attachments.test.ts.
+RT-27	fixed	35a43993	apiKeyEnv returns '' for unknown vendors (no <PREFIX>_API_KEY lookup); ACP rejects unsupported broker-key injection. tests/provider-registry.test.ts.
+RT-28	fixed	00588a49	profileVisibleTo scoping: resolver ignores other project/org profile ids and createTask/updateArmedParams refuse them. tests/platform-authz.test.ts.
+RT-29	fixed	6daa6374,e57ed794	isProviderPolicyRejection matches exact native codes; wording matched only at explicit provider boundaries (providerOrigin). tests/limits.test.ts.
+RT-30a	partial	ae29e50e,e8343d8e	Settle/deletion now prune turnsession/turnresult (tests/view-publication.test.ts). Pre-fix run-scoped rows of settled tasks never pruned: sweep matches only '#' form (db.ts:7473).
+RT-30b	partial	c938851a	PID-named profiles; dead owners' files reaped on next exec turn in that home (tests/codex-work-profile-cleanup.test.ts). Pre-fix orphans kept; no boot sweep; recycled PIDs unchecked.
+RT-30c	fixed	c938851a,d68fa38c	Timeout sends SIGTERM, SIGKILL after 1s; promise settles only on exit, so temp credentials are removed after the child is gone. tests/usage-process-cleanup.test.ts.
+RT-30d	open	-	Unchanged: runtime text still hard-codes krmax/Krmax (core.ts:227,3669; api.ts:540,3818,4292; acp.ts:530), ignoring configured siteName; no commit addresses it.
+RT-31a	fixed	431677a6	RT-1 (CRIT) covered: tests/fork-reauthorize.test.ts drives confirm layers/mode and Responder at the API, plus cross-org and sibling-project refusal in runAgentTurn.
+RT-31b	partial	d4753123	RT-2: tests/explanation.test.ts covers host anchoring, HTTPS, redirects, private networks; no test for the still-open body settings.endpoint override by any member.
+RT-31c	fixed	6b42b670,b8acc9ed	RT-3 covered: tests/agent-admission.test.ts runs failure, cancel, timeout, post-turn and billing errors and asserts the managed charge is retained.
+RT-31d	fixed	c20494a5	RT-4 covered: tests/limits.test.ts asserts karmax's own rate-limit messages never park a login; agent-admission.test.ts asserts backpressure retries as agent-infra.
+RT-31e	partial	ca711eec,5e4e0b67,ffc6ed3e,223dc722	RT-5: tests/host-git.test.ts covers hooks, fsmonitor, gitfile, env, filters, transport, includes; open gaps (gpg.ssh.defaultKeyCommand, core.worktree) untested.
+RT-31f	fixed	e74c1d48	RT-6 covered: tests/world-provision-transition.test.ts asserts a slow local createWorld heartbeats until registration and leaves no timers.
