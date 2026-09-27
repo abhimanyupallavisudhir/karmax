@@ -179,7 +179,11 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
     await new Promise((r) => setTimeout(r, 700));
-    await handle.signal('followUp', { id: 'm1', role: 'user', text: '@write injected.txt :: from a live follow-up', ts: 0 });
+    const followUp = { id: 'm1', role: 'user' as const, text: '@write injected.txt :: from a live follow-up', ts: 0 };
+    await handle.signal('followUp', followUp);
+    // The API journals every accepted follow-up; the running turn asks the
+    // workflow for it only then (LT-13).
+    await h.store.appendEvent({ taskId, type: 'conversation.message', ts: Date.now(), payload: { role: 'do', message: followUp } });
     // The follow-up is executed in the SAME turn (in-flight), so the turn reaches Review
     // with BOTH files written and no second Do turn.
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');

@@ -775,12 +775,11 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // wait until the Do turn is actually running, then send the follow-up MID-turn
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
     await new Promise((r) => setTimeout(r, 700)); // ensure we're inside the sleeping turn
-    await handle.signal('followUp', {
-      id: 'mid1',
-      role: 'user',
-      text: '@write mid.txt :: delivered after all',
-      ts: 0,
-    });
+    const followUp = { id: 'mid1', role: 'user' as const, text: '@write mid.txt :: delivered after all', ts: 0 };
+    await handle.signal('followUp', followUp);
+    // The API journals every accepted follow-up; the running turn asks the
+    // workflow for it only then (LT-13).
+    await h.store.appendEvent({ taskId, type: 'conversation.message', ts: Date.now(), payload: { role: 'do', message: followUp } });
     // The single Do turn folds the follow-up in: its reply proves the directive was
     // injected + executed in-flight.
     await expect

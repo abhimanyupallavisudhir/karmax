@@ -484,9 +484,10 @@ export class AcpAdapter implements AgentAdapter {
         (await (await currentTiming())?.markOnce('provider.first-event'));
         const update = params.update;
         if (update.sessionUpdate === 'agent_message_chunk') {
-          const text = textOf(update.content);
-          finalText += text;
-          ctx.emit(text, 'assistant');
+          // Chunks are deltas; the task renders each emit as the whole live
+          // message, so publish the growing text (LT-5).
+          finalText += textOf(update.content);
+          ctx.emit(finalText, 'assistant');
         }
         const activity = updateActivity(update, tools);
         if (activity) ctx.emitActivity(activity);

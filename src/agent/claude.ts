@@ -1,5 +1,6 @@
 import { claudeWorkEnvironment, workEnvironment } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
+import { readAnthropicMessage } from './api-streams.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
 import os from 'node:os';
@@ -156,6 +157,9 @@ export class ClaudeAdapter implements AgentAdapter {
             tools,
             // Reasoning effort (SPEC §10.5) — sent only on models that accept it.
             ...(claudeMessagesEffort(model, input.profile.effort) ? { output_config: { effort: claudeMessagesEffort(model, input.profile.effort) } } : {}),
+            // Text reaches the task as it is generated (LT-5); the reader rebuilds
+            // the same message object the non-streaming response carries.
+            stream: true,
           }),
           signal: ctx.signal,
         });
@@ -163,7 +167,7 @@ export class ClaudeAdapter implements AgentAdapter {
           const message = `Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`;
           throw providerErrorFromMessage('claude', message, 'structured');
         }
-        const data = (await res.json()) as any;
+        const data = await readAnthropicMessage(res, (text) => ctx.emit(text, 'assistant'));
         (await (await currentTiming())?.markOnce('first.output'));
         return data;
       });
@@ -653,6 +657,9 @@ export class ClaudeAdapter implements AgentAdapter {
         // managed policy still win — as they should; we only auto-grant the "ask" path.
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
+        // Token deltas, so the task shows text as it is generated (LT-5). The
+        // complete assistant frame still follows and records the message.
+        includePartialMessages: true,
         canUseTool: async (tool: string, toolInput: Record<string, unknown>) => {
           if (tool === 'Bash' && typeof toolInput?.command === 'string') ctx.emit(`$ ${toolInput.command}`);
           return { behavior: 'allow' as const, updatedInput: toolInput };
@@ -747,6 +754,8 @@ export class ClaudeAdapter implements AgentAdapter {
       },
     });
     let publishedSession = false;
+    // The main agent's text block being generated; undefined between blocks.
+    let streamingText: string | undefined;
     let firstSdkEvent = true;
     let startupDiagnosticCaptured = false;
     const diagnoseStartup = async (reason: 'timeout' | 'error') => {
@@ -851,7 +860,7 @@ export class ClaudeAdapter implements AgentAdapter {
           }
           if (text) {
             finalText = text;
-            ctx.emit(text, 'assistant');
+            if (text !== streamingText) ctx.emit(text, 'assistant');
             ctx.emitActivity({
               id: String((message as any).uuid ?? `message-${Date.now()}`),
               kind: 'message',
@@ -883,6 +892,14 @@ export class ClaudeAdapter implements AgentAdapter {
           // now belongs to the NEXT turn / Review, not crammed into this one.
           if (content.some((b: any) => b.type === 'tool_use' && /signal_completion$/.test(String(b.name ?? '')))) {
             completionSeen = true;
+          }
+        } else if (message.type === 'stream_event') {
+          // A sub-agent streams into its own transcript, never the main bubble.
+          const event = (message as any).parent_tool_use_id ? undefined : (message as any).event;
+          if (event?.type === 'content_block_start') streamingText = event.content_block?.type === 'text' ? '' : undefined;
+          else if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta' && streamingText !== undefined) {
+            streamingText += event.delta.text ?? '';
+            ctx.emit(streamingText, 'assistant');
           }
         } else if (message.type === 'user') {
           const content = Array.isArray((message as any).message?.content) ? (message as any).message.content : [];

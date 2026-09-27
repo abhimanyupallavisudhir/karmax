@@ -36,6 +36,15 @@ test('waits for readiness and drains accepted refreshes before stopping', async 
   await expect(worker.start()).rejects.toThrow('cannot be started again');
 });
 
+test('wakes the supervisor when the child commits events, coalescing a burst (LT-15)', async () => {
+  const onEvents = vi.fn();
+  const worker = manager('announce', { onEvents });
+  await worker.start();
+  await vi.waitFor(() => expect(onEvents).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect(onEvents).toHaveBeenCalledTimes(2);
+});
+
 test('keeps the previous package set when a refresh is rejected', async () => {
   const worker = manager('reject-refresh');
   const original = [{ type: 'fixture@1', entryFile: '/fixture/one.ts' }];

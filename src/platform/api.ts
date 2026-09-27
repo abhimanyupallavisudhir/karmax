@@ -1276,43 +1276,49 @@ export class KarmaxApi {
     // stale and is always revalidated at Merge. Still, catching the common
     // missing-reviewer setup at queue time is much kinder than discovering it
     // after CI. Never turn the observation into a krmax capability or reject the
-    // task—the creator may intentionally arrange the reviewer later.
-    if (!args.draft && String(resolved.remote ?? project.config.remote ?? 'none') === 'pr'
-      && createdBy?.kind === 'user' && this.deps.githubApp) {
-      const wikiRepository = (await this.deps.store.projectWiki(project.id))?.repository;
-      const slugs = [...new Set([
-        ...(await this.deps.store.listProjectRepositories(project.id))
-          .map((linked) => `${linked.repository.owner}/${linked.repository.name}`),
-        ...(wikiRepository ? [`${wikiRepository.owner}/${wikiRepository.name}`] : []),
-      ])];
-      const accountId = githubAccountId;
-      const creatorCanMerge = Boolean(accountId && slugs.length && (await Promise.all(slugs.map((slug) =>
-        this.deps.githubApp!.repositoryPermission(createdBy.userId, slug, accountId).catch(() => undefined))))
-        .every((permission) => permission?.canMerge));
-      if (!creatorCanMerge && slugs.length) {
-        const confirmer = manifest.params.find((field) => field.type === 'confirmer');
-        const layers = confirmer ? confirmLayersOf(resolved[confirmer.name] as any) : [];
-        const routedUsers = [...new Set((await __asyncCollections.flatMap(layers.filter((layer) => layer.kind === 'human'), async (layer) => (await this.deps.store.humanAudience(task.id, layer.audience)))))];
-        let routedEligible = false;
-        for (const userId of routedUsers) {
-          const reviewerAccount = (await this.deps.githubApp.activeUserAccountId(userId));
-          if (!reviewerAccount) continue;
-          const permissions = await Promise.all(slugs.map((slug) =>
-            this.deps.githubApp!.repositoryPermission(userId, slug, reviewerAccount).catch(() => undefined)));
-          if (permissions.every((permission) => permission?.canMerge)) { routedEligible = true; break; }
-        }
-        if (!routedEligible) {
-          const warning = 'The task creator cannot merge every GitHub repository and no selected human Review step currently routes to a connected person who can. The task may proceed, but it will stop at Merge for an eligible human.';
-          (await this.deps.store.appendEvent({ taskId: task.id, type: 'github.merge.preflight-warning', ts: Date.now(),
-            payload: { warning, repositories: slugs } }));
-          (task as TaskRecord & { warnings?: string[] }).warnings = [warning];
+    // task—the creator may intentionally arrange the reviewer later. Its live
+    // GitHub calls run alongside the workflow start, not before it (LT-16).
+    const mergePreflight = async () => {
+      if (!args.draft && String(resolved.remote ?? project.config.remote ?? 'none') === 'pr'
+        && createdBy?.kind === 'user' && this.deps.githubApp) {
+        const wikiRepository = (await this.deps.store.projectWiki(project.id))?.repository;
+        const slugs = [...new Set([
+          ...(await this.deps.store.listProjectRepositories(project.id))
+            .map((linked) => `${linked.repository.owner}/${linked.repository.name}`),
+          ...(wikiRepository ? [`${wikiRepository.owner}/${wikiRepository.name}`] : []),
+        ])];
+        const accountId = githubAccountId;
+        const creatorCanMerge = Boolean(accountId && slugs.length && (await Promise.all(slugs.map((slug) =>
+          this.deps.githubApp!.repositoryPermission(createdBy.userId, slug, accountId).catch(() => undefined))))
+          .every((permission) => permission?.canMerge));
+        if (!creatorCanMerge && slugs.length) {
+          const confirmer = manifest.params.find((field) => field.type === 'confirmer');
+          const layers = confirmer ? confirmLayersOf(resolved[confirmer.name] as any) : [];
+          const routedUsers = [...new Set((await __asyncCollections.flatMap(layers.filter((layer) => layer.kind === 'human'), async (layer) => (await this.deps.store.humanAudience(task.id, layer.audience)))))];
+          let routedEligible = false;
+          for (const userId of routedUsers) {
+            const reviewerAccount = (await this.deps.githubApp.activeUserAccountId(userId));
+            if (!reviewerAccount) continue;
+            const permissions = await Promise.all(slugs.map((slug) =>
+              this.deps.githubApp!.repositoryPermission(userId, slug, reviewerAccount).catch(() => undefined)));
+            if (permissions.every((permission) => permission?.canMerge)) { routedEligible = true; break; }
+          }
+          if (!routedEligible) {
+            const warning = 'The task creator cannot merge every GitHub repository and no selected human Review step currently routes to a connected person who can. The task may proceed, but it will stop at Merge for an eligible human.';
+            if (!(await this.deps.store.getTask(task.id))) return; // creation was undone meanwhile
+            (await this.deps.store.appendEvent({ taskId: task.id, type: 'github.merge.preflight-warning', ts: Date.now(),
+              payload: { warning, repositories: slugs } }));
+            (task as TaskRecord & { warnings?: string[] }).warnings = [warning];
+          }
         }
       }
-    }
+    };
     if (!args.draft) {
       try { (await this.assertHumanRoutes(task, manifest, resolved)); }
       catch (error) { (await this.deps.store.deleteTask(task.id)); throw error; }
     }
+    // Awaited only where the created task is returned, for its `warnings`.
+    const preflight = mergePreflight().catch(() => { /* advisory: never fails the create */ });
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
     // same way whether the task is queued now or saved as a draft.
@@ -1447,6 +1453,7 @@ export class KarmaxApi {
     }
     (await dispatchEnd());
     (await this.saveAgentSnapshot(task.id, manifest, input));
+    await preflight;
     // These attempts were explicitly requested as part of creation, so start all
     // of them. addAttempt() remains intentionally different: it creates one draft
     // for inspection/editing and never queues it implicitly.

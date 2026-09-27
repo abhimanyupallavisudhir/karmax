@@ -276,6 +276,8 @@ async function main() {
     entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
     env: workerEnvironment,
     onFailure: terminateOnWorkerFailure,
+    // Deliver the child's events to browsers now, not on the relay's next poll (LT-15).
+    onEvents: () => { void eventRelay?.wake(); },
   }) : new WorkerManager(conn, {
     store,
     worlds,

@@ -540,6 +540,8 @@ export const DEFAULT_GATEWAY_PORT = 4505;
 const LOGIN_MAX_FAILURES = 10;
 const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
+/** How long a live event socket reuses a task visibility decision (LT-15). */
+const SOCKET_DECISION_TTL_MS = 60_000;
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -585,6 +587,8 @@ export class Gateway {
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
   private wikiWork = new Set<Promise<void>>();
+  /** Projects whose local wiki repository this gateway process has ensured. */
+  private wikiLocalReady = new Set<string>();
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
   private wikiRemoteRetryAfter = new Map<string, number>();
@@ -694,6 +698,27 @@ export class Gateway {
       if (data.toString().length > 1024) return;
       try { (await delivery.acknowledge(JSON.parse(data.toString()))); } catch { /* invalid observation */ }
     });
+    // Decide each task's visibility once and reuse it (LT-15): re-verifying the
+    // token cost several store reads per event per socket, and a streaming agent
+    // publishes several events a second. A decision lasts until the token
+    // expires and at most SOCKET_DECISION_TTL_MS, so revocation and membership
+    // changes still reach sockets that stay open.
+    const decisions = new Map<string, { allowed: Promise<boolean>; until: number }>();
+    const mayRead = (projectId: string | undefined, taskId: string): Promise<boolean> => {
+      const key = `${projectId ?? ''}\0${taskId}`;
+      const cached = decisions.get(key);
+      if (cached && cached.until > Date.now()) return cached.allowed;
+      if (decisions.size >= 4096) decisions.clear();
+      const allowed = (async () => {
+        if ((await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok) return true;
+        const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
+        return allows(humanCaps ?? [], 'task:event:read');
+      })();
+      // A failed lookup is not a decision: the next event asks again.
+      allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
+      decisions.set(key, { allowed, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS, scoped?.expiresAt ?? Infinity) });
+      return allowed;
+    };
     const off = this.fanout.on(async (ev, projectId) => {
       // Reconnect/backfill from durable state rather than allowing a slow
       // browser's send queue to grow without bound.
@@ -704,10 +729,7 @@ export class Gateway {
       }
       if (ev.type === 'timing' && !(await this.cachedTimingEnabled())) return;
       if (scoped?.projectId && projectId !== scoped.projectId) return;
-      if (!(await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined)).ok) {
-        const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
-        if (!allows(humanCaps ?? [], 'task:event:read')) return;
-      }
+      if (!(await mayRead(projectId, ev.taskId).catch(() => false))) return;
       try {
         const payload = ev.payload as Record<string, unknown>;
         const timingDeliveryId = (ev.type === 'agent.activity' && payload.kind === 'message' && payload.title
@@ -4512,7 +4534,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           const project = (await store.getProject(projectId));
-          if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+          if (project) await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
           const task = await api.createTask(token, { projectId, ...b }, receivedAt);
           return this.json(res, 200, task);
         }
@@ -4708,7 +4730,7 @@ export class Gateway {
       if (queueMatch && method === 'POST') {
         const queued = (await store.getTask(queueMatch[1]!));
         const project = queued ? (await store.getProject(queued.projectId)) : undefined;
-        if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+        if (project) await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const taskPayments = p.match(/^\/api\/tasks\/([^/]+)\/payments$/);
@@ -7657,11 +7679,22 @@ export class Gateway {
     void work.finally(() => this.wikiWork.delete(work)).catch(() => {});
   }
 
+  /** A task start needs its project's local wiki repository, and once this
+   * gateway has ensured it, it exists. Ensuring it again waits in the wiki's
+   * Git lane, which can sit behind a remote sync, so a start refreshes it
+   * alongside rather than before creating the task (LT-16). */
+  private async wikiForTaskStart(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
+    if (!this.wikiLocalReady.has(project.id)) return this.ensureProjectWiki(project, userId);
+    this.trackWikiWork(this.ensureProjectWiki(project, userId).catch(error =>
+      console.warn(`[karmax] could not refresh wiki for ${project.id}:`, error instanceof Error ? error.message : error)));
+  }
+
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
     if (this.closing) return;
     const root = await ensureProjectWikiRepositoryAsync(paths().content, project.id);
     if (this.closing) return;
     if (!(await this.deps.store.projectWiki(project.id))) (await this.deps.store.setProjectWikiRepository(project.id));
+    this.wikiLocalReady.add(project.id);
     const current = (await this.deps.store.projectWiki(project.id))?.repository;
     if (current && this.wikiRemotesReady.has(project.id)) return;
     if (!this.deps.githubApp) return;

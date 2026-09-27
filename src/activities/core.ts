@@ -38,6 +38,7 @@ import {
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn, type QueuedDelegation } from '../agent/runtime.js';
 import { SecretScrubber } from '../agent/activity.js';
+import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -1728,9 +1729,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         attempt: timingAttempt, role: args.role, requestIds }, async row => (await record(args.taskId, 'timing', { ...row }))));
       trace.signal = timingSignal;
       // Sandbox resume, history/tool preparation and final artifact retention
-      // can each outlast the heartbeat timeout. The runtime's timer only covers
-      // the provider call. Keep this entire activity alive, retaining the exact
-      // retry session even before world.open finishes, and stop on every exit.
+      // can each outlast the heartbeat timeout. Keep this entire activity alive,
+      // retaining the exact retry session even before world.open finishes, and
+      // stop on every exit. This is the turn's one liveness timer: it also
+      // delivers cancellation through a silent provider stretch (LT-13).
       const keepAlive = heartbeat ? setInterval(() => {
         try { heartbeat!(); } catch { /* cancellation is handled by the activity */ }
       }, 1_000) : undefined;
@@ -2314,17 +2316,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // into the running session. Backed by the workflow's `pendingMessages` query;
       // absent when there's no client (unit tests) or the workflow doesn't define it
       // (the query throws → treated as "no new messages").
+      // The query runs only once a follow-up has been journaled (LT-13).
       const pullFollowUps: ((fromIndex: number) => Promise<Message[]>) | undefined =
         deps.client && liveChannel
-          ? async (fromIndex: number) => {
-              try {
-                const handle = deps.client!.workflow.getHandle(args.taskId);
-                const out = (await handle.query('pendingMessages', args.role, fromIndex)) as Message[] | undefined;
-                return Array.isArray(out) ? await materializeFileAttachments(world, out) : [];
-              } catch {
-                return []; // query not registered / workflow gone / transient — no injection
-              }
-            }
+          ? gateFollowUps({
+              query: async (fromIndex: number) => {
+                try {
+                  const handle = deps.client!.workflow.getHandle(args.taskId);
+                  const out = (await handle.query('pendingMessages', args.role, fromIndex)) as Message[] | undefined;
+                  return Array.isArray(out) ? await materializeFileAttachments(world, out) : [];
+                } catch {
+                  return []; // query not registered / workflow gone / transient — no injection
+                }
+              },
+              cursor: () => store.latestEventSeq(),
+              journaled: async (seq) => (await store.eventsOfType(args.taskId, ['conversation.message', 'view.updated'], seq))
+                .map(event => ({ seq: event.seq, messageId: event.type === 'conversation.message'
+                  ? String((event.payload as { message?: { id?: string } }).message?.id ?? `seq:${event.seq}`) : undefined })),
+            })
           : undefined;
 
       // Confirm turns for sibling attempts share one durable transcript and run

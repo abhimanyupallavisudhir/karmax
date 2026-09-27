@@ -3352,7 +3352,8 @@ function connectWs() {
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     if (document.hidden) { S.liveUpdatesStale = true; return; }
-    if (S.tab === 'activity' && (!ev.projectId || ev.projectId === S.projectId)) {
+    // Streamed text chunks are the live bubble's, not activity (LT-5).
+    if (S.tab === 'activity' && ev.type !== 'agent.output' && (!ev.projectId || ev.projectId === S.projectId)) {
       S.activity.unshift(ev);
       if (S.activity.length > 400) S.activity.pop();
       bgRenderMain();
@@ -3373,11 +3374,19 @@ function connectWs() {
         if (S.taskEvents.length > 400) S.taskEvents.shift();
       }
       if (ev.type === 'agent.output' && ev.payload?.text) {
-        // Provider adapters emit the current complete block, not a token delta.
-        // Replacing avoids the old "H / He / Hello" cumulative transcript.
-        S.liveOutput = ev.payload.text;
-        updateLiveBubble();
+        // Adapters publish the whole text so far of the block being generated,
+        // not a token delta, so the bubble is replaced. Tool lines are timeline
+        // rows of their own and never replace it.
+        if (ev.payload.source === 'assistant') {
+          S.liveOutput = ev.payload.text;
+          S.liveOutputRole = ev.payload.role;
+          updateLiveBubble();
+        }
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
+        // The completed message supersedes its live text; a new or failed
+        // attempt voids it, so a half message never lingers as if final.
+        if (ev.type === 'agent.activity' && (ev.payload?.kind === 'turn' || ev.payload?.kind === 'message' && ev.payload?.phase === 'completed'))
+          S.liveOutput = '';
         scheduleTaskPageRender();
       }
       if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
@@ -6849,7 +6858,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
   // "let me merge master into this branch") bleeds into THIS page's live bubble
   // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
-  S.liveOutput = '';
+  S.liveOutput = ''; S.liveOutputRole = undefined;
   // Drop the previous task's view + per-task derived state up front. `S.view` is
   // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
   // fetched a few awaits later — so a render firing in that gap (a WS event, a
@@ -7029,7 +7038,7 @@ function closeTaskDom() {
   S.taskFileLoad = null;
   S.checkinSel = null;
   S.conversationFullscreen = false;
-  S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
+  S.liveOutput = ''; S.liveOutputRole = undefined; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
   if (reviewActionWs) { try { reviewActionWs.close(); } catch {} reviewActionWs = null; } // …and stops streaming a review action into the next page
@@ -8746,8 +8755,8 @@ function conversationPane(v, t) {
       : '';
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
-  const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
-  const live = t.role === liveRoleFor(v) && !hasStructuredMessages
+  // The bubble belongs to the conversation of the agent that is streaming.
+  const live = t.role === (S.liveOutputRole || liveRoleFor(v))
     ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
     : '';
   // Only subscription/CLI sessions carry a config home; API-key / stateless
@@ -10710,10 +10719,14 @@ function wireFollowups(v) {
 
 function updateLiveBubble() {
   const b = document.getElementById('live-bubble');
-  if (!b) return;
+  const thread = document.getElementById('ck-thread');
+  if (S.liveOutputRole && thread?.dataset.role && thread.dataset.role !== S.liveOutputRole) {
+    b?.classList.add('hidden'); // another agent's conversation is open
+    return;
+  }
+  if (!b) { if (thread) scheduleTaskPageRender(); return; } // this conversation gains its bubble
   // Follow the stream only when the reader is already parked at the bottom; if
   // they've scrolled up to read history, hold their view fixed as text streams in.
-  const thread = document.getElementById('ck-thread');
   const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
   b.classList.remove('hidden');
   b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
@@ -11044,7 +11057,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true).reverse();
+    S.activity = activity.filter(e => e.type !== 'agent.output' && (e.type !== 'timing' || S.meta?.timingEnabled === true)).reverse();
     renderMain();
   } catch {}
 }

@@ -89,6 +89,43 @@ function pollSecretEnv(live: Record<string, string>, pull: () => Promise<Record<
   return () => clearInterval(timer);
 }
 
+/** Streaming adapters re-emit the growing text of the block being generated,
+ * token by token. Publish the first chunk at once, then at most one update per
+ * window carrying the latest text, so a fast stream cannot flood the event log
+ * and every open console (LT-5). Tool lines are discrete and go out at once. */
+export const OUTPUT_PUBLISH_INTERVAL_MS = 150;
+
+function coalescedOutput(publish: (text: string, source?: 'assistant' | 'tool') => void) {
+  let lastAt = -Infinity;
+  let pending: { text: string; source?: 'assistant' | 'tool' } | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const send = (next: { text: string; source?: 'assistant' | 'tool' }) => {
+    pending = undefined;
+    lastAt = Date.now();
+    publish(next.text, next.source);
+  };
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = undefined; }
+    if (pending) send(pending);
+  };
+  return {
+    emit(text: string, source?: 'assistant' | 'tool') {
+      if (source !== 'assistant') { flush(); send({ text, source }); return; }
+      pending = { text, source };
+      const wait = lastAt + OUTPUT_PUBLISH_INTERVAL_MS - Date.now();
+      if (wait <= 0 && !timer) send(pending);
+      else timer ??= setTimeout(flush, wait);
+    },
+    /** Before anything that must follow the text (the item completing it, the turn's end). */
+    flush,
+    /** A failed or cancelled turn publishes nothing more. */
+    discard() {
+      if (timer) { clearTimeout(timer); timer = undefined; }
+      pending = undefined;
+    },
+  };
+}
+
 export const KARMAX_RUNTIME_PROTOCOL = 1 as const;
 export interface RuntimeTurnRequestV1 { version: typeof KARMAX_RUNTIME_PROTOCOL; input: TurnInput }
 
@@ -160,6 +197,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const drainObservers = async () => {
     while (observers.size) await Promise.all(observers);
   };
+  const output = coalescedOutput((text, source) => { observe(async () => {
+    const observed = text.trim() ? outputObserved() : undefined;
+    const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
+    await Promise.all([deps.onEmit?.(text, source), observed, firstText]);
+  }); });
 
   const ctx: PlatformToolContext = {
     openPr() {
@@ -265,12 +307,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       return deps.platformRequest(method, path, body);
     },
     fillPaymentCard: deps.fillPaymentCard,
-    emit(text, source) { return observe(async () => {
-      const output = text.trim() ? outputObserved() : undefined;
-      const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
-      await Promise.all([deps.onEmit?.(text, source), output, firstText]);
-    }); },
-    emitActivity(activity) { return observe(async () => {
+    emit(text, source) { output.emit(text, source); },
+    emitActivity(activity) { output.flush(); return observe(async () => {
       const output = outputObserved();
       const firstText = activity.kind === 'message' && activity.title?.trim() ? trace?.markOnce('first.text') : undefined;
       await Promise.all([deps.onActivity?.(activity), output, firstText]);
@@ -297,19 +335,6 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     } : undefined,
   };
 
-  // Liveness + cancellation delivery: beat every second for the turn's whole
-  // duration. Adapters also heartbeat on activity, but only this interval
-  // guarantees a long silent stretch — a big tool run, a slow first token — can't
-  // delay cancellation. The Worker caps heartbeat throttling at the same interval.
-  const hb = deps.heartbeat
-    ? setInterval(() => {
-        try {
-          deps.heartbeat!();
-        } catch {
-          /* never let a heartbeat failure kill the turn */
-        }
-      }, 1_000)
-    : undefined;
   const secretPoll = liveSecretEnv ? pollSecretEnv(liveSecretEnv, deps.pullSecretEnv!, secretEnvListeners) : undefined;
   let turn: AdapterTurn;
   try {
@@ -318,6 +343,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     await deps.onProviderStart?.();
     turn = await adapter.runTurn(input, ctx);
     deps.onProviderResult?.(turn);
+    if (!deps.signal?.aborted) output.flush();
     await drainObservers();
     if (observerFailed) throw observerError;
     // An adapter may deliberately swallow its provider's AbortError so it can clean
@@ -347,6 +373,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     }));
     if (observerFailed) throw observerError;
   } catch (error) {
+    output.discard();
     await observe(() => deps.onActivity?.({
       id: 'turn',
       kind: 'turn',
@@ -356,7 +383,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     }));
     throw error;
   } finally {
-    if (hb) clearInterval(hb);
+    output.discard();
     secretPoll?.();
     await drainObservers();
   }
