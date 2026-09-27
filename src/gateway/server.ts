@@ -8,6 +8,7 @@ import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
+import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { TimingDelivery } from '../timing/delivery.js';
 import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
 import { probeConnection } from '../mcp/connections/probe.js';
@@ -8141,8 +8142,11 @@ export class Gateway {
         const real = await fs.promises.realpath(hostPath);
         const realBase = await fs.promises.realpath(hostBase).catch(() => hostBase);
         if (real !== realBase && !real.startsWith(realBase + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+        if ((await fs.promises.stat(real)).size > MAX_REVIEW_ARTIFACT_BYTES) return this.json(res, 413, { error: 'file exceeds 100 MiB' });
       }
-      const data = await world.readFileBuffer(relPath);
+      // One byte past the cap tells a larger file apart without loading it whole.
+      const data = await readWorldFilePrefix(world, relPath, MAX_REVIEW_ARTIFACT_BYTES + 1);
+      if (data.length > MAX_REVIEW_ARTIFACT_BYTES) return this.json(res, 413, { error: 'file exceeds 100 MiB' });
       const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
       const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {

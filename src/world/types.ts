@@ -342,6 +342,8 @@ export interface World {
   exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
   readFile(relPath: string): Promise<string>;
   readFileBuffer(relPath: string): Promise<Buffer>;
+  /** At most `maxBytes` from the start of a regular file (world/file-prefix.ts). */
+  readFilePrefix?(relPath: string, maxBytes: number): Promise<Buffer>;
   writeFile(relPath: string, content: string): Promise<void>;
   writeFileBuffer?(relPath: string, content: Buffer): Promise<void>;
   listFiles(): Promise<string[]>;

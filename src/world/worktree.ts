@@ -14,6 +14,7 @@ import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
 import { addCheckoutWith } from './checkout.js';
 import { materializeGitCredential } from './git-credential.js';
+import { readRegularFilePrefix } from './file-prefix.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -465,6 +466,10 @@ class WorktreeWorld implements World {
 
   async readFileBuffer(relPath: string): Promise<Buffer> {
     return fs.promises.readFile(this.filePath(relPath));
+  }
+
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    return readRegularFilePrefix(this.filePath(relPath), maxBytes);
   }
 
   async writeFile(relPath: string, content: string): Promise<void> {

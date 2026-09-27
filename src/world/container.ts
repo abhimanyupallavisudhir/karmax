@@ -10,6 +10,7 @@ import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
 import { boundedResponseBody } from './http.js';
 import { openSpawnedPty, runLocalCommand, startSpawnedProcess } from './local-execution.js';
+import { readRegularFilePrefix } from './file-prefix.js';
 
 const pexec = promisify(execFile);
 const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22';
@@ -200,6 +201,9 @@ class ContainerWorld implements World {
   }
   async readFileBuffer(rel: string): Promise<Buffer> {
     return fs.promises.readFile(this.filePath(rel));
+  }
+  async readFilePrefix(rel: string, maxBytes: number): Promise<Buffer> {
+    return readRegularFilePrefix(this.filePath(rel), maxBytes);
   }
   async writeFile(rel: string, content: string): Promise<void> {
     const abs = this.filePath(rel);

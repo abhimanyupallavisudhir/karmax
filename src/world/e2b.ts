@@ -492,6 +492,31 @@ class E2BWorld implements World {
     return typeof value === 'string' ? Buffer.from(value) : Buffer.from(toBytes(value));
   }
 
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    const abort = new AbortController();
+    const stream = await this.sandbox.files.read(this.filePath(relPath),
+      { format: 'stream', signal: abort.signal }) as unknown as ReadableStream<Uint8Array>;
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let length = 0, finished = false;
+    try {
+      while (length < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done) { finished = true; break; }
+        const chunk = Buffer.from(value.buffer, value.byteOffset, Math.min(value.byteLength, maxBytes - length));
+        chunks.push(chunk);
+        length += chunk.length;
+      }
+    } finally {
+      // Stop the download at the limit instead of draining the rest.
+      if (!finished) {
+        await reader.cancel().catch(() => undefined);
+        abort.abort();
+      }
+    }
+    return Buffer.concat(chunks, length);
+  }
+
   async writeFile(relPath: string, content: string): Promise<void> {
     await this.sandbox.files.write(this.filePath(relPath), content);
   }

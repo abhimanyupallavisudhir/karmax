@@ -4,6 +4,7 @@ import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
+import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
@@ -24,6 +25,8 @@ export interface ToolSchema {
 
 const MAX_OUTPUT = 12_000;
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
+/** UTF-8 spends at most 3 bytes per UTF-16 unit, so this many bytes always decode past MAX_OUTPUT. */
+const READ_FILE_MAX_BYTES = MAX_OUTPUT * 4;
 
 export { MAX_REVIEW_TEXT_LENGTH };
 
@@ -893,7 +896,9 @@ export function platformToolHandlers(
     },
     async read_file(args) {
       try {
-        return truncate(await world.readFile(String(args?.path ?? '')));
+        // A longer file still fills the result, so a huge one never has to
+        // reach this process whole (AD-1).
+        return truncate((await readWorldFilePrefix(world, String(args?.path ?? ''), READ_FILE_MAX_BYTES)).toString('utf8'));
       } catch (e: any) {
         return `error: ${e?.message ?? e}`;
       }

@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
 import { openLocalPty, startLocalProcess } from './local-execution.js';
+import { readRegularFilePrefix } from './file-prefix.js';
 
 const pexec = promisify(execFile);
 
@@ -62,6 +63,9 @@ class MemoryWorld implements World {
   }
   async readFileBuffer(relPath: string): Promise<Buffer> {
     return fs.promises.readFile(this.filePath(relPath));
+  }
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    return readRegularFilePrefix(this.filePath(relPath), maxBytes);
   }
   async writeFile(relPath: string, content: string): Promise<void> {
     const abs = this.filePath(relPath);

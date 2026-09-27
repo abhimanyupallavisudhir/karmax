@@ -360,6 +360,14 @@ class DaytonaWorld implements World {
 
   async readFile(relPath: string): Promise<string> { return (await this.readFileBuffer(relPath)).toString('utf8'); }
   async readFileBuffer(relPath: string): Promise<Buffer> { return this.sandbox.fs.downloadFile(this.file(relPath)); }
+  /** The SDK only downloads whole files and returns command output as text,
+   * so the sandbox cuts the prefix and base64-encodes it in one command. */
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    const read = await this.exec('sh', ['-c', 'test -f "$1" || { echo "not a regular file" >&2; exit 1; }; '
+      + 'head -c "$2" -- "$1" | base64 | tr -d "\\n"', 'sh', this.file(relPath), String(maxBytes)]);
+    if (read.code !== 0) throw new Error(read.stderr.trim() || `could not read ${relPath}`);
+    return Buffer.from(read.stdout.trim(), 'base64');
+  }
   async writeFile(relPath: string, content: string): Promise<void> { await this.writeFileBuffer(relPath, Buffer.from(content)); }
   async writeFileBuffer(relPath: string, content: Buffer): Promise<void> {
     const target = this.file(relPath);

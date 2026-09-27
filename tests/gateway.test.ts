@@ -1051,6 +1051,12 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const symlinkEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=escape-link`, { headers: auth() });
     expect(symlinkEscape.status).toBe(400);
     await fs.promises.unlink(`${view.worldPath}/escape-link`);
+    // A file past the cap is refused, not loaded whole into the gateway (AD-1).
+    fs.writeFileSync(`${view.worldPath}/huge.bin`, '');
+    fs.truncateSync(`${view.worldPath}/huge.bin`, 101 * 1024 * 1024);
+    const huge = await fetch(`${base}/api/tasks/${task.id}/file?path=huge.bin`, { headers: auth() });
+    expect(huge.status).toBe(413);
+    await fs.promises.unlink(`${view.worldPath}/huge.bin`);
 
     // Land through the real workflow and release the Git worktree. The same
     // authenticated attachment URL must survive; no Git fallback can supply
