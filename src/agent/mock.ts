@@ -1,5 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
+import { providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 
 /**
@@ -225,13 +226,16 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`slept ${ms}ms`);
           break;
         }
+        // The mock stands in for a provider, so its failures are typed the way a
+        // real adapter types a provider's error: only provider-tagged failures
+        // may park a login (AD-2/AD-7); anything else stays a plain Error.
         case 'fail':
-          throw new Error(rest || 'mock failure');
+          throw providerErrorFromMessage('mock', rest || 'mock failure');
         case 'failonce': {
           const key = `${input.world.handle.id}:${rest}`;
           if (!failedOnce.has(key)) {
             failedOnce.add(key);
-            throw new Error(rest || 'mock transient failure');
+            throw providerErrorFromMessage('mock', rest || 'mock transient failure');
           }
           // Reached only when the retry REPLAYED the original prompt (no session
           // resume); a resumed retry sees just the continuation nudge instead.
