@@ -71,6 +71,7 @@ import {
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
   renderGithubActionsFailure,
+  summarizeGithubActionsFailure,
   type GithubActionsApi,
   type GithubActionsFailureDecision,
 } from '../integrations/github-actions.js';
@@ -3687,10 +3688,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: `GitHub could not be inspected or updated: ${detail}`,
         };
       };
-      const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness) => {
+      // `brief` is for people: a line of each check's output, not its log.
+      const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness, brief = false) => {
         const failures = (readiness.failedChecks ?? []).slice(0, 12).map((check) => {
           const detail = check.detail?.trim();
-          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${detail ? `\n${detail.slice(0, 12_000)}` : ''}`;
+          const limit = brief ? 300 : 12_000;
+          const shown = detail && detail.length > limit ? `${detail.slice(0, limit)}…` : detail;
+          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${shown ? `\n${shown}` : ''}`;
         });
         return [
           `Pull request ${ref.slug}#${ref.number} has terminally failing CI (${readiness.checks}).`,
@@ -3704,6 +3708,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         inspection: Awaited<ReturnType<typeof inspectionFor>>,
       ): Promise<GitHubMergeAuthorization | { status: 'checks-satisfied' }> => {
         const summary = ciFailureDetail(ref, readiness);
+        const briefSummary = ciFailureDetail(ref, readiness, true);
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
         const fallbackIdentityKey = githubRequiredCheckKey({
@@ -3896,33 +3901,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const providerFailure = classifyGithubCheckStates((readiness.failedChecks ?? []).map(check => check.state));
           if (providerFailure?.disposition === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\n${providerFailure.reason}`,
+            detail: `${briefSummary}\n\n${providerFailure.reason}`,
             waitReason: providerFailure.waitReason,
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure?.disposition === 'retry') {
             (await fallbackObservation(fallbackIdentityKey, providerFailure.disposition));
             return (await externalWait(fallbackIdentityKey,
-              `${summary}\n\nGitHub reports an interrupted check, but exact-head Actions inspection is unavailable. Waiting for a replacement without rerunning or reopening the proposal; admission is released while inspection is unavailable.`));
+              `${briefSummary}\n\nGitHub reports an interrupted check, but exact-head Actions inspection is unavailable. Waiting for a replacement without rerunning or reopening the proposal; admission is released while inspection is unavailable.`));
           }
           const permissionFailure = inspectionFailures.find(({ error }) =>
             error instanceof GithubActionsApiError && [401, 403].includes(error.status));
           if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
             waitReason: 'GitHub Actions inspection unavailable',
-            detail: `${summary}\n\nExact-head Actions inspection is unavailable. Restore the GitHub App Actions read permission or inspect the run on GitHub before deciding whether code needs repair. Check text alone cannot establish the cause.`,
+            detail: `${briefSummary}\n\nExact-head Actions inspection is unavailable. Restore the GitHub App Actions read permission or inspect the run on GitHub before deciding whether code needs repair. Check text alone cannot establish the cause.`,
             eligibleUserIds: [actorUserId],
           };
           if (actionReconciliationFailed && runIds.length && !permissionFailure) return {
             status: 'retryable-error', prs: current, actorUserId,
-            detail: `${summary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
+            detail: `${briefSummary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
           };
           const fallbackKey = fallbackIdentityKey;
           (await fallbackObservation(fallbackKey, 'revision'));
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === fallbackKey);
           if (repairRequested) return (await externalWait(fallbackKey,
-            `${summary}\n\nThis exact terminal CI result was already sent for repair, but the pull-request candidate is unchanged. Waiting for a new run or candidate instead of waking Do again.`));
+            `${briefSummary}\n\nThis exact terminal CI result was already sent for repair, but the pull-request candidate is unchanged. Waiting for a new run or candidate instead of waking Do again.`));
           (await record(handle.id, 'github.ci.repair-requested', {
             key: fallbackKey, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
             runId: runIds[0] ?? 0, attempt: 0,
@@ -3935,9 +3940,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
         }
         const detail = decisions.map(({ decision }) => renderGithubActionsFailure(decision)).join('\n\n').slice(0, 128_000);
+        // Full diagnostics are for the agent; a person gets the brief form.
+        const brief = decisions.map(({ decision }) => summarizeGithubActionsFailure(decision)).join('\n\n');
+        // Reruns the failed jobs of one exact run; returns a decision only when
+        // GitHub refuses.
+        const rerun = async (
+          { decision, key }: (typeof decisions)[number], rerunNumber: number, reason?: string,
+        ): Promise<GitHubMergeAuthorization | undefined> => {
+          const { id, attempt } = decision.inspection.run;
+          try {
+            await inspection.actions!.rerun(ref.slug, id, true);
+          } catch (error) {
+            const blocked = error instanceof GithubActionsApiError && [401, 403, 404, 422].includes(error.status);
+            return {
+              status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
+              detail: `${brief}\n\nGitHub rejected the automatic rerun: ${error instanceof Error ? error.message : String(error)}`,
+              ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
+            };
+          }
+          (await record(handle.id, 'github.ci.rerun-requested', {
+            ...ref, key, runId: id, observedAttempt: attempt, rerunNumber, ...(reason ? { reason } : {}),
+          }));
+          return undefined;
+        };
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
-          status: 'needs-human', prs: current, actorUserId, detail,
+          status: 'needs-human', prs: current, actorUserId,
+          detail: `${brief}\n\n${human.decision.reason}`,
           waitReason: human.decision.waitReason,
           eligibleUserIds: [actorUserId],
         };
@@ -3945,8 +3974,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (revision) {
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === revision.key);
-          if (repairRequested) return (await externalWait(revision.key,
-            `${detail}\n\nThis exact terminal run was already sent for repair, but the repository, pull request, candidate head, run, and attempt are unchanged. Waiting for a substantive external change instead of reopening the proposal.`));
+          // The key pins the head, so a repair that is already recorded means
+          // Do resubmitted the exact revision: it found nothing to fix. Only a
+          // new run can change GitHub's answer, so start one (task 389). A
+          // second failure on the same revision is evidence the agent missed
+          // something, which a person must weigh.
+          if (repairRequested) {
+            const run = revision.decision.inspection.run;
+            const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
+              && event.payload?.key === revision.key && event.payload?.reason === 'unchanged-after-repair');
+            if (reruns.some((event) => Number(event.payload?.runId) === run.id
+              && Number(event.payload?.observedAttempt) === run.attempt))
+              return { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+            if (reruns.length) return {
+              status: 'needs-human', prs: current, actorUserId,
+              waitReason: 'CI failed again after a rerun',
+              detail: `The agent found no code problem, but CI failed again after an automatic rerun of the same commit.\n${brief}\n\nSend a follow-up to return it to the agent, or rerun CI on GitHub and confirm.`,
+              eligibleUserIds: [actorUserId],
+            };
+            return (await rerun(revision, reruns.length + 1, 'unchanged-after-repair'))
+              ?? { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+          }
           (await record(handle.id, 'github.ci.repair-requested', {
             key: revision.key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
             runId: revision.decision.inspection.run.id, attempt: revision.decision.inspection.run.attempt,
@@ -3965,25 +4013,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             Number(event.payload?.runId) === retry.decision.inspection.run.id
             && Number(event.payload?.observedAttempt) === retry.decision.inspection.run.attempt);
           if (!alreadyRequested && reruns.length < 2) {
-            try {
-              await inspection.actions.rerun(ref.slug, retry.decision.inspection.run.id, true);
-              (await record(handle.id, 'github.ci.rerun-requested', {
-                ...ref, key: retry.key, runId: retry.decision.inspection.run.id,
-                observedAttempt: retry.decision.inspection.run.attempt,
-                rerunNumber: reruns.length + 1,
-              }));
-            } catch (error) {
-              const blocked = error instanceof GithubActionsApiError && [401, 403, 404, 422].includes(error.status);
-              return {
-                status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
-                detail: `${detail}\n\nGitHub rejected the automatic rerun: ${error instanceof Error ? error.message : String(error)}`,
-                ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
-              };
-            }
+            const rejected = await rerun(retry, reruns.length + 1);
+            if (rejected) return rejected;
           } else if (!alreadyRequested && reruns.length >= 2) {
             return {
               status: 'needs-human', prs: current, actorUserId,
-              detail: `${detail}\n\nThe exact workflow run remained transiently broken after two automatic reruns. Inspect GitHub's runner or repository configuration before retrying.`,
+              detail: `${brief}\n\nThe exact workflow run remained transiently broken after two automatic reruns. Inspect GitHub's runner or repository configuration before retrying.`,
               eligibleUserIds: [actorUserId],
             };
           }

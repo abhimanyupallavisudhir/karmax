@@ -562,6 +562,23 @@ export function renderGithubActionsFailure(
   return rendered.length <= maxChars ? rendered : `${rendered.slice(0, maxChars)}\n[Additional diagnostics omitted at the task-event safety limit.]`;
 }
 
+/** A person-sized account of the same failure: which run and job failed and
+ * where to look. Logs belong in the repair prompt and on GitHub, not in a
+ * request for human input. */
+export function summarizeGithubActionsFailure(decision: GithubActionsFailureDecision): string {
+  const { run, failedJobs, notices } = decision.inspection;
+  const failed = failedJobs.slice(0, 6).map((job) => {
+    const steps = job.steps.filter((step) => FAILURE_CONCLUSIONS.has(String(step.conclusion ?? '').toLowerCase()));
+    return `- ${job.name}${steps.length ? `: ${steps.map((step) => step.name).join(', ')}` : ''}`;
+  });
+  return [
+    `GitHub Actions run ${run.name} #${run.runNumber} (attempt ${run.attempt}) concluded ${run.conclusion ?? run.status}.`,
+    ...(run.url ? [`Run: ${run.url}`] : []),
+    ...(failed.length ? ['Failed:', ...failed] : []),
+    ...notices.slice(0, 3).map((notice) => `Note: ${notice.slice(0, 200)}`),
+  ].join('\n');
+}
+
 export function githubActionsRunIdFromUrl(value: string | undefined): number | undefined {
   const match = value?.match(/\/actions\/runs\/(\d+)(?:\/|$)/);
   if (!match) return undefined;
