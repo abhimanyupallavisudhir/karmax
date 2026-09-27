@@ -2635,9 +2635,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Dropping them cuts the single biggest events-table growth driver
           // (one row per chunk) without changing what the UI renders.
           onEmit: async (t, source) => {
-            if (t === lastEmit) return;
-            lastEmit = t;
-            (await record(args.taskId, 'agent.output', { text: secrets.scrub(t), source, role: args.role,
+            // Assistant text is still being generated and may end mid-secret.
+            const text = source === 'assistant' ? secrets.scrubPartial(t) : secrets.scrub(t);
+            if (text === lastEmit || !text && source === 'assistant') return;
+            lastEmit = text;
+            (await record(args.taskId, 'agent.output', { text, source, role: args.role,
               turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt }));
           },
           ...(delegationKey ? {

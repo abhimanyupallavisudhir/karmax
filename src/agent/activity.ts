@@ -85,7 +85,30 @@ export class SecretScrubber {
     for (const value of this.values) if (text.includes(value)) text = text.split(value).join('[redacted]');
     return text;
   }
+
+  /** `scrub` for the text so far of a block still being generated. A cut can
+   * fall inside a value, which then cannot match whole, so a tail that begins
+   * one (at least PARTIAL_SECRET_CHARS of it) is held back until more text
+   * arrives and the whole value can be replaced. */
+  scrubPartial(text: string): string {
+    let end = text.length;
+    for (let held = true; held;) {
+      held = false;
+      for (const value of this.values) {
+        for (let length = Math.min(value.length - 1, end); length >= Math.min(PARTIAL_SECRET_CHARS, value.length); length--) {
+          if (!text.startsWith(value.slice(0, length), end - length)) continue;
+          end -= length;
+          held = true;
+          break;
+        }
+      }
+    }
+    return this.scrub(text.slice(0, end));
+  }
 }
+
+/** The shortest start of a secret a live publication may not end with. */
+const PARTIAL_SECRET_CHARS = 4;
 
 /**
  * Tools whose arguments OR results carry plaintext secrets end-to-end. Their
