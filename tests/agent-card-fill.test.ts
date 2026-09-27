@@ -7,12 +7,20 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import { BudgetService } from '../src/autonomy/payments.js';
 import * as credentialFill from '../src/autonomy/fill.js';
 import * as cardFill from '../src/autonomy/card-fill.js';
+import * as connectionRuntime from '../src/mcp/connections/runtime.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); });
 
-it.each(['container', 'e2b'] as const)('fills the browser where the %s task runs it (AU-11)', async kind => {
+// Containers (WD-6) and V2 cloud sandboxes run the agent and its browser MCP
+// inside the world; a local world drives the host browser.
+it.each([
+  ['container', { kind: 'container' }, true],
+  ['cloud', { kind: 'e2b', version: 2, sealedProviderRef: 'sealed' }, true],
+  ['local', { kind: 'memory' }, false],
+] as const)('fills the browser where the %s task runs it (AU-11)', async (_name, shape, inWorld) => {
+  vi.spyOn(connectionRuntime, 'prepareConnections').mockResolvedValue([]);
   const fillViaCdp = vi.spyOn(credentialFill, 'fillViaCdp').mockResolvedValue({ origin: 'https://shop.example.com' });
   const fillCardInWorld = vi.spyOn(cardFill, 'fillCardInWorld').mockResolvedValue({ origin: 'https://shop.example.com' });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-card-routing-'));
@@ -36,12 +44,13 @@ it.each(['container', 'e2b'] as const)('fills the browser where the %s task runs
     } }]]) });
   const handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
   const world = await worlds.open(handle);
-  const open = vi.spyOn(worlds, 'open').mockResolvedValue({ ...world, handle: { ...handle, kind } });
+  const shaped = { ...handle, ...shape } as typeof handle;
+  const open = vi.spyOn(worlds, 'open').mockResolvedValue(Object.assign(Object.create(Object.getPrototypeOf(world)), world, { handle: shaped }));
   try {
-    await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: { ...handle, kind }, messages: [],
+    await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: shaped, messages: [],
       task: { projectId: project.id, title: task.title, prompt: '', project: {}, workflow: 'just-do' } as any });
-    expect(fillCardInWorld).toHaveBeenCalledTimes(kind === 'e2b' ? 1 : 0);
-    expect(fillViaCdp).toHaveBeenCalledTimes(kind === 'container' ? 3 : 0);
+    expect(fillCardInWorld).toHaveBeenCalledTimes(inWorld ? 1 : 0);
+    expect(fillViaCdp).toHaveBeenCalledTimes(inWorld ? 0 : 3);
   } finally {
     open.mockRestore();
     await core.destroyWorld(handle);

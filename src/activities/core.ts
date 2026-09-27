@@ -73,7 +73,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
-import { materializeRemoteSession } from '../agent/remote-process.js';
+import { isRemoteAgentWorld, materializeRemoteSession } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -2603,7 +2603,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const details = await provider.retrieveCardDetails(card.id);
                   const expected = [domain];
                   let origin: string;
-                  if (isRemote(world.handle.kind)) {
+                  // Fill the browser the agent's MCP drives: inside the world whenever
+                  // the agent itself runs there (cloud sandboxes and containers).
+                  if (isRemoteAgentWorld(world)) {
                     origin = (await fillCardInWorld(world, {
                       cdpUrl: fill.cdpUrl, domain, selectors: fill.selectors, details,
                     })).origin;
