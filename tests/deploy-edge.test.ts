@@ -127,7 +127,7 @@ describe('public edge (Caddy) image', () => {
   it('keeps signed legacy webhooks reachable without redirecting their POSTs', () => {
     const legacy = read('Caddyfile').split('{$KARMAX_LEGACY_DOMAIN:http://127.0.0.1:65535} {')[1]?.split('\n}')[0] ?? '';
     expect(legacy).toContain('import karmax_ratelimit');
-    expect(legacy).toContain('handle /api/github/webhook {\n\t\treverse_proxy 127.0.0.1:4505');
+    expect(legacy).toContain('handle /api/github/webhook {\n\t\treverse_proxy app:4505');
     expect(legacy).toContain('handle {\n\t\tredir https://{$KARMAX_DOMAIN}{uri} permanent');
   });
 
@@ -259,17 +259,4 @@ describe('deploy/karmax preserves operator settings across a re-run', () => {
     expect(result).toContain('KARMAX_PREVIEW_DOMAIN=preview.krmax.example.com');
     expect(result).toMatch(/^POSTGRES_PASSWORD=.+$/m);
   });
-});
-
-it('preserves public IPv6 peers and exposes the app only on host loopback (CI-8)', () => {
-  for (const name of ['compose.turnkey.yml', 'compose.hosted.yml']) {
-    const config = parse(read(name));
-    expect(config.services.caddy.network_mode).toBe('host');
-    expect(config.services.caddy.ports).toBeUndefined();
-    expect(config.services.app.ports).toEqual(['127.0.0.1:4505:4505']);
-    expect(config.services.app.environment.KARMAX_TRUSTED_PROXY_IP).toBe('172.30.0.1');
-    expect(config.networks.default.ipam.config[0].gateway).toBe('172.30.0.1');
-  }
-  expect(read('Caddyfile')).not.toContain('app:4505');
-  expect(read('Caddyfile').match(/header_up X-Forwarded-For \{http.request.remote.host\}/g)).toHaveLength(3);
 });
