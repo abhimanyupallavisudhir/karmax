@@ -62,7 +62,7 @@ it('refuses to wipe state when a recorded pid belongs to another process', () =>
       env: { ...process.env, KARMAX_HOME: home }, encoding: 'utf8',
     });
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('is not the Temporal dev server');
+    expect(result.stderr).toContain('Cannot verify the recorded Temporal process');
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('live');
     expect(() => process.kill(other.pid!, 0)).not.toThrow();
   } finally {

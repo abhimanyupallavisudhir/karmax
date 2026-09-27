@@ -1,9 +1,15 @@
 import { currentTiming } from '../timing/index.js';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
+import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
+
+export interface QueuedDelegation {
+  subTasks?: { title: string; prompt: string }[];
+  subTaskResponses?: SubTaskResponse[];
+}
 
 export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
@@ -13,6 +19,12 @@ export interface RunTurnDeps {
   onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void | Promise<void>;
+  /** Sub-task spawns and answers this turn queued before a retry interrupted it.
+   *  The tool told the agent they were queued, and a resumed agent will not
+   *  queue them again, so they belong to this turn's result. */
+  queuedDelegation?: QueuedDelegation;
+  /** Persist queued spawns/answers before the tool acknowledges them. */
+  onDelegation?: (queued: QueuedDelegation) => void | Promise<void>;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
     request(ctx: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -113,8 +125,15 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let confirmDecision: ConfirmDecision | undefined;
   let raise: RaiseToParent | undefined;
   let waitForSubtasks = false;
-  const subTasks: { title: string; prompt: string }[] = [];
-  const subTaskResponses: SubTaskResponse[] = [];
+  const subTasks: { title: string; prompt: string }[] = [...(deps.queuedDelegation?.subTasks ?? [])];
+  const subTaskResponses: SubTaskResponse[] = [...(deps.queuedDelegation?.subTaskResponses ?? [])];
+  // A resumed agent may queue the same request again; deliver it once.
+  const queueDelegation = async <T>(list: T[], item: T) => {
+    const key = JSON.stringify(item);
+    if (list.some(existing => JSON.stringify(existing) === key)) return;
+    list.push(item);
+    await deps.onDelegation?.({ subTasks: [...subTasks], subTaskResponses: [...subTaskResponses] });
+  };
   const skills: { name: string; content: string }[] = [];
   // Set only if the agent partitioned its change across another branch this turn.
   let worldHandle: import('../world/types.js').WorldHandle | undefined;
@@ -168,9 +187,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // Providers can dispatch tools concurrently. Serialize accumulation with
       // publication so an overlapping call cannot overwrite another's actions.
       const publication = reviewPublication.then(async () => {
-        const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
-        const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+        const call = validateReviewInfoCall(info);
+        const actions = call.actions ? [...(reviewInfo?.actions ?? []), ...call.actions] : reviewInfo?.actions;
+        const supplied = Object.fromEntries(Object.entries(call).filter(([, value]) => value !== undefined));
         const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
+        assertReviewInfoTotal(nextReviewInfo);
         await deps.onReviewInfo?.(nextReviewInfo, info);
         reviewInfo = nextReviewInfo;
       });
@@ -178,11 +199,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       reviewPublication = publication.catch(() => {});
       await publication;
     },
-    createSubTask(t) {
-      subTasks.push(t);
+    async createSubTask(t) {
+      await queueDelegation(subTasks, t);
     },
-    respondToSubTask(r) {
-      subTaskResponses.push(r);
+    async respondToSubTask(r) {
+      await queueDelegation(subTaskResponses, r);
     },
     raiseToParent(r) {
       raise = r;

@@ -20,7 +20,7 @@ export function scratchWorktreeHome(): string {
   return dir;
 }
 
-/** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
+/** Per-invocation `-c` config for the profile identity (wiki plans/PLAN-git-config §4A):
  *  merge commits land in the TARGET's worktree (or a temp one), which carries no
  *  worktree-scoped profile config — inject it per command instead so those
  *  commits are attributed (and signed) exactly like the attempt's. */
@@ -37,7 +37,7 @@ export interface MergeResult {
   conflict?: string;
   /** Uncommitted paths that blocked the merge (newline-joined). Commit-vs-gitignore
    *  is a judgment call, so a dirty tree is rejected back to the task agent
-   *  instead of being blind-swept (PLAN-git-config.md §6). */
+   *  instead of being blind-swept (wiki plans/PLAN-git-config §6). */
   dirty?: string;
   landedFiles: string[];
   note?: string;
@@ -123,7 +123,7 @@ async function finalizeMergeRepoUnlocked(worldRepo: WorldRepo, target: string, w
   //    vs-gitignore is a judgment call, and a blind `git add -A` here would land
   //    files generated AFTER the Review gate (test artifacts, logs) unseen.
   //    Reject with the file list so the workflow loops back to the task agent
-  //    (PLAN-git-config.md §6). One mechanical exception: a RESOLVED but
+  //    (wiki plans/PLAN-git-config §6). One mechanical exception: a RESOLVED but
   //    uncommitted merge (MERGE_HEAD present; step 0 ruled out unresolved paths)
   //    is completed on purpose — that is a forgotten `git commit`, not a
   //    judgment call — and the marker scan below still rejects anything that

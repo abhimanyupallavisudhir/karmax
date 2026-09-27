@@ -300,7 +300,7 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
   if (spec.browser === 'chrome-devtools') {
     // Run chrome-devtools-mcp through karmax's launcher so it drives a Chrome
     // that also exposes a loopback DevTools port — the same port host-side
-    // fill_credential types into (PLAN-passwords.md §5B). Bare
+    // fill_credential types into (wiki plans/PLAN-passwords §5B). Bare
     // `chrome-devtools-mcp` uses a pipe with no HTTP endpoint, so the fill
     // could never reach the agent's browser. The launcher falls back to plain
     // pipe mode if Chrome is unavailable, so browser tools never regress.

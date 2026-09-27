@@ -28,7 +28,9 @@ describe('workflow package activation', () => {
     await second;
     expect(premature).toBe(false);
     expect(manager.resolveStart(manifest.name)).toBeDefined();
-    expect(refresh).toHaveBeenCalledTimes(3); // failed activation, rollback, second activation
+    // Failed activation, then the second. A failed build never swapped the
+    // worker, so no rollback roll (WF-15): the old worker kept serving.
+    expect(refresh).toHaveBeenCalledTimes(2);
   });
 
   it('does not advertise restored packages when their bundle fails', async () => {

@@ -118,7 +118,7 @@ summaries. Native MCP is separately exercised with real subprocesses and local
 HTTP model-protocol fixtures in `tests/mcp-agent-turns.test.ts`.
 
 A measured 80-turn example and its compressed raw export are in
-[the fixture results](latency-fixture-results.md). The offline report command
+[the fixture results](../benchmarks/results/latency-fixture-results.md). The offline report command
 also accepts `.json.gz` exports.
 
 ## Production collection and fair comparisons
@@ -197,8 +197,8 @@ tools. The workflow uses the harness fixture profile for credential/admission bo
 checkpointed separately; request limits and a conservative pricing-based budget
 are enforced before each real request. The estimated cost is not a billing invoice. Action-count validation distinguishes a completed model turn from a valid workload; skipped/failed reads must not enter comparable latency summaries.
 
-See [live model measurements](latency-live-results.md) for the September 18 isolated
+See [live model measurements](../benchmarks/results/latency-live-results.md) for the September 18 isolated
 OpenAI/Anthropic collection, validation exclusions, usage, and bottleneck evidence.
 
-See [deployed E2B measurements](latency-e2b-results.md) for the September 19
+See [deployed E2B measurements](../benchmarks/results/latency-e2b-results.md) for the September 19
 production tavya.io startup, follow-up, native-agent and browser observations.

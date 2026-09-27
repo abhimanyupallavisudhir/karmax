@@ -352,7 +352,7 @@ export class WorktreeProvider implements WorldProvider {
   }
 
   /**
-   * Give this worktree its git identity (PLAN-git-config.md §4A). With a profile
+   * Give this worktree its git identity (wiki plans/PLAN-git-config §4A). With a profile
    * identity, everything is WORKTREE-scoped (`extensions.worktreeConfig`): the
    * user's own checkout and sibling worlds are untouched, and two concurrent
    * worlds can commit as different accounts. Enabling the extension itself is the

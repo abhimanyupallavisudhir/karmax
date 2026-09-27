@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import type { World } from '../world/types.js';
 
 /**
- * Remote-world credential fill (PLAN-passwords.md §5B, cloud path).
+ * Remote-world credential fill (wiki plans/PLAN-passwords §5B, cloud path).
  *
  * For a LOCAL world the gateway types the secret over CDP itself (fill.ts) —
  * agent and gateway share a host, so `127.0.0.1:<port>` is the same browser.

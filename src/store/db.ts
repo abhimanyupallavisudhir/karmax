@@ -4726,7 +4726,7 @@ export class Store {
     });
   }
 
-  // ─── Saved views (a view is a saved query — PLAN-search-views) ───────────────
+  // ─── Saved views (a view is a saved query) ────────────────────────────────────
 
   async listViews(projectId: string): Promise<SavedView[]> {
     return (
@@ -5108,7 +5108,7 @@ export class Store {
       (await prefix.run(sharePrefix, sharePrefix));
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
   
@@ -5131,6 +5131,7 @@ export class Store {
       const requests = JSON.parse(raw);
       if (!Array.isArray(requests)) return;
       const remaining = requests.filter((request) => !removed.has(String(request?.taskId ?? '')));
+      for (const request of requests) if (removed.has(String(request?.taskId ?? ''))) (await exact.run(`permission:deciding:${request?.id}`));
       if (remaining.length) (await this.kvSet(key, JSON.stringify(remaining)));
       else (await exact.run(key));
     } catch {
@@ -7574,8 +7575,8 @@ export class Store {
   async clearTurnCheckpoints(taskId: string, runId?: string): Promise<void> {
     await this.db.transaction(async () => {
       const remove = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
-      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
-        ...(runId ? [`turnsession:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
+      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
+        ...(runId ? [`turnsession:legacy:${runId}:`, `turnspawns:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
     });
   }
 

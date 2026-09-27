@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Browser MCP launcher (PLAN-passwords.md §5B, finding: browser↔fill wiring).
+ * Browser MCP launcher (wiki plans/PLAN-passwords §5B, finding: browser↔fill wiring).
  *
  * `chrome-devtools-mcp` launches its own Chrome over a DevTools *pipe*, which
  * has no loopback HTTP endpoint — so karmax's host-side `fill_credential`

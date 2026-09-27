@@ -31,6 +31,7 @@ provider and webhook route; changing the default does not migrate customers.
    an installation with Paddle billing records between sandbox and live.
 5. Review the exact policy version and enable paid launch only after live
    verification. Setup never checks off the founder's review on their behalf.
+   The full pre-launch list is [docs/paid-launch-checklist.md](../docs/paid-launch-checklist.md).
 
 New Paddle checkout uses server-created transactions; only signed subscription
 events grant access. `/api/subscriptions/paddle/checkout-config` exposes the

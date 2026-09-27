@@ -244,7 +244,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return 'credential:write';
   }
   if (p.startsWith('/api/credentials')) return read ? 'credential:read' : 'credential:write';
-  // Vault items (PLAN-passwords.md): admin CRUD is credential:write; agent
+  // Vault items (wiki plans/PLAN-passwords): admin CRUD is credential:write; agent
   // write-back is the narrower vault:store; use/reveal/fill/request attempts
   // need only credential:read — the per-item grant + policy check happens in
   // the handler against the caller's own capability set.
@@ -331,6 +331,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p)) return 'task:signal';
+  if (/^\/api\/tasks\/[^/]+\/messages$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
   if (p === '/api/skills') return 'skill:write';
@@ -1649,7 +1650,7 @@ export class Gateway {
         return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
       }
     }
-    // Agent mailbox inbound webhook (PLAN-passwords.md §8): authenticated by a
+    // Agent mailbox inbound webhook (wiki plans/PLAN-passwords §8): authenticated by a
     // configured shared secret, not a karmax session — so it sits with the other
     // unauthenticated endpoints, before the session gate.
     if (p === '/api/agent-mail/ingest' && method === 'POST') {
@@ -4519,7 +4520,7 @@ export class Gateway {
         }
       }
 
-      // ── search / organization (a view is a saved query — PLAN-search-views) ──
+      // ── search / organization (a view is a saved query) ──
       // The searchable-field registry the UI reads to build its filter/sort/group menus.
       if (p === '/api/search' && method === 'GET') {
         const query = url.searchParams.get('q')?.trim() ?? '';
@@ -4840,6 +4841,12 @@ export class Gateway {
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
         const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault }, receivedAt);
+        return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
+      }
+      const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
+      if (messageMatch && method === 'POST') {
+        const b = await this.body(req);
+        const message = await api.messageAgent(token, messageMatch[1]!, String(b.text ?? ''), b.role);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
@@ -6233,7 +6240,7 @@ export class Gateway {
         }
       }
 
-      // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
+      // ── vault items + credential access requests (wiki plans/PLAN-passwords §§4–7) ──
       if (p.startsWith('/api/vault')) {
         // Bind to the caller's own organization (tenant boundary). The token org
         // is authoritative and cannot be spoofed — auth() validated it against
@@ -7168,7 +7175,7 @@ export class Gateway {
           .delete(decodeURIComponent(gitProfileMatch[1]!)));
         return this.json(res, 200, { ok: true });
       }
-      // The doctor check (PLAN-git-config.md §7): which tier a project's remote
+      // The doctor check (wiki plans/PLAN-git-config §7): which tier a project's remote
       // ops resolve to (profile / host fallback) and whether it can reach the
       // repos' remotes non-interactively. Read-only.
       if (!userGitResource && gitResourcePath === '/api/git-profiles/preflight' && method === 'GET') {

@@ -98,7 +98,7 @@ const S = {
   paramEditDrafts: {}, // taskId -> { saved, values, dirtyNames }
   activity: [],
   search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
-  // Task organization (PLAN-search-views): a view IS a saved query.
+  // Task organization: a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
@@ -6131,7 +6131,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => autoSaveSoon());
-  // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
+  // The vault credential picker (wiki plans/PLAN-passwords §6): item grants layered onto
   // the authorization package. Keep selection in form-local state so the task
   // sidebar stays one compact button; the full checkbox list lives in a modal.
   // Applying a selection dispatches a change event into the form's auto-save
@@ -6211,7 +6211,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     return {
       body, notes: $('#tf-notes')?.value ?? '',
       authorization: readAuthorizationEditor($('#tf-authorization')),
-      // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
+      // Per-task vault item grants (wiki plans/PLAN-passwords §6) — the credential picker.
       credentialGrants: inheritedVault.error ? undefined : [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
       credentialPolicies: inheritedVault.error ? undefined : vaultCredentialPolicies,
     };
@@ -9664,7 +9664,7 @@ async function wireTaskAuthorization(v) {
   const previous = edits[v.taskId];
   let syncAuthorization = () => {};
   wireAuthorizationEditor(select, projects, () => syncAuthorization());
-  // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
+  // Per-task vault grants (wiki plans/PLAN-passwords §6): prefill from the stored grant.
   const vaultGrantIds = new Set((auth0.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
@@ -14769,7 +14769,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   }
 }
 
-// ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
+// ── vault items + credential access requests (wiki plans/PLAN-passwords §§4–10) ──
 const VAULT_SECRET_LABELS = {
   login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],

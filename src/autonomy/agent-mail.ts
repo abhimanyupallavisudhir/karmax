@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
 /**
- * Agent mailbox (PLAN-passwords.md §8). Registration and email-verification
+ * Agent mailbox (wiki plans/PLAN-passwords §8). Registration and email-verification
  * flows need somewhere to receive codes and magic links — but never the user's
  * real inbox. karmax mints a dedicated agent address; an inbound mail webhook
  * drops messages here; the `check_agent_mail` tool reads them and pulls out the

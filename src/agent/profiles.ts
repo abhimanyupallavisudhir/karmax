@@ -80,6 +80,15 @@ export const organizationProfileId = (organizationId: string, role: AgentRole | 
 export const projectProfileId = (projectId: string, role: AgentRole | string) =>
   `${projectId}::${role}-default`;
 
+/** Profile ids are scoped by prefix: `<project>::…` and `organization:<org>::…`
+ * belong to that project/organization; ids without `::` are installation-wide.
+ * A task may name only profiles visible to its own project. */
+export function profileVisibleTo(id: string, projectId: string | undefined, organizationId: string | undefined): boolean {
+  if (!id.includes('::')) return true;
+  return (!!projectId && id.startsWith(`${projectId}::`))
+    || (!!organizationId && id.startsWith(`organization:${organizationId}::`));
+}
+
 /** Resolve the editable defaults without letting one organization's choice
  * become another's fallback: project → organization → bundled/legacy. */
 export async function roleDefaultProfile(store: Store, role: AgentRole | string,
@@ -112,7 +121,8 @@ export class ProfileResolver {
 
   async resolve(role: AgentRole, taskProfiles?: Record<string, string>, explicitId?: string, projectId?: string): Promise<AgentProfile> {
     const id = explicitId ?? taskProfiles?.[role];
-    if (id) {
+    const organizationId = projectId ? (await this.store.getProject(projectId))?.organizationId ?? 'org_personal' : undefined;
+    if (id && profileVisibleTo(id, projectId, organizationId)) {
       const p = (await this.store.getProfile(id));
       if (p) return { ...p, mcpConnections: p.mcpConnections ?? (await roleDefaultProfile(this.store, role, projectId))?.mcpConnections ?? [...DEFAULT_MCP_CONNECTIONS] };
     }

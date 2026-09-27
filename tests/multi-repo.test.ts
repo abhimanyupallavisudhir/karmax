@@ -88,7 +88,7 @@ describe('multi-repo worlds (real git)', () => {
     await world.writeFile('beta/feature.js', 'export const fb = () => 7;\n');
 
     // Uncommitted work is rejected back to the merge agent, with the offending
-    // paths prefixed by repo name (PLAN-git-config.md §6) — never blind-swept.
+    // paths prefixed by repo name (wiki plans/PLAN-git-config §6) — never blind-swept.
     const rejected = await finalizeMerge(world, 'main');
     expect(rejected.merged).toBe(false);
     expect(rejected.dirty).toContain('alpha/feature.js');
