@@ -33,5 +33,5 @@ it('RT-9/WD-20 bounds repository-free changed files and states the omission', as
   const result = await core.buildReview(world.handle, 'main');
   expect(result.changedFiles.length).toBeLessThanOrEqual(1000);
   expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(128 * 1024);
-  expect(result.summary).toContain('truncated');
+  expect(result.summary).toContain(`Showing ${result.changedFiles.length};`);
 });
