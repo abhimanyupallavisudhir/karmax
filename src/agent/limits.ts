@@ -80,6 +80,15 @@ export class ProviderFailure extends Error {
   }
 }
 
+/** An error envelope received on the provider protocol, not local bootstrap or
+ * sandbox transport. Only adapters at that boundary may apply this tag. */
+export class ProviderStreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderStreamError';
+  }
+}
+
 /** A provider rejected requests from a login it had just proven valid. Neither
  * a person signing in again nor login rotation can fix that, so it is retried
  * as infrastructure until the provider recovers, never parked as a dead login. */
@@ -114,6 +123,8 @@ export interface LimitClassifierOptions {
   /** Enables semantic phrase-family matching. Use only at the provider adapter
    * boundary; arbitrary build/git errors must remain on the Resolve path. */
   providerOrigin?: boolean;
+  /** Preserve message-only failure routing recorded by older workflow histories. */
+  legacy?: boolean;
 }
 
 const diagnosticText = (value: unknown, max = 500): string | undefined => {
@@ -273,7 +284,7 @@ export function isTransportError(error: unknown): boolean {
       // Short-lived host process-table / descriptor pressure. Disk-full and
       // permission errors are intentionally absent: those need intervention.
       /\b(?:eagain|emfile|enfile)\b/.test(lc) ||
-      /\b(?:408|50[0234]|529)\b/.test(lc)
+      /\b(?:http(?:\/\d(?:\.\d)?)?|(?:unexpected\s+)?status(?:\s+code)?|api(?:\s+error)?)\s*[:=]?\s*(?:408|50[0234]|529)\b/.test(lc)
     );
   };
   return inspect(error);
@@ -324,7 +335,8 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
 
   // Stable human phrases retained for compatibility with old workflow histories and
   // with providers (notably subscription CLIs) that expose no machine error code.
-  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc);
+  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc)
+    || (!options.legacy && /credit balance is too low/.test(lc));
   const knownLimit =
     /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc);
 
@@ -400,8 +412,7 @@ export function providerFailure(
   return new ProviderFailure(message, { ...metadata, source: metadata.source ?? 'structured' });
 }
 
-/** Prefer adapter metadata; fall back to semantic matching only because third-party
- * adapters and older provider rails may still throw plain Errors. */
+/** Only provider-tagged failures may change shared account availability. */
 export function classifyProviderTurnError(
   err: unknown,
   provider?: ProviderFailureMetadata['provider'],
@@ -424,7 +435,8 @@ export function classifyProviderTurnError(
       metadata: m,
     };
   }
-  const message = err instanceof Error ? err.message : String(err);
+  if (!(err instanceof ProviderStreamError)) return { classification: { limited: false } };
+  const message = err.message;
   const classification = classifyLimitError(message, { providerOrigin: true });
   if (!classification.limited) return { classification };
   const diagnostic = nativeProviderDiagnostic(message);

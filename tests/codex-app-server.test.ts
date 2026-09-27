@@ -26,15 +26,23 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     // Karmax answered our dynamic-tool call; now finish the turn.
     send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
   }
+  else if (msg.method === 'turn/steer') {
+    send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    setTimeout(() => send({ id: msg.id, result: {} }), 100);
+  }
   else if (msg.method === 'turn/start') {
+    if (process.env.STUB_MODE === 'rpc-limit') { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: 'usageLimitReached' } } }); return; }
+    if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
     const mode = process.env.STUB_MODE || 'completed';
+    if (mode === 'steer-race') { send({ method: 'turn/started', params: { turn: { id: 'turn-1' } } }); return; }
     if (mode === 'tool') {
       // A server→client request: the model called a karmax dynamic tool.
       send({ id: 5000, method: 'item/tool/call', params: { callId: 'c1', tool: 'confirm_decision', arguments: { action: 'confirm' } } });
       return;
     }
+    if (mode === 'stderr-limit') { process.stderr.write('npm registry 429 rate limit exceeded'); process.exit(1); }
     if (mode === 'exit') process.exit(0);
     else if (mode === 'expired-app-token') {
       const detail = 'Provided authentication token is expired. Please try signing in again.';
@@ -168,6 +176,17 @@ describe('CodexAdapter app-server security policy', () => {
       inputTokensIncludeCacheRead: true, totalTokens: 3050 });
   });
 
+  it('waits for in-flight steering before draining the idle boundary', async () => {
+    const offsets: number[] = [];
+    const records = await run(undefined, 'steer-race', false, { pullFollowUps: async (offset: number) => {
+      offsets.push(offset);
+      return offsets.length === 1 ? [{ role: 'user', text: 'follow-up' }] : [];
+    } });
+    expect(offsets).toEqual([1, 2]);
+    expect(lastResult.delivered).toBe(2);
+    expect(records.filter(r => r.method === 'turn/steer')).toHaveLength(1);
+  });
+
   it('reports no usage when the app-server sent none', async () => {
     await run();
     expect(lastResult.usage).toBeUndefined();
@@ -234,6 +253,23 @@ describe('CodexAdapter app-server security policy', () => {
     });
     expect(requests.some((r) => r.method === 'thread/resume')).toBe(false);
     expect(requests.find((r) => r.method === 'turn/start')?.params.threadId).toBe('thread-forked');
+  });
+
+  it.each(['disk', 'npm'])('keeps non-provider RPC errors task-local (%s)', async (kind) => {
+    const failure = await run(undefined, `rpc-local-${kind}`).catch(error => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.name).not.toBe('ProviderFailure');
+  });
+
+  it('preserves an account failure received as a provider RPC rejection', async () => {
+    await expect(run(undefined, 'rpc-limit')).rejects.toMatchObject({ name: 'ProviderFailure',
+      metadata: { kind: 'quota', permanence: 'transient' } });
+  });
+
+  it('does not classify subprocess stderr as a provider limit', async () => {
+    const error = await run(undefined, 'stderr-limit').catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).not.toBe('ProviderFailure');
   });
 
   it('rejects an interrupted terminal status even when partial assistant text exists', async () => {

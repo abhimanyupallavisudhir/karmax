@@ -1,4 +1,6 @@
+import { openLocalPty } from '../src/world/local-execution.js';
 import { it, expect } from 'vitest';
+
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +26,7 @@ function diskWorld(root: string): World {
     fs.writeFileSync(dest, content);
   };
   return {
+    openPty: (spec: any) => openLocalPty(root, spec),
     handle: { root },
     readFile: async (file: string) => fs.readFileSync(path.join(root, file), 'utf8'),
     readFileBuffer: async (file: string) => fs.readFileSync(path.join(root, file)),
@@ -106,7 +109,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
         approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id;
       await turn(client, root, 'inherited-root-marker');
       // The host cache is now one completed turn behind the live source.
-      await syncRemoteAgentHome(source, 'codex', sourceHome, host);
+      await syncRemoteAgentHome(source, 'codex', sourceHome, host, root);
       await turn(client, root, 'newest-source-marker');
     });
     const stale = rollouts(host).find((file) => file.endsWith(`${root}.jsonl`))!;
@@ -177,7 +180,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
           approvalPolicy: 'never', sandbox: 'danger-full-access' });
         await turn(client, child, `resumed-${generation}-marker`);
       });
-      await syncRemoteAgentHome(destination, 'codex', home, host);
+      await syncRemoteAgentHome(destination, 'codex', home, host, child);
       from = destination;
       parent = child;
     }

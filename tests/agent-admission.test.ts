@@ -5,6 +5,30 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 describe('agent turn admission', () => {
+  it.each(['requests', 'active'])('retries organization %s backpressure without parking a login', async (kind) => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Backpressure');
+    const task = await store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    await store.setOrganizationUsagePolicy(project.organizationId!, {
+      maxAgentStartsPerMinute: kind === 'requests' ? 1 : 10, maxActiveAgentTurns: 1,
+    });
+    await store.admitAgentUsage({ id: 'occupied', organizationId: project.organizationId!, projectId: project.id,
+      taskId: task.id, provider: 'anthropic', fundingSource: 'customer' });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const core = makeCoreActivities({ store, worlds, adapters: new Map() as any,
+      profiles: new ProfileResolver(store, 'claude') });
+    try {
+      await expect(core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: 'blocked',
+        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'just-do', agents: { do: { provider: 'claude', model: 'test' } } },
+      } as any)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
+    } finally { await world.destroy(); await store.close(); }
+  });
+
   it('does not release another admission when a colliding turn is rejected', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Collision'));

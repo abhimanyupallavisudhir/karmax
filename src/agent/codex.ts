@@ -25,6 +25,7 @@ import {
   providerFailure,
   providerFailureDisplay,
   ProviderFailure,
+  ProviderStreamError,
   ProviderOutage,
   ProviderPolicyFailure,
   isProviderPolicyRejection,
@@ -146,6 +147,17 @@ export class CodexAdapter implements AgentAdapter {
   /** The ChatGPT-subscription rail: the app-server (live, steerable) by default, or
    *  the legacy one-shot `codex exec` when forced via `KARMAX_CODEX_USE_EXEC`. */
   private async runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    try { return await this.runSubscriptionWithRecovery(input, ctx); }
+    catch (error) {
+      // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
+      // account health must come from a host-side provider request or probe.
+      if (isRemoteAgentWorld(input.world) && (error instanceof ProviderFailure || error instanceof ProviderStreamError))
+        throw new Error(error.message, { cause: error });
+      throw error;
+    }
+  }
+
+  private async runSubscriptionWithRecovery(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world)) return this.runCodexExec(input, ctx);
     const remote = isRemoteAgentWorld(input.world);
     const configHome = input.resolvedAuth?.configHome;
@@ -380,7 +392,15 @@ export class CodexAdapter implements AgentAdapter {
           title: String(call.name ?? 'Tool call'),
           ...(startedDetail ? { detail: startedDetail } : {}),
         });
-        const result = handler ? await handler(args) : `unknown tool ${call.name}`;
+        let result: unknown;
+        let failed = false;
+        try {
+          if (!handler) throw new Error(`unknown tool ${call.name}`);
+          result = await handler(args);
+        } catch (error) {
+          failed = true;
+          result = { is_error: true, error: error instanceof Error ? error.message : String(error) };
+        }
         const doneDetail = toolActivityDetail(call.name, result);
         ctx.emitActivity({
           id: String(call.call_id ?? `${call.name}-${i}`),
@@ -390,7 +410,7 @@ export class CodexAdapter implements AgentAdapter {
           ...(doneDetail ? { detail: doneDetail } : {}),
         });
         toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: typeof result === 'string' ? result : JSON.stringify(result) });
-        if (call.name === 'signal_completion') completed = true;
+        if (!failed && call.name === 'signal_completion') completed = true;
       }
       nextInput = toolOutputs;
       // A response containing function calls cannot be resumed until every
@@ -411,7 +431,7 @@ export class CodexAdapter implements AgentAdapter {
       delivered: deliveredIndex,
       usage: reportedUsage.total(),
     };
-    } finally { await mcp.close(); }
+    } finally { try { await mcp.close(); } catch { /* cleanup must not replace the turn outcome */ } }
   }
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
@@ -460,7 +480,7 @@ export class CodexAdapter implements AgentAdapter {
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     let stderr = '';
-    child.stderr?.on('data', (d: Buffer | string) => { stderr = utf8Tail(stderr + d.toString(), 4096); });
+    child.stderr?.on('data', (d: Buffer | string) => { stderr = utf8Tail(stderr + d.toString(), 64 * 1024); });
 
     const cleanups: Array<() => void> = [];
     const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
@@ -585,7 +605,7 @@ export class CodexAdapter implements AgentAdapter {
         policyFailure ??= new ProviderPolicyFailure(native, 'codex', { model, operation });
         return;
       }
-      const blob = typeof native === 'string' ? native : JSON.stringify(native ?? {});
+      const blob = native instanceof Error ? native.message : typeof native === 'string' ? native : JSON.stringify(native ?? {});
       const cls = classifyLimitError(blob, { providerOrigin: true });
       if (!cls.limited) return;
       const m = blob.match(/"?(?:resets_in_seconds|resetInSeconds|retry_after|retryAfter)"?\s*[:=]\s*(\d+)/);
@@ -755,7 +775,10 @@ export class CodexAdapter implements AgentAdapter {
         pollLock = false;
       }
     };
-    const followPoll = ctx.pullFollowUps ? setInterval(() => { void steerFollowUps(); }, 1200) : undefined;
+    let steering: Promise<void> | undefined;
+    const followPoll = ctx.pullFollowUps ? setInterval(() => {
+      if (!steering) steering = steerFollowUps().catch(() => {}).finally(() => { steering = undefined; });
+    }, 1200) : undefined;
 
     try {
       // ── Handshake ──
@@ -891,6 +914,7 @@ export class CodexAdapter implements AgentAdapter {
 
         // Collect follow-ups that weren't steered in (arrived after the last poll /
         // after completion) → drive a follow-on turn; else the turn is done.
+        await steering;
         nextInput = [];
         if (ctx.pullFollowUps) {
           for (const m of await ctx.pullFollowUps(deliveredIndex)) {
@@ -906,7 +930,7 @@ export class CodexAdapter implements AgentAdapter {
       // below classify a limit and rotate the login, or surface a partial result instead
       // of discarding output already produced (mirrors the exec/SDK error tolerance).
       if (!ctx.signal?.aborted) {
-        noteLimit(e, 'app-server request');
+        if (e instanceof ProviderStreamError) noteLimit(e, 'app-server request');
         turnError = turnError ?? String((e as Error)?.message ?? e);
       }
     } finally {
@@ -915,11 +939,13 @@ export class CodexAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       client.close();
-      if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
-      else await child.stop();
+      try {
+        if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
+        else await child.stop();
+      } catch { /* cleanup must not replace the turn outcome */ }
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
       if (remoteHome && input.resolvedAuth?.configHome) {
-        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome);
+        const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome, threadId);
         if (failure) ctx.emitActivity({
           id: 'codex-remote-state-sync', kind: 'error', phase: 'failed',
           title: 'Could not preserve remote Codex state', detail: failure.message.slice(0, 1000),
@@ -927,9 +953,6 @@ export class CodexAdapter implements AgentAdapter {
       }
     }
 
-    // A limit can also arrive as a rejected request (handshake/turn) or a subprocess
-    // death recorded in `turnError` — scan it so those paths rotate the login too.
-    if (turnError && !limit) noteLimit(turnError, 'app-server turn');
     if (policyFailure) throw policyFailure;
     if (limit) {
       // Same shape as the exec path so limits.ts computes the refresh instant and the
@@ -1020,13 +1043,15 @@ export class CodexAdapter implements AgentAdapter {
     const { files: imageFiles, cleanup: cleanupImages } = materializeImageFiles(toSend);
     for (const f of imageFiles) flags.push('-i', f);
     // Args go straight to execve (no shell), so a multi-line prompt needs no escaping.
-    const args = [...workArgs, ...(resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText])];
+    const args = [...workArgs, ...(resuming ? ['exec', 'resume', input.session!, ...flags, '-'] : ['exec', ...flags, '-'])];
 
     // Keep a detached root group as fallback, while the inherited custody marker
     // covers descendants that create their own groups/sessions.
     const custody = createCustodyEnv(env);
     (await (await currentTiming())?.mark('process.spawn.requested'));
-    const child = spawn(cmd, args, { cwd, env: custody.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const child = spawn(cmd, args, { cwd, env: custody.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    child.stdin.on('error', () => {}); // process failure is reported by close/error below
+    child.stdin.end(promptText);
 
     // Process-tree custody (src/agent/custody.ts): record the root pid so a
     // boot-time sweep can reap this group if karmax is SIGKILLed mid-turn
@@ -1129,6 +1154,7 @@ export class CodexAdapter implements AgentAdapter {
       }
     };
 
+    child.stdout?.setEncoding('utf8');
     child.stdout?.on('data', (d) => {
       buf += d.toString();
       let i;
@@ -1138,7 +1164,7 @@ export class CodexAdapter implements AgentAdapter {
       }
     });
     child.stderr?.on('data', (d) => {
-      stderr = utf8Tail(stderr + d.toString(), 4096);
+      stderr = utf8Tail(stderr + d.toString(), 64 * 1024);
     });
 
     const exited: { code: number; signal?: NodeJS.Signals; spawnError?: string } = await new Promise((resolve) => {

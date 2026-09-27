@@ -8,7 +8,7 @@ import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
  * notification fan-out. No real `codex` binary — a PassThrough feeds server lines
  * and a capturing Writable records what the client sends.
  */
-function harness() {
+function harness(maxLineBytes?: number) {
   const stdout = new PassThrough();
   const sent: any[] = [];
   const stdin = new Writable({
@@ -17,12 +17,25 @@ function harness() {
       cb();
     },
   });
-  const client = new CodexAppServerClient(stdin, stdout);
+  const client = new CodexAppServerClient(stdin, stdout, maxLineBytes);
   const feed = (obj: unknown) => stdout.write(JSON.stringify(obj) + '\n');
   return { client, sent, feed, stdout };
 }
 
 describe('CodexAppServerClient', () => {
+  it.each([false, true])('rejects oversized protocol lines (fragmented=%s)', async (fragmented) => {
+    const { client, stdout } = harness(128);
+    const result = client.request('initialize', {});
+    const rejected = expect(result).rejects.toThrow(/line exceeds/);
+    if (fragmented) {
+      for (let n = 0; n < 70; n++) stdout.write('é');
+    } else stdout.write('x'.repeat(129) + '\n');
+    // A later valid response must not rescue a transport that exceeded its cap.
+    stdout.write('{"id":1,"result":{}}\n');
+    await rejected;
+    await expect(client.request('thread/start', {})).rejects.toThrow(/closed/);
+  });
+
   it('correlates a response to its request by id and resolves the result', async () => {
     const { client, sent, feed } = harness();
     const p = client.request('thread/start', { cwd: '/w' });

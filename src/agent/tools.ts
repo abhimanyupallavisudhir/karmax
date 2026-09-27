@@ -1,3 +1,4 @@
+import { boundedExec } from '../world/bounded-exec.js';
 import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
@@ -887,10 +888,10 @@ export function platformToolHandlers(
     async bash(args) {
       const cmd = String(args?.command ?? '');
       const env = workEnv?.();
-      const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000, ...(env ? { env } : {}) });
+      const r = await boundedExec(world, cmd, { maxBytes: 16_000, overflow: 'tail', timeoutMs: 120_000, ...(env ? { env } : {}) });
       ctx.emit(`$ ${cmd}`);
       const out = `exit ${r.code}\n${r.stdout}${r.stderr}`;
-      return truncate(out);
+      return out;
     },
     async read_file(args) {
       try {

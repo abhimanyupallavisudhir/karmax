@@ -37,7 +37,11 @@ const finish = () => {
   } });
   send({ jsonrpc: '2.0', method: 'session/update', params: {
     sessionId: 'session-new',
-    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'do' } },
+  } });
+  send({ jsonrpc: '2.0', method: 'session/update', params: {
+    sessionId: 'session-new',
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ne' } },
   } });
   send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: process.env.STUB_STOP_REASON || 'end_turn' } });
 };
@@ -132,6 +136,7 @@ describe('generic ACP agent adapter', () => {
   });
 
   async function run(opts: {
+    hugeOutput?: boolean;
     subscription?: boolean;
     secretEnv?: Record<string, string>;
     session?: string;
@@ -145,7 +150,7 @@ describe('generic ACP agent adapter', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-acp-'));
     const stub = path.join(dir, 'agent.cjs');
     const requests = path.join(dir, 'requests.jsonl');
-    fs.writeFileSync(stub, STUB);
+    fs.writeFileSync(stub, opts.hugeOutput ? STUB.replace('outputByteLimit: 1024', 'outputByteLimit: 1e12').replace('process.stdout.write("terminal-ok:"', 'process.stdout.write("x".repeat(2 * 1024 * 1024) + "terminal-ok:"') : STUB);
     fs.chmodSync(stub, 0o755);
     process.env.KARMAX_OPENCODE_CMD = stub;
     process.env.KARMAX_KIMI_CMD = stub;
@@ -183,6 +188,13 @@ describe('generic ACP agent adapter', () => {
     return { turn, output, activities, records };
   }
 
+  it('caps provider-requested terminal output retention', async () => {
+    const { records } = await run({ hugeOutput: true });
+    const output = records.find(r => r.id === 903)?.result;
+    expect(output.truncated).toBe(true);
+    expect(Buffer.byteLength(output.output)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
   it('honors a leased subscription over ambient keys while giving terminals their project secrets', async () => {
     const prior = process.env.XAI_API_KEY;
     process.env.XAI_API_KEY = 'ambient-wrong-key';
@@ -210,7 +222,7 @@ describe('generic ACP agent adapter', () => {
       output: 'done',
       delivered: 1,
     });
-    expect(output.at(-1)).toBe('done');
+    expect(output).toEqual(['do', 'ne']);
     expect(activities).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'tool-1', kind: 'file', phase: 'started' }),
       expect.objectContaining({ id: 'tool-1', kind: 'file', phase: 'completed' }),

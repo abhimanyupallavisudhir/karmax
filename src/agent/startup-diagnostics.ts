@@ -12,6 +12,16 @@ const FLAGS = ['auth', 'network', 'package', 'memory'];
 const WAITS = ['0', 'do_wait', 'wait_woken', 'futex_wait_queue', 'futex_wait_queue_me', 'ep_poll',
   'do_epoll_wait', 'pipe_read', 'pipe_write', 'hrtimer_nanosleep', 'wait_on_page_bit_common'];
 
+/** Allowlisted local stderr evidence, without paths, credentials or arbitrary text. */
+export function startupStderrSummary(text: string, bytes: number) {
+  return { bytes, codes: CODES.filter(code => text.includes(code)), flags: [
+    /unauthorized|authentication|oauth|401|403/i.test(text) && 'auth',
+    /network|connect|socket|timed? out|dns/i.test(text) && 'network',
+    /npm (?:err|error)|cannot find module/i.test(text) && 'package',
+    /heap out of memory|allocation failed|enomem/i.test(text) && 'memory',
+  ].filter(Boolean) };
+}
+
 /** Only envelope labels survive. Neither arbitrary subtype strings, IDs, nor
  * payloads are diagnostic data. Bound buffering even before a newline arrives. */
 export class StartupProtocolTrace {

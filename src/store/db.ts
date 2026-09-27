@@ -1,3 +1,4 @@
+import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
@@ -280,9 +281,7 @@ export class Store {
       }
     }
 
-    // Turn caps are now optional (unlimited by default). Strip the legacy caps
-    // that older builds seeded onto the role-default profiles so existing installs
-    // match the new "no limit unless you set one" behavior.
+    // Migrate role-default capabilities while preserving user-configured turn caps.
     const rows = (await this.db.prepare("SELECT id, json FROM profiles WHERE id LIKE '%-default'").all()) as any[];
     for (const r of rows) {
       let p: any;
@@ -306,10 +305,6 @@ export class Store {
       if (Array.isArray(p.capabilities) && p.capabilities.includes('task:world:read')) {
         p.capabilities = [...new Set(p.capabilities.filter((capability: string) => capability !== 'task:world:read')
           .concat(['task:git:publish', 'task:git:import']))];
-        profileChanged = true;
-      }
-      if (p.maxTurns !== undefined) {
-        delete p.maxTurns;
         profileChanged = true;
       }
       // Only write when something actually changed: an unconditional UPDATE
@@ -6219,7 +6214,7 @@ export class Store {
         const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
             AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId, now - 60_000)) as any).n);
-        if (recent >= policy.maxRemoteStartsPerMinute) throw new Error('organization remote sandbox start rate limit exceeded');
+        if (recent >= policy.maxRemoteStartsPerMinute) throw new AdmissionBackpressureError('organization remote sandbox start rate limit exceeded');
       }
       (await this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
         cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -6485,7 +6480,7 @@ export class Store {
           (await assertManagedCapacity());
           const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
             WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
-          if (active >= policy.effectiveMaxActiveAgentTurns) throw new Error('organization active model turn limit reached');
+          if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
           (await this.db.prepare("UPDATE usage_admissions SET state='active', releasedAt=NULL WHERE id=?").run(input.id));
           (await this.db.exec('COMMIT'));
           return { reused: true };
@@ -6497,10 +6492,10 @@ export class Store {
       const minute = now - 60_000;
       const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND createdAt>=?`).get(input.organizationId, minute)) as any).n);
-      if (recent >= policy.maxAgentStartsPerMinute) throw new Error('organization model request rate limit exceeded');
+      if (recent >= policy.maxAgentStartsPerMinute) throw new AdmissionBackpressureError('organization model request rate limit exceeded');
       const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
-      if (active >= policy.effectiveMaxActiveAgentTurns) throw new Error('organization active model turn limit reached');
+      if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
       (await this.db.prepare(`INSERT INTO usage_admissions (id, organizationId, projectId, taskId, kind, provider, model,
         fundingSource, state, reservedCostMicros, createdAt) VALUES (?, ?, ?, ?, 'agent', ?, ?, ?, 'active', ?, ?)`)
         .run(input.id, input.organizationId, input.projectId, input.taskId, input.provider, input.model ?? null,

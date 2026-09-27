@@ -1,5 +1,6 @@
 import { concurrentMap } from '../util/concurrent-map.js';
 import { notifyChildSettlement } from './children.js';
+import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
@@ -157,7 +158,7 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // Admission happens before a provider process exists. Temporal coordinator
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
-  if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
+  if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {

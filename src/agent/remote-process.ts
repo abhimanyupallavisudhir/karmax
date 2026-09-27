@@ -1,3 +1,4 @@
+import { boundedExec } from '../world/bounded-exec.js';
 import { timed } from '../timing/index.js';
 import { mapBatches } from '../util/async-batch.js';
 import fs from 'node:fs';
@@ -69,7 +70,6 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // `git add -A` without modifying the user's tracked .gitignore.
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
   await onStartupStep?.('prepare-config');
-  const existing = await timed('bootstrap.list-home', () => remoteHomeFiles(world, absolute));
   const files = configFiles(localHome, provider, session);
   const rollouts = files.filter(file => provider === 'codex' && codexRolloutIdentity(file.relative.split(path.sep).join('/')));
   async function seed(file: { relative: string; content: Buffer }) {
@@ -87,13 +87,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     }
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
     const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
-    if (!existing.has(target) || controlledAuth) {
-      await world.writeFileBuffer(target, content);
-    } else if (authFreshness(provider, file.relative, file.content) !== undefined) {
-      const remote = await world.readFileBuffer(target);
-      if (authIsNewer(provider, file.relative, file.content, remote))
-        await world.writeFileBuffer(target, content);
-    }
+    await world.writeFileBuffer(target, content);
   }
   // Ordinary files have distinct paths and no live reader until startup. Rollout
   // publication reconciles shared session identity, so keep it serialized.
@@ -129,62 +123,71 @@ export function remoteAgentHomeRelative(provider: Provider, localHome: string): 
   return `${REMOTE_ROOT}/${provider}/${identity}`;
 }
 
-/** Export only provider-owned authentication and native conversation files.
- * Remote MCP/browser rewrites, logs, caches, and process-control files remain
- * sandbox-local. Atomic 0600 writes make OAuth token rotation durable without
- * allowing a partial download to corrupt the account's control-plane home. */
+const HISTORY_FILE_BYTES = 16 * 1024 * 1024;
+const HISTORY_TOTAL_BYTES = 32 * 1024 * 1024;
+const HISTORY_FILE_COUNT = 64;
+type HistoryBudget = { bytes: number; files: number };
+
+async function readRemoteHistory(world: World, file: string, budget: HistoryBudget, maxBytes = HISTORY_FILE_BYTES): Promise<Buffer> {
+  if (++budget.files > HISTORY_FILE_COUNT) throw new Error('remote history file count limit exceeded');
+  const result = await boundedExec(world,
+    `set -o pipefail; head -c ${maxBytes + 1} -- ${quote(path.posix.join(world.handle.root, file))} | base64 -w 0`,
+    { maxBytes: Math.ceil((maxBytes + 1) / 3) * 4, timeoutMs: 60_000 });
+  if (result.code !== 0) throw new Error(`could not read remote history: ${result.stderr || result.stdout.slice(0, 512)}`);
+  const data = Buffer.from(result.stdout.trim(), 'base64');
+  budget.bytes += data.length;
+  if (data.length > maxBytes || budget.bytes > HISTORY_TOTAL_BYTES)
+    throw new Error('remote history byte limit exceeded');
+  return data;
+}
+
+/** Export only this turn's conversation and physical Codex history dependencies.
+ * Credentials are host-owned; a task world must never replace another session. */
 export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
-  localHome: string): Promise<void> {
-  if (!localHome) return;
-  const listed = await world.exec('bash', ['-lc',
-    `if [ -d ${quote(remoteHome.absolute)} ]; then find ${quote(remoteHome.absolute)} -type f -print; fi`]);
-  if (listed.code !== 0) throw new Error(`could not export remote ${provider} state: ${listed.stderr || listed.stdout}`);
-  const root = world.handle.root.replace(/\/+$/, '');
+  localHome: string, session?: string): Promise<void> {
+  if (!localHome || !session) return;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const homePrefix = `${remoteHome.relative}/`;
-  const files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
-    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file).filter((file) => file.startsWith(homePrefix));
-  const auth = new Set(provider === 'codex'
-    ? ['auth.json', 'karmax-oauth.json']
-    : ['.credentials.json', '.claude/.credentials.json', 'karmax-oauth.json']);
-  for (const remoteFile of files) {
-    const relative = remoteFile.slice(homePrefix.length);
-    const session = provider === 'codex'
-      ? (relative.startsWith('sessions/') || relative.startsWith('archived_sessions/')) && relative.endsWith('.jsonl')
-      : relative.startsWith('projects/') && relative.endsWith('.jsonl');
-    const recovery = provider === 'codex' && /^\.karmax-history-recovery\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.json$/.test(relative);
-    if (!auth.has(relative) && !session && !recovery) continue;
-    // Remote provider processes receive refresh-token-free projections. They are
-    // intentionally never refresh authority and must never overwrite the one
-    // canonical credential shared by every task using this login.
-    if (isControlPlaneAuth(provider, relative)) continue;
-    // The listing came from a shell inside the sandbox, which the agent controls:
-    // a `..` segment would write anywhere the control plane's user can.
-    const segments = relative.split('/');
-    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) continue;
-    const destination = path.join(localHome, ...segments);
-    if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
-    const data = await world.readFileBuffer(remoteFile);
-    if (recovery) { atomicPrivateWrite(destination, data); continue; }
-    if (provider === 'codex' && session) {
-      const id = path.posix.basename(relative).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]
-        ?? path.posix.basename(relative).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
-      publishLocalCodexHistory(localHome, { file: relative, content: data }, id);
+  const files = [...await remoteHomeFiles(world, remoteHome.absolute)].filter(file => {
+    if (!file.startsWith(homePrefix)) return false;
+    const relative = file.slice(homePrefix.length);
+    return !relative.split('/').some(segment => !segment || segment === '.' || segment === '..');
+  });
+  const pending = [session];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (seen.has(current)) throw new CodexHistoryError(`cyclic lineage for ${session}`);
+    seen.add(current);
+    const matches = files.filter(file => {
+      const relative = file.slice(homePrefix.length);
+      return provider === 'codex'
+        ? !!codexRolloutIdentity(relative) && path.posix.basename(relative).endsWith(`${current}.jsonl`)
+        : relative.startsWith('projects/') && path.posix.basename(relative) === `${current}.jsonl`;
+    });
+    const candidates = [];
+    for (const file of matches) candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
+    if (!candidates.length) {
+      if (current !== session) throw new CodexHistoryError(`missing ancestor ${current}`);
       continue;
     }
-    // A task cleanup can race a human re-login on the control plane. Do not let
-    // an older persistent world restore the token the user just replaced.
-    if (auth.has(relative) && fs.existsSync(destination)) {
-      const local = fs.readFileSync(destination);
-      if (authIsNewer(provider, relative, local, data)) continue;
-    }
-    fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-    const temp = `${destination}.${crypto.randomBytes(6).toString('hex')}.karmax-tmp`;
-    try {
-      fs.writeFileSync(temp, data, { mode: 0o600 });
-      fs.renameSync(temp, destination);
-      fs.chmodSync(destination, 0o600);
-    } finally {
-      fs.rmSync(temp, { force: true });
+    if (provider === 'codex') {
+      const kept = selectCodexHistoryCopy(candidates, current);
+      publishLocalCodexHistory(localHome, { file: kept.file.slice(homePrefix.length), content: kept.content }, current);
+      const base = codexHistoryBase(kept.content);
+      if (base) pending.push(base);
+    } else {
+      for (const candidate of candidates) {
+        const destination = path.resolve(localHome, candidate.file.slice(homePrefix.length));
+        if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
+        if (fs.existsSync(destination)) {
+          const local = fs.readFileSync(destination);
+          if (local.subarray(0, candidate.content.length).equals(candidate.content)) continue;
+          if (!candidate.content.subarray(0, local.length).equals(local))
+            throw new Error(`divergent Claude history for ${current}`);
+        }
+        atomicPrivateWrite(destination, candidate.content);
+      }
     }
   }
 }
@@ -232,36 +235,13 @@ function remoteAuthProjection(provider: Provider, relative: string, content: Buf
   }
 }
 
-/** Provider-native monotonic-ish credential freshness for Claude, whose remote
- * SDK still owns refresh. Codex is deliberately excluded: one canonical host
- * owns its rotating refresh token, independent of task-local timestamps. */
-function authFreshness(provider: Provider, relative: string, content: Buffer): number | undefined {
-  const normalized = relative.split(path.sep).join('/');
-  const isClaude = provider === 'claude'
-    && (normalized === '.credentials.json' || normalized === '.claude/.credentials.json');
-  if (!isClaude) return undefined;
-  try {
-    const parsed = JSON.parse(content.toString('utf8'));
-    const expiry = Number(parsed?.claudeAiOauth?.expiresAt ?? parsed?.oauthAccount?.expiresAt);
-    return Number.isFinite(expiry) && expiry > 0 ? expiry : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function authIsNewer(provider: Provider, relative: string, candidate: Buffer, current: Buffer): boolean {
-  const next = authFreshness(provider, relative, candidate);
-  const prior = authFreshness(provider, relative, current);
-  return next !== undefined && (prior === undefined || next > prior);
-}
-
 /** Remote auth/session export is a durability enhancement, not the provider
  * turn's terminal result. Return a diagnostic instead of throwing so a control-
  * plane timeout during cleanup cannot replace a verified successful turn. */
 export async function syncRemoteAgentHomeBestEffort(world: World, provider: Provider,
-  remoteHome: RemoteAgentHome, localHome: string): Promise<Error | undefined> {
+  remoteHome: RemoteAgentHome, localHome: string, session?: string): Promise<Error | undefined> {
   try {
-    await syncRemoteAgentHome(world, provider, remoteHome, localHome);
+    await syncRemoteAgentHome(world, provider, remoteHome, localHome, session);
     return undefined;
   } catch (error) {
     if (error instanceof CodexHistoryError) throw error;
@@ -547,7 +527,8 @@ export class RemoteSpawnedProcess extends EventEmitter {
     // Recover a bounded tail before close so startup failures retain their cause.
     if (this.stderrFile) {
       try {
-        const result = await this.world.exec('tail', ['-c', '8192', this.stderrFile], { timeoutMs: 5000 });
+        const result = await boundedExec(this.world, `tail -c 8192 -- ${quote(this.stderrFile)}`,
+          { maxBytes: 8192, overflow: 'tail', timeoutMs: 5000 });
         if (result.code === 0 && result.stdout) this.stderr.write(result.stdout);
       } catch { /* diagnostics must not replace the process failure */ }
     }
@@ -558,9 +539,20 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.emit('close', code, signal);
   }
 
+  private writeProtocol(chunk: string): void {
+    if (this.stdout.readableLength + this.stdout.writableLength + Buffer.byteLength(chunk) > 8 * 1024 * 1024) {
+      this.kill();
+      void this.finish(null, { lost: new Error('agent output buffer limit exceeded') });
+      return;
+    }
+    if (this.startup) this.received.read(chunk);
+    this.stdout.write(chunk);
+  }
+
   private onData(chunk: string): void {
+    if (this.finishing || this.killed) return;
     if (this.startup) this.readBytes += Buffer.byteLength(chunk);
-    if (this.protocolReady) { if (this.startup) this.received.read(chunk); this.stdout.write(chunk); return; }
+    if (this.protocolReady) { this.writeProtocol(chunk); return; }
     this.preamble += chunk;
     const marker = this.preamble.indexOf(READY);
     if (marker < 0) {
@@ -573,7 +565,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
     this.openProtocolGate();
     const rest = this.preamble.slice(marker + READY.length);
     this.preamble = '';
-    if (rest) { if (this.startup) this.received.read(rest); this.stdout.write(rest); }
+    if (rest) this.writeProtocol(rest);
   }
 }
 
@@ -592,7 +584,7 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
       // real E2B filesystem request time out. Durable config, skills, rules,
       // commands, hooks, and plugin manifests continue through this walk; the one
       // requested session is materialized separately below.
-      if (top.startsWith('.karmax-history') || ['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
+      if (top === KARMAX_TOKEN_FILE || /^karmax-work-.*\.config\.toml$/.test(top) || top.startsWith('.karmax-history') || ['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
         || segments.some((segment) => ['cache', '.remote-plugin-install-staging'].includes(segment))
         || /^(?:logs?|state|goals|memories)(?:[_-].*)?\.sqlite(?:-(?:wal|shm))?$/.test(entry.name.toLowerCase())
         || ['history.jsonl', 'models_cache.json'].includes(entry.name.toLowerCase())) continue;
@@ -636,9 +628,11 @@ function codexRolloutIdentity(file: string): string | undefined {
 }
 
 async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
-  const result = await world.exec('bash', ['-lc',
-    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`]);
+  const result = await boundedExec(world,
+    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`,
+    { maxBytes: 1024 * 1024, timeoutMs: 60_000 });
   if (result.code !== 0) throw new Error(`could not inspect remote subscription home: ${result.stderr || result.stdout}`);
+  if (result.stdout.split('\n').length > 4096) throw new Error('remote history listing count limit exceeded');
   const root = world.handle.root.replace(/\/+$/, '');
   return new Set(result.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
     file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
@@ -651,6 +645,7 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
  * sessions and Codex's derived SQLite indexes alone. */
 export async function reconcileRemoteCodexSessionCopies(world: World, home: RemoteAgentHome,
   session: string): Promise<void> {
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const prefix = `${home.relative}/`;
   const files = [...await remoteHomeFiles(world, home.absolute)]
     .filter((file) => file.startsWith(prefix) && codexRolloutIdentity(file.slice(prefix.length)));
@@ -662,7 +657,7 @@ export async function reconcileRemoteCodexSessionCopies(world: World, home: Remo
     seen.add(current);
     const candidates: { file: string; content: Buffer }[] = [];
     for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${current}.jsonl`)))
-      candidates.push({ file, content: await world.readFileBuffer(file) });
+      candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
     if (!candidates.length && current === session) break;
     const kept = selectCodexHistoryCopy(candidates, current);
     publications.push({ session: current, ...kept });
@@ -675,12 +670,13 @@ export async function reconcileRemoteCodexSessionCopies(world: World, home: Remo
 export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
   session: string, dynamicTools: unknown[]): Promise<string | undefined> {
   if (!world.writeFileBuffer) return undefined;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const files = [...await remoteHomeFiles(world, home.absolute)]
     .filter((file) => file.startsWith(`${home.relative}/sessions/`) || file.startsWith(`${home.relative}/archived_sessions/`));
   const snapshot = await prepareCodexHistory(session, async (id) => {
     const candidates = [];
     for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${id}.jsonl`)))
-      candidates.push({ file, content: await world.readFileBuffer(file) });
+      candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
     return selectCodexHistoryCopy(candidates, id);
   }, { dynamicTools });
   if (!snapshot) return session;
@@ -696,12 +692,14 @@ export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAg
 export async function materializeRemoteSession(source: World, destination: World,
   provider: Provider, session: string, destinationLocalHome: string): Promise<boolean> {
   if (!destination.writeFileBuffer) return false;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
   const prefix = `${REMOTE_ROOT}/${provider}/`;
   let files: string[];
   try {
     const sourceDirectory = path.posix.join(source.handle.root, prefix);
-    const listed = await source.exec('bash', ['-lc',
-      `if [ -d ${quote(sourceDirectory)} ]; then find ${quote(sourceDirectory)} -type f -print; fi`]);
+    const listed = await boundedExec(source,
+      `if [ -d ${quote(sourceDirectory)} ]; then find ${quote(sourceDirectory)} -type f -print; fi`,
+      { maxBytes: 1024 * 1024, timeoutMs: 60_000 });
     if (listed.code !== 0) return false;
     const root = source.handle.root.replace(/\/+$/, '');
     files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
@@ -721,7 +719,7 @@ export async function materializeRemoteSession(source: World, destination: World
     while (file) {
       if (seen.has(file)) throw new CodexHistoryError(`cyclic lineage for ${session}`);
       seen.add(file);
-      let content = await source.readFileBuffer(file);
+      let content: Buffer;
       if (provider === 'codex') {
         const id = path.posix.basename(file).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]
           ?? path.posix.basename(file).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
@@ -729,10 +727,10 @@ export async function materializeRemoteSession(source: World, destination: World
         for (const candidate of files.filter((candidate) =>
           (candidate.startsWith(`${sourceHome}/sessions/`) || candidate.startsWith(`${sourceHome}/archived_sessions/`))
           && path.posix.basename(candidate).endsWith(`${id}.jsonl`)))
-          candidates.push({ file: candidate, content: await source.readFileBuffer(candidate) });
+          candidates.push({ file: candidate, content: await readRemoteHistory(source, candidate, budget) });
         const kept = selectCodexHistoryCopy(candidates, id);
         file = kept.file; content = kept.content;
-      }
+      } else content = await readRemoteHistory(source, file, budget);
       pending.push({ file, content });
       const base = provider === 'codex' ? codexHistoryBase(content) : undefined;
       if (!base) break;
@@ -791,10 +789,8 @@ function claudeCwdSlug(worldPath: string): string { return worldPath.replace(/[^
 async function seedRemoteCodexConfig(world: World, localHome: string, home: RemoteAgentHome,
   browserMcp?: RemoteAgentHome['browserMcp']): Promise<void> {
   let config = '';
-  // Preserve settings the remote Codex process changed itself; use the host
-  // config only for the first seed into a new sandbox.
-  try { config = await world.readFile(`${home.relative}/config.toml`); }
-  catch { try { config = fs.readFileSync(path.join(localHome, 'config.toml'), 'utf8'); } catch { /* new home */ } }
+  // Host settings are authoritative on every turn, like the skills seeded above.
+  try { config = fs.readFileSync(path.join(localHome, 'config.toml'), 'utf8'); } catch { /* new home */ }
   config = removeTomlTable(removeTomlTable(removeTomlTable(config,
     'mcp_servers.karmax'), 'mcp_servers.chrome-devtools'), 'mcp_servers.playwright').trimEnd();
   for (const [name, server] of Object.entries(browserMcp ?? {})) {
@@ -840,7 +836,20 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
-  const baked = await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
+  try {
+    const cached = JSON.parse((await readRemoteHistory(world, marker, { bytes: 0, files: 0 }, 8192)).toString('utf8'));
+    if (cached.playwright === PLAYWRIGHT_VERSION && cached.chromeMcp === CHROME_DEVTOOLS_MCP_VERSION
+      && cached.playwrightMcp === PLAYWRIGHT_MCP_VERSION && typeof cached.chromium === 'string'
+      && typeof cached.bin === 'string' && typeof cached.cache === 'string') {
+      const probe = await world.exec('bash', ['-lc', [cached.chromium,
+        path.posix.join(cached.bin, 'playwright-mcp'), path.posix.join(cached.bin, 'chrome-devtools-mcp')]
+        .map(file => `test -x ${quote(file)}`).join(' && ')]);
+      if (probe.code === 0) {
+        chromium = cached.chromium; resolvedBin = cached.bin; resolvedCache = cached.cache;
+      }
+    }
+  } catch { /* missing or stale readiness marker: probe and repair below */ }
+  const baked = chromium ? { code: 1 } : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
   if (baked.code === 0) {
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
@@ -854,7 +863,6 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       resolvedCache = bakedCache;
     }
   }
-  if (!chromium) try { chromium = JSON.parse(await world.readFile(marker)).chromium; } catch { /* install below */ }
   if (!chromium) {
     const packages = [
       `playwright@${PLAYWRIGHT_VERSION}`,
@@ -900,8 +908,9 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
         : dependencyInstall;
       if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Krmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
-    await world.writeFile(marker, JSON.stringify({ chromium, playwright: PLAYWRIGHT_VERSION }));
   }
+  await world.writeFile(marker, JSON.stringify({ chromium, bin: resolvedBin, cache: resolvedCache,
+    playwright: PLAYWRIGHT_VERSION, chromeMcp: CHROME_DEVTOOLS_MCP_VERSION, playwrightMcp: PLAYWRIGHT_MCP_VERSION }));
   const env = { PLAYWRIGHT_BROWSERS_PATH: resolvedCache, ...(pathEnv ? { PATH: pathEnv } : {}) };
   if (browser === 'playwright')
     return { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
