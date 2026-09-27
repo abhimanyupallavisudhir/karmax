@@ -19,6 +19,16 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
+// Provider transport bounds are exercised in bounded-exec.test.ts; these fake
+// worlds answer commands directly instead of through a PTY.
+vi.mock('../src/world/bounded-exec.js', () => ({
+  boundedExec: async (world: any, command: string, options: { maxBytes: number }) => {
+    const result = await world.exec('bash', ['-lc', command]);
+    if (Buffer.byteLength(result.stdout) > options.maxBytes) throw new Error('world command output exceeds capture limit');
+    return result;
+  },
+}));
+
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
 import { ProviderFailure, isTransportError } from '../src/agent/limits.js';

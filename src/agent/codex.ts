@@ -939,12 +939,23 @@ export class CodexAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       client.close();
+      let stopped = true;
       try {
         if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
         else await child.stop();
-      } catch { /* cleanup must not replace the turn outcome */ }
+      } catch (error) {
+        // Cleanup must not replace the turn outcome, but a writer whose exit is
+        // unconfirmed may still be appending to its history: don't export it
+        // (docs/codex-history-integrity.md).
+        stopped = false;
+        ctx.emitActivity({
+          id: 'codex-remote-state-sync', kind: 'error', phase: 'failed',
+          title: 'Could not confirm Codex stopped; its history was not exported',
+          detail: String((error as Error)?.message ?? error).slice(0, 1000),
+        });
+      }
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
-      if (remoteHome && input.resolvedAuth?.configHome) {
+      if (stopped && remoteHome && input.resolvedAuth?.configHome) {
         const failure = await syncRemoteAgentHomeBestEffort(runtimeWorld, 'codex', remoteHome, input.resolvedAuth.configHome, threadId);
         if (failure) ctx.emitActivity({
           id: 'codex-remote-state-sync', kind: 'error', phase: 'failed',

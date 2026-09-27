@@ -235,16 +235,16 @@ function remoteAuthProjection(provider: Provider, relative: string, content: Buf
   }
 }
 
-/** Remote auth/session export is a durability enhancement, not the provider
- * turn's terminal result. Return a diagnostic instead of throwing so a control-
- * plane timeout during cleanup cannot replace a verified successful turn. */
+/** Remote session export is a durability enhancement, not the provider turn's
+ * terminal result. Return a diagnostic instead of throwing so a control-plane
+ * timeout or a refused history (CodexHistoryError: nothing is published) during
+ * cleanup cannot replace a verified successful turn (AD-11). */
 export async function syncRemoteAgentHomeBestEffort(world: World, provider: Provider,
   remoteHome: RemoteAgentHome, localHome: string, session?: string): Promise<Error | undefined> {
   try {
     await syncRemoteAgentHome(world, provider, remoteHome, localHome, session);
     return undefined;
   } catch (error) {
-    if (error instanceof CodexHistoryError) throw error;
     return error instanceof Error ? error : new Error(String(error));
   }
 }
