@@ -28,3 +28,17 @@ it('WF-15: a rejected bundle does not roll the healthy worker again', async () =
   expect(refresh).toHaveBeenCalledTimes(1);
   expect(manager.list().some(item => item.name === 'fixture')).toBe(false);
 });
+
+it('PS-2: boot restores the external set before starting a single worker', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'boot-restore-'));
+  const dir = path.join(home, 'abcdef1234'); fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(home, 'installed.json'), JSON.stringify([{ name: 'fixture', version: '1.0.0', sha: 'abcdef1234', dir }]));
+  const refresh = vi.fn();
+  const manager = new WorkflowManager({ refresh }, { inspect: async () => ({ manifest, workflowEntry: path.join(dir, 'workflow.js') }) } as any,
+    PackageStore.withBundled(), home);
+  try {
+    expect(await manager.restore(undefined, false)).toBe(1);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(manager.workflowRefs).toEqual([{ type: 'fixture@1.0.0', entryFile: path.join(dir, 'workflow.js'), exportName: undefined }]);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

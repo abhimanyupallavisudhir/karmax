@@ -178,17 +178,19 @@ export class WorkflowManager {
     return { name: pkg.manifest.name, version: pkg.manifest.version };
   }
 
+  get workflowRefs(): ExternalWorkflowRef[] { return [...this.external.values()]; }
+
   /**
    * Reload previously-installed packages from disk and roll the worker once so
    * they're served again after a restart (SPEC §4.2). Loads from the cached
    * snapshot — no network — so an unreachable origin doesn't break boot. A
    * snapshot that has gone missing is skipped (reported to `onWarn`).
    */
-  async restore(onWarn: (msg: string) => void = () => {}): Promise<number> {
-    return this.exclusive(() => this.restoreExclusive(onWarn));
+  async restore(onWarn: (msg: string) => void = () => {}, activate = true): Promise<number> {
+    return this.exclusive(() => this.restoreExclusive(onWarn, activate));
   }
 
-  private async restoreExclusive(onWarn: (msg: string) => void): Promise<number> {
+  private async restoreExclusive(onWarn: (msg: string) => void, activate: boolean): Promise<number> {
     if (this.hosted) {
       if (this.readRegistry().length) onWarn('External workflow restore disabled in hosted deployments; existing external executions require migration');
       return 0;
@@ -230,7 +232,7 @@ export class WorkflowManager {
         onWarn(`could not restore workflow ${r.name}@${r.version}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    if (external.size) await this.worker.refresh([...external.values()]);
+    if (activate && external.size) await this.worker.refresh([...external.values()]);
     this.external = external; this.shaByType = shaByType; this.shaByPackage = shaByPackage;
     for (const { organizationId, manifest } of manifests) this.storeFor(organizationId).register(manifest);
     return loaded;

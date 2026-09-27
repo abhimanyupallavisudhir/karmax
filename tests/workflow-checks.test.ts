@@ -51,7 +51,7 @@ function registerFakeWorld(opts: { kind: string; remote: boolean; hasBundle: boo
   return worlds;
 }
 
-async function coreFor(worlds: WorldRegistry, contentDir: string, client: any = {}) {
+async function coreFor(worlds: WorldRegistry, contentDir: string, client: any = {}, workflowBundle?: () => { code: string }) {
   const store = (await Store.create(':memory:'));
   (await store.claimPersonalOrganization('owner'));
   return {
@@ -60,7 +60,7 @@ async function coreFor(worlds: WorldRegistry, contentDir: string, client: any = 
       store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock'),
       contentDir,
       // Only needs to be present: every assertion here returns before it is used.
-      client,
+      client, workflowBundle,
     } as any),
   };
 }
@@ -158,11 +158,14 @@ it('replays only organization task histories from a repeatable streamed snapshot
     if (nextPageToken?.length) return { history: { events: [{ eventId: 2, eventType: 5, workflowTaskScheduledEventAttributes: {} }] } };
     fetched.push(execution.workflowId); return { history, nextPageToken: Buffer.from('page-2') };
   } } };
-  const { store, core } = await coreFor(worlds, root, client);
+  const liveBundle = { code: 'already-compiled-running-worker' };
+  const { store, core } = await coreFor(worlds, root, client, () => liveBundle);
   const { Worker } = await import('@temporalio/worker');
   const seen: string[][] = [];
   const streamed: boolean[] = [];
   const replay = vi.spyOn(Worker, 'runReplayHistories').mockImplementation(async function* (_opts, histories) {
+    if (seen.length === 0) expect(_opts.workflowBundle).toBe(liveBundle);
+    else expect(_opts.workflowBundle).toHaveProperty('code');
     streamed.push(!Array.isArray(histories));
     const ids: string[] = []; seen.push(ids);
     for await (const item of histories) {

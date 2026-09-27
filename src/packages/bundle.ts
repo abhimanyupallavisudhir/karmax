@@ -1,4 +1,7 @@
 import os from 'node:os';
+import { createRequire } from 'node:module';
+import { paths } from '../config/paths.js';
+import { cachedWorkflowBundle, bundleHash } from './bundle-cache.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -31,21 +34,67 @@ const PROJECT_NODE_MODULES = fileURLToPath(new URL('../../node_modules', import.
  * the project's node_modules so an external file far from the tree can still
  * resolve `@temporalio/workflow`.
  */
-export async function buildVersionedBundle(externals: ExternalWorkflowRef[]): Promise<WorkflowBundle> {
+export async function buildVersionedBundle(externals: ExternalWorkflowRef[], options: {
+  workflowsPath?: string; cacheDir?: string; cache?: boolean;
+} = {}): Promise<WorkflowBundle> {
+  const entry = options.workflowsPath
+    ? `export * from ${JSON.stringify(pathToFileURL(options.workflowsPath).href)};\n`
+    : generateEntry(externals);
+  if (options.cache === false) return (await compileBundle(entry)).bundle;
+  const identity = JSON.stringify([3, entry, process.versions, process.platform, process.arch,
+    process.env.NODE_ENV, process.env.NODE_OPTIONS, process.env.SWC_BINARY_PATH]);
+  return cachedWorkflowBundle(options.cacheDir ?? path.join(paths().state, 'workflow-bundles'), identity,
+    () => compileBundle(entry));
+}
+
+async function compileBundle(entry: string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wf-entry-'));
   try {
-    fs.writeFileSync(path.join(dir, 'entry.mjs'), generateEntry(externals));
+    fs.writeFileSync(path.join(dir, 'entry.mjs'), entry);
+    let files: string[] = [], missing: string[] = [], contexts: string[] = [];
+    const reads = new Map<string, string>();
+    const keep = (file: string) => !file.startsWith(dir + path.sep);
+    const require = createRequire(import.meta.url);
     // Quiet the bundler's webpack/info chatter by default (KARMAX_TEMPORAL_LOG to raise).
     const level = (process.env.KARMAX_TEMPORAL_LOG ?? 'WARN').toUpperCase() as LogLevel;
-    return await bundleWorkflowCode({
+    const bundle = await bundleWorkflowCode({
       workflowsPath: path.join(dir, 'entry.mjs'),
       logger: new DefaultLogger(level),
       webpackConfigHook: (config) => {
         config.resolve = config.resolve ?? {};
         (config.resolve as { modules?: string[] }).modules = [PROJECT_NODE_MODULES, ...((config.resolve as { modules?: string[] }).modules ?? ['node_modules'])];
+        config.plugins ??= [];
+        config.plugins.push({ apply(compiler) {
+          compiler.hooks.beforeRun.tap('karmax-bundle-inputs', () => {
+            const input = compiler.inputFileSystem!;
+            const read = input.readFile.bind(input);
+            input.readFile = ((file: string, callback: any) => read(file, (error: any, bytes: any) => {
+              if (!error && bytes && keep(String(file)) && fs.existsSync(String(file)))
+                reads.set(String(file), bundleHash(bytes));
+              callback(error, bytes);
+            })) as typeof input.readFile;
+          });
+          compiler.hooks.afterCompile.tap('karmax-bundle-inputs', compilation => {
+            files = [...compilation.fileDependencies].filter(keep);
+            missing = [...compilation.missingDependencies].filter(keep);
+            contexts = [...compilation.contextDependencies].filter(keep);
+          });
+        } });
         return config;
       },
     });
+    // Include the compiler/loader implementation, SDK version, and our bundle
+    // configuration as well as webpack's transitive workflow/resolution inputs.
+    const toolFiles = Object.keys(require.cache);
+    const manifests = toolFiles.flatMap(file => {
+      const match = file.match(/^(.*[/\\]node_modules[/\\](?:@[^/\\]+[/\\])?[^/\\]+)[/\\]/);
+      return match ? [path.join(match[1]!, 'package.json')] : [];
+    });
+    files.push(...toolFiles, ...manifests, fileURLToPath(import.meta.url),
+      fileURLToPath(new URL('./bundle-cache.ts', import.meta.url)),
+      fileURLToPath(new URL('../../package-lock.json', import.meta.url)),
+      fileURLToPath(new URL('../../package.json', import.meta.url)));
+    return { bundle, files: [...new Set(files)], missing, contexts, reads };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

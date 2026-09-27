@@ -5364,6 +5364,14 @@ export class Store {
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
+  /** Read only the sparse evidence a consumer needs, preserving revocation order. */
+  async eventsOfTypes(taskId: string, types: string[]): Promise<(KarmaxEvent & { seq: number })[]> {
+    if (!types.length) return [];
+    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND type IN (${types.map(() => '?').join(',')}) ORDER BY seq`)
+      .all(taskId, ...types)) as any[])
+      .map(r => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
   async eventBySeq(taskId: string, seq: number): Promise<(KarmaxEvent & { seq: number }) | undefined> {
     const row = (await this.db.prepare('SELECT * FROM events WHERE taskId = ? AND seq = ?').get(taskId, seq)) as any;
     return row ? { seq: row.seq, type: row.type, taskId: row.taskId, ts: row.ts, payload: JSON.parse(row.payload) } : undefined;

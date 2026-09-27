@@ -25,6 +25,7 @@ const prs: any[] = [];
 const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
 let githubReadiness: Record<string, unknown> = {};
+let readinessReads = 0;
 const githubReadinessBySlug = new Map<string, Record<string, unknown>>();
 let mergeHttpStatus: number | undefined;
 let useMergeQueue = false;
@@ -141,6 +142,7 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     return json(201, pr);
   }
   if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('PullRequestReadiness')) {
+    readinessReads++;
     const querySlug = `${body.variables?.owner}/${body.variables?.name}`;
     const pr = prs.find((candidate) => candidate.repo === querySlug
       && candidate.number === Number(body.variables?.number)) ?? prs[0];
@@ -1397,32 +1399,33 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
     await handle.signal('confirm');
     const publications = async () => (await h.store.eventsSince(task.id, 0)).filter((e) => e.type === 'view.updated').length;
-    // Drive full polling cycles explicitly. A 1ms timer can start another
-    // non-heartbeating activity during shutdown; losing its completion then
-    // leaves replay waiting for the five-minute activity timeout. This test
-    // measures history size and replay, so restart at a durable timer boundary.
-    const waitForPoll = async (previous: number) => {
+    // Let the read-only watcher settle before stopping its worker. Each wake
+    // must complete a real GitHub read without republishing the conversation.
+    const watcherId = `${task.id}/landing-watch/0`;
+    const waitForPoll = async () => {
       await expect.poll(async () => {
         const description = await h.client.workflowService.describeWorkflowExecution({
-          namespace: h.client.options.namespace, execution: { workflowId: task.id },
-        });
+          namespace: h.client.options.namespace, execution: { workflowId: watcherId },
+        }).catch(() => undefined);
         const current = (await h.store.getTask(task.id))?.lastView;
-        return (await publications()) > previous && current?.stage === 'merge'
-          && current.waitingFor?.kind === 'github'
+        return !!description && current?.stage === 'merge' && current.waitingFor?.kind === 'github'
           && !description.pendingActivities?.length && !description.pendingWorkflowTask;
       }, { timeout: 30_000 }).toBe(true);
     };
-    const advancePublications = async (minimum: number) => {
-      while ((await publications()) <= minimum) {
-        const previous = (await publications());
+    const advancePolls = async (count: number) => {
+      for (let i = 0; i < count; i++) {
+        const previous = readinessReads;
         await handle.signal('providerChanged');
-        await waitForPoll(previous);
+        await expect.poll(() => readinessReads, { timeout: 10_000 }).toBeGreaterThan(previous);
+        await waitForPoll();
       }
     };
-    await waitForPoll(0);
-    await advancePublications(30);
+    await waitForPoll();
+    const initialPublications = await publications();
+    await advancePolls(5);
     await h.restartWorker();
-    await advancePublications(100);
+    await advancePolls(5);
+    expect(await publications()).toBe(initialPublications);
     const live = await view(handle);
     expect(live.stage).toBe('merge');
     expect(live.messages.map((m: any) => m.text).join('\n')).toContain(log);
@@ -1447,10 +1450,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       ? [e.activityTaskScheduledEventAttributes] : []);
     const decode = (payload: any) => JSON.parse(Buffer.from(payload.data).toString());
     const bodies = scheduled.map((e) => decode(e.input!.payloads![1]));
-    expect(bodies.filter((v) => v.messages === undefined).length).toBeGreaterThan(90);
+    expect(bodies.filter((v) => v.messages === undefined).length).toBeGreaterThan(0);
     expect(JSON.stringify(events).length).toBeLessThan(10_000_000);
-    // The previous protocol crossed Temporal's 50MB limit with this workload.
-    expect(Buffer.byteLength(JSON.stringify(live)) * scheduled.length).toBeGreaterThan(50 * 1024 * 1024);
+    // Idle GitHub observations add no publication commands at all.
+    expect(scheduled.length).toBeLessThan(35);
     expect((await h.store.getTask(task.id))?.lastView?.messages).toEqual(live.messages);
   }, 240_000);
 
