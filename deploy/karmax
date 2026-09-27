@@ -12,10 +12,10 @@ die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
 dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
-backup_checksums() {
+backup_checksums() (
   destination=$1
   (cd "$destination" && sha256sum *.dump deployment-secrets/* > SHA256SUMS)
-}
+)
 
 compact_backups() {
   # Optional space optimization must never invalidate a verified backup or
