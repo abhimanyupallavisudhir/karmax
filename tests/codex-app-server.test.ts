@@ -34,7 +34,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     if (process.env.STUB_MODE === 'rpc-limit') { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: 'usageLimitReached' } } }); return; }
     if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
-    send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
+    if (process.env.STUB_MODE === 'stream') {
+      send({ method: 'item/started', params: { item: { type: 'agentMessage', id: 'msg-1', text: '' } } });
+      for (const delta of ['d', 'o', 'ne']) send({ method: 'item/agentMessage/delta', params: { threadId: 'thread-new', turnId: 'turn-1', itemId: 'msg-1', delta } });
+    }
+    send({ method: 'item/completed', params: { item: { type: 'agentMessage', id: 'msg-1', text: 'done' } } });
     const mode = process.env.STUB_MODE || 'completed';
     if (mode === 'steer-race') { send({ method: 'turn/started', params: { turn: { id: 'turn-1' } } }); return; }
     if (mode === 'tool') {
@@ -185,6 +189,18 @@ describe('CodexAdapter app-server security policy', () => {
     expect(offsets).toEqual([1, 2]);
     expect(lastResult.delivered).toBe(2);
     expect(records.filter(r => r.method === 'turn/steer')).toHaveLength(1);
+  });
+
+  it('streams agent-message deltas as the growing text and records the message once (LT-5)', async () => {
+    const emitted: string[] = [];
+    const messages: string[] = [];
+    await run(undefined, 'stream', false, {
+      emit: (text: string, source?: string) => { if (source === 'assistant') emitted.push(text); },
+      emitActivity: (activity: any) => { if (activity.kind === 'message') messages.push(activity.title); },
+    });
+    expect(emitted).toEqual(['d', 'do', 'done']);
+    expect(messages).toEqual(['done']);
+    expect(lastResult.output).toBe('done');
   });
 
   it('reports no usage when the app-server sent none', async () => {

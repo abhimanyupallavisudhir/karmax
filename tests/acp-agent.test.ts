@@ -222,7 +222,9 @@ describe('generic ACP agent adapter', () => {
       output: 'done',
       delivered: 1,
     });
-    expect(output).toEqual(['do', 'ne']);
+    // The console renders each emit as the whole live message (LT-5), so chunks
+    // are published as the growing text, never as bare deltas.
+    expect(output).toEqual(['do', 'done']);
     expect(activities).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'tool-1', kind: 'file', phase: 'started' }),
       expect.objectContaining({ id: 'tool-1', kind: 'file', phase: 'completed' }),

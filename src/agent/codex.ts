@@ -1,5 +1,6 @@
 import { workEnvironment, codexWorkProfile } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
+import { readOpenAiResponse } from './api-streams.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
 import { selectedCodexMcpFlags } from '../mcp/connections/codex-selection.js';
@@ -303,7 +304,9 @@ export class CodexAdapter implements AgentAdapter {
       // prompt (task, world path, wiki context, role template) after the very
       // first model call, and a resumed turn never sent it at all. Always send
       // it, alongside the chain id. (Claude's metered path does the same.)
-      const body: any = { model, tools, tool_choice: completionPending ? 'none' : 'auto', store: true, input: nextInput, instructions: input.systemPrompt };
+      // `stream`: text reaches the task as it is generated (LT-5); the terminal
+      // event carries the same response object the non-streaming call returns.
+      const body: any = { model, tools, tool_choice: completionPending ? 'none' : 'auto', store: true, stream: true, input: nextInput, instructions: input.systemPrompt };
       if (respId) body.previous_response_id = respId;
       // Reasoning effort (SPEC §10.5) — only reasoning models accept it (not gpt-4.1).
       const reasoningEffort = codexReasoningEffort(model, input.profile.effort);
@@ -320,7 +323,7 @@ export class CodexAdapter implements AgentAdapter {
         const message = `OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`;
         throw providerErrorFromMessage('codex', message, 'structured');
       }
-      const data = (await res.json()) as any;
+      const data = await readOpenAiResponse(res, (text) => ctx.emit(text, 'assistant'));
       (await (await currentTiming())?.markOnce('first.output'));
       return data;
       });
@@ -542,6 +545,8 @@ export class CodexAdapter implements AgentAdapter {
     let currentTurnId: string | undefined;
     let turnActive = false;
     let finalText = '';
+    let streamingItem: string | undefined;
+    let streamingText = '';
     let limit: ProviderFailureMetadata | undefined;
     let turnError: string | undefined;
     let terminalStatus: string | undefined;
@@ -648,10 +653,21 @@ export class CodexAdapter implements AgentAdapter {
             if (activity) ctx.emitActivity(activity);
           }
           break;
+        case 'item/agentMessage/delta':
+          // Token deltas (LT-5): publish the message's growing text; its
+          // item/completed below records the message itself.
+          if (typeof params?.delta === 'string' && params.delta) {
+            if (streamingItem !== String(params.itemId)) { streamingItem = String(params.itemId); streamingText = ''; }
+            streamingText += params.delta;
+            ctx.emit(streamingText, 'assistant');
+          }
+          break;
         case 'item/completed':
           if (params?.item?.type === 'agentMessage' && typeof params.item.text === 'string' && params.item.text) {
             finalText = params.item.text;
-            ctx.emit(finalText, 'assistant');
+            if (finalText !== streamingText) ctx.emit(finalText, 'assistant');
+            streamingItem = undefined;
+            streamingText = '';
           }
           {
             const activity = codexItemActivity(params?.item, 'completed');

@@ -66,7 +66,9 @@ export interface PlatformToolContext {
   }): Promise<{ filled: true; origin: string }>;
   /** Call the capability-checked karmax gateway under this turn's scoped token. */
   platformRequest?(method: string, path: string, body?: unknown): Promise<unknown>;
-  /** Stream incremental output to the task's live event log. */
+  /** Stream live output to the task's event log. For `assistant`, `text` is the
+   *  whole text so far of the block being generated (never a bare delta), so an
+   *  adapter may call this per token; the runtime coalesces publication. */
   emit(text: string, source?: 'assistant' | 'tool'): void;
   /** Publish a structured provider item for the durable conversation timeline. */
   emitActivity(activity: AgentActivity): void | Promise<void>;
