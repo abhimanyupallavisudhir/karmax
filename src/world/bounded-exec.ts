@@ -82,16 +82,21 @@ export async function boundedExec(world: World, command: string, options: {
       // The PTY's exit proves nothing about the output: node-pty emits it once
       // its socket closes, and destroys the socket 200 ms after the child exits
       // whatever is still unread. Only the end-of-output marker (written after
-      // the command, carrying its status) proves the capture is complete.
+      // the command, carrying its status) proves the capture is complete; an
+      // exit before it means the shell died, never a finished command.
       detachExit = terminal.onExit(() => fail(new Error('world command transport ended without its end-of-output marker')));
       // Base64 lines avoid terminal canonical-line and exec argv limits. Supply
       // the script on a descriptor so command stdin remains the terminal.
       const encoded = Buffer.from(command).toString('base64').match(/.{1,1024}/g)?.join('\n') ?? '';
       // The trailer shares the command's last line so the shell parses it with
       // the command; a separate line would sit in the terminal's input, where a
-      // command reading stdin could consume it.
+      // command reading stdin could consume it. After the marker the shell waits
+      // on the terminal instead of exiting: an exiting shell starts node-pty's
+      // 200 ms socket teardown, which a slow reader loses the marker to. We
+      // close the terminal once the marker arrives; the bounded wait still ends
+      // a shell whose close cannot reach it (a detached `docker exec`).
       const script = `bash -l /dev/fd/3 3< <(base64 -d <<'${marker}_END'\n${encoded}\n${marker}_END\n`
-        + `); karmax_status=$?; printf '%s%s\\n' '${endMarker}' "$karmax_status"; exit "$karmax_status"\n`;
+        + `); karmax_status=$?; printf '%s%s\\n' '${endMarker}' "$karmax_status"; read -r -t 60 _; exit "$karmax_status"\n`;
       void Promise.resolve(terminal.write(`stty -echo -onlcr; PS1= PS2=; bind 'set enable-bracketed-paste off'; printf '\\n${marker}\\n'\n`))
         .then(() => { pendingScript = script; if (started) sendScript(); }).catch(fail);
     });

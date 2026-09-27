@@ -49,6 +49,53 @@ describe('bounded world command capture', () => {
     expect(result).toEqual({ code: 0, stdout: 'read:', stderr: '' });
   });
 
+  // AD-30 on a real PTY: node-pty destroys its socket 200 ms after the shell
+  // exits. A reader slower than that (a loaded host) must still get every byte.
+  it('delivers the complete output of a real terminal to a slow reader', async () => {
+    const world = { openPty: async (spec: any) => {
+      const terminal = await openLocalPty('/tmp', spec);
+      return { ...terminal, onData: (cb: (chunk: string) => void) => terminal.onData((chunk) => {
+        const until = Date.now() + 30;
+        while (Date.now() < until) { /* a busy event loop */ }
+        cb(chunk);
+      }) };
+    } } as any;
+    const lines = Array.from({ length: 4000 }, (_, i) => `line ${i}`);
+    const result = await boundedExec(world, `for i in $(seq 0 3999); do echo "line $i"; done; printf last`,
+      { maxBytes: 1_000_000, timeoutMs: 60_000 });
+    expect(result).toEqual({ code: 0, stdout: `${lines.join('\n')}\nlast`, stderr: '' });
+  }, 90_000);
+
+  // The same teardown, modelled exactly: a real shell behind a terminal that
+  // delivers each chunk later and, 10 ms after the shell exits, drops
+  // whatever it has not delivered yet, then reports exit.
+  it('never loses the marker to a terminal torn down as soon as the shell exits', async () => {
+    const { spawn } = await import('node:child_process');
+    let shell: ReturnType<typeof spawn> | undefined;
+    const world = { async openPty() {
+      shell = spawn('bash', ['--norc', '-i'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let output = (_: string) => {}, exit = (_: number | null) => {};
+      let queue = Promise.resolve(), torn = false;
+      const deliver = (data: Buffer) => { queue = queue.then(() => new Promise(resolve => setTimeout(() => {
+        if (!torn) output(data.toString('utf8'));
+        resolve();
+      }, 20))); };
+      shell.stdout!.on('data', deliver);
+      shell.stderr!.on('data', () => {}); // prompts and non-terminal warnings
+      shell.on('exit', (code) => setTimeout(() => { torn = true; exit(code); }, 10));
+      return {
+        onData(cb: typeof output) { output = cb; return () => {}; },
+        onExit(cb: typeof exit) { exit = cb; return () => {}; },
+        write(data: string) { shell!.stdin!.write(data); },
+        close() { shell!.kill('SIGKILL'); },
+      };
+    } } as any;
+    const result = await boundedExec(world, "printf 'first\\n'; printf 'the tail that matters'; exit 4", { maxBytes: 1024, timeoutMs: 10_000 });
+    expect(result).toEqual({ code: 4, stdout: 'first\nthe tail that matters', stderr: '' });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(shell!.exitCode !== null || shell!.signalCode !== null).toBe(true); // the terminal was closed
+  });
+
   it('delivers commands larger than the terminal canonical line limit intact', async () => {
     const world = { openPty: (spec: any) => openLocalPty('/tmp', spec) } as any;
     const command = `printf '%s' '${'x'.repeat(200_000)}'; printf done`;
