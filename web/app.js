@@ -90,7 +90,7 @@ const S = {
   approvalRequests: [], // credential decisions for the selected task
   permissionRequests: [], // exact capability elevations requested by the selected task
   approvalItems: [], // organization vault metadata used to label/bind those requests
-  liveOutput: '',
+  liveOutput: {}, // role → { text, seq, turnId, attempt }: each agent's streamed text so far
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   followupHeights: {}, // manual minimum height for each draft, preserved across background renders
   // In-flight parameter edits are deliberately manual-save. Keep their working
@@ -2747,7 +2747,7 @@ function resumeVisibleUpdates() {
     S.liveUpdatesStale = false;
     resourceReviewCache.clear(); resourceInventoryCache.clear();
     loadInbox().catch(() => {});
-    if (S.selected) { refreshTask(); refreshTaskHistory(S.selected); }
+    if (S.selected) { S.liveOutput = {}; refreshTask(); refreshTaskHistory(S.selected); }
     else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
     else if (S.tab === 'activity') seedActivity();
   }
@@ -3413,17 +3413,15 @@ function connectWs() {
       if (ev.type === 'agent.output' && ev.payload?.text) {
         // Adapters publish the whole text so far of the block being generated,
         // not a token delta, so the bubble is replaced. Tool lines are timeline
-        // rows of their own and never replace it.
+        // rows of their own and never replace it. Each agent keeps its own text.
         if (ev.payload.source === 'assistant') {
-          S.liveOutput = ev.payload.text;
-          S.liveOutputRole = ev.payload.role;
-          updateLiveBubble();
+          noteLiveOutput(ev);
+          updateLiveBubble(ev.payload.role || 'do');
         }
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
-        // The completed message supersedes its live text; a new or failed
-        // attempt voids it, so a half message never lingers as if final.
-        if (ev.type === 'agent.activity' && (ev.payload?.kind === 'turn' || ev.payload?.kind === 'message' && ev.payload?.phase === 'completed'))
-          S.liveOutput = '';
+        // The completed message supersedes its agent's live text; a new or
+        // failed attempt voids it, so a half message never lingers as if final.
+        if (ev.type === 'agent.activity' && supersedesLiveOutput(ev)) delete S.liveOutput[ev.payload?.role || 'do'];
         scheduleTaskPageRender();
       }
       if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
@@ -3435,7 +3433,6 @@ function connectWs() {
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
-        S.liveOutput = '';
         refreshTask(ev.type);
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
@@ -3471,7 +3468,8 @@ function connectWs() {
     else if (wsHadDropped) {
       loadInbox().catch(() => {});
       refreshTasks().catch(() => {});
-      if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
+      // Events were missed: live text is rebuilt from history, never kept stale.
+      if (S.selected) { S.liveOutput = {}; refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
     }
     wsHadDropped = false;
   };
@@ -6838,6 +6836,34 @@ function mergeTaskHistory(events) {
       explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
   }
   S.taskEvents = [...ordinary, ...explanations.values()].filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true);
+  // History carries each agent's latest streamed text, so a page opened
+  // mid-stream (or back from a drop) shows it until what supersedes it arrives.
+  for (const event of events) if (event.type === 'agent.output' && event.payload?.source === 'assistant' && event.payload.text) noteLiveOutput(event);
+}
+
+// An agent's live text belongs to its turn and attempt and is ordered by
+// durable seq, so a late or replayed publication never replaces a newer one.
+function noteLiveOutput(ev) {
+  const role = ev.payload.role || 'do';
+  const prior = S.liveOutput[role];
+  if (prior?.seq != null && ev.seq != null && Number(ev.seq) < Number(prior.seq)) return;
+  S.liveOutput[role] = { text: ev.payload.text, seq: ev.seq, turnId: ev.payload.turnId, attempt: ev.payload.attempt };
+}
+
+function supersedesLiveOutput(ev) {
+  return ev.payload?.kind === 'turn' || ev.payload?.kind === 'message' && ev.payload?.phase === 'completed';
+}
+
+// The text to show live for `role`, or '' once it is no longer live: the task
+// stopped, the agent's running turn is another one, or history already holds a
+// later message completion or turn boundary for that agent.
+function liveOutputFor(v, role) {
+  const live = S.liveOutput?.[role];
+  if (!live?.text || v?.status !== 'active') return '';
+  if (live.turnId && v.agentTurn?.role === role && v.agentTurn.turnId !== live.turnId) return '';
+  if (live.seq != null && (S.taskEvents || []).some((event) => event.type === 'agent.activity' && (event.payload?.role || 'do') === role
+    && event.seq != null && Number(event.seq) > Number(live.seq) && supersedesLiveOutput(event))) return '';
+  return live.text;
 }
 
 async function refreshTaskHistory(taskId) {
@@ -6895,7 +6921,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
   // "let me merge master into this branch") bleeds into THIS page's live bubble
   // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
-  S.liveOutput = ''; S.liveOutputRole = undefined;
+  S.liveOutput = {};
   // Drop the previous task's view + per-task derived state up front. `S.view` is
   // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
   // fetched a few awaits later — so a render firing in that gap (a WS event, a
@@ -7077,7 +7103,7 @@ function closeTaskDom() {
   S.taskFileLoad = null;
   S.checkinSel = null;
   S.conversationFullscreen = false;
-  S.liveOutput = ''; S.liveOutputRole = undefined; // drop any streamed live text so it can't reappear on the next task page
+  S.liveOutput = {}; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
   if (reviewActionWs) { try { reviewActionWs.close(); } catch {} reviewActionWs = null; } // …and stops streaming a review action into the next page
@@ -8792,12 +8818,10 @@ function conversationPane(v, t) {
     : S.taskHistoryError
       ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
       : '';
-  // Only the stage's own conversation gets the #live-bubble (one per page,
-  // updated by the WS stream).
-  // The bubble belongs to the conversation of the agent that is streaming.
-  const live = t.role === (S.liveOutputRole || liveRoleFor(v))
-    ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
-    : '';
+  // The open conversation's #live-bubble shows its own agent's streamed text
+  // (one per page, patched by the WS stream).
+  const liveText = liveOutputFor(v, t.role);
+  const live = `<div class="msg agent ${liveText ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(liveText)}</div>`;
   // Only subscription/CLI sessions carry a config home; API-key / stateless
   // sessions can't be forked from a terminal, so no command is shown. The session
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
@@ -10756,19 +10780,18 @@ function wireFollowups(v) {
   });
 }
 
-function updateLiveBubble() {
+function updateLiveBubble(role) {
   const b = document.getElementById('live-bubble');
   const thread = document.getElementById('ck-thread');
-  if (S.liveOutputRole && thread?.dataset.role && thread.dataset.role !== S.liveOutputRole) {
-    b?.classList.add('hidden'); // another agent's conversation is open
-    return;
-  }
+  if (thread?.dataset?.role && thread.dataset.role !== role) return; // another agent's conversation is open
   if (!b) { if (thread) scheduleTaskPageRender(); return; } // this conversation gains its bubble
+  const text = liveOutputFor(S.view, role);
+  if (!text) { b.classList.add('hidden'); return; }
   // Follow the stream only when the reader is already parked at the bottom; if
   // they've scrolled up to read history, hold their view fixed as text streams in.
   const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
   b.classList.remove('hidden');
-  b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
+  b.innerHTML = `<div class="role">agent · live</div>${esc(text)}`;
   if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
