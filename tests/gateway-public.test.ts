@@ -37,7 +37,7 @@ describe('public gateway payloads', () => {
     gateway.deps = { tokens: { verify: async () => ({}), check: async () => ({ ok: true }) } };
     gateway.fanout = { on: (listener: typeof publish) => { publish = listener; return () => {}; } };
     const sent: any[] = [];
-    const ws = { readyState: 1, bufferedAmount: 0, on: () => {}, send: (value: string) => sent.push(JSON.parse(value)) };
+    const ws = { readyState: 1, bufferedAmount: 0, on: () => {}, once: () => {}, send: (value: string) => sent.push(JSON.parse(value)) };
     await gateway.eventStream(ws, { url: '/ws' });
     await publish!({ type: 'view.updated', taskId: 'task-1', payload: {} }, 'project-1');
     expect(sent[0]).toMatchObject({ projectId: 'project-1', taskId: 'task-1' });
