@@ -52,5 +52,8 @@ it('persists a real webpack bundle and invalidates transitive external sources',
     const changed = await buildVersionedBundle(refs, { cacheDir });
     expect(changed.code).not.toBe(cold.code);
     expect(changed.code).toContain('modified-value');
+    const ephemeralCache = path.join(dir, 'ephemeral-cache');
+    await buildVersionedBundle(refs, { cacheDir: ephemeralCache, cache: false });
+    await expect(fs.access(ephemeralCache)).rejects.toThrow();
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 }, 60_000);

@@ -35,11 +35,12 @@ const PROJECT_NODE_MODULES = fileURLToPath(new URL('../../node_modules', import.
  * resolve `@temporalio/workflow`.
  */
 export async function buildVersionedBundle(externals: ExternalWorkflowRef[], options: {
-  workflowsPath?: string; cacheDir?: string;
+  workflowsPath?: string; cacheDir?: string; cache?: boolean;
 } = {}): Promise<WorkflowBundle> {
   const entry = options.workflowsPath
     ? `export * from ${JSON.stringify(pathToFileURL(options.workflowsPath).href)};\n`
     : generateEntry(externals);
+  if (options.cache === false) return (await compileBundle(entry)).bundle;
   const identity = JSON.stringify([3, entry, process.versions, process.platform, process.arch,
     process.env.NODE_ENV, process.env.NODE_OPTIONS, process.env.SWC_BINARY_PATH]);
   return cachedWorkflowBundle(options.cacheDir ?? path.join(paths().state, 'workflow-bundles'), identity,

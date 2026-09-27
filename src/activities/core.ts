@@ -3034,7 +3034,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
           const baselineBundle = deps.workflowBundle?.() ?? await buildVersionedBundle([]);
           const baselineFailures = await replay(baselineBundle);
-          const candidateFailures = await replay(await buildVersionedBundle([], { workflowsPath: candidatePath }));
+          const candidateFailures = await replay(await buildVersionedBundle([], { workflowsPath: candidatePath, cache: !mirror }));
           const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
           const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
           const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
