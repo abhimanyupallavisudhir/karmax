@@ -42,7 +42,7 @@ Prompt character counts are observed; token/cache counts are absent because the 
 
 ## Reproduce and inspect
 
-See [response timing](response-timing.md) for the full measurement contract and live-production collection procedure. The compressed [raw export](../benchmarks/results/latency-fixture-2026-09-17.json.gz) contains content-free observations, environment, scenario groups, and the report. Recompute without contacting any services:
+See [response timing](../../docs/response-timing.md) for the full measurement contract and live-production collection procedure. The compressed [raw export](latency-fixture-2026-09-17.json.gz) contains content-free observations, environment, scenario groups, and the report. Recompute without contacting any services:
 
 ```sh
 npx tsx src/scripts/timing-report.ts benchmarks/results/latency-fixture-2026-09-17.json.gz > /tmp/timing-report.json
