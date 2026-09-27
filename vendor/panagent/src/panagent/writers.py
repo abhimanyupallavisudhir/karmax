@@ -299,6 +299,8 @@ def write_codex(
                 "timestamp": created,
                 "cwd": native_cwd,
                 "originator": "panagent",
+                # Codex requires the writing client's version; the writer here is panagent.
+                "cli_version": __version__,
                 "source": "cli",
                 "thread_source": "user",
                 "model_provider": "openai",
