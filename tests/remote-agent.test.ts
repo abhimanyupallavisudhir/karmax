@@ -10,7 +10,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // fixtures execute the command against in-memory files or a local fake sandbox.
 vi.mock('../src/world/bounded-exec.js', () => ({
   boundedExec: async (world: World, command: string, options: { maxBytes: number }) => {
-    const result = await world.exec('bash', ['-lc', command]);
+    // A verified read (remote-process.ts) appends its output's length and digest.
+    const verified = /\{ ([\s\S]*)\n\} > "\$out"/.exec(command)?.[1];
+    const result = await world.exec('bash', ['-lc', verified ?? command]);
+    if (verified !== undefined && result.code === 0) {
+      const { createHash } = await import('node:crypto');
+      const output = Buffer.from(result.stdout);
+      result.stdout += `\n${output.length} ${createHash('sha256').update(output).digest('hex')}\n`;
+    }
     if (Buffer.byteLength(result.stdout) > options.maxBytes) throw new Error('world command output exceeds capture limit');
     return result;
   },
