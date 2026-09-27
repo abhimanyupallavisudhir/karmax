@@ -21,6 +21,44 @@ import { worldWorkingRelativePath } from '../src/world/types.js';
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
 describe('project resources', () => {
+  it.each(['configured', 'default', 'legacy'] as const)('preserves %s global Git ignores alongside worktree secrets (WD-29)', async source => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-secret-inherited-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    const xdg = path.join(dir, 'config'); fs.mkdirSync(path.join(xdg, 'git'), { recursive: true });
+    const ignores = source !== 'default' ? path.join(dir, 'global-ignore') : path.join(xdg, 'git', 'ignore');
+    const config = path.join(dir, 'gitconfig');
+    fs.writeFileSync(config, source !== 'default' ? `[core]\nexcludesFile = ${ignores}\n` : '');
+    fs.writeFileSync(ignores, '*.cache\n');
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    await gitOrThrow(repo, ['commit', '-q', '--allow-empty', '-m', 'base']);
+    const world = await new WorktreeProvider(path.join(dir, 'worlds'))
+      .create({ taskId: 'inherited', repo, base: 'main', target: 'main' });
+    const exec = world.exec.bind(world);
+    world.exec = (command, args, options) => exec(command, args, { ...options,
+      env: { ...options?.env, GIT_CONFIG_GLOBAL: config, XDG_CONFIG_HOME: xdg } });
+    try {
+      if (source === 'legacy') {
+        await world.exec('git', ['config', 'extensions.worktreeConfig', 'true']);
+        const admin = (await world.exec('git', ['rev-parse', '--absolute-git-dir'])).stdout.trim();
+        fs.mkdirSync(path.join(admin, 'info'), { recursive: true });
+        fs.writeFileSync(path.join(admin, 'info/exclude'), '/.env.legacy\n');
+        await world.exec('git', ['config', '--worktree', 'core.excludesFile', path.join(admin, 'info/exclude')]);
+        await world.writeFile('.env.legacy', 'legacy secret');
+      }
+      await world.writeFile('artifact.cache', 'generated');
+      await world.writeFile('.env.local', 'secret');
+      await ensureWorldExcluded(world, '.env.local');
+      expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
+      fs.appendFileSync(ignores, '*.log\n');
+      await world.writeFile('output.log', 'generated');
+      await world.writeFile('.env.second', 'second secret');
+      await ensureWorldExcluded(world, '.env.second');
+      expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
+      expect(fs.readFileSync(ignores, 'utf8')).toBe('*.cache\n*.log\n');
+      expect((await git(repo, ['config', '--local', '--get', 'core.excludesFile'])).code).toBe(1);
+    } finally { await world.destroy(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([undefined, 'nested'] as const)('Git-excludes file secrets only in their owning worktree (%s layout)', async (layout) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-secret-exclude-'));
     const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);

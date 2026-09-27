@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { wikiRoot } from './wiki.js';
+import { withDirectoryLock } from '../world/worktree-lock.js';
 import { materializeGitCredential, type GitCredential } from '../world/git-credential.js';
 
 export const PROJECT_WIKI_BRANCH = 'main';
@@ -40,22 +41,13 @@ function setRemote(root: string, remote: string): void {
   git(root, exists ? ['remote', 'set-url', 'origin', remote] : ['remote', 'add', 'origin', remote]);
 }
 
-/** Canonical wiki writes and remote reconciliation both mutate the same `main`
- * worktree. Keep them in one per-repository lane: otherwise a second browser
- * save can commit while the first save is fetching/merging origin, or startup's
- * best-effort remote wiring can race an interface edit through Git's index. */
-const projectWikiOperations = new Map<string, Promise<unknown>>();
-
-async function serializeProjectWikiOperation<T>(root: string, operation: () => Promise<T> | T): Promise<T> {
-  const key = path.resolve(root);
-  const previous = projectWikiOperations.get(key) ?? Promise.resolve();
-  const current = previous.catch(() => undefined).then(operation);
-  projectWikiOperations.set(key, current);
-  try {
-    return await current;
-  } finally {
-    if (projectWikiOperations.get(key) === current) projectWikiOperations.delete(key);
-  }
+/** Canonical writes, task landings, and remote reconciliation share one lane
+ * across the gateway and activity worker. Keep the lock outside the checkout
+ * so initial repository creation neither dirties the wiki nor pre-creates .git. */
+export async function serializeProjectWikiOperation<T>(root: string, operation: () => Promise<T> | T): Promise<T> {
+  const resolved = path.resolve(root);
+  const lock = path.join(path.dirname(resolved), `.${path.basename(resolved)}.karmax-wiki.lock`);
+  return withDirectoryLock(lock, async () => operation());
 }
 
 export class ProjectWikiPublishError extends Error {

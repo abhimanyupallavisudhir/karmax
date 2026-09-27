@@ -6,6 +6,7 @@ import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget, orderC
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
 import { paths } from '../config/paths.js';
 import { withWorktreeLock } from './worktree-lock.js';
+import { serializeProjectWikiOperation } from '../wiki/repository.js';
 
 /**
  * Where throwaway merge/landing worktrees are created: under karmax storage,
@@ -86,6 +87,12 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
  *  host-local checkout lands through this exact machinery (same conflict/dirty
  *  guards, same target-worktree landing) after importing its branch bundle. */
 export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
+  const land = () => finalizeMergeRepoUnlocked(worldRepo, target, worldId, identity);
+  return worldRepo.role === 'project-wiki' && worldRepo.repo
+    ? serializeProjectWikiOperation(worldRepo.repo, land) : land();
+}
+
+async function finalizeMergeRepoUnlocked(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   // `target` is task input; as a positional git argument a leading `-` would be an option.
   if (!validGitBranch(target)) throw new Error(`invalid target branch "${target}"`);
   const root = worldRepo.root;

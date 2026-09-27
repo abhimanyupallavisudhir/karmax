@@ -16,7 +16,18 @@ export async function ensureWorldExcluded(world: World, value: string): Promise<
   await world.exec('bash', ['-c',
     'set -e; git config extensions.worktreeConfig true; '
     + 'd="$(git rev-parse --absolute-git-dir)"; mkdir -p "$d/info"; '
-    + 'grep -qxF "$1" "$d/info/exclude" 2>/dev/null || echo "$1" >> "$d/info/exclude"; '
-    + 'git config --worktree core.excludesFile "$d/info/exclude"',
+    + 'combined="$d/info/karmax-exclude"; secrets="$d/info/karmax-secret-exclude"; '
+    + 'base="$(git config --path --get core.excludesFile || printf %s "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore")"; '
+    + 'if [ "$base" = "$combined" ]; then base="$(git config --worktree --path --get karmax.secretExcludeBase)"; '
+    // Recover the inherited setting when upgrading a worktree made by the old helper.
+    + 'elif [ "$base" = "$d/info/exclude" ]; then '
+    + 'cat "$base" >> "$secrets"; '
+    + 'base="$(git config --local --path --get core.excludesFile || git config --global --path --get core.excludesFile '
+    + '|| printf %s "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore")"; fi; '
+    + 'git config --worktree karmax.secretExcludeBase "$base"; '
+    + 'grep -qxF "$1" "$secrets" 2>/dev/null || printf "%s\\n" "$1" >> "$secrets"; '
+    + 'tmp="$(mktemp "$combined.XXXXXX")"; trap \'rm -f "$tmp"\' EXIT; '
+    + '{ if [ -f "$base" ]; then cat "$base"; fi; printf "\\n"; cat "$secrets"; } > "$tmp"; '
+    + 'mv "$tmp" "$combined"; git config --worktree core.excludesFile "$combined"',
     'karmax-exclude', pattern], { cwd: repo.root }).catch(() => undefined);
 }

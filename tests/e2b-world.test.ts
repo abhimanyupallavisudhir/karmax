@@ -3,6 +3,19 @@ import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandbo
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const connect = vi.fn(async () => sandbox);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect, get: connect } as any);
+    const world = await provider.create({ taskId: 'legacy', base: 'main' });
+    const forged = { ...world.handle, sealedProviderRef: undefined,
+      meta: { ...world.handle.meta, sandboxId: 'another-tenant-sandbox', organizationId: 'victim' } };
+    await expect(provider.open(forged)).rejects.toThrow('invalid E2B world handle');
+    await expect(provider.destroy(forged)).rejects.toThrow('invalid E2B world handle');
+    expect(connect).not.toHaveBeenCalled();
+    await expect(provider.open(world.handle)).resolves.toBeDefined();
+  });
+
   it('uses one provider inventory request before a new allocation (LT-3)', async () => {
     const sandbox = fakeSandbox(() => undefined);
     const list = vi.fn(async () => []);

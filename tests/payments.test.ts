@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { cardRemaining, evaluateSpend, MockPaymentProvider, StripeIssuingProvider, PaymentRegistry, BudgetService } from '../src/autonomy/payments.js';
 import { Store } from '../src/store/db.js';
 
@@ -339,6 +339,98 @@ describe('task payment policy', () => {
 });
 
 describe('payment reservations under concurrency', () => {
+  it('expires abandoned authorizing reservations and audits their release once (AU-10)', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const provider = new MockPaymentProvider(store);
+      const project = await store.createProject('Expiry', {});
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 1000 });
+      await provider.fund(card.id, 1000);
+      await store.setSettings(project.id, 'payments', { budget: 100 });
+      const ctx = { projectId: project.id, taskId: 'abandoned', capabilities: ['use-card:*'] };
+      const now = Date.now();
+      const reservation = await store.createPaymentSpendRequest({ organizationId: 'org_personal', ...ctx,
+        cardId: card.id, amount: 100, status: 'authorizing', expiresAt: now + 30 * 60_000 });
+      expect(await store.paymentSpent(ctx.taskId)).toBe(100);
+      expect(await store.cardPaymentSpent(card.id)).toBe(100);
+      expect(await store.expirePaymentSpendRequests(reservation.expiresAt - 1)).toBe(0);
+      expect(await store.expirePaymentSpendRequests(reservation.expiresAt)).toBe(1);
+      expect(await store.paymentSpent(ctx.taskId)).toBe(0);
+      expect(await store.cardPaymentSpent(card.id)).toBe(0);
+      expect(await store.getPaymentSpendRequest(reservation.id)).toMatchObject({ status: 'expired' });
+      expect(await store.expirePaymentSpendRequests(reservation.expiresAt + 1)).toBe(0);
+      const audit = await store.db.prepare("SELECT * FROM audit_log WHERE action='payment.reservation.expired'").all() as any[];
+      expect(audit).toHaveLength(1);
+      expect(JSON.parse(audit[0].detail)).toMatchObject({ requestId: reservation.id, taskId: ctx.taskId,
+        amount: 100, previousStatus: 'authorizing' });
+      const retry = await new BudgetService(store, provider).request(ctx, { amount: 100 });
+      expect(retry.status).toBe('granted');
+      expect(retry.requestId).not.toBe(reservation.id);
+      await store.expirePaymentSpendRequests(reservation.expiresAt + 60 * 60_000);
+      expect(await store.paymentSpent(ctx.taskId)).toBe(100);
+    } finally { await store.close(); }
+  });
+
+  it('starts a fresh bounded reservation when approving an old request (AU-10)', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const provider = new MockPaymentProvider(store);
+      const project = await store.createProject('Late approval', {});
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 1000 });
+      await provider.fund(card.id, 1000);
+      const task = await store.createTask({ projectId: project.id, title: 'Late approval', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+      const request = await store.createPaymentSpendRequest({ organizationId: 'org_personal', projectId: project.id,
+        taskId: task.id, cardId: card.id, amount: 100, status: 'pending_approval', expiresAt: Date.now() - 1 });
+      const original = provider.authorize.bind(provider);
+      vi.spyOn(provider, 'authorize').mockImplementation(async (...args) => {
+        const current = await store.getPaymentSpendRequest(request.id);
+        expect(current.status).toBe('authorizing');
+        expect(current.expiresAt).toBeGreaterThan(Date.now());
+        expect(current.expiresAt).toBeLessThanOrEqual(Date.now() + 30 * 60_000);
+        expect(await store.paymentSpent(request.taskId)).toBe(100);
+        return original(...args);
+      });
+      expect((await new BudgetService(store, provider).approve(request.id, 'user:approver')).status).toBe('granted');
+    } finally { await store.close(); }
+  });
+
+  it('rolls back a late local authorization before admitting a replacement reservation (AU-10)', async () => {
+    const store = await Store.create(':memory:');
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const provider = new MockPaymentProvider(store);
+      const project = await store.createProject('Late settlement', {});
+      const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Expenses', cap: 1000 });
+      await provider.fund(card.id, 1000);
+      await store.setSettings(project.id, 'payments', { budget: 100 });
+      const budget = new BudgetService(store, provider);
+      const ctx = { projectId: project.id, taskId: 'late-settlement', capabilities: ['use-card:*'] };
+      let entered!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const original = provider.authorize.bind(provider);
+      vi.spyOn(provider, 'authorize').mockImplementationOnce(async (...args) => {
+        entered();
+        await blocked;
+        return original(...args);
+      });
+      const first = budget.request(ctx, { amount: 100 });
+      await started;
+      now += 31 * 60_000;
+      const replacement = budget.request(ctx, { amount: 100 });
+      release();
+      const [late, retry] = await Promise.all([first, replacement]);
+      expect(late.status).toBe('denied');
+      expect(retry.status).toBe('granted');
+      expect(retry.requestId).not.toBe(late.requestId);
+      expect((await store.getPaymentSpendRequest(late.requestId!)).status).toBe('expired');
+      expect((await provider.getCard(card.id))!.available).toBe(900);
+      expect(await store.paymentSpent(ctx.taskId)).toBe(100);
+    } finally { clock.mockRestore(); await store.close(); }
+  });
+
   it('counts in-progress charges and never charges the same approval twice', async () => {
     const store = (await Store.create(':memory:'));
     const provider = new MockPaymentProvider(store);

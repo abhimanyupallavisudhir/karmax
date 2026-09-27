@@ -218,10 +218,20 @@ release their execution lease when finished.
 
 A backup includes PostgreSQL dumps of Karmax metadata, identity, and Temporal,
 plus a consistent online snapshot of the encrypted credential vault,
-attachments, local object/checkpoint data, and stable decryption/signing keys.
+attachments and local object/checkpoint data. The vault key is excluded: retain
+it separately in trusted storage; it authenticates the control-plane manifest.
 Task VMs are deliberately excluded: Git plus encrypted portable checkpoints are
-their durable form. Copy backups to encrypted off-host storage. Anyone holding a
-backup can recover the vault, so protect it like production credentials.
+their durable form. Copy backups to encrypted off-host storage; other plaintext
+credentials may still be present, so protect them like production credentials.
+
+New control-plane backups use a version-2 HMAC-authenticated manifest. Restore
+refuses unsigned legacy manifests, altered metadata and changed payload hashes.
+For a fresh deployment, provision the original `deploy/.secrets/vault_key` before
+running restore; never obtain this trust anchor from the backup being verified.
+Standalone restores accept the original `KARMAX_VAULT_KEY` (or its `_FILE`) or
+`npm run restore -- --key-file /trusted/original/vault.key BACKUP_DIR` for a local
+binary vault key. Existing installations retain their original key across restore.
+Do not delete old trusted key copies when migrating from unsigned backups.
 
 On Linux hosts with the util-linux `hardlink` command, completed backups share
 identical large object-store files automatically. This preserves every restore
@@ -292,3 +302,14 @@ HTTPS origins are separated, stable keys exist, PostgreSQL and Temporal are
 durable, and the object-store profile is appropriate. Hosted projects cannot select worktree,
 memory, or Docker worlds, so repository code never executes in the control-plane
 container.
+
+The Linux deployment runs Caddy on the host network so IPv6 connections retain
+real peer addresses. The app publishes port 4505 on host loopback only. Its
+Compose bridge gateway is pinned to `172.30.0.1` (subnet `172.30.0.0/24`); only
+that host peer may supply Caddy's overwritten, single-address X-Forwarded-For.
+Host-local processes are trusted at this boundary. Reserve this subnet on the
+host, or change both IPAM and `KARMAX_TRUSTED_PROXY_IP` together if it conflicts.
+Never expose port 4505 publicly or trust an entire proxy subnet. Other installs
+ignore forwarded headers unless an exact trusted proxy IP is configured. The
+gateway groups IPv6 clients by /64 for login lockout and hosted request budgets;
+Caddy also enforces its per-address edge budgets. These budgets are per replica.
