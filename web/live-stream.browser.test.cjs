@@ -98,14 +98,24 @@ const { chromium } = require('playwright');
     await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Running'));
     assert.equal(await bubble(), 'Running');
 
-    // 5. A failed attempt voids its partial text; the retry streams afresh.
+    // 5. Another agent's stream (the Review gate's confirmer) stays out of this
+    // conversation; after a repaint, this agent's next chunk brings its bubble back.
+    send('agent.output', { role: 'confirm', turnId: 'confirm-1', attempt: 1, text: 'Reviewing the diff', source: 'assistant' });
+    await page.waitForFunction(() => document.getElementById('live-bubble')?.classList.contains('hidden') !== false);
+    send('agent.activity', { ...turn, id: 'cmd-1', kind: 'command', phase: 'started', title: 'npm test' });
+    await page.locator('#ck-thread').getByText('npm test').first().waitFor();
+    assert.equal(await occurrences('Reviewing the diff'), 0, "the confirmer's text never lands in the Do conversation");
+    send('agent.output', { ...turn, text: 'Running the suite', source: 'assistant' });
+    await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Running the suite'));
+
+    // 6. A failed attempt voids its partial text; the retry streams afresh.
     send('agent.activity', { ...turn, id: 'turn', kind: 'turn', phase: 'failed', title: 'Agent turn failed' });
     await page.waitForFunction(() => document.getElementById('live-bubble')?.classList.contains('hidden') !== false);
-    assert.equal(await occurrences('Running'), 0, 'a failed attempt leaves no half message behind');
+    assert.equal(await occurrences('Running the suite'), 0, 'a failed attempt leaves no half message behind');
     send('agent.output', { ...turn, attempt: 2, text: 'Retrying the fix', source: 'assistant' });
     await page.waitForFunction(() => document.getElementById('live-bubble')?.textContent.endsWith('Retrying the fix'));
 
-    // 6. Cancelling the task clears the half message; it never renders as final.
+    // 7. Cancelling the task clears the half message; it never renders as final.
     view = { ...view, status: 'cancelled', stage: 'cancelled', agentTurn: undefined };
     send('view.updated', { stage: 'cancelled', status: 'cancelled' });
     await page.waitForFunction(() => !document.getElementById('live-bubble') || document.getElementById('live-bubble').classList.contains('hidden'));
