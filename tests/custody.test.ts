@@ -127,6 +127,23 @@ describe('process-tree custody', () => {
     expect(fs.existsSync(path.join(agentsDir(), `${pid}.json`))).toBe(false);
   });
 
+  // AD-18: macOS self-hosters have no procfs. Identity comes from `ps` there,
+  // so the start-time guard still holds and killAgent still signals the agent.
+  it('kills an agent and still refuses a recycled pid on a host without procfs', async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    try {
+      const pid = spawnDetachedSleep();
+      custody.registerAgent({ pid, cmd: 'sleep', owner: process.pid, startedAt: Date.now() });
+      const recycled = spawnDetachedSleep();
+      custody.registerAgent({ pid: recycled, pidStart: 'Thu Jan  1 00:00:00 1970', cmd: 'sleep', owner: process.pid, startedAt: Date.now() });
+      await custody.killAgent(pid, 500);
+      await custody.killAgent(recycled, 0);
+      expect(await waitDead(pid)).toBe(true);
+      expect(isAlive(recycled)).toBe(true);
+    } finally { Object.defineProperty(process, 'platform', platform); }
+  });
+
   it('killAgent reaps marked descendants that created a new process group', async () => {
     const { root, custodyId, descendantFile } = spawnMarkedTree();
     const descendant = await waitForPidFile(descendantFile);

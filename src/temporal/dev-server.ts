@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import { Connection } from '@temporalio/client';
 import { findFreePortFrom, findFreePorts, isPortFree, waitForPort } from '../util/ports.js';
 import { withTimeout } from '../util/timeout.js';
-import { trackProcess, processStartTick } from '../util/processes.js';
+import { trackProcess, processArgv, processStartTick } from '../util/processes.js';
 import { CUSTODY_ENV } from '../agent/custody.js';
 
 const execFileP = promisify(execFileCb);
@@ -96,7 +96,7 @@ function pidAlive(pid: number): boolean {
 }
 
 /** Reap test-only Temporal children whose owning Node test process is gone. The
- * record includes the random gRPC port and we verify it against /proc before
+ * record includes the random gRPC port and we verify its command line before
  * signalling, so a recycled pid or the shared production server is never hit. */
 export function reapOrphanedEphemeralServers(): number {
   let reaped = 0;
@@ -120,13 +120,9 @@ export function reapOrphanedEphemeralServers(): number {
       try { fs.rmSync(full, { force: true }); } catch {}
       continue;
     }
-    let cmdline = '';
-    try {
-      cmdline = fs.readFileSync(`/proc/${rec.pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-    } catch {
-      // Without a verifiable command line, fail closed and leave the process alone.
-      continue;
-    }
+    // Without a verifiable command line, fail closed and leave the process alone.
+    const cmdline = processArgv(rec.pid)?.join(' ');
+    if (!cmdline) continue;
     if (!cmdline.includes('temporal server start-dev') || !cmdline.includes('--headless') || !cmdline.includes(`--port ${rec.grpcPort}`)) continue;
     try {
       process.kill(rec.pid, 'SIGKILL');
@@ -202,8 +198,8 @@ export async function stopRecordedDevServer(record: ServerRecord, dbFilename: st
   if (!Number.isInteger(record.pid) || record.pid <= 1) return false;
   if (!pidAlive(record.pid)) return true;
   try {
-    const argv = fs.readFileSync(`/proc/${record.pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
-    if (!matchesRecordedTemporalProcess(record, { argv, startTick: processStartTick(record.pid) }, dbFilename)) return false;
+    const argv = processArgv(record.pid, [dbFilename]);
+    if (!argv || !matchesRecordedTemporalProcess(record, { argv, startTick: processStartTick(record.pid) }, dbFilename)) return false;
     if (record.unit && (await unitMainPid(record.unit)) !== record.pid) return false;
     // Recheck after the asynchronous unit lookup before sending the signal.
     if (record.startTick && processStartTick(record.pid) !== record.startTick) return false;

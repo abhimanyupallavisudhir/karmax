@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 /**
  * Live process accounting for the dashboard task manager (GET /api/processes).
@@ -83,7 +84,10 @@ const registry = new Map<number, TrackedProcess>();
  * stays dependency-free.
  */
 export function processStartTick(pid: number | undefined): string | undefined {
-  if (!pid || pid <= 0 || process.platform !== 'linux') return undefined;
+  if (!pid || pid <= 0) return undefined;
+  // Without procfs (macOS), `ps` reports the start time to the second, which
+  // still tells a recycled pid from the recorded process.
+  if (process.platform !== 'linux') return psColumn(pid, 'lstart');
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     // The comm field may itself contain spaces/parens; split after the LAST ')'.
@@ -91,6 +95,29 @@ export function processStartTick(pid: number | undefined): string | undefined {
     return afterComm[19]; // the array begins at field 3, so index 19 is field 22
   } catch {
     return undefined;
+  }
+}
+
+/** A process's arguments: exact from procfs; elsewhere from `ps`, which joins
+ * them with spaces, so `verbatim` values that may contain spaces stay whole. */
+export function processArgv(pid: number, verbatim: string[] = []): string[] | undefined {
+  if (process.platform === 'linux') {
+    try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean); }
+    catch { return undefined; }
+  }
+  let command = psColumn(pid, 'command');
+  if (!command) return undefined;
+  const kept = verbatim.filter(value => value.includes(' '));
+  kept.forEach((value, index) => { command = command!.split(value).join(`\0${index}\0`); });
+  return command.split(/\s+/).filter(Boolean).map(arg => arg.replace(/\0(\d+)\0/g, (_, index) => kept[Number(index)]!));
+}
+
+function psColumn(pid: number, column: 'lstart' | 'command'): string | undefined {
+  try {
+    return execFileSync('ps', ['-ww', '-o', `${column}=`, '-p', String(pid)],
+      { encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || undefined;
+  } catch {
+    return undefined; // exited, or no `ps` (Windows): unverifiable
   }
 }
 
