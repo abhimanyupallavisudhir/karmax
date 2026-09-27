@@ -323,7 +323,8 @@ export function sampleProcesses(): ProcessSample {
  * preferred (custody's SIGTERM→SIGKILL group escalation); otherwise the signal
  * goes to the process group when the pid leads one, else to the bare pid.
  */
-export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM'): Promise<{ ok: boolean; error?: string }> {
+export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM',
+  stopTask?: (taskId: string) => Promise<unknown>): Promise<{ ok: boolean; error?: string }> {
   if (!Number.isInteger(pid) || pid <= 1) return { ok: false, error: 'invalid pid' };
   if (pid === process.pid) return { ok: false, error: 'refusing to kill krmax itself' };
   const entry = registry.get(pid);
@@ -342,6 +343,13 @@ export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM
   if (!inScope) return { ok: false, error: 'pid is not a krmax-managed process' };
 
   try {
+    if (entry?.kind === 'agent' && entry.taskId) {
+      // Raw signals look like infrastructure failures and cause the workflow to
+      // retry. Cancellation owns process teardown and prevents another turn.
+      if (!stopTask) return { ok: false, error: 'stop the owning task to stop its agent' };
+      await stopTask(entry.taskId);
+      return { ok: true };
+    }
     if (entry?.kill) {
       await entry.kill(signal);
       return { ok: true };

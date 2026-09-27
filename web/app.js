@@ -11131,9 +11131,9 @@ function procPanelHtml(sample) {
   // affordance is discoverable even on an idle instance where only protected
   // infrastructure — karmax itself + Temporal — is running).
   const LOCK = `<span class="proc-lock" title="Protected — ${siteNameMarkup()} can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
-  const killBtn = (pid, label, killable) =>
+  const killBtn = (pid, label, killable, taskId) =>
     sample.canKill === false ? '' : killable
-      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
+      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" ${taskId ? `data-stop-task="${esc(taskId)}"` : ''} title="${taskId ? 'Stop task and its agent' : 'click: SIGTERM · shift-click: SIGKILL'}">✕ ${taskId ? 'stop task' : 'kill'}</button>`
       : LOCK;
   const rows = (sample.groups || [])
     .map((g) => {
@@ -11149,7 +11149,7 @@ function procPanelHtml(sample) {
         <td class="mono num">${g.procs.length}</td>
         <td class="mono num">${g.cpuPct.toFixed(1)}%</td>
         <td class="mono num">${g.rssMb >= 1024 ? (g.rssMb / 1024).toFixed(2) + 'G' : g.rssMb.toFixed(0) + 'M'}</td>
-        <td class="num">${rootKillable ? killBtn(g.key, g.label, true) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
+        <td class="num">${rootKillable ? killBtn(g.key, g.label, true, g.kind === 'agent' ? g.taskId : undefined) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
       </tr>`;
       const body = g.procs
         .map((r) => {
@@ -11161,7 +11161,7 @@ function procPanelHtml(sample) {
             <td class="mono num">${r.pid}<span class="proc-age"> · ${fmtDur(r.ageSec)}</span></td>
             <td class="mono num">${r.cpuPct.toFixed(1)}%</td>
             <td class="mono num">${r.rssMb >= 1024 ? (r.rssMb / 1024).toFixed(2) + 'G' : r.rssMb.toFixed(0) + 'M'}</td>
-            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable)}</td>
+            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable, g.kind === 'agent' && String(r.pid) === g.key ? g.taskId : undefined)}</td>
           </tr>`;
         })
         .join('');
@@ -11183,11 +11183,12 @@ function wireProcPanel(el) {
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
       const signal = ev.shiftKey ? 'SIGKILL' : 'SIGTERM';
-      if (!confirm(`Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
+      const taskId = b.dataset.stopTask;
+      if (!confirm(taskId ? `Stop task ${numLabel(taskId)} and its agent?` : `Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
       b.disabled = true;
       try {
         await api('/api/processes/kill', { method: 'POST', body: JSON.stringify({ pid, signal }) });
-        toast(`${signal} sent to ${pid}`);
+        toast(taskId ? 'Task stopping' : `${signal} sent to ${pid}`);
       } catch (e) { toast(e.message, true); }
       refreshProcPanel(true);
     }),

@@ -3288,7 +3288,8 @@ export class Gateway {
       if (p === '/api/processes/kill' && method === 'POST') {
         const b = await this.body(req);
         const { killTracked } = await import('../util/processes.js');
-        const out = await killTracked(Number(b.pid), b.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM');
+        const out = await killTracked(Number(b.pid), b.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM',
+          (taskId) => api.signalTask(token, taskId, 'cancel'));
         return this.json(res, out.ok ? 200 : 400, out);
       }
 
