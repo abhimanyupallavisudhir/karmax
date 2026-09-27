@@ -122,8 +122,14 @@ export async function readAnthropicMessage(res: Response, onText: TextListener):
 
 /** HTTP status OpenAI returns for the error codes a Responses stream can carry. */
 const OPENAI_ERROR_STATUS: Record<string, number> = {
-  invalid_api_key: 401, rate_limit_exceeded: 429, insufficient_quota: 429, server_error: 500,
+  invalid_api_key: 401, rate_limit_exceeded: 429, insufficient_quota: 429, server_error: 500, invalid_prompt: 400,
 };
+
+/** A stream `error` event, or a response that failed mid-generation, reads
+ * exactly like the same error returned as an HTTP status before the stream
+ * began, so a transient outage is still retried (#396 review item 4). */
+const openAiStreamFailure = (error: Record<string, unknown>) => providerErrorFromMessage('codex',
+  `OpenAI Responses API ${OPENAI_ERROR_STATUS[String(error.code)] ?? 'stream error'}: ${JSON.stringify({ error }).slice(0, 500)}`, 'structured');
 
 /** OpenAI Responses API: `stream: true` → its terminal event's response object,
  * which is the same object `res.json()` returns (status, output, usage). */
@@ -142,12 +148,12 @@ export async function readOpenAiResponse(res: Response, onText: TextListener): P
       }
       case 'response.completed':
       case 'response.incomplete':
-      case 'response.failed':
         return event.response;
+      case 'response.failed':
+        throw openAiStreamFailure(event.response?.error ?? {});
       case 'error': {
         const { type: _type, sequence_number: _sequence, ...error } = event;
-        const status = OPENAI_ERROR_STATUS[String(error.code)] ?? 'stream error';
-        throw providerErrorFromMessage('codex', `OpenAI Responses API ${status}: ${JSON.stringify({ error }).slice(0, 500)}`, 'structured');
+        throw openAiStreamFailure(error);
       }
       default:
         break;

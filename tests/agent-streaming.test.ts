@@ -368,4 +368,26 @@ describe('metered API rails stream their responses (LT-5)', () => {
     const { diagnostic: _returned, ...returned } = viaHttp.metadata;
     expect(streamed).toEqual(returned);
   });
+
+  // #396 review item 4: without streaming, a response that fails mid-generation
+  // came back as the HTTP status of its error code, so a transient outage retried.
+  it.each([
+    ['server_error', 500, 'The server had an error while processing your request.'],
+    ['rate_limit_exceeded', 429, 'Rate limit reached for gpt-5.5'],
+    ['insufficient_quota', 429, 'You exceeded your current quota, please check your plan and billing details.'],
+    ['invalid_prompt', 400, 'Invalid prompt: the prompt was flagged.'],
+  ])('Responses API: a response.failed with %s is classified like HTTP %i', async (code, status, message) => {
+    const classify = (error: any) => ({ constructor: error.constructor, message: error.message,
+      transport: isTransportError(error), metadata: error.metadata && (({ diagnostic: _d, ...rest }) => rest)(error.metadata) });
+    provider.script([{ status, json: { error: { message, type: code === 'server_error' ? 'server_error' : 'requests', code, param: null } } }]);
+    const viaHttp = classify(await new CodexAdapter().runTurn(codexInput(), toolContext([])).catch((e) => e));
+    provider.script([{ sse: [{ type: 'response.created', response: { id: 'r', status: 'in_progress', output: [] } },
+      { type: 'response.failed', response: { id: 'r', status: 'failed', output: [], error: { code, message } } }] }]);
+    const viaStream = classify(await new CodexAdapter().runTurn(codexInput(), toolContext([])).catch((e) => e));
+    expect(viaStream.constructor).toBe(viaHttp.constructor);
+    expect(viaStream.transport).toBe(viaHttp.transport);
+    expect(viaStream.metadata).toEqual(viaHttp.metadata);
+    expect(viaStream.message).toMatch(new RegExp(`^OpenAI Responses API ${status}: `));
+    if (code === 'server_error') expect(viaStream.transport).toBe(true);
+  });
 });
