@@ -5350,6 +5350,15 @@ export class Store {
     });
   }
 
+  /** Append only while the task exists, atomically with that check, so work
+   *  that outlives an undone creation leaves no orphan event. */
+  async appendEventIfTaskExists(ev: KarmaxEvent): Promise<number | undefined> {
+    return this.db.transaction(async () => {
+      if (!(await this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(ev.taskId))) return undefined;
+      return this.appendEvent(ev);
+    });
+  }
+
   async eventsSince(taskId: string, seq: number, limit?: number, excludeTiming = false): Promise<(KarmaxEvent & { seq: number })[]> {
     // Initial task-page loads ask for the newest bounded window. Do the bound in
     // SQLite: materializing every historical event and slicing in JS is precisely

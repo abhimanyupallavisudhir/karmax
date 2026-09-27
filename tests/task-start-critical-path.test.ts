@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -45,6 +45,48 @@ describe('task start critical path (LT-16)', () => {
       expect((task as any).warnings).toEqual([expect.stringContaining('cannot merge every GitHub repository')]);
       expect((await f.store.eventsOfType(task.id, 'github.merge.preflight-warning'))).toHaveLength(1);
     } finally { await f.store.close(); }
+  });
+
+  // #396 review item 10: a hung GitHub made the client time out and retry,
+  // which duplicated the task.
+  it('returns within a bounded wait when GitHub hangs, and journals the warning when it answers', async () => {
+    const f = await fixture(1_500, false); // two sequential permission reads: 3 s
+    try {
+      const started = Date.now();
+      const task = await f.api.createTask(f.token, { projectId: f.project.id, workflow: 'software-dev', prompt: 'ship it' });
+      expect(Date.now() - started).toBeLessThan(2_600);
+      expect((task as any).warnings).toBeUndefined();
+      await vi.waitFor(async () => {
+        expect((await f.store.eventsOfType(task.id, 'github.merge.preflight-warning'))).toHaveLength(1);
+      }, { timeout: 3_000 });
+    } finally { await new Promise((resolve) => setTimeout(resolve, 50)); await f.store.close(); }
+  });
+
+  it('never journals a warning for a task whose creation was undone meanwhile', async () => {
+    const f = await fixture(2_200, false);
+    let answered = false;
+    const permission = (f.api as any).deps.githubApp.repositoryPermission;
+    (f.api as any).deps.githubApp.repositoryPermission = async (...args: unknown[]) => {
+      const result = await permission(...args);
+      answered = true;
+      return result;
+    };
+    // The creation is undone just after any read that follows GitHub's answer.
+    const getTask = f.store.getTask.bind(f.store);
+    let undone = false;
+    vi.spyOn(f.store, 'getTask').mockImplementation(async (id: string) => {
+      const task = await getTask(id);
+      if (answered && !undone && task) { undone = true; await f.store.deleteTask(id); }
+      return task;
+    });
+    try {
+      const task = await f.api.createTask(f.token, { projectId: f.project.id, workflow: 'software-dev', prompt: 'ship it' });
+      await vi.waitFor(() => { expect(answered).toBe(true); }, { timeout: 3_000 });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const warnings = await f.store.eventsOfType(task.id, 'github.merge.preflight-warning');
+      const exists = Boolean(await getTask(task.id));
+      expect(exists || warnings.length === 0).toBe(true);
+    } finally { vi.restoreAllMocks(); await f.store.close(); }
   });
 
   it('reports no warning when the creator can merge', async () => {
