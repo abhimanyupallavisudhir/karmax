@@ -145,12 +145,13 @@ export class MockAdapter implements AgentAdapter {
           break;
         }
         case 'respond': {
-          // @respond <action> [:: text] — parent answering a raising child. Omits
-          // child_task_id, so it targets all children currently waiting.
+          // @respond <action> [child_task_id] [:: text] — parent answering a child.
+          // Without child_task_id it targets all children currently waiting.
           const [action, textRest = ''] = splitOn(rest, '::');
-          const act = action.trim();
+          const [act = '', childTaskId] = action.trim().split(/\s+/);
           if (['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(act)) {
-            await ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
+            await ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined,
+              ...(childTaskId ? { childTaskId } : {}) });
             outputs.push(`respond: ${act}`);
           }
           break;

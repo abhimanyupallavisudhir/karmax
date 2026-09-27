@@ -2330,8 +2330,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 }
               },
               cursor: () => store.latestEventSeq(),
-              journaled: async (seq) => (await store.eventsOfType(args.taskId, ['conversation.message', 'view.updated'], seq))
-                .map(event => ({ seq: event.seq, messageId: event.type === 'conversation.message'
+              journaled: async (seq) => (await store.eventsOfType(args.taskId, ['conversation.message', 'view.updated', 'subtask.parent-response'], seq))
+                .map(event => ({ seq: event.seq, pending: event.type === 'subtask.parent-response', messageId: event.type === 'conversation.message'
                   ? String((event.payload as { message?: { id?: string } }).message?.id ?? `seq:${event.seq}`) : undefined })),
             })
           : undefined;
@@ -2880,6 +2880,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { kept, refused } = await ownSubTaskResponses(store, args.taskId, result.subTaskResponses);
         result.subTaskResponses = kept;
         if (refused.length) (await record(args.taskId, 'subtask.response_refused', { childTaskIds: refused }));
+        // The workflow pushes a comment to its child as a follow-up once this
+        // result returns. Journal it for the child now so a running child's
+        // follow-up gate asks at its next poll, not at the backstop (#396 review item 8).
+        const commented = (result.subTaskResponses ?? []).filter((response) => response.action === 'comment' && response.text);
+        const children = commented.some((response) => !response.childTaskId) ? (await store.childTasks(args.taskId))
+          .filter((child) => !['done', 'cancelled', 'failed'].includes(child.lastView?.status ?? '')).map((child) => child.id) : [];
+        for (const childTaskId of new Set(commented.flatMap((response) => response.childTaskId ? [response.childTaskId] : children)))
+          (await record(childTaskId, 'subtask.parent-response', { parentTaskId: args.taskId }));
       }
       (await record(args.taskId, 'turn.result', {
         completed: result.completed,

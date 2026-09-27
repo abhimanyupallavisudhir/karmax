@@ -5,8 +5,8 @@ import type { Message } from '../domain/types.js';
  * query can still race the workflow task that applies it, and a message for a
  * different agent never appears in this turn's transcript at all. */
 export const FOLLOW_UP_SETTLE_MS = 10_000;
-/** A writer that journals nothing (an operator's raw Temporal signal, a parent
- * workflow's comment) is still delivered in-turn, within this bound. */
+/** A writer that journals nothing (an operator's raw Temporal signal) is still
+ * delivered in-turn, within this bound. */
 export const FOLLOW_UP_BACKSTOP_MS = 30_000;
 
 /**
@@ -25,14 +25,17 @@ export function gateFollowUps(options: {
   /** Highest event sequence now; journal entries after it are new. */
   cursor: () => Promise<number>;
   /** Journal entries after `seq`: a follow-up carries its message id, a view
-   *  publication none. */
-  journaled: (seq: number) => Promise<{ seq: number; messageId?: string }[]>;
+   *  publication none. `pending` marks a message about to be signalled whose id
+   *  the journal cannot know (a parent's answer, #396 review item 8): the gate
+   *  keeps asking until the settle window lapses. */
+  journaled: (seq: number) => Promise<{ seq: number; messageId?: string; pending?: boolean }[]>;
   now?: () => number;
 }): (fromIndex: number) => Promise<Message[]> {
   const now = options.now ?? Date.now;
   let seen: number | undefined;
   let askedAt = 0;
   let publication = false;
+  let pendingUntil = 0;
   // Journaled message id → when to stop waiting for it to come back.
   const awaited = new Map<string, number>();
   // A query can return a message before its journal entry is written.
@@ -41,11 +44,12 @@ export function gateFollowUps(options: {
     if (seen === undefined) { seen = await options.cursor(); return true; }
     for (const entry of await options.journaled(seen)) {
       seen = Math.max(seen, entry.seq);
-      if (!entry.messageId) publication = true;
+      if (entry.pending) pendingUntil = now() + FOLLOW_UP_SETTLE_MS;
+      else if (!entry.messageId) publication = true;
       else if (!returned.has(entry.messageId)) awaited.set(entry.messageId, now() + FOLLOW_UP_SETTLE_MS);
     }
     for (const [id, until] of awaited) if (until <= now()) awaited.delete(id);
-    return publication || awaited.size > 0 || now() - askedAt >= FOLLOW_UP_BACKSTOP_MS;
+    return publication || awaited.size > 0 || pendingUntil > now() || now() - askedAt >= FOLLOW_UP_BACKSTOP_MS;
   };
   return async (fromIndex) => {
     // An unreadable journal cannot rule a follow-up out: ask the workflow.

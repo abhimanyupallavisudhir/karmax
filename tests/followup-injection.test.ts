@@ -245,6 +245,27 @@ describe('gateFollowUps (LT-13)', () => {
     expect(queries).toBe(1 + FOLLOW_UP_SETTLE_MS / 1_000);
   });
 
+  it('keeps asking after a pending parent answer until it arrives, then only until the window lapses', async () => {
+    const { gateFollowUps, FOLLOW_UP_SETTLE_MS } = await import('../src/activities/follow-up-gate.js');
+    let clock = 0, queries = 0;
+    const journal: { seq: number; pending?: boolean }[] = [];
+    const inbox: Message[] = [];
+    const pull = gateFollowUps({
+      query: async () => { queries++; return inbox.splice(0); },
+      cursor: async () => 5,
+      journaled: async (seq) => journal.filter((entry) => entry.seq > seq),
+      now: () => clock,
+    });
+    await pull(1);
+    // Journaled by the parent's turn before its workflow sends the signal.
+    journal.push({ seq: 6, pending: true });
+    clock = 1_000; expect(await pull(1)).toEqual([]);
+    inbox.push({ id: 'p-3', role: 'user', text: 'use postgres', ts: 3 });
+    clock = 2_000; expect((await pull(1)).map((m) => m.id)).toEqual(['p-3']);
+    for (clock = 3_000; clock <= FOLLOW_UP_SETTLE_MS + 5_000; clock += 1_000) await pull(2);
+    expect(queries).toBe(1 + FOLLOW_UP_SETTLE_MS / 1_000);
+  });
+
   it('asks the workflow when the journal cannot be read', async () => {
     const { gateFollowUps } = await import('../src/activities/follow-up-gate.js');
     let queries = 0;
