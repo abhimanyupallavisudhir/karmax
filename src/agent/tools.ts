@@ -162,7 +162,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'save_skill',
-    description: 'Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: 'Save a reusable skill (markdown content) for future tasks in your organization; saving the same name overwrites it. For content that belongs to one project, or that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -965,7 +965,11 @@ export function platformToolHandlers(
       }
     },
     async save_skill(args) {
-      ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
+      const skill = { name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') };
+      // The gateway writes it under the caller's organization; the turn result
+      // only records that it was saved.
+      await platformRequest('POST', '/api/skills', skill);
+      ctx.saveSkill(skill);
       return 'skill saved';
     },
     async read_wiki(args) {

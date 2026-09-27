@@ -55,6 +55,10 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'get_execution_policy', 'set_execution_policy',
       ]),
     );
+    // PL-7: saveSkill writes under the caller's organization, not installation-wide.
+    const saveSkill = tools.find((t) => t.name === 'save_skill')!;
+    expect(saveSkill.description).not.toMatch(/installation-wide/i);
+    expect(saveSkill.description).toMatch(/organization/i);
     const described: any = await client.callTool({ name: 'describe_platform', arguments: {} });
     const catalog = JSON.parse(described.content[0].text);
     expect(catalog.administration).toContain('GET|POST /api/users');

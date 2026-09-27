@@ -767,7 +767,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {
-    description: 'Save a reusable skill (markdown) for future tasks. This writes INSTALLATION-WIDE global state — the skill is visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: 'Save a reusable skill (markdown) for future tasks in your organization; saving the same name overwrites it. For content that belongs to one project, or that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     inputSchema: { name: z.string(), content: z.string() },
   }, async (a) => wrap(async () => (await ops.saveSkill(a))));
   server.registerTool(
