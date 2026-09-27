@@ -26,7 +26,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { EvalResult } from '../domain/search.js';
-import type { TaskView } from '../domain/types.js';
+import type { KarmaxEvent, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -542,6 +542,8 @@ const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 /** How long a live event socket reuses a task visibility decision (LT-15). */
 const SOCKET_DECISION_TTL_MS = 60_000;
+/** Past this much unsent data a socket gets only the latest streamed text. */
+const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -720,10 +722,32 @@ export class Gateway {
       decisions.set(key, { allowed, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS, scoped?.expiresAt ?? Infinity) });
       return allowed;
     };
-    const off = this.fanout.on(async (ev, projectId) => {
+    // Streamed text supersedes itself, so a client that has fallen behind gets
+    // only each agent's latest text once its buffer drains, never every window
+    // (#396 review item 2). Everything else keeps its order and the hard bound.
+    const heldOutput = new Map<string, { ev: KarmaxEvent & { seq?: number }; projectId?: string }>();
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const releaseHeld = () => {
+      drainTimer ??= setTimeout(() => {
+        drainTimer = undefined;
+        if (ws.readyState !== WebSocketClient.OPEN) return;
+        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { releaseHeld(); return; }
+        const held = [...heldOutput.values()];
+        heldOutput.clear();
+        for (const { ev, projectId } of held) void deliver(ev, projectId);
+      }, 100);
+      drainTimer.unref?.();
+    };
+    lifetime.add(() => { if (drainTimer) clearTimeout(drainTimer); });
+    const deliver = async (ev: KarmaxEvent & { seq?: number }, projectId?: string) => {
       // Reconnect/backfill from durable state rather than allowing a slow
       // browser's send queue to grow without bound.
       if (ws.readyState !== WebSocketClient.OPEN) return;
+      if (ev.type === 'agent.output' && (ev.payload as { source?: unknown }).source === 'assistant') {
+        const key = `${ev.taskId}\0${String((ev.payload as { role?: unknown }).role ?? '')}`;
+        heldOutput.delete(key);
+        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { heldOutput.set(key, { ev, projectId }); releaseHeld(); return; }
+      }
       if (ws.bufferedAmount > 2 * 1024 * 1024) {
         ws.close(1013, 'Client fell behind; reconnect to refresh');
         return;
@@ -741,7 +765,8 @@ export class Gateway {
         if (ws.readyState !== WebSocketClient.OPEN) return;
         ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId, ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
-    }, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
+    };
+    const off = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
     lifetime.add(off);
   }
 

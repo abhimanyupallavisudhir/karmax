@@ -2639,8 +2639,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const text = source === 'assistant' ? secrets.scrubPartial(t) : secrets.scrub(t);
             if (text === lastEmit || !text && source === 'assistant') return;
             lastEmit = text;
-            (await record(args.taskId, 'agent.output', { text, source, role: args.role,
-              turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt }));
+            const payload = { text, source, role: args.role, turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt };
+            if (source !== 'assistant') { (await record(args.taskId, 'agent.output', payload)); return; }
+            // Each publication supersedes the last (#396 review item 2).
+            const event = { type: 'agent.output', taskId: args.taskId, ts: Date.now(), payload };
+            deps.bus?.emit({ ...event, seq: (await store.appendLiveOutput(event)) });
           },
           ...(delegationKey ? {
             queuedDelegation: await store.kvGet(delegationKey).then(raw => raw ? JSON.parse(raw) : undefined),
