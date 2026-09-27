@@ -33,7 +33,7 @@ import {
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
-import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
+import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn, type QueuedDelegation } from '../agent/runtime.js';
 import { SecretScrubber } from '../agent/activity.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
@@ -1773,6 +1773,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
+      let delegationKey: string | undefined;
       let resumedActivityAttempt = false;
       let activityAttempt = 1;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
@@ -1794,6 +1795,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        // Queued sub-task spawns/answers survive a retry of the same turn.
+        delegationKey = stableTurnId ? `turnspawns:${stableTurnId}` : undefined;
         // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
         // SQLite key closes the small hard-kill window before a heartbeat reaches the
         // service; unlike session:<task>:<role>, it cannot accidentally pick up a
@@ -2624,6 +2627,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             (await record(args.taskId, 'agent.output', { text: secrets.scrub(t), source, role: args.role,
               turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt }));
           },
+          ...(delegationKey ? {
+            queuedDelegation: await store.kvGet(delegationKey).then(raw => raw ? JSON.parse(raw) : undefined),
+            onDelegation: async (queued: QueuedDelegation) => { (await store.kvSet(delegationKey!, JSON.stringify(queued))); },
+          } : {}),
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
             if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);
@@ -2749,6 +2756,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
           resultCheckpointed = true;
+          // The checkpointed result now carries every queued spawn and answer.
+          if (delegationKey) (await store.kvDelete(delegationKey));
         }
         }
         // Defence in depth around the activity boundary. `runTurn` rejects an

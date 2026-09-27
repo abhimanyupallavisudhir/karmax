@@ -126,7 +126,7 @@ export class MockAdapter implements AgentAdapter {
         }
         case 'subtask': {
           const [title, prompt = ''] = splitOn(rest, '::');
-          ctx.createSubTask({ title: title.trim(), prompt: prompt.trim() });
+          await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim() });
           outputs.push(`subtask: ${title.trim()}`);
           break;
         }
@@ -149,7 +149,7 @@ export class MockAdapter implements AgentAdapter {
           const [action, textRest = ''] = splitOn(rest, '::');
           const act = action.trim();
           if (['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(act)) {
-            ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
+            await ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
             outputs.push(`respond: ${act}`);
           }
           break;

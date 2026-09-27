@@ -5108,7 +5108,7 @@ export class Store {
       (await prefix.run(sharePrefix, sharePrefix));
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
     }
   
@@ -7565,8 +7565,8 @@ export class Store {
   async clearTurnCheckpoints(taskId: string, runId?: string): Promise<void> {
     await this.db.transaction(async () => {
       const remove = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
-      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
-        ...(runId ? [`turnsession:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
+      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
+        ...(runId ? [`turnsession:legacy:${runId}:`, `turnspawns:legacy:${runId}:`] : [])]) await remove.run(prefix, prefix);
     });
   }
 

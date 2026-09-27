@@ -923,14 +923,14 @@ export function platformToolHandlers(
       return 'review info recorded';
     },
     async create_sub_task(args) {
-      ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
+      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
       return 'sub-task queued: it starts when this turn ends (branches off your work; you are its confirmer)';
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
       if (!['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(action))
         return 'invalid action — use open_pr | confirm | comment | retry | cancel';
-      ctx.respondToSubTask({
+      await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
         action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
         text: args?.text ? String(args.text) : undefined,
