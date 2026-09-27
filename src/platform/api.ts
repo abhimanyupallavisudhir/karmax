@@ -4324,9 +4324,20 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number }): Promise<Message | undefined> {
+    return this.deliverSignal('signal_task', token, taskId, signal, text, role, images, files, attemptChoice, receivedAt);
+  }
+
+  /** `message_agent`: a follow-up into one of a task's agent conversations. That
+   *  is exactly what task:conversation:message grants, so it is authorized as
+   *  that — not as task:signal, which also confirms, cancels and retries. */
+  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<Message | undefined> {
+    return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+  }
+
+  private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number }): Promise<Message | undefined> {
     receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const scopedTask = (await this.deps.store.getTask(taskId));
-    const caller = (await this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId }));
+    const caller = (await this.require(token, tool, { projectId: scopedTask?.projectId, taskId }));
     // Only a task's own workflow, and only with what a task takes from people
     // and agents. Every workflow shares one namespace: a coordinator id has no
     // project to scope-check, and internal signals (grants, sub-task replies,

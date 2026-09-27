@@ -201,6 +201,20 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(saved).toEqual([{ name: 'resolve/npm-eresolve', content: '# fix' }]);
   });
 
+  /** PL-6: message_agent goes to the conversation-message endpoint, which is
+   *  authorized as task:conversation:message, not to the task:signal route. */
+  it('sends message_agent to the conversation-message endpoint', async () => {
+    const sent: any[] = [];
+    const handlers = platformToolHandlers({} as any, {
+      platformRequest: async (method: string, requestPath: string, body?: unknown) => {
+        sent.push({ method, requestPath, body }); return {};
+      },
+      emit() {}, emitActivity() {},
+    } as any);
+    await expect(handlers.message_agent!({ task_id: 'task_fork', role: 'merge', message: 'rebase please' })).resolves.toBe('message delivered');
+    expect(sent).toEqual([{ method: 'POST', requestPath: '/api/tasks/task_fork/messages', body: { role: 'merge', text: 'rebase please' } }]);
+  });
+
   it('rejects overlong review text without recording it and tells the agent why', async () => {
     let recorded: any;
     const handlers = platformToolHandlers({} as any, {

@@ -174,7 +174,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
     'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload)',
     'GET /api/tasks/:taskId/events?since=',
-    'GET /api/tasks/:taskId/timing (correlated response timing, counts/median/p95, missing data, spans and content-free observations; task:event:read)', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent)',
+    'GET /api/tasks/:taskId/timing (correlated response timing, counts/median/p95, missing data, spans and content-free observations; task:event:read)', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent; task:signal)', 'POST /api/tasks/:taskId/messages (body {text, role}; message an agent with task:conversation:message)',
     'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})',
   ],
   review: [
