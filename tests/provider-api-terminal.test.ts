@@ -1,4 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+// The PTY transport is exercised in bounded-exec.test.ts; these fake worlds
+// answer commands directly, with the environment the tool delivers.
+vi.mock('../src/world/bounded-exec.js', () => ({
+  boundedExec: async (world: any, command: string, options: { env?: Record<string, string> }) =>
+    world.exec('bash', ['-lc', command], { env: options.env }),
+}));
 import { TimingTrace, withTiming } from '../src/timing/index.js';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
