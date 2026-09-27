@@ -9,6 +9,7 @@ it('reuses bytes, invalidates all dependency kinds, and rejects corrupt cache en
   const source = path.join(dir, 'workflow.ts'), sdk = path.join(dir, 'package.json');
   const missing = path.join(dir, 'optional.ts'), context = path.join(dir, 'imports');
   await fs.mkdir(context);
+  await fs.symlink(context, path.join(context, 'self'), 'dir');
   await fs.writeFile(source, 'first'); await fs.writeFile(sdk, '{"version":"1"}');
   let builds = 0;
   const build = async () => ({ bundle: { code: `bundle-${++builds}` }, files: [source, sdk], missing: [missing], contexts: [context] });
@@ -65,3 +66,20 @@ it('persists a real webpack bundle and invalidates transitive external sources',
     await expect(fs.access(ephemeralCache)).rejects.toThrow();
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 }, 60_000);
+
+it('frames each input so moving delimiter-like bytes between files cannot reuse a stale bundle', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bundle-framing-test-'));
+  const a = path.join(dir, 'a'), b = path.join(dir, 'b');
+  await fs.writeFile(a, 'original-a'); await fs.writeFile(b, '');
+  const delimiter = `\0${JSON.stringify(b)}${await fs.realpath(b)}`;
+  await fs.writeFile(b, `${delimiter}original-b`);
+  let builds = 0;
+  const get = () => cachedWorkflowBundle(path.join(dir, 'cache'), 'entry', async () => ({
+    bundle: { code: String(++builds) }, files: [a, b], missing: [], contexts: [],
+  }));
+  try {
+    expect((await get()).code).toBe('1');
+    await fs.writeFile(a, `original-a${delimiter}`); await fs.writeFile(b, 'original-b');
+    expect((await get()).code).toBe('2');
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});

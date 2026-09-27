@@ -9,21 +9,23 @@ export const bundleHash = (value: string | Uint8Array): string => createHash('sh
 
 async function fingerprint(inputs: Inputs): Promise<string> {
   const hash = createHash('sha256');
+  const visited = new Set<string>();
   const visit = async (file: string, recursive: boolean) => {
-    hash.update(JSON.stringify(file));
     try {
       const stat = await fs.stat(file);
-      hash.update(await fs.realpath(file));
-      if (stat.isFile()) hash.update(await fs.readFile(file));
+      const real = await fs.realpath(file);
+      if (stat.isFile()) hash.update(JSON.stringify([file, real, 'file', bundleHash(await fs.readFile(file))]));
       else if (stat.isDirectory()) {
-        hash.update('directory');
-        if (recursive) for (const name of (await fs.readdir(file)).sort()) await visit(path.join(file, name), true);
+        hash.update(JSON.stringify([file, real, 'directory']));
+        if (recursive && !visited.has(real)) {
+          visited.add(real);
+          for (const name of (await fs.readdir(file)).sort()) await visit(path.join(file, name), true);
+        }
       } else throw new Error(`unsupported bundle input: ${file}`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      hash.update('missing');
+      hash.update(JSON.stringify([file, 'missing']));
     }
-    hash.update('\0');
   };
   for (const file of [...new Set([...inputs.files, ...inputs.missing])].sort()) await visit(file, false);
   for (const dir of [...new Set(inputs.contexts)].sort()) await visit(dir, true);
