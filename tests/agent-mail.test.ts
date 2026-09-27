@@ -35,6 +35,18 @@ describe('agent mail code/link extraction (§8)', () => {
   });
 });
 
+describe('a damaged agent inbox (AU-28)', () => {
+  it('fails closed instead of reading as empty and overwriting every message', async () => {
+    const store = memStore();
+    const mail = new AgentMail(store);
+    const address = (await mail.address('org_damaged'));
+    expect((await mail.ingest({ from: 'a@b.com', to: address, text: 'code 112233' })).delivered).toBe(true);
+    (await store.kvSet('agent-mail:messages:org_damaged', '[{"id":"m1"'));
+    await expect(mail.ingest({ from: 'a@b.com', to: address, text: 'code 445566' })).rejects.toThrow(/unreadable/);
+    expect(await store.kvGet('agent-mail:messages:org_damaged')).toBe('[{"id":"m1"');
+  });
+});
+
 describe('AgentMail inbox (per-organization tenancy)', () => {
   it('mints one stable address per organization (agent.local without a domain)', async () => {
     const store = memStore();

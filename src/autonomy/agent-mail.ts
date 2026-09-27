@@ -315,10 +315,12 @@ export class AgentMail {
   private async all(organizationId: string): Promise<AgentMessage[]> {
     const raw = await this.store.kvGet(kvMessages(organizationId));
     if (raw && Buffer.byteLength(raw) > 8 * 1_048_576) throw new Error('agent inbox exceeds size limit; archive it before polling');
+    // A damaged inbox must not read as empty: the next delivery would replace
+    // every stored message with just the new one (AU-28).
     try {
       return JSON.parse(raw ?? '[]');
     } catch {
-      return [];
+      throw new Error('The agent inbox is unreadable, so it was left untouched; restore it from a backup');
     }
   }
 

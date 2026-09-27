@@ -88,6 +88,20 @@ describe('vault items: CRUD + write-only secrets', () => {
   });
 });
 
+describe('a damaged vault index (AU-28)', () => {
+  it('fails closed instead of reading as empty and overwriting every item', async () => {
+    const { items, store } = makeService('org_damaged');
+    (await items.save({ type: 'login', label: 'Kept', secrets: { password: 'p' } }));
+    const damaged = '[{"id":"item_1","type":"login","label":"Kept"';
+    (await store.kvSet('vault:items:org_damaged', damaged));
+    await expect(items.list()).rejects.toThrow(/unreadable/);
+    await expect(items.save({ type: 'login', label: 'New', secrets: { password: 'q' } })).rejects.toThrow(/unreadable/);
+    expect(await store.kvGet('vault:items:org_damaged')).toBe(damaged);
+    (await store.kvSet('vault:requests:org_damaged', '{broken'));
+    await expect(items.requests()).rejects.toThrow(/unreadable/);
+  });
+});
+
 describe('vault usage frequency', () => {
   it('persists successful accesses without treating usage as an edit', async () => {
     const { items, store, broker, dir } = makeService();

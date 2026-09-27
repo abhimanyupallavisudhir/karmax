@@ -140,6 +140,14 @@ export interface VaultItemStore {
 // no org qualifier.
 const kvItems = (org: string) => `vault:items:${org}`;
 const kvRequests = (org: string) => `vault:requests:${org}`;
+
+/** A damaged index must never read as empty: the next write would replace
+ *  every entry with just the new one (AU-28). Fail closed; the stored bytes
+ *  stay untouched for recovery. */
+function parseIndex<T>(raw: string, what: string): T {
+  try { return JSON.parse(raw) as T; }
+  catch { throw new Error(`${what} is unreadable, so it was left untouched; restore it from a backup`); }
+}
 const kvGrant = (taskId: string) => `vault:grant:${taskId}`;
 const kvPasses = (taskId: string) => `vault:pass:${taskId}`;
 const kvTaskPolicies = (taskId: string) => `vault:task-policy:${taskId}`;
@@ -232,12 +240,7 @@ export class VaultItems {
     return this.store.transaction(async () => {
     const raw = (await this.store.kvGet(kvItems(this.organizationId)));
     if (!raw) return [];
-    let items: VaultItem[];
-    try {
-      items = JSON.parse(raw) as VaultItem[];
-    } catch {
-      return [];
-    }
+    const items = parseIndex<VaultItem[]>(raw, 'The vault item index');
     const legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
     if (legacy.length) {
       const now = Date.now();
@@ -642,12 +645,7 @@ export class VaultItems {
 
   async requests(filter: { taskId?: string; status?: CredentialAccessRequest['status'] } = {}): Promise<CredentialAccessRequest[]> {
     const raw = (await this.store.kvGet(kvRequests(this.organizationId)));
-    let all: CredentialAccessRequest[] = [];
-    try {
-      all = raw ? JSON.parse(raw) : [];
-    } catch {
-      all = [];
-    }
+    const all: CredentialAccessRequest[] = raw ? parseIndex(raw, 'The credential request list') : [];
     return all.filter((r) => (!filter.taskId || r.taskId === filter.taskId) && (!filter.status || r.status === filter.status));
   }
 
