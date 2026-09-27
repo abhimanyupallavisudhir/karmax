@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
+import { appendGitConfig } from '../src/world/git-credential.js';
 
 const roots: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -53,4 +55,53 @@ it('refuses executable repository filters before host staging (RT-5)', async () 
   await gitOrThrow(root, ['config', 'filter.untrusted.clean', `touch '${marker}'; cat`]);
   expect((await git(root, ['add', '.'])).code).not.toBe(0);
   expect(fs.existsSync(marker)).toBe(false);
+});
+it('refuses repository transport and prompt programs before a host fetch (RT-5)', async () => {
+  const root = await fixture(), origin = await fixture();
+  const marker = path.join(root, 'program-ran');
+  await gitOrThrow(root, ['remote', 'add', 'origin', origin]);
+  for (const [key, value] of [
+    ['remote.origin.uploadpack', `touch '${marker}'; git-upload-pack`],
+    ['core.askPass', `touch '${marker}'`],
+    ['submodule.lib.update', `!touch '${marker}'`],
+  ]) {
+    await gitOrThrow(root, ['config', key!, value!]);
+    expect((await git(root, ['fetch', '-q', 'origin'])).code).not.toBe(0);
+    expect(fs.existsSync(marker)).toBe(false);
+    // karmax's own wrapper now refuses every command here, `config` included.
+    execFileSync('git', ['config', '--unset', key!], { cwd: root });
+  }
+  await gitOrThrow(root, ['fetch', '-q', 'origin']);
+});
+it('refuses executable configuration pulled in through a repository include (RT-5)', async () => {
+  const root = await fixture();
+  const marker = path.join(root, 'filter-ran');
+  const included = path.join(root, 'included.config');
+  fs.writeFileSync(included, `[filter "untrusted"]\n\tclean = touch '${marker}'; cat\n`);
+  fs.writeFileSync(path.join(root, '.gitattributes'), '*.txt filter=untrusted\n');
+  fs.writeFileSync(path.join(root, 'file.txt'), 'content');
+  await gitOrThrow(root, ['config', 'include.path', included]);
+  expect((await git(root, ['add', '.'])).code).not.toBe(0);
+  expect(fs.existsSync(marker)).toBe(false);
+});
+// The operator's own Git setup is trusted: global/system files (identity, LFS
+// filters, credential helpers) and environment-supplied config chains. Only
+// what an agent can write — the repository's config — is refused.
+it('keeps the operator\'s global and environment Git configuration', async () => {
+  const root = await fixture();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'host-git-home-')); roots.push(home);
+  fs.writeFileSync(path.join(home, '.gitconfig'), '[user]\n\tname = Operator\n[filter "lfs"]\n\tclean = cat\n\tsmudge = cat\n');
+  vi.stubEnv('HOME', home);
+  vi.stubEnv('XDG_CONFIG_HOME', path.join(home, '.config'));
+  vi.stubEnv('GIT_CONFIG_COUNT', '1');
+  vi.stubEnv('GIT_CONFIG_KEY_0', 'karmax.operator');
+  vi.stubEnv('GIT_CONFIG_VALUE_0', 'env');
+  expect(await gitOrThrow(root, ['config', '--global', 'user.name'])).toBe('Operator');
+  fs.writeFileSync(path.join(root, '.gitattributes'), '*.bin filter=lfs\n');
+  fs.writeFileSync(path.join(root, 'data.bin'), 'binary');
+  await gitOrThrow(root, ['add', '.']);
+  const env: Record<string, string> = {};
+  appendGitConfig(env, 'karmax.appended', 'yes');
+  expect(await gitOrThrow(root, ['config', 'karmax.operator'], { env })).toBe('env');
+  expect(await gitOrThrow(root, ['config', 'karmax.appended'], { env })).toBe('yes');
 });

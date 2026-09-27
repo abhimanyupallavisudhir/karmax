@@ -34,15 +34,20 @@ export async function git(cwd: string, args: string[], opts: { timeoutMs?: numbe
   try {
     await validateGitDirectory(cwd);
     const env = { ...hostGitEnvironment(), ...(opts.env ?? {}), GIT_TERMINAL_PROMPT: '0' };
-    const config = await pexec('git', ['config', '--null', '--get-regexp',
-      '^(filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver|diff\\..*\\.(command|textconv)|diff\\.external|core\\.(sshcommand|gitproxy|alternaterefscommand)|gpg(\\..*)?\\.program|credential(\\..*)?\\.helper)$'],
+    // Only the repository's own configuration (and what it includes) can be
+    // written from an agent's checkout; operator and karmax-supplied scopes are
+    // trusted, so an operator's LFS filter or credential helper keeps working.
+    const config = await pexec('git', ['config', '--show-scope', '--includes', '--null', '--get-regexp',
+      '^(filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver|diff\\..*\\.(command|textconv)|diff\\.external|core\\.(sshcommand|gitproxy|alternaterefscommand|askpass)|gpg(\\..*)?\\.program|credential(\\..*)?\\.helper|remote\\..*\\.(uploadpack|receivepack)|submodule\\..*\\.update)$'],
       { cwd, env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 1024 * 1024 }).catch(error => {
         if (error.code === 1 && !error.killed) return { stdout: '' };
         throw error;
       });
-    for (const setting of config.stdout.split('\0')) {
+    const fields = config.stdout.split('\0');
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      const scope = fields[index]!, setting = fields[index + 1]!;
       const separator = setting.indexOf('\n');
-      if (separator >= 0 && setting.slice(separator + 1).trim())
+      if ((scope === 'local' || scope === 'worktree') && separator >= 0 && setting.slice(separator + 1).trim())
         throw new Error(`refusing executable repository Git configuration: ${setting.slice(0, separator)}`);
     }
     const { stdout, stderr } = await pexec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
@@ -105,10 +110,26 @@ export async function ensureIdentity(dir: string) {
   }
 }
 
+/** The environment host Git inherits. An allowlist, so karmax's own secrets and
+ * inherited GIT_DIR-style overrides never reach a Git subprocess; what it keeps
+ * is the operator's trusted setup — global/system config files, environment
+ * config chains (which appendGitConfig extends), proxies and CA bundles.
+ * Tenant-scoped callers layer isolatedGitEnvironment() over this. */
 function hostGitEnvironment(): Record<string, string> {
-  const env: Record<string, string> = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
-  for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSH_AUTH_SOCK', 'GIT_TRACE2_EVENT'])
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'XDG_CONFIG_HOME',
+    'SSH_AUTH_SOCK', 'GIT_TRACE2_EVENT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'GIT_SSH',
+    'GIT_SSH_COMMAND', 'GIT_SSL_CAINFO', 'GIT_SSL_CAPATH', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy'])
     if (process.env[key]) env[key] = process.env[key]!;
+  const count = Number(process.env.GIT_CONFIG_COUNT ?? 0);
+  if (Number.isSafeInteger(count) && count > 0) {
+    env.GIT_CONFIG_COUNT = String(count);
+    for (let index = 0; index < count; index++) {
+      env[`GIT_CONFIG_KEY_${index}`] = process.env[`GIT_CONFIG_KEY_${index}`] ?? '';
+      env[`GIT_CONFIG_VALUE_${index}`] = process.env[`GIT_CONFIG_VALUE_${index}`] ?? '';
+    }
+  }
   return env;
 }
 
