@@ -21,6 +21,7 @@ vi.mock('../src/world/bounded-exec.js', () => ({
     if (Buffer.byteLength(result.stdout) > options.maxBytes) throw new Error('world command output exceeds capture limit');
     return result;
   },
+  IncompleteOutputError: class IncompleteOutputError extends Error {},
 }));
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,

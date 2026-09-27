@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../src/world/bounded-exec.js', () => ({
   boundedExec: async (world: any, command: string, options: { env?: Record<string, string> }) =>
     world.exec('bash', ['-lc', command], { env: options.env }),
+  IncompleteOutputError: class IncompleteOutputError extends Error {},
 }));
 import { TimingTrace, withTiming } from '../src/timing/index.js';
 import { ClaudeAdapter } from '../src/agent/claude.js';

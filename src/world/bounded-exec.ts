@@ -1,6 +1,10 @@
 import crypto from 'node:crypto';
 import type { ExecResult, World } from './types.js';
 
+/** The terminal ended before the command's end-of-output marker arrived: its
+ * output may be missing a tail, so it is a failed read, never a result. */
+export class IncompleteOutputError extends Error {}
+
 /** Capture sandbox output through the streaming PTY, avoiding SDK command
  * handles that accumulate stdout internally even when a callback is supplied. */
 export async function boundedExec(world: World, command: string, options: {
@@ -84,7 +88,7 @@ export async function boundedExec(world: World, command: string, options: {
       // whatever is still unread. Only the end-of-output marker (written after
       // the command, carrying its status) proves the capture is complete; an
       // exit before it means the shell died, never a finished command.
-      detachExit = terminal.onExit(() => fail(new Error('world command transport ended without its end-of-output marker')));
+      detachExit = terminal.onExit(() => fail(new IncompleteOutputError('world command transport ended without its end-of-output marker')));
       // Base64 lines avoid terminal canonical-line and exec argv limits. Supply
       // the script on a descriptor so command stdin remains the terminal.
       const encoded = Buffer.from(command).toString('base64').match(/.{1,1024}/g)?.join('\n') ?? '';
