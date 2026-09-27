@@ -1372,7 +1372,12 @@ async function softwareDevImpl(
       humanPauseWake = { kind: 'retry' };
   });
   // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
-  if (recovery && patched('software-dev-preserve-replacement-children-v1'))
+  // A child settles when its durable view does, which the publish activity
+  // signals here (platform/child-settlement.ts); that follows the task across
+  // lifecycle replacements of its run. A replaced run's own result is not a
+  // settlement: the task goes on in a successor run (WF-31).
+  const durableChildSettlement = patched('software-dev-durable-child-settlement-v1');
+  if ((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
     setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => { settled.push(result); });
   setHandler(raiseFromChildSignal, (r) => {
     if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
@@ -2399,7 +2404,10 @@ Inspect the complete current diff and specifically compare its delta from the re
   /** Record a child's eventual settlement so the management loop can react. */
   function trackChild(childTaskId: string, child: ChildWorkflowHandle<typeof softwareDev>) {
     child.result().then(
-      (res) => settled.push({ childTaskId, stage: (res as { stage: Stage }).stage }),
+      (res) => {
+        if (durableChildSettlement && (res as { lifecycleReplacement?: boolean }).lifecycleReplacement) return;
+        settled.push({ childTaskId, stage: (res as { stage: Stage }).stage });
+      },
       (err) => settled.push({ childTaskId, stage: 'failed', detail: describeError(err) }),
     );
   }
@@ -2518,7 +2526,9 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     while (settled.length) {
       const s = settled.shift()!;
-      if (recovery && patched('software-dev-preserve-replacement-children-v1') && !outstanding.has(s.childTaskId)) continue;
+      // Both a run's result and the durable signal report one settlement.
+      if (((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
+        && !outstanding.has(s.childTaskId)) continue;
       subtaskNags = 0;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
@@ -4142,7 +4152,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         }
       }
     }
-    return { stage } as { stage: Stage };
+    return (lifecycleReplacement && durableChildSettlement ? { stage, lifecycleReplacement: true } : { stage }) as { stage: Stage };
   }
 }
 
