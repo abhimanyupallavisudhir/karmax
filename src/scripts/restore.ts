@@ -1,13 +1,9 @@
 import { restoreBackup, verifyBackup } from '../ops/backup.js';
 
-const args = process.argv.slice(2);
-const keyIndex = args.indexOf('--key-file');
-const keyFile = keyIndex < 0 ? undefined : args.splice(keyIndex, 2)[1];
-if (keyIndex >= 0 && !keyFile) throw new Error('--key-file requires the original vault key file');
-const verifyOnly = args[0] === '--verify';
-const source = args[verifyOnly ? 1 : 0];
+const verifyOnly = process.argv[2] === '--verify';
+const source = process.argv[verifyOnly ? 3 : 2];
 if (!source) throw new Error('usage: npm run restore -- /path/to/backup');
-const manifest = verifyOnly ? verifyBackup(source, { keyFile }) : await restoreBackup(source, { keyFile });
+const manifest = verifyOnly ? verifyBackup(source) : await restoreBackup(source);
 if (verifyOnly) {
   console.log(`backup verified: ${manifest.files.length} files`);
   process.exit(0);

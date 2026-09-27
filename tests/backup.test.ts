@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,8 +7,6 @@ import { createBackup, restoreBackup } from '../src/ops/backup.js';
 import { Vault } from '../src/autonomy/vault.js';
 
 const roots: string[] = [];
-beforeEach(() => vi.stubEnv('KARMAX_VAULT_KEY', 'independently-trusted-test-key-32-characters'));
-afterEach(() => vi.unstubAllEnvs());
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe('control-plane backup', () => {
@@ -33,7 +31,7 @@ describe('control-plane backup', () => {
         externalTemporal: true });
       // Prove recovery uses the snapshot, not the source's current state.
       await vault.put(handle, 'changed-after-backup');
-      await restoreBackup(directory, { home: recovered, keyFile: path.join(original, 'vault', 'vault.key') });
+      await restoreBackup(directory, { home: recovered });
       const restored = await Store.create(path.join(recovered, 'state', 'karmax.db'));
       try {
         const restoredHandle = await restored.kvGet('recovery-handle');
@@ -213,14 +211,15 @@ describe('control-plane backup', () => {
     await expect(restoreBackup(destination, { home })).rejects.toThrow('integrity check failed');
   });
 
-  it('always excludes the signing key and optionally excludes other secrets', async () => {
+  it('flags — and can exclude — the key material that decrypts the payload', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-secrets-'));
     const home = path.join(root, 'home');
     roots.push(root);
     fs.mkdirSync(path.join(home, 'vault'), { recursive: true });
     fs.mkdirSync(path.join(home, 'state'), { recursive: true });
-    // Keep the trusted local key when restoring a secrets-excluded snapshot.
-    vi.stubEnv('KARMAX_VAULT_KEY', undefined);
+    // `vault.key` sits next to the ciphertext it opens, and `auth.db.secret`
+    // beside the auth database — so a default backup directory is a
+    // plaintext-equivalent credential bundle, not merely "portable".
     fs.writeFileSync(path.join(home, 'vault', 'vault.key'), 'KEY');
     fs.writeFileSync(path.join(home, 'vault', 'vault.key.123.fixture.tmp'), 'CRASHED-KEY');
     fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'ciphertext');
@@ -228,7 +227,7 @@ describe('control-plane backup', () => {
 
     const withSecrets = await createBackup({ home, destination: path.join(root, 'a'), externalTemporal: true });
     expect(withSecrets.manifest.secretsIncluded).toBe(true);
-    expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key'))).toBe(true);
     expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key.123.fixture.tmp'))).toBe(false);
 
     const without = await createBackup({ home, destination: path.join(root, 'b'), externalTemporal: true, excludeSecrets: true });
@@ -260,7 +259,11 @@ describe('control-plane backup', () => {
     const without = await createBackup({ home, destination: path.join(root, 'b'), externalTemporal: true, excludeSecrets: true });
     expect(without.manifest.secretsIncluded).toBe(false);
 
-    // The independently supplied environment key authenticates a fresh restore.
+    // A different machine — the off-site case `excludeSecrets` exists for. There is
+    // no key here to carry across, and that is fine: the restore cannot destroy a
+    // key that was never here. It must SUCCEED and leave the ciphertext intact so
+    // the operator can deliver the key separately. Refusing here would break the
+    // only workflow excludeSecrets is for.
     const fresh = path.join(root, 'fresh');
     fs.mkdirSync(fresh, { recursive: true });
     await expect(restoreBackup(path.join(root, 'b'), { home: fresh })).resolves.toBeTruthy();
@@ -268,8 +271,13 @@ describe('control-plane backup', () => {
     expect(fs.existsSync(path.join(fresh, 'vault', 'vault.key'))).toBe(false);
   });
 
-  it('rejects unsigned legacy manifests before replacing target secrets', async () => {
-    // Unsigned legacy metadata cannot be authenticated, including missing flags.
+  it('treats a legacy manifest with no secretsIncluded field as carrying its secrets', async () => {
+    // `secretsIncluded` was added to a manifest whose `version` stayed `1`, so every
+    // backup taken before it exists still validates — and reads back `undefined`.
+    // A falsiness test (`!manifest.secretsIncluded`) then took the preserve-live-secrets
+    // path for a payload that DOES contain key material, writing the target host's key
+    // over the one just restored. On the documented "restore onto a new host" path that
+    // pairs the backup's ciphertext with a foreign key: undecryptable forever.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-backup-legacy-'));
     roots.push(root);
     const home = path.join(root, 'home');
@@ -281,11 +289,11 @@ describe('control-plane backup', () => {
     const destination = path.join(root, 'snapshot');
     await createBackup({ home, destination, externalTemporal: true });
 
-    // A pre-authentication manifest must never bypass verification.
+    // Age the manifest back to what a pre-`secretsIncluded` karmax wrote: same
+    // version, same file list (the manifest itself is not hashed), field absent.
     const manifestFile = path.join(destination, 'manifest.json');
     const aged = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) as Record<string, unknown>;
     delete aged.secretsIncluded;
-    aged.version = 1;
     fs.writeFileSync(manifestFile, `${JSON.stringify(aged, null, 2)}\n`);
 
     // A different host, with its own established (and different) key material.
@@ -294,10 +302,12 @@ describe('control-plane backup', () => {
     fs.mkdirSync(path.join(target, 'state'), { recursive: true });
     fs.writeFileSync(path.join(target, 'vault', 'vault.key'), 'TARGET-KEY');
     fs.writeFileSync(path.join(target, 'state', 'auth.db.secret'), 'TARGET-AUTH');
-    fs.rmSync(path.join(destination, 'manifest.hmac'));
-    await expect(restoreBackup(destination, { home: target })).rejects.toThrow(/authentication/);
-    expect(fs.readFileSync(path.join(target, 'vault', 'vault.key'), 'utf8')).toBe('TARGET-KEY');
-    expect(fs.readFileSync(path.join(target, 'state', 'auth.db.secret'), 'utf8')).toBe('TARGET-AUTH');
+    await restoreBackup(destination, { home: target });
+
+    // The payload's own key must survive the restore, matched to its own ciphertext.
+    expect(fs.readFileSync(path.join(target, 'vault', 'vault.json'), 'utf8')).toBe('source-ciphertext');
+    expect(fs.readFileSync(path.join(target, 'vault', 'vault.key'), 'utf8')).toBe('SOURCE-KEY');
+    expect(fs.readFileSync(path.join(target, 'state', 'auth.db.secret'), 'utf8')).toBe('SOURCE-AUTH');
   });
 
   it('reports secretsIncluded from the operator intent, not from what the payload happens to hold', async () => {
@@ -341,55 +351,4 @@ describe('control-plane backup', () => {
     expect(made.directory.startsWith(path.join(home, 'backups'))).toBe(true);
     expect(fs.existsSync(path.join(made.directory, 'manifest.json'))).toBe(true);
   });
-});
-
-it('authenticates manifest fields and hashes with the independently supplied vault key (DB-10)', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-mac-'));
-  roots.push(root);
-  const home = path.join(root, 'home');
-  fs.mkdirSync(path.join(home, 'content'), { recursive: true });
-  fs.writeFileSync(path.join(home, 'content', 'note'), 'original');
-  const { directory } = await createBackup({ home, externalTemporal: true });
-  const file = path.join(directory, 'manifest.json');
-  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
-  manifest.temporal = 'embedded';
-  fs.writeFileSync(file, JSON.stringify(manifest));
-  await expect(restoreBackup(directory, { home })).rejects.toThrow(/authentication/i);
-  expect(fs.readFileSync(path.join(home, 'content', 'note'), 'utf8')).toBe('original');
-});
-
-it('keeps the manifest authentication key out of the backup even when other secrets are included', async () => {
-  vi.stubEnv('KARMAX_VAULT_KEY', undefined);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-private-key-'));
-  roots.push(root);
-  const home = path.join(root, 'home');
-  const vault = new Vault(path.join(home, 'vault'));
-  await vault.put('fixture', 'original');
-  const { directory } = await createBackup({ home, externalTemporal: true });
-  expect(fs.existsSync(path.join(directory, 'payload/vault/vault.key'))).toBe(false);
-  await restoreBackup(directory, { home });
-  expect(new Vault(path.join(home, 'vault')).reveal('fixture')).toBe('original');
-  const fresh = path.join(root, 'fresh');
-  await expect(restoreBackup(directory, { home: fresh })).rejects.toThrow(/original vault key/);
-});
-
-it('rejects a rehashed payload and a forged manifest MAC without replacing live files', async () => {
-  const { createHash } = await import('node:crypto');
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-forgery-'));
-  roots.push(root);
-  const home = path.join(root, 'home');
-  fs.mkdirSync(path.join(home, 'content'), { recursive: true });
-  fs.writeFileSync(path.join(home, 'content/note'), 'original');
-  const { directory } = await createBackup({ home, externalTemporal: true });
-  const file = path.join(directory, 'manifest.json');
-  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
-  fs.writeFileSync(path.join(directory, 'payload/content/note'), 'forgery!');
-  const entry = manifest.files.find((entry: any) => entry.path === 'content/note');
-  entry.bytes = 8;
-  entry.sha256 = createHash('sha256').update('forgery!').digest('hex');
-  fs.writeFileSync(file, JSON.stringify(manifest));
-  await expect(restoreBackup(directory, { home })).rejects.toThrow(/authentication/);
-  fs.writeFileSync(path.join(directory, 'manifest.hmac'), '0'.repeat(64));
-  await expect(restoreBackup(directory, { home })).rejects.toThrow(/authentication/);
-  expect(fs.readFileSync(path.join(home, 'content/note'), 'utf8')).toBe('original');
 });

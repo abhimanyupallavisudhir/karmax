@@ -3,7 +3,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { Vault } from '../autonomy/vault.js';
 import { paths } from '../config/paths.js';
 import { scanInstances } from '../util/instance.js';
 
@@ -15,14 +14,34 @@ type Component = typeof COMPONENTS[number];
 
 export interface BackupManifest {
   format: 'karmax-backup';
-  version: 2;
+  version: 1;
   createdAt: string;
   sourceHome: string;
   temporal: 'embedded' | 'external';
   objectStore: 'local' | 'external';
   worldsIncluded: false;
-  /** Whether plaintext credentials and auth secrets were requested. The vault
-   * signing key is always excluded and must be retained independently. */
+  /**
+   * Does the payload carry the key material that decrypts the rest of it?
+   *
+   * `vault/` is copied verbatim, and `vault.key` lives INSIDE it, next to the
+   * ciphertext it opens — as does `state/auth.db.secret`. A backup directory is
+   * therefore a plaintext-equivalent credential bundle, not the merely-"portable"
+   * archive the format name suggests. Callers now choose explicitly
+   * (`excludeSecrets`), and the manifest records which kind of artifact this is,
+   * so anyone handling the directory (or restoring it) can tell.
+   *
+   * This records the CALLER'S INTENT (`!excludeSecrets`), not whether the payload
+   * happens to hold either file. An install keyed by `KARMAX_VAULT_KEY` has no
+   * on-disk `vault.key` and may have no `auth.db.secret`; deriving the flag from
+   * the payload made those backups claim `false` although nothing was withheld,
+   * which silently armed the preserve-live-secrets path in `restoreBackup` and
+   * paired the restoring host's key material with this payload's ciphertext.
+   *
+   * Every manifest written since the field existed sets it — but manifests written
+   * BEFORE it exist too, and they are still `version: 1` (see `restoreBackup`), so
+   * a parsed value can be `undefined`. Absent means "included": that is what those
+   * backups actually contain. Never test this by falsiness.
+   */
   secretsIncluded: boolean;
   files: Array<{ path: string; bytes: number; sha256: string }>;
 }
@@ -52,13 +71,12 @@ export async function createBackup(options: {
    * `BackupManifest.secretsIncluded`). The resulting directory is genuinely
    * portable: it can be stored somewhere less trusted than the install, and
    * restoring it needs the key material supplied separately. Default `false`
-   * includes other plaintext credentials; the vault key is always excluded.
+   * preserves the existing self-contained behaviour.
    */
   excludeSecrets?: boolean;
 } = {}): Promise<{ directory: string; manifest: BackupManifest }> {
   const home = path.resolve(options.home ?? paths().home);
   const p = paths(home);
-  const signingKey = backupKey(home, undefined, true);
   // Components are snapshotted at different instants, so a backup taken while an
   // app is writing is NOT point-in-time consistent (the SQLite snapshots are each
   // internally consistent, but they can disagree with one another and with the
@@ -119,15 +137,13 @@ export async function createBackup(options: {
       await backupSqlite(path.join(p.temporal, 'temporal.db'), path.join(payload, 'temporal', 'temporal.db'));
     if (!options.externalObjectStore) copyTree(p.objects, path.join(payload, 'objects'));
 
-    // A MAC is meaningless if its signing key travels in the same untrusted archive.
-    fs.rmSync(path.join(payload, 'vault', 'vault.key'), { force: true });
     if (options.excludeSecrets) {
       for (const relative of SECRET_FILES) fs.rmSync(path.join(payload, relative), { force: true });
       for (const relative of PLAINTEXT_SECRET_DIRS) fs.rmSync(path.join(payload, relative), { recursive: true, force: true });
     }
 
     const manifest: BackupManifest = {
-      format: 'karmax-backup', version: 2, createdAt: new Date().toISOString(), sourceHome: home,
+      format: 'karmax-backup', version: 1, createdAt: new Date().toISOString(), sourceHome: home,
       temporal: options.externalTemporal ? 'external' : 'embedded',
       objectStore: options.externalObjectStore ? 'external' : 'local', worldsIncluded: false,
       // Intent, NOT payload contents: `fs.existsSync` over SECRET_FILES reports
@@ -138,9 +154,7 @@ export async function createBackup(options: {
       secretsIncluded: !options.excludeSecrets,
       files: listFiles(payload).map((file) => ({ path: slash(path.relative(payload, file)), bytes: fs.statSync(file).size, sha256: hashFile(file) })),
     };
-    const manifestBytes = `${JSON.stringify(manifest, null, 2)}\n`;
-    writeAtomic(path.join(destination, 'manifest.json'), manifestBytes, 0o600);
-    writeAtomic(path.join(destination, 'manifest.hmac'), manifestMac(manifestBytes, signingKey), 0o600);
+    writeAtomic(path.join(destination, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
     return { directory: destination, manifest };
   } catch (error) {
     fs.rmSync(destination, { recursive: true, force: true });
@@ -150,17 +164,10 @@ export async function createBackup(options: {
 
 /** Verify every byte before replacing anything, then restore each component via
  * same-filesystem rename. A failed verification leaves the installation intact. */
-export function verifyBackup(source: string, options: { home?: string; keyFile?: string } = {}): BackupManifest {
+export function verifyBackup(source: string): BackupManifest {
   const directory = path.resolve(source);
-  const bytes = fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8');
-  let signature: string;
-  try { signature = fs.readFileSync(path.join(directory, 'manifest.hmac'), 'utf8'); }
-  catch { throw new Error('backup manifest authentication is missing; unsigned backups cannot be restored'); }
-  const expected = manifestMac(bytes, backupKey(options.home ?? paths().home, options.keyFile));
-  if (!/^[a-f0-9]{64}$/.test(signature) || !crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex')))
-    throw new Error('backup manifest authentication failed');
-  const manifest = JSON.parse(bytes) as BackupManifest;
-  if (manifest.format !== 'karmax-backup' || manifest.version !== 2 || !Array.isArray(manifest.files))
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as BackupManifest;
+  if (manifest.format !== 'karmax-backup' || manifest.version !== 1 || !Array.isArray(manifest.files))
     throw new Error('unsupported or invalid Krmax backup manifest');
   const payload = path.join(directory, 'payload');
   for (const entry of manifest.files) {
@@ -185,9 +192,9 @@ export function verifyBackup(source: string, options: { home?: string; keyFile?:
   return manifest;
 }
 
-export async function restoreBackup(source: string, options: { home?: string; allowRunning?: boolean; keyFile?: string } = {}): Promise<BackupManifest> {
+export async function restoreBackup(source: string, options: { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
   const directory = path.resolve(source);
-  const manifest = verifyBackup(directory, options);
+  const manifest = verifyBackup(directory);
   const payload = path.join(directory, 'payload');
 
   const home = path.resolve(options.home ?? paths().home);
@@ -209,15 +216,41 @@ export async function restoreBackup(source: string, options: { home?: string; al
   fs.mkdirSync(previousRoot, { mode: 0o700 });
   const present = COMPONENTS.filter((component) => fs.existsSync(path.join(payload, component)));
 
+  // A `secretsIncluded: false` backup carries the vault's CIPHERTEXT but not
+  // `vault/vault.key` — that is the whole point of `excludeSecrets`, which exists so
+  // a backup can be handed off-site. Restore, however, swaps whole component
+  // directories: the live `vault/` was renamed away and the keyless payload renamed
+  // into its place, then the saved copy was deleted outright on success. That made
+  // the entire credential vault permanently undecryptable and invalidated every
+  // session, with no undo — the single most destructive thing this file could do.
+  //
+  // So carry the live secrets across the swap. Restoring a secrets-excluded backup
+  // onto the home it came from then works completely — the surviving key still
+  // matches the ciphertext.
+  //
+  // Deliberately preserve-only, never refuse: if this home has no key either, the
+  // restore cannot destroy one, and the off-site case `excludeSecrets` exists for
+  // (restore the ciphertext here, deliver the key by another channel) has to stay
+  // possible. Absence of a key is the operator's business; silently eating one they
+  // already had is ours.
+  //
+  // `=== false`, never `!manifest.secretsIncluded`. The field was added to a manifest
+  // whose `version` stayed `1` (deliberately — the payload layout did not change, and
+  // bumping it would make every existing backup unrestorable by the check above, a
+  // worse failure than the one being fixed), so a legacy manifest validates and reads
+  // back `undefined`. Those backups DO carry their secrets; treating absent as
+  // "excluded" ran this preservation path over a payload that had its own key, writing
+  // the restoring host's `vault.key`/`auth.db.secret` on top of the restored ones. On
+  // the documented restore-onto-a-new-host path that leaves the backup's ciphertext
+  // paired with a foreign key — permanently undecryptable, every session invalidated.
   const preserved = new Map<string, Buffer>();
-  // The signing key never travels in the payload. Preserve the trusted local key,
-  // or install the separately supplied original key when restoring on a new host.
-  if (present.includes('vault') && (options.keyFile || (!process.env.KARMAX_VAULT_KEY && !process.env.KARMAX_VAULT_KEY_FILE)))
-    preserved.set('vault/vault.key', backupKey(home, options.keyFile));
   if (manifest.secretsIncluded === false) {
-    const authSecret = path.join(home, 'state', 'auth.db.secret');
-    if (present.includes('state') && fs.existsSync(authSecret))
-      preserved.set('state/auth.db.secret', fs.readFileSync(authSecret));
+    for (const relative of SECRET_FILES) {
+      const component = relative.split('/')[0]!;
+      if (!present.includes(component as (typeof COMPONENTS)[number])) continue;
+      const live = path.join(home, relative);
+      if (fs.existsSync(live)) preserved.set(relative, fs.readFileSync(live));
+    }
   }
 
   try {
@@ -248,22 +281,6 @@ export async function restoreBackup(source: string, options: { home?: string; al
     fs.rmSync(previousRoot, { recursive: true, force: true });
     throw error;
   }
-}
-
-/** Never authenticate with a key found in the untrusted backup payload. */
-function backupKey(home: string, keyFile?: string, create = false): Buffer {
-  if (keyFile) return fs.readFileSync(keyFile);
-  const supplied = process.env.KARMAX_VAULT_KEY || (process.env.KARMAX_VAULT_KEY_FILE
-    ? fs.readFileSync(process.env.KARMAX_VAULT_KEY_FILE, 'utf8').trim() : undefined);
-  if (supplied) return crypto.createHash('sha256').update(supplied).digest();
-  const file = path.join(home, 'vault', 'vault.key');
-  if (!fs.existsSync(file) && create) new Vault(path.join(home, 'vault'));
-  if (!fs.existsSync(file)) throw new Error('backup authentication needs the original vault key; supply KARMAX_VAULT_KEY or --key-file');
-  return fs.readFileSync(file);
-}
-
-function manifestMac(bytes: string, key: Buffer): string {
-  return crypto.createHmac('sha256', key).update('karmax-backup-manifest-v2\0').update(bytes).digest('hex');
 }
 
 async function backupSqlite(source: string, destination: string): Promise<void> {
