@@ -2893,7 +2893,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (!repos.length) {
         const files = (await world.listFiles()).map((file) => `${file} (new)`);
         const { changedFiles, truncated } = reviewFiles(files);
-        const summary = files.length ? `${files.length} file(s) in the task workspace.${truncated ? ' File list truncated; inspect the workspace for the full list.' : ''}` : 'No file changes detected.';
+        const summary = files.length ? `${files.length} file(s) in the task workspace.${truncated ? ` Showing ${changedFiles.length}; inspect the workspace for the full list.` : ''}` : 'No file changes detected.';
         (await record(handle.id, 'review.built', { files: changedFiles.length }));
         return { summary, changedFiles };
       }
@@ -2927,7 +2927,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         );
       }
       const bounded = reviewFiles(changedFiles);
-      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.${bounded.truncated ? ' File list truncated; inspect the checkouts for the full list.' : ''}` : 'No file changes detected.';
+      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.${bounded.truncated ? ` Showing ${bounded.changedFiles.length}; inspect the checkouts for the full list.` : ''}` : 'No file changes detected.';
       (await record(handle.id, 'review.built', { files: changedFiles.length }));
       return { summary, changedFiles: bounded.changedFiles };
     },
