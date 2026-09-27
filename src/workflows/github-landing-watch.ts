@@ -1,4 +1,4 @@
-import { condition, continueAsNew, defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';
+import { condition, continueAsNew, defineSignal, proxyActivities, setHandler, isCancellation, workflowInfo } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import type { GitHubMergeAuthorization, WorldHandleLike, LandingAuthority } from './contract.js';
 
@@ -28,9 +28,11 @@ export async function githubLandingWatch(input: LandingWatchInput): Promise<GitH
         mode: 'preflight', authority: input.authority,
       });
     } catch (error) {
+      if (isCancellation(error)) throw error;
       return { status: 'retryable-error', prs: input.previous.prs, detail: String(error) };
     }
     if (JSON.stringify(result) !== previous) return result;
+    if (workflowInfo().continueAsNewSuggested || workflowInfo().historySize >= 10_000_000) break;
   }
   return continueAsNew<typeof githubLandingWatch>({ ...input, wake });
 }
