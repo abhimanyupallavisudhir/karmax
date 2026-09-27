@@ -16,7 +16,9 @@ it('reuses bytes, invalidates all dependency kinds, and rejects corrupt cache en
   try {
     expect((await get()).code).toBe('bundle-1');
     expect((await get()).code).toBe('bundle-1');
+    const originalStat = await fs.stat(source);
     await fs.writeFile(source, 'other');
+    await fs.utimes(source, originalStat.atime, originalStat.mtime);
     expect((await get()).code).toBe('bundle-2');
     await fs.writeFile(sdk, '{"version":"2"}');
     expect((await get()).code).toBe('bundle-3');
@@ -52,6 +54,12 @@ it('persists a real webpack bundle and invalidates transitive external sources',
     const changed = await buildVersionedBundle(refs, { cacheDir });
     expect(changed.code).not.toBe(cold.code);
     expect(changed.code).toContain('modified-value');
+    await fs.writeFile(entryFile, "import { value } from './priority.js'; export default async function external() { return value; }");
+    await fs.writeFile(path.join(dir, 'priority.js'), "export const value = 'lower-priority';");
+    expect((await buildVersionedBundle(refs, { cacheDir })).code).toContain('lower-priority');
+    // Temporal's .js alias prefers .ts: a previously missing file changes resolution.
+    await fs.writeFile(path.join(dir, 'priority.ts'), "export const value = 'higher-priority';");
+    expect((await buildVersionedBundle(refs, { cacheDir })).code).toContain('higher-priority');
     const ephemeralCache = path.join(dir, 'ephemeral-cache');
     await buildVersionedBundle(refs, { cacheDir: ephemeralCache, cache: false });
     await expect(fs.access(ephemeralCache)).rejects.toThrow();
