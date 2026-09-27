@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { openPage, CdpSession } from './cdp.js';
 
 /**
- * Agent-enrolled passkeys (PLAN-passwords.md §8). The user's own passkeys are
+ * Agent-enrolled passkeys (wiki plans/PLAN-passwords §8). The user's own passkeys are
  * unusable by an agent by design — the OS biometric gesture is the product.
  * Instead the agent enrolls ITS OWN passkey on the account, via a CDP virtual
  * authenticator whose credential material karmax generates and stores as a

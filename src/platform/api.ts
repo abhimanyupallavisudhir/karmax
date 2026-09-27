@@ -1094,7 +1094,7 @@ export class KarmaxApi {
        * to run with that limited package. */
       allowAttenuation?: boolean;
       acceptAttenuation?: boolean;
-      /** Per-task vault item grants (PLAN-passwords.md §6): `use-credential:item:…`
+      /** Per-task vault item grants (wiki plans/PLAN-passwords §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
       /** Sparse blind-use/plaintext policy overrides for the credentials this
@@ -1891,7 +1891,7 @@ export class KarmaxApi {
 
   /**
    * Layer per-task vault item grants onto the attenuated profile package
-   * (PLAN-passwords.md §6). A creator can attach only items its own grant
+   * (wiki plans/PLAN-passwords §6). A creator can attach only items its own grant
    * covers — or any item when it holds credential administration — so a
    * confused deputy cannot mint credential access it does not have. Dropped
    * grants mark the task attenuated rather than failing creation.
@@ -4059,7 +4059,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return result;
   }
 
-  // ─── Search & organization (task search / views — PLAN-search-views) ─────────
+  // ─── Search & organization (task search / views) ─────────────────────────────
   // A *view* is a saved *query*: every list surface (including the default one) is the
   // result of evaluating a `TaskQuery` — free text + structured filters + sort + group —
   // against the project's tasks. The evaluator is pure (src/domain/search.ts); it runs

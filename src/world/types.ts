@@ -112,7 +112,7 @@ export interface WorldHandle extends WorldHandleRef {
   warnings?: string[];
 }
 
-/** Git identity a world's commits carry (PLAN-git-config.md §4A), materialized
+/** Git identity a world's commits carry (wiki plans/PLAN-git-config §4A), materialized
  *  from the project's git profile. `signingKeyPath` is an SSH key file already
  *  written to disk by the profile service (never a secret in transit here). */
 export interface WorldGitIdentity {

@@ -93,12 +93,12 @@ All three benchmark tasks were cancelled after collection and emitted `world.des
 
 ## Evidence and reproduction
 
-- [Codex observations, request reports, cohorts and native usage](../benchmarks/results/e2b-codex-2026-09-19.json.gz)
-- [Claude observations and excluded late steering attempt](../benchmarks/results/e2b-claude-2026-09-19.json.gz)
-- [Censored default-browser pilot](../benchmarks/results/e2b-pilot-default-tools-2026-09-19.json)
-- [Browser observer data](../benchmarks/results/e2b-browser-2026-09-19.json) and [deployed console screenshot](../benchmarks/results/e2b-browser-2026-09-19.png)
-- [Earlier traces from this authorized task](../benchmarks/results/e2b-existing-task-2026-09-19.json), retained separately because real-task context/retries are not comparable marker workloads.
+- [Codex observations, request reports, cohorts and native usage](e2b-codex-2026-09-19.json.gz)
+- [Claude observations and excluded late steering attempt](e2b-claude-2026-09-19.json.gz)
+- [Censored default-browser pilot](e2b-pilot-default-tools-2026-09-19.json)
+- [Browser observer data](e2b-browser-2026-09-19.json) and [deployed console screenshot](e2b-browser-2026-09-19.png)
+- [Earlier traces from this authorized task](e2b-existing-task-2026-09-19.json), retained separately because real-task context/retries are not comparable marker workloads.
 
-Regenerate the Codex tables offline with `npx tsx benchmarks/summarize-e2b.ts benchmarks/results/e2b-codex-2026-09-19.json.gz`. The [browser observer](../benchmarks/e2b-browser-observer.cjs) documents the deployed-console attachment and clock boundaries; it expects the scoped task token in the environment and never writes it to artifacts. Observation exports preserve incomplete and overlapping spans. Same-clock monotonic differences are used for stage durations; lifecycle-event and matching-message differences explicitly labelled wall estimates are not clock-synchronization guarantees. Stage medians cannot be added into an end-to-end median, and residual time is not silently assigned to inference.
+Regenerate the Codex tables offline with `npx tsx benchmarks/summarize-e2b.ts benchmarks/results/e2b-codex-2026-09-19.json.gz`. The [browser observer](../e2b-browser-observer.cjs) documents the deployed-console attachment and clock boundaries; it expects the scoped task token in the environment and never writes it to artifacts. Observation exports preserve incomplete and overlapping spans. Same-clock monotonic differences are used for stage durations; lifecycle-event and matching-message differences explicitly labelled wall estimates are not clock-synchronization guarantees. Stage medians cannot be added into an end-to-end median, and residual time is not silently assigned to inference.
 
 The deployed extension measured conversations, startup, and a harmless command fixture. The single/sequential/parallel simulated-service comparisons remain in the earlier local-world report; they were **not rerun in production E2B**, and no fully live external service or Grok comparison is claimed. There were no shared external service accounts available. Twenty repeated Codex observations are split into two ten-sample cohorts; independent fresh-world, Anthropic and browser samples remain deliberately small under the announced execution limits.

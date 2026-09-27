@@ -1,5 +1,5 @@
 /**
- * The task query language (PLAN-search-views) — a Linear/Jira-style token syntax that
+ * The task query language — a Linear/Jira-style token syntax that
  * round-trips a `TaskQuery` to and from a single search string. This is what powers the
  * one search box: humans type it, saved views store it, and the UI's filter chips both
  * read and write it.

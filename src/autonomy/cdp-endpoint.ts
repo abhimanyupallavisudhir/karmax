@@ -1,6 +1,6 @@
 /**
  * The single loopback Chrome DevTools endpoint that the agent's browser MCP and
- * karmax's host-side credential fill/passkey paths (PLAN-passwords.md §5B/§8)
+ * karmax's host-side credential fill/passkey paths (wiki plans/PLAN-passwords §5B/§8)
  * both point at, so a zero-exposure fill lands in the very page the agent is
  * driving. `chrome-cdp-launcher.mjs` opens Chrome here; `fill`/`passkey`/card
  * default here. Override the port with KARMAX_CDP_PORT, or the whole URL with

@@ -4726,7 +4726,7 @@ export class Store {
     });
   }
 
-  // ─── Saved views (a view is a saved query — PLAN-search-views) ───────────────
+  // ─── Saved views (a view is a saved query) ────────────────────────────────────
 
   async listViews(projectId: string): Promise<SavedView[]> {
     return (

@@ -1,7 +1,7 @@
 import { openPage } from './cdp.js';
 
 /**
- * Broker-side browser fill (PLAN-passwords.md §5B): the gateway — not the
+ * Broker-side browser fill (wiki plans/PLAN-passwords §5B): the gateway — not the
  * agent — resolves a secret and types it into a page over the Chrome DevTools
  * Protocol. The secret never appears in tool arguments, model context, or the
  * transcript; the agent only learns `{ filled: true }`.

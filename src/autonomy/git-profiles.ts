@@ -12,7 +12,7 @@ import { paths } from '../config/paths.js';
 const pexec = promisify(execFile);
 
 /**
- * Git profiles (PLAN-git-config.md §3): named identity + credentials for the
+ * Git profiles (wiki plans/PLAN-git-config §3): named identity + credentials for the
  * repos karmax works on — the git analogue of the agent config-home accounts.
  *
  * The registry (names, user.name/email, which-secrets-exist flags) lives in the
@@ -372,7 +372,7 @@ export class GitProfiles {
   }
 
   /**
-   * The preflight/doctor check (PLAN-git-config.md §7): which tier a project's
+   * The preflight/doctor check (wiki plans/PLAN-git-config §7): which tier a project's
    * remote operations resolve to, and whether that tier can actually reach the
    * repos' remotes non-interactively. Read-only; never throws.
    */

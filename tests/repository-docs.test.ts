@@ -34,4 +34,27 @@ describe('repository guidance', () => {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
     }).trim()).toBe('design/gold-logo-options/gold-check.png');
   });
+
+  it('cites design plans as wiki pages, never as missing repository files', () => {
+    let found = '';
+    try {
+      found = execFileSync('git', ['grep', '-nE', 'PLAN[-_A-Za-z]*\\.md', '--', 'src', 'web', 'tests', 'CLAUDE.md'], {
+        cwd: new URL('..', import.meta.url), encoding: 'utf8',
+      });
+    } catch (error) {
+      if ((error as { status?: number }).status !== 1) throw error; // 1 = no match
+    }
+    const cites = found.split('\n').filter(line => line && !line.includes('PLAN-*.md') && !line.startsWith('tests/repository-docs.test.ts'));
+    expect(cites).toEqual([]);
+  });
+
+  it('links every tracked benchmark result from a repository doc', () => {
+    const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
+      cwd: new URL('..', import.meta.url), encoding: 'utf8',
+    }).trim().split('\n').filter(Boolean);
+    const docs = ls('*.md').map(read).join('\n');
+    const orphans = ls('benchmarks/results').filter(file => !file.endsWith('.md'))
+      .filter(file => !docs.includes(file.split('/').pop()!));
+    expect(orphans).toEqual([]);
+  });
 });
