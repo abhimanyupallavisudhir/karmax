@@ -152,7 +152,8 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
       expect(params._authorization).toBeUndefined();
       expect(params._workflowRunId).toBeUndefined();
       expect(params._discardProgress).toBeUndefined();
-      expect(params._githubAccountId).not.toBe('attacker');
+      // …and a full-form replace keeps the account the task was pinned to.
+      expect(params._githubAccountId).toBe('owner-account');
     }
   });
 
