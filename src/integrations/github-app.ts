@@ -717,8 +717,8 @@ export class GitHubAppService {
 
   /** Only offer installations this human can administer. App credentials alone
    * must never allow linking an arbitrary installation into another tenant. */
-  async connectableInstallations(userId: string): Promise<Array<{ id: string; accountLogin: string; accountType: string }>> {
-    const accountId = await this.activeUserAccountId(userId);
+  async connectableInstallations(userId: string, githubAccountId?: string): Promise<Array<{ id: string; accountLogin: string; accountType: string }>> {
+    const accountId = githubAccountId ?? await this.activeUserAccountId(userId);
     const identity = await this.userIdentity(userId, accountId);
     const result: Array<{ id: string; accountLogin: string; accountType: string }> = [];
     for (let page = 1; page <= MAX_REPOSITORY_PAGES; page++) {
@@ -749,6 +749,13 @@ export class GitHubAppService {
     if (!(await this.connectableInstallations(userId)).some(installation => installation.id === installationId))
       throw new Error('This GitHub installation is not available to this account');
     return this.connectInstallation(organizationId, installationId);
+  }
+
+  /** The installation on the GitHub user's own account. GitHub organizations
+   * the user administers are deliberately excluded: choosing one is ambiguous. */
+  async ownInstallation(userId: string, githubAccountId: string): Promise<string | undefined> {
+    return (await this.connectableInstallations(userId, githubAccountId))
+      .find(installation => installation.accountType === 'User')?.id;
   }
 
   installationUrl(state: string): string {

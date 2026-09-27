@@ -15434,7 +15434,7 @@ async function wireVaultCards(organizationId) {
     let profileData = { profiles: [], defaultProfile: null };
     try { profileData = await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`); } catch {}
     const storeFields = () => `      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
-      <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detects .password-store)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
+      <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detected)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
       <div class="form-row"><label>Git profile <span class="task-sub">(used for private clone and push)</span></label><select class="git-pass-profile">
         <option value="">Organization default${profileData.defaultProfile ? ` — ${esc(profileData.defaultProfile)}` : ''}</option>
         ${profileData.profiles.map((profile) => `<option value="${esc(profile.name)}">${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}
