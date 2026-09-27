@@ -928,6 +928,10 @@ export class Store {
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN fundingSource TEXT NOT NULL DEFAULT 'customer'"));
     if (!usageCols.some((c) => c.name === 'costClassification'))
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN costClassification TEXT NOT NULL DEFAULT 'none'"));
+    // Self-healing on every boot (a rollback can write unclassified rows again),
+    // but served by a partial index that holds only the rows still to repair,
+    // so it no longer scans the whole usage ledger at each start (PS-5).
+    (await this.db.exec("CREATE INDEX IF NOT EXISTS idx_usage_unclassified ON usage_events(id) WHERE costMicros>0 AND costClassification='none'"));
     (await this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'"));
     const usageAdmissionCols = (await this.db.prepare('PRAGMA table_info(usage_admissions)').all()) as { name: string }[];
     if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
