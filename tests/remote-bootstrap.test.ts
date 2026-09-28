@@ -5,11 +5,12 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { ensureRemoteNode, prewarmRemoteAgentHome, remoteAgentHomeRelative, seedRemoteAgentHome,
+import { ensureRemoteBrowser, ensureRemoteNode, prewarmRemoteAgentHome, remoteAgentHomeRelative, seedRemoteAgentHome,
   syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import { CodexHistoryError } from '../src/agent/codex-history.js';
 import { KARMAX_TOKEN_FILE } from '../src/autonomy/config-homes.js';
 import type { ExecResult } from '../src/world/types.js';
+import { prepareConnections } from '../src/mcp/connections/runtime.js';
 import { directorySandbox, freshCodexHome, newMeter, NO_LATENCY, sandboxRollout, stageBakedBrowser, stageBakedRuntime, stageRemoteRuntime,
   type SandboxLatency } from './helpers/directory-sandbox.js';
 
@@ -20,24 +21,36 @@ const roots: string[] = [];
 const temp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
-function codexFixture(options: { growth?: number; latency?: SandboxLatency; config?: string; profile?: string; prefix?: string } = {}) {
+function codexFixture(options: { growth?: number; latency?: SandboxLatency; config?: string; profile?: string; prefix?: string;
+  tools?: string[] } = {}) {
   const root = temp(options.prefix ?? 'karmax-sandbox-'), localHome = temp('karmax-codex-home-');
   stageRemoteRuntime(root);
   freshCodexHome(localHome);
   fs.writeFileSync(path.join(localHome, 'config.toml'), options.config ?? 'model = "gpt-5.5"\n\n[mcp_servers.docs]\ncommand = "docs-mcp"\n');
   let session: string | undefined;
-  const turn = async (extra: Record<string, unknown> = {}) => {
+  // With tools, a turn runs as runAgentTurn does: the bootstrap starts beside
+  // prompt preparation (promptMs), then MCP connections are prepared.
+  const turn = async (extra: Record<string, unknown> = {}, promptMs = 0) => {
     const meter = newMeter();
     const world = directorySandbox(root, meter, { latency: options.latency ?? NO_LATENCY, growth: options.growth ?? 4096,
       ...(options.profile !== undefined ? { profile: options.profile } : {}) });
+    const connection = { execs: [] as string[], writes: [] as string[] };
+    let agentMcp: unknown[] | undefined;
+    if (options.tools) {
+      prewarmRemoteAgentHome(world, 'codex', localHome, session, options.tools);
+      await new Promise((resolve) => setTimeout(resolve, promptMs));
+      const [execs, writes] = [meter.execs.length, meter.writes.length];
+      agentMcp = await prepareConnections(undefined, world, options.tools, 'project', 'task', () => {});
+      connection.execs = meter.execs.slice(execs); connection.writes = meter.writes.slice(writes);
+    }
     const result = await new CodexAdapter().runTurn({
-      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [], mcpConnections: [] },
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [], mcpConnections: options.tools ?? [] },
       world, messages: [{ id: 'm', role: 'user', text: 'continue', ts: 0 }], systemPrompt: 'Do the task.', role: 'do',
-      resolvedAuth: { configHome: localHome }, ...(session ? { session } : {}), ...extra,
+      resolvedAuth: { configHome: localHome }, ...(session ? { session } : {}), ...(agentMcp ? { agentMcp } : {}), ...extra,
     } as any, { emit() {}, emitActivity() {}, platformRequest: async () => [] } as any);
     expect(result.termination).toMatchObject({ kind: 'success' });
     session = result.session;
-    return meter;
+    return Object.assign(meter, { connection });
   };
   const home = () => path.join(root, remoteAgentHomeRelative('codex', localHome));
   const hostFile = () => fs.readdirSync(path.join(localHome, 'sessions'), { recursive: true }).map(String)
@@ -436,3 +449,64 @@ it('runs in a sandbox whose path needs shell quoting', async () => {
   expect(fixture.hostCopy()).toEqual(fs.readFileSync(sandboxRollout(fixture.home(), fixture.session())!));
 });
 
+const BROWSER = ['browser:chrome-devtools'];
+const smokes = (meter: { execs: string[] }) => meter.execs.filter((command) => command.endsWith(' /opt/karmax/smoke.mjs'));
+
+it('LT-22 checks browser readiness once per turn, inside the bootstrap', async () => {
+  const fixture = codexFixture({ tools: BROWSER });
+  stageBakedBrowser(fixture.root);
+  const first = await fixture.turn();
+  expect(smokes(first)).toHaveLength(1);
+  const later = await fixture.turn();
+  // The bootstrap probed the marker, the executables and the launcher: nothing is left to ask or write.
+  expect(later.connection).toEqual({ execs: [], writes: [] });
+  expect(smokes(later)).toEqual([]);
+  expect(later.execsAtModelStart).toBe(1);
+  expect(later.launches[0]).toContain('mcp_servers.chrome-devtools.command');
+});
+
+it('LT-22 runs a first turn\'s browser smoke test while the prompt is prepared', async () => {
+  const fixture = codexFixture({ tools: BROWSER });
+  stageBakedBrowser(fixture.root, 300);
+  const meter = await fixture.turn({}, 600);
+  expect(smokes(meter)).toHaveLength(1);
+  expect(meter.connection.execs).toEqual([]);
+});
+
+it('LT-22 repairs a browser whose executable disappeared, and rewrites only what changed', async () => {
+  const fixture = codexFixture({ tools: BROWSER });
+  stageBakedBrowser(fixture.root);
+  await fixture.turn();
+  const chrome = path.join(fixture.root, '.opt-karmax/browsers/chromium/chrome');
+  fs.rmSync(chrome);
+  const repaired = await fixture.turn();
+  expect(smokes(repaired)).toHaveLength(1);
+  expect(repaired.writes.filter((file) => file.endsWith('ready.json'))).toHaveLength(1);
+  write(chrome, '#!/bin/sh\n'); fs.chmodSync(chrome, 0o755);
+  const launcher = path.join(fixture.root, '.karmax-injection/agent/chrome-cdp-launcher.mjs');
+  fs.appendFileSync(launcher, '// changed in the sandbox\n');
+  const rewritten = await fixture.turn();
+  expect(smokes(rewritten)).toEqual([]);
+  expect(rewritten.writes.filter((file) => file.endsWith('chrome-cdp-launcher.mjs'))).toHaveLength(1);
+  expect(rewritten.writes.filter((file) => file.endsWith('ready.json'))).toEqual([]);
+  expect((await fixture.turn()).connection.writes).toEqual([]);
+});
+
+it('LT-22 reuses a verified baked browser without a prewarmed bootstrap, and repairs missing executables', async () => {
+  const root = temp('karmax-sandbox-');
+  stageRemoteRuntime(root);
+  stageBakedBrowser(root);
+  const bin = path.join(root, '.karmax-injection/agent/tools/node-22.16.0/bin');
+  const turn = async () => {
+    const meter = newMeter();
+    const servers = await ensureRemoteBrowser(directorySandbox(root, meter), 'playwright', bin);
+    expect(servers.playwright?.command).toBe('/opt/karmax/bin/playwright-mcp');
+    return meter;
+  };
+  expect(smokes(await turn())).toHaveLength(1);
+  const verified = await turn();
+  expect(smokes(verified)).toEqual([]);
+  expect(verified.execs).toHaveLength(1);
+  fs.rmSync(path.join(root, '.opt-karmax/browsers/chromium/chrome'));
+  expect(smokes(await turn())).toHaveLength(1);
+});

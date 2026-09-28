@@ -97,7 +97,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   const early = bootstraps.get(world);
   const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
   const own = (async () => (await reused) ?? runBootstrap(world, request))();
-  bootstraps.set(world, { bootstrap: own });
+  bootstraps.set(world, { bootstrap: own, ...(early?.browser ? { browser: early.browser } : {}) });
   const bootstrap = await timed('bootstrap.prepare', () => own);
   const home: RemoteAgentHome = { absolute, relative, runtimeBin: bootstrap.runtimeBin };
   const inventory = trustedInventory(world, provider, session, bootstrap.history);
@@ -139,19 +139,32 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   return { ...home, ...(browserMcp ? { browserMcp } : {}), ...(configuredMcpServers ? { configuredMcpServers } : {}) };
 }
 
-/** Start the sandbox half of seedRemoteAgentHome for the next turn in this
- * world while the caller prepares its prompt (LT-1). The seed reuses the
- * result when provider, home and session match. */
-export function prewarmRemoteAgentHome(world: World, provider: Provider, localHome: string, session?: string): void {
+/** Start the sandbox half of this turn's start-up while the caller prepares
+ * its prompt (LT-1, LT-22): the runtime, the agent home when the turn runs on
+ * a subscription (`localHome`), and the browser tools its MCP connections (or,
+ * without a selection, the account's own config) name, including a first
+ * turn's browser smoke test. The seed reuses the home half when provider,
+ * home and session match; connection preparation reuses the rest. */
+export function prewarmRemoteAgentHome(world: World, provider: Provider, localHome: string | undefined, session?: string,
+  mcpConnections?: readonly string[]): void {
   const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
-  if (!localHome || !isRemoteAgentWorld(runtimeWorld) || bootstraps.has(runtimeWorld)) return;
+  if (!isRemoteAgentWorld(runtimeWorld) || bootstraps.has(runtimeWorld)) return;
+  const browser = mcpConnections ? mcpConnections.some((id) => id.startsWith('browser:')) : !!localHome && !!configuredBrowser(localHome, provider);
+  if (!localHome && !browser) return;
   try {
-    const absolute = path.posix.join(runtimeWorld.handle.root, remoteAgentHomeRelative(provider, localHome));
-    const request = bootstrapRequest(runtimeWorld, provider, absolute, session, hostHistoryFiles(localHome, provider, session));
-    const bootstrap = runBootstrap(runtimeWorld, request);
+    const request: BootstrapRequest = localHome
+      ? bootstrapRequest(runtimeWorld, provider, path.posix.join(runtimeWorld.handle.root, remoteAgentHomeRelative(provider, localHome)),
+        session, hostHistoryFiles(localHome, provider, session))
+      : { key: '' };
+    const bootstrap = runBootstrap(runtimeWorld, { ...request, browser });
     bootstrap.catch(() => undefined);
-    bootstraps.set(runtimeWorld, { key: request.key, bootstrap });
-  } catch { /* the seed reports whatever made this fail */ }
+    const entry: WorldBootstrap = { ...(localHome ? { key: request.key } : {}), bootstrap };
+    if (browser) {
+      entry.browser = bootstrap.then((prepared) => readyBrowser(runtimeWorld, prepared.runtimeBin, prepared.browser));
+      entry.browser.catch(() => undefined);
+    }
+    bootstraps.set(runtimeWorld, entry);
+  } catch { /* the seed and connection preparation report whatever made this fail */ }
 }
 
 /** This turn's bootstrap of a world. World objects live for one activity, so
@@ -160,6 +173,7 @@ interface WorldBootstrap {
   /** The home, session and history a prewarmed bootstrap measured, until a seed uses it. */
   key?: string;
   bootstrap: Promise<RemoteBootstrap>;
+  browser?: Promise<BrowserTools>;
 }
 const bootstraps = new WeakMap<World, WorldBootstrap>();
 
@@ -193,6 +207,8 @@ interface RemoteBootstrap {
   systemCodexConfig: boolean;
   /** The world's private work-environment directory exists (AD-12). */
   workDirectory: boolean;
+  /** Undefined when the probe did not run; readyBrowser then probes step by step. */
+  browser?: BrowserProbe;
 }
 
 interface BootstrapRequest {
@@ -202,6 +218,8 @@ interface BootstrapRequest {
   quiesce?: boolean;
   inventory?: HistoryInventoryRequest;
   systemCodexConfig?: boolean;
+  /** Probe the browser tools' readiness (LT-22). */
+  browser?: boolean;
 }
 
 interface HistoryInventoryRequest { home: string; provider: Provider; session: string; known: Record<string, number> }
@@ -245,6 +263,7 @@ function syncedCodexHistory(relative: string, history: Array<{ relative: string;
 // Exit statuses by which the bootstrap command names the step that failed.
 const BOOTSTRAP_NODE = 64, BOOTSTRAP_EXPOSE = 65, BOOTSTRAP_QUIESCE = 66, BOOTSTRAP_PROTECT = 67;
 const HISTORY_MARKER = 'KARMAX_HISTORY_INVENTORY ';
+const BROWSER_MARKER = 'KARMAX_BROWSER_PROBE ';
 const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
 const WORK_DIRECTORY_READY = 'KARMAX_WORK_DIRECTORY_READY';
 
@@ -267,6 +286,7 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
       // the directory itself when this could not: never fail a turn over it.
       `( mkdir -p ${quote(workDirectory(world))} && chmod 700 ${quote(workDirectory(world))} ) 2>/dev/null && printf '\\n%s\\n' ${WORK_DIRECTORY_READY}`] : []),
     ...(request.inventory ? [`${historyInventoryCommand(node, request.inventory)} || true`] : []),
+    ...(request.browser ? [`${browserProbeCommand(world, node)} || true`] : []),
     ...(request.systemCodexConfig ? [`if [ -e '/etc/codex' ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
     'exit 0',
   ].join('\n');
@@ -281,7 +301,8 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
   if (result.code !== 0) throw new Error(`remote runtime bootstrap failed (status ${result.code}): ${detail}`);
   const lines = result.stdout.split('\n').map((line) => line.trim());
   return { runtimeBin: runtime.bin, systemCodexConfig: lines.includes(SYSTEM_CODEX_CONFIG), workDirectory: lines.includes(WORK_DIRECTORY_READY),
-    ...(request.inventory ? { history: parseHistoryInventory(result.stdout) } : {}) };
+    ...(request.inventory ? { history: parseHistoryInventory(result.stdout) } : {}),
+    ...(request.browser ? { browser: parseBrowserProbe(result.stdout) } : {}) };
 }
 
 // Runs in the sandbox with the paired Node: find every copy of the session's
@@ -1248,16 +1269,99 @@ function configuredBrowser(home: string, provider: Provider): BrowserKind | unde
   return undefined;
 }
 
+/** Browser tools ready in a world: what the readiness marker records. */
+interface BrowserTools { chromium: string; bin: string; cache: string }
+
+/** What the bootstrap found of the browser tools, in one pass (LT-22). */
+interface BrowserProbe {
+  /** The marker, when its versions are current and every executable it names is there. */
+  ready?: BrowserTools;
+  /** A template's baked browser tools are present. */
+  baked: boolean;
+  /** Digest of the CDP launcher the world holds, if any. */
+  launcher?: string;
+}
+
+const BROWSER_ROOT = `${REMOTE_ROOT}/tools/browser-${PLAYWRIGHT_VERSION}`;
+const BROWSER_MARKER_FILE = `${BROWSER_ROOT}/ready.json`;
+const CDP_LAUNCHER = `${REMOTE_ROOT}/chrome-cdp-launcher.mjs`;
+const BROWSER_VERSIONS = { playwright: PLAYWRIGHT_VERSION, chromeMcp: CHROME_DEVTOOLS_MCP_VERSION, playwrightMcp: PLAYWRIGHT_MCP_VERSION };
+const cdpLauncherSource = () => fs.readFileSync(fileURLToPath(new URL('../autonomy/chrome-cdp-launcher.mjs', import.meta.url)), 'utf8');
+
+// Runs in the sandbox with the paired Node: the readiness marker, the
+// executables it names, the baked alternative and the launcher's digest.
+const REMOTE_BROWSER_PROBE = String.raw`
+const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const [marker, launcher, versionsJson] = process.argv.slice(1);
+const versions = JSON.parse(versionsJson);
+const executable = (file) => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
+let ready;
+try {
+  const cached = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  if (Object.entries(versions).every(([key, value]) => cached[key] === value)
+    && ['chromium', 'bin', 'cache'].every((key) => typeof cached[key] === 'string')
+    && [cached.chromium, path.join(cached.bin, 'playwright-mcp'), path.join(cached.bin, 'chrome-devtools-mcp')].every(executable))
+    ready = { chromium: cached.chromium, bin: cached.bin, cache: cached.cache };
+} catch {}
+const baked = !ready && executable('/opt/karmax/bin/playwright-mcp') && executable('/opt/karmax/bin/chrome-devtools-mcp')
+  && fs.existsSync('/opt/karmax/smoke.mjs');
+let digest;
+try { digest = crypto.createHash('sha256').update(fs.readFileSync(launcher)).digest('hex'); } catch {}
+process.stdout.write('\n${BROWSER_MARKER}' + JSON.stringify({ ...(ready ? { ready } : {}), baked, ...(digest ? { launcher: digest } : {}) }) + '\n');
+`;
+
+function browserProbeCommand(world: World, node: string): string {
+  return [node, '-e', REMOTE_BROWSER_PROBE, path.posix.join(world.handle.root, BROWSER_MARKER_FILE),
+    path.posix.join(world.handle.root, CDP_LAUNCHER), JSON.stringify(BROWSER_VERSIONS)].map(quote).join(' ');
+}
+
+function parseBrowserProbe(stdout: string): BrowserProbe | undefined {
+  const line = stdout.split('\n').reverse().find((candidate) => candidate.startsWith(BROWSER_MARKER));
+  let probe: any;
+  try { probe = JSON.parse(line!.slice(BROWSER_MARKER.length)); } catch { return undefined; }
+  const ready = probe?.ready;
+  if (typeof probe?.baked !== 'boolean' || (probe.launcher !== undefined && typeof probe.launcher !== 'string')
+    || (ready !== undefined && !['chromium', 'bin', 'cache'].every((key) => typeof ready?.[key] === 'string'))) return undefined;
+  return { baked: probe.baked, ...(ready ? { ready: { chromium: ready.chromium, bin: ready.bin, cache: ready.cache } } : {}),
+    ...(probe.launcher ? { launcher: probe.launcher } : {}) };
+}
+
+/** The browser MCP servers for this world, rewritten to sandbox-local, pinned
+ * executables. Readiness is established once per turn (LT-22): by the
+ * bootstrap prewarmed beside prompt preparation when there is one, including
+ * a first turn's smoke test, otherwise by one probe here. */
+export async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
+  const entry = bootstraps.get(world.withoutProjectEnvironment?.() ?? world);
+  const bin = runtimeBin ?? (await entry?.bootstrap.catch(() => undefined))?.runtimeBin;
+  let tools = await entry?.browser?.catch(() => undefined);
+  if (!tools) {
+    const ready = timed('bootstrap.browser.ready', async () => readyBrowser(world, bin,
+      parseBrowserProbe((await world.exec('bash', ['-c', browserProbeCommand(world, bin ? path.posix.join(bin, 'node') : 'node')])).stdout)));
+    if (entry) entry.browser = ready;
+    tools = await ready;
+  }
+  return browserServers(world, browser, tools, bin);
+}
+
 /** Provider templates are the fast path; this sandbox-local installation is the
  * compatibility path for stock/custom environments. The launch smoke test is
  * the actual guarantee: a world is never handed to an agent with a configured
- * browser MCP that cannot start its browser. */
-export async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
-  const relative = `${REMOTE_ROOT}/tools/browser-${PLAYWRIGHT_VERSION}`;
-  const absolute = path.posix.join(world.handle.root, relative);
+ * browser MCP that cannot start its browser. The marker and the CDP launcher
+ * are written only when the probe found them missing or different. */
+async function readyBrowser(world: World, runtimeBin: string | undefined, probe?: BrowserProbe): Promise<BrowserTools> {
+  const launcher = cdpLauncherSource();
+  const launcherWrite = probe?.launcher === sha256(Buffer.from(launcher)) ? undefined : world.writeFile(CDP_LAUNCHER, launcher);
+  launcherWrite?.catch(() => undefined);
+  const tools = probe?.ready ?? await repairBrowser(world, runtimeBin, probe);
+  if (!probe?.ready) await world.writeFile(BROWSER_MARKER_FILE, JSON.stringify({ ...tools, ...BROWSER_VERSIONS }));
+  await launcherWrite;
+  return tools;
+}
+
+async function repairBrowser(world: World, runtimeBin: string | undefined, probe?: BrowserProbe): Promise<BrowserTools> {
+  const absolute = path.posix.join(world.handle.root, BROWSER_ROOT);
   const bin = path.posix.join(absolute, 'node_modules/.bin');
   const browserCache = path.posix.join(absolute, 'browsers');
-  const marker = `${relative}/ready.json`;
   let chromium = '';
   let resolvedBin = bin;
   let resolvedCache = browserCache;
@@ -1265,20 +1369,8 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
-  try {
-    const cached = JSON.parse((await readRemoteHistory(world, marker, { bytes: 0, files: 0 }, 8192)).toString('utf8'));
-    if (cached.playwright === PLAYWRIGHT_VERSION && cached.chromeMcp === CHROME_DEVTOOLS_MCP_VERSION
-      && cached.playwrightMcp === PLAYWRIGHT_MCP_VERSION && typeof cached.chromium === 'string'
-      && typeof cached.bin === 'string' && typeof cached.cache === 'string') {
-      const probe = await world.exec('bash', ['-lc', [cached.chromium,
-        path.posix.join(cached.bin, 'playwright-mcp'), path.posix.join(cached.bin, 'chrome-devtools-mcp')]
-        .map(file => `test -x ${quote(file)}`).join(' && ')]);
-      if (probe.code === 0) {
-        chromium = cached.chromium; resolvedBin = cached.bin; resolvedCache = cached.cache;
-      }
-    }
-  } catch { /* missing or stale readiness marker: probe and repair below */ }
-  const baked = chromium ? { code: 1 } : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
+  const baked = probe ? { code: probe.baked ? 0 : 1 }
+    : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
   if (baked.code === 0) {
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
@@ -1338,11 +1430,16 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Krmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
   }
-  await world.writeFile(marker, JSON.stringify({ chromium, bin: resolvedBin, cache: resolvedCache,
-    playwright: PLAYWRIGHT_VERSION, chromeMcp: CHROME_DEVTOOLS_MCP_VERSION, playwrightMcp: PLAYWRIGHT_MCP_VERSION }));
-  const env = { PLAYWRIGHT_BROWSERS_PATH: resolvedCache, ...(pathEnv ? { PATH: pathEnv } : {}) };
+  return { chromium, bin: resolvedBin, cache: resolvedCache };
+}
+
+function browserServers(world: World, browser: BrowserKind, tools: BrowserTools,
+  runtimeBin?: string): NonNullable<RemoteAgentHome['browserMcp']> {
+  const nodeCommand = runtimeBin ? path.posix.join(runtimeBin, 'node') : 'node';
+  const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
+  const env = { PLAYWRIGHT_BROWSERS_PATH: tools.cache, ...(pathEnv ? { PATH: pathEnv } : {}) };
   if (browser === 'playwright')
-    return { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
+    return { playwright: { command: path.posix.join(tools.bin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
   // Run chrome-devtools-mcp through karmax's launcher so the sandbox browser
   // exposes a loopback DevTools port (wiki plans/PLAN-passwords §5B, cloud path): the
   // launcher opens Chromium with --remote-debugging-port and attaches the baked
@@ -1353,18 +1450,15 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   // renderer cannot reserve its virtual CodeRange and dies, hanging all
   // page-level CDP (see findings/e2b-headless-chrome-overcommit.md). It
   // self-falls-back to pipe mode if the browser can't open, so tools never
-  // regress. The dep-free launcher is shipped into the world here.
-  const launcherRel = `${REMOTE_ROOT}/chrome-cdp-launcher.mjs`;
-  const launcherSource = fs.readFileSync(fileURLToPath(new URL('../autonomy/chrome-cdp-launcher.mjs', import.meta.url)), 'utf8');
-  await world.writeFile(launcherRel, launcherSource);
+  // regress. readyBrowser ships the dep-free launcher into the world.
   return { 'chrome-devtools': {
     command: nodeCommand,
-    args: [path.posix.join(world.handle.root, launcherRel)],
+    args: [path.posix.join(world.handle.root, CDP_LAUNCHER)],
     env: {
       ...env,
-      KARMAX_CDP_MCP_BIN: path.posix.join(resolvedBin, 'chrome-devtools-mcp'),
+      KARMAX_CDP_MCP_BIN: path.posix.join(tools.bin, 'chrome-devtools-mcp'),
       KARMAX_CDP_MCP_VERSION: CHROME_DEVTOOLS_MCP_VERSION,
-      KARMAX_CDP_CHROME: chromium,
+      KARMAX_CDP_CHROME: tools.chromium,
       KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT),
       KARMAX_CDP_NO_SANDBOX: '1',
       KARMAX_CDP_SET_OVERCOMMIT: '1',

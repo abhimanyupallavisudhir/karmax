@@ -2218,9 +2218,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
 
-      // A native agent's sandbox bootstrap runs while its prompt is prepared (LT-1).
-      if (remoteSubscriptionRail && resolvedAuth?.configHome && (profile.provider === 'codex' || profile.provider === 'claude'))
-        prewarmRemoteAgentHome(world, profile.provider, resolvedAuth.configHome, session);
+      // The sandbox bootstrap, and a native agent's home and browser tools, are
+      // prepared while the prompt is (LT-1, LT-22).
+      prewarmRemoteAgentHome(world, profile.provider, remoteSubscriptionRail && (profile.provider === 'codex' || profile.provider === 'claude')
+        ? resolvedAuth?.configHome : undefined, session, profile.mcpConnections);
 
       // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
       // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering

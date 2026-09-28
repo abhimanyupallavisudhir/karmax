@@ -175,26 +175,6 @@ describe('remote subscription agents', () => {
       'could not make managed Node/npm the sandbox default');
   });
 
-  it('reuses a verified baked browser on later turns and repairs missing executables', async () => {
-    const world = fakeWorld(false, true);
-    await ensureRemoteBrowser(world, 'playwright');
-    await ensureRemoteBrowser(world, 'playwright');
-    expect(world.commands.filter(command => command.includes('/opt/karmax/smoke.mjs')
-      && !command.includes('test -f'))).toHaveLength(1);
-    const exec = world.exec.bind(world);
-    let stale = true;
-    world.exec = async (command, args, options) => {
-      if (stale && args.some(arg => arg.includes('test -x') && arg.includes('/opt/karmax/browsers/chromium'))) {
-        stale = false;
-        return { code: 1, stdout: '', stderr: '' };
-      }
-      return exec(command, args, options);
-    };
-    await ensureRemoteBrowser(world, 'playwright');
-    expect(world.commands.filter(command => command.includes('/opt/karmax/smoke.mjs')
-      && !command.includes('test -f'))).toHaveLength(2);
-  });
-
   it('probes baked browser packages without an out-of-world working directory', async () => {
     const world = fakeWorld();
     world.exec = async (_command, args = [], options) => {
