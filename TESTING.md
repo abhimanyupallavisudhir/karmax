@@ -79,8 +79,8 @@ measurements from a green CI run:
 gh run view <run-id> --log | npm run test:durations
 ```
 
-No shard can finish faster than the slowest single file (`pipeline.test.ts`,
-about 6.5 minutes in CI). Adding a number to the `test` job's `shard` list helps
+No shard can finish faster than the slowest single file
+(`github-pr-pipeline.test.ts`, about 3.5 minutes). Adding a number to the `test` job's `shard` list helps
 only while the shards are well above that; past it, split the slowest file.
 
 Jobs install through `.github/actions/install`, which restores `node_modules`
