@@ -583,19 +583,22 @@ cmd_update() {
   fi
   # The candidate's first boot may migrate the vault one way (data epoch 3),
   # where no automatic rollback follows. Check it read-only with the new image
-  # first: a refused key, an unreadable entry or one it would quarantine keeps
-  # the previous app serving unless the operator accepts the findings.
-  if ! dc run --rm --no-deps -T app npm run --silent vault-preflight; then
-    if [ -n "$accept_vault" ]; then
-      note 'Proceeding past the vault preflight findings (--accept-vault-findings).'
-    else
-      git -C "$ROOT_DIR" checkout --detach "$previous"
-      restore_migration
-      dc build app || true
-      cleanup_migration
-      migration_backup=''
-      die "deployment $target stopped by the vault preflight; production remains at $previous. Fix what it reported, or rerun update with --accept-vault-findings"
-    fi
+  # first. A secret it would quarantine (exit 3) keeps the previous app serving
+  # unless the operator accepts the findings; a refused key, an unreadable file
+  # or a vault it cannot open (exit 4) means the boot would fail, and always does.
+  preflight=0
+  dc run --rm --no-deps -T app npm run --silent vault-preflight || preflight=$?
+  if [ "$preflight" -eq 3 ] && [ -n "$accept_vault" ]; then
+    note 'Proceeding past the vault preflight findings (--accept-vault-findings).'
+  elif [ "$preflight" -ne 0 ]; then
+    git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
+    dc build app || true
+    cleanup_migration
+    migration_backup=''
+    [ "$preflight" -eq 3 ] \
+      && die "deployment $target stopped by the vault preflight; production remains at $previous. Fix what it reported, or rerun update with --accept-vault-findings"
+    die "deployment $target could not boot on this vault (see the vault preflight above); production remains at $previous. Fix what it reported first"
   fi
 
   if dc up -d --remove-orphans && wait_ready; then

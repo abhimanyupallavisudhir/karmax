@@ -175,8 +175,11 @@ async function main() {
   }));
   const vault = new Vault(p.vault);
   // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
-  for (const entry of (await vault.migrate()).quarantined)
+  // Reported until audited, so a crash between quarantine and audit still reaches the log.
+  const { quarantined } = await vault.migrate();
+  for (const entry of quarantined)
     (await store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
+  vault.acknowledgeQuarantine(quarantined);
   const broker = new CredentialBroker(vault);
   await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33

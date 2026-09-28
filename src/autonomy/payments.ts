@@ -88,9 +88,12 @@ export async function separateStoredCardCvcs(broker: CredentialBroker): Promise<
     catch { continue; } // not card details; never block boot on one entry
     if (details?.cvc === undefined) continue;
     const { cvc, ...rest } = details;
-    (await broker.registerHandle(`${handle}:cvc`, String(cvc)));
-    (await broker.registerHandle(handle, JSON.stringify(rest), { history: false }));
-    separated++;
+    // One card must not stop the rest, nor the boot that runs this.
+    try {
+      (await broker.registerHandle(`${handle}:cvc`, String(cvc)));
+      (await broker.registerHandle(handle, JSON.stringify(rest), { history: false }));
+      separated++;
+    } catch (error) { console.error(`[payments] could not separate the CVC of ${handle}: ${(error as Error).message}`); }
   }
   return separated;
 }

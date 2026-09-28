@@ -26,14 +26,27 @@ const boundTo = (handle: string) => Buffer.from(`karmax-vault:v2\0${handle}`, 'u
 const ENTRY_FILE = /^[a-f0-9]{64}\.json$/;
 /** How long quarantined entries are kept for someone to recover them. */
 const QUARANTINE_RETENTION_MS = 30 * 86_400_000;
+/** Secrets a write may not exceed, unless it shrinks one already stored. */
+const SECRET_LIMIT = 65_536;
+/** What `secrets.json` holds once its secrets have moved to `entries/`: not a
+ * map, so a release before data epoch 3 refuses it ("not a secret map")
+ * instead of starting on an empty vault and writing secrets this one ignores. */
+const MOVED = ['karmax-vault-moved-to-entries',
+  'The secrets moved to vault/entries/ (data epoch 3). To run an earlier release, restore the pre-update backup with its code.'];
+const isMoved = (parsed: unknown) => Array.isArray(parsed) && parsed[0] === MOVED[0];
+
+/** The vault key is not the vault's (as opposed to a vault that cannot be read). */
+export class VaultKeyRefused extends Error {}
 
 /** An entry `migrate` moved to `entries/quarantine/` because it would not open. */
 export interface QuarantinedEntry { file: string; handle?: string; reason: string }
 
 /** What opening and migrating a vault would do, found without writing (`inspectVault`). */
 export interface VaultInspection {
-  key: 'accepted' | 'refused';
+  /** `unchecked`: the vault could not be opened far enough to check the key (`fatal` says why). */
+  key: 'accepted' | 'refused' | 'unchecked';
   refusal?: string;
+  fatal?: string;
   /** Binding still to run: unbound ciphertext is accepted until it does. */
   bound: boolean;
   /** Secrets binding would re-encrypt (from `secrets.json` or `entries/`). */
@@ -42,19 +55,28 @@ export interface VaultInspection {
   quarantine: QuarantinedEntry[];
   /** Files that cannot be read (permissions, I/O): binding stops on them. */
   unreadable: Array<{ file: string; error: string }>;
+  /** Secrets over the 64 KiB write limit (a previous release set none): kept,
+   * and only ever rewritten smaller, as the CVC split does. */
+  oversized?: string[];
 }
 
 /** One secret as binding sees it: from the pre-epoch-3 map, or an entry file. */
 type PlannedEntry =
   | { kind: 'unreadable'; file: string; error: string }
   | { kind: 'damaged'; file: string; raw?: string; handle?: string; reason: string; fromMap: boolean }
-  | { kind: 'entry'; file: string; handle: string; current: string; kept: string[]; dropped: number; fromMap: boolean; changed: boolean };
+  | { kind: 'entry'; file: string; handle: string; current: string; kept: string[]; dropped: number; fromMap: boolean; changed: boolean; bytes: number }
+  /** A bound entry an interrupted move wrote for a secret no longer in the map. */
+  | { kind: 'stale'; file: string };
 
 /** Open the vault in `dir` read-only and report what `migrate` would do. */
 export function inspectVault(dir: string): VaultInspection {
   let vault: Vault;
   try { vault = new Vault(dir, { readOnly: true }); }
-  catch (error) { return { key: 'refused', refusal: (error as Error).message, bound: false, rebind: 0, quarantine: [], unreadable: [] }; }
+  catch (error) {
+    const message = (error as Error).message;
+    return { ...(error instanceof VaultKeyRefused ? { key: 'refused', refusal: message } : { key: 'unchecked', fatal: message }),
+      bound: false, rebind: 0, quarantine: [], unreadable: [] };
+  }
   return vault.inspect();
 }
 
@@ -85,9 +107,10 @@ export class Vault {
   private canaryPath: string;
   /** Recorded in the authenticated canary: unbound ciphertext is refused. */
   private bound = false;
-  private quarantined: QuarantinedEntry[] = [];
   private reported = new Set<string>();
   private readOnly: boolean;
+  /** A well-formed canary failed to authenticate (for the wording of a refusal). */
+  private canaryFailed = false;
 
   /** `readOnly` opens without creating or recording anything (a preflight, a
    * restore drill); anything that would write throws. */
@@ -116,7 +139,7 @@ export class Vault {
     return process.env.KARMAX_VAULT_ACCEPT_KEY === this.keyId();
   }
   private refuse(detail: string, overridable: boolean): Error {
-    return new Error(`the vault key does not open this vault: ${detail}. Restore the key the vault was created with`
+    return new VaultKeyRefused(`the vault key does not open this vault: ${detail}. Restore the key the vault was created with`
       + (overridable ? `. If you are certain this key is the vault's, start once with KARMAX_VAULT_ACCEPT_KEY=${this.keyId()}; `
         + 'secrets it cannot open are then quarantined (deploy/README.md, "Rollback compatibility")' : ''));
   }
@@ -146,23 +169,35 @@ export class Vault {
       else if (others.some((key) => this.opens(blob, handle, key))) elsewhere++;
     }
     if (secrets.length && !opened)
-      throw this.refuse(`vault/vault.canary is missing or damaged, and the key opens none of the ${secrets.length} entries`, false);
+      throw this.refuse(this.canaryFailed
+        ? `vault/vault.canary fails to authenticate, and KARMAX_VAULT_ACCEPT_KEY cannot override that: the key opens none of the ${secrets.length} entries`
+        : `vault/vault.canary is missing or damaged, and the key opens none of the ${secrets.length} entries`, false);
     if (elsewhere > opened) {
       if (!this.overridden())
         throw this.refuse(`vault/vault.canary is missing or damaged, and the key opens ${opened} of ${secrets.length} entries `
           + `while vault/vault.key opens ${elsewhere}`, true);
       console.error(`[vault] KARMAX_VAULT_ACCEPT_KEY: accepting a key that opens ${opened} of ${secrets.length} entries`);
     }
-    // Bound secrets mean this vault was bound; its canary was lost, not absent.
-    this.bound = secrets.some(({ blob }) => blob.startsWith('v2.'));
+    // Bound secrets, or a moved secrets.json, mean this vault was bound: its
+    // canary was lost, not absent, and unbound ciphertext in it is planted.
+    this.bound = this.moved() || secrets.some(({ blob }) => blob.startsWith('v2.'));
     this.writeCanary();
+  }
+
+  /** Has `secrets.json` been replaced by the moved sentinel? */
+  private moved(): boolean {
+    try { return isMoved(JSON.parse(fs.readFileSync(this.dbPath, 'utf8'))); } catch { return false; }
+  }
+  /** Have the secrets moved out of `secrets.json` (the sentinel, or an earlier build's marker)? */
+  private migrated(): boolean {
+    return this.moved() || fs.existsSync(path.join(this.entriesPath, '.migrated'));
   }
 
   /** After the move to `entries/`, `secrets.json` stays empty. Secrets there
    * now were written by a previous release run against this vault; binding
    * them would accept unbound ciphertext, ignoring them would lose them. */
   private checkLegacyMap(): void {
-    if (!fs.existsSync(path.join(this.entriesPath, '.migrated'))) return;
+    if (!this.migrated()) return;
     const count = Object.keys(this.readDb()).length;
     if (count) throw new Error(`vault/secrets.json holds ${count} secret${count === 1 ? '' : 's'} although the vault moved to `
       + 'vault/entries/: a previous release ran against it after the upgrade. Restore the pre-update backup with its code '
@@ -178,7 +213,7 @@ export class Vault {
         if (typeof entry?.handle === 'string' && typeof entry.blob === 'string') secrets.set(entry.handle, entry.blob);
       } catch { /* unreadable: counted by neither side */ }
     }
-    if (!fs.existsSync(path.join(this.entriesPath, '.migrated')))
+    if (!this.migrated())
       for (const [handle, blob] of Object.entries(this.readDb())) if (typeof blob === 'string') secrets.set(handle, blob);
     return [...secrets].map(([handle, blob]) => ({ handle, blob }));
   }
@@ -206,9 +241,11 @@ export class Vault {
     let state: { canary?: string; bound?: unknown } | undefined;
     try { state = JSON.parse(this.decrypt(blob as string, CANARY_HANDLE)); } catch { state = undefined; }
     if (state?.canary !== CANARY) {
+      this.canaryFailed = true;
       // Overridden, the secrets decide as for a missing canary: the key must still open some.
       if (this.overridden()) { console.error('[vault] KARMAX_VAULT_ACCEPT_KEY: replacing a canary this key does not open'); return undefined; }
-      throw this.refuse('vault/vault.canary fails to authenticate under KARMAX_VAULT_KEY (or vault.key)', true);
+      const opensAny = this.snapshot().some(({ handle, blob }) => this.opens(blob, handle, this.key));
+      throw this.refuse('vault/vault.canary fails to authenticate under KARMAX_VAULT_KEY (or vault.key)', opensAny);
     }
     return state.bound === true;
   }
@@ -267,6 +304,7 @@ export class Vault {
     let parsed: unknown;
     try { parsed = JSON.parse(raw); }
     catch (error) { throw new Error(`vault ${this.dbPath} is unreadable (${(error as Error).message}); restore it from a backup`); }
+    if (isMoved(parsed)) return {};
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`vault ${this.dbPath} is not a secret map; restore it from a backup`);
     return parsed as Record<string, string>;
   }
@@ -326,7 +364,7 @@ export class Vault {
       if (entry?.handle !== handle || typeof entry.blob !== 'string') throw new Error('vault entry is corrupt');
       return entry.blob as string;
     }
-    if (fs.existsSync(path.join(this.entriesPath, '.migrated'))) return undefined;
+    if (this.migrated()) return undefined;
     return this.readDb()[handle];
   }
 
@@ -344,7 +382,7 @@ export class Vault {
   }
 
   private validateSecret(secret: string): void {
-    if (Buffer.byteLength(secret, 'utf8') > 65_536) throw new Error('vault secret exceeds size limit (64 KiB)');
+    if (Buffer.byteLength(secret, 'utf8') > SECRET_LIMIT) throw new Error('vault secret exceeds size limit (64 KiB)');
   }
 
   private async mutate<T>(operation: () => T): Promise<T> {
@@ -352,7 +390,7 @@ export class Vault {
     const release = process.platform === 'linux'
       ? await acquireFileLock(`${this.dbPath}.lock`) : undefined;
     try {
-      if (!this.bound || !fs.existsSync(path.join(this.entriesPath, '.migrated'))) this.bind();
+      if (!this.bound || !this.moved()) this.bind();
       return operation();
     } finally { release?.(); }
   }
@@ -368,7 +406,8 @@ export class Vault {
   private plan(): PlannedEntry[] {
     const planned: PlannedEntry[] = [];
     const fromMap = new Set<string>();
-    if (!fs.existsSync(path.join(this.entriesPath, '.migrated')) && fs.existsSync(this.dbPath)) {
+    const fromMapSource = !this.migrated() && fs.existsSync(this.dbPath);
+    if (fromMapSource) {
       let db: Record<string, unknown>;
       try { db = this.readDb(); }
       catch (error) {
@@ -382,7 +421,7 @@ export class Vault {
           if (typeof blob !== 'string') throw new Error('not a ciphertext');
           const plain = this.decrypt(blob, handle);
           planned.push({ kind: 'entry', file, handle, current: blob.startsWith('v2.') ? blob : this.encrypt(plain, handle),
-            kept: [], dropped: 0, fromMap: true, changed: true });
+            kept: [], dropped: 0, fromMap: true, changed: true, bytes: Buffer.byteLength(plain, 'utf8') });
         } catch (error) {
           planned.push({ kind: 'damaged', file, raw: JSON.stringify({ handle, blob }), handle, reason: (error as Error).message, fromMap: true });
         }
@@ -397,6 +436,10 @@ export class Vault {
       let entry: { handle?: unknown; blob?: unknown; previous?: unknown };
       try { entry = JSON.parse(raw); }
       catch { planned.push({ kind: 'damaged', file, raw, reason: 'unreadable entry file', fromMap: false }); continue; }
+      // While secrets.json is still the source of truth, a bound entry for a
+      // secret it no longer holds was written by an interrupted move, and the
+      // previous release has since deleted that secret.
+      if (fromMapSource && typeof entry?.blob === 'string' && entry.blob.startsWith('v2.')) { planned.push({ kind: 'stale', file }); continue; }
       if (typeof entry?.handle !== 'string' || typeof entry.blob !== 'string' || this.entryPath(entry.handle) !== path.join(this.entriesPath, file)) {
         planned.push({ kind: 'damaged', file, raw, reason: 'not a vault entry', fromMap: false });
         continue;
@@ -408,11 +451,12 @@ export class Vault {
         return blob.startsWith('v2.') ? blob : this.encrypt(plain, handle);
       };
       let current: string;
-      try { current = rebind(entry.blob); }
+      let bytes = 0;
+      try { current = rebind(entry.blob); bytes = Buffer.byteLength(this.decrypt(current, handle), 'utf8'); }
       catch (error) { planned.push({ kind: 'damaged', file, raw, handle, reason: (error as Error).message, fromMap: false }); continue; }
       const history = Array.isArray(entry.previous) ? entry.previous : [];
       const kept = history.flatMap(blob => { try { return [rebind(blob)]; } catch { return []; } });
-      planned.push({ kind: 'entry', file, handle, current, kept, dropped: history.length - kept.length, fromMap: false,
+      planned.push({ kind: 'entry', file, handle, current, kept, dropped: history.length - kept.length, fromMap: false, bytes,
         changed: current !== entry.blob || kept.some((blob, i) => blob !== history[i]) || kept.length < history.length });
     }
     return planned;
@@ -420,7 +464,7 @@ export class Vault {
 
   /** What `migrate` would do, without writing (see `inspectVault`). */
   inspect(): VaultInspection {
-    const migrated = fs.existsSync(path.join(this.entriesPath, '.migrated'));
+    const migrated = this.moved();
     const planned = this.bound && migrated ? [] : this.plan();
     const report: VaultInspection = { key: 'accepted', bound: this.bound && migrated, rebind: 0, quarantine: [], unreadable: [] };
     // A bound vault is not rewritten, but an unreadable entry still fails its reads.
@@ -431,8 +475,9 @@ export class Vault {
     for (const entry of planned) {
       if (entry.kind === 'unreadable') report.unreadable.push({ file: entry.file, error: entry.error });
       else if (entry.kind === 'damaged') report.quarantine.push({ file: entry.file, ...(entry.handle ? { handle: entry.handle } : {}), reason: entry.reason });
-      else {
+      else if (entry.kind === 'entry') {
         if (entry.changed) report.rebind++;
+        if (entry.bytes > SECRET_LIMIT) (report.oversized ??= []).push(entry.handle);
         if (entry.dropped) report.quarantine.push({ file: entry.file, handle: entry.handle, reason: `${entry.dropped} earlier revision(s) would not open` });
       }
     }
@@ -451,9 +496,8 @@ export class Vault {
    * secret. Each step is repeatable, so a crash midway redoes the rest.
    */
   private bind(): void {
-    const migrated = path.join(this.entriesPath, '.migrated');
     // Another process may have bound the vault while this one waited.
-    if (this.readCanary() && fs.existsSync(migrated)) { this.bound = true; return; }
+    if (this.readCanary() && this.moved()) { this.bound = true; return; }
     const planned = this.plan();
     const unreadable = planned.filter((entry): entry is Extract<PlannedEntry, { kind: 'unreadable' }> => entry.kind === 'unreadable');
     if (unreadable.length)
@@ -461,7 +505,8 @@ export class Vault {
         + `(${unreadable.map(entry => `${entry.file}: ${entry.error}`).join(', ')}); nothing was changed. `
         + 'Make them readable by the app, or restore them from a backup, then restart');
     for (const entry of planned) {
-      if (entry.kind === 'damaged') this.quarantine(entry);
+      if (entry.kind === 'stale') fs.rmSync(path.join(this.entriesPath, entry.file), { force: true });
+      else if (entry.kind === 'damaged') this.quarantine(entry);
       else if (entry.kind === 'entry') {
         if (entry.dropped) this.quarantine({ kind: 'damaged', file: entry.file, handle: entry.handle,
           reason: `${entry.dropped} earlier revision(s) would not open`, fromMap: false }, true);
@@ -469,27 +514,55 @@ export class Vault {
       }
     }
     syncDirectory(this.entriesPath);
-    if (!fs.existsSync(migrated)) {
-      if (fs.existsSync(this.dbPath)) this.writeDb({});
-      writeDurably(migrated, '');
-    }
+    // One atomic step retires secrets.json: from here the previous release
+    // refuses the vault instead of starting on it empty.
+    if (!this.moved()) writeDurably(this.dbPath, `${JSON.stringify(MOVED)}\n`);
+    if (!fs.existsSync(path.join(this.entriesPath, '.migrated'))) writeDurably(path.join(this.entriesPath, '.migrated'), '');
     this.bound = true;
     this.writeCanary();
   }
 
-  /** Move an entry aside (or copy it, when its current secret survives), synced. */
+  /**
+   * Move an entry aside (or copy it, when its current secret survives), synced.
+   * Its reason goes in a `.why` sidecar first, so `migrate` reports it for the
+   * audit log until `acknowledgeQuarantine`, even across a crash. The file's
+   * time is reset: the 30 days run from now.
+   */
   private quarantine(entry: Extract<PlannedEntry, { kind: 'damaged' }>, copy = false): void {
     const dir = path.join(this.entriesPath, 'quarantine');
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const target = path.join(dir, `${entry.file}.${Date.now()}.${crypto.randomUUID()}`);
+    writeDurably(`${target}.why`, JSON.stringify({ ...(entry.handle === undefined ? {} : { handle: entry.handle }), reason: entry.reason }), false);
     if (entry.fromMap) writeDurably(target, entry.raw!, false);
     else if (copy) { fs.copyFileSync(path.join(this.entriesPath, entry.file), target); syncFile(target); }
     else fs.renameSync(path.join(this.entriesPath, entry.file), target);
+    const now = new Date();
+    fs.utimesSync(target, now, now);
     syncDirectory(dir);
     syncDirectory(this.entriesPath);
-    this.quarantined.push({ file: path.relative(path.dirname(this.entriesPath), target), ...(entry.handle === undefined ? {} : { handle: entry.handle }), reason: entry.reason });
     console.error(`[vault] QUARANTINED ${entry.handle === undefined ? entry.file : `the entry for ${entry.handle}`}: ${entry.reason}. `
       + `It is kept at ${target} for 30 days; restore it from a backup if it is needed.`);
+  }
+
+  /** Quarantined entries not yet in the audit log (see `acknowledgeQuarantine`). */
+  private unaudited(): QuarantinedEntry[] {
+    const dir = path.join(this.entriesPath, 'quarantine');
+    let names: string[] = [];
+    try { names = fs.readdirSync(dir); } catch { return []; }
+    return names.filter((name) => name.endsWith('.why')).sort().flatMap((why): QuarantinedEntry[] => {
+      const file = why.slice(0, -'.why'.length);
+      if (!names.includes(file)) { fs.rmSync(path.join(dir, why), { force: true }); return []; } // crashed before the move
+      let detail: { handle?: unknown; reason?: unknown } = {};
+      try { detail = JSON.parse(fs.readFileSync(path.join(dir, why), 'utf8')); } catch { /* reason lost */ }
+      return [{ file: path.relative(path.dirname(this.entriesPath), path.join(dir, file)),
+        ...(typeof detail.handle === 'string' ? { handle: detail.handle } : {}),
+        reason: typeof detail.reason === 'string' ? detail.reason : 'quarantined' }];
+    });
+  }
+
+  /** Record that `entries` reached the audit log: `migrate` stops reporting them. */
+  acknowledgeQuarantine(entries: QuarantinedEntry[]): void {
+    for (const entry of entries) fs.rmSync(path.join(path.dirname(this.entriesPath), `${entry.file}.why`), { force: true });
   }
 
   /** Bind the vault (AU-27) without waiting for its next write, and tidy what
@@ -498,29 +571,46 @@ export class Vault {
   async migrate(): Promise<{ quarantined: QuarantinedEntry[] }> {
     await this.mutate(() => {
       // A crash between writing a temporary and renaming it leaves the whole
-      // secret (a card with its CVC, say) beside the entries. Writers hold this lock.
-      for (const file of fs.readdirSync(this.entriesPath))
-        if (file.endsWith('.tmp')) fs.rmSync(path.join(this.entriesPath, file), { force: true });
+      // secret (a card with its CVC, say), or a previous release's whole map,
+      // beside the files; backups would carry it. Entry writers hold this lock;
+      // the vault directory's own temporaries are swept once they are a minute old.
+      const vaultDir = path.dirname(this.entriesPath);
       const quarantine = path.join(this.entriesPath, 'quarantine');
+      const sweep = (dir: string, minAgeMs: number) => {
+        let names: string[] = [];
+        try { names = fs.readdirSync(dir); } catch { return; }
+        for (const name of names) if (name.endsWith('.tmp')) {
+          const file = path.join(dir, name);
+          try { if (Date.now() - fs.statSync(file).mtimeMs >= minAgeMs) fs.rmSync(file, { force: true }); } catch { /* gone */ }
+        }
+      };
+      sweep(this.entriesPath, 0);
+      sweep(quarantine, 0);
+      sweep(vaultDir, 60_000);
       let held: string[] = [];
       try { held = fs.readdirSync(quarantine); } catch { /* none */ }
-      for (const file of held)
-        if (Date.now() - fs.statSync(path.join(quarantine, file)).mtimeMs > QUARANTINE_RETENTION_MS) fs.rmSync(path.join(quarantine, file), { force: true });
+      for (const file of held.filter((name) => !name.endsWith('.why')))
+        if (Date.now() - fs.statSync(path.join(quarantine, file)).mtimeMs > QUARANTINE_RETENTION_MS)
+          for (const stale of [file, `${file}.why`]) fs.rmSync(path.join(quarantine, stale), { force: true });
       // Rollback copies an earlier build of this release kept.
-      const vaultDir = path.dirname(this.entriesPath);
       for (const name of fs.readdirSync(vaultDir))
         if (name.startsWith('entries.pre-v2')) fs.rmSync(path.join(vaultDir, name), { recursive: true, force: true });
     });
-    return { quarantined: this.quarantined.splice(0) };
+    return { quarantined: this.unaudited() };
   }
 
   /** `history: false` replaces the secret and forgets its earlier revisions,
    * for a value that must not survive in them (a card's CVC, AU-31). */
   async put(handle: string, secret: string, options: { history?: boolean } = {}): Promise<void> {
-    this.validateSecret(secret);
     await this.mutate(() => {
-      if (options.history === false) return this.writeEntry(handle, this.encrypt(secret, handle));
       const prior = this.readEntry(handle);
+      // A rewrite that shrinks a stored secret is always allowed: the previous
+      // release stored card billing fields with no limit, and their CVC must
+      // still come out (AU-31). Anything else keeps the limit.
+      const bytes = Buffer.byteLength(secret, 'utf8');
+      if (bytes > SECRET_LIMIT && !(prior !== undefined && bytes <= Buffer.byteLength(this.decrypt(prior, handle), 'utf8')))
+        this.validateSecret(secret);
+      if (options.history === false) return this.writeEntry(handle, this.encrypt(secret, handle));
       if (prior !== undefined && this.decrypt(prior, handle) === secret) return;
       const previous = prior === undefined ? [] : [prior, ...this.history(handle)].slice(0, 5);
       this.writeEntry(handle, this.encrypt(secret, handle), previous);
@@ -568,7 +658,7 @@ export class Vault {
         this.reported.add(file);
       }
     }
-    if (!fs.existsSync(path.join(this.entriesPath, '.migrated'))) handles.push(...Object.keys(this.readDb()));
+    if (!this.migrated()) handles.push(...Object.keys(this.readDb()));
     return [...new Set(handles)];
   }
   async delete(handle: string): Promise<void> {

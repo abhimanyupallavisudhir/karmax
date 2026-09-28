@@ -36,7 +36,7 @@ git() {
 }
 dc() {
   printf '%s\\n' "$*" >> "$ROOT_DIR/operations"
-  case "$*" in *vault-preflight*) [ "${failure}" != vault ]; return ;; esac
+  case "$*" in *vault-preflight*) case "${failure}" in vault) return 3 ;; vault-fatal) return 4 ;; esac; return 0 ;; esac
   case "$*" in *psql*) [ "${failure}" != role ]; return ;; esac
   [ "${failure}" != build ] || [ "$*" != "build --pull app" ]
 }
@@ -163,6 +163,15 @@ it('reads the vault flag after the revision too', () => {
   expect(result.status, result.stderr).toBe(0);
   expect(result.head).toBe(result.target);
   expect(update('2\n', '3\n', true, '', ['--after', '--no-such-flag']).stderr).toContain('unknown update option');
+});
+
+it('never proceeds past a finding the new release could not boot with', () => {
+  const result = update('2\n', '3\n', true, 'vault-fatal', ['--accept-vault-findings']);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('could not boot');
+  expect(result.stderr).not.toContain('--accept-vault-findings');
+  expect(result.operations).not.toContain('up -d');
+  expect(result.head).toBe(result.previous);
 });
 
 it('proceeds past the vault preflight only when told to', () => {

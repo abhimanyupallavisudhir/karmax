@@ -287,21 +287,22 @@ procedure on an isolated deployment before the production epoch transition.
 backup and before switching (`npm run vault-preflight`, with the key the app
 itself reads): whether the key would be accepted, which files cannot be read,
 and which secrets the first boot would quarantine. Any finding stops the update
-with the previous app still serving; `./deploy/karmax update REVISION
---accept-vault-findings` proceeds anyway.
+with the previous app still serving. `./deploy/karmax update REVISION
+--accept-vault-findings` proceeds past secrets to quarantine, never past a
+refused key, an unreadable file or a vault that cannot be opened: the new
+release could not boot with those.
 
 The epoch 3 vault migration moves the previous release's `vault/secrets.json`
-into `vault/entries/`, one bound file per secret, and leaves `secrets.json`
-empty. It reads everything first; a file it cannot read (permissions, an I/O
+into `vault/entries/`, one bound file per secret, then replaces `secrets.json`
+with a marker the previous release refuses to open ("not a secret map"). It reads everything first; a file it cannot read (permissions, an I/O
 error) stops boot with a list and changes nothing. Secrets that do not parse or
 authenticate under the vault key are moved to `vault/entries/quarantine/` (kept
 30 days) and recorded in the audit log (`vault.entry.quarantined`). The previous
 release cannot read the result: **the only way back is the pre-update backup
-with its code.** There is no vault-only rollback. If a previous release runs
-against the migrated vault anyway, it sees an empty vault and writes new
-secrets to `secrets.json`; the next boot of this release then refuses to start
-("vault/secrets.json holds N secrets although the vault moved"), so restore the
-backup.
+with its code.** There is no vault-only rollback: the previous release cannot
+start on the migrated vault. If `secrets.json` is replaced by hand and it runs
+anyway, the next boot of this release refuses to start ("vault/secrets.json
+holds N secrets although the vault moved"); restore the backup.
 
 "the vault key does not open this vault" says which check failed:
 - "vault/vault.canary fails to authenticate": `KARMAX_VAULT_KEY` (or
