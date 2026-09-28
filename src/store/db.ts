@@ -79,6 +79,7 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { withPullRequestStates } from '../integrations/github-pr.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -3846,6 +3847,7 @@ export class Store {
     // already done/cancelled) so a later view re-save can't override a user who
     // deliberately un-archived a finished task.
     const prev = (await this.taskMetadata(taskId));
+    view = withPullRequestStates(view, prev?.lastView, { mergedOnly: true });
     const { messages, transcripts, ...status } = view;
     if (conversationReference) {
       const key = `view-conversation:${taskId}:${conversationReference}`;

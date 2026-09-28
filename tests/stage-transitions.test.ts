@@ -597,6 +597,25 @@ describe('task stage transitions', () => {
     expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject({ stage: 'done', status: 'done' });
   });
 
+  // WF-32 (#396): a Done took its pull requests from the live view it read
+  // before the stop, so one merged or closed on GitHub still showed as open.
+  it('keeps the pull request states GitHub reported when a person marks a task done', async () => {
+    const f = (await fixture());
+    const pr = { repo: 'app', slug: 'o/app', number: 7, url: 'https://github.com/o/app/pull/7', state: 'open' as const };
+    const other = { ...pr, number: 8, url: 'https://github.com/o/app/pull/8' };
+    const review = { ...f.view, stage: 'review' as const, status: 'waiting' as const, pr, prs: [pr, other] };
+    (await f.store.saveView(f.task.id, review));
+    f.setLiveView(review);
+    // What the GitHub webhook records on the stored view.
+    (await f.store.saveView(f.task.id, { ...review, pr: { ...pr, state: 'closed', merged: true },
+      prs: [{ ...pr, state: 'closed', merged: true }, { ...other, state: 'closed' }] }));
+    const done = await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    const expected = { pr: { number: 7, state: 'closed', merged: true },
+      prs: [{ number: 7, state: 'closed', merged: true }, { number: 8, state: 'closed', merged: false }] };
+    expect(done).toMatchObject({ stage: 'done', ...expected });
+    expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject(expected);
+  });
+
   it('tells the parent when a person marks its sub-task done', async () => {
     const f = (await fixture());
     const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',

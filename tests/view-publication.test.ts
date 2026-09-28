@@ -6,6 +6,7 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { conversationPublisher, type PublishedView } from '../src/domain/view-publication.js';
 import type { TaskView } from '../src/domain/types.js';
+import { reconcilePullRequestView } from '../src/integrations/github-pr.js';
 
 describe('durable conversation publication', () => {
   it.each(['done', 'cancelled', 'failed'] as const)('prunes completed turn retry records on %s while retaining resumable sessions', async status => {
@@ -251,6 +252,22 @@ describe('durable conversation publication', () => {
       return { store, task, core, view, stored, updates, useRun: (id: string) => { runId = id; },
         close: async () => { ctx.mockRestore(); await store.close(); } };
     }
+
+    // WF-32: a webhook records a merge on the stored view, and the workflow,
+    // which never saw it, must not publish the pull request back open.
+    it('keeps a pull request merge the workflow has not seen', async () => {
+      const f = await publisher();
+      try {
+        const pr = { repo: 'app', slug: 'o/app', number: 7, url: 'https://github.com/o/app/pull/7', state: 'open' as const };
+        const other = { ...pr, number: 8, url: 'https://github.com/o/app/pull/8' };
+        await f.core.publishView(f.task.id, { ...f.view('review', 40), pr, prs: [pr, other] });
+        await f.store.saveView(f.task.id, reconcilePullRequestView((await f.stored())!,
+          { repo: 'o/app', number: 7, state: 'closed', merged: true }));
+        await f.core.publishView(f.task.id, { ...f.view('review', 50), pr, prs: [pr, other] });
+        expect(await f.stored()).toMatchObject({ pr: { number: 7, state: 'closed', merged: true },
+          prs: [{ number: 7, state: 'closed', merged: true }, { number: 8, state: 'open' }] });
+      } finally { await f.close(); }
+    });
 
     it('ignores a late publication that the same run has already superseded', async () => {
       const f = await publisher();
