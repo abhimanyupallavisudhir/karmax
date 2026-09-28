@@ -135,17 +135,16 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   finishMetadata();
   await openingQueue;
 
-  // A task has its own immediate loading page, so cached organization metadata
-  // also refreshes behind (rather than in front of) opening it.
+  // A task page reads nothing from tags or saved views that the list has not
+  // already loaded, so opening one (or walking tasks with j/k) re-reads neither;
+  // the list refreshes them when it is shown again (UI-6).
   calls = [];
-  let finishTaskMetadata;
   global.parseRoute = () => ({ name: 'project', slug: 'b', tab: 'tasks', taskKey: '7', q: '' });
   global.resolveProjectTaskKey = async () => 't7';
-  global.loadOrg = () => { calls.push('loadOrg:task-pending'); return new Promise((resolve) => { finishTaskMetadata = resolve; }); };
+  global.loadOrg = () => { calls.push('loadOrg:task'); return new Promise(() => {}); };
   await applyRoute();
   ok(calls.includes('openTask:t7'), 'task opening does not await a cached metadata refresh');
-  finishTaskMetadata();
-  await new Promise((resolve) => setImmediate(resolve));
+  ok(!calls.includes('loadOrg:task'), 'task opening does not re-read cached tags and views');
   global.loadOrg = async () => { calls.push(`loadOrg:${S.projectId}`); S.orgProjectId = S.projectId; };
 
   // A task permalink carries no ?q= (it is about the task): it must leave the

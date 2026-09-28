@@ -29,7 +29,9 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       const req = route.request(), url = new URL(req.url()), p = url.pathname;
       if (!p.startsWith('/api/')) {
         const file = /^\/[\w-]+\.js$|^\/styles\.css$/.test(p) && fs.existsSync(path.join(__dirname, p)) ? p.slice(1) : 'index.html';
-        return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: fs.readFileSync(path.join(__dirname, file), 'utf8') });
+        // CONSOLE_APP_JS measures another console build (e.g. the base revision) on the same fixture.
+        const source = file === 'app.js' && process.env.CONSOLE_APP_JS ? process.env.CONSOLE_APP_JS : path.join(__dirname, file);
+        return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: fs.readFileSync(source, 'utf8') });
       }
       const entry = { key: `${req.method()} ${p}`, start: Date.now(), end: Infinity };
       log.push(entry);
@@ -60,6 +62,8 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       else if (p.endsWith('/sessions')) data = {};
       else if ((m = p.match(/^\/api\/tasks\/(\w+)\/attempts$/))) data = m[1] === 't1' ? { principalAttemptId: 't1', attempts: [task(1), sibling] } : { principalAttemptId: m[1], attempts: [] };
       else if (p.endsWith('/explanation-settings')) data = { effective: {} };
+      else if (p.endsWith('/avatars')) data = { avatars: [], availability: { enabled: false } };
+      else if (p === '/api/search/fields') data = [{ key: 'stage', label: 'Stage', type: 'enum', values: ['do'] }];
       else if (p.endsWith('/onboarding')) data = { display: 'hidden', steps: [] };
       route.fulfill({ json: data }).catch(() => {});
       entry.end = Date.now();
@@ -98,7 +102,7 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await page.locator('[data-id="t2"] .row-link').click();
       await page.locator('#tp-body').waitFor();
     }));
-    assert.deepEqual(watches.at(-1), { type: 'watch', projectId: 'p', taskId: 't2' }, 'the socket watches the open task');
+    if (!report) assert.deepEqual(watches.at(-1), { type: 'watch', projectId: 'p', taskId: 't2' }, 'the socket watches the open task');
     record(await measure('j/k walk (5 keys)', async () => {
       await page.evaluate(() => document.activeElement?.blur());
       for (let i = 0; i < 4; i++) await page.keyboard.press('j');
@@ -108,6 +112,11 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await page.locator('#tp-body').waitFor();
     }));
     console.log(`j/k walk ended at ${walkedTo}`);
+    // Approval requests load for the tab that lists them, not for every task open.
+    record(await measure('approvals tab', async () => {
+      await page.locator('[data-tasktab="approvals"]').click();
+      await page.locator('#task-approval-requests').waitFor();
+    }));
     await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/org/workspace'); dispatchEvent(new PopStateEvent('popstate')); });
     await page.locator('[data-id="t1"]').waitFor();
     await settle();
@@ -145,6 +154,11 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       };
       budget('boot', Infinity, Infinity);
       budget('busy event stream (list)', 0);
+      budget('task open', 8, 1);
+      assert.equal(walkedTo, '/org/workspace/tasks/5', 'every j/k press counts, even before the last task loaded');
+      budget('j/k walk (5 keys)', 8, 1);
+      for (const list of ['/api/vault/requests', '/api/permission-requests', '/api/authorization-requests'])
+        assert.equal(results['approvals tab'].counts[`GET ${list}`], 1, `the Approvals tab loads ${list}`);
     }
     console.log('Console request budgets: ok');
   } finally { await browser.close(); }

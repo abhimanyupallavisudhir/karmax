@@ -662,12 +662,11 @@ async function applyRoute() {
     if (tab === 'activity') seedActivity();
     if (tab === 'queue') seedQueue();
   }
-  const organizationRefresh = loadOrg().catch(() => false); // tags / saved views / field registry
-  // A task page can open entirely from the loaded task record and paints its own
-  // loading state below. Do not put the metadata refresh back in front of it.
-  // First visits/cross-project routes still wait so they never render foreign tags.
-  if (!r.taskKey || !projectOrganizationLoaded) await organizationRefresh;
-  else organizationRefresh.then(() => { if (routeIsCurrent()) renderRail(); });
+  // Tags / saved views / field registry. A task page in a project whose metadata
+  // is loaded re-reads none of it, so opening or j/k-walking tasks costs only the
+  // task's own reads (UI-6); the list refreshes it when shown again. First visits
+  // and cross-project routes wait so they never render foreign tags.
+  if (!r.taskKey || !projectOrganizationLoaded) await loadOrg().catch(() => false);
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
@@ -2357,13 +2356,15 @@ function api(path, opts = {}) {
   if (opts.signal) return fetchApi(path, opts);
   const key = JSON.stringify([S.token, typeof S.user === 'object' ? S.user?.id : S.user, path, opts]);
   const cached = defaults.get(key);
-  if (cached && Date.now() - cached.at < 10_000) return Promise.resolve(JSON.parse(cached.json));
+  if (cached && (cached.stable || Date.now() - cached.at < 10_000)) return Promise.resolve(JSON.parse(cached.json));
   defaults.delete(key);
   if (pending.has(key)) return pending.get(key);
   const request = fetchApi(path, opts).then(value => {
-    if (path.startsWith('/api/defaults/') && pending.get(key) === request) {
+    // `stable` reads (settings that change only by a write) are kept until this
+    // tab's next write; resolved defaults for ten seconds.
+    if ((opts.stable || path.startsWith('/api/defaults/')) && pending.get(key) === request) {
       if (defaults.size >= 64) defaults.delete(defaults.keys().next().value);
-      defaults.set(key, { at: Date.now(), json: JSON.stringify(value) });
+      defaults.set(key, { at: Date.now(), stable: !!opts.stable, json: JSON.stringify(value) });
     }
     return value;
   }).finally(() => {
@@ -6924,6 +6925,39 @@ async function refreshTaskHistory(taskId) {
   }
 }
 
+// j/k walking (see openAdjacentTask) keeps the task it is heading to in
+// S.taskWalkTarget until that page opens. Opens during a walk wait this long
+// before fetching, so a further key press supersedes them.
+const TASK_WALK_SETTLE_MS = 150;
+
+// Approval decisions load for the pages that show them: a task with pending
+// requests, or its Approvals tab (UI-6). Vault item names only label credential
+// requests, so they load only when there are some.
+function ensureTaskApprovals(taskId) {
+  if (S.taskApprovalsFor === taskId) return Promise.resolve();
+  const epoch = S.taskOpenEpoch;
+  const inFlight = ensureTaskApprovals.pending;
+  if (inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
+  const rec = taskRecord(taskId);
+  const draft = !!rec?.params?.draft;
+  const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  const query = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  const promise = (async () => {
+    const [approvalRequests, permissionRequests, authorizationRequests] = await Promise.all([
+      draft ? [] : api(`/api/vault/requests?${query}`).catch(() => []),
+      draft ? [] : api(`/api/permission-requests?${query}`).catch(() => []),
+      api(`/api/authorization-requests?${query}`).catch(() => []),
+    ]);
+    const approvalItems = approvalRequests.length
+      ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
+    if (S.selected !== taskId || S.taskOpenEpoch !== epoch) return;
+    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems, taskApprovalsFor: taskId });
+    scheduleTaskPageRender();
+  })().finally(() => { if (ensureTaskApprovals.pending?.promise === promise) ensureTaskApprovals.pending = null; });
+  ensureTaskApprovals.pending = { taskId, epoch, promise };
+  return promise;
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
   const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
   S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
@@ -6944,6 +6978,14 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.viewingAttempt = explicitAttempt ? taskId : null;
   S.view = null;
   renderTaskLoadingPage(rec);
+  // j/k outpaces loading: each step paints its title at once, and only the task
+  // the walk settles on is fetched (UI-6).
+  const walking = !!S.taskWalkTarget;
+  if (S.taskWalkTarget === taskId) S.taskWalkTarget = null;
+  if (walking) {
+    await new Promise((resolve) => setTimeout(resolve, TASK_WALK_SETTLE_MS));
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
+  }
   if (rec?.params?.repeatable) {
     await renderSeriesPage(rec);
     return;
@@ -6977,6 +7019,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.permissionRequests = [];
   S.authorizationRequests = [];
   S.approvalItems = [];
+  S.taskApprovalsFor = null;
   try {
     // Start secondary resources in parallel, but let the compact task projection
     // paint as soon as it arrives. A large event history or a slow session lookup
@@ -6992,11 +7035,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
-      draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
-      draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
-      api(`/api/authorization-requests?${approvalQuery}`).catch(() => []),
-      draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
-      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
+      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`, { stable: true }).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
       api(`/api/connections?${approvalQuery}`).catch(() => []),
@@ -7009,17 +7048,14 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
+    if (S.view.approvalRequests || S.taskTab === 'approvals') ensureTaskApprovals(taskId);
 
-    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents, connections] = await details;
+    const [events, widgets, sessions, attempts, explanationSettings, explanationEvents, connections] = await details;
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.approvalRequests = approvalRequests;
-    S.permissionRequests = permissionRequests;
-    S.authorizationRequests = authorizationRequests;
-    S.approvalItems = approvalItems;
     S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
@@ -7064,6 +7100,7 @@ async function refreshTask(reason = 'all') {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const approvals = S.taskApprovalsFor === id;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       // Widgets are resolved against the view (the Overview's stage and changed
@@ -7071,10 +7108,10 @@ async function refreshTask(reason = 'all') {
       has(/view\.updated|review|stage|turn\.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
       has(/session|turn.result|stage/) ? api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions) : S.sessions,
       has(/attempt|turn.result|merge.result/) ? api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup) : S.attemptGroup,
-      has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
-      has(/permission\.approval/) ? api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests) : S.permissionRequests,
-      has(/authorization\.approval/) ? api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests) : S.authorizationRequests,
-      has(/credential\.approval/) ? api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems) : S.approvalItems,
+      approvals && has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
+      approvals && has(/permission\.approval/) ? api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests) : S.permissionRequests,
+      approvals && has(/authorization\.approval/) ? api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests) : S.authorizationRequests,
+      approvals && has(/credential\.approval/) ? api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems) : S.approvalItems,
       has(/^connection\./) ? api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []) : S.connections,
     ]);
     // The user may have opened another task while this websocket-driven refresh
@@ -7093,6 +7130,7 @@ async function refreshTask(reason = 'all') {
     S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
     S.connections = connections;
+    if (!approvals && (S.view.approvalRequests || S.taskTab === 'approvals')) ensureTaskApprovals(id);
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -7128,6 +7166,7 @@ function closeTask() {
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
+  S.taskWalkTarget = null;
   if (!S.selected && !S.view) return;
   S.selected = null;
   syncLiveWatch();
@@ -7759,6 +7798,10 @@ function taskTabBody(v, tab) {
 }
 
 function approvalRequestsTab(v) {
+  if (S.taskApprovalsFor !== v.taskId) {
+    ensureTaskApprovals(v.taskId);
+    return '<div class="task-approvals" id="task-approval-requests"><span class="global-search-loading">Loading…</span></div>';
+  }
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
     .filter((request) => request.status === 'pending' && !request.dismissed).length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status)).length;
   return `<div class="task-approvals" id="task-approval-requests">
@@ -18451,9 +18494,12 @@ function taskOrder() {
 }
 function openAdjacentTask(delta) {
   const order = taskOrder();
-  const i = order.indexOf(S.selected);
+  // A key pressed before the previous step's page opened continues from its target.
+  const i = order.indexOf(S.taskWalkTarget || S.selected);
   const next = order[i < 0 ? 0 : i + delta];
-  if (next) { S.cursorId = next; goToTask(next); }
+  if (!next) return;
+  S.cursorId = S.taskWalkTarget = next;
+  goToTask(next);
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
