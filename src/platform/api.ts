@@ -71,6 +71,8 @@ import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { itemHandle } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
+import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
+import { assertAgentSpec, selectableAvatar } from './agent-params.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -78,29 +80,7 @@ import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integr
 import { BRAND } from '../domain/brand.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 
-export class CapabilityError extends Error {
-  code = 'capability_denied';
-  /** HTTP status the gateway answers with. Kept on the class so one mapping in
-   *  `Gateway.fail` covers every route instead of each handler wrapping locally. */
-  status = 403;
-}
-
-/**
- * A named identifier did not resolve. An agent has to be able to tell this from
- * a denial (escalate) and from a server fault (back off) — `no such task <id>`
- * used to reach the client as a 500, which reads as "karmax is broken" rather
- * than "you passed the wrong id".
- */
-export class NotFoundError extends Error {
-  code = 'not_found';
-  status = 404;
-}
-
-/** Caller-supplied input was rejected. A 400, never a 500. */
-export class ValidationError extends Error {
-  code = 'invalid_request';
-  status = 400;
-}
+export { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 
 /** Signals a person or agent may send to a task; a workflow may offer more as
  *  declared actions (`TaskView.actions`, kind 'signal'). */
@@ -1014,35 +994,28 @@ export class KarmaxApi {
     }
   }
 
-  /** Resolve every Avatar referenced by the task's role fields and Review-agent
-   * layers. Invocation is checked against the human who initiated the calling
-   * chain, not against an arbitrary task-agent id. */
-  private async validateTaskAvatars(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap, taskId?: string) {
+  /** Validate the task's agent fields (shared with create_sub_task) and resolve
+   * every Avatar they and the Review-agent layers reference. Invocation is
+   * checked against the human who initiated the calling chain. */
+  private async validateTaskAgents(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap, taskId?: string) {
     // A system caller (the trigger dispatcher) starts a task for the human who
     // created it; that human must still be allowed to call the Avatar.
     const callerUserId = caller.humanSubject?.userId
       ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined)
       ?? (caller.kind === 'system' && taskId ? (await this.deps.store.taskCreatorUserId(taskId)) : undefined);
     const selected: Array<{ avatar: import('../domain/types.js').Avatar; role: string }> = [];
-    const add = async (spec: unknown, role: string) => {
-      const record = spec && typeof spec === 'object' && !Array.isArray(spec)
-        ? spec as Record<string, unknown> : undefined;
-      const avatarId = record?.avatarId;
-      if (typeof avatarId !== 'string' || !avatarId) return;
-      const avatar = (await this.deps.store.getAvatar(avatarId));
-      if (!avatar || avatar.projectId !== project.id) throw new ValidationError('the selected Avatar is not available in this project');
-      if (!(await avatarEnabled(this.deps.store, avatar))) throw new ValidationError(`Avatar "${avatar.name}" is disabled`);
-      const purpose = typeof record?.avatarPurpose === 'string' ? record.avatarPurpose : role;
-      if (avatar.roles.length && !avatar.roles.includes(purpose))
-        throw new ValidationError(`Avatar "${avatar.name}" cannot be used for the ${purpose} role`);
-      if (!callerUserId || !(await avatarCallableBy(this.deps.store, avatar, callerUserId)))
-        throw new CapabilityError(`you are not allowed to call Avatar "${avatar.name}"`);
-      selected.push({ avatar, role });
-    };
     for (const field of manifest.params) {
-      if (field.type === 'agent') (await add(resolved[field.name], field.role ?? field.name.replace(/^agent:/, '')));
+      if (field.type === 'agent') {
+        const role = field.role ?? field.name.replace(/^agent:/, '');
+        const avatar = (await assertAgentSpec(this.deps.store, project, resolved[field.name], role, callerUserId));
+        if (avatar) selected.push({ avatar, role });
+      }
       if (field.type === 'confirmer') {
-        for (const layer of confirmLayersOf(resolved[field.name] as any)) if (layer.kind === 'agent') (await add(layer, field.role ?? 'confirm'));
+        for (const layer of confirmLayersOf(resolved[field.name] as any)) {
+          const avatar = layer.kind === 'agent'
+            ? (await selectableAvatar(this.deps.store, project, layer, field.role ?? 'confirm', callerUserId)) : undefined;
+          if (avatar) selected.push({ avatar, role: field.role ?? 'confirm' });
+        }
       }
     }
     return selected;
@@ -1196,7 +1169,7 @@ export class KarmaxApi {
       taskOverrides.files = promptFiles;
     }
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
-    const selectedAvatars = (await this.validateTaskAvatars(caller, project, manifest, resolved));
+    const selectedAvatars = (await this.validateTaskAgents(caller, project, manifest, resolved));
     for (const { avatar } of selectedAvatars) {
       if (avatar.credentialPolicies) Object.assign(credentialPolicies, avatar.credentialPolicies);
     }
@@ -1700,7 +1673,7 @@ export class KarmaxApi {
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, files, _authorization,
       _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
-    if (caller) (await this.validateTaskAvatars(caller, project, manifest, resolved, task.id));
+    if (caller) (await this.validateTaskAgents(caller, project, manifest, resolved, task.id));
     // Drafts re-resolve at queue time. Stamp that the resulting common branch
     // values already include repository fallback so provisioning must not apply
     // the repository default again over a project/task override.

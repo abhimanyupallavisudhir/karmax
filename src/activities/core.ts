@@ -98,9 +98,11 @@ import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
+import { assembleTaskInput } from '../platform/params.js';
+import { subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskResponse } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskRequest, type SubTaskResponse } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -431,6 +433,9 @@ export interface PrepareChildArgs {
   /** The parent's own capability grant; the child's delegation caps are attenuated
    *  by it (a restricted parent can't over-grant). Merge is scoped separately. */
   parentGrant?: string[];
+  /** The child's own agent fields from create_sub_task `params` (PL-11),
+   *  validated by `subTaskParams` when the tool ran. */
+  params?: SubTaskRequest['params'];
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
@@ -2659,6 +2664,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             queuedDelegation: await store.kvGet(delegationKey).then(raw => raw ? JSON.parse(raw) : undefined),
             onDelegation: async (queued: QueuedDelegation) => { (await store.kvSet(delegationKey!, JSON.stringify(queued))); },
           } : {}),
+          subTaskParams: (params: unknown) => subTaskParams(store, { projectId: args.task.projectId, parentTaskId: args.taskId, params }),
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
             if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);
@@ -5302,7 +5308,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         title: args.title,
         workflow: 'software-dev',
         workflowVersion: parent?.workflowVersion ?? '1.0.0',
-        params: { prompt: args.prompt, base: args.base, target: args.target,
+        // The child's own agent fields first: its prompt and the parent's branch always win.
+        params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
           [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true },
         parentTaskId: args.parentTaskId,
         createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
@@ -5354,6 +5361,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
         project,
         profiles: args.profiles,
+        // Each agent field overrides the inherited profile for its role, as the
+        // same field does for create_task.
+        ...(args.params ? { agents: assembleTaskInput(manifest('software-dev')!, args.params, {
+          taskId: child.id, projectId: args.projectId, title: args.title, project }).agents } : {}),
         resolveAgentEnabled: args.resolveAgentEnabled,
         grant,
         grantPrincipal: `task:${args.parentTaskId}`,
