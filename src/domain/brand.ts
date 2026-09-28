@@ -7,9 +7,15 @@ export type BrandIcon = (typeof BRAND_ICONS)[number];
 
 export const DEFAULT_BRAND_ICON: BrandIcon = 'diamond';
 
-/** Human-facing name of an installation. Technical identifiers deliberately
- * remain `karmax` for compatibility with existing homes, env vars and tasks. */
-export const DEFAULT_SITE_NAME = 'krmax';
+/** The product brand, in everything that leaves the platform or that people
+ * see: Git branches, commits and PR text, local checkout commands, UI copy and
+ * the names third-party services record. Internal identifiers (env vars, state
+ * files, storage and lookup keys, MCP server ids) deliberately remain `karmax`
+ * for compatibility with existing homes, sandboxes and tasks. */
+export const BRAND = 'tavya';
+
+/** Human-facing name of an installation; the admin can override it. */
+export const DEFAULT_SITE_NAME = BRAND;
 export const MAX_SITE_NAME_LENGTH = 48;
 
 /** Files served under `/brand/`. Not every variant has every file, and a miss
@@ -39,3 +45,20 @@ export function siteNameError(value: unknown): string | undefined {
 export function siteNameOf(settings: Record<string, unknown> | undefined): string {
   return siteNameError(settings?.siteName) ? DEFAULT_SITE_NAME : String(settings!.siteName).trim();
 }
+
+/** Branch namespaces that mark a task branch. New tasks use the first; the
+ * rest are earlier names still carried by existing tasks and open PRs. */
+const TASK_BRANCH_NAMESPACES = [BRAND, 'karmax'] as const;
+
+/** The branch a task works on unless it asks for a specific one. */
+export function taskBranch(taskId: string): string {
+  return `${BRAND}/${taskId}`;
+}
+
+/** The task a task branch belongs to, for correlating GitHub back to a task. */
+export function taskIdOfBranch(branch: string | undefined): string | undefined {
+  if (!branch) return undefined;
+  const namespace = TASK_BRANCH_NAMESPACES.find((name) => branch.startsWith(`${name}/`));
+  return namespace ? branch.slice(namespace.length + 1) || undefined : undefined;
+}
+

@@ -99,7 +99,7 @@ describe('user data export', () => {
     const exported = JSON.parse(text);
 
     expect(response.status).toBe(200);
-    expect(response.headers.get('content-disposition')).toMatch(/attachment; filename="krmax-alice-export-\d{4}-\d{2}-\d{2}\.json"/);
+    expect(response.headers.get('content-disposition')).toMatch(/attachment; filename="tavya-alice-export-\d{4}-\d{2}-\d{2}\.json"/);
     expect(response.headers.get('content-type')).toContain('application/json');
     expect(text).toContain('\n  "format": "karmax-user-export"');
     expect(exported.profile).toMatchObject({ id: user.id, name: 'Alice', email: 'alice@example.com' });
@@ -114,7 +114,7 @@ describe('user data export', () => {
     const organizationText = await organizationResponse.text();
     expect(organizationResponse.status).toBe(200);
     expect(organizationResponse.headers.get('content-disposition'))
-      .toMatch(/attachment; filename="krmax-personal-export-\d{4}-\d{2}-\d{2}\.json"/);
+      .toMatch(/attachment; filename="tavya-personal-export-\d{4}-\d{2}-\d{2}\.json"/);
     expect(organizationText).toContain('\n  "format": "karmax-organization-export"');
     expect(JSON.parse(organizationText)).toMatchObject({
       organization: { id: organization.id },

@@ -19,14 +19,14 @@ import { WorldRepo } from '../src/world/types.js';
 const repo = (name: string, branch: string, base = 'main'): WorldRepo =>
   ({ name, repo: '/src/alpha', root: `/w/${name}`, branch, base, target: 'main' });
 
-const REPOS = [repo('alpha', 'karmax/t'), repo('docs', 'karmax/t-docs')];
+const REPOS = [repo('alpha', 'tavya/t'), repo('docs', 'tavya/t-docs')];
 
 describe('per-checkout review approval', () => {
   it('reports each checkout with its head and approval state', () => {
     const view = reviewCheckouts(REPOS, { alpha: 'aaa', docs: 'bbb' }, { alpha: 'aaa' }, []);
     expect(view.map((c) => [c.name, c.branch, c.head, c.approved])).toEqual([
-      ['alpha', 'karmax/t', 'aaa', true],
-      ['docs', 'karmax/t-docs', 'bbb', false],
+      ['alpha', 'tavya/t', 'aaa', true],
+      ['docs', 'tavya/t-docs', 'bbb', false],
     ]);
   });
 
@@ -66,7 +66,7 @@ describe('per-checkout review approval', () => {
   });
 
   it('marks a checkout stacked on a sibling so review can show the stack', () => {
-    const stacked = [REPOS[0]!, repo('api', 'karmax/t-api', 'karmax/t')];
+    const stacked = [REPOS[0]!, repo('api', 'tavya/t-api', 'tavya/t')];
     const view = reviewCheckouts(stacked, {}, {}, []);
     expect(view.find((c) => c.name === 'api')!.stackedOn).toBe('alpha');
     expect(view.find((c) => c.name === 'alpha')!.stackedOn).toBeUndefined();
@@ -78,12 +78,12 @@ describe('who may add a branch', () => {
   const profile: any = { id: 'p', name: 'm', provider: 'mock', capabilities: [] };
   /** A world that would happily create the checkout, so only the guard can stop it. */
   const worldWith = (added: string[]): any => ({
-    handle: { id: 'w1', root: '/tmp/w', branch: 'karmax/t', base: 'main',
-      repos: [{ name: 'alpha', repo: '/src/alpha', root: '/tmp/w/alpha', branch: 'karmax/t', base: 'main' }] },
+    handle: { id: 'w1', root: '/tmp/w', branch: 'tavya/t', base: 'main',
+      repos: [{ name: 'alpha', repo: '/src/alpha', root: '/tmp/w/alpha', branch: 'tavya/t', base: 'main' }] },
     async addCheckout(spec: any) {
       added.push(spec.name);
       return { ...this.handle, repos: [...this.handle.repos, { name: spec.name, repo: '/src/alpha',
-        root: `/tmp/w/${spec.name}`, branch: `karmax/t-${spec.name}`, base: 'main' }] };
+        root: `/tmp/w/${spec.name}`, branch: `tavya/t-${spec.name}`, base: 'main' }] };
     },
   });
   const turn = (role: string, added: string[]) => runTurn(

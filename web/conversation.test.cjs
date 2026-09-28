@@ -56,7 +56,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -197,6 +197,21 @@ const markdownLinked = annotateWorldFileLinks('<p><a href="/work/task-1/web/app.
 ok(markdownLinked.includes('/acme/app/tasks/task-1/file?path=%2Fwork%2Ftask-1%2Fweb%2Fapp.js&amp;line=42'), 'the default Markdown path emits the same durable handoff URL');
 ok(renderConversationText('[app](/work/task-1/app.js)', 'user', S.view).includes('[app]('), 'user-authored Markdown remains literal');
 
+// Task 367: a citation of a file in the task's wiki checkout opened a file
+// handoff, which cannot contain the wiki. It links to the entry in the wiki
+// view, on the task's own branch, whatever form the agent cited it in.
+global.projectRoute = (pid, tab) => `/acme/app/${tab}`;
+const wikiView = { taskId: 'task-cloud', num: 367, worldWiki: 'app-wiki' };
+const wikiLinked = renderConversationText('[review](app-wiki/reviews/2026-09-26/SKILL.md)', 'agent', wikiView);
+ok(wikiLinked.includes('href="/acme/app/wiki?task=367#reviews%2F2026-09-26"') && wikiLinked.includes('Open in the wiki'),
+  'a relative wiki citation links to its entry on the task branch');
+ok(renderConversationText('[m](/home/user/app/app-wiki/notes/MEMORY.md)', 'agent', wikiView).includes('href="/acme/app/wiki?task=367#notes"'),
+  'an absolute wiki citation links to its entry');
+ok(annotateWorldFileLinks('<a href="../app-wiki/SPEC/diagram.png">d</a>', wikiView).includes('href="/acme/app/wiki?task=367#SPEC"'),
+  'an attachment links to the entry holding it');
+ok(renderConversationText('[x](src/app-wiki/x.ts)', 'agent', wikiView).includes('/tasks/task-cloud/file?'),
+  'a same-named folder elsewhere in a repository is still an ordinary file');
+
 // Regression (Task 311): the workflow stamps agent/system replies with a per-array
 // sequence number while user messages carry real epoch-ms timestamps. A reply must
 // stay right after the message it answers, not be flung to the top of the timeline
@@ -226,7 +241,7 @@ global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
 global.openTaskForm = (...args) => { global.openedForkForm = args; };
-const forkView = { taskId: 'source-task', status: 'done', branch: 'karmax/source-task', targetBranch: 'release', actions: [] };
+const forkView = { taskId: 'source-task', status: 'done', branch: 'tavya/source-task', targetBranch: 'release', actions: [] };
 for (const status of ['done', 'cancelled', 'waiting']) {
   forkView.status = status;
   for (const role of ['do', 'merge', 'confirm', 'resolve']) {
@@ -245,7 +260,7 @@ for (const status of ['done', 'cancelled', 'waiting']) {
     ok(workflow === 'software-dev' && !draft && !prompt
       && params['agent:do'].resumeFrom.taskId === 'source-task'
       && params['agent:do'].resumeFrom.role === role
-      && params.base === (status === 'done' ? 'release' : 'karmax/source-task'),
+      && params.base === (status === 'done' ? 'release' : 'tavya/source-task'),
       `${status} ${role} fork opens a new task form with the correct source, branch and an empty next instruction`);
   }
 }

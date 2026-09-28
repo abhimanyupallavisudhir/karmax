@@ -303,7 +303,11 @@ function captureLoginPrompt(
       spawnError = error;
       finish();
     });
-    child.once('exit', () => setTimeout(finish, 50));
+    // 'exit' can arrive before the last output is read; 'close' means stdout
+    // and stderr are drained. A helper that keeps the pipe open gets a bounded
+    // grace after the login process itself has exited.
+    child.once('close', finish);
+    child.once('exit', () => setTimeout(finish, 1000));
     setTimeout(finish, timeoutMs).unref();
   });
 }

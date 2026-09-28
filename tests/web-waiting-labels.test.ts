@@ -83,11 +83,25 @@ describe('waiting labels in task summaries', () => {
         detail: 'GitHub returned action_required for CI run 410.',
       },
     })).toBe('GitHub Actions approval required');
+    // A turn parked on its credential is not working (task 384 read "working"
+    // for hours behind an exhausted login).
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
       state: {},
-      waitingFor: { kind: 'account', provider: 'claude' },
+      waitingFor: { kind: 'account', provider: 'claude', detail: 'Every allowed credential needs attention — sign in again or add one' },
+    })).toBe('Waiting for credential');
+    expect(stageLabel({
+      stage: 'do',
+      status: 'waiting',
+      state: {},
+      waitingFor: { kind: 'account', provider: 'codex', earliestResetAt: Date.now() + 60_000 },
+    })).toBe('Waiting for quota');
+    expect(stageLabel({
+      stage: 'do',
+      status: 'waiting',
+      state: {},
+      waitingFor: { kind: 'agentSlot', provider: 'claude', detail: 'Starting agent' },
     })).toBe('working');
     expect(stageLabel({
       stage: 'merge',

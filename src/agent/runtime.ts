@@ -3,6 +3,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult }
 import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { BRAND } from '../domain/brand.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
 
@@ -307,7 +308,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       return outcome;
     },
     async platformRequest(method, path, body) {
-      if (!deps.platformRequest) throw new Error('karmax gateway is unavailable to this turn');
+      if (!deps.platformRequest) throw new Error(`${BRAND} gateway is unavailable to this turn`);
       return deps.platformRequest(method, path, body);
     },
     fillPaymentCard: deps.fillPaymentCard,

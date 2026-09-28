@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 
@@ -104,11 +105,11 @@ export async function isDirty(dir: string): Promise<boolean> {
 export async function ensureIdentity(dir: string) {
   const name = await git(dir, ['config', 'user.name']);
   if (name.code !== 0 || !name.stdout.trim()) {
-    await git(dir, ['config', 'user.name', 'karmax']);
+    await git(dir, ['config', 'user.name', BRAND]);
   }
   const email = await git(dir, ['config', 'user.email']);
   if (email.code !== 0 || !email.stdout.trim()) {
-    await git(dir, ['config', 'user.email', 'karmax@localhost']);
+    await git(dir, ['config', 'user.email', `${BRAND}@localhost`]);
   }
 }
 

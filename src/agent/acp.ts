@@ -36,6 +36,7 @@ import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge, type Con
 import { trackProcess } from '../util/processes.js';
 import { isRemoteAgentWorld } from './remote-process.js';
 import type { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
+import { BRAND } from '../domain/brand.js';
 
 interface HarnessSpec {
   command: string;
@@ -331,7 +332,7 @@ export class AcpAdapter implements AgentAdapter {
     // provider is simply unavailable there until remote-process.ts grows support.
     if (isRemoteAgentWorld(input.world))
       throw new Error(
-        `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where krmax itself runs. `
+        `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where ${BRAND} itself runs. `
         + 'Choose a Claude or Codex agent for this task, or give the project a local worktree world.');
     const work = await openCodeWorkEnvironment(input, !!ctx.onSecretEnvChange);
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
@@ -402,7 +403,7 @@ export class AcpAdapter implements AgentAdapter {
     const tools = new Map<string, ToolCall>();
     const terminals = new Map<string, AcpTerminal>();
     let terminalSeq = 0;
-    const app = client({ name: 'karmax' })
+    const app = client({ name: BRAND })
       .onRequest(methods.client.session.requestPermission, ({ params }) => {
         const allow = params.options.find((o) => o.kind === 'allow_always')
           ?? params.options.find((o) => o.kind === 'allow_once');
@@ -538,7 +539,7 @@ export class AcpAdapter implements AgentAdapter {
         const init = await agent.request(methods.agent.initialize, {
           protocolVersion: PROTOCOL_VERSION,
           clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
-          clientInfo: { name: 'karmax', version: '1.0.0' },
+          clientInfo: { name: BRAND, version: '1.0.0' },
         });
         (await startupEnd?.());
         if (init.protocolVersion !== PROTOCOL_VERSION) {
@@ -553,7 +554,7 @@ export class AcpAdapter implements AgentAdapter {
           ].filter(Boolean);
           if (missing.length) {
             throw new Error(
-              `OpenCode ACP is below Krmax's parity requirement (missing ${missing.join(', ')}); update OpenCode`,
+              `OpenCode ACP is below ${BRAND}'s parity requirement (missing ${missing.join(', ')}); update OpenCode`,
             );
           }
         }
@@ -613,7 +614,7 @@ export class AcpAdapter implements AgentAdapter {
         const delta = messagesToDeliver(input).filter((m) => m.role !== 'system');
         let prompt = conversationToPromptText(delta);
         if ((!input.session || input.fork) && this.provider !== 'opencode') {
-          prompt = `<karmax_instructions>\n${input.systemPrompt}\n</karmax_instructions>\n\n${prompt || 'Begin the task.'}`;
+          prompt = `<${BRAND}_instructions>\n${input.systemPrompt}\n</${BRAND}_instructions>\n\n${prompt || 'Begin the task.'}`;
         }
         const promptBlocks: ContentBlock[] = [{ type: 'text', text: prompt || 'Continue.' }];
         const images = collectAcpImageBlocks(delta);

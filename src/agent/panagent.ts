@@ -10,6 +10,7 @@ import { claudeCwdSlug } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
 import { installLocalCodexSnapshot, readLocalCodexHistory } from './codex-history-files.js';
 import { publicFetch, publicUrl } from '../mcp/connections/http.js';
+import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 const VENDORED_PANAGENT = fileURLToPath(new URL('../../vendor/panagent/src', import.meta.url));
@@ -92,7 +93,7 @@ export async function exportConversationWithPanagent(opts: {
         unavailable: ['provider_continuation_state', 'hidden_reasoning', 'provider_tool_state'],
       },
       warnings: [{ code: 'karmax_transcript_export', severity: 'info',
-        message: 'Generated from Karmax durable messages because no native provider history was available.' }],
+        message: `Generated from ${BRAND} durable messages because no native provider history was available.` }],
     };
     fs.writeFileSync(input, JSON.stringify(ir), { mode: 0o600 });
     const warnings = await runPanagent([

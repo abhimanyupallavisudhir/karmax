@@ -269,8 +269,8 @@ describe('seeding a cloud world from its local checkout', () => {
   it('does not fall back when an explicitly reviewed branch is missing', async () => {
     const { root, env } = await makeRepoPair('karmax-missing-review-');
     await expect(provisionGitRepos(hostTarget(env), {
-      taskId: 'missing-review', base: 'main', branch: 'karmax/missing', repo: 'git@example:remote.git',
-    }, { ...OPTIONS, root: path.join(root, 'world'), home: root })).rejects.toThrow('no remote branch "karmax/missing"');
+      taskId: 'missing-review', base: 'main', branch: 'tavya/missing', repo: 'git@example:remote.git',
+    }, { ...OPTIONS, root: path.join(root, 'world'), home: root })).rejects.toThrow('no remote branch "tavya/missing"');
   });
 
   it('forks off the local branch state when the checkout is ahead of origin', async () => {
@@ -290,7 +290,7 @@ describe('seeding a cloud world from its local checkout', () => {
     expect(warnings).toEqual([]);
     expect(repos[0]).toMatchObject({ repo: 'git@example:remote.git', localPath: source, baseSha: localMain });
     expect((await git(world, ['rev-parse', 'refs/remotes/origin/main'])).stdout.trim()).toBe(localMain);
-    expect((await git(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()).toBe('karmax/seeded-task');
+    expect((await git(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()).toBe('tavya/seeded-task');
     expect(fs.readFileSync(path.join(world, 'local-only.txt'), 'utf8')).toContain('never pushed');
     expect(fs.existsSync(path.join(world, '.karmax-seed.bundle'))).toBe(false);
   });
@@ -326,15 +326,15 @@ describe('seeding a cloud world from its local checkout', () => {
 
   it('reviews a branch that exists only in the local checkout', async () => {
     const { root, source, env } = await makeRepoPair('karmax-provision-branch-');
-    await gitOrThrow(source, ['branch', 'karmax/other-task']);
+    await gitOrThrow(source, ['branch', 'tavya/other-task']);
 
     const world = path.join(root, 'world');
     const { repos } = await provisionGitRepos(hostTarget(env), {
-      taskId: 'review-task', repos: ['git@example:remote.git'], base: 'main', branch: 'karmax/other-task',
+      taskId: 'review-task', repos: ['git@example:remote.git'], base: 'main', branch: 'tavya/other-task',
       copySources: [source],
     }, { root: world, home: root, sshUrlError: 'ssh required', copyGlobsWarning: 'no host checkout' });
 
-    expect(repos[0]!.branch).toBe('karmax/other-task');
-    expect((await git(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()).toBe('karmax/other-task');
+    expect(repos[0]!.branch).toBe('tavya/other-task');
+    expect((await git(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()).toBe('tavya/other-task');
   });
 });

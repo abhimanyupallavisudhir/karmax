@@ -84,7 +84,7 @@ describe('public conversation sharing over HTTP', async () => {
     expect(html).not.toContain('<script>title</script>');
     expect(html).toContain('/shared-conversation.js');
     expect(html).toContain('/styles.css');
-    expect(html).toContain('Join krmax');
+    expect(html).toContain('Join tavya');
     for (const hidden of ['wrong agent', 'private-file', 'private-tool', 'hidden system']) expect(html).not.toContain(hidden);
     messages.push({ id: 'later', role: 'agent', text: 'later message', ts: 4 });
     expect(await (await fetch(`${base}${sharedUrl}`)).text()).not.toContain('later message');
@@ -218,8 +218,8 @@ describe('public conversation sharing over HTTP', async () => {
       }
       await page.goto(`${base}${url}`);
       await page.locator('.md-table').waitFor();
-      expect(await page.getByRole('link', { name: 'krmax home' }).getAttribute('href')).toBe('/');
-      expect(await page.getByRole('link', { name: 'Join krmax' }).getAttribute('href')).toBe('/signup');
+      expect(await page.getByRole('link', { name: 'tavya home' }).getAttribute('href')).toBe('/');
+      expect(await page.getByRole('link', { name: 'Join tavya' }).getAttribute('href')).toBe('/signup');
       expect(await page.getByRole('link', { name: 'Sign in', exact: true }).getAttribute('href')).toBe('/login');
       expect(await page.locator('.msg-text strong').last().innerText()).toBe('Bold');
       expect(await page.locator('.md-table tbody td').last().innerText()).toBe('Passed');
@@ -246,7 +246,7 @@ describe('public conversation sharing over HTTP', async () => {
       const plain = await browser.newPage({ javaScriptEnabled: false });
       await plain.goto(`${base}${url}`);
       expect(await plain.locator('[data-share-message]').last().innerText()).toContain('**Bold**');
-      expect(await plain.getByRole('link', { name: 'krmax home' }).count()).toBe(1);
+      expect(await plain.getByRole('link', { name: 'tavya home' }).count()).toBe(1);
       await plain.close();
       const offline = await browser.newPage();
       await offline.route('https://cdn.jsdelivr.net/**', route => route.abort());
@@ -264,12 +264,12 @@ describe('public conversation sharing over HTTP', async () => {
         await page.reload();
         expect(await page.getByRole('link', { name: 'Open workspace' }).getAttribute('href')).toBe('/');
         expect(await page.getByRole('link', { name: 'Sign in', exact: true }).count()).toBe(0);
-        expect(await page.getByRole('link', { name: 'Join krmax' }).count()).toBe(0);
+        expect(await page.getByRole('link', { name: 'Join tavya' }).count()).toBe(0);
       } finally { deps.identity = identity; }
       await request(endpoint, 'DELETE');
       expect((await page.reload())?.status()).toBe(404);
       expect(await page.getByRole('heading', { name: 'Conversation unavailable' }).count()).toBe(1);
-      expect(await page.getByRole('link', { name: 'krmax home' }).count()).toBe(1);
+      expect(await page.getByRole('link', { name: 'tavya home' }).count()).toBe(1);
       expect(await page.locator('[data-share-message]').count()).toBe(0);
       await request(endpoint, 'POST');
     } finally { await browser.close(); }

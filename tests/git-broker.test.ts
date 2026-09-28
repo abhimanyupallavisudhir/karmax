@@ -129,9 +129,9 @@ describe('cloud Git broker', () => {
       source: sshRemote, name: 'empty', branch: parent.handle.branch, base: 'main', target: 'main',
       identity: { name: 'Karmax Test', email: 'karmax@example.com' },
     }, auth);
-    expect(enrolled).toMatchObject({ name: 'empty', branch: 'karmax/parent', base: 'main', sourceAuthority: 'origin' });
+    expect(enrolled).toMatchObject({ name: 'empty', branch: 'tavya/parent', base: 'main', sourceAuthority: 'origin' });
     expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/main'])).code).toBe(0);
-    expect((await git(enrolled.root, ['branch', '--show-current'])).stdout.trim()).toBe('karmax/parent');
+    expect((await git(enrolled.root, ['branch', '--show-current'])).stdout.trim()).toBe('tavya/parent');
     expect((await git(enrolled.root, ['config', '--get', 'remote.origin.url'])).stdout.trim()).toBe(sshRemote);
     expect(fs.readFileSync(path.join(enrolled.root, '.git', 'config'), 'utf8')).not.toContain(secret);
 
@@ -139,7 +139,7 @@ describe('cloud Git broker', () => {
     await gitOrThrow(enrolled.root, ['add', '-A']);
     await gitOrThrow(enrolled.root, ['commit', '-q', '-m', 'parent work']);
     expect(await brokerPublishBranch(parent, auth)).toEqual({ pushed: ['first', 'second', 'empty'], skipped: [] });
-    expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/karmax/parent'])).code).toBe(0);
+    expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/tavya/parent'])).code).toBe(0);
 
     const child = await provider.create({ taskId: 'child', repos: [first, second], base: 'main' });
     const childRepo = await brokerEnrollRepository(child, {
@@ -149,9 +149,9 @@ describe('cloud Git broker', () => {
     expect((await git(childRepo.root, ['show', 'HEAD:parent.txt'])).stdout).toContain('parent work');
     const imported = await brokerImportTaskBranch(child, parent.handle, 'parent', auth);
     expect(imported).toEqual(expect.arrayContaining([
-      expect.objectContaining({ repo: 'empty', branch: 'karmax/parent', ref: 'refs/karmax/tasks/parent/empty' }),
+      expect.objectContaining({ repo: 'empty', branch: 'tavya/parent', ref: 'refs/tavya/tasks/parent/empty' }),
     ]));
-    expect((await git(childRepo.root, ['show', 'refs/karmax/tasks/parent/empty:parent.txt'])).stdout)
+    expect((await git(childRepo.root, ['show', 'refs/tavya/tasks/parent/empty:parent.txt'])).stdout)
       .toContain('parent work');
     expect(auth).toHaveBeenCalled();
   });
@@ -196,8 +196,8 @@ describe('cloud Git broker', () => {
     collaborator.handle.repo = sshRemote;
     collaborator.handle.repos![0]!.repo = sshRemote;
     const imported = await brokerImportTaskBranch(collaborator, world.handle, 'cloud-task', env);
-    expect(imported).toEqual([expect.objectContaining({ repo: 'source', branch: 'karmax/cloud-task',
-      ref: 'refs/karmax/tasks/cloud-task/source' })]);
+    expect(imported).toEqual([expect.objectContaining({ repo: 'source', branch: 'tavya/cloud-task',
+      ref: 'refs/tavya/tasks/cloud-task/source' })]);
     expect((await git(collaborator.handle.root, ['show', `${imported[0]!.ref}:feature.txt`])).stdout)
       .toContain('landed through broker');
 
@@ -208,7 +208,7 @@ describe('cloud Git broker', () => {
     const verify = path.join(root, 'verify');
     await gitOrThrow(root, ['clone', '-q', remote, verify]);
     expect(fs.readFileSync(path.join(verify, 'feature.txt'), 'utf8')).toContain('landed through broker');
-    const branch = await git(remote, ['show-ref', '--verify', 'refs/heads/karmax/cloud-task']);
+    const branch = await git(remote, ['show-ref', '--verify', 'refs/heads/tavya/cloud-task']);
     expect(branch.code).toBe(0);
     const refreshed = await brokerRefreshUpstream(collaborator, env, 'main');
     expect(refreshed.refs[0]).toMatchObject({ branch: 'main', ref: 'refs/remotes/origin/main', sha: result.sha });
@@ -231,14 +231,14 @@ describe('cloud Git broker', () => {
     await world.writeFile('feature.txt', 'still checked out\n');
     await gitOrThrow(world.handle.root, ['add', '-A']);
     await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'feature']);
-    expect((await git(world.handle.root, ['branch', '--show-current'])).stdout.trim()).toBe('karmax/local-publish');
+    expect((await git(world.handle.root, ['branch', '--show-current'])).stdout.trim()).toBe('tavya/local-publish');
 
     const auth = vi.fn(async () => {
       throw new Error('local publication must not request remote credentials');
     });
     expect(await brokerPublishBranch(world, auth)).toEqual({ pushed: ['source'], skipped: [] });
     expect(auth).not.toHaveBeenCalled();
-    expect((await git(source, ['rev-parse', 'refs/heads/karmax/local-publish'])).stdout.trim())
+    expect((await git(source, ['rev-parse', 'refs/heads/tavya/local-publish'])).stdout.trim())
       .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
   });
 
@@ -270,7 +270,7 @@ describe('cloud Git broker', () => {
       GIT_CONFIG_VALUE_0: 'git@example:',
     };
     expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
-    expect((await git(remote, ['rev-parse', 'refs/heads/karmax/pr-publish'])).stdout.trim())
+    expect((await git(remote, ['rev-parse', 'refs/heads/tavya/pr-publish'])).stdout.trim())
       .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
   });
 
@@ -389,7 +389,7 @@ describe('cloud Git broker', () => {
     expect(await brokerPublishBranch(world, env, observed, record))
       .toEqual({ pushed: ['source'], skipped: [] });
     expect(observed).toEqual({ source: repairedHead });
-    expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
+    expect((await git(remote, ['rev-parse', 'refs/heads/tavya/lease-repair'])).stdout.trim()).toBe(repairedHead);
 
     // A stale lease cannot overwrite a newer writer.
     await gitOrThrow(world.handle.root, ['reset', '--hard', '-q', 'main']);
@@ -401,7 +401,7 @@ describe('cloud Git broker', () => {
     expect(refused.skipped).toEqual(['source']);
     expect(refused.errors?.source).toMatch(/remote task branch non-fast-forward.*Reconnect GitHub will not fix/i);
     expect(observed).toEqual({ source: repairedHead });
-    expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
+    expect((await git(remote, ['rev-parse', 'refs/heads/tavya/lease-repair'])).stdout.trim()).toBe(repairedHead);
   });
 
   // `git fetch` and `git commit` start `git maintenance run --auto`, which
@@ -468,13 +468,13 @@ describe('cloud Git broker', () => {
         kind: 'e2b',
         id: 'broken-publish',
         root: '/workspace',
-        branch: 'karmax/broken-publish',
+        branch: 'tavya/broken-publish',
         base: 'main',
         repos: [{
           name: 'app',
           repo: '/not-an-ssh-remote',
           root: '/workspace',
-          branch: 'karmax/broken-publish',
+          branch: 'tavya/broken-publish',
           base: 'main',
         }],
       },
@@ -528,8 +528,8 @@ describe('cloud Git broker', () => {
 
     // Publish persists the branch in the local checkout without touching origin.
     expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
-    expect((await git(source, ['rev-parse', '--verify', 'refs/heads/karmax/cloud-local-task'])).code).toBe(0);
-    expect((await git(remote, ['show-ref', 'refs/heads/karmax/cloud-local-task'])).code).not.toBe(0);
+    expect((await git(source, ['rev-parse', '--verify', 'refs/heads/tavya/cloud-local-task'])).code).toBe(0);
+    expect((await git(remote, ['show-ref', 'refs/heads/tavya/cloud-local-task'])).code).not.toBe(0);
 
     // Project-authority refresh serves the LOCAL target state, so a local merge
     // agent resolves against the same history the merge will land on.
@@ -565,10 +565,10 @@ describe('cloud Git broker', () => {
     const calls: string[] = [];
     const world = {
       handle: {
-        kind: 'e2b', id: 'partial-refresh', root: '/workspace', branch: 'karmax/partial-refresh', base: 'main',
+        kind: 'e2b', id: 'partial-refresh', root: '/workspace', branch: 'tavya/partial-refresh', base: 'main',
         repos: [
-          { name: 'app', repo: 'git@example:app.git', root: '/workspace/app', branch: 'karmax/partial-refresh', base: 'main' },
-          { name: 'wiki', repo: '/not-an-ssh-remote', root: '/workspace/wiki', branch: 'karmax/partial-refresh', base: 'main' },
+          { name: 'app', repo: 'git@example:app.git', root: '/workspace/app', branch: 'tavya/partial-refresh', base: 'main' },
+          { name: 'wiki', repo: '/not-an-ssh-remote', root: '/workspace/wiki', branch: 'tavya/partial-refresh', base: 'main' },
         ],
       },
       async exec(command: string, args: string[], options: { cwd: string }) {
@@ -695,12 +695,12 @@ describe('cloud Git broker', () => {
       expect(commands.filter((argv) => argv.includes('ls-remote') && argv.includes(f.sshRemote)).length).toBeGreaterThanOrEqual(4);
       expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(1);
       expect((await git(f.remote, ['show', 'main:two.txt'])).stdout).toBe('two.txt\n');
-      expect((await git(f.remote, ['rev-parse', 'refs/heads/karmax/mirrored-task'])).stdout.trim())
-        .toBe((await git(world.handle.root, ['rev-parse', 'karmax/mirrored-task'])).stdout.trim());
+      expect((await git(f.remote, ['rev-parse', 'refs/heads/tavya/mirrored-task'])).stdout.trim())
+        .toBe((await git(world.handle.root, ['rev-parse', 'tavya/mirrored-task'])).stdout.trim());
       // Nothing a world produced is written into the shared mirror.
       const mirror = path.join(process.env.KARMAX_HOME!, 'cache', 'git-mirrors', mirrors().find((name) => name.endsWith('.git'))!);
       expect((await git(mirror, ['for-each-ref', '--format=%(refname)'])).stdout.split('\n').filter(Boolean).sort())
-        .toEqual(['refs/heads/karmax/mirrored-task', 'refs/heads/main']);
+        .toEqual(['refs/heads/main', 'refs/heads/tavya/mirrored-task']);
       const unpushed = (await git(world.handle.root, ['commit-tree', '-m', 'local only', 'HEAD^{tree}'])).stdout.trim();
       expect((await git(mirror, ['cat-file', '-e', unpushed])).code).not.toBe(0);
       await f.destroy(world);

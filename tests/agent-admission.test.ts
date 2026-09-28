@@ -361,7 +361,7 @@ describe('agent turn admission', () => {
     const error = await core.runAgentTurn({
       taskId: 'reconnect-task', role: 'do',
       worldHandle: { kind: 'fake-remote', id: 'reconnect-task', root: '/workspace',
-        branch: 'karmax/reconnect-task', base: 'main' },
+        branch: 'tavya/reconnect-task', base: 'main' },
       messages: [{ id: 'm0', role: 'user', text: 'continue', ts: 0 }],
       task: { projectId: 'project', title: 'Reconnect', prompt: 'continue', project: {},
         workflow: 'software-dev' },

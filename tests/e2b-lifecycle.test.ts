@@ -59,7 +59,7 @@ describe('E2B provider lifecycle', () => {
       denyOut: ['0.0.0.0/0'] });
     // Clone credentials never outlive provisioning.
     expect(box.commands.log).toContain('rm -f /home/user/.ssh/karmax-auth*');
-    expect(world.handle).toMatchObject({ kind: 'e2b', id: 'task-1', branch: 'karmax/task-1',
+    expect(world.handle).toMatchObject({ kind: 'e2b', id: 'task-1', branch: 'tavya/task-1',
       meta: { environmentFlavor: 'headless', environmentArtifact: 'org-template', releaseOnCompletion: true } });
     expect(JSON.stringify(world.handle)).not.toContain(box.sandboxId);
     expect(await provider.status(world.handle)).toBe('ready');

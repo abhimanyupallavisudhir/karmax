@@ -18,6 +18,7 @@ import {
   isUsageStale,
   USAGE_TTL_MS,
 } from '../src/agent/usage.js';
+import { ProviderFailure } from '../src/agent/limits.js';
 
 /**
  * Hermetic verification of the proactive-quota parser + probe (#6). The panel text
@@ -327,6 +328,60 @@ describe('probeClaudeUsage', () => {
         },
       })).resolves.toBe(true);
       expect(calls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // Claude Code refreshes only inside the last five minutes of an access token
+  // (`BM(expiresAt)` in the bundled CLI is `now + 300000 >= expiresAt`). With
+  // six minutes left it correctly declines, and the still-valid token must be
+  // launched rather than failing the turn (tasks 367/382, 2026-09-26 04:52).
+  it('launches with a still-valid token the Claude CLI declines to refresh yet', async () => {
+    const home = mkHome(false);
+    const expiresAt = Date.now() + 6 * 60_000;
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'six-minutes-left', refreshToken: 'canonical-refresh', expiresAt,
+    } }));
+    let calls = 0;
+    try {
+      await expect(ensureClaudeAccessTokenFresh({
+        configHome: home,
+        minValidityMs: 10 * 60_000,
+        run: async () => { calls++; return FULL_PANEL; }, // CLI: "not_needed"
+      })).resolves.toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // When the refresh token itself is dead (it expired ~29 days after sign-in,
+  // or was revoked), Claude Code blanks the stored tokens. That is a login
+  // needing a person, so it must be a typed credential failure: the account is
+  // quarantined and the task waits for a credential instead of escalating
+  // with "refresh completed without a fresh access token".
+  it('reports a signed-out Claude login as a hard credential failure', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'expired-access', refreshToken: 'dead-refresh', expiresAt: Date.now() - 1,
+      refreshTokenExpiresAt: Date.now() - 60_000,
+    } }));
+    try {
+      const failure = await ensureClaudeAccessTokenFresh({
+        configHome: home,
+        run: async () => {
+          fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+            accessToken: '', refreshToken: '', expiresAt: 0, refreshTokenExpiresAt: Date.now() - 60_000,
+          } }));
+          return 'Please run /login';
+        },
+      }).then(() => undefined, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(ProviderFailure);
+      expect((failure as ProviderFailure).metadata).toMatchObject({
+        kind: 'credential', permanence: 'hard', provider: 'claude',
+      });
+      expect((failure as Error).message).toMatch(/signed out.*sign in again/i);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
