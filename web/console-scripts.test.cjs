@@ -7,6 +7,7 @@ test('UI-13: the console shell has no inline executable script', () => {
 });
 test('UI-13: the pinned MathJax entrypoint has cross-origin integrity metadata', () => {
   const src = fs.readFileSync(`${__dirname}/markdown.js`, 'utf8');
-  assert.match(src, /script\.integrity = 'sha384-[A-Za-z0-9+/=]+'/);
+  assert.match(src, /'tex-svg': 'sha384-[A-Za-z0-9+/=]+'/);
+  assert.match(src, /script\.integrity = integrity;/);
   assert.match(src, /script\.crossOrigin = 'anonymous'/);
 });

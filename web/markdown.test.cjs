@@ -148,18 +148,6 @@ ok(!withTexDelimiters.includes('<em>'), 'underscores inside TeX-delimited math a
 const noMath = renderMarkdown('cost $5 and $10 today', { math: false });
 ok(noMath.includes('cost $5 and $10 today'), 'currency $ untouched when math is off');
 
-// The lazily inserted CDN script must be byte-pinned before it executes.
-let mathjaxLoad = null;
-let mathjaxScript;
-global.window = {};
-global.document = { createElement: () => ({}), head: { appendChild: script => { mathjaxScript = script; } } };
-eval(extractFn('ensureMathJax'));
-ensureMathJax();
-ok(/^sha384-[A-Za-z0-9+/=]+$/.test(mathjaxScript.integrity), 'MathJax CDN script has integrity metadata');
-ok(mathjaxScript.crossOrigin === 'anonymous', 'MathJax integrity uses anonymous CORS');
-mathjaxScript.onerror();
-delete global.window;
-delete global.document;
 
 // GFM pipe tables.
 const table = renderMarkdown('| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |', {});
@@ -180,5 +168,36 @@ ok(!renderMarkdown('---', {}).includes('<table'), 'horizontal rule is not a tabl
 ok(!renderMarkdown('a | b\nc | d', {}).includes('<table'), 'pipes without a delimiter row are not a table');
 ok(mdIsDelimiterRow('|:--|--:|') && !mdIsDelimiterRow('| a | b |'), 'delimiter-row detection');
 
-console.log(`${pass} passed, ${fail} failed`);
-if (fail) process.exit(1);
+// The lazily inserted CDN script must be byte-pinned before it executes.
+let mathjaxLoad = null;
+let mathjaxScript;
+global.window = {};
+global.document = { createElement: () => ({}), head: { appendChild: script => { mathjaxScript = script; } } };
+eval(src.slice(src.indexOf('const MATHJAX_ROOT'), src.indexOf('  function loadPinnedScript(')).replace(/\bconst /g, 'var '));
+eval(extractFn('loadPinnedScript'));
+eval(extractFn('ensureMathJax'));
+ensureMathJax();
+ok(/^sha384-[A-Za-z0-9+/=]+$/.test(mathjaxScript.integrity), 'MathJax CDN script has integrity metadata');
+ok(mathjaxScript.crossOrigin === 'anonymous', 'MathJax integrity uses anonymous CORS');
+// UI-13/CI-16: MathJax's own loader fetches ui/safe and TeX extensions at run
+// time; each goes through the same integrity table, and anything else is refused.
+const loaded = [];
+global.document.head.appendChild = script => { loaded.push(script); setTimeout(() => script.onload(), 0); };
+const root = mathjaxScript.src.slice(0, mathjaxScript.src.lastIndexOf('/') + 1);
+const load = file => window.MathJax.loader.require(`${root}${file}`);
+ok(typeof window.MathJax.loader.require === 'function', 'MathJax runtime loads go through the integrity hook');
+const mathjaxChecks = (async () => {
+  await load('ui/safe.js');
+  await load('input/tex/extensions/color.js');
+  ok(loaded.length === 2 && loaded.every(script => /^sha384-[A-Za-z0-9+/]{64}$/.test(script.integrity) && script.crossOrigin === 'anonymous'),
+    'every runtime-loaded MathJax script carries integrity metadata');
+  ok(loaded[0].integrity === 'sha384-BAIqbtawDyB5QXh8BrGd4h2FmhlZB70FJqMpHt2LxKkPSRa29VXhrB/DV3xLP+/B', 'ui/safe is pinned to MathJax 3.2.2');
+  ok(await load('a11y/sre.js').then(() => false, () => true), 'an unpinned MathJax file is refused');
+  ok(await window.MathJax.loader.require('https://cdn.jsdelivr.net/npm/mathjax@3.2.1/es5/ui/safe.js').then(() => false, () => true), 'a file from another release is refused');
+  ok(loaded.length === 2, 'refused files never reach the page');
+})().finally(() => { delete global.window; delete global.document; }).catch(error => { ok(false, error.stack); });
+
+mathjaxChecks.then(() => {
+  console.log(`${pass} passed, ${fail} failed`);
+  if (fail) process.exit(1);
+});
