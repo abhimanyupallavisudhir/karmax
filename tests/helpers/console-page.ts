@@ -83,3 +83,43 @@ export async function consolePage(options: { api?: ApiHandler; viewport?: { widt
 function safeJson(value: string): unknown {
   try { return JSON.parse(value); } catch { return value; }
 }
+
+/**
+ * The replies a signed-in console needs to boot: by default one organization
+ * (`org`) with one project (`/org/workspace`). `signedIn(overrides)` answers
+ * those and defers everything else to `overrides`, which is asked first.
+ * Mirrors the fixture in web/console-journeys.browser.test.cjs.
+ */
+export function signedIn(overrides: ApiHandler = () => undefined, fixture: {
+  projects?: Array<Record<string, unknown>>; organizations?: Array<Record<string, unknown>>; meta?: Record<string, unknown>;
+} = {}): ApiHandler {
+  const projects = fixture.projects ?? [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }];
+  const organizations = fixture.organizations ?? [{ id: 'o', name: 'Organization', slug: 'org' }];
+  return async (call) => {
+    const override = await overrides(call);
+    if (override !== undefined) return override;
+    if (call.method !== 'GET') return undefined;
+    const pathname = call.path.split('?')[0]!;
+    const replies: Record<string, unknown> = {
+      '/api/meta': { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' },
+        worldProviders: [], ...fixture.meta },
+      '/api/launch': {},
+      '/api/session': { authenticated: true, user: { id: 'u', name: 'Tester' } },
+      '/api/settings/installation': { canManage: false },
+      '/api/organizations': organizations,
+      '/api/user/default-organization': { organizationId: organizations[0]!.id },
+      '/api/projects': projects,
+      '/api/schema': [],
+      '/api/contributions': { slots: [], commands: [], events: [] },
+      '/api/models': { providers: [] },
+      '/api/inbox': [],
+    };
+    for (const project of projects) {
+      replies[`/api/projects/${project.id}`] = project;
+      for (const list of ['tasks', 'tags', 'views']) replies[`/api/projects/${project.id}/${list}`] = [];
+    }
+    if (pathname in replies) return replies[pathname];
+    if (pathname.endsWith('/defaults')) return { effective: {}, inherited: {} };
+    return undefined;
+  };
+}

@@ -1,168 +1,259 @@
-import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
+import { closeConsoleBrowser, consolePage, signedIn, type ApiCall, type ApiHandler } from './helpers/console-page.js';
 
-const source = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
-const styles = fs.readFileSync(path.resolve('web/styles.css'), 'utf8');
+afterAll(closeConsoleBrowser);
 
-function extractFunction(name: string): string {
-  const start = source.indexOf(`function ${name}(`);
-  if (start < 0) throw new Error(`${name} not found`);
-  let depth = 0;
-  for (let index = source.indexOf('{', start); index < source.length; index++) {
-    if (source[index] === '{') depth++;
-    else if (source[index] === '}' && --depth === 0) return source.slice(start, index + 1);
-  }
-  throw new Error(`unterminated ${name}`);
+const all = { project: true, projectDelete: true, projectTransfer: true, organization: true };
+
+/** Every settings section loads with nothing configured yet. */
+const emptySettings: ApiHandler = ({ method, path: route }) => {
+  if (method !== 'GET') return undefined;
+  const pathname = route.split('?')[0]!;
+  if (pathname === '/api/settings/access') return all;
+  if (/\/(repositories|members|git-connections|resources|storage|runner-pools|world-providers|teams|invitations)$/.test(pathname)) return [];
+  if (pathname.endsWith('/roles')) return { profiles: [], capabilityGroups: [], creatableCapabilities: [], canCreate: false };
+  if (pathname.endsWith('/github/app')) return { configured: false };
+  if (pathname.endsWith('/secrets')) return { secrets: [], suggestions: [] };
+  if (pathname.endsWith('/services')) return { services: [] };
+  if (pathname.endsWith('/environment')) return { spec: {}, builds: [] };
+  if (pathname === '/api/users') return [];
+  return undefined;
+};
+
+async function settings(options: { path?: string; api?: ApiHandler; projects?: Array<Record<string, unknown>>;
+  organizations?: Array<Record<string, unknown>> } = {}) {
+  const ui = await consolePage({ path: options.path ?? '/org/workspace/settings', api: signedIn(async (call: ApiCall) =>
+    (await options.api?.(call)) ?? emptySettings(call), { projects: options.projects, organizations: options.organizations }) });
+  await ui.run('window.confirm = () => true; boot()');
+  await ui.page.locator('.settings-layout').waitFor();
+  return ui;
 }
 
-describe('Project settings browser source', () => {
-  it('uses the same name-first heading hierarchy for project and organization settings', () => {
-    const project = source.slice(source.indexOf('function settingsView('), source.indexOf('function cloudEnvironmentCard('));
-    const organization = source.slice(source.indexOf('function organizationView('), source.indexOf('function pendingInvitationRow('));
+type Console = Awaited<ReturnType<typeof consolePage>>;
+const visible = (ui: Console, selector: string) => ui.page.locator(selector).isVisible();
+/** Open a settings pane the way a person does, from the section navigation. */
+const pane = (ui: Console, id: string) => ui.page.locator(`.settings-nav a[href="#${id}"]`).click();
 
-    expect(project).toContain('<h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p>');
-    expect(organization).toContain('<h1 class="page-title">${esc(org?.name || \'Organization\')}</h1>');
-    expect(organization).toContain('<p class="settings-intro">Organization settings</p>');
+describe('Project settings', () => {
+  it('uses the same name-first heading hierarchy for project and organization settings', async () => {
+    const project = await settings();
+    expect(await project.page.locator('h1.page-title').textContent()).toBe('Workspace');
+    expect(await project.page.locator('h1.page-title + .settings-intro').textContent()).toBe('Project settings');
+    await project.close();
+    const organization = await settings({ path: '/org/settings' });
+    expect(await organization.page.locator('h1.page-title').textContent()).toBe('Organization');
+    expect(await organization.page.locator('h1.page-title + .settings-intro').textContent()).toBe('Organization settings');
+    await organization.close();
   });
 
-  it('places permission-gated rename controls in Advanced settings', () => {
-    const project = source.slice(source.indexOf('function settingsView('), source.indexOf('function cloudEnvironmentCard('));
-    const organization = source.slice(source.indexOf('function organizationView('), source.indexOf('function pendingInvitationRow('));
-    const projectWiring = extractFunction('wireSettingsView');
-    const organizationWiring = extractFunction('hydrateOrganizationView');
+  it('places permission-gated rename controls in Advanced settings and saves only the name', async () => {
+    const ui = await settings({ api: ({ method, path: route }) => route.startsWith('/api/settings/access')
+      ? { project: true, projectDelete: false, projectTransfer: true }
+      : method === 'PATCH' ? { id: 'p', organizationId: 'o', name: 'Renamed', config: {} } : undefined });
+    await pane(ui, 'project-advanced');
+    await expect.poll(() => visible(ui, '#rename-project')).toBe(true);
+    expect(await ui.page.locator('#project-name').inputValue()).toBe('Workspace');
+    expect(await ui.page.locator('#project-folder').count()).toBe(0);
+    expect(await visible(ui, '#move-project')).toBe(true);
+    expect(await visible(ui, '#delete-project')).toBe(false); // no projectDelete authority
+    expect(await ui.page.evaluate(() => {
+      const move = document.getElementById('move-project')!;
+      return [document.getElementById('project-advanced')!.compareDocumentPosition(move) & Node.DOCUMENT_POSITION_FOLLOWING,
+        move.compareDocumentPosition(document.getElementById('project-experimental')!) & Node.DOCUMENT_POSITION_FOLLOWING];
+    })).toEqual([Node_FOLLOWING, Node_FOLLOWING]);
+    await ui.page.locator('#project-name').fill('Renamed');
+    await ui.page.locator('#rename-project').click();
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'PATCH'))
+      .toEqual([{ method: 'PATCH', path: '/api/projects/p', body: { name: 'Renamed' } }]);
+    await ui.close();
 
-    expect(project).toContain('id="project-name"');
-    expect(project).toContain('value="${esc(projectPath(proj))}"');
-    expect(project).not.toContain('id="project-folder"');
-    expect(project).toContain('id="rename-project"');
-    expect(project).toContain('data-settings-access="projectDelete"');
-    expect(project).toContain('data-settings-access="projectTransfer"');
-    expect(project.indexOf('id="move-project"')).toBeGreaterThan(project.indexOf('id="project-advanced"'));
-    expect(project.indexOf('id="move-project"')).toBeLessThan(project.indexOf('id="project-experimental"'));
-    expect(organization).toContain('id="organization-name"');
-    expect(organization).toContain('id="rename-organization"');
-    expect(projectWiring).toContain("method: 'PATCH'");
-    expect(projectWiring).toContain('JSON.stringify({ name })');
-    expect(projectWiring).not.toContain('JSON.stringify({ name, folder })');
-    expect(organizationWiring).toContain("method: 'PATCH'");
+    const organization = await settings({ path: '/org/settings', api: ({ method }) => method === 'PATCH' ? {} : undefined });
+    await organization.page.locator('#rename-organization').evaluate((element) =>
+      (element.closest('section.settings-pane') as HTMLElement | null)?.dataset.pane).then((id) => pane(organization, id!));
+    await expect.poll(() => visible(organization, '#rename-organization')).toBe(true);
+    await organization.page.locator('#organization-name').fill('Renamed organization');
+    await organization.page.locator('#rename-organization').click();
+    await expect.poll(() => organization.calls.find((call) => call.method === 'PATCH'))
+      .toMatchObject({ path: '/api/organizations/o', body: { name: 'Renamed organization' } });
+    await organization.close();
   });
 
-  it('creates projects in a native escapable path dialog', () => {
-    const dialog = extractFunction('newProject');
-    expect(dialog).toContain('class="modal-card new-project-dialog"');
-    expect(dialog).toContain('role="dialog" aria-modal="true"');
-    expect(dialog).toContain('placeholder="e.g. Work/Clients/Website"');
-    expect(dialog).toContain("if (event.key === 'Escape') close()");
-    expect(dialog).toContain("if (event.target === event.currentTarget) close()");
-    expect(dialog).toContain("$('#modal-root').appendChild(host)");
-    expect(dialog).not.toContain("prompt('Project name')");
+  it('creates projects in a native escapable path dialog', async () => {
+    const ui = await settings();
+    const open = async () => { await ui.run('newProject()'); return ui.page.getByRole('dialog'); };
+    let dialog = await open();
+    expect(await dialog.getAttribute('aria-modal')).toBe('true');
+    expect(await ui.page.locator('#modal-root .new-project-dialog').count()).toBe(1);
+    expect(await dialog.locator('input').first().getAttribute('placeholder')).toBe('e.g. Work/Clients/Website');
+    await ui.page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'detached' });
+    dialog = await open();
+    await ui.page.locator('.modal-overlay').click({ position: { x: 5, y: 5 } });
+    await dialog.waitFor({ state: 'detached' });
+    await ui.close();
   });
 
-  it('edits project paths and folder names inline from the sidebar', () => {
-    const rows = extractFunction('railProjectRows');
-    const projectEdit = extractFunction('editRailProject');
-    const folderEdit = extractFunction('editRailFolder');
-    const inlineEdit = extractFunction('beginRailInlineEdit');
+  it('edits project paths and folder names inline from the sidebar', async () => {
+    const projects = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} },
+      { id: 'w', organizationId: 'o', name: 'Site', folder: 'Work', config: {} }];
+    const ui = await settings({ projects, api: ({ method, path: route, body }) => method !== 'PATCH' ? undefined
+      : route === '/api/projects/p' ? { ...projects[0], name: body.name }
+        : route === '/api/projects/w/folder' ? [{ ...projects[1], folder: body.name }] : undefined });
+    const edit = ui.page.locator('#rail [data-project-edit="p"]');
+    // The edit affordance appears only when the row is hovered or focused.
+    const opacity = () => edit.evaluate((element) => Number(getComputedStyle(element).opacity));
+    expect(await opacity()).toBe(0);
+    await ui.page.locator('#rail .proj', { has: ui.page.locator('[data-project-edit="p"]') }).hover();
+    await expect.poll(opacity).toBeGreaterThan(0);
+    await edit.click();
+    const input = ui.page.locator('#rail .rail-edit-input');
+    expect(await input.inputValue()).toBe('Workspace');
+    await ui.page.keyboard.press('Escape');
+    await input.waitFor({ state: 'detached' });
+    expect(ui.calls.some((call) => call.method === 'PATCH')).toBe(false);
+    await ui.page.locator('#rail .proj', { has: ui.page.locator('[data-project-edit="p"]') }).hover();
+    await edit.click();
+    await input.fill('Clients/Website');
+    await ui.page.locator('#rail .rail-edit-confirm').click();
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'PATCH'))
+      .toEqual([{ method: 'PATCH', path: '/api/projects/p', body: { name: 'Clients/Website' } }]);
 
-    expect(rows).toContain('data-project-edit=');
-    expect(rows).toContain('data-folder-edit=');
-    expect(projectEdit).toContain('value: projectPath(project)');
-    expect(projectEdit).toContain("method: 'PATCH'");
-    expect(projectEdit).toContain('JSON.stringify({ name })');
-    expect(folderEdit).toContain('/folder`');
-    expect(folderEdit).toContain('JSON.stringify({ folder, name })');
-    expect(inlineEdit).toContain("event.key !== 'Escape'");
-    expect(inlineEdit).toContain('class="rail-edit-confirm"');
-    expect(inlineEdit).toContain('class="rail-edit-cancel"');
-    expect(styles).toContain('.rail .rail-edit-action { margin: -3px -4px -3px auto; opacity: 0;');
-    expect(styles).toContain('.rail .proj:hover .rail-edit-action');
+    await ui.page.locator('#rail .proj', { has: ui.page.locator('[data-folder-edit="Work"]') }).hover();
+    await ui.page.locator('#rail [data-folder-edit="Work"]').click();
+    expect(await input.inputValue()).toBe('Work');
+    await input.fill('Clients');
+    await ui.page.keyboard.press('Enter');
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'PATCH').at(-1))
+      .toEqual({ method: 'PATCH', path: '/api/projects/w/folder', body: { folder: 'Work', name: 'Clients' } });
+    await ui.close();
   });
 
-  it('keeps the post-delete fallback inside the deleted project’s organization', () => {
-    const projectWiring = extractFunction('wireSettingsView');
-
-    expect(projectWiring).toContain('firstProjectForOrganization(deletedOrganizationId)');
-    expect(projectWiring).toContain("globalRoute('insights', organizationById(deletedOrganizationId))");
-    expect(projectWiring).not.toContain('const next = S.projects[0]');
+  it('keeps the post-delete fallback inside the deleted project’s organization', async () => {
+    const organizations = [{ id: 'x', name: 'Elsewhere', slug: 'elsewhere' }, { id: 'o', name: 'Organization', slug: 'org' }];
+    const deleted = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
+    const foreign = { id: 'f', organizationId: 'x', name: 'First anywhere', config: {} };
+    const sibling = { id: 's', organizationId: 'o', name: 'Sibling', config: {} };
+    const afterDelete = async (remaining: Array<Record<string, unknown>>) => {
+      let gone = false;
+      const ui = await settings({ projects: [foreign, deleted, ...remaining], organizations, api: ({ method, path: route }) => {
+        if (method === 'DELETE' && route === '/api/projects/p') { gone = true; return {}; }
+        if (gone && method === 'GET' && route === '/api/projects') return [foreign, ...remaining];
+        return undefined;
+      } });
+      await pane(ui, 'project-advanced');
+      await expect.poll(() => visible(ui, '#delete-project')).toBe(true);
+      await ui.page.locator('#delete-project').click();
+      await expect.poll(() => ui.page.evaluate(() => location.pathname)).not.toBe('/org/workspace/settings');
+      const landed = await ui.page.evaluate(() => location.pathname);
+      await ui.close();
+      return landed;
+    };
+    expect(await afterDelete([sibling])).toBe('/org/sibling');
+    expect(await afterDelete([])).toBe('/org/insights');
   });
 
-  it('formats discovered and revision byte sizes without a missing global', () => {
-    const formatBytes = Function(`${extractFunction('formatBytes')}; return formatBytes;`)() as (value: unknown) => string;
-    expect(formatBytes(0)).toBe('0 B');
-    expect(formatBytes(1023)).toBe('1023 B');
-    expect(formatBytes(1024)).toBe('1 KB');
-    expect(formatBytes(5 * 1024 ** 3)).toBe('5 GB');
-    expect(formatBytes(undefined)).toBe('—');
+  it('formats discovered and revision byte sizes without a missing global', async () => {
+    const ui = await consolePage();
+    expect(await ui.run('[0, 1023, 1024, 5 * 1024 ** 3, undefined].map(formatBytes)'))
+      .toEqual(['0 B', '1023 B', '1 KB', '5 GB', '—']);
+    await ui.close();
   });
 
-  it('keeps code, secrets, data, services, and environment in one Project pane', () => {
-    const settings = source.slice(source.indexOf('function settingsView('), source.indexOf('function cloudEnvironmentCard('));
-    expect(settings).toContain('<a href="#project">Project</a>');
-    expect(settings).not.toContain('<a href="#project-data">Data</a>');
+  it('keeps code, secrets, data, services, and environment in one Project pane', async () => {
+    const ui = await settings();
+    const nav = await ui.page.locator('.settings-layout nav a, .settings-nav a').allInnerTexts();
+    expect(nav).toContain('Project');
+    expect(nav).not.toContain('Data');
     for (const id of ['project-git', 'project-secrets', 'project-data', 'project-services', 'project-environment'])
-      expect(settings).toContain(`id="${id}"`);
-    expect(settings).not.toContain('Agent-manageable by design');
+      expect(await ui.page.locator(`#${id}`).count(), id).toBe(1);
+    expect(await ui.page.locator('#main').innerText()).not.toContain('Agent-manageable by design');
+    await ui.close();
   });
 
-  it('keeps organization repository and storage controls in one Projects pane', () => {
-    const organization = source.slice(source.indexOf('function organizationView('), source.indexOf('function pendingInvitationRow('));
-    expect(organization).toContain('<a href="#settings-code">Projects</a>');
-    expect(organization).not.toContain('<a href="#settings-storage">Data storage</a>');
-    expect(organization).toContain('id="settings-code"><div>Projects');
-    expect(organization).toContain('<div class="section-h">Git &amp; GitHub</div>');
-    expect(organization).toContain('<div class="section-h" id="settings-storage">Data storage ${policyTip(');
+  it('keeps organization repository and storage controls in one Projects pane', async () => {
+    const ui = await settings({ path: '/org/settings' });
+    const links = await ui.page.locator('.settings-layout a[href^="#settings-"]').evaluateAll((anchors) =>
+      anchors.map((anchor) => [anchor.getAttribute('href'), anchor.textContent?.trim()]));
+    expect(links).toContainEqual(['#settings-code', 'Projects']);
+    expect(links.map(([, label]) => label)).not.toContain('Data storage');
+    const projects = ui.page.locator('section.settings-pane', { has: ui.page.locator('#settings-code') });
+    expect(await projects.locator('.section-h', { hasText: 'Git & GitHub' }).count()).toBe(1);
+    expect(await projects.locator('#settings-storage').count()).toBe(1);
+    expect(await ui.page.locator('#settings-storage').textContent()).toMatch(/^Data storage/);
+    await ui.close();
   });
 
-  it('explains data locations and the Data/Service/S3 boundary', () => {
-    const data = source.slice(source.indexOf('async function hydrateProjectData('), source.indexOf('async function hydrateProjectServices('));
-    const services = source.slice(source.indexOf('async function hydrateProjectServices('), source.indexOf('async function hydrateProjectEnvironment('));
-    // The boundary is explained once, in the Data and Services headings' tips.
-    expect(source).toContain('<h2>Data ${policyTip(`Choose Data when');
-    expect(source).toContain('Storage only decides where the encrypted revisions live');
-    expect(source).toContain("<h2>Services ${policyTip('Use an external service for an API, hosted database or S3 bucket");
-    expect(data).toContain('Mount at path <small>(repo-relative)</small>');
+  it('explains the Data/Service/S3 boundary once, in the section tips, and offers each import path', async () => {
+    const ui = await settings();
+    const tip = (heading: string) => ui.page.locator('h2', { hasText: heading }).first().locator('[data-tip], [title], .policy-tip').first()
+      .evaluate((element) => element.getAttribute('data-tip') || element.getAttribute('title') || element.textContent || '');
+    expect(await tip('Data')).toContain('Choose Data when');
+    expect(await tip('Data')).toContain('Storage only decides where the encrypted revisions live');
+    expect(await tip('Services')).toContain('Use an external service for an API, hosted database or S3 bucket');
+    await ui.page.locator('#data-add-panel summary').click();
+    const data = await ui.page.locator('#data-add-panel').innerText();
+    expect(data).toContain('Mount at path (repo-relative)');
     expect(data).toContain('Import from local path');
-    expect(data).toContain('formatBytes(proposal.bytes)');
-    expect(services).toContain('external service');
+    expect(await ui.page.locator('#service-kind option').allTextContents())
+      .toContain('Connect to an existing external service');
+    await ui.close();
   });
 
-  it('keeps forms concise and offers optional base-image suggestions', () => {
+  it('keeps forms concise and offers optional base-image suggestions', async () => {
+    const ui = await settings();
+    await ui.page.locator('#environment-image').waitFor({ state: 'attached' });
+    const text = await ui.page.locator('#main').innerText();
     for (const removed of [
       'The repositories this project works on, and the identity it commits with.',
       'Sensitive values injected only when a task needs them. Values are never shown again.',
-      'No versioned data yet.',
-      'A human-readable name in Project settings.',
-      'The destination path inside every task world',
-      'Expensive installation commands baked into a reusable build',
+      'No versioned data yet.', 'A human-readable name in Project settings.',
+      'The destination path inside every task world', 'Expensive installation commands baked into a reusable build',
       'No build yet.',
-    ]) expect(source).not.toContain(removed);
-    expect(source).toContain('Local repo, GitHub, or Git URL');
-    expect(source).toContain('Base image <small>(optional)</small>');
-    expect(source).toContain('list="environment-image-options"');
-    expect(source).toContain('python:3.13-slim');
-    expect(source).toContain('uv sync');
-    expect(source).toContain('uv run python manage.py migrate');
+    ]) expect(text).not.toContain(removed);
+    expect(text).toContain('Local repo, GitHub, or Git URL');
+    expect(text).toContain('Base image (optional)');
+    expect(await ui.page.locator('#environment-image').getAttribute('list')).toBe('environment-image-options');
+    expect(await ui.page.locator('#environment-image-options option').evaluateAll((options) =>
+      options.map((option) => (option as HTMLOptionElement).value))).toContain('python:3.13-slim');
+    const suggestions = (await ui.page.locator('#environment-setup, #environment-boot').evaluateAll((fields) =>
+      fields.map((field) => (field as HTMLTextAreaElement).placeholder))).join('\n');
+    expect(suggestions).toContain('uv sync');
+    expect(suggestions).toContain('uv run python manage.py migrate');
+    await ui.close();
   });
 
-  it('opens GitHub repository creation from a button beside Save repositories', () => {
-    const access = source.slice(source.indexOf('async function hydrateProjectAccess('), source.indexOf('async function hydrateWorkflowPins('));
-    const dialog = source.slice(source.indexOf('function openNewGithubRepositoryDialog('), source.indexOf('async function hydrateProjectAccess('));
-    const save = access.indexOf('>Save repositories</button>');
-    const open = access.indexOf('>New repository...</button>');
-
-    expect(save).toBeGreaterThan(-1);
-    expect(open).toBeGreaterThan(save);
-    expect(access.slice(save, open)).not.toContain('</div>');
-    expect(access).not.toContain('<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b>');
-    expect(access).toContain("openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget)");
-    for (const label of ['GitHub account', 'Repository name', 'Description', 'Private repository']) expect(dialog).toContain(label);
-    expect(dialog).toContain('role="dialog" aria-modal="true"');
-    expect(dialog).toContain("if (event.key === 'Escape') close()");
-    expect(dialog).toContain("opener?.focus?.()");
+  it('opens GitHub repository creation from a button beside Save repositories', async () => {
+    const ui = await settings({ api: ({ method, path: route }) => method !== 'GET' ? undefined
+      : route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
+        : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }] : undefined });
+    const save = ui.page.getByRole('button', { name: 'Save repositories' });
+    const create = ui.page.getByRole('button', { name: 'New repository...' });
+    await create.waitFor();
+    expect(await save.evaluate((element, other) => element.parentElement === other!.parentElement
+      && !!(element.compareDocumentPosition(other!) & Node.DOCUMENT_POSITION_FOLLOWING), await create.elementHandle())).toBe(true);
+    await create.click();
+    const dialog = ui.page.getByRole('dialog');
+    expect(await dialog.getAttribute('aria-modal')).toBe('true');
+    const text = await dialog.innerText();
+    for (const label of ['GitHub account', 'Repository name', 'Description', 'Private repository']) expect(text).toContain(label);
+    await ui.page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'detached' });
+    expect(await create.evaluate((element) => element === document.activeElement)).toBe(true);
+    await ui.close();
   });
 
-  it('resets the actual scroll container when switching settings panes', () => {
-    expect(source).toContain("$('#main')?.closest('.main')?.scrollTo?.(0, 0)");
+  it('resets the actual scroll container when switching settings panes', async () => {
+    const ui = await settings();
+    const scroller = ui.page.locator('.main').first();
+    await scroller.evaluate((element) => { element.scrollTop = 600; });
+    expect(await scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+    await ui.page.locator('.settings-layout a[href="#project-people"], .settings-layout a[href^="#project-"]').last().click();
+    await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBe(0);
+    await ui.close();
   });
 });
+
+const Node_FOLLOWING = 4; // Node.DOCUMENT_POSITION_FOLLOWING
+void fs; void path;
