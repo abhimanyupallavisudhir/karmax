@@ -10,9 +10,11 @@ import { formatMinorUnits } from '../util/currency.js';
 const money = (minor: number | undefined, currency = 'usd') => `${formatMinorUnits(minor ?? 0, currency)} ${currency.toUpperCase()}`;
 
 /** The Review note for a spend that was not granted (SPEC §7.6). */
-export function spendReviewSummary(outcome: { status: string; reason?: string; shortfall?: number; currency?: string },
+export function spendReviewSummary(outcome: { status: string; reason?: string; shortfall?: number; currency?: string; cardId?: string },
   args: { amount: number; merchant?: string; why?: string }): string {
   const at = args.merchant ? ` at ${args.merchant}` : '';
+  if (outcome.status === 'needs_funding' && !outcome.cardId)
+    return `Choose a card for this task to pay ${money(args.amount, outcome.currency)}${at}. ${args.why ?? ''}`;
   return outcome.status === 'needs_funding'
     ? `Funding needed: add ${money(outcome.shortfall ?? args.amount, outcome.currency)} to the card to pay ${money(args.amount, outcome.currency)}${at}. ${args.why ?? ''}`
     : outcome.status === 'needs_approval'

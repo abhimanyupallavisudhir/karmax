@@ -1085,9 +1085,11 @@ export class BudgetService {
       : visibleCards[0];
     if (!card && args.cardId) return { status: 'denied', reason: 'the requested card is not available to this task' };
     if (!card) {
-      const reason = 'no card is selected for this task — choose a card in task parameters';
+      // Recorded in the budget's currency: only a card in it can pay this later.
+      const { currency } = await this.policy(ctx.projectId, ctx.taskId);
+      const reason = 'choose a card for this task';
       const pending = (await this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
-        taskId: ctx.taskId, amount: args.amount, merchant: args.merchant, why: args.why,
+        taskId: ctx.taskId, amount: args.amount, currency, merchant: args.merchant, why: args.why,
         status: 'needs_funding', reason, shortfall: args.amount }));
       return this.result(pending);
     }
@@ -1191,13 +1193,23 @@ export class BudgetService {
         ? this.store.updatePaymentSpendRequest(request.id, { status: 'denied', reason, resolvedBy }) : current;
     });
     if (await ended()) return this.result(await refuse('the task has ended'));
+    // A request made before any card was chosen is in its budget's currency;
+    // only a card in that currency can pay it.
     const card = request.cardId
       ? (await this.store.getCard(request.cardId)) as Card | undefined
       : (await this.cards({
         projectId: request.projectId,
         taskId: request.taskId,
         organizationId: request.organizationId,
-      }))[0];
+      })).find(candidate => cardCurrency(candidate) === cardCurrency(request));
+    if (!card && !request.cardId) {
+      const reason = `choose a ${cardCurrency(request).toUpperCase()} card for this task`;
+      return this.result(await this.store.paymentTransaction(async () => {
+        const current = (await this.store.getPaymentSpendRequest(requestId))!;
+        return ['pending_approval', 'needs_funding'].includes(current.status)
+          ? this.store.updatePaymentSpendRequest(request.id, { reason }) : current;
+      }));
+    }
     if (card && !(await this.cards({ projectId: request.projectId, taskId: request.taskId, organizationId: request.organizationId })).some(c => c.id === card.id))
       return { status: 'denied', reason: 'card is no longer selected for this task', requestId };
     if (!card) return this.result(await refuse('card no longer exists'));

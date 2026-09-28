@@ -87,7 +87,7 @@ describe('payment policy currency through the API', () => {
   it('shows the approver each amount in its own currency', () => {
     expect(spendReviewSummary({ status: 'needs_approval', reason: 'over the task budget', currency: 'jpy' },
       { amount: 1_250, merchant: 'shop.example.jp', why: 'domain' })).toContain('Approval needed to spend 1250 JPY at shop.example.jp');
-    expect(spendReviewSummary({ status: 'needs_funding', shortfall: 2_500, currency: 'kwd' }, { amount: 12_500 }))
+    expect(spendReviewSummary({ status: 'needs_funding', shortfall: 2_500, currency: 'kwd', cardId: 'card' }, { amount: 12_500 }))
       .toContain('add 2.500 KWD to the card to pay 12.500 KWD');
     expect(spendReviewSummary({ status: 'needs_approval', reason: 'x' }, { amount: 1_250 })).toContain('12.50 USD');
     expect(evaluateSpend({ amount: 1_250, allowance: 1_000, spent: 0, available: 50_000, hardCap: 50_000, currency: 'jpy' }))
@@ -111,6 +111,35 @@ describe('payment policy currency through the API', () => {
       expect(result).toMatchObject({ status: 'needs_approval', currency: 'jpy' });
       expect(await new BudgetService(store, provider).request({ projectId: project.id, taskId: task.id, capabilities: ['use-card:*'] }, { amount: 0.5 } as any))
         .toMatchObject({ status: 'denied', reason: expect.not.stringContaining('cents') });
+    } finally { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // Round 4, item 9: a request made before any card is chosen is in the
+  // budget's currency, and only a card in that currency can pay it.
+  it('keeps a card-less request in the budget currency until a card in it is chosen', async () => {
+    const store = (await Store.create(':memory:'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cardless-'));
+    try {
+      const project = (await store.createProject('Yen, no card yet'));
+      (await store.setSettings(project.id, 'payments', { budget: 100_000, currency: 'jpy', cardIds: [] }));
+      const provider = new VaultCardProvider(store, new CredentialBroker(new Vault(dir)));
+      const { BudgetService } = await import('../src/autonomy/payments.js');
+      const budget = new BudgetService(store, provider);
+      const task = await store.createTask({ projectId: project.id, title: 'buy', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } } as any);
+      const ctx = { projectId: project.id, taskId: task.id, capabilities: ['use-card:*'] };
+      const pending = await budget.request(ctx, { amount: 1_250, merchant: 'shop.example.jp' });
+      expect(pending).toMatchObject({ status: 'needs_funding', currency: 'jpy' });
+      expect(spendReviewSummary(pending, { amount: 1_250, merchant: 'shop.example.jp' })).toMatch(/^Choose a card for this task to pay 1250 JPY at shop\.example\.jp/);
+      const details = { number: '4242424242424242', cvc: '123', expMonth: 1, expYear: 2031 };
+      const dollars = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Dollars', cap: 100_000, details } as any);
+      (await store.setSettings(project.id, 'payments', { budget: 100_000, currency: 'jpy', cardIds: [dollars.id] }));
+      expect(await budget.approve(pending.requestId!, 'user:owner')).toMatchObject({ status: 'needs_funding', reason: expect.stringMatching(/choose a JPY card/) });
+      expect((await store.getPaymentSpendRequest(pending.requestId!))).toMatchObject({ cardId: null, currency: 'jpy' });
+      const yen = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Yen', cap: 100_000, currency: 'JPY', details } as any);
+      (await store.setSettings(project.id, 'payments', { budget: 100_000, currency: 'jpy', cardIds: [dollars.id, yen.id] }));
+      await budget.approve(pending.requestId!, 'user:owner');
+      expect((await store.getPaymentSpendRequest(pending.requestId!))).toMatchObject({ cardId: yen.id, currency: 'jpy' });
     } finally { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
