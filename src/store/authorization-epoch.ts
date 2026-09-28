@@ -9,13 +9,23 @@ import type { SqlDatabase } from './sql.js';
  * bounded only by their cache's TTL.
  */
 let epoch = 0;
+const listeners = new Set<() => void>();
 export const authorizationEpoch = (): number => epoch;
-export const authorizationChanged = (): void => { epoch++; };
+export const authorizationChanged = (): void => {
+  epoch++;
+  for (const listener of listeners) try { listener(); } catch { /* a listener's own failure */ }
+};
+/** Call `listener` after every change (long-lived sockets re-decide then). */
+export function onAuthorizationChange(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
 
 /** Tables are matched on the statement, not on the Store method, so every path
- * that writes them (deprovisioning, account closure, a project move) is caught.
- * Inserts are included: they can replace a grant with a narrower one. */
-const AUTHORITY_WRITE = /^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b[\s\S]*?\b(?:scoped_tokens|principal_grants|organization_memberships|project_memberships|team_memberships|human_delegations)\b|^\s*UPDATE\s+projects\s+SET\b[\s\S]*?\borganizationId\b|^\s*DELETE\s+FROM\s+(?:projects|teams|organizations)\b/i;
+ * that writes them (deprovisioning, account closure, a project move, a revoked
+ * preview lease) is caught. Inserts are included: they can replace a grant
+ * with a narrower one. */
+const AUTHORITY_WRITE = /^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b[\s\S]*?\b(?:scoped_tokens|principal_grants|organization_memberships|project_memberships|team_memberships|human_delegations)\b|^\s*UPDATE\s+projects\s+SET\b[\s\S]*?\borganizationId\b|^\s*(?:UPDATE|DELETE)\b[\s\S]*?\bpreview_leases\b|^\s*DELETE\s+FROM\s+(?:projects|teams|organizations)\b/i;
 
 /** `db`, moving the epoch once each authority write has committed. */
 export function watchAuthorityWrites(db: SqlDatabase): SqlDatabase {

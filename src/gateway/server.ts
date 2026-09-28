@@ -1,4 +1,4 @@
-import { socketLifetime } from './socket-lifetime.js';
+import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -710,8 +710,8 @@ export class Gateway {
     // token cost several store reads per event per socket, and a streaming agent
     // publishes several events a second. A decision lasts until this process
     // commits anything that can withdraw access (revocation, member removal,
-    // project transfer), until the token expires, and at most
-    // SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
+    // project transfer), until a token-based socket's token expires, and at
+    // most SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
     const decisions = new Map<string, { allowed: Promise<boolean>; until: number; epoch: number }>();
     const mayRead = (projectId: string | undefined, taskId: string): Promise<boolean> => {
       const key = `${projectId ?? ''}\0${taskId}`;
@@ -730,7 +730,10 @@ export class Gateway {
       })();
       // A failed lookup is not a decision: the next event asks again.
       allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
-      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS, scoped?.expiresAt ?? Infinity) });
+      // A person's decision does not depend on the socket token, so it does not
+      // expire with it; a token's does.
+      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS,
+        auth.userId && this.deps.authorization ? Infinity : scoped?.expiresAt ?? Infinity) });
       return allowed;
     };
     // Streamed text supersedes itself, so a client that has fallen behind gets
@@ -1389,6 +1392,11 @@ export class Gateway {
     // Close the provider stream first, then drain accepted output. Natural exit
     // and socket close share one finalization promise and one lease release.
     ws.on('close', () => { void stopTerminal().catch(failed); });
+    // The shell lasts only as long as its principal may edit the task.
+    keepAuthorized(ws, socketLifetime(ws), async () => {
+      const current = await this.socketAuth(req, url, task.projectId) ?? ticketRecord?.session;
+      return !!current && (await this.deps.tokens.check(current.apiToken, 'task:edit', { projectId: task.projectId, taskId })).ok;
+    });
     if (this.closing || ws.readyState !== 1) await stopTerminal();
   }
 
@@ -1423,6 +1431,10 @@ export class Gateway {
       if (done) { send({ type: 'exit', code }); try { ws.close(); } catch {} }
     }));
     lifetime.add(off);
+    keepAuthorized(ws, lifetime, async () => {
+      const current = await this.socketAuth(req, url, task?.projectId);
+      return !!current && (await this.deps.tokens.check(current.apiToken, 'task:review:execute', { projectId: task?.projectId, taskId: rec.taskId })).ok;
+    });
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -8284,6 +8296,8 @@ export class Gateway {
     let taskId: string;
     let port: number;
     let requestPath: string;
+    /** The connect-time decision, made again while the socket stays open. */
+    let stillAllowed: () => Promise<boolean>;
     const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
     if (taskMatch) {
       if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
@@ -8291,6 +8305,10 @@ export class Gateway {
       port = Number(taskMatch[2]);
       const task = (await this.deps.store.getTask(taskId));
       const auth = await this.socketAuth(req, url, task?.projectId);
+      stillAllowed = async () => {
+        const current = task && await this.socketAuth(req, url, task.projectId);
+        return !!current && (await this.deps.tokens.check(current.apiToken, 'task:review:execute', { projectId: task!.projectId, taskId })).ok;
+      };
       if (!task || !auth || !(await this.deps.tokens.check(auth.apiToken, 'task:review:execute', { projectId: task.projectId, taskId })).ok) {
         browser.close(4403, 'forbidden'); return;
       }
@@ -8299,6 +8317,14 @@ export class Gateway {
     } else {
       const leaseMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
       const lease = leaseMatch ? (await this.deps.store.previewLease(leaseMatch[1]!)) : undefined;
+      stillAllowed = async () => {
+        const current = await this.deps.store.previewLease(lease!.id);
+        if (!current || current.revokedAt || current.expiresAt <= Date.now()) return false;
+        if (((await this.deps.store.currentWorld(current.worldId))?.generation ?? 1) !== current.generation) return false;
+        if (current.tokenHash) return true;
+        const session = await this.auth(req, current.projectId, current.organizationId);
+        return !!session && (await this.deps.tokens.check(session.apiToken, 'task:read', { projectId: current.projectId, taskId: current.taskId })).ok;
+      };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
@@ -8354,6 +8380,7 @@ export class Gateway {
     upstream.on('message', (data, binary) => { if (browser.readyState === browser.OPEN) browser.send(data, { binary }); });
     upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
     upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
+    keepAuthorized(browser, lifetime, stillAllowed);
   }
 
   /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only

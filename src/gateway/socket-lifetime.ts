@@ -1,4 +1,5 @@
 import type { WebSocket } from 'ws';
+import { onAuthorizationChange } from '../store/authorization-epoch.js';
 
 /** Register disconnect cleanup before awaiting resource acquisition. */
 export function socketLifetime(socket: WebSocket) {
@@ -25,4 +26,32 @@ export function socketLifetime(socket: WebSocket) {
       else cleanups.add(run);
     },
   };
+}
+
+/**
+ * Close `socket` once `allowed` says no (#367 review item 12). A socket that
+ * checks only when it connects outlives a revoked token, a removed member or
+ * a narrowed grant for as long as it stays open: a terminal keeps its shell.
+ * Decided again at once when this process commits a change that can withdraw
+ * access, and every `intervalMs` for changes another replica made. A check
+ * that fails to run is not a refusal; the next one decides.
+ */
+export function keepAuthorized(socket: WebSocket, lifetime: ReturnType<typeof socketLifetime>,
+  allowed: () => Promise<boolean>, intervalMs = 5_000): void {
+  let running: Promise<void> | undefined;
+  let again = false;
+  const check = (): void => {
+    if (running) { again = true; return; }
+    running = (async () => {
+      do {
+        again = false;
+        if (lifetime.closed) return;
+        if (!(await allowed().catch(() => true)) && !lifetime.closed) { socket.close(4403, 'access withdrawn'); return; }
+      } while (again);
+    })().finally(() => { running = undefined; });
+  };
+  const timer = setInterval(check, intervalMs);
+  timer.unref?.();
+  const off = onAuthorizationChange(check);
+  lifetime.add(() => { clearInterval(timer); off(); });
 }
